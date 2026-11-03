@@ -64,6 +64,9 @@ typedef enum {
     WL_CONTROLLED_STEP_DIRTY,
     /* A stopped synchronous SNAPSHOT may only be retried as SNAPSHOT. */
     WL_CONTROLLED_STEP_SNAPSHOT_RETRYABLE,
+    /* A genuine retained native error owns cleanup independently of the
+     * original control's current attempt and the caller's progress permission. */
+    WL_CONTROLLED_STEP_NATIVE_ERROR_CLEANUP_PENDING,
 } wl_controlled_step_state_t;
 
 /* Host source inspection request (Issue #2321).  ADMIT checks only the

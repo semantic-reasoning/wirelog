@@ -3511,6 +3511,14 @@ int wl_columnar_eval_stack_cleanup_receipt_read(wl_col_session_t *,
     wl_columnar_eval_cleanup_receipt_t *);
 int wl_columnar_eval_stack_cleanup_receipt_ack(wl_col_session_t *,
     const wl_columnar_eval_cleanup_receipt_key_t *);
+typedef struct {
+    int protocol;
+    int execution_result;
+} wl_columnar_eval_cleanup_receipt_ack_result_t;
+wl_columnar_eval_cleanup_receipt_ack_result_t
+    wl_columnar_eval_stack_cleanup_receipt_ack_funded(wl_col_session_t *,
+    const wl_columnar_eval_cleanup_receipt_key_t *,
+    wl_evaluation_control_t *, uint64_t);
 int wl_columnar_eval_stack_cleanup_receipt_retry(wl_col_session_t *,
     const wl_columnar_eval_cleanup_receipt_key_t *);
 int wl_columnar_eval_stack_cleanup_receipt_prepare(
@@ -8463,6 +8471,41 @@ int wl_columnar_eval_stack_auto_consume(
     uint64_t, bool, bool *);
 bool wl_columnar_eval_stack_auto_error_drain(
     const wl_columnar_eval_serial_framed_attempt_t *);
+/* Read-only observation of an actual registered native bound child debt.
+ * Stored owner association is checked independently of the calling thread.
+ * A nonzero first cause protects continuation; it never authorizes progress. */
+int wl_columnar_eval_stack_auto_cleanup_debt(const wl_col_session_t *,
+    const wl_columnar_eval_private_bindings_t *, uint64_t);
+/* Scalar observations only. The complete private session dispatcher combines
+ * real registered ownership, both native threads and fresh metadata admission;
+ * neither query grants mutation authority or performs cleanup. */
+bool wl_columnar_eval_stack_auto_cleanup_current(const wl_col_session_t *);
+int wl_columnar_eval_stack_auto_cleanup_shape(const wl_col_session_t *,
+    const wl_columnar_eval_serial_framed_attempt_t *);
+/* Complete session-derived union of the two observations for the private
+ * outer dispatcher. Returns no context loan or mutation permission. */
+int wl_columnar_eval_stack_auto_cleanup_ready(const wl_col_session_t *);
+
+typedef enum {
+    WL_COLUMNAR_SESSION_METADATA_NATIVE_ERROR
+} wl_columnar_session_metadata_purpose_t;
+typedef enum {
+    WL_COLUMNAR_SESSION_METADATA_SETUP_REFUSED,
+    WL_COLUMNAR_SESSION_METADATA_BODY_RETURNED
+} wl_columnar_session_metadata_event_t;
+
+typedef enum {
+    WL_COLUMNAR_SESSION_NATIVE_ERROR_INERT,
+    WL_COLUMNAR_SESSION_NATIVE_ERROR_CHILD,
+    WL_COLUMNAR_SESSION_NATIVE_ERROR_DISPOSE,
+    WL_COLUMNAR_SESSION_NATIVE_ERROR_FINAL,
+    WL_COLUMNAR_SESSION_NATIVE_ERROR_DONE
+} wl_columnar_session_native_error_phase_t;
+#ifdef WL_SESSION_TEST_HOOKS
+wl_columnar_session_native_error_phase_t
+wl_columnar_session_test_native_error_phase(const wl_col_session_t *);
+#endif
+
 int wl_columnar_eval_stack_auto_cleanup_admit(
     const wl_columnar_eval_serial_framed_attempt_t *, wl_evaluation_control_t *,
     uint64_t);
@@ -8596,6 +8639,17 @@ int wl_columnar_session_test_host_abort(wl_col_session_t *);
 extern void (*wl_columnar_session_test_framed_grant_finished)(
     const wl_col_session_t *, wl_columnar_eval_serial_framed_host_action_t,
     wl_evaluation_control_t *, int);
+/* Pre-create capacity/diagnostics only; no private metadata pointer or ID.
+ * Test-only: quiescent native-INERT debt may reset/rebegin an already inactive
+ * ORIGINAL through checked control APIs.
+ * Saved IDs/bindings/receipts/proofs and original configuration stay unchanged.
+ * STEP/try_destroy probes require existing admission EBUSY before dispatch.
+ * Completed observer is pure, BY VALUE, after metadata detach/final release. */
+extern uint64_t (*wl_columnar_session_test_metadata_limit)(
+    const wl_col_session_t *, wl_columnar_session_metadata_purpose_t, uint64_t);
+extern void (*wl_columnar_session_test_metadata_finished)(
+    const wl_col_session_t *, wl_columnar_session_metadata_purpose_t,
+    wl_columnar_session_metadata_event_t, int, wl_evaluation_control_report_t);
 extern int wl_columnar_session_test_exhaust_after_relation;
 extern int wl_columnar_session_hash_test_registry_allocation;
 extern int (*wl_columnar_session_hash_test_registry_move)(

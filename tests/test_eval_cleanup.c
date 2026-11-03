@@ -2,6 +2,7 @@
 * Copyright (C) CleverPlant. Licensed under LGPL-3.0. */
 #include "../wirelog/columnar/internal.h"
 #include "../wirelog/thread.h"
+#include "../wirelog/columnar/mem_ledger_publication.h"
 #include <stdio.h>
 #include <stdlib.h>
 
@@ -1387,9 +1388,154 @@ test_unary_snapshot_and_refusals(void)
     col_rel_destroy(r); destroy_session(s);
 }
 
+/* This fixture owns a real raw-JOIN result. It exercises the defensive
+ * ledger-positive scalar bridge separately from automatic native cleanup,
+ * whose current private result constructors leave mem_ledger NULL. */
+static wl_evaluation_control_t *
+scalar_control(uint64_t limit, const void *owner)
+{
+    wl_evaluation_control_t *control = NULL;
+    CHECK(!wl_evaluation_control_create(limit, &control));
+    CHECK(!wl_evaluation_control_attach(control, owner));
+    CHECK(!wl_evaluation_control_begin(control, owner));
+    return control;
+}
+
+static uint64_t
+scalar_control_end(wl_evaluation_control_t *control, const void *owner,
+    int result)
+{
+    CHECK(wl_evaluation_control_finish(control, owner,
+        result > 0 ? result : 0, 0) == result);
+    wl_evaluation_control_report_t report;
+    CHECK(!wl_evaluation_control_report(control, &report));
+    CHECK(!wl_evaluation_control_detach(control, owner));
+    wl_evaluation_control_release(control);
+    return report.consumed;
+}
+
+static void
+test_scalar_finite_ledger_bridge(void)
+{
+    wl_col_session_t *s = new_session();
+    col_rel_t *left = col_rel_new_auto("left", 1);
+    col_rel_t *right = col_rel_new_auto("right", 1);
+    int64_t value = 42;
+    CHECK(left && right && !col_rel_append_row(left, &value)
+        && !col_rel_append_row(right, &value));
+    col_rel_t *registry[] = {right};
+    s->rels = registry; s->nrels = 1;
+    eval_stack_t stack = {0};
+    CHECK(!eval_stack_push(&stack, left, false));
+    wl_plan_op_t op = {.op = WL_PLAN_OP_JOIN, .right_relation = "right"};
+    CHECK(!col_op_join(&op, &stack, s) && stack.top == 1);
+    eval_entry_t result = eval_stack_pop(&stack);
+    CHECK(result.owned && result.rel && result.rel->nrows == 1
+        && result.rel->mem_ledger == &s->mem_ledger
+        && col_rel_owned_ledger_bytes(result.rel) > 0);
+    wl_columnar_relation_scalar_retirement_t receipt = {0};
+    wl_columnar_relation_scalar_retirement_initializer_t initializer = {0};
+    int owner = 0, peer_owner = 0;
+    wl_evaluation_control_t *control = scalar_control(0, &owner);
+    uint64_t id = wl_evaluation_control_active_attempt_id(control);
+    CHECK(!wl_columnar_relation_scalar_retirement_init_begin(&initializer,
+        &owner, &receipt, result.rel, control, id));
+    bool done = false;
+    for (unsigned turn = 0; !done && turn < 1000; ++turn) {
+        int rc = wl_columnar_relation_scalar_retirement_init_step(&initializer,
+                &owner, &receipt, result.rel, control, id, &done);
+        CHECK(!rc || rc == EAGAIN);
+    }
+    CHECK(done && !wl_columnar_relation_scalar_retirement_init_reset(
+            &initializer, &owner, control, id));
+    for (unsigned turn = 0; !receipt.ready && turn < 1000; ++turn) {
+        int rc = wl_columnar_relation_scalar_retirement_prepare_finite(
+            &receipt, control, id);
+        CHECK(!rc || rc == EAGAIN);
+    }
+    CHECK(receipt.ready
+        && !wl_columnar_relation_scalar_retirement_commit(&receipt));
+    for (unsigned turn = 0; receipt.phase != 12 && turn < 1000; ++turn)
+        CHECK(wl_columnar_relation_scalar_retirement_step(&receipt,
+            control, id) == EAGAIN);
+    CHECK(receipt.phase == 12 && receipt.ledger == &s->mem_ledger
+        && receipt.ledger_bytes > 0 && !receipt.ledger_timestamp_bytes);
+    uint64_t debt = receipt.ledger_bytes;
+    uint64_t before = atomic_load_explicit(
+        &s->mem_ledger.subsys_bytes[WL_MEM_SUBSYS_RELATION],
+        memory_order_relaxed);
+    CHECK(before >= debt);
+    scalar_control_end(control, &owner, 0);
+    /* Each short admission preserves the authentic irreversible owner. */
+    const uint64_t limits[] = {127, 128, 236, 237, 402, 403, 430};
+    const uint64_t consumed[] = {0, 128, 128, 237, 237, 403, 403};
+    for (unsigned i = 0; i < sizeof(limits) / sizeof(limits[0]); ++i) {
+        control = scalar_control(limits[i], &owner);
+        id = wl_evaluation_control_active_attempt_id(control);
+        int rc = wl_evaluation_control_charge_attempt(control, id, 128);
+        if (!rc) rc = wl_columnar_relation_scalar_retirement_ledger_step_finite(
+                &receipt, control, id);
+        CHECK(rc == WL_EVALUATION_CONTROL_WORK_LIMIT
+            && receipt.phase == 12 && receipt.ledger_bytes == debt
+            && !atomic_load_explicit(&s->mem_ledger.writer_gate,
+            memory_order_acquire)
+            && atomic_load_explicit(&s->mem_ledger.subsys_bytes[
+                WL_MEM_SUBSYS_RELATION], memory_order_relaxed) == before);
+        CHECK(scalar_control_end(control, &owner, rc) == consumed[i]);
+    }
+    wl_evaluation_control_t *peer = scalar_control(0, &peer_owner);
+    wl_columnar_mem_ledger_publication_prepared_t held = {0};
+    CHECK(!wl_columnar_mem_ledger_publication_prepare_controlled(
+            &s->mem_ledger, NULL, 0, &held, peer)
+        && !wl_columnar_mem_ledger_publication_try_acquire_controlled(&held));
+    control = scalar_control(431, &owner);
+    id = wl_evaluation_control_active_attempt_id(control);
+    CHECK(!wl_evaluation_control_charge_attempt(control, id, 128)
+        && wl_columnar_relation_scalar_retirement_ledger_step_finite(
+            &receipt, control, id) == EAGAIN
+        && receipt.phase == 12 && receipt.ledger_bytes == debt
+        && atomic_load_explicit(&s->mem_ledger.writer_gate,
+        memory_order_acquire) == 1
+        && atomic_load_explicit(&s->mem_ledger.subsys_bytes[
+            WL_MEM_SUBSYS_RELATION], memory_order_relaxed) == before);
+    CHECK(scalar_control_end(control, &owner, 0) == 431);
+    CHECK(!wl_columnar_mem_ledger_publication_cancel(&held));
+    CHECK(scalar_control_end(peer, &peer_owner, 0) == 303);
+    control = scalar_control(431, &owner);
+    id = wl_evaluation_control_active_attempt_id(control);
+    CHECK(!wl_evaluation_control_charge_attempt(control, id, 128)
+        && wl_columnar_relation_scalar_retirement_ledger_step_finite(
+            &receipt, control, id) == EAGAIN
+        && receipt.phase == 10 && !receipt.ledger && !receipt.ledger_bytes
+        && !result.rel->mem_ledger
+        && !atomic_load_explicit(&s->mem_ledger.writer_gate,
+        memory_order_acquire)
+        && atomic_load_explicit(&s->mem_ledger.subsys_bytes[
+            WL_MEM_SUBSYS_RELATION], memory_order_relaxed) == before - debt);
+    CHECK(wl_columnar_relation_scalar_retirement_ledger_step_finite(
+            &receipt, control, id) == EINVAL);
+    CHECK(scalar_control_end(control, &owner, 0) == 431);
+    control = scalar_control(0, &owner);
+    id = wl_evaluation_control_active_attempt_id(control);
+    int rc = EAGAIN;
+    for (unsigned turn = 0; rc == EAGAIN && turn < 1000; ++turn)
+        rc = wl_columnar_relation_scalar_retirement_step(&receipt, control, id);
+    CHECK(!rc && receipt.storage.phase ==
+        WL_COLUMNAR_RELATION_MANAGED_RETIREMENT_DONE);
+    scalar_control_end(control, &owner, 0);
+    /* Receipt freed the owned result. Only the two borrowed inputs remain. */
+    CHECK(!stack.top && atomic_load_explicit(&s->mem_ledger.subsys_bytes[
+            WL_MEM_SUBSYS_RELATION], memory_order_relaxed) == before - debt);
+    col_rel_destroy(left); col_rel_destroy(right);
+    s->rels = NULL; s->nrels = 0;
+    session_rel_free_hash(s);
+    destroy_session(s);
+}
+
 int
 main(void)
 {
+    test_scalar_finite_ledger_bridge();
     test_admission_and_nesting();
     for (unsigned storage = 0; storage < 3; storage++)
         test_storage_refusal(storage);

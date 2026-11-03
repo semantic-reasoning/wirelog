@@ -2138,6 +2138,22 @@ more source sites. The test hook resets that counter only in isolated tests.
 | `session_hash.c:wl_columnar_session_hash_registry_inert` | `token->state` | `atomic_load_explicit` | acquire | Prove one private or retired token inert before the image drain seal |
 | `session_hash.c:wl_columnar_session_hash_registry_inert#2` | `token->owner_bits` | `atomic_load_explicit` | acquire | Verify no lease remains while the original parent marker still protects retirement |
 
+Ended-original native error cleanup remains bound to the original native thread,
+canonical transaction and immutable child binding. A pending query carries no
+mutation permission. Each dispatcher turn independently proves ownership and
+uses a fresh private2304 metadata control. Factory failure or short allowance
+cannot register or move a native owner. Completed metadata observation receives
+scalar values only, after the private control has been released.
+
+The original attempt may be inactive or have a live successor while its old
+native owner remains pending. Cleanup neither polls nor finishes that successor.
+Public reentry during capacity injection refuses at admission before backend
+dispatch; it does not authorize general callback reentry. Idle checked destroy
+is available only after normal operation end clears the actual pending owner.
+Finite scalar ledger retirement cancels local READY/HELD records before return
+and never releases another publication's gate. Ordinary coordinator cleanup
+funding retains independent qualification requirements.
+
 The bounded mixed-gate receipt takes at most four non-spurious CAS attempts,
 then releases any acquired prefix in reverse order before returning. Reader
 rollback uses one atomic decrement so concurrent peer readers keep their own

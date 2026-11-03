@@ -3,8 +3,10 @@
 #include "../wirelog/exec_plan_gen.h"
 #include "../wirelog/session.h"
 #include "../wirelog/session_options.h"
+#include "../wirelog/thread.h"
 #include "../wirelog/wirelog.h"
 #include <errno.h>
+#include <inttypes.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -294,13 +296,171 @@ test_production_abort_consume(void)
 static unsigned bound_failure_mode;
 static bool bound_failure_injected;
 static bool bound_expect_lftj, bound_saw_lftj;
+static unsigned bound_turnover_mode;
+static bool bound_turned_over;
+static uint64_t bound_successor;
+static uint64_t bound_metadata_limit;
+static unsigned bound_metadata_reports, bound_metadata_factories;
+static uint64_t bound_metadata_consumed;
+static bool bound_factory_reentry;
+static bool bound_factory_turned_over;
+static unsigned bound_factory_reentries;
+static bool bound_receipt_probe, bound_receipt_short_requested;
+static unsigned bound_receipt_peer_count, bound_receipt_refusals,
+    bound_receipt_acks;
+static uint64_t bound_receipt_original;
+static wl_evaluation_control_report_t bound_turnover_report;
+
+/* Genuine earlier-head result, observed only while its actual owner is live. */
+static bool bound_earlier_head;
+static unsigned bound_earlier_candidates, bound_null_ledger_phase12;
+static wl_col_session_t *bound_observed_session;
+extern int wl_columnar_session_test_retirement_view(
+    const wl_col_session_t *, uint64_t [16]);
+extern void (*wl_columnar_session_test_retirement_checkpoint)(
+    wl_evaluation_control_t *, unsigned, unsigned, uint32_t, const col_rel_t *);
+
+static void
+bound_earlier_checkpoint(wl_evaluation_control_t *control, unsigned role,
+    unsigned action, uint32_t index, const col_rel_t *target)
+{
+    (void)control; (void)index;
+    uint64_t view[16];
+    CHECK(bound_observed_session &&
+        !wl_columnar_session_test_retirement_view(bound_observed_session,
+        view));
+    if (role == 5 && action == 8 && view[14] == 1 && target
+        && target->name && !strcmp(target->name, "first")) {
+        CHECK(target->memory_governor && target->storage_owner == target
+            && target->ncols == 2 && target->nrows == 2
+            && target->retained_reserved_bytes > 0);
+        ++bound_earlier_candidates;
+    }
+}
+
+static uint64_t
+bound_metadata_capacity(const wl_col_session_t *session,
+    wl_columnar_session_metadata_purpose_t purpose, uint64_t limit)
+{
+    CHECK(purpose == WL_COLUMNAR_SESSION_METADATA_NATIVE_ERROR &&
+        limit == 2304);
+    ++bound_metadata_factories;
+    if (bound_earlier_head) {
+        uint64_t view[16];
+        CHECK(!wl_columnar_session_test_retirement_view(session, view));
+        if (view[11] == 5 && view[14] == 12) {
+            /* Capacity is recorded even without a ledger pointer. */
+            CHECK(!(view[12] & 2u) && (view[12] & 8u));
+            ++bound_null_ledger_phase12;
+        }
+    }
+    if (bound_turnover_mode == 5 && !bound_factory_turned_over
+        && bound_metadata_limit == 2304) {
+        /* Legal control turnover inside the capacity hook cannot refresh
+         * the protected owner proved before this factory call. */
+        wl_evaluation_control_t *control = session->base.evaluation_control;
+        wl_columnar_eval_serial_framed_attempt_t *ctx = NULL;
+        CHECK(!wl_columnar_eval_stack_framed_context(session->cleanup_active,
+            (wl_col_session_t *)session, &ctx));
+        uint64_t old_id = ctx->attempt_id;
+        CHECK(!wl_evaluation_control_active_attempt_id(control)
+            && !wl_evaluation_control_reset(control)
+            && !wl_evaluation_control_begin(control,
+            session->base.operation_admission));
+        bound_successor = wl_evaluation_control_active_attempt_id(control);
+        CHECK(bound_successor && bound_successor != old_id
+            && ctx->attempt_id == old_id
+            && wl_columnar_session_test_native_error_phase(session)
+            == WL_COLUMNAR_SESSION_NATIVE_ERROR_INERT);
+        CHECK(!wl_evaluation_control_report(control, &bound_turnover_report));
+        bound_factory_turned_over = true;
+    }
+    if (bound_factory_reentry) {
+        bound_factory_reentry = false;
+        wl_session_t *base = &((wl_col_session_t *)session)->base;
+        wl_session_t *same = base;
+        wl_columnar_session_native_error_phase_t phase =
+            wl_columnar_session_test_native_error_phase(session);
+        CHECK(wl_session_step(base) == EBUSY
+            && wl_session_try_destroy(&same) == EBUSY && same == base
+            && wl_columnar_session_test_native_error_phase(session) == phase);
+        ++bound_factory_reentries;
+    }
+    return bound_metadata_limit ? bound_metadata_limit : limit;
+}
 
 static uint64_t
 bound_failure_limit(const wl_col_session_t *session,
     wl_columnar_eval_serial_framed_host_action_t action, uint64_t limit)
 {
-    (void)action;
-    if (bound_failure_injected || !session->cleanup_active) return limit;
+    if (bound_receipt_probe
+        && action == WL_COLUMNAR_EVAL_SERIAL_FRAMED_RECEIPT_ACK) {
+        const wl_columnar_eval_cleanup_receipt_t *receipt =
+            &session->cleanup_receipts[bound_receipt_peer_count];
+        CHECK(!session->cleanup_active
+            && receipt->state == WL_COLUMNAR_EVAL_CLEANUP_RECEIPT_FREED
+            && receipt->key.operation_attempt_id == bound_receipt_original);
+        if (!bound_receipt_short_requested) {
+            bound_receipt_short_requested = true;
+            return 383;
+        }
+        return 384;
+    }
+    if (!session->cleanup_active) return limit;
+    if (bound_failure_injected) {
+        if (bound_turnover_mode && !bound_turned_over) {
+            wl_columnar_eval_serial_framed_attempt_t *ctx = NULL;
+            if (!wl_columnar_eval_stack_framed_context(session->cleanup_active,
+                (wl_col_session_t *)session, &ctx)
+                && wl_columnar_eval_stack_auto_error_drain(ctx)) {
+                CHECK(wl_columnar_eval_stack_auto_cleanup_current(session));
+                CHECK(!wl_columnar_eval_stack_auto_cleanup_shape(session, ctx));
+                CHECK(!wl_columnar_eval_stack_auto_cleanup_ready(session)
+                    && wl_columnar_eval_stack_auto_cleanup_ready(NULL) ==
+                    EINVAL);
+                wl_columnar_eval_serial_framed_attempt_t copy;
+                memcpy(&copy, ctx, sizeof(copy));
+                CHECK(wl_columnar_eval_stack_auto_cleanup_shape(session,
+                    &copy) == EINVAL
+                    && wl_columnar_eval_stack_auto_cleanup_shape(NULL,
+                    ctx) == EINVAL
+                    && !wl_columnar_eval_stack_auto_cleanup_current(NULL)
+                    && !memcmp(ctx, &copy, sizeof(copy)));
+                wl_evaluation_control_t *control =
+                    session->base.evaluation_control;
+                bound_receipt_original = ctx->attempt_id;
+                int cause = bound_failure_mode == 2
+                    ? WL_EVALUATION_CONTROL_CANCELLED
+                    : WL_EVALUATION_CONTROL_WORK_LIMIT;
+                CHECK(wl_evaluation_control_active_attempt_id(control) ==
+                    ctx->attempt_id);
+                CHECK(wl_evaluation_control_finish(control,
+                    session->base.operation_admission, cause, 0) == cause);
+                wl_evaluation_control_report_t ended;
+                CHECK(!wl_evaluation_control_report(control, &ended)
+                    && ended.attempt_id == ctx->attempt_id &&
+                    ended.result == cause
+                    && !ended.cleanup_status);
+                if (bound_turnover_mode > 1 && bound_turnover_mode != 5)
+                    CHECK(!wl_evaluation_control_reset(control));
+                if (bound_turnover_mode > 2 && bound_turnover_mode != 5) {
+                    CHECK(!wl_evaluation_control_begin(control,
+                        session->base.operation_admission));
+                    bound_successor =
+                        wl_evaluation_control_active_attempt_id(control);
+                    CHECK(bound_successor &&
+                        bound_successor != ctx->attempt_id);
+                    if (bound_turnover_mode == 3)
+                        CHECK(!wl_evaluation_control_finish(control,
+                            session->base.operation_admission, 0, 0));
+                }
+                CHECK(!wl_evaluation_control_report(control,
+                    &bound_turnover_report));
+                bound_turned_over = true;
+            }
+        }
+        return limit;
+    }
     wl_columnar_eval_stack_test_auto_observation_t observation;
     CHECK(!wl_columnar_eval_stack_test_auto_observe(session->cleanup_active,
         session, &observation));
@@ -333,9 +493,18 @@ bound_failure_limit(const wl_col_session_t *session,
         if (joins != bound_failure_mode + 1) return limit;
         if (bound_expect_lftj) {
             CHECK(ctx->child.lftj.identity == &ctx->child.lftj
-                && ctx->child.lftj.phase == WL_COLUMNAR_LFTJ_ATTEMPT_DONE);
+                && ctx->child.lftj.phase == WL_COLUMNAR_LFTJ_ATTEMPT_DONE
+                && wl_columnar_eval_stack_auto_cleanup_shape(session,
+                ctx) == EINVAL
+                && wl_columnar_eval_stack_auto_cleanup_ready(session) ==
+                EINVAL);
             bound_saw_lftj = true;
-        }
+        } else CHECK(wl_columnar_eval_stack_auto_cleanup_shape(session,
+                ctx) == EINVAL
+                && wl_columnar_eval_stack_auto_cleanup_ready(session) ==
+                EINVAL);
+        /* The genuine live decision has no semantic error yet; structural
+         * observations never turn it into an authorized cleanup destination. */
         CHECK(ctx->private_bindings && ctx->private_bindings->dynamic_entries
             && observation.saved_binding == ctx->private_bindings
             && observation.saved_binding_generation ==
@@ -357,13 +526,314 @@ bound_failure_limit(const wl_col_session_t *session,
 }
 
 static void
-test_dynamic_bound_active_failure(void)
+bound_check_original(const wl_session_t *session)
 {
+    wl_evaluation_control_report_t report;
+    CHECK(!wl_evaluation_control_report(session->evaluation_control, &report));
+    CHECK(report.attempt_id == bound_turnover_report.attempt_id
+        && report.result == bound_turnover_report.result
+        && report.limit == bound_turnover_report.limit
+        && report.consumed == bound_turnover_report.consumed
+        && report.stop_reason == bound_turnover_report.stop_reason
+        && report.execution_status == bound_turnover_report.execution_status
+        && report.cleanup_status == bound_turnover_report.cleanup_status);
+    if (bound_turnover_mode == 4
+        || (bound_turnover_mode == 5 && bound_factory_turned_over)) {
+        uint64_t work;
+        CHECK(!wl_evaluation_control_test_active_consumed(
+                session->evaluation_control,
+                bound_successor, &work) && !work);
+    } else CHECK(!wl_evaluation_control_active_attempt_id(
+                session->evaluation_control));
+}
+
+static void
+bound_metadata_finished(const wl_col_session_t *session,
+    wl_columnar_eval_serial_framed_host_action_t action,
+    wl_evaluation_control_t *grant, int protocol)
+{
+    (void)session; (void)protocol;
+    if (bound_receipt_probe
+        && action == WL_COLUMNAR_EVAL_SERIAL_FRAMED_RECEIPT_ACK) {
+        wl_evaluation_control_report_t report;
+        CHECK(!wl_evaluation_control_report(grant, &report));
+        if (protocol == WL_EVALUATION_CONTROL_WORK_LIMIT) {
+            CHECK(!report.consumed);
+            ++bound_receipt_refusals;
+        } else {
+            CHECK(!protocol && report.consumed == 384);
+            ++bound_receipt_acks;
+        }
+    }
+
+}
+
+/* The engine has already finished/detached/released private metadata.
+* Only this seven-field value copy is available to instrumentation. */
+static void
+bound_metadata_report(const wl_col_session_t *session,
+    wl_columnar_session_metadata_purpose_t purpose,
+    wl_columnar_session_metadata_event_t event, int protocol,
+    wl_evaluation_control_report_t report)
+{
+    (void)session; (void)protocol;
+    CHECK(purpose == WL_COLUMNAR_SESSION_METADATA_NATIVE_ERROR
+        && report.attempt_id == 1 && !report.execution_status
+        && !report.cleanup_status);
+    CHECK(report.limit == (bound_metadata_limit ? bound_metadata_limit : 2304));
+    if (event == WL_COLUMNAR_SESSION_METADATA_SETUP_REFUSED) {
+        CHECK(report.result == WL_EVALUATION_CONTROL_WORK_LIMIT
+            && report.stop_reason == WL_EVALUATION_CONTROL_WORK_LIMIT
+            && !report.consumed && protocol == EAGAIN);
+    } else {
+        CHECK(event == WL_COLUMNAR_SESSION_METADATA_BODY_RETURNED
+            && !report.result && !report.stop_reason &&
+            report.consumed == 2304);
+    }
+    bound_metadata_consumed = report.consumed;
+    ++bound_metadata_reports;
+}
+
+typedef struct { wl_session_t *session; int result; } bound_peer_t;
+static void *
+bound_foreign_step(void *argument)
+{
+    bound_peer_t *peer = argument;
+    CHECK(!wl_columnar_eval_stack_auto_cleanup_current(
+            (wl_col_session_t *)peer->session));
+    CHECK(wl_columnar_eval_stack_auto_cleanup_ready(
+            (wl_col_session_t *)peer->session) == EBUSY);
+    peer->result = wl_session_step(peer->session);
+    return NULL;
+}
+
+static void
+bound_foreign_refusal(wl_session_t *session)
+{
+    wl_col_session_t *columnar = (wl_col_session_t *)session;
+    wl_columnar_session_native_error_phase_t phase =
+        wl_columnar_session_test_native_error_phase(columnar);
+    wl_columnar_eval_stack_cleanup_frame_t *frame = columnar->cleanup_active;
+    uint64_t bytes = columnar->cleanup_reserved_bytes;
+    bound_peer_t peer = {.session = session};
+    wl_thread_t thread;
+    CHECK(!wl_thread_create(&thread, bound_foreign_step, &peer));
+    CHECK(!wl_thread_join(&thread));
+    if (wl_columnar_session_test_native_error_phase(columnar) != phase)
+        fprintf(stderr, "foreign native cleanup result=%d phase=%u->%u\n",
+            peer.result, (unsigned)phase,
+            (unsigned)wl_columnar_session_test_native_error_phase(columnar));
+    CHECK((peer.result == EBUSY || peer.result == EINVAL)
+        && wl_columnar_session_test_native_error_phase(columnar) == phase
+        && columnar->cleanup_active == frame &&
+        columnar->cleanup_reserved_bytes == bytes);
+    CHECK(session->backend->session_controlled_step_state(session)
+        == WL_CONTROLLED_STEP_NATIVE_ERROR_CLEANUP_PENDING);
+    bound_check_original(session);
+    wl_session_t *same = session;
+    CHECK(wl_session_try_destroy(&same) == EBUSY && same == session);
+}
+
+static void
+bound_metadata_refusal(wl_session_t *session, bool factory)
+{
+    wl_col_session_t *columnar = (wl_col_session_t *)session;
+    wl_columnar_session_native_error_phase_t phase =
+        wl_columnar_session_test_native_error_phase(columnar);
+    wl_columnar_eval_stack_cleanup_frame_t *frame = columnar->cleanup_active;
+    uint64_t bytes = columnar->cleanup_reserved_bytes;
+    unsigned reports = bound_metadata_reports;
+    unsigned factories = bound_metadata_factories;
+    uint64_t restore_identity = 0;
+    if (factory) {
+        /* A real create-error branch, outside the capacity hook. No other
+         * creator runs in this quiescent fixture. The saved next identity
+         * has never been issued; restore it before any retry/cleanup. */
+        wl_evaluation_control_t *probe = NULL;
+        CHECK(!wl_evaluation_control_create(0, &probe));
+        uint64_t identity = wl_evaluation_control_identity(probe);
+        CHECK(identity && identity < UINT64_MAX - 1);
+        restore_identity = identity + 1;
+        wl_evaluation_control_release(probe);
+        CHECK(!wl_evaluation_control_test_seed_next_identity(UINT64_MAX));
+    } else bound_metadata_limit = 2303;
+    int result = wl_session_step(session);
+    if (factory)
+        CHECK(!wl_evaluation_control_test_seed_next_identity(restore_identity));
+    bound_metadata_limit = 0;
+    CHECK(result == EAGAIN && bound_metadata_factories == factories + 1);
+    if (factory) CHECK(bound_metadata_reports == reports);
+    else CHECK(bound_metadata_reports == reports + 1 &&
+            !bound_metadata_consumed);
+    CHECK(wl_columnar_session_test_native_error_phase(columnar) == phase
+        && columnar->cleanup_active == frame &&
+        columnar->cleanup_reserved_bytes == bytes
+        && session->backend->session_controlled_step_state(session)
+        == WL_CONTROLLED_STEP_NATIVE_ERROR_CLEANUP_PENDING);
+    bound_check_original(session);
+    wl_session_t *same = session;
+    CHECK(wl_session_try_destroy(&same) == EBUSY && same == session);
+    capture_t image = {0};
+    CHECK(wl_session_snapshot(session, on_tuple, &image) == EBUSY
+        && wl_session_snapshot(session, NULL, NULL) == EBUSY && !image.count);
+    const int64_t duplicate[] = {1, 10};
+    CHECK(wl_session_insert(session, "a", duplicate, 1, 2) == EBUSY);
+    CHECK(wl_session_inspection_begin(session) ==
+        WIRELOG_SOURCE_QUERY_UNSUPPORTED);
+    /* v1 refuses controlled inspection before acquiring its reservation;
+     * source_query requires that reservation and cannot be called here. */
+    wirelog_on_delta_fn callback = columnar->delta_cb;
+    void *userdata = columnar->delta_data;
+    wl_session_set_delta_cb(session, NULL, NULL);
+    CHECK(columnar->delta_cb == callback && columnar->delta_data == userdata);
+}
+
+static int
+bound_ended_drive(wl_session_t *session)
+{
+    wl_col_session_t *columnar = (wl_col_session_t *)session;
+    bool first = false, registered = false, frame_freed = false, final = false;
+    bool disposing = false;
+    for (unsigned turns = 0; turns < 100000; ++turns) {
+        if (bound_turned_over) {
+            wl_columnar_session_native_error_phase_t phase =
+                wl_columnar_session_test_native_error_phase(columnar);
+            if (!first) {
+                CHECK(phase == WL_COLUMNAR_SESSION_NATIVE_ERROR_INERT);
+                bound_foreign_refusal(session);
+                bound_metadata_refusal(session, true);
+                bound_metadata_refusal(session, false);
+                first = true;
+            } else if (!registered &&
+                phase == WL_COLUMNAR_SESSION_NATIVE_ERROR_CHILD) {
+                bound_foreign_refusal(session);
+                bound_metadata_refusal(session, false);
+                registered = true;
+            }
+            if (!frame_freed && phase == WL_COLUMNAR_SESSION_NATIVE_ERROR_CHILD
+                && !columnar->cleanup_active) {
+                bound_metadata_refusal(session, false);
+                frame_freed = true;
+            }
+            if (!disposing &&
+                phase == WL_COLUMNAR_SESSION_NATIVE_ERROR_DISPOSE) {
+                bound_metadata_refusal(session, false);
+                disposing = true;
+            }
+            if (!final && phase == WL_COLUMNAR_SESSION_NATIVE_ERROR_FINAL) {
+                CHECK(!columnar->cleanup_active && !columnar->cleanup_pending);
+                bound_metadata_refusal(session, false);
+                final = true;
+            }
+            bound_check_original(session);
+        }
+        bool metadata = bound_turned_over;
+        unsigned reports = bound_metadata_reports;
+        if (metadata) {
+            bound_metadata_limit = 2304;
+            if (bound_factory_reentries < 2) bound_factory_reentry = true;
+        }
+        int rc = wl_session_step(session);
+        bound_metadata_limit = 0;
+        if (metadata) CHECK(bound_metadata_reports == reports + 1
+                && bound_metadata_consumed == 2304);
+        if (rc == WL_EVALUATION_CONTROL_WORK_LIMIT && bound_receipt_probe
+            && bound_receipt_refusals == 1 && !bound_receipt_acks
+            && wl_columnar_session_test_native_error_phase(columnar)
+            == WL_COLUMNAR_SESSION_NATIVE_ERROR_CHILD) {
+            CHECK(session->backend->session_controlled_step_state(session)
+                == WL_CONTROLLED_STEP_NATIVE_ERROR_CLEANUP_PENDING);
+            bound_check_original(session);
+            if (!bound_receipt_peer_count && !bound_failure_mode) {
+                wl_columnar_eval_cleanup_receipt_t before, after;
+                wl_columnar_eval_cleanup_receipt_key_t key =
+                    columnar->cleanup_receipts[0].key;
+                CHECK(!wl_columnar_eval_stack_cleanup_receipt_read(columnar,
+                    &key, &before));
+                wl_columnar_eval_stack_cleanup_frame_t *nested = NULL;
+                CHECK(!wl_columnar_eval_stack_cleanup_begin(columnar,
+                    &nested));
+                bound_receipt_probe = false;
+                int refusal = wl_session_step(session);
+                bound_receipt_probe = true;
+                CHECK((refusal == EINVAL || refusal == EBUSY)
+                    && columnar->cleanup_active == nested
+                    && wl_columnar_session_test_native_error_phase(columnar)
+                    == WL_COLUMNAR_SESSION_NATIVE_ERROR_CHILD
+                    && session->backend->session_controlled_step_state(
+                        session)
+                    == WL_CONTROLLED_STEP_NATIVE_ERROR_CLEANUP_PENDING);
+                CHECK(!wl_columnar_eval_stack_cleanup_receipt_read(columnar,
+                    &key, &after) && !memcmp(&before, &after, sizeof(before)));
+                bound_check_original(session);
+                CHECK(!wl_columnar_eval_stack_cleanup_finish(&nested)
+                    && !nested && !columnar->cleanup_active);
+            }
+            continue;
+        }
+        if (rc != EAGAIN) {
+            CHECK(first && registered && frame_freed && disposing && final
+                && bound_factory_reentries == 2
+                && wl_columnar_session_test_native_error_phase(columnar)
+                == WL_COLUMNAR_SESSION_NATIVE_ERROR_DONE
+                && session->backend->session_controlled_step_state(session)
+                == WL_CONTROLLED_STEP_IDLE);
+            bound_check_original(session);
+            return rc;
+        }
+    }
+    CHECK(false);
+    return EIO;
+}
+
+/* Unrelated backend EAGAIN without an attempt must retain its old EIO
+ * disposition. This stub is only a negative framework case, no native owner. */
+static int
+bound_unrelated_yield(wl_session_t *session)
+{
+    (void)session;
+    return EAGAIN;
+}
+
+static wl_controlled_step_state_t
+bound_unrelated_idle(const wl_session_t *session)
+{
+    (void)session;
+    return WL_CONTROLLED_STEP_IDLE;
+}
+
+static void
+bound_unrelated_refusal(wl_session_t *session)
+{
+    const wl_compute_backend_t *backend = session->backend;
+    wl_compute_backend_t unrelated = *backend;
+    unrelated.session_step = bound_unrelated_yield;
+    unrelated.session_controlled_step_state = bound_unrelated_idle;
+    session->backend = &unrelated;
+    CHECK(wl_session_step(session) == EIO);
+    session->backend = backend;
+    CHECK(!wl_evaluation_control_active_attempt_id(session->evaluation_control)
+        && !((wl_col_session_t *)session)->controlled_step
+        && !((wl_col_session_t *)session)->cleanup_active);
+}
+
+static void
+test_dynamic_bound_failure(unsigned turnover)
+{
+    bound_turnover_mode = turnover;
+    bound_turned_over = false;
     bound_expect_lftj = false;
     const char *text = ".decl a(k:int64,x:int64)\n"
         ".decl b(k:int64,t:int64,y:int64)\n.decl c(t:int64,z:int64)\n"
         ".decl output(x:int64,y:int64,z:int64)\n"
         "output(x,y,z) :- a(k,x), b(k,t,y), c(t,z).\n";
+    if (bound_earlier_head)
+        text = ".decl a(k:int64,x:int64)\n"
+            ".decl b(k:int64,t:int64,y:int64)\n.decl c(t:int64,z:int64)\n"
+            ".decl first(k:int64,x:int64)\n"
+            ".decl output(x:int64,y:int64,z:int64)\n"
+            "first(k,x) :- a(k,x).\n"
+            "output(x,y,z) :- first(k,x), b(k,t,y), c(t,z).\n";
     for (unsigned mode = 0; mode < 4; ++mode) {
         wirelog_error_t error;
         wirelog_program_t *program = wirelog_parse_string(text, &error);
@@ -374,6 +844,19 @@ test_dynamic_bound_active_failure(void)
         wl_session_options_t options;
         wl_session_options_init(&options);
         options.evaluation_control = control;
+        wl_columnar_memory_governor_ref_t *governor = NULL;
+        if (bound_receipt_probe || bound_earlier_head) {
+            const wl_columnar_memory_resolution_t resolution = {
+                .budget_bytes = UINT64_C(512) << 20,
+                    .usable_bytes = UINT64_C(512) << 20,
+                    .mode = WL_COLUMNAR_MEMORY_MODE_ENFORCING,
+                    .source = WL_COLUMNAR_MEMORY_SOURCE_ENV,
+                    .status = WL_COLUMNAR_MEMORY_OK
+            };
+            governor = wl_columnar_memory_governor_ref_create(&resolution);
+            CHECK(governor);
+            options.memory_governor = governor;
+        }
         wl_session_t *session = NULL;
         CHECK(!wl_session_create_with_options(wl_backend_columnar(), plan, 1,
             &options, &session));
@@ -383,6 +866,30 @@ test_dynamic_bound_active_failure(void)
         CHECK(!wl_session_insert(session, "a", a, 2, 2));
         CHECK(!wl_session_insert(session, "b", b, 2, 3));
         CHECK(!wl_session_insert(session, "c", c, 2, 2));
+        wl_columnar_eval_cleanup_receipt_key_t peers[
+            WL_COLUMNAR_EVAL_STACK_CLEANUP_MAX_FRAMES];
+        uint64_t reserved_before = 0;
+        if (bound_receipt_probe) {
+            CHECK(bound_receipt_peer_count <
+                WL_COLUMNAR_EVAL_STACK_CLEANUP_MAX_FRAMES);
+            /* These are real prior-attempt reservations. The generated
+             * evaluation creates its own target in the next free slot. */
+            CHECK(!wl_evaluation_control_begin(control,
+                session->operation_admission));
+            uint64_t peer_attempt =
+                wl_evaluation_control_active_attempt_id(control);
+            uint64_t peer_owner = wl_evaluation_control_identity(control);
+            CHECK(peer_attempt && peer_owner);
+            for (unsigned i = 0; i < bound_receipt_peer_count; ++i)
+                CHECK(!wl_columnar_eval_stack_cleanup_receipt_reserve(
+                        (wl_col_session_t *)session, peer_attempt, peer_owner,
+                        &peers[i]));
+            CHECK(!wl_evaluation_control_finish(control,
+                session->operation_admission, 0, 0)
+                && !wl_evaluation_control_reset(control));
+            reserved_before = wl_columnar_memory_reserved(
+                wl_columnar_memory_governor_ref_get(governor));
+        }
         capture_t events = {0};
         wl_session_set_delta_cb(session, on_delta, &events);
         col_relation_snapshot_t before[3];
@@ -390,49 +897,123 @@ test_dynamic_bound_active_failure(void)
         for (unsigned i = 0; i < 3; ++i)
             before[i] = wl_columnar_relation_snapshot(
                 session_find_rel((wl_col_session_t *)session, names[i]));
+        if (turnover == 1 && !mode) bound_unrelated_refusal(session);
         bound_failure_mode = mode;
         bound_failure_injected = false;
+        bound_turned_over = false;
+        bound_successor = 0;
+        bound_metadata_reports = bound_metadata_factories = 0;
+        bound_factory_reentries = 0;
+        bound_factory_reentry = false;
+        bound_factory_turned_over = false;
+        bound_receipt_short_requested = false;
+        bound_receipt_refusals = bound_receipt_acks = 0;
         publication_heads = finish_heads = acknowledgments = 0;
         wl_columnar_session_test_framed_grant_limit = bound_failure_limit;
         wl_columnar_eval_stack_test_unary_prepared_checkpoint =
             prepared_checkpoint;
         int cause = mode == 2 ? WL_EVALUATION_CONTROL_CANCELLED
             : WL_EVALUATION_CONTROL_WORK_LIMIT;
-        CHECK(drive(session, false, NULL) == cause && bound_failure_injected);
+        if (turnover) {
+            wl_columnar_session_test_framed_grant_finished =
+                bound_metadata_finished;
+            wl_columnar_session_test_metadata_limit = bound_metadata_capacity;
+            wl_columnar_session_test_metadata_finished = bound_metadata_report;
+        }
+        bound_earlier_candidates = bound_null_ledger_phase12 = 0;
+        if (bound_earlier_head) {
+            bound_observed_session = (wl_col_session_t *)session;
+            wl_columnar_session_test_retirement_checkpoint =
+                bound_earlier_checkpoint;
+        }
+        int result = turnover ? bound_ended_drive(session) : drive(session,
+                false, NULL);
+        if (bound_earlier_head) {
+            wl_columnar_session_test_retirement_checkpoint = NULL;
+            bound_observed_session = NULL;
+            CHECK(bound_earlier_candidates && bound_null_ledger_phase12);
+            CHECK(!session_find_rel((wl_col_session_t *)session, "first"));
+        }
+        wl_columnar_session_test_framed_grant_finished = NULL;
+        wl_columnar_session_test_metadata_limit = NULL;
+        wl_columnar_session_test_metadata_finished = NULL;
+        if (result != cause)
+            fprintf(stderr,
+                "bound mode=%u turnover=%u ended=%u result=%d expected=%d\n",
+                mode, turnover, bound_turned_over, result, cause);
+        CHECK(result == cause && bound_failure_injected
+            && (!turnover || bound_turned_over)
+            && bound_factory_turned_over == (turnover == 5));
         wl_columnar_session_test_framed_grant_limit = NULL;
         wl_columnar_eval_stack_test_unary_prepared_checkpoint = NULL;
         wl_col_session_t *columnar = (wl_col_session_t *)session;
         CHECK(!events.count && !session_find_rel(columnar, "output")
             && !columnar->cleanup_active && !columnar->cleanup_pending
             && !columnar->cleanup_reserved_bytes);
+        if (bound_receipt_probe) {
+            CHECK(bound_receipt_short_requested && bound_receipt_refusals == 1
+                && bound_receipt_acks == 1
+                && wl_columnar_memory_reserved(
+                    wl_columnar_memory_governor_ref_get(governor)) ==
+                reserved_before);
+        }
         CHECK(finish_heads == (mode == 0 ? 0u : 1u));
         for (unsigned i = 0; i < 3; ++i)
             CHECK(wl_columnar_relation_snapshot_equal(before[i],
                 wl_columnar_relation_snapshot(session_find_rel(columnar,
                 names[i]))));
         wl_evaluation_control_report_t report;
-        CHECK(!wl_evaluation_control_report(control, &report)
-            && report.result == cause && !report.cleanup_status
-            && !wl_evaluation_control_active_attempt_id(control));
-        CHECK(!wl_evaluation_control_reset(control));
-        CHECK(!wl_evaluation_control_configure(control, 0));
-        CHECK(!drive(session, false, NULL));
-        const col_rel_t *output = session_find_rel(columnar, "output");
-        CHECK(output && output->nrows == 2 && output->ncols == 3
-            && output->columns[0][0] == 10 && output->columns[1][0] == 100
-            && output->columns[2][0] == 1000 && output->columns[0][1] == 20
-            && output->columns[1][1] == 200 && output->columns[2][1] == 2000
-            && events.count == 2);
+        if (turnover) {
+            bound_check_original(session);
+            if (turnover >= 4)
+                CHECK(!wl_evaluation_control_finish(control,
+                    session->operation_admission, 0, 0));
+        } else CHECK(!wl_evaluation_control_report(control, &report)
+                && report.result == cause && !report.cleanup_status
+                && !wl_evaluation_control_active_attempt_id(control));
+        if (!turnover || !(turnover % 2)) {
+            CHECK(!wl_evaluation_control_reset(control));
+            CHECK(!wl_evaluation_control_configure(control, 0));
+            CHECK(!drive(session, false, NULL));
+            const col_rel_t *output = session_find_rel(columnar, "output");
+            CHECK(output && output->nrows == 2 && output->ncols == 3
+                && output->columns[0][0] == 10 && output->columns[1][0] == 100
+                && output->columns[2][0] == 1000 && output->columns[0][1] == 20
+                && output->columns[1][1] == 200 && output->columns[2][1] == 2000
+                && events.count == 2);
+        }
+        if (bound_receipt_probe) {
+            for (unsigned i = 0; i < bound_receipt_peer_count; ++i)
+                CHECK(!wl_columnar_eval_stack_cleanup_receipt_release(columnar,
+                    &peers[i]));
+            for (unsigned i = 0; i < WL_COLUMNAR_EVAL_STACK_CLEANUP_MAX_FRAMES;
+                ++i)
+                CHECK(columnar->cleanup_receipts[i].state ==
+                    WL_COLUMNAR_EVAL_CLEANUP_RECEIPT_FREE);
+        }
         CHECK(!wl_session_try_destroy(&session));
         wl_evaluation_control_release(control);
         wl_plan_free(plan);
+        /* The program's intern table can retain its governor reservation
+         * beyond the session, so the final zero check follows this owner. */
         wirelog_program_free(program);
+        if (governor) {
+            uint64_t remaining = wl_columnar_memory_reserved(
+                wl_columnar_memory_governor_ref_get(governor));
+            if (remaining) fprintf(stderr,
+                    "receipt pool governor mode=%u peers=%u remaining=%" PRIu64
+                    "\n",
+                    mode, bound_receipt_peer_count, remaining);
+            CHECK(!remaining);
+            wl_columnar_memory_governor_ref_release(governor);
+        }
     }
 }
 
 static void
 test_dynamic_lftj_then_join_failure(void)
 {
+    bound_turnover_mode = 0;
     const char *text = ".decl a(k:int64,x:int64)\n.decl b(k:int64,y:int64)\n"
         ".decl c(k:int64,z:int64)\n.decl d(z:int64,w:int64)\n"
         ".decl output(x:int64,y:int64,w:int64)\n"
@@ -499,7 +1080,22 @@ main(void)
             for (unsigned empty = 0; empty < 2; ++empty)
                 test_generated(snapshot, observed, empty);
     test_production_abort_consume();
-    test_dynamic_bound_active_failure();
+    test_dynamic_bound_failure(0);
+    test_dynamic_bound_failure(1);
+    test_dynamic_bound_failure(2);
+    test_dynamic_bound_failure(3);
+    test_dynamic_bound_failure(4);
+    test_dynamic_bound_failure(5);
+    bound_receipt_probe = true;
+    const unsigned positions[] = {0, 15, 31};
+    for (unsigned i = 0; i < sizeof(positions) / sizeof(positions[0]); ++i) {
+        bound_receipt_peer_count = positions[i];
+        test_dynamic_bound_failure(4);
+    }
+    bound_receipt_probe = false;
+    bound_earlier_head = true;
+    test_dynamic_bound_failure(4);
+    bound_earlier_head = false;
     test_dynamic_lftj_then_join_failure();
     return 0;
 }
