@@ -623,7 +623,8 @@ static const char program_d[]
     "a(x2,x0) :- e1(x1,x0), b(x2,x1), x1 != x2.\n";
 
 /* A program on which an earlier form of the #2127 fix made a step at two
- * workers return EINVAL. */
+ * workers return EINVAL.  Its static cross-product rule for b is skipped
+ * after the first iteration; program_m63_noskip below keeps it evaluated. */
 static const char program_m63[]
     = ".decl e0(c0: int64, c1: int64, c2: int64)\n"
     ".decl e1(c0: int64, c1: int64)\n"
@@ -635,6 +636,28 @@ static const char program_m63[]
     "b(x0,x2) :- e1(x0,x0), e3(x1,x2).\n"
     "b(x0,x0) :- l0(x0,x1), a(x2,x1), !e2(x0,x1,x0).\n"
     "a(x1,x0) :- b(x0,x1), b(x1,x2), a(x3,x4), !l0(x4,x3).\n";
+
+/* m63 with one more rule for b that joins e1 as its right relation.  A
+ * relation that a rule of the same plan joins on the right is never skipped,
+ * so the static rule b(x0,x2) :- e1(x0,x0), e3(x1,x2) is evaluated at every
+ * iteration.  That shape made a step at two workers return EINVAL until
+ * #2240 was fixed.  With the m63 data the new rule derives nothing: no e1
+ * row starts at 2. */
+static const char program_m63_noskip[]
+    = ".decl e0(c0: int64, c1: int64, c2: int64)\n"
+    ".decl e1(c0: int64, c1: int64)\n"
+    ".decl e2(c0: int64, c1: int64, c2: int64)\n"
+    ".decl e3(c0: int64, c1: int64)\n"
+    ".decl a(c0: int64, c1: int64)\n"
+    ".decl b(c0: int64, c1: int64)\n"
+    ".decl l0(c0: int64, c1: int64)\n"
+    "b(x0,x2) :- e1(x0,x0), e3(x1,x2).\n"
+    "b(x0,x0) :- l0(x0,x1), a(x2,x1), !e2(x0,x1,x0).\n"
+    "a(x1,x0) :- b(x0,x1), b(x1,x2), a(x3,x4), !l0(x4,x3).\n"
+    "b(x0,x1) :- b(x0,x2), e1(x2,x1).\n";
+
+static const char m63_data[] = "e0 4 2 0; e0 0 5 4; e0 5 3 6; e1 0 1; "
+    "e1 6 6; e2 6 6 5; e3 6 2; e3 0 2";
 
 /* Two rules join the same inputs on different columns. */
 static const char program_b[]
@@ -763,10 +786,54 @@ static void
 test_step_stays_successful(void)
 {
     check_fixture("m63: a step at every worker count succeeds",
-        program_m63,
-        "e0 4 2 0; e0 0 5 4; e0 5 3 6; e1 0 1; e1 6 6; e2 6 6 5; "
-        "e3 6 2; e3 0 2",
-        "b(6,2)");
+        program_m63, m63_data, "b(6,2)");
+}
+
+/* #2240's second shape: the static rule of m63 evaluated at every
+ * iteration.  The skip count is read at one worker, where the session
+ * counts the whole evaluation; m63 itself is the control that does skip. */
+static void
+test_step_with_static_rule_evaluated(void)
+{
+    int failures = 0;
+
+    check_fixture("m63 without the skip: a step at every worker count "
+        "succeeds", program_m63_noskip, m63_data, "b(6,2)");
+    TEST("m63 without the skip: the static rule is never skipped");
+    for (int ps = PASSES_NONE; ps <= PASSES_ALL; ps++) {
+        run_t plain = run_fixture(program_m63, m63_data, (passes_t)ps, 1,
+                false);
+        run_t noskip = run_fixture(program_m63_noskip, m63_data,
+                (passes_t)ps, 1, false);
+        if (plain.rc != 0 || noskip.rc != 0 || plain.base_case_skips == 0
+            || noskip.base_case_skips != 0) {
+            printf("\n    passes=%s: rc=%d/%d skips m63=%llu noskip=%llu",
+                passes_names[ps], plain.rc, noskip.rc,
+                (unsigned long long)plain.base_case_skips,
+                (unsigned long long)noskip.base_case_skips);
+            failures++;
+        }
+    }
+    if (failures == 0)
+        PASS();
+    else
+        FAIL("the variant does not keep the static rule evaluated");
+    TEST("m63 without the skip: a step runs on two or more workers");
+    failures = 0;
+    for (size_t wi = 1; wi < WORKER_COUNTS; wi++) {
+        uint32_t active = 0;
+        int step_rc = step_width(program_m63_noskip, m63_data,
+                worker_counts[wi], &active);
+        if (step_rc != 0 || active < 2) {
+            printf("\n    W=%u: rc=%d max_active=%u", worker_counts[wi],
+                step_rc, active);
+            failures++;
+        }
+    }
+    if (failures == 0)
+        PASS();
+    else
+        FAIL("the step did not run on two or more workers");
 }
 
 /* A rule that reads only relations with no new rows is still skipped after
@@ -863,6 +930,7 @@ main(void)
     test_same_join_still_shares_cache();
     test_right_filter_guard();
     test_step_stays_successful();
+    test_step_with_static_rule_evaluated();
     test_static_rule_still_skipped();
     test_parallel_strategy_runs();
     knobs_restore();
