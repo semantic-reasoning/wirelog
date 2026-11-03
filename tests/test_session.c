@@ -17167,6 +17167,168 @@ test_worker_image_run_guard(void)
         PASS();
     }
 }
+
+/* A step that fails inside a recursive stratum's worker evaluation, before
+ * the worker merge, arms no step-completion cursor (#2328).  Input must stay
+ * open, and the next step must finish on the worker path with the same
+ * relations as a session that never failed. */
+static uint32_t recovery_worker_images;
+
+static int
+recovery_count_before_dedup(wl_col_session_t *sess, col_rel_t *r,
+    col_rel_t *image, col_rel_t *delta)
+{
+    (void)sess;
+    (void)r;
+    (void)image;
+    (void)delta;
+    wl_mutex_lock(&run_guard.mutex);
+    recovery_worker_images++;
+    wl_mutex_unlock(&run_guard.mutex);
+    return 0;
+}
+
+static int
+recovery_tuple_compare(const void *a, const void *b)
+{
+    const int64_t *x = a, *y = b;
+    for (unsigned i = 0; i < 3; i++)
+        if (x[i] != y[i])
+            return x[i] < y[i] ? -1 : 1;
+    return 0;
+}
+
+/* Collect every snapshot row as (relation tag, col0, col1), sorted. */
+static int
+recovery_collect(wl_session_t *session, tuple_collector_t *c,
+    int64_t (*out)[3], int *n)
+{
+    memset(c, 0, sizeof(*c));
+    int rc = wl_session_snapshot(session, collect_tuple, c);
+    if (rc != 0)
+        return rc;
+    if (c->count >= MAX_DELTAS)
+        return E2BIG;
+    for (int i = 0; i < c->count; i++) {
+        if (c->ncols[i] != 2)
+            return EINVAL;
+        out[i][0] = strcmp(c->relations[i], "p") == 0 ? 1
+            : strcmp(c->relations[i], "e") == 0 ? 0 : -1;
+        if (out[i][0] < 0)
+            return EINVAL;
+        out[i][1] = c->rows[i][0];
+        out[i][2] = c->rows[i][1];
+    }
+    qsort(out, (size_t)c->count, sizeof(out[0]), recovery_tuple_compare);
+    *n = c->count;
+    return 0;
+}
+
+static void
+test_worker_failure_recovery(uint32_t workers)
+{
+    static const int64_t chain[][2] = {
+        { 1, 2 }, { 2, 3 }, { 3, 4 }, { 4, 5 }, { 5, 6 }, { 6, 7 }
+    };
+    static const int64_t more[2] = { 7, 8 };
+    static tuple_collector_t collector;
+    static int64_t actual[MAX_DELTAS][3], expected[MAX_DELTAS][3];
+    const char *saved = getenv("WIRELOG_TDD_MIN_ROWS_PER_WORKER");
+    char saved_value[32] = "";
+    wl_session_t *session = NULL, *reference = NULL;
+    wl_plan_t *plan = NULL;
+    const char *failure = NULL;
+    int nactual = 0, nexpected = 0;
+
+    TEST("W>=2 worker failure before merge leaves input open and recovers");
+    if (saved)
+        snprintf(saved_value, sizeof(saved_value), "%s", saved);
+    memset(&run_guard, 0, sizeof(run_guard));
+    recovery_worker_images = 0;
+    if (wl_mutex_init(&run_guard.mutex) != 0) {
+        FAIL("recovery probe mutex");
+        return;
+    }
+#define RECOVERY_CHECK(c, m) do { if (!(c)) { failure = (m); \
+                                              goto recovery_cleanup; \
+                                  } } while (0)
+#ifdef _WIN32
+    (void)_putenv_s("WIRELOG_TDD_MIN_ROWS_PER_WORKER", "1");
+#else
+    (void)setenv("WIRELOG_TDD_MIN_ROWS_PER_WORKER", "1", 1);
+#endif
+    plan = build_plan(".decl e(x: int64, y: int64)\n"
+            ".decl p(x: int64, y: int64)\n"
+            "p(x,y) :- e(x,y).\n"
+            "p(x,w) :- p(x,y), p(y,z), p(z,w).\n");
+    RECOVERY_CHECK(plan, "recovery plan");
+    RECOVERY_CHECK(wl_session_create(wl_backend_columnar(), plan, workers,
+        &session) == 0 && wl_session_create(wl_backend_columnar(), plan,
+        workers, &reference) == 0, "recovery sessions");
+    for (size_t i = 0; i < sizeof(chain) / sizeof(chain[0]); i++)
+        RECOVERY_CHECK(wl_session_insert(session, "e", chain[i], 1, 2) == 0
+            && wl_session_insert(reference, "e", chain[i], 1, 2) == 0,
+            "recovery chain input");
+
+    wl_columnar_eval_test_before_worker_dedup = run_guard_before_dedup;
+    wl_columnar_eval_test_after_worker_dedup = run_guard_after_dedup;
+    int rc = wl_session_step(session);
+    wl_columnar_eval_test_before_worker_dedup = NULL;
+    wl_columnar_eval_test_after_worker_dedup = NULL;
+    RECOVERY_CHECK(rc == EINVAL && run_guard.forced > 0
+        && run_guard.refused == run_guard.forced && run_guard.other == 0,
+        "forced worker refusal fails the step");
+    RECOVERY_CHECK(!COL_SESSION(session)->plain_step_completion_pending
+        && !COL_SESSION(session)->plain_step_completion_active,
+        "failure before the merge arms no completion cursor");
+
+    RECOVERY_CHECK(wl_session_insert(session, "e", more, 1, 2) == 0
+        && wl_session_insert(reference, "e", more, 1, 2) == 0,
+        "insert after the failed step is accepted");
+    wl_columnar_eval_test_before_worker_dedup = recovery_count_before_dedup;
+    rc = wl_session_step(session);
+    wl_columnar_eval_test_before_worker_dedup = NULL;
+    RECOVERY_CHECK(rc == 0, "step after the failed step");
+    RECOVERY_CHECK(recovery_worker_images > 0,
+        "recovery step ran on the worker path");
+    RECOVERY_CHECK(wl_session_step(reference) == 0, "reference step");
+
+    RECOVERY_CHECK(recovery_collect(session, &collector, actual, &nactual)
+        == 0, "recovered snapshot");
+    RECOVERY_CHECK(recovery_collect(reference, &collector, expected,
+        &nexpected) == 0, "reference snapshot");
+    /* The snapshot emits p only: the 16 odd-length paths over nodes 1..8. */
+    RECOVERY_CHECK(nexpected == 16, "reference row count");
+    if (nactual != nexpected
+        || memcmp(actual, expected, (size_t)nactual * sizeof(actual[0]))) {
+        printf(" (recovered=%d reference=%d)", nactual, nexpected);
+        failure = "recovered relations differ from the reference";
+    }
+recovery_cleanup:
+    wl_columnar_eval_test_before_worker_dedup = NULL;
+    wl_columnar_eval_test_after_worker_dedup = NULL;
+    if (session)
+        wl_session_destroy(session);
+    if (reference)
+        wl_session_destroy(reference);
+    if (plan)
+        wl_plan_free(plan);
+#ifdef _WIN32
+    (void)_putenv_s("WIRELOG_TDD_MIN_ROWS_PER_WORKER",
+        saved ? saved_value : "");
+#else
+    if (saved)
+        (void)setenv("WIRELOG_TDD_MIN_ROWS_PER_WORKER", saved_value, 1);
+    else
+        (void)unsetenv("WIRELOG_TDD_MIN_ROWS_PER_WORKER");
+#endif
+    wl_mutex_destroy(&run_guard.mutex);
+    if (failure)
+        FAIL(failure);
+    else
+        PASS();
+#undef RECOVERY_CHECK
+}
 #endif
 
 int
@@ -17182,6 +17344,8 @@ main(void)
     test_plain_step_ordinary_error(true, 0);
     test_plain_step_ordinary_error(true, 1);
     test_worker_image_run_guard();
+    test_worker_failure_recovery(2);
+    test_worker_failure_recovery(8);
 #endif
 #ifdef WL_SESSION_TEST_HOOKS
     test_governed_retraction_transaction();
