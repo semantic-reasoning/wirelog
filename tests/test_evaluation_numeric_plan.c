@@ -4967,7 +4967,7 @@ test_composed_private_input_binding(void)
                 &getter_output);
             CHECK(getter_refused.protocol == EINVAL
                 && getter_refused.outcome == WL_COLUMNAR_JOIN_SETUP_INVALID
-                && !getter_output);
+                && getter_output == (const void *)&f.record);
             /* An invalid association must not latch the requested foreign
              * cancellation by probing it. Its real finish remains successful. */
             CHECK(!wl_evaluation_control_finish(stopped_foreign,
@@ -10807,7 +10807,7 @@ test_prepared_unary_authority_and_query(void)
             CHECK(wl_columnar_eval_plan_numeric_private_bindings_get(&f->record,
                 supplied_frame, supplied, supplied_control, supplied_id,
                 &bindings) == EINVAL
-                && !bindings);
+                && bindings == (const void *)p);
         }
     }
     int getter_owner = 0;
@@ -10830,8 +10830,8 @@ test_prepared_unary_authority_and_query(void)
     CHECK(!wl_evaluation_control_detach(getter_grant, &getter_owner));
     wl_evaluation_control_release(getter_grant);
     free(wrong_session);
-    /* Unproven owners cannot establish that output storage is external.
-     * They refuse without applying ordinary self-owned error normalization. */
+    /* Invalid owner tuples refuse before output normalization, including
+     * absent and nonself owners that cannot prove external output storage. */
     bindings = (const void *)p;
     CHECK(wl_columnar_eval_plan_numeric_private_bindings_get(NULL, NULL, NULL,
         NULL, 0, &bindings) == EINVAL && bindings == (const void *)p);

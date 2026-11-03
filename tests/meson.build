@@ -6795,6 +6795,17 @@ test_evaluation_serial_exe = executable(
            '-DWL_TEST_LFTJ_ADMISSION_HOOKS=1'],
   link_with: [testlib_prod_memory_hooks],
 )
+test_evaluation_join_prepared_auto_exe = executable(
+  'test_evaluation_join_prepared_auto', files('test_evaluation_join_prepared_auto.c'),
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
+  c_args: ['-DWL_SESSION_TEST_HOOKS=1', '-DWL_COLUMNAR_MEMORY_TEST_HOOKS=1'],
+  link_with: [testlib_prod_memory_hooks],
+)
+test('evaluation_join_prepared_auto_domains', test_evaluation_join_prepared_auto_exe,
+     env: ['WIRELOG_JOIN_BATCH_BYTES=', 'WIRELOG_JOIN_BATCH_STRICT='],
+     suite: ['unit', 'tsan'], timeout: 120)
+
 test('evaluation_serial', test_evaluation_serial_exe,
      suite: ['unit', 'tsan'], timeout: 120)
 # #2262: the fixtures must not inherit the bounded join knob.
