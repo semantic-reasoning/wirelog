@@ -142,7 +142,7 @@ funding_limit(const wl_col_session_t *session,
     CHECK(wl_columnar_session_controlled_batch_authorized(session, active,
         root->attempt_id, root->operation_identity));
     selected_id = root->attempt_id; selected_consumers = consumers;
-    selected_limit = short_grant ? 1151 : 1152;
+    selected_limit = short_grant ? 1791 : 1792;
     return selected_limit;
 }
 
@@ -162,10 +162,10 @@ funding_finished(const wl_col_session_t *session,
     if (short_grant) {
         CHECK(protocol == WL_EVALUATION_CONTROL_WORK_LIMIT &&
             report.result == protocol
-            && report.consumed == 768 && consumers == selected_consumers);
+            && report.consumed == 1408 && consumers == selected_consumers);
         ++refused_grants;
     } else {
-        CHECK(!protocol && !report.result && report.consumed == 1152
+        CHECK(!protocol && !report.result && report.consumed == 1792
             && consumers == selected_consumers + 1);
         ++paid_grants;
     }

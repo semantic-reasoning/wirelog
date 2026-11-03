@@ -17,6 +17,11 @@ int wl_columnar_join_pipeline_numeric_setup_step(
 int wl_columnar_join_pipeline_numeric_step(
     wl_columnar_eval_plan_numeric_attempt_t *, wl_evaluation_control_t *,
     uint64_t);
+/* Actual initialized parent activation: module256 then the existing child fee.
+ * No validated state or host loan is accepted or returned. */
+int wl_columnar_join_pipeline_numeric_step_funded(
+    wl_columnar_eval_plan_numeric_attempt_t *, wl_evaluation_control_t *,
+    uint64_t);
 int wl_columnar_join_pipeline_numeric_delta_owned(const void *,
     const wl_columnar_eval_stack_cleanup_frame_t *, bool *);
 enum {
@@ -39,9 +44,10 @@ int wl_columnar_join_pipeline_key_attempt(
 int wl_columnar_join_pipeline_probe_source_owned(const void *,
     const wl_columnar_eval_stack_cleanup_frame_t *, const wl_plan_op_t *,
     const col_rel_t *, const col_rel_t *);
-/* Exact direct consumer payment384 includes this host's dispatch; do not add
- * another1. Root and facade independently keep their existing384 fees. Other
- * ready phases admit1 plus their actual independently funded cleanup actions.
+/* Legacy child quote: consumer384 already includes its dispatch; do not add1.
+ * The funded initialized parent separately pays384+module256 before this
+ * child quote. Root and facade each retain384. Other ready children admit1
+ * plus their actual independently funded cleanup actions.
  * Bootstrap/unready setup uses numeric_setup_step after separate parent384,
  * followed by independently paid setup actions; this quote is bypassed. */
 int wl_columnar_join_pipeline_numeric_funding_work(

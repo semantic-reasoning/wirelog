@@ -2138,3 +2138,13 @@ finishes its credit and releases its governor under independent maintenance
 funding, retaining the first semantic error. The initialized pipeline and other
 remaining #2293 policy/transaction obligations keep their separate qualification
 requirements; these setup boundaries do not certify an entire containing call.
+
+Initialized controlled batch entry separately admits parent384, one checked
+module metadata256 action and the existing child1/384 fee. For consumers this
+is1024 locally or1792 through the real facade/root. A short child grant preserves
+record/context/host state and original work after640 locally paid metadata;
+consume any real pending receipt before advancing. The existing unready parent
+charge is shared once by both readiness branches, including retained-resource
+cleanup reroutes. Standalone checked APIs and source/consumer error ordering
+remain unchanged. These fixed metadata bounds do not certify the nested
+forward, consumer or cleanup helper interiors.

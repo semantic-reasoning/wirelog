@@ -1529,6 +1529,20 @@ wl_columnar_join_pipeline_test_stream_view(const void *owner,
 }
 #endif
 
+/* Scalar observation after actual host proof, private to this activation.
+ * Neither this fee nor its automatic value carries authority across returns. */
+static uint64_t
+wl_columnar_join_pipeline_phase_work(const wl_columnar_join_host_t *h,
+    int semantic_result)
+{
+    return h->phase == WL_COLUMNAR_JOIN_HOST_CONSUMER_START
+           || h->phase == WL_COLUMNAR_JOIN_HOST_CONSUMER_STEP
+           || h->phase == WL_COLUMNAR_JOIN_HOST_CONSUMER_ACK
+           || (h->exchange_active && h->consumer_live
+           && (h->phase == WL_COLUMNAR_JOIN_HOST_ABORT || semantic_result))
+        ? 384 : 1;
+}
+
 int
 wl_columnar_join_pipeline_numeric_funding_work(
     const wl_columnar_eval_plan_numeric_attempt_t *r, uint64_t *work)
@@ -1545,12 +1559,7 @@ wl_columnar_join_pipeline_numeric_funding_work(
         <= sizeof(wl_columnar_join_host_t)) return 0;
     const wl_columnar_join_host_t *h = wl_columnar_join_host_valid(r, r->frame);
     if (!h) return EINVAL;
-    if (h->phase == WL_COLUMNAR_JOIN_HOST_CONSUMER_START
-        || h->phase == WL_COLUMNAR_JOIN_HOST_CONSUMER_STEP
-        || h->phase == WL_COLUMNAR_JOIN_HOST_CONSUMER_ACK
-        || (h->exchange_active && h->consumer_live
-        && (h->phase == WL_COLUMNAR_JOIN_HOST_ABORT || r->semantic_result)))
-        *work = 384;
+    *work = wl_columnar_join_pipeline_phase_work(h, r->semantic_result);
     return 0;
 }
 
@@ -2727,6 +2736,46 @@ wl_columnar_join_pipeline_numeric_step(
             funding_id);
     if (h && r->join_host == h) h->busy = false;
     return rc;
+}
+
+/* One current metadata action owns these checks and the legacy checked
+ * wrapper/body plumbing. Nested forward/consumer/cleanup work keeps its own
+ * separate qualification; the scalar phase quote is never a proof token. */
+int
+wl_columnar_join_pipeline_numeric_step_funded(
+    wl_columnar_eval_plan_numeric_attempt_t *r,
+    wl_evaluation_control_t *funding, uint64_t funding_id)
+{
+    if (!r || r->identity != r) return EINVAL;
+    if (r->join_host_busy) return EBUSY;
+    if (!funding || funding == r->control || !funding_id) return EINVAL;
+    int rc = wl_evaluation_control_charge_attempt(funding, funding_id, 256);
+    if (rc) return rc;
+    rc = wl_columnar_eval_stack_numeric_owner(r->frame, r);
+    if (rc) return rc;
+    if (!r->composed_busy || !r->composed_mode
+        || !r->controlled_materialized_batch_fallback || r->private_bindings
+        || !r->control || !r->attempt_id
+        || r->session->cleanup_active != r->frame
+        || r->phase != WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_JOIN_BATCH
+        || !r->plan || !r->plan->ops || r->cursor < r->begin
+        || r->cursor >= r->end || r->end > r->plan->op_count
+        || !r->join_host || r->join_host_initialized_bytes
+        != sizeof(wl_columnar_join_host_t) + 1u
+        || r->plan->ops[r->cursor].op != WL_PLAN_OP_JOIN) return EINVAL;
+    const wl_columnar_join_host_t *h = r->join_host;
+    if (h->identity != h || h->parent != r
+        || h->op != &r->plan->ops[r->cursor]) return EINVAL;
+    if (h->busy) return EBUSY;
+    uint64_t work = wl_columnar_join_pipeline_phase_work(h, r->semantic_result);
+    rc = wl_evaluation_control_charge_attempt(funding, funding_id, work);
+    if (rc) return rc;
+    if (r->abort_requested
+        && wl_evaluation_control_active_attempt_id(r->control) == r->attempt_id)
+        wl_evaluation_control_request_cancel(r->control);
+    r->pending_action = r->phase;
+    r->phase = WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_PENDING;
+    return wl_columnar_join_pipeline_numeric_step(r, funding, funding_id);
 }
 
 /* The checked setup entry owns this activation. These values classify the

@@ -1631,7 +1631,9 @@ resource state, physical-pointer reuse, every zero/final phase refusal, one
 HEADER16, and marker-last. A predicate extended before session construction by
 2000 genuine numeric instructions preserves all28 literal rows and raw parity;
 classification takes more than2000 turns and adds exactly2000 original units.
-Ready consumer383/384 and facade1151/1152 checks remain. Existing governor seams
+Legacy child383/384 remains independently exercised after actual metadata;
+the complete facade boundary is updated by the initialized containing repair
+below. Existing governor seams
 finish/reset/begin either original or funding at reserve/commit: successor work
 stays zero, canonical state is drained or resumed, and both module entries
 reject actual reentry. A constructor-created local no-session/no-left-governor
@@ -1644,3 +1646,73 @@ This qualifies bootstrap/unready setup only. Ready consumer/forward/cleanup
 containing proofs, direct compatibility paths, nonselected special dispatch,
 automatic prepared publication/FINISH, cache/policy/shared-cap and general
 transaction acceptance remain required for the grouped issues.
+
+### Initialized pipeline entry metadata
+
+Every actual JOIN_BATCH call now pays parent384 after the retained full public
+proof and exact funding-role/generation guard, before the readiness split.
+This is the existing unready charge hoisted once, not a second charge. The
+public composed wrapper and its selected ordinary READY path are unchanged.
+The existing RELEASE-with-retained-resources reroute still records its first
+semantic result and enters JOIN_BATCH before this admission; it cannot lose
+parent funding by missing a wrapper-only phase selector. A refusal preserves
+that existing reroute ordering rather than pretending to restore RELEASE.
+
+The initialized destination admits one module256 action, then proves its
+actual native/module owner, active frame/session, constructor fallback/NONE
+domain, ready-size marker, bounded current JOIN and private host identity.
+Only then does a private pure predicate return the legacy child1/384 fee into
+an automatic scalar. No proof token, host loan or state persists across return.
+No callback/yield occurs before the exact child admission. The old standalone
+quote keeps its complete checks/default output behavior; the old checked
+step and body guards remain. There is no additional synthetic validation stage.
+
+On child refusal, parent/metadata fees remain paid, but record, stack/context,
+host bytes, pending tuple and original consumed work are unchanged. Once the
+child fee succeeds, the saved-ID conditional cancellation and actual PENDING
+stores precede the original checked step. Its consumer receipt reconciliation,
+first-error disposition and busy claim/release retain their order. The adapter
+does not read the host after that call can free it. Metadata proofs do not poll
+the original early or turn a funding error into a semantic stop.
+
+| Initialized entry boundary | Local total | Full facade/root total |
+|---|---:|---:|
+| Parent plus actual module metadata | 640 | 1408 |
+| Nonconsumer legacy child1 | 641 | 1409 |
+| Consumer legacy child384 | 1024 | 1792 |
+
+These are entry thresholds before any additional nested funding. Consumer
+383/384 is isolated by giving640 completed metadata plus383/384, through a real
+parent call and receipt. Complete facade1791/1792 tests replace its old
+1151/1152 entry oracle; a short call consumes1408 and performs no original work.
+The actual normal capacity2496 and recursive/general3072 remain unchanged.
+
+The independently expanded fixed module bound is231/256: preadmission
+self/busy/role checks14, actual module owner27, complete tuple28, phase
+predicate15, child-admission/cancel/PENDING12, old wrapper31/body guard27,
+fixed routing20, pending reconciliation13, semantic latch9, dispatch/call
+tails27 and return/busy-clear8. Adjacent prefunding windows are conservative
+latency bounds, not double-spendable source credit. The parent envelope remains
+380/384. Public wrapper, old checked step/body, Unit29 setup leaves and
+STACK-to-HEADER189/192 are byte-identical. There is no field, reservation,
+reader, layout or production allowance change.
+
+Constructor-driven tests apply383/639/1023 short funding before every actual
+consumer START/STEP/ACK, followed by exact1024 and consume-first. Byte snapshots
+are only compared, never operated as ownership tokens. A protected stream stack
+remains inaccessible through the unowned stack getter on refusal. Nonconsumer
+640/641 proves actual entry; source work starts only after successful admission.
+Real callbacks exercise public/old/new checked reentry; copied owners, actual
+original-as-funding, stale funding, a lawful nested frame and a foreign native
+thread preserve original work and ownership. Cancellation, sticky exhaustion
+and original finish/reset/new generation retain first errors, zero successor
+work and complete independent cleanup. Probe full-chain witnesses retain their
+literal/raw content. The funding family is also selected for TSan because it
+now includes the real foreign-thread test.
+
+This completes fixed containing entry bookkeeping only. The actual nested
+forward/consumer/cleanup helpers, their callback/source/governor/retirement
+interiors, direct compatibility and nonselected routes still need their own
+complete source qualification. Automatic publication/FINISH, cache/strict/local
+and shared-cap/general transaction acceptance remain OPEN. Neither256 nor a
+passing entry threshold certifies the unchanged helper interiors.
