@@ -5,6 +5,7 @@
 #include "../wirelog/exec_plan_gen.h"
 #include "../wirelog/session.h"
 #include "../wirelog/session_options.h"
+#include "../wirelog/thread.h"
 #include "../wirelog/wirelog.h"
 #include <errno.h>
 #include <stdarg.h>
@@ -691,8 +692,8 @@ failures(void)
     destroy(&expression);
 }
 
-/* Direct composed entry pays one384, direct framed entry pays384+384, and
- * the facade adds another384. This test isolates the first of these levels. */
+/* The actual composed consumer pays parent384+metadata256+child384.
+ * Each framed/facade layer adds its existing384. */
 static void
 funding_composed(void)
 {
@@ -739,7 +740,9 @@ funding_composed(void)
             }
             CHECK(!wl_evaluation_control_reset(grant));
             CHECK(!wl_evaluation_control_configure(grant,
-                underfund ? 383 : setup
+                underfund ? 1023 : consumer ? 1024 : setup
+                || (started && record.phase ==
+                WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_JOIN_BATCH)
                 ? WL_COLUMNAR_JOIN_PIPELINE_SETUP_MAX_WORK : 384));
             CHECK(!wl_evaluation_control_begin(grant, &owners[slot]));
             uint64_t id = wl_evaluation_control_active_attempt_id(grant);
@@ -811,8 +814,8 @@ funding_composed(void)
             (void)wl_evaluation_control_finish(grant, &owners[slot], 0, 0);
             wl_evaluation_control_report_t report;
             CHECK(!wl_evaluation_control_report(grant, &report));
-            if (underfund) CHECK(!report.consumed);
-            else if (consumer) CHECK(report.consumed == 384);
+            if (underfund) CHECK(report.consumed == 640);
+            else if (consumer) CHECK(report.consumed == 1024);
         }
         CHECK(setup_counted && paid > 64 && refusals == (trial ? paid : 0));
         if (trial == 2) CHECK(setup_turns > 2000);
@@ -897,10 +900,11 @@ setup_original_work(setup_fixture_t *s)
 }
 
 static void
-setup_begin(setup_fixture_t *s)
+setup_begin_limit(setup_fixture_t *s, uint64_t limit)
 {
     memset(s, 0, sizeof(*s));
     init(&s->fixture, 0, true, 2);
+    CHECK(!wl_evaluation_control_configure(s->fixture.control, limit));
     CHECK(!wl_evaluation_control_begin(s->fixture.control,
         s->fixture.session->operation_admission));
     s->original = wl_evaluation_control_active_attempt_id(s->fixture.control);
@@ -922,6 +926,12 @@ setup_begin(setup_fixture_t *s)
     }
     CHECK(!s->record.join_host && !s->record.private_bindings
         && s->record.controlled_materialized_batch_fallback);
+}
+
+static void
+setup_begin(setup_fixture_t *s)
+{
+    setup_begin_limit(s, 0);
 }
 
 static void
@@ -1048,6 +1058,8 @@ setup_governor_checkpoint(wl_evaluation_control_t *control,
         s->grant, s->grant_id) == EBUSY);
     CHECK(wl_columnar_join_pipeline_numeric_step(&s->record,
         s->grant, s->grant_id) == EBUSY);
+    CHECK(wl_columnar_join_pipeline_numeric_step_funded(&s->record,
+        s->grant, s->grant_id) == EBUSY);
     wl_evaluation_control_t *changed = setup_turnover_funding
         ? s->grant : control;
     const void *owner = setup_turnover_funding ? (const void *)&s->grant_owner
@@ -1107,8 +1119,204 @@ funding_setup_turnover(void)
         }
 }
 
+static void
+metadata_ready(setup_fixture_t *s)
+{
+    size_t bytes = wl_columnar_join_pipeline_numeric_host_size();
+    for (unsigned turns = 0; !s->record.join_host
+        || s->record.join_host_initialized_bytes <= bytes; ++turns) {
+        CHECK(turns < 1000 && !setup_turn(s, 0));
+    }
+    setup_consume(s);
+}
+
+static void
+metadata_refusal(setup_fixture_t *s, uint64_t limit, uint64_t paid)
+{
+    wl_columnar_eval_plan_numeric_attempt_t record = s->record;
+    eval_stack_t *stack = wl_columnar_eval_stack_cleanup_stack(s->frame);
+    eval_stack_t before = {0};
+    if (stack) before = *stack;
+    size_t bytes = wl_columnar_join_pipeline_numeric_host_size();
+    unsigned char *host = malloc(bytes);
+    CHECK(host);
+    /* Byte snapshots are only compared, never operated as ownership tokens. */
+    memcpy(host, s->record.join_host, bytes);
+    uint64_t original = setup_original_work(s);
+    CHECK(setup_turn(s, limit) == WL_EVALUATION_CONTROL_WORK_LIMIT
+        && s->consumed == paid
+        && !memcmp(&record, &s->record, sizeof(record))
+        && wl_columnar_eval_stack_cleanup_stack(s->frame) == stack
+        && (!stack || !memcmp(&before, stack, sizeof(before)))
+        && !memcmp(host, s->record.join_host, bytes)
+        && setup_original_work(s) == original);
+    free(host);
+}
+
+static setup_fixture_t *metadata_fixture;
+static unsigned metadata_starts, metadata_steps, metadata_acks;
+
+static void
+metadata_checkpoint(wl_evaluation_control_t *control, unsigned event,
+    uint64_t generation, uint32_t extent, uint64_t producer_work)
+{
+    (void)generation; (void)extent; (void)producer_work;
+    setup_fixture_t *s = metadata_fixture;
+    CHECK(s && control == s->fixture.control);
+    if (event != WL_COLUMNAR_JOIN_PIPELINE_TEST_CONSUMER) return;
+    wl_columnar_filter_context_t *context = NULL;
+    CHECK(!wl_columnar_eval_stack_filter_context_owned(s->frame, &context,
+        &s->record));
+    if (context->stage == WL_COLUMNAR_FILTER_STAGE_INERT) ++metadata_starts;
+    else if (context->stage == WL_COLUMNAR_FILTER_STAGE_DONE) ++metadata_acks;
+    else ++metadata_steps;
+    uint64_t original = setup_original_work(s);
+    int owner;
+    wl_evaluation_control_t *grant = NULL;
+    CHECK(!wl_evaluation_control_create(256, &grant)
+        && !wl_evaluation_control_attach(grant, &owner)
+        && !wl_evaluation_control_begin(grant, &owner));
+    uint64_t id = wl_evaluation_control_active_attempt_id(grant);
+    CHECK(wl_columnar_eval_plan_numeric_composed_attempt_step(&s->record,
+        grant, id) == EBUSY);
+    CHECK(wl_columnar_join_pipeline_numeric_step(&s->record, grant, id)
+        == EBUSY);
+    /* The new checked entry accepts JOIN_BATCH, never its pending receipt. */
+    CHECK(wl_columnar_join_pipeline_numeric_step_funded(&s->record, grant, id)
+        == EINVAL && setup_original_work(s) == original);
+    CHECK(!wl_evaluation_control_finish(grant, &owner, 0, 0));
+    wl_evaluation_control_report_t report;
+    CHECK(!wl_evaluation_control_report(grant, &report)
+        && report.consumed == 256);
+    CHECK(!wl_evaluation_control_detach(grant, &owner));
+    wl_evaluation_control_release(grant);
+}
+
+static void
+funding_metadata(void)
+{
+    setup_fixture_t s; setup_begin(&s); metadata_ready(&s);
+    metadata_refusal(&s, 383, 0);
+    metadata_refusal(&s, 639, 384);
+    metadata_refusal(&s, 640, 640);
+    uint64_t original = setup_original_work(&s);
+    CHECK(!setup_turn(&s, 641) && s.consumed == 641
+        && setup_original_work(&s) > original);
+    setup_consume(&s);
+    metadata_fixture = &s;
+    metadata_starts = metadata_steps = metadata_acks = 0;
+    wl_columnar_join_pipeline_test_numeric_checkpoint = metadata_checkpoint;
+    unsigned consumers = 0;
+    for (unsigned turns = 0; s.record.phase !=
+        WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_DONE; ++turns) {
+        CHECK(turns < 100000);
+        uint64_t work = 0;
+        bool consumer = s.record.phase ==
+            WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_JOIN_BATCH
+            && !wl_columnar_join_pipeline_numeric_funding_work(&s.record,
+                &work) && work == 384;
+        if (!consumer) {
+            CHECK(!setup_turn(&s, 0)); continue;
+        }
+        metadata_refusal(&s, 383, 0);
+        metadata_refusal(&s, 639, 384);
+        /* Exactly640 paid metadata precedes the isolated383/384 child fee. */
+        metadata_refusal(&s, 1023, 640);
+        CHECK(!setup_turn(&s, 1024) && s.consumed == 1024);
+        setup_consume(&s);
+        ++consumers;
+    }
+    wl_columnar_join_pipeline_test_numeric_checkpoint = NULL;
+    metadata_fixture = NULL;
+    CHECK(consumers > 64 && metadata_starts > 1 && metadata_steps
+        && metadata_acks == metadata_starts);
+    setup_close_result(&s, 0);
+}
+
+static void *
+metadata_foreign_thread(void *argument)
+{
+    setup_fixture_t *s = argument;
+    int owner;
+    wl_evaluation_control_t *grant = NULL;
+    CHECK(!wl_evaluation_control_create(0, &grant)
+        && !wl_evaluation_control_attach(grant, &owner)
+        && !wl_evaluation_control_begin(grant, &owner));
+    CHECK(wl_columnar_eval_plan_numeric_composed_attempt_step(&s->record,
+        grant, wl_evaluation_control_active_attempt_id(grant)) == EINVAL);
+    CHECK(!wl_evaluation_control_finish(grant, &owner, 0, 0));
+    wl_evaluation_control_report_t report;
+    CHECK(!wl_evaluation_control_report(grant, &report) && !report.consumed);
+    CHECK(!wl_evaluation_control_detach(grant, &owner));
+    wl_evaluation_control_release(grant);
+    return NULL;
+}
+
+static void
+funding_metadata_authority(void)
+{
+    setup_fixture_t s; setup_begin(&s); metadata_ready(&s);
+    uint64_t original = setup_original_work(&s);
+    wl_columnar_eval_plan_numeric_attempt_t record = s.record, copy = s.record;
+    setup_grant_begin(&s, 0);
+    CHECK(wl_columnar_join_pipeline_numeric_step_funded(&copy, s.grant,
+        s.grant_id) == EINVAL);
+    CHECK(wl_columnar_join_pipeline_numeric_step_funded(&s.record,
+        s.fixture.control, s.original) == EINVAL);
+    CHECK(wl_columnar_eval_plan_numeric_composed_attempt_step(&s.record,
+        s.fixture.control, s.original) == EINVAL);
+    CHECK(wl_columnar_eval_plan_numeric_composed_attempt_step(&s.record,
+        s.grant, s.grant_id + 1u) == EINVAL);
+    setup_grant_end(&s); CHECK(!s.consumed);
+    setup_grant_begin(&s, 0);
+    uint64_t stale = s.grant_id;
+    CHECK(!wl_evaluation_control_finish(s.grant, &s.grant_owner, 0, 0)
+        && !wl_evaluation_control_reset(s.grant)
+        && !wl_evaluation_control_begin(s.grant, &s.grant_owner));
+    CHECK(wl_columnar_join_pipeline_numeric_step_funded(&s.record, s.grant,
+        stale) == EINVAL);
+    CHECK(wl_columnar_eval_plan_numeric_composed_attempt_step(&s.record,
+        s.grant, stale) == EINVAL);
+    setup_grant_end(&s); CHECK(!s.consumed);
+    wl_columnar_eval_stack_cleanup_frame_t *nested = NULL;
+    CHECK(!wl_columnar_eval_stack_cleanup_begin(
+            (wl_col_session_t *)s.fixture.session, &nested));
+    CHECK(setup_turn(&s, 0) == EBUSY && !s.consumed);
+    CHECK(!wl_columnar_eval_stack_cleanup_finish(&nested));
+    wl_thread_t thread;
+    CHECK(!wl_thread_create(&thread, metadata_foreign_thread, &s)
+        && !wl_thread_join(&thread));
+    CHECK(!memcmp(&record, &s.record, sizeof(record))
+        && setup_original_work(&s) == original);
+    setup_close_result(&s, 0);
+    for (unsigned stop = 0; stop < 3; ++stop) {
+        setup_begin_limit(&s, UINT64_C(1000000000)); metadata_ready(&s);
+        int result = stop == 0 ? WL_EVALUATION_CONTROL_CANCELLED
+            : stop == 1 ? WL_EVALUATION_CONTROL_WORK_LIMIT : EINVAL;
+        uint64_t successor = 0;
+        if (stop == 0) wl_evaluation_control_request_cancel(s.fixture.control);
+        else if (stop == 1) CHECK(wl_evaluation_control_charge(
+                    s.fixture.control, UINT64_MAX) == result);
+        else {
+            const void *owner = s.fixture.session->operation_admission;
+            CHECK(!wl_evaluation_control_finish(s.fixture.control, owner, 0, 0)
+                && !wl_evaluation_control_reset(s.fixture.control)
+                && !wl_evaluation_control_begin(s.fixture.control, owner));
+            successor =
+                wl_evaluation_control_active_attempt_id(s.fixture.control);
+        }
+        CHECK(!setup_turn(&s, 641) && s.consumed == 641);
+        if (successor) {
+            uint64_t work;
+            CHECK(!wl_evaluation_control_test_active_consumed(s.fixture.control,
+                successor, &work) && !work);
+        }
+        setup_close_result(&s, result);
+    }
+}
+
 static uint64_t selected_limit;
-static uint64_t selected_original;
+static uint64_t selected_original, selected_original_work;
 static unsigned selected_hits, public_refusals, public_paid;
 static bool short_public;
 
@@ -1132,8 +1340,10 @@ public_grant_limit(const wl_col_session_t *session,
     CHECK(wl_columnar_session_controlled_batch_authorized(session,
         active->control, ctx->attempt_id, ctx->operation_identity));
     selected_original = ctx->attempt_id;
+    CHECK(!wl_evaluation_control_test_active_consumed(active->control,
+        selected_original, &selected_original_work));
     selected_hits = hits[WL_COLUMNAR_JOIN_PIPELINE_TEST_CONSUMER];
-    selected_limit = short_public ? 1151 : 1152;
+    selected_limit = short_public ? 1791 : 1792;
     return selected_limit;
 }
 
@@ -1151,13 +1361,17 @@ public_grant_finished(const wl_col_session_t *session,
         && report.limit == selected_limit && !report.execution_status);
     CHECK(wl_evaluation_control_active_attempt_id(active->control) ==
         selected_original);
-    if (selected_limit == 1151) {
+    if (selected_limit == 1791) {
         CHECK(protocol == WL_EVALUATION_CONTROL_WORK_LIMIT
-            && report.result == protocol && report.consumed == 768
+            && report.result == protocol && report.consumed == 1408
             && hits[WL_COLUMNAR_JOIN_PIPELINE_TEST_CONSUMER] == selected_hits);
+        uint64_t original_work;
+        CHECK(!wl_evaluation_control_test_active_consumed(active->control,
+            selected_original, &original_work)
+            && original_work == selected_original_work);
         ++public_refusals;
     } else {
-        CHECK(!protocol && !report.result && report.consumed == 1152
+        CHECK(!protocol && !report.result && report.consumed == 1792
             && hits[WL_COLUMNAR_JOIN_PIPELINE_TEST_CONSUMER] ==
             selected_hits + 1);
         ++public_paid;
@@ -1166,7 +1380,8 @@ public_grant_finished(const wl_col_session_t *session,
 }
 
 /* Real classifier, facade/root dispatch, and exact previous receipt delivery.
- * Finished reports prove full facade1152 and its nested root's remaining768;
+ * Finished reports prove full facade1792, including640 of checked metadata
+ * before the isolated child383/384 refusal/success;
  * no active consumed sample or standalone root capability is fabricated. */
 static void
 funding_public(void)
@@ -1213,6 +1428,7 @@ static void
 funding(void)
 {
     funding_setup(); funding_setup_turnover();
+    funding_metadata(); funding_metadata_authority();
     funding_composed(); funding_public();
 }
 

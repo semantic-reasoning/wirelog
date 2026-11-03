@@ -3080,29 +3080,17 @@ wl_columnar_eval_plan_numeric_composed_attempt_step_validated_body(
         if (!funding || funding == record->control || !funding_id
             || wl_evaluation_control_active_attempt_id(funding) != funding_id)
             return EINVAL;
+        rc = wl_evaluation_control_charge_attempt(funding, funding_id,
+                WL_COLUMNAR_EVAL_PLAN_NUMERIC_HOST_WORK);
+        if (rc) return rc;
         if (!record->join_host || record->join_host_initialized_bytes
             <= wl_columnar_join_pipeline_numeric_host_size()) {
-            rc = wl_evaluation_control_charge_attempt(funding, funding_id,
-                    WL_COLUMNAR_EVAL_PLAN_NUMERIC_HOST_WORK);
-            if (rc) return rc;
             record->pending_action = record->phase;
             record->phase = WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_PENDING;
             return wl_columnar_join_pipeline_numeric_setup_step(record,
                        funding, funding_id);
         }
-        uint64_t host_work = 0;
-        rc = wl_columnar_join_pipeline_numeric_funding_work(record, &host_work);
-        if (rc) return rc;
-        rc = wl_evaluation_control_charge_attempt(funding, funding_id,
-                host_work);
-        if (rc) return rc;
-        if (record->abort_requested
-            && wl_evaluation_control_active_attempt_id(record->control)
-            == record->attempt_id)
-            wl_evaluation_control_request_cancel(record->control);
-        record->pending_action = record->phase;
-        record->phase = WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_PENDING;
-        return wl_columnar_join_pipeline_numeric_step(record, funding,
+        return wl_columnar_join_pipeline_numeric_step_funded(record, funding,
                    funding_id);
     }
     bool empty_child = false;
