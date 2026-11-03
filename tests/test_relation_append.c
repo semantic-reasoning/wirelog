@@ -83,6 +83,49 @@ test_float_bit_semantics(void)
         tests_failed == before ? "PASS" : "FAIL");
 }
 
+/* Side-compound intern IDs and legacy integer producers share a physical
+ * lane with declared symbols. Join admission accepts these pairs, so equality
+ * and hashing must agree without accepting float encodings as integer IDs. */
+static void
+test_integer_family_keys(void)
+{
+    wirelog_column_type_t types[] = {
+        WIRELOG_TYPE_INT32, WIRELOG_TYPE_INT64, WIRELOG_TYPE_UINT32,
+        WIRELOG_TYPE_UINT64, WIRELOG_TYPE_STRING, WIRELOG_TYPE_BOOL
+    };
+    wirelog_column_type_t floating = WIRELOG_TYPE_FLOAT;
+    col_rel_t float_rel = { .column_types = &floating };
+    const int64_t values[] = { 0, 1, 107, INT64_MAX, INT64_MIN };
+    for (unsigned i = 0; i <= sizeof(types) / sizeof(types[0]); i++) {
+        col_rel_t left = { .column_types = i < sizeof(types) / sizeof(types[0])
+                ? &types[i] : NULL };
+        for (unsigned j = 0; j <= sizeof(types) / sizeof(types[0]); j++) {
+            col_rel_t right = { .column_types = j <
+                                    sizeof(types) / sizeof(types[0])
+                    ? &types[j] : NULL };
+            for (unsigned k = 0; k < sizeof(values) / sizeof(values[0]); k++) {
+                int64_t value = values[k];
+                check_bits(wl_columnar_value_equal(&left, 0, value,
+                    &right, 0, value), "equal integer-family keys differ");
+                check_bits(!wl_columnar_value_equal(&left, 0, value,
+                    &right, 0, value ^ 1),
+                    "different integer-family keys match");
+                check_bits(wl_columnar_hash_value(2166136261u, &left, 0, value)
+                    == wl_columnar_hash_value(2166136261u, &right, 0, value),
+                    "equal integer-family keys hash differently");
+            }
+        }
+        check_bits(!wl_columnar_value_equal(&left, 0, 0, &float_rel, 0, 0)
+            && !wl_columnar_value_equal(&float_rel, 0, 0, &left, 0, 0),
+            "float zero matched an integer-family zero");
+    }
+    check_bits(wl_columnar_value_equal(&float_rel, 0, INT64_MIN,
+        &float_rel, 0, 0), "float signed zeros differ");
+    check_bits(wl_columnar_hash_value(2166136261u, &float_rel, 0, INT64_MIN)
+        == wl_columnar_hash_value(2166136261u, &float_rel, 0, 0),
+        "float signed zeros hash differently");
+}
+
 static void
 test_float_write_boundaries(void)
 {
@@ -254,6 +297,7 @@ int
 main(void)
 {
     printf("=== col_rel_append_all overflow tests (Issue #1200) ===\n");
+    test_integer_family_keys();
     test_float_bit_semantics();
     test_float_write_boundaries();
     test_float_storage_validation();

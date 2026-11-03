@@ -5762,6 +5762,15 @@ test_wirelog_advanced_exe = executable(
 
 test('wirelog_advanced', test_wirelog_advanced_exe)
 
+# Issue #2324: symbol guards derived from int64 side-compound lanes.
+test_session_window_guard_reuse_exe = executable(
+  'test_session_window_guard_reuse', files('test_session_window_guard_reuse.c'),
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  link_with: wirelog_lib,
+)
+test('session_window_guard_reuse', test_session_window_guard_reuse_exe,
+  suite: ['unit', 'tsan'])
+
 # Issue #2321: non-evaluating host source inspection.
 test_source_inspection_exe = executable(
   'test_source_inspection',
