@@ -2062,6 +2062,11 @@ tdd_worker_dedup_append(col_rel_t *image, col_rel_t *delta, uint32_t start,
     int64_t *rbuf = image->ncols <= 8 ? row_buf : image->row_scratch;
     uint32_t keep = start;
     col_rel_append_batch_t batch = { 0 };
+    /* Prepare may copy run metadata that covers only the canonical prefix
+     * (#2240).  Hash-set dedup does not use runs and reorders the tail, so
+     * the image leaves here without any, as commit requires. */
+    image->run_count = 0;
+    memset(image->run_ends, 0, sizeof(image->run_ends));
     int rc = col_rel_append_batch_begin(&batch, delta);
     for (uint32_t i = start; i < image->nrows && rc == 0; i++) {
         uint64_t h = WL_COLUMNAR_EVAL_DEDUP_ROW_HASH(image, i);
@@ -2560,6 +2565,18 @@ tdd_worker_subpass_fn(void *arg)
                 image->sorted_nrows = keep;
                 wl_columnar_relation_touch_view(image);
             }
+        } else if (rc2 == 0 && image->run_count > 0
+            && image->run_ends[image->run_count - 1] != snap[ri]) {
+            /* The consolidation below treats [0, snap) as the run-covered
+             * prefix.  Rows there outside every run would be folded into one
+             * run that is not sorted and could be re-emitted as new (#2240),
+             * so refuse instead of publishing a relation with duplicates. */
+            WL_LOG(WL_LOG_SEC_EVAL, WL_LOG_ERROR,
+                "worker image of '%s': runs end at row %u but the pass "
+                "started at row %u; refusing to consolidate",
+                r->name ? r->name : "?",
+                image->run_ends[image->run_count - 1], snap[ri]);
+            rc2 = EINVAL;
         } else if (rc2 == 0) {
             int fast_flag = 0;
             rc2 = col_op_consolidate_incremental_delta(image, snap[ri],

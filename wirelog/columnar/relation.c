@@ -18981,12 +18981,20 @@ col_rel_deep_copy_governed_impl(const col_rel_t *src, col_rel_t **out,
             }
             previous_end = end;
         }
-        if (src->run_count > 0 && previous_end != src->nrows)
+        /* A mutable image keeps runs that cover only a canonical prefix:
+         * its source may carry an appended, not-yet-consolidated tail
+         * (#2240).  Dropping them would make the worker's consolidation
+         * treat the whole prefix as one sorted run, which it is not when
+         * the prefix holds interleaved runs. */
+        if (src->run_count > 0 && previous_end != src->nrows
+            && !mutable_image)
             run_metadata_valid = false;
     }
     if (run_metadata_valid) {
         dst->run_count = src->run_count;
         memcpy(dst->run_ends, src->run_ends, sizeof(dst->run_ends));
+        if (src->run_count > 0 && dst->sorted_nrows > previous_end)
+            dst->sorted_nrows = previous_end;
     } else {
         dst->run_count = 0;
         memset(dst->run_ends, 0, sizeof(dst->run_ends));
@@ -19148,8 +19156,10 @@ col_rel_mutable_image_validate(const col_rel_t *r, bool source,
         end = r->run_ends[i];
     }
     /* A published source may have an appended, not-yet-consolidated tail;
-     * its run metadata then covers only the canonical prefix.  A private
-     * replacement image must describe every row. */
+     * its run metadata then covers only the canonical prefix.  Prepare
+     * copies that metadata into the private image (#2240), and the worker's
+     * consolidation or dedup settles it, so a replacement image must
+     * describe every row by the time it is committed. */
     return r->run_count && (source ? end > r->nrows : end != r->nrows)
         ? EINVAL : 0;
 }
