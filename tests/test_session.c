@@ -10899,7 +10899,26 @@ test_outbound_head_growth_refused(uint32_t workers, bool owner)
     GROWTH_CHECK(wl_session_insert(session, "input", values, input_rows,
         2) == 0, "growth input");
     wl_columnar_eval_test_outbound_head_growth = outbound_grow_head;
+    /* The audit records the refusal only with the stratum profile on; the
+     * value set before is restored after the snapshot. */
+    const char *old_profile = getenv("WIRELOG_TDD_STRATUM_PROFILE");
+    char *saved_profile = old_profile ? strdup(old_profile) : NULL;
+#ifdef _WIN32
+    (void)_putenv_s("WIRELOG_TDD_STRATUM_PROFILE", "1");
+#else
+    (void)setenv("WIRELOG_TDD_STRATUM_PROFILE", "1", 1);
+#endif
     int rc = wl_session_snapshot(session, collect_tuple, &tuples);
+#ifdef _WIN32
+    (void)_putenv_s("WIRELOG_TDD_STRATUM_PROFILE",
+        saved_profile ? saved_profile : "");
+#else
+    if (saved_profile)
+        (void)setenv("WIRELOG_TDD_STRATUM_PROFILE", saved_profile, 1);
+    else
+        (void)unsetenv("WIRELOG_TDD_STRATUM_PROFILE");
+#endif
+    free(saved_profile);
     wl_columnar_eval_test_outbound_head_growth = NULL;
     wl_col_session_t *coord = COL_SESSION(session);
     GROWTH_CHECK(atomic_load_explicit(&outbound_growth_workers,
@@ -10909,6 +10928,9 @@ test_outbound_head_growth_refused(uint32_t workers, bool owner)
         memory_order_relaxed) != 0) == owner, "the intended mode ran");
     GROWTH_CHECK(rc == EPROTO, "head growth fails the stratum with EPROTO");
     GROWTH_CHECK(tuples.count == 0, "no tuple is delivered");
+    GROWTH_CHECK(COL_SESSION(session)->tdd_audit.refusal
+        && strcmp(COL_SESSION(session)->tdd_audit.refusal,
+        "outbound_growth") == 0, "the audit names the refusal");
     GROWTH_CHECK(coord->tdd_workers_count == 0 && coord->tdd_channel == NULL
         && coord->mem_channel_side_bytes == 0,
         "workers and the channel are torn down after the refusal");

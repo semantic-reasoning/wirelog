@@ -694,11 +694,20 @@ tdd_channel_cancel_rc(wl_tdd_channel_t *ch)
 int (*wl_columnar_eval_test_before_pump)(wl_tdd_channel_t *ch);
 #endif
 
-/* One pump, preceded by the test hook while the round is not cancelled. */
+/* One pump, preceded while the round is not cancelled by the stop poll and
+ * the test hook. */
 static wl_tdd_pump_result_t
-tdd_collect_pump(wl_tdd_channel_t *ch, bool cancelled, wl_tdd_batch_t **out,
-    int *err)
+tdd_collect_pump(wl_tdd_channel_t *ch, bool cancelled,
+    const wl_tdd_stop_t *stop, wl_tdd_batch_t **out, int *err)
 {
+    if (!cancelled && stop && stop->fn) {
+        int stop_rc = stop->fn(stop->ctx);
+        if (stop_rc != 0) {
+            *out = NULL;
+            *err = stop_rc;
+            return WL_TDD_PUMP_ERROR;
+        }
+    }
 #ifdef WL_SESSION_TEST_HOOKS
     if (!cancelled && wl_columnar_eval_test_before_pump) {
         int hook_rc = wl_columnar_eval_test_before_pump(ch);
@@ -708,8 +717,6 @@ tdd_collect_pump(wl_tdd_channel_t *ch, bool cancelled, wl_tdd_batch_t **out,
             return WL_TDD_PUMP_ERROR;
         }
     }
-#else
-    (void)cancelled;
 #endif
     return wl_tdd_channel_pump(ch, out, err);
 }
@@ -718,7 +725,7 @@ int
 wl_columnar_eval_tdd_channel_collect(wl_tdd_channel_t *ch,
     wl_mem_ledger_t *ledger, wl_tdd_batch_t **lists, uint32_t nworkers,
     uint32_t nrels, wl_tdd_batch_t **discard, uint64_t *rows,
-    const wl_tdd_hold_t *hold)
+    const wl_tdd_hold_t *hold, const wl_tdd_stop_t *stop)
 {
     if (!ch || !lists || nworkers == 0 || !discard
         || (hold && (!hold->coord || !hold->stats)))
@@ -732,8 +739,8 @@ wl_columnar_eval_tdd_channel_collect(wl_tdd_channel_t *ch,
     for (;;) {
         wl_tdd_batch_t *batch = NULL;
         int err = 0;
-        wl_tdd_pump_result_t result = tdd_collect_pump(ch, cancelled, &batch,
-                &err);
+        wl_tdd_pump_result_t result = tdd_collect_pump(ch, cancelled, stop,
+                &batch, &err);
         if (result == WL_TDD_PUMP_COMPLETE) {
             /* An orphan reclaimed on a lane that returned 0 leaves its
              * EPROTO on the channel; a completed round must report it. */
@@ -1111,6 +1118,8 @@ wl_columnar_eval_tdd_channel_stage_relation(wl_col_session_t *coord,
             staged);
     if (peak > stats->stage_peak_bytes)
         stats->stage_peak_bytes = peak;
+    if (peak > stats->stratum_stage_peak_bytes)
+        stats->stratum_stage_peak_bytes = peak;
     if (staged > stats->max_stage_bytes)
         stats->max_stage_bytes = staged;
 #ifdef WL_SESSION_TEST_HOOKS

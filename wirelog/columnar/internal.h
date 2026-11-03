@@ -2604,6 +2604,27 @@ typedef struct wl_col_session_t {
         uint64_t worker_delta_rows;
         const char *replay;
         int replay_rc;
+        /* The stratum's TDD channel (#1373): rounds whose channel was
+         * cancelled, the first error it recorded (kept when a worker's
+         * error outranks it as the round's rc), descriptors reclaimed
+         * from closed lanes, and reservations refused because their
+         * descriptor belonged to another round. */
+        uint64_t channel_cancelled;
+        int channel_rc;
+        uint64_t orphan_reclaims;
+        uint64_t rejected;
+        /* The stratum's consumer counts (see wl_tdd_consumer_stats_t):
+         * batches spilled, cap passes that ended over the held cap,
+         * stagings that ended over it, and the stratum's
+         * stage_peak_bytes. */
+        uint64_t consumer_spills;
+        uint64_t held_over_cap;
+        uint64_t stage_over_cap;
+        uint64_t stage_peak_bytes;
+        /* The reason the worker whose error failed a round gave, when it
+         * gave one: "outbound_growth" for an outbound frame's head growth
+         * (EPROTO). */
+        const char *refusal;
     } tdd_audit;
     /* Phase 4: tracks which relation was just inserted via
      * col_session_insert_incremental, so a step with a delta callback can
@@ -6289,6 +6310,7 @@ typedef struct col_eval_tdd_worker_ctx {
     col_rel_t **delta_rels;        /* OUT: produced deltas [nrels], coord frees */
     uint64_t runtime_ns;           /* OUT: worker sub-pass wall runtime */
     int rc;                        /* OUT: return code                */
+    const char *refusal;           /* OUT: why rc was set, or NULL     */
 } col_eval_tdd_worker_ctx_t;
 
 /* Release the coordinator's TDD channel and its side buffers.  Every batch

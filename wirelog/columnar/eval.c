@@ -367,6 +367,31 @@ wl_columnar_eval_tdd_channel_cancel_for_teardown(wl_col_session_t *sess)
 }
 
 /*
+ * The evaluation stop the consumer polls before each pump, until it has
+ * cancelled the channel (#1373): the stop the attached evaluation
+ * control's charge(0) reports, WL_EVALUATION_CONTROL_CANCELLED or
+ * WL_EVALUATION_CONTROL_WORK_LIMIT.  Any other result, such as the
+ * control's sticky accounting EOVERFLOW, is not a stop and does not end the
+ * round; a global-read round would otherwise read that EOVERFLOW as its
+ * own overflow and replay serially.  The control reports a latched
+ * accounting error ahead of any stop, so once one is latched the poll
+ * finds no stop.  Without an active attempt nothing stops the round.
+ * col_eval_stratum_tdd() returns ENOTSUP under an evaluation control, so
+ * on today's paths this finds none and returns 0.
+ */
+static int
+tdd_round_stop(void *ctx)
+{
+    wl_col_session_t *coord = ctx;
+    wl_evaluation_control_t *control = coord->base.evaluation_control;
+    if (!control || wl_evaluation_control_active_attempt_id(control) == 0)
+        return 0;
+    int rc = wl_evaluation_control_charge(control, 0);
+    return rc == WL_EVALUATION_CONTROL_CANCELLED
+           || rc == WL_EVALUATION_CONTROL_WORK_LIMIT ? rc : 0;
+}
+
+/*
  * The error of a joined round (#1373): the first worker rc, in worker
  * order, that is neither 0 nor ECANCELED; otherwise the channel's error;
  * otherwise the consumer's; otherwise ECANCELED when a worker saw the
@@ -388,6 +413,45 @@ tdd_round_select_rc(const col_eval_tdd_worker_ctx_t *ctxs, uint32_t W,
     if (consumer_rc != 0)
         return consumer_rc;
     return cancelled ? ECANCELED : 0;
+}
+
+/* The refusal reason of the worker whose rc tdd_round_select_rc() picks
+ * first, or NULL when that worker gave none or no worker failed. */
+static const char *
+tdd_round_refusal(const col_eval_tdd_worker_ctx_t *ctxs, uint32_t W)
+{
+    for (uint32_t w = 0; w < W; w++)
+        if (ctxs[w].rc != 0 && ctxs[w].rc != ECANCELED)
+            return ctxs[w].refusal;
+    return NULL;
+}
+
+/*
+ * Record the stratum's channel and consumer counts in its audit (#1373),
+ * while the channel still exists.  @base is the consumer statistics when
+ * the stratum began, which the snapshot's earlier strata have added to.
+ */
+static void
+tdd_audit_channel(wl_col_session_t *coord,
+    const wl_tdd_consumer_stats_t *base)
+{
+    if (!coord->tdd_audit.enabled)
+        return;
+    if (coord->tdd_channel) {
+        wl_tdd_channel_stats_t st;
+        wl_tdd_channel_stats(coord->tdd_channel, &st);
+        coord->tdd_audit.channel_cancelled = st.cancelled_rounds;
+        coord->tdd_audit.channel_rc = st.first_channel_rc;
+        coord->tdd_audit.orphan_reclaims = st.orphan_reclaims;
+        coord->tdd_audit.rejected = st.rejected_epoch;
+    }
+    const wl_tdd_consumer_stats_t *c = &coord->tdd_consumer;
+    coord->tdd_audit.consumer_spills
+        = c->consumer_spills - base->consumer_spills;
+    coord->tdd_audit.held_over_cap = c->held_over_cap - base->held_over_cap;
+    coord->tdd_audit.stage_over_cap
+        = c->stage_over_cap - base->stage_over_cap;
+    coord->tdd_audit.stage_peak_bytes = c->stratum_stage_peak_bytes;
 }
 
 #ifdef WL_TEST_ALLOC_WRAP
@@ -2780,6 +2844,7 @@ tdd_worker_subpass_fn(void *arg)
          * (#1373). */
         if (ctx->outbound_only) {
             ctx->rc = EPROTO;
+            ctx->refusal = "outbound_growth";
             free(snap);
             TDD_WORKER_RETURN();
         }
@@ -7383,6 +7448,9 @@ col_eval_stratum_tdd_recursive(const wl_plan_stratum_t *sp,
         return EOVERFLOW;
     int rc = 0;
     uint64_t tdd_total_t0 = now_ns();
+    /* The stratum's own consumer counts start here, for its audit. */
+    coord->tdd_consumer.stratum_stage_peak_bytes = 0;
+    const wl_tdd_consumer_stats_t consumer_base = coord->tdd_consumer;
 
     col_eval_tdd_worker_ctx_t *ctxs = NULL;
 
@@ -7928,6 +7996,7 @@ col_eval_stratum_tdd_recursive(const wl_plan_stratum_t *sp,
                     || global_read_mode;
                 ctxs[w].runtime_ns = 0;
                 ctxs[w].rc = 0;
+                ctxs[w].refusal = NULL;
             }
 #if defined(WL_TEST_BDX_SEED) || defined(WL_SESSION_TEST_HOOKS)
             if (wl_columnar_eval_test_subpass_boundary)
@@ -8007,10 +8076,11 @@ col_eval_stratum_tdd_recursive(const wl_plan_stratum_t *sp,
                  * consumer spills while the producers run. */
                 const wl_tdd_hold_t hold = { coord, held_cap,
                                              &coord->tdd_consumer };
+                const wl_tdd_stop_t stop = { tdd_round_stop, coord };
                 consumer_rc = wl_columnar_eval_tdd_channel_collect(
                     coord->tdd_channel, &coord->mem_ledger,
                     coord->tdd_channel_lists, W, nrels,
-                    &coord->tdd_channel_discard, &delivered, &hold);
+                    &coord->tdd_channel_discard, &delivered, &hold, &stop);
                 /* Collect ends the round before it returns, with two
                  * exceptions: invalid arguments, which this cancel covers,
                  * and a second pump error after collect has cancelled the
@@ -8079,6 +8149,9 @@ col_eval_stratum_tdd_recursive(const wl_plan_stratum_t *sp,
              * nothing, so its status is not recorded either. */
             rc = tdd_round_select_rc(ctxs, W,
                     tdd_channel_error(coord->tdd_channel), consumer_rc);
+            if (coord->tdd_audit.enabled && rc != 0
+                && !coord->tdd_audit.refusal)
+                coord->tdd_audit.refusal = tdd_round_refusal(ctxs, W);
             for (uint32_t w = 0; w < W; w++) {
                 wl_col_session_t *worker = ctxs[w].worker_sess;
                 if (ctxs[w].rc != ECANCELED) {
@@ -8271,6 +8344,7 @@ col_eval_stratum_tdd_recursive(const wl_plan_stratum_t *sp,
     coord->eval_stratum_iteration_capped = iter == iteration_limit;
 
 done:
+    tdd_audit_channel(coord, &consumer_base);
     /* An owner lifetime record owns the channel's batches and the slot
      * matrix across a refused checked destroy: its retry captures what the
      * channel still holds, queued, on the discard list or on a consumer

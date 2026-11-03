@@ -19,6 +19,7 @@
 #include "../wirelog/backend.h"
 #include "../wirelog/columnar/eval_tdd_channel.h"
 #include "../wirelog/columnar/internal.h"
+#include "../wirelog/evaluation_control.h"
 #include "../wirelog/session.h"
 #include "../wirelog/thread.h"
 
@@ -1014,6 +1015,126 @@ test_refusal_sink(void)
 }
 
 /* ------------------------------------------------------------------ */
+/* An evaluation stop reaches a producer blocked for space             */
+/* ------------------------------------------------------------------ */
+
+typedef struct {
+    wl_tdd_channel_t *ch;
+    wl_columnar_memory_governor_ref_t *g;
+    int first_rc;  /* the first batch's reserve */
+    int second_rc; /* the reserve that waits for space */
+} stop_producer_t;
+
+/* Lane 0: publish one batch, which fills the channel, then wait for space
+ * for a second; close the lane with what that reserve returned. */
+static void *
+stop_producer_main(void *arg)
+{
+    stop_producer_t *p = arg;
+    const int64_t v[4] = { 1, 2, 3, 4 };
+    const col_delta_timestamp_t s[4] = { ts(1, 4, 0, 1), ts(1, 4, 0, 1),
+                                         ts(1, 4, 0, 1), ts(1, 4, 0, 1) };
+    col_rel_t *r = make_rel(p->g, "stop", v, s, 4);
+    wl_tdd_batch_t *batch = NULL;
+    CHECK(wl_tdd_channel_batch_new(p->ch, 0, 0, &producer_owner, &batch)
+        == 0);
+    p->first_rc = wl_tdd_channel_reserve(p->ch, batch,
+            col_rel_transport_bytes(r));
+    CHECK(p->first_rc == 0);
+    wl_tdd_channel_publish(p->ch, batch, r, r->nrows);
+    col_rel_t *again = make_rel(p->g, "stop", v, s, 4);
+    wl_tdd_batch_t *second = NULL;
+    CHECK(wl_tdd_channel_batch_new(p->ch, 0, 0, &producer_owner, &second)
+        == 0);
+    p->second_rc = wl_tdd_channel_reserve(p->ch, second,
+            col_rel_transport_bytes(again));
+    wl_tdd_channel_batch_abandon(p->ch, second);
+    CHECK(col_rel_destroy_checked(again) == 0);
+    wl_tdd_channel_close_lane(p->ch, 0, p->second_rc);
+    return NULL;
+}
+
+static bool
+space_waiter_pred(const wl_tdd_channel_stats_t *s, void *ctx)
+{
+    (void)ctx;
+    return s->space_waiters >= 1;
+}
+
+typedef struct {
+    wl_tdd_channel_t *ch;
+    unsigned polls;
+    int waited;
+} stop_poll_t;
+
+/* The stop poll: once the producer waits for space, report a stop. */
+static int
+stop_once_blocked(void *ctx)
+{
+    stop_poll_t *poll = ctx;
+    poll->polls++;
+    poll->waited = wl_tdd_channel_test_wait(poll->ch, space_waiter_pred,
+            NULL, 10000u);
+    return poll->waited == 0 ? WL_EVALUATION_CONTROL_CANCELLED : 0;
+}
+
+/* A stop polled before a pump cancels the round, and the cancel releases a
+ * producer that waits for space: the consumer has taken nothing yet, so
+ * nothing else would free any. */
+static void
+test_collect_stop(void)
+{
+    wl_columnar_memory_governor_ref_t *g = governor(UINT64_C(1) << 26);
+    /* Room for one four-row batch only. */
+    const int64_t v[4] = { 1, 2, 3, 4 };
+    const col_delta_timestamp_t s[4] = { ts(1, 4, 0, 1), ts(1, 4, 0, 1),
+                                         ts(1, 4, 0, 1), ts(1, 4, 0, 1) };
+    col_rel_t *probe = make_rel(g, "probe", v, s, 4);
+    uint64_t cap = col_rel_transport_bytes(probe);
+    CHECK(col_rel_destroy_checked(probe) == 0);
+    wl_tdd_channel_t *ch = wl_tdd_channel_create(1, cap,
+            wl_columnar_memory_governor_ref_get(g), &consumer_owner);
+    CHECK(ch && wl_tdd_channel_begin_round(ch, 4, 1) == 0);
+    stop_producer_t p = { ch, g, -1, -1 };
+    wl_thread_t thread;
+    CHECK(wl_thread_create(&thread, stop_producer_main, &p) == 0);
+
+    wl_tdd_batch_t *lists[1] = { NULL };
+    wl_tdd_batch_t *discard = NULL;
+    uint64_t rows = 0;
+    stop_poll_t poll = { ch, 0, -1 };
+    const wl_tdd_stop_t stop = { stop_once_blocked, &poll };
+    int rc = wl_columnar_eval_tdd_channel_collect(ch, NULL, lists, 1, 1,
+            &discard, &rows, NULL, &stop);
+    wl_thread_join(&thread);
+    /* Polled once: the cancel ends the polling. */
+    CHECK(poll.waited == 0 && poll.polls == 1);
+    CHECK(rc == WL_EVALUATION_CONTROL_CANCELLED);
+    CHECK(p.first_rc == 0 && p.second_rc == ECANCELED);
+    /* The published batch was taken in discard mode, before the lane
+     * closed, or is still queued. */
+    CHECK(lists[0] == NULL && rows == 0);
+    wl_tdd_channel_stats_t st;
+    wl_tdd_channel_stats(ch, &st);
+    CHECK(st.cancelled && st.channel_rc == WL_EVALUATION_CONTROL_CANCELLED);
+    CHECK(st.cancelled_rounds == 1
+        && st.first_channel_rc == WL_EVALUATION_CONTROL_CANCELLED);
+    CHECK(st.queued_batches + (discard ? 1u : 0u) == 1);
+    CHECK(!discard || !discard->next);
+
+    sink_log_t log;
+    memset(&log, 0, sizeof(log));
+    wl_tdd_refusal_sink_t sink = { record_refusal, &log };
+    wl_columnar_eval_tdd_discard_list(ch, &discard, &sink);
+    wl_tdd_discard_ctx_t dctx = { ch, sink, NULL };
+    wl_tdd_channel_discard_all(ch, wl_columnar_eval_tdd_discard_sink, &dctx);
+    CHECK(log.count == 0 && retired_count(ch) == 1);
+    CHECK(wl_tdd_channel_destroy(ch) == 0);
+    CHECK(reserved(g) == 0);
+    wl_columnar_memory_governor_ref_release(g);
+}
+
+/* ------------------------------------------------------------------ */
 /* Held cap: consumer spill as batches are taken                       */
 /* ------------------------------------------------------------------ */
 
@@ -1183,7 +1304,7 @@ test_collect_hold(void)
     memset(&stats, 0, sizeof(stats));
     const wl_tdd_hold_t policy = { coord, 0, &stats };
     CHECK(wl_columnar_eval_tdd_channel_collect(ch, NULL, lists, 2, 2,
-        &discard, &rows, &policy) == 0);
+        &discard, &rows, &policy, NULL) == 0);
     CHECK(rows == 9 && !discard);
     CHECK(lists[0] && lists[1] && !lists[2] && lists[3]);
     for (uint32_t i = 0; i < 4; i++)
@@ -1221,7 +1342,7 @@ test_collect_hold(void)
     wl_tdd_channel_close_lane(ch, 0, 0);
     wl_tdd_channel_close_lane(ch, 1, 0);
     CHECK(wl_columnar_eval_tdd_channel_collect(ch, NULL, lists, 2, 2,
-        &discard, &rows, NULL) == 0);
+        &discard, &rows, NULL, NULL) == 0);
     CHECK(lists[2] && lists[2]->kind == WL_TDD_BATCH_RESIDENT);
     wl_columnar_eval_tdd_channel_discard_lists(ch, lists, 4, &sink);
     CHECK(log.count == 0 && retired_count(ch) == 4);
@@ -1581,6 +1702,7 @@ static const test_case_t tests[] = {
     { "collect_hold", test_collect_hold },
     { "coalesce_schema_template", test_coalesce_schema_template },
     { "stage_relation", test_stage_relation },
+    { "collect_stop", test_collect_stop },
 };
 
 static void

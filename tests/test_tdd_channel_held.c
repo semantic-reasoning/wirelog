@@ -211,6 +211,16 @@ typedef struct {
     uint64_t mixed_rounds;    /* rounds that ended with mixed lists */
     uint64_t open_spills;     /* pumps that saw a spill with a lane open */
     const char *replay;       /* the stratum's replay, "none" without one */
+    /* The audit of the last stratum the run evaluated. */
+    uint64_t audit_cancelled;
+    int audit_channel_rc;
+    uint64_t audit_orphans;
+    uint64_t audit_rejected;
+    uint64_t audit_spills;
+    uint64_t audit_held_over_cap;
+    uint64_t audit_stage_over_cap;
+    uint64_t audit_stage_peak;
+    const char *audit_refusal;
 } run_info_t;
 
 /* The coordinator of the run in progress, for pump_hook(). */
@@ -463,6 +473,15 @@ note_run(wl_session_t *session, run_info_t *info)
     info->strategy = coord->tdd_audit.strategy;
     info->selected = coord->tdd_audit.selected_workers;
     info->replay = coord->tdd_audit.replay;
+    info->audit_cancelled = coord->tdd_audit.channel_cancelled;
+    info->audit_channel_rc = coord->tdd_audit.channel_rc;
+    info->audit_orphans = coord->tdd_audit.orphan_reclaims;
+    info->audit_rejected = coord->tdd_audit.rejected;
+    info->audit_spills = coord->tdd_audit.consumer_spills;
+    info->audit_held_over_cap = coord->tdd_audit.held_over_cap;
+    info->audit_stage_over_cap = coord->tdd_audit.stage_over_cap;
+    info->audit_stage_peak = coord->tdd_audit.stage_peak_bytes;
+    info->audit_refusal = coord->tdd_audit.refusal;
     info->consumer = coord->tdd_consumer;
     info->spill_store = coord->spill_store != NULL;
     info->pumps = pump_count;
@@ -818,6 +837,35 @@ check_held_bound(const char *name, uint32_t workers,
         (unsigned long long)c->held_cap);
 }
 
+/*
+ * After a successful run whose last stratum is its only TDD stratum, that
+ * stratum's audit repeats the consumer counts, which start at 0 for each
+ * snapshot, and records no cancel, channel error, orphan, rejected
+ * reservation or refusal.
+ */
+static void
+check_audit(const char *name, uint32_t workers, const run_info_t *info)
+{
+    const wl_tdd_consumer_stats_t *c = &info->consumer;
+    CHECK(info->audit_spills == c->consumer_spills
+        && info->audit_held_over_cap == c->held_over_cap
+        && info->audit_stage_over_cap == c->stage_over_cap
+        && info->audit_stage_peak == c->stage_peak_bytes,
+        "%s W=%u: audit spills=%llu over_cap=%llu stage_over_cap=%llu "
+        "stage_peak=%llu", name, workers,
+        (unsigned long long)info->audit_spills,
+        (unsigned long long)info->audit_held_over_cap,
+        (unsigned long long)info->audit_stage_over_cap,
+        (unsigned long long)info->audit_stage_peak);
+    CHECK(info->audit_cancelled == 0 && info->audit_channel_rc == 0
+        && info->audit_orphans == 0 && info->audit_rejected == 0
+        && !info->audit_refusal,
+        "%s W=%u: audit cancelled=%llu channel_rc=%d refusal=%s", name,
+        workers, (unsigned long long)info->audit_cancelled,
+        info->audit_channel_rc,
+        info->audit_refusal ? info->audit_refusal : "(none)");
+}
+
 /* A numeric run with the held cap at 1 byte: every batch is spilled as
  * it is taken, so no pump sees a held byte, and read back when it is
  * staged. */
@@ -869,6 +917,7 @@ check_spill_run(const char *name, const char *want_strategy,
         (unsigned long long)c->held_over_cap,
         (unsigned long long)c->max_held_bytes);
     check_held_bound(name, workers, c);
+    check_audit(name, workers, info);
     CHECK(!dup, "%s W=%u: duplicate rows", name, workers);
     CHECK(same_set(got, serial), "%s W=%u: %zu rows, serial has %zu", name,
         workers, got->count, serial->count);
@@ -1103,9 +1152,72 @@ test_string_over_cap(void)
             "strings W=%u: max_held %llu not over the cap", workers,
             (unsigned long long)c->max_held_bytes);
         check_held_bound("strings", workers, c);
+        check_audit("strings", workers, &info);
         CHECK(!dup, "strings W=%u: duplicate rows", workers);
         CHECK(same_set(&got, &serial), "strings W=%u: %zu rows, serial %zu",
             workers, got.count, serial.count);
+        free(got.rows);
+    }
+    free(serial.rows);
+}
+
+/*
+ * A snapshot with two recursive TDD strata: tc over the DAG, then u, which
+ * joins tc with step edges tc does not hold, so u's one round publishes
+ * nothing and stages nothing.  Under a 1-byte held cap tc's batches spill.
+ * The audit of u, the last stratum, must count only u's own spills and
+ * staging peak, which are 0, while the snapshot's consumer counts include
+ * tc's.
+ */
+static void
+test_audit_per_stratum(void)
+{
+    static const run_config_t cfg = { "1", false, true };
+    static const program_t p = { "two-strata",
+                                 ".decl step(x: int32, y: int32)\n"
+                                 ".decl u(x: int32, y: int32)\n"
+                                 "tc(x, z) :- tc(x, y), edge(y, z).\n"
+                                 "u(x, y) :- step(x, y), tc(x, y).\n"
+                                 "u(x, z) :- u(x, y), step(y, z).\n"
+                                 "step(100, 101).\nstep(101, 102).\n",
+                                 "owner" };
+    collect_t serial = { 0 };
+    run_info_t info;
+    memset(&info, 0, sizeof(info));
+    int rc = run_program(&p, false, 1, NULL, &serial, &info);
+    CHECK(rc == 0 && serial.count > 0, "two strata: serial rc=%d rows=%zu",
+        rc, serial.count);
+    (void)sort_has_duplicate(&serial);
+    for (size_t wi = 0; wi < sizeof(widths) / sizeof(widths[0]); wi++) {
+        uint32_t workers = widths[wi];
+        collect_t got = { 0 };
+        memset(&info, 0, sizeof(info));
+        rc = run_program(&p, false, workers, &cfg, &got, &info);
+        const wl_tdd_consumer_stats_t *c = &info.consumer;
+        bool dup = sort_has_duplicate(&got);
+        fprintf(stderr, "  two strata W=%u: strategy=%s selected=%u "
+            "spills=%llu/%llu stage_peak=%llu/%llu rows=%zu/%zu\n", workers,
+            info.strategy ? info.strategy : "(none)", info.selected,
+            (unsigned long long)info.audit_spills,
+            (unsigned long long)c->consumer_spills,
+            (unsigned long long)info.audit_stage_peak,
+            (unsigned long long)c->stage_peak_bytes, got.count, serial.count);
+        CHECK(rc == 0, "two strata W=%u: rc=%d", workers, rc);
+        CHECK(info.strategy && strcmp(info.strategy, "owner") == 0
+            && info.selected == workers,
+            "two strata W=%u: last stratum strategy %s on %u workers",
+            workers, info.strategy ? info.strategy : "(none)", info.selected);
+        CHECK(info.audit_spills == 0 && c->consumer_spills > 0,
+            "two strata W=%u: audit spills %llu of %llu", workers,
+            (unsigned long long)info.audit_spills,
+            (unsigned long long)c->consumer_spills);
+        CHECK(info.audit_stage_peak == 0 && c->stage_peak_bytes > 0,
+            "two strata W=%u: audit stage peak %llu of %llu", workers,
+            (unsigned long long)info.audit_stage_peak,
+            (unsigned long long)c->stage_peak_bytes);
+        CHECK(!dup && same_set(&got, &serial),
+            "two strata W=%u: %zu rows, serial %zu", workers, got.count,
+            serial.count);
         free(got.rows);
     }
     free(serial.rows);
@@ -1454,6 +1566,7 @@ test_stage_bound(void)
                 p->name, workers, (unsigned long long)c->stage_over_cap);
             check_stage_bound(p->name, workers, c);
             check_held_bound(p->name, workers, c);
+            check_audit(p->name, workers, &info);
             /* The exchanges create the deltas they install under the
              * governor, except the shared views a broadcast installs next
              * to the one relation it builds; owner mode's deltas are the
@@ -1564,6 +1677,7 @@ test_stage_adopted(void)
             CHECK(c->stage_adopted > 0, "adopted %s W=%u: nothing adopted",
                 kind, workers);
             check_stage_bound(kind, workers, c);
+            check_audit(kind, workers, &info);
             CHECK(c->owner_private_at_commit == 0,
                 "adopted %s W=%u: %llu private slots reached the commit", kind,
                 workers, (unsigned long long)c->owner_private_at_commit);
@@ -1695,6 +1809,7 @@ static const test_case_t tests[] = {
     { "spill_then_fail", test_spill_then_fail },
     { "aligned_spill", test_aligned_spill },
     { "string_over_cap", test_string_over_cap },
+    { "audit_per_stratum", test_audit_per_stratum },
     { "held_cap_defaults", test_held_cap_defaults },
     { "injected_floor", test_injected_floor },
     { "stage_bound", test_stage_bound },

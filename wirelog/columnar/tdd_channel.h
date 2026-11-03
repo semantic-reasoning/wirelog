@@ -115,6 +115,11 @@ typedef struct {
     bool cancelled;
     bool consumer_waiting;
     int channel_rc;
+    /* Over the channel's life, unlike cancelled and channel_rc, which
+     * describe the current round: the rounds a cancel took effect in, and
+     * the first error the channel recorded. */
+    uint64_t cancelled_rounds;
+    int first_channel_rc;
 } wl_tdd_channel_stats_t;
 
 /*
