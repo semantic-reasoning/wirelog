@@ -8339,12 +8339,10 @@ test_lftj_schema_continuations(void)
                                         ? wl_columnar_float_to_bits(r ? 2.5 :
                                     1.5) : (r ? 20 : 10)));
                     } else {
-                        /* Equality also checks exact STRING versus INT64
-                         * types. Domain3 supplies the matching default-INT64
-                         * right canary for the same STRING-code LFTJ output. */
-                        uint32_t rows = empty ? 0 : context == 3
-                            ? (domain == 2 ? 2 : 0)
-                            : domain == 2 && context <= 2 ? 0 : 2;
+                        /* Non-FLOAT lanes compare their int64 key encoding.
+                         * STRING IDs therefore match default-INT64 LFTJ
+                         * output; domain3 retains the integer right canary. */
+                        uint32_t rows = empty ? 0 : context == 3 ? 0 : 2;
                         CHECK(actual->items[0].rel->nrows == rows);
                     }
                     if (context == 5) {
