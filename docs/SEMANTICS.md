@@ -2149,6 +2149,53 @@ cleanup reroutes. Standalone checked APIs and source/consumer error ordering
 remain unchanged. These fixed metadata bounds do not certify the nested
 forward, consumer or cleanup helper interiors.
 
+### Ended-original native transaction cleanup
+
+A genuine observed EVALUATE transaction can retain a native JOIN error after
+its original attempt is finished, reset or superseded. Public STEP preserves
+operation admission while that old owner is being drained. Unrelated inactive
+EAGAIN retains its existing EIO disposition. Every native turn proves the
+canonical session, transaction, frame, child binding and retained error history;
+a foreign thread cannot advance these owners.
+
+After this proof, a fresh private metadata control admits2304 work before
+registration or mutation. Its pointer and identity never escape into the old
+operation, session or test callbacks. Each admitted metadata action consumes2304;
+a2303 grant refuses before body work and consumes zero. The private control is
+finished, checked, detached and released before its value-only report hook.
+The original and any successor retain their reports and consumption. Actual
+child ABORT and receipt ACK retain separate384 funding and their383 refusal
+boundary; metadata allowance cannot fund those actions.
+
+The initial turn registers cleanup. Later turns drain the child and real pending
+receipt, dispose private transaction owners and free the transaction. A distinct
+FINAL turn clears operation metadata without revisiting freed storage. The old
+semantic error is returned when those owners are inert. Ordinary active
+transaction dispatch and its raw scalar phase12 fee are unchanged by this path.
+
+| Native source region | Fixed source upper bound | Admission |
+|---|---:|---:|
+| Complete native dispatcher action, including positive ledger branch |2176|2304|
+| Metadata factory failure |449|512|
+| Short metadata allowance |499|512|
+| Registered foreign refusal |346|512|
+| Unselected legal native probe |227|256|
+
+These source-operation bounds apply to the checked private call tree, not elapsed
+time or ordinary transaction coordination. Finite scalar ledger retirement admits
+caller metadata128, prepare109, initial/apply/release166 and one gate round28
+separately. A failed round cancels its local prepared record before return;
+a real peer keeps its held gate. Freshly funded retry refunds recorded debt once.
+
+Tests distinguish governed earlier-head native disposal from a separate raw
+JOIN-owned ledger fixture. Current native result constructors leave the ledger
+pointer NULL even when scalar preparation records nonzero physical capacity.
+The raw fixture reaches actual positive-ledger retirement, exercises each short
+admission and held-peer retry, and drains physical/governor owners. Neither
+fixture seeds scalar phases, ledger pointers or ownership tokens. Consumer
+accounting, ordinary publication/FINISH and configured policy/cap intersections
+remain required work in the containing #2297/#2298 bundle.
+
 ### Cleanup construction during consumer dispatch
 
 Plain, controlled and receipted cleanup constructors reject an active stream dispatch with `EBUSY` after their existing argument validation. The refusal precedes allocation, work debit and receipt output normalization, preserving the active frame and receipt counters. Between dispatches, a parked stream still permits nested cleanup; the caller must finish the nested frame before resuming its parent.

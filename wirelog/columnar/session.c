@@ -395,6 +395,25 @@ struct wl_columnar_controlled_step {
     uint32_t staging_slot;
     size_t staging_byte;
     bool staging_ready, staging_done, staging_tail_prepaid;
+    /* Durable cleanup obligation, registered before native child evidence is
+     * released. These are borrowed identities, never additional owners. */
+    wl_columnar_session_native_error_phase_t native_error_phase;
+    wl_columnar_session_observed_transaction_t *native_error_transaction;
+    wl_evaluation_control_t *native_error_control;
+    uint64_t native_error_control_identity, native_error_operation_id;
+    uint64_t native_error_operation_identity, native_error_generation;
+    const wl_plan_relation_t *native_error_plan;
+    const wl_columnar_eval_private_dynamic_binding_t *native_error_entries;
+    uint32_t native_error_head, native_error_count;
+    int native_error_result;
+    bool native_error_busy, native_error_thread_valid;
+#if defined(WL_HAVE_C11_THREADS)
+    thrd_t native_error_thread;
+#elif defined(_WIN32) || defined(_WIN64)
+    DWORD native_error_thread;
+#else
+    pthread_t native_error_thread;
+#endif
 };
 
 static bool
@@ -581,6 +600,11 @@ uint64_t (*wl_columnar_session_test_framed_grant_limit)(
 void (*wl_columnar_session_test_framed_grant_finished)(
     const wl_col_session_t *, wl_columnar_eval_serial_framed_host_action_t,
     wl_evaluation_control_t *, int);
+uint64_t (*wl_columnar_session_test_metadata_limit)(
+    const wl_col_session_t *, wl_columnar_session_metadata_purpose_t, uint64_t);
+void (*wl_columnar_session_test_metadata_finished)(
+    const wl_col_session_t *, wl_columnar_session_metadata_purpose_t,
+    wl_columnar_session_metadata_event_t, int, wl_evaluation_control_report_t);
 int wl_columnar_session_test_exhaust_after_relation;
 unsigned wl_columnar_session_test_preflight_quantum = 64;
 void (*wl_columnar_session_test_recursive_step_checkpoint)(
@@ -8360,6 +8384,72 @@ col_controlled_step_grant_release(wl_columnar_controlled_step_t *step,
     *grant = NULL;
 }
 
+enum {
+    WL_COLUMNAR_SESSION_NATIVE_ERROR_METADATA_WORK = 2304
+};
+
+/* Only the synchronous owner wrapper borrows the fresh metadata control.
+ * Capacity callbacks precede creation; body/child callbacks never see it. */
+static int
+wl_columnar_session_metadata_begin(wl_col_session_t *sess,
+    wl_columnar_controlled_step_t *step,
+    wl_columnar_session_metadata_purpose_t purpose,
+    wl_evaluation_control_t **out, uint64_t *out_id)
+{
+    *out = NULL; *out_id = 0;
+    uint64_t limit = WL_COLUMNAR_SESSION_NATIVE_ERROR_METADATA_WORK;
+#ifdef WL_SESSION_TEST_HOOKS
+    if (wl_columnar_session_test_metadata_limit)
+        limit = wl_columnar_session_test_metadata_limit(sess, purpose, limit);
+#else
+    (void)sess; (void)purpose;
+#endif
+    wl_evaluation_control_t *grant = NULL;
+    int rc = wl_evaluation_control_create(limit, &grant);
+    if (rc) return EAGAIN;
+    rc = wl_evaluation_control_attach(grant, step);
+    if (rc) {
+        wl_evaluation_control_release(grant);
+        return EAGAIN;
+    }
+    rc = wl_evaluation_control_begin(grant, step);
+    if (rc) {
+        if (wl_evaluation_control_detach(grant, step)) abort();
+        wl_evaluation_control_release(grant);
+        return EAGAIN;
+    }
+    *out = grant;
+    *out_id = wl_evaluation_control_active_attempt_id(grant);
+    if (!*out_id) abort();
+    return 0;
+}
+
+static void
+wl_columnar_session_metadata_end(wl_col_session_t *sess,
+    wl_columnar_controlled_step_t *step, wl_evaluation_control_t *grant,
+    uint64_t id, wl_columnar_session_metadata_purpose_t purpose,
+    uint64_t work, int expected,
+    wl_columnar_session_metadata_event_t event, int body_protocol)
+{
+    int finished = wl_evaluation_control_finish(grant, step, 0, 0);
+    wl_evaluation_control_report_t report;
+    if (wl_evaluation_control_report(grant, &report)
+        || wl_evaluation_control_active_attempt_id(grant)
+        || report.attempt_id != id || finished != expected
+        || report.result != finished || report.execution_status
+        || report.cleanup_status
+        || report.consumed != (expected == 0 ? work : 0)) abort();
+    if (wl_evaluation_control_detach(grant, step)) abort();
+    wl_evaluation_control_release(grant);
+#ifdef WL_SESSION_TEST_HOOKS
+    if (wl_columnar_session_test_metadata_finished)
+        wl_columnar_session_test_metadata_finished(sess, purpose, event,
+            body_protocol, report);
+#else
+    (void)sess; (void)purpose; (void)event; (void)body_protocol;
+#endif
+}
+
 static int
 col_controlled_step_grant_begin(wl_col_session_t *sess,
     wl_columnar_controlled_step_t *step, wl_evaluation_control_t **out,
@@ -8661,6 +8751,26 @@ col_controlled_step_successor_publish_candidate(wl_col_session_t *sess,
     return 0;
 }
 
+/* Shared callback-free fixed metadata suffix; no control lifecycle. */
+static void
+wl_columnar_session_step_reset_metadata(wl_columnar_controlled_step_t *step)
+{
+    step->controlled_materialized_batch_fallback = false;
+    step->default_preflight_phase = COL_CONTROLLED_DEFAULT_PREFLIGHT_IDLE;
+    step->default_preflight_plan = NULL;
+    step->default_preflight_registry = NULL;
+    step->default_preflight_stratum = 0;
+    step->default_preflight_relation = 0;
+    step->default_preflight_op = 0;
+    step->default_preflight_registry_slot = 0;
+    step->default_preflight_name_byte = 0;
+    step->default_preflight_registry_count = 0;
+    step->default_preflight_call_actions = 0;
+    step->default_preflight_charged_actions = 0;
+    step->default_preflight_target_found = false;
+    step->default_preflight_entry_charged = false;
+}
+
 static int
 col_controlled_step_finish(wl_col_session_t *sess,
     wl_columnar_controlled_step_t *step, int result)
@@ -8702,20 +8812,7 @@ col_controlled_step_finish(wl_col_session_t *sess,
             step->retirement_work_valid = true;
         }
     }
-    step->controlled_materialized_batch_fallback = false;
-    step->default_preflight_phase = COL_CONTROLLED_DEFAULT_PREFLIGHT_IDLE;
-    step->default_preflight_plan = NULL;
-    step->default_preflight_registry = NULL;
-    step->default_preflight_stratum = 0;
-    step->default_preflight_relation = 0;
-    step->default_preflight_op = 0;
-    step->default_preflight_registry_slot = 0;
-    step->default_preflight_name_byte = 0;
-    step->default_preflight_registry_count = 0;
-    step->default_preflight_call_actions = 0;
-    step->default_preflight_charged_actions = 0;
-    step->default_preflight_target_found = false;
-    step->default_preflight_entry_charged = false;
+    wl_columnar_session_step_reset_metadata(step);
     if (!step->snapshot_owned) {
         step->operation_active = false;
         step->operation_id = 0;
@@ -8904,6 +9001,46 @@ wl_columnar_session_retirement_dispose_body(
 }
 
 static int
+wl_columnar_session_native_error_retirement_dispose_body(
+    wl_columnar_session_retirement_progress_t *p,
+    wl_evaluation_control_t *control, uint64_t id)
+{
+    if (p->physical_done)
+        return wl_columnar_session_retirement_clear(p, control, id);
+    int rc;
+    if (!p->begun || !p->receipt->committed) {
+        rc = wl_columnar_session_retirement_prepare_body(p, control, id);
+        if (rc) return rc;
+        wl_columnar_session_retirement_checkpoint(p, control, 9);
+        rc = wl_columnar_relation_scalar_retirement_commit(p->receipt);
+        return rc ? rc : EAGAIN;
+    }
+#ifdef WL_SESSION_TEST_HOOKS
+    if (p->role == 2 && wl_columnar_session_test_observed_transaction_checkpoint
+        && ((const wl_columnar_session_observed_transaction_t *)p->parent)->
+        round > 0){
+        if (p->receipt->phase == 6 && p->receipt->column > 0)
+            wl_columnar_session_test_observed_transaction_checkpoint(control,
+                22, 0, NULL);
+        else if (p->receipt->phase == 13)
+            wl_columnar_session_test_observed_transaction_checkpoint(control,
+                23, 0, NULL);
+    }
+#endif
+    if (p->receipt->phase == 12) {
+        rc = wl_evaluation_control_charge_attempt(control, id, 128);
+        if (!rc) rc = wl_columnar_relation_scalar_retirement_ledger_step_finite(
+                p->receipt, control, id);
+    } else rc = wl_columnar_relation_scalar_retirement_step(p->receipt, control,
+                id);
+    if (rc) return rc;
+    /* No hook/debit between actual physical success and stable slot disposal. */
+    p->physical_done = true;
+    if (p->slot) *p->slot = p->replacement;
+    return EAGAIN;
+}
+
+static int
 wl_columnar_session_retirement_cancel_body(
     wl_columnar_session_retirement_progress_t *p,
     wl_evaluation_control_t *control, uint64_t id)
@@ -8942,6 +9079,29 @@ wl_columnar_session_retirement_drive(wl_columnar_controlled_step_t *step,
     int rc = action == 0 ? wl_columnar_session_retirement_prepare_body(p,
             control, id)
         : action == 1 ? wl_columnar_session_retirement_dispose_body(p, control,
+            id)
+        : wl_columnar_session_retirement_cancel_body(p, control, id);
+    p->busy = step->retirement_busy = false;
+    return rc;
+}
+
+static int
+wl_columnar_session_native_error_retirement_drive(
+    wl_columnar_controlled_step_t *step,
+    wl_columnar_session_retirement_progress_t *p,
+    wl_evaluation_control_t *control, uint64_t id, unsigned action)
+{
+    if (step->retirement_busy || p->busy) return EBUSY;
+    if (!control || !id ||
+        wl_evaluation_control_active_attempt_id(control) != id) return EINVAL;
+    if (p->identity != p || !p->parent || !p->receipt || !p->target
+        || p->step != step || !p->registered || !step->retirement_native_count
+        || !wl_columnar_session_retirement_thread(p)) return EINVAL;
+    step->retirement_busy = p->busy = true;
+    int rc = action == 0 ? wl_columnar_session_retirement_prepare_body(p,
+            control, id)
+        : action ==
+        1 ? wl_columnar_session_native_error_retirement_dispose_body(p, control,
             id)
         : wl_columnar_session_retirement_cancel_body(p, control, id);
     p->busy = step->retirement_busy = false;
@@ -9352,8 +9512,20 @@ wl_columnar_session_test_retirement_view(const wl_col_session_t *sess,
             ((uint64_t)tx->disposal_progress.physical_done << 1);
         out[11] =
             tx->disposal_progress.identity ? tx->disposal_progress.role : 0;
-        if (tx->round_progress.begun) out[13] = tx->round_retirement.phase;
-        if (tx->disposal_progress.begun) out[14] = tx->disposal.phase;
+        /* Test-only scalar observations; no target pointer escapes. Bits
+         * 0/1 identify real round/disposal ledgers, 2/3 their actual debt. */
+        if (tx->round_progress.begun) {
+            out[13] = tx->round_retirement.phase;
+            if (tx->round_retirement.ledger) out[12] |= 1u;
+            if (tx->round_retirement.ledger_bytes
+                || tx->round_retirement.ledger_timestamp_bytes) out[12] |= 4u;
+        }
+        if (tx->disposal_progress.begun) {
+            out[14] = tx->disposal.phase;
+            if (tx->disposal.ledger) out[12] |= 2u;
+            if (tx->disposal.ledger_bytes
+                || tx->disposal.ledger_timestamp_bytes) out[12] |= 8u;
+        }
         if (tx->originals && tx->index && tx->index < tx->old_count
             && tx->originals[tx->index - 1].retirement_progress.begun)
             out[15] = tx->originals[tx->index - 1].retirement.ready;
@@ -10934,6 +11106,38 @@ wl_columnar_session_observed_cancel_claims(wl_columnar_controlled_step_t *step,
 }
 
 static int
+wl_columnar_session_observed_child_result(wl_col_session_t *sess,
+    wl_columnar_controlled_step_t *step, int rc)
+{
+    wl_columnar_session_observed_transaction_t *tx = step->transaction;
+    if (rc == EAGAIN) return rc;
+    if (step->reply.kind ==
+        WL_COLUMNAR_EVAL_SERIAL_FRAMED_REPLY_TERMINAL_CLEANUP_PENDING) {
+        tx->receipt_pending = true;
+        tx->receipt_key = step->reply.cleanup_receipt_key;
+        if (step->reply.execution_result)
+            tx->child_result = step->reply.execution_result;
+        return EAGAIN;
+    }
+    if (step->reply.kind == WL_COLUMNAR_EVAL_SERIAL_FRAMED_REPLY_TERMINAL) {
+        if (step->reply.execution_result)
+            tx->child_result = step->reply.execution_result;
+        if ((!tx->receipt_pending && step->reply.cleanup_receipt_key.receipt_id)
+            || (tx->receipt_pending && !tx->receipt_ack)) {
+            tx->receipt_key = step->reply.cleanup_receipt_key;
+            tx->receipt_pending = true;
+            tx->receipt_ack = true;
+            return EAGAIN;
+        }
+        tx->receipt_pending = tx->receipt_ack = tx->child_active = false;
+        memset(&tx->receipt_key, 0, sizeof(tx->receipt_key));
+        col_controlled_step_grant_release(step, &step->previous_funding);
+        return tx->child_result;
+    }
+    return EAGAIN;
+}
+
+static int
 wl_columnar_session_observed_child(wl_col_session_t *sess,
     wl_columnar_controlled_step_t *step)
 {
@@ -10958,30 +11162,10 @@ wl_columnar_session_observed_child(wl_col_session_t *sess,
             : WL_COLUMNAR_EVAL_SERIAL_FRAMED_RECEIPT_RETRY)
         : WL_COLUMNAR_EVAL_SERIAL_FRAMED_ADVANCE;
     int rc = col_controlled_step_host_action(sess, step, &head->plan, action);
-    if (rc == EAGAIN) return rc;
-    if (step->reply.kind ==
-        WL_COLUMNAR_EVAL_SERIAL_FRAMED_REPLY_TERMINAL_CLEANUP_PENDING){
-        tx->receipt_pending = true;
-        tx->receipt_key = step->reply.cleanup_receipt_key;
-        if (step->reply.execution_result) tx->child_result =
-                step->reply.execution_result;
-        return EAGAIN;
-    }
-    if (step->reply.kind == WL_COLUMNAR_EVAL_SERIAL_FRAMED_REPLY_TERMINAL) {
-        if (step->reply.execution_result) tx->child_result =
-                step->reply.execution_result;
-        if ((!tx->receipt_pending && step->reply.cleanup_receipt_key.receipt_id)
-            || (tx->receipt_pending && !tx->receipt_ack)) {
-            tx->receipt_key = step->reply.cleanup_receipt_key;
-            tx->receipt_pending = true;
-            tx->receipt_ack = true;
-            return EAGAIN;
-        }
-        tx->receipt_pending = tx->receipt_ack = tx->child_active = false;
-        memset(&tx->receipt_key, 0, sizeof(tx->receipt_key));
-        col_controlled_step_grant_release(step, &step->previous_funding);
-        return tx->child_result;
-    }
+    if (rc == EAGAIN || step->reply.kind ==
+        WL_COLUMNAR_EVAL_SERIAL_FRAMED_REPLY_TERMINAL_CLEANUP_PENDING
+        || step->reply.kind == WL_COLUMNAR_EVAL_SERIAL_FRAMED_REPLY_TERMINAL)
+        return wl_columnar_session_observed_child_result(sess, step, rc);
     if (rc && step->reply.kind == WL_COLUMNAR_EVAL_SERIAL_FRAMED_REPLY_REJECTED
         && !sess->cleanup_active) {
         tx->child_active = false;
@@ -11035,6 +11219,28 @@ wl_columnar_session_recursive_retire(wl_columnar_controlled_step_t *step,
             p->identity ? p->index : tx->round_index);
     if (rc) return rc;
     rc = wl_columnar_session_retirement_drive(step, p, control, id, 1);
+    if (!rc) tx->round_owner = NULL;
+    return rc ? rc : EAGAIN;
+}
+
+static int
+wl_columnar_session_native_error_recursive_retire(
+    wl_columnar_controlled_step_t *step,
+    wl_columnar_session_observed_transaction_t *tx, col_rel_t **owner,
+    wl_evaluation_control_t *control, uint64_t id)
+{
+    wl_columnar_session_retirement_progress_t *p = &tx->round_progress;
+    if (step->retirement_busy) return EBUSY;
+    if (!p->identity && !*owner) return 0;
+    if (tx->round_owner && tx->round_owner != owner) return EINVAL;
+    tx->round_owner = owner;
+    int rc = wl_columnar_session_retirement_select(step, p, tx,
+            &tx->round_retirement,
+            p->identity ? p->target : *owner, owner, NULL, 2,
+            p->identity ? p->index : tx->round_index);
+    if (rc) return rc;
+    rc = wl_columnar_session_native_error_retirement_drive(step, p, control, id,
+            1);
     if (!rc) tx->round_owner = NULL;
     return rc ? rc : EAGAIN;
 }
@@ -12428,7 +12634,8 @@ wl_columnar_session_observed_dispose(wl_col_session_t *sess,
         bool done = false;
         rc = wl_columnar_memory_reservation_finish_step(&tx->metadata_credit,
                 true, &done);
-        if (rc || !done) return rc ? rc : EAGAIN;
+        if (rc) return rc;
+        if (!done) return EAGAIN;
     }
     (void)wl_evaluation_control_finish(tx->maintenance, tx, 0, 0);
     (void)wl_evaluation_control_detach(tx->maintenance, tx);
@@ -12436,6 +12643,503 @@ wl_columnar_session_observed_dispose(wl_col_session_t *sess,
     assert(!step->retirement_native_count);
     free(tx); step->transaction = NULL;
     return 0;
+}
+
+static int
+wl_columnar_session_native_error_observed_dispose(wl_col_session_t *sess,
+    wl_columnar_controlled_step_t *step)
+{
+    if (!wl_columnar_session_retirement_native_equal(step)) return EBUSY;
+    wl_columnar_session_observed_transaction_t *tx = step->transaction;
+    if (!tx) return 0;
+    if (!step->transaction_initialized) {
+        free(tx); step->transaction = NULL;
+        return 0;
+    }
+    if (tx->child_active || sess->cleanup_active) return EBUSY;
+    int rc = wl_columnar_session_observed_maintenance(tx);
+    if (rc) return rc;
+    rc = wl_columnar_arrangement_diff_attempt_drain(&tx->differential,
+            sess, tx->maintenance, tx->maintenance_id);
+    if (rc) return rc;
+    uint32_t originals = tx->phase <
+        WL_SESSION_OBSERVED_LEASES ? 0 : tx->old_count;
+    if (originals > tx->old_count) originals = tx->old_count;
+    if (tx->cleanup_index < originals) {
+        wl_columnar_session_observed_original_t *original =
+            &tx->originals[tx->cleanup_index];
+        if (original->reader.descriptor_held) {
+            rc = wl_columnar_relation_reader_step(original->relation,
+                    &original->reader, true, tx->maintenance,
+                    tx->maintenance_id);
+            if (rc) return rc;
+        }
+        wl_columnar_session_retirement_progress_t *p =
+            &original->retirement_progress;
+        if (p->identity) {
+            bool committed = p->begun && original->retirement.committed;
+            rc = wl_columnar_session_native_error_retirement_drive(step, p,
+                    tx->maintenance,
+                    tx->maintenance_id, committed ? 1 : 2);
+            if (rc) return rc;
+            if (committed) original->retirement_done = true;
+        }
+        tx->cleanup_index++;
+        return EAGAIN;
+    }
+    if (tx->observer_started && !tx->committed) {
+        rc = wl_columnar_eval_delta_observer_build_discard(sess);
+        if (rc) return rc;
+        rc = wl_columnar_eval_delta_observer_prepare_discard(sess);
+        if (rc) return rc;
+        wl_columnar_eval_delta_observer_set_active(sess, false);
+        rc = wl_columnar_eval_delta_observer_discard(sess);
+        if (rc) return rc;
+        tx->observer_started = false;
+    }
+    if (tx->phase >= WL_SESSION_OBSERVED_SCHEMA && tx->heads) {
+        if (tx->round_owner) {
+            rc = wl_columnar_session_native_error_recursive_retire(step, tx,
+                    tx->round_owner,
+                    tx->maintenance, tx->maintenance_id);
+            if (rc) return rc;
+        }
+        while (tx->cleanup_round < tx->head_count) {
+            col_rel_t **owner = &tx->heads[tx->cleanup_round].previous;
+            if (*owner) {
+                rc = wl_columnar_session_native_error_recursive_retire(step, tx,
+                        owner,
+                        tx->maintenance, tx->maintenance_id);
+                if (rc) return rc;
+            }
+            wl_columnar_session_observed_head_t *head =
+                &tx->heads[tx->cleanup_round];
+            if (head->frontier || tx->round_owner == &head->frontier) {
+                rc = wl_columnar_session_native_error_recursive_retire(step, tx,
+                        &head->frontier,
+                        tx->maintenance, tx->maintenance_id);
+                if (rc) return rc;
+            }
+            if (head->next_frontier) {
+                rc = wl_columnar_session_native_error_recursive_retire(step, tx,
+                        &head->next_frontier,
+                        tx->maintenance, tx->maintenance_id);
+                if (rc) return rc;
+            }
+            tx->cleanup_round++;
+            return EAGAIN;
+        }
+    }
+    if (tx->append_delta) {
+        rc = wl_columnar_session_native_error_recursive_retire(step, tx,
+                &tx->append_delta,
+                tx->maintenance, tx->maintenance_id);
+        if (rc) return rc;
+        return EAGAIN;
+    }
+    if (tx->disposal_progress.identity) {
+        rc = wl_columnar_session_native_error_retirement_drive(step,
+                &tx->disposal_progress,
+                tx->maintenance, tx->maintenance_id, 1);
+        return rc ? rc : EAGAIN;
+    }
+    uint32_t entries = tx->phase < WL_SESSION_OBSERVED_SCHEMA ? 0 : tx->count;
+    if (entries > tx->count) entries = tx->count;
+    if (tx->dispose_index < entries) {
+        if (!tx->entries || !tx->heads) return EINVAL;
+        uint32_t i = tx->dispose_index;
+        col_rel_t *r = i < sess->plan->edb_count
+            ? tx->entries[i].relation != tx->entries[i].public_relation
+                ? tx->entries[i].relation : NULL
+            : tx->committed ? NULL : tx->heads[i -
+                sess->plan->edb_count].candidate;
+        if (r) {
+            col_rel_t **slot = i <
+                sess->plan->edb_count ? &tx->entries[i].relation
+                : &tx->heads[i - sess->plan->edb_count].candidate;
+            col_rel_t *replacement = i < sess->plan->edb_count
+                ? tx->entries[i].public_relation : NULL;
+            rc = wl_columnar_session_retirement_select(step,
+                    &tx->disposal_progress,
+                    tx, &tx->disposal, r, slot, replacement,
+                    i < sess->plan->edb_count ? 4 : 5, i);
+            if (rc) return rc;
+            rc = wl_columnar_session_native_error_retirement_drive(step,
+                    &tx->disposal_progress,
+                    tx->maintenance, tx->maintenance_id, 1);
+            if (rc) return rc;
+        }
+        tx->dispose_index++;
+        return EAGAIN;
+    }
+    if (tx->committed) {
+        rc = wl_columnar_session_observed_old_storage_finish(tx);
+        if (rc) return rc;
+    }
+    free((void *)tx->image); tx->image = NULL;
+    if (tx->image_admitted && !tx->committed && sess->memory_governor) {
+        bool done = false;
+        rc = wl_columnar_memory_reservation_finish_step(&tx->image_credit, true,
+                &done);
+        if (rc || !done) return rc ? rc : EAGAIN;
+        tx->image_admitted = false;
+    }
+    free(tx->entries); tx->entries = NULL;
+    free(tx->heads); tx->heads = NULL;
+    free(tx->originals); tx->originals = NULL;
+    free(tx->overrides); tx->overrides = NULL;
+    free(tx->ops); tx->ops = NULL;
+    free(tx->frontier_sources); tx->frontier_sources = NULL;
+    if (tx->metadata_admitted && sess->memory_governor) {
+        bool done = false;
+        rc = wl_columnar_memory_reservation_finish_step(&tx->metadata_credit,
+                true, &done);
+        if (rc) return rc;
+        if (!done) return EAGAIN;
+    }
+    (void)wl_evaluation_control_finish(tx->maintenance, tx, 0, 0);
+    (void)wl_evaluation_control_detach(tx->maintenance, tx);
+    wl_evaluation_control_release(tx->maintenance);
+    assert(!step->retirement_native_count);
+    free(tx); step->transaction = NULL;
+    return 0;
+}
+
+/* Observation protects ownership even when the caller cannot execute on the
+ * stored native thread. Every mutation below separately proves that thread. */
+static bool
+wl_columnar_session_native_error_debt_registered(const wl_col_session_t *sess)
+{
+    const wl_columnar_controlled_step_t *step = sess->controlled_step;
+    if (!step
+        || step->native_error_phase < WL_COLUMNAR_SESSION_NATIVE_ERROR_CHILD
+        || step->native_error_phase > WL_COLUMNAR_SESSION_NATIVE_ERROR_FINAL
+        || !step->native_error_thread_valid || !step->native_error_result
+        || !step->operation_active
+        || step->operation_id != step->native_error_operation_id
+        || step->operation_identity != step->native_error_operation_identity
+        || sess->base.evaluation_control != step->native_error_control
+        || wl_evaluation_control_identity(step->native_error_control)
+        != step->native_error_control_identity) return false;
+    /* This observes the real registered root without following an inner
+     * header. A refused inner proof must not relinquish public protection.
+     * Progress still invokes the complete validator below on every call. */
+    return step->native_error_phase == WL_COLUMNAR_SESSION_NATIVE_ERROR_FINAL
+        ? !step->transaction && !step->native_error_transaction
+        : step->transaction
+           && step->transaction == step->native_error_transaction;
+}
+
+static bool
+wl_columnar_session_native_error_registered(const wl_col_session_t *sess,
+    const wl_columnar_controlled_step_t *step)
+{
+    if (!step || sess->controlled_step != step
+        || step->native_error_phase < WL_COLUMNAR_SESSION_NATIVE_ERROR_CHILD
+        || step->native_error_phase > WL_COLUMNAR_SESSION_NATIVE_ERROR_FINAL
+        || !step->native_error_thread_valid || !step->native_error_result
+        || !step->general_observed || !step->operation_active
+        || step->operation_id != step->native_error_operation_id
+        || step->operation_identity != step->native_error_operation_identity
+        || sess->base.evaluation_control != step->native_error_control
+        || wl_evaluation_control_identity(step->native_error_control)
+        != step->native_error_control_identity) return false;
+    const wl_columnar_session_observed_transaction_t *tx = step->transaction;
+    if (step->native_error_phase == WL_COLUMNAR_SESSION_NATIVE_ERROR_FINAL)
+        return !tx && !step->native_error_transaction && !sess->cleanup_active
+               && !sess->cleanup_pending && !step->previous_valid
+               && !step->previous_funding && !step->retirement_native_count;
+    if (!tx || tx != step->native_error_transaction
+        || !step->transaction_initialized || tx->committed
+        || tx->phase != WL_SESSION_OBSERVED_EVALUATE
+        || tx->generation != step->native_error_generation
+        || tx->head != step->native_error_head
+        || tx->count != step->native_error_count) return false;
+    if (step->native_error_phase == WL_COLUMNAR_SESSION_NATIVE_ERROR_DISPOSE)
+        return !tx->child_active && !tx->receipt_pending && !tx->receipt_ack
+               && !sess->cleanup_active && !sess->cleanup_pending
+               && !step->previous_valid && !step->previous_funding;
+    return tx->child_active && tx->heads && tx->head < tx->head_count
+           && &tx->heads[tx->head].plan == step->native_error_plan
+           && tx->entries == step->native_error_entries
+           && tx->bindings.identity == (uintptr_t)&tx->bindings
+           && tx->bindings.dynamic_entries == tx->entries
+           && tx->bindings.generation == tx->generation
+           && tx->bindings.count == tx->count
+           && tx->bindings.plan == step->native_error_plan
+           && tx->bindings.session == sess
+           && tx->bindings.control == step->native_error_control
+           && tx->bindings.attempt_id == step->native_error_operation_id;
+}
+
+static int
+wl_columnar_session_native_error_origin(const wl_col_session_t *sess,
+    const wl_columnar_controlled_step_t *step)
+{
+    if (!step || sess->controlled_step != step || !step->operation_active
+        || !step->operation_id
+        || wl_evaluation_control_active_attempt_id(
+            sess->base.evaluation_control) == step->operation_id
+        || !step->general_observed
+        || !step->transaction_initialized || step->snapshot_owned
+        || step->published || step->transaction_discard
+        || step->native_error_phase != WL_COLUMNAR_SESSION_NATIVE_ERROR_INERT)
+        return 0;
+    const wl_columnar_session_observed_transaction_t *tx = step->transaction;
+    if (!tx || tx->phase != WL_SESSION_OBSERVED_EVALUATE || tx->committed
+        || !tx->child_active || !tx->heads || tx->head >= tx->head_count)
+        return 0;
+    /* Exact union with the standalone dynamic registration proof. Its
+     * step/tx predicates above already ran in this callback-free activation;
+     * caller-bound arguments add no second relationship to authenticate. */
+    const wl_columnar_eval_private_bindings_t *bindings = &tx->bindings;
+    if (bindings->identity != (uintptr_t)bindings
+        || bindings->dynamic_entries != tx->entries
+        || bindings->count != tx->count
+        || bindings->generation != tx->generation
+        || bindings->plan != &tx->heads[tx->head].plan
+        || bindings->session != sess
+        || bindings->control != sess->base.evaluation_control
+        || bindings->attempt_id != step->operation_id)
+        return 0;
+    return wl_columnar_eval_stack_auto_cleanup_debt(sess, &tx->bindings,
+               step->operation_identity);
+}
+
+static bool
+wl_columnar_session_native_error_thread(
+    const wl_columnar_controlled_step_t *step)
+{
+    if (!step->native_error_thread_valid) return false;
+#if defined(WL_HAVE_C11_THREADS)
+    return thrd_equal(step->native_error_thread, thrd_current()) != 0;
+#elif defined(_WIN32) || defined(_WIN64)
+    return step->native_error_thread == GetCurrentThreadId();
+#else
+    return pthread_equal(step->native_error_thread, pthread_self()) != 0;
+#endif
+}
+
+static bool
+wl_columnar_session_native_error_done(const wl_col_session_t *sess,
+    const wl_columnar_controlled_step_t *step)
+{
+    return step &&
+           step->native_error_phase == WL_COLUMNAR_SESSION_NATIVE_ERROR_DONE
+           && !step->native_error_busy && !step->native_error_thread_valid
+           && !step->native_error_transaction && !step->native_error_control
+           && !step->transaction && !step->operation_active &&
+           !step->operation_id
+           && !step->relation_active && !step->previous_valid
+           && !step->previous_funding && !step->retirement_native_count
+           && !sess->cleanup_active && !sess->cleanup_pending
+           && !step->staging_progress.identity &&
+           !step->successor_input_reader.owner;
+}
+
+#ifdef WL_SESSION_TEST_HOOKS
+wl_columnar_session_native_error_phase_t
+wl_columnar_session_test_native_error_phase(const wl_col_session_t *sess)
+{
+    return sess && sess->controlled_step
+        ? sess->controlled_step->native_error_phase
+        : WL_COLUMNAR_SESSION_NATIVE_ERROR_INERT;
+}
+#endif
+
+typedef struct {
+    bool selected;
+    int protocol;
+} wl_columnar_session_native_error_dispatch_result_t;
+
+static wl_columnar_session_native_error_dispatch_result_t
+wl_columnar_session_native_error_dispatch(wl_col_session_t *sess,
+    wl_columnar_controlled_step_t *step)
+{
+    if (!step) return (wl_columnar_session_native_error_dispatch_result_t){false,
+                                                                           0};
+    if (step->native_error_busy || step->retirement_busy
+        || step->retirement_begin_busy) return (
+            wl_columnar_session_native_error_dispatch_result_t){true, EBUSY};
+    bool registered = step->native_error_phase !=
+        WL_COLUMNAR_SESSION_NATIVE_ERROR_INERT
+        && wl_columnar_session_native_error_registered(sess, step);
+    int cause = registered ? step->native_error_result
+        : wl_columnar_session_native_error_origin(sess, step);
+    if (!cause) return (wl_columnar_session_native_error_dispatch_result_t){
+                   false, 0
+        };
+    if (registered) {
+        if (!wl_columnar_session_native_error_thread(step)
+            || !wl_columnar_session_retirement_native_equal(
+                step)) return (
+                wl_columnar_session_native_error_dispatch_result_t){true,
+                                                                    EBUSY};
+    } else {
+        int rc = wl_columnar_eval_stack_auto_cleanup_ready(sess);
+        if (rc || !wl_columnar_session_retirement_native_equal(step)) return (
+                wl_columnar_session_native_error_dispatch_result_t){true,
+                                                                    rc ? rc :
+                                                                    EBUSY};
+    }
+    wl_evaluation_control_t *grant = NULL;
+    uint64_t grant_id = 0;
+    int rc = wl_columnar_session_metadata_begin(sess, step,
+            WL_COLUMNAR_SESSION_METADATA_NATIVE_ERROR, &grant, &grant_id);
+    if (rc) return (wl_columnar_session_native_error_dispatch_result_t){true,
+                                                                        EAGAIN};
+    /* Only the factory's declared capacity/read-only hooks can run here.
+     * They cannot mutate protected frame/tx/receipt/native authority. Legal
+     * original-control fuel or generation changes do not refresh that proof.
+     * The freshly created funding identity still has its own exact check. */
+    if (!grant || grant == sess->base.evaluation_control
+        || grant == step->previous_funding || !grant_id) abort();
+    rc = wl_evaluation_control_charge_attempt(grant, grant_id,
+            WL_COLUMNAR_SESSION_NATIVE_ERROR_METADATA_WORK);
+    if (rc) {
+        if (rc != WL_EVALUATION_CONTROL_WORK_LIMIT) abort();
+        wl_columnar_session_metadata_end(sess, step, grant, grant_id,
+            WL_COLUMNAR_SESSION_METADATA_NATIVE_ERROR,
+            WL_COLUMNAR_SESSION_NATIVE_ERROR_METADATA_WORK, rc,
+            WL_COLUMNAR_SESSION_METADATA_SETUP_REFUSED, EAGAIN);
+        return (wl_columnar_session_native_error_dispatch_result_t){true,
+                                                                    EAGAIN};
+    }
+    if (!registered) {
+        step->native_error_busy = true;
+        wl_columnar_session_observed_transaction_t *tx = step->transaction;
+        step->native_error_transaction = tx;
+        step->native_error_control = sess->base.evaluation_control;
+        step->native_error_control_identity =
+            wl_evaluation_control_identity(step->native_error_control);
+        step->native_error_operation_id = step->operation_id;
+        step->native_error_operation_identity = step->operation_identity;
+        step->native_error_generation = tx->generation;
+        step->native_error_head = tx->head;
+        step->native_error_count = tx->count;
+        step->native_error_plan = &tx->heads[tx->head].plan;
+        step->native_error_entries = tx->entries;
+        /* The complete readonly query proved both stored owner threads equal
+         * this native caller before the restricted factory hook. */
+#if defined(WL_HAVE_C11_THREADS)
+        step->native_error_thread = thrd_current();
+#elif defined(_WIN32) || defined(_WIN64)
+        step->native_error_thread = GetCurrentThreadId();
+#else
+        step->native_error_thread = pthread_self();
+#endif
+        step->native_error_thread_valid = true;
+        step->native_error_result = cause;
+        step->native_error_phase = WL_COLUMNAR_SESSION_NATIVE_ERROR_CHILD;
+        rc = EAGAIN;
+        wl_columnar_session_metadata_end(sess, step, grant, grant_id,
+            WL_COLUMNAR_SESSION_METADATA_NATIVE_ERROR,
+            WL_COLUMNAR_SESSION_NATIVE_ERROR_METADATA_WORK, 0,
+            WL_COLUMNAR_SESSION_METADATA_BODY_RETURNED, rc);
+        step->native_error_busy = false;
+        return (wl_columnar_session_native_error_dispatch_result_t){true, rc};
+    }
+    step->native_error_busy = true;
+    switch (step->native_error_phase) {
+    case WL_COLUMNAR_SESSION_NATIVE_ERROR_CHILD: {
+        wl_columnar_session_observed_transaction_t *tx = step->transaction;
+        if (tx->receipt_pending && tx->receipt_ack && !sess->cleanup_active
+            && !step->previous_valid && !step->previous_funding) {
+            wl_evaluation_control_t *child_grant = NULL;
+            uint64_t child_id = 0;
+            rc = col_controlled_step_grant_begin(sess, step, &child_grant,
+                    &child_id, WL_COLUMNAR_EVAL_SERIAL_FRAMED_RECEIPT_ACK);
+            if (rc) break;
+            if (!tx->receipt_key.session_generation
+                || !tx->receipt_key.receipt_id || !tx->receipt_key.plan_epoch
+                || tx->receipt_key.operation_attempt_id != step->operation_id
+                || tx->receipt_key.operation_id != step->operation_identity)
+                rc = EINVAL;
+            else {
+                wl_columnar_eval_cleanup_receipt_ack_result_t ack =
+                    wl_columnar_eval_stack_cleanup_receipt_ack_funded(sess,
+                        &tx->receipt_key, child_grant, child_id);
+                rc = ack.protocol;
+                if (!rc) {
+                    if (ack.execution_result)
+                        tx->child_result = ack.execution_result;
+                    /* The real receipt is gone, including when grant finish
+                     * later fails. Never retry an already consumed ACK. */
+                    tx->receipt_pending = tx->receipt_ack =
+                        tx->child_active = false;
+                    memset(&tx->receipt_key, 0, sizeof(tx->receipt_key));
+                }
+            }
+            int finish_rc = wl_evaluation_control_finish(child_grant, step,
+                    0, 0);
+            if (finish_rc && !rc) rc = finish_rc;
+#ifdef WL_SESSION_TEST_HOOKS
+            if (wl_columnar_session_test_framed_grant_finished)
+                wl_columnar_session_test_framed_grant_finished(sess,
+                    WL_COLUMNAR_EVAL_SERIAL_FRAMED_RECEIPT_ACK, child_grant,
+                    rc);
+#endif
+            col_controlled_step_grant_release(step, &child_grant);
+        } else {
+            wl_columnar_eval_serial_framed_host_action_t action =
+                tx->receipt_pending
+                ? tx->receipt_ack ? WL_COLUMNAR_EVAL_SERIAL_FRAMED_RECEIPT_ACK
+                    : WL_COLUMNAR_EVAL_SERIAL_FRAMED_RECEIPT_RETRY
+                : WL_COLUMNAR_EVAL_SERIAL_FRAMED_ABORT;
+            rc = col_controlled_step_host_action(sess, step,
+                    step->native_error_plan, action);
+            if (!rc || rc == EAGAIN || step->reply.kind ==
+                WL_COLUMNAR_EVAL_SERIAL_FRAMED_REPLY_TERMINAL_CLEANUP_PENDING
+                || step->reply.kind ==
+                WL_COLUMNAR_EVAL_SERIAL_FRAMED_REPLY_TERMINAL)
+                rc = wl_columnar_session_observed_child_result(sess, step, rc);
+        }
+        if (!tx->child_active) {
+            step->native_error_plan = NULL;
+            step->native_error_entries = NULL;
+            step->native_error_phase = WL_COLUMNAR_SESSION_NATIVE_ERROR_DISPOSE;
+        }
+        if (!rc || !tx->child_active) rc = EAGAIN;
+        break;
+    }
+    case WL_COLUMNAR_SESSION_NATIVE_ERROR_DISPOSE:
+        rc = wl_columnar_session_native_error_observed_dispose(sess, step);
+        if (!rc) {
+            step->native_error_transaction = NULL;
+            step->native_error_phase = WL_COLUMNAR_SESSION_NATIVE_ERROR_FINAL;
+            rc = EAGAIN;
+        }
+        break;
+    case WL_COLUMNAR_SESSION_NATIVE_ERROR_FINAL:
+        wl_columnar_session_step_reset_metadata(step);
+        step->operation_active = false;
+        step->operation_id = 0;
+        step->relation_active = false;
+        step->primary_result = 0;
+        step->transaction_initialized = false;
+        step->transaction_initialized_bytes = 0;
+        step->transaction_discard = false;
+        step->complete = false;
+        step->retryable = false;
+        step->refused = true;
+        step->native_error_control = NULL;
+        step->native_error_thread_valid = false;
+        step->native_error_control_identity = 0;
+        step->native_error_operation_id = 0;
+        step->native_error_operation_identity = 0;
+        step->native_error_generation = 0;
+        step->native_error_head = step->native_error_count = 0;
+        step->native_error_phase = WL_COLUMNAR_SESSION_NATIVE_ERROR_DONE;
+        rc = cause;
+        break;
+    default: rc = EINVAL; break;
+    }
+    wl_columnar_session_metadata_end(sess, step, grant, grant_id,
+        WL_COLUMNAR_SESSION_METADATA_NATIVE_ERROR,
+        WL_COLUMNAR_SESSION_NATIVE_ERROR_METADATA_WORK, 0,
+        WL_COLUMNAR_SESSION_METADATA_BODY_RETURNED, rc);
+    step->native_error_busy = false;
+    return (wl_columnar_session_native_error_dispatch_result_t){true, rc};
 }
 
 /* Original begin failed before creating an attempt. Use only the existing
@@ -12505,7 +13209,8 @@ static int
 col_controlled_step_drive(wl_col_session_t *sess,
     wl_columnar_controlled_step_t *step, bool teardown)
 {
-    if (step->retirement_begin_busy || step->retirement_busy) return EBUSY;
+    if (step->native_error_busy || step->retirement_begin_busy
+        || step->retirement_busy) return EBUSY;
     int owner_guard = wl_columnar_session_retirement_entry_guard(sess, step);
     if (owner_guard) return owner_guard;
     if (step->retirement_begin_failure_pending)
@@ -12535,6 +13240,10 @@ col_controlled_step_drive(wl_col_session_t *sess,
         step->operation_id = wl_evaluation_control_active_attempt_id(control);
         if (!step->operation_id) return EINVAL;
         step->operation_active = true;
+        if (step->native_error_phase == WL_COLUMNAR_SESSION_NATIVE_ERROR_DONE) {
+            step->native_error_phase = WL_COLUMNAR_SESSION_NATIVE_ERROR_INERT;
+            step->native_error_result = 0;
+        }
         step->retirement_work_valid = false;
         step->primary_result = 0;
         step->staging_cancel_protocol_status = 0;
@@ -12941,7 +13650,8 @@ col_controlled_step(wl_col_session_t *sess,
     wl_columnar_session_snapshot_payload_t *snapshot)
 {
     if (sess->controlled_step &&
-        (sess->controlled_step->retirement_begin_busy
+        (sess->controlled_step->native_error_busy
+        || sess->controlled_step->retirement_begin_busy
         || sess->controlled_step->retirement_busy)) return EBUSY;
     wl_columnar_controlled_step_t *step = sess->controlled_step;
     if (step) {
@@ -13066,12 +13776,16 @@ static int
 wl_columnar_session_controlled_step_drain_for_destroy(wl_col_session_t *sess)
 {
     if (sess->controlled_step &&
-        (sess->controlled_step->retirement_begin_busy
+        (sess->controlled_step->native_error_busy
+        || sess->controlled_step->retirement_begin_busy
         || sess->controlled_step->retirement_busy)) return EBUSY;
     wl_columnar_controlled_step_t *step = sess->controlled_step;
     if (!step) return 0;
     int rc = 0;
-    if (step->operation_active)
+    wl_columnar_session_native_error_dispatch_result_t cleanup =
+        wl_columnar_session_native_error_dispatch(sess, step);
+    if (cleanup.selected) rc = cleanup.protocol;
+    else if (step->operation_active)
         rc = col_controlled_step_drive(sess, step, true);
     if (rc == EAGAIN || step->operation_active) return EBUSY;
     if (step->transaction) {
@@ -13117,8 +13831,12 @@ col_session_step(wl_session_t *session)
     if (!session) return EINVAL;
     wl_col_session_t *sess = COL_SESSION(session);
     if (sess->controlled_step &&
-        (sess->controlled_step->retirement_begin_busy
+        (sess->controlled_step->native_error_busy
+        || sess->controlled_step->retirement_begin_busy
         || sess->controlled_step->retirement_busy)) return EBUSY;
+    wl_columnar_session_native_error_dispatch_result_t cleanup =
+        wl_columnar_session_native_error_dispatch(sess, sess->controlled_step);
+    if (cleanup.selected) return cleanup.protocol;
     if (sess->controlled_step) {
         int owner_guard = wl_columnar_session_retirement_entry_guard(sess,
                 sess->controlled_step);
@@ -13145,6 +13863,17 @@ col_session_controlled_step_state(const wl_session_t *session)
 {
     const wl_col_session_t *sess = COL_SESSION((wl_session_t *)session);
     const wl_columnar_controlled_step_t *step = sess->controlled_step;
+    if (step
+        && step->native_error_phase == WL_COLUMNAR_SESSION_NATIVE_ERROR_DONE
+        && wl_columnar_session_native_error_done(sess, step))
+        return WL_CONTROLLED_STEP_IDLE;
+    if (step
+        && ((step->native_error_phase >= WL_COLUMNAR_SESSION_NATIVE_ERROR_CHILD
+        && step->native_error_phase <= WL_COLUMNAR_SESSION_NATIVE_ERROR_FINAL
+        && wl_columnar_session_native_error_debt_registered(sess))
+        || (step->native_error_phase == WL_COLUMNAR_SESSION_NATIVE_ERROR_INERT
+        && wl_columnar_session_native_error_origin(sess, step))))
+        return WL_CONTROLLED_STEP_NATIVE_ERROR_CLEANUP_PENDING;
     if (sess->cleanup_active || sess->cleanup_pending)
         return WL_CONTROLLED_STEP_PENDING;
     if (!step) return WL_CONTROLLED_STEP_IDLE;
@@ -14376,6 +15105,7 @@ col_session_snapshot_controlled(wl_session_t *session,
     wl_controlled_step_state_t state =
         col_session_controlled_step_state(session);
     if (state == WL_CONTROLLED_STEP_PENDING
+        || state == WL_CONTROLLED_STEP_NATIVE_ERROR_CLEANUP_PENDING
         || state == WL_CONTROLLED_STEP_RETRYABLE
         || state == WL_CONTROLLED_STEP_INVALIDATED) return EBUSY;
     if (!callback) return EINVAL;
@@ -14457,7 +15187,8 @@ col_session_snapshot(wl_session_t *session, wirelog_on_tuple_fn callback,
     if (!session) return EINVAL;
     wl_col_session_t *sess = COL_SESSION(session);
     if (sess->controlled_step &&
-        (sess->controlled_step->retirement_begin_busy
+        (sess->controlled_step->native_error_busy
+        || sess->controlled_step->retirement_begin_busy
         || sess->controlled_step->retirement_busy)) return EBUSY;
     if (wl_columnar_session_cold_pending(sess)) return EBUSY;
     sess->cold_seal_closed = true;

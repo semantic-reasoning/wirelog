@@ -879,7 +879,8 @@ wl_session_step(wl_session_t *session)
             && session->backend->session_controlled_step_state
             ? session->backend->session_controlled_step_state(session)
             : WL_CONTROLLED_STEP_IDLE;
-        bool pending = (rc == EAGAIN
+        bool pending = state == WL_CONTROLLED_STEP_NATIVE_ERROR_CLEANUP_PENDING
+            || (rc == EAGAIN
             && wl_evaluation_control_active_attempt_id(
                 session->evaluation_control) != 0)
             || (rc == WL_EVALUATION_CONTROL_WORK_LIMIT

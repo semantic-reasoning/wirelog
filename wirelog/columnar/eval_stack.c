@@ -2586,13 +2586,56 @@ wl_columnar_eval_cleanup_receipt_find(wl_col_session_t *session,
         || key->session_generation !=
         session->cleanup_receipt_session_generation)
         return NULL;
-    for (unsigned i = 0; i < WL_COLUMNAR_EVAL_STACK_CLEANUP_MAX_FRAMES; ++i) {
-        wl_columnar_eval_cleanup_receipt_t *receipt
-            = &session->cleanup_receipts[i];
-        if (receipt->state != WL_COLUMNAR_EVAL_CLEANUP_RECEIPT_FREE
-            && wl_columnar_eval_cleanup_receipt_key_equal(&receipt->key, key))
-            return receipt;
-    }
+    /* Fixed source extent, including a refused first receipt debit. The ID
+     * is only a rejection filter; every candidate retains full key proof. */
+#if WL_COLUMNAR_EVAL_STACK_CLEANUP_MAX_FRAMES != 32u
+#error "Update the complete receipt slot expansion for the new capacity"
+#endif
+#define WL_COLUMNAR_EVAL_STACK_RECEIPT_SLOT(N) \
+        if (session->cleanup_receipts[(N)].key.receipt_id == key->receipt_id \
+            && session->cleanup_receipts[(N)].state \
+            != WL_COLUMNAR_EVAL_CLEANUP_RECEIPT_FREE \
+            && session->cleanup_receipts[(N)].key.session_generation \
+            == key->session_generation \
+            && session->cleanup_receipts[(N)].key.plan_epoch == key->plan_epoch \
+            && session->cleanup_receipts[(N)].key.operation_attempt_id \
+            == key->operation_attempt_id \
+            && session->cleanup_receipts[(N)].key.operation_id \
+            == key->operation_id) \
+        return &session->cleanup_receipts[(N)]
+    WL_COLUMNAR_EVAL_STACK_RECEIPT_SLOT(0);
+    WL_COLUMNAR_EVAL_STACK_RECEIPT_SLOT(1);
+    WL_COLUMNAR_EVAL_STACK_RECEIPT_SLOT(2);
+    WL_COLUMNAR_EVAL_STACK_RECEIPT_SLOT(3);
+    WL_COLUMNAR_EVAL_STACK_RECEIPT_SLOT(4);
+    WL_COLUMNAR_EVAL_STACK_RECEIPT_SLOT(5);
+    WL_COLUMNAR_EVAL_STACK_RECEIPT_SLOT(6);
+    WL_COLUMNAR_EVAL_STACK_RECEIPT_SLOT(7);
+    WL_COLUMNAR_EVAL_STACK_RECEIPT_SLOT(8);
+    WL_COLUMNAR_EVAL_STACK_RECEIPT_SLOT(9);
+    WL_COLUMNAR_EVAL_STACK_RECEIPT_SLOT(10);
+    WL_COLUMNAR_EVAL_STACK_RECEIPT_SLOT(11);
+    WL_COLUMNAR_EVAL_STACK_RECEIPT_SLOT(12);
+    WL_COLUMNAR_EVAL_STACK_RECEIPT_SLOT(13);
+    WL_COLUMNAR_EVAL_STACK_RECEIPT_SLOT(14);
+    WL_COLUMNAR_EVAL_STACK_RECEIPT_SLOT(15);
+    WL_COLUMNAR_EVAL_STACK_RECEIPT_SLOT(16);
+    WL_COLUMNAR_EVAL_STACK_RECEIPT_SLOT(17);
+    WL_COLUMNAR_EVAL_STACK_RECEIPT_SLOT(18);
+    WL_COLUMNAR_EVAL_STACK_RECEIPT_SLOT(19);
+    WL_COLUMNAR_EVAL_STACK_RECEIPT_SLOT(20);
+    WL_COLUMNAR_EVAL_STACK_RECEIPT_SLOT(21);
+    WL_COLUMNAR_EVAL_STACK_RECEIPT_SLOT(22);
+    WL_COLUMNAR_EVAL_STACK_RECEIPT_SLOT(23);
+    WL_COLUMNAR_EVAL_STACK_RECEIPT_SLOT(24);
+    WL_COLUMNAR_EVAL_STACK_RECEIPT_SLOT(25);
+    WL_COLUMNAR_EVAL_STACK_RECEIPT_SLOT(26);
+    WL_COLUMNAR_EVAL_STACK_RECEIPT_SLOT(27);
+    WL_COLUMNAR_EVAL_STACK_RECEIPT_SLOT(28);
+    WL_COLUMNAR_EVAL_STACK_RECEIPT_SLOT(29);
+    WL_COLUMNAR_EVAL_STACK_RECEIPT_SLOT(30);
+    WL_COLUMNAR_EVAL_STACK_RECEIPT_SLOT(31);
+#undef WL_COLUMNAR_EVAL_STACK_RECEIPT_SLOT
     return NULL;
 }
 
@@ -2764,6 +2807,28 @@ wl_columnar_eval_stack_cleanup_receipt_ack(wl_col_session_t *session,
         return EBUSY;
     memset(receipt, 0, sizeof(*receipt));
     return 0;
+}
+
+wl_columnar_eval_cleanup_receipt_ack_result_t
+wl_columnar_eval_stack_cleanup_receipt_ack_funded(wl_col_session_t *session,
+    const wl_columnar_eval_cleanup_receipt_key_t *key,
+    wl_evaluation_control_t *funding, uint64_t funding_id)
+{
+    wl_columnar_eval_cleanup_receipt_t *receipt =
+        wl_columnar_eval_cleanup_receipt_find(session, key);
+    if (!receipt)
+        return (wl_columnar_eval_cleanup_receipt_ack_result_t){ENOENT, 0};
+    if (!funding || funding == session->base.evaluation_control || !funding_id
+        || wl_evaluation_control_active_attempt_id(funding) != funding_id)
+        return (wl_columnar_eval_cleanup_receipt_ack_result_t){EINVAL, 0};
+    int rc = wl_evaluation_control_charge_attempt(funding, funding_id,
+            WL_COLUMNAR_EVAL_SERIAL_FRAMED_HOST_WORK);
+    if (rc) return (wl_columnar_eval_cleanup_receipt_ack_result_t){rc, 0};
+    if (receipt->state != WL_COLUMNAR_EVAL_CLEANUP_RECEIPT_FREED)
+        return (wl_columnar_eval_cleanup_receipt_ack_result_t){EBUSY, 0};
+    int result = receipt->result;
+    memset(receipt, 0, sizeof(*receipt));
+    return (wl_columnar_eval_cleanup_receipt_ack_result_t){0, result};
 }
 
 int
@@ -5479,6 +5544,184 @@ wl_columnar_eval_stack_auto_error_drain(
            && phase <= WL_COLUMNAR_EVAL_SERIAL_FRAMED_SCRATCH_REFERENCE)
            || (phase >= WL_COLUMNAR_EVAL_SERIAL_FRAMED_CANDIDATE_ABORT
            && phase <= WL_COLUMNAR_EVAL_SERIAL_FRAMED_DONE);
+}
+
+int
+wl_columnar_eval_stack_auto_cleanup_debt(const wl_col_session_t *session,
+    const wl_columnar_eval_private_bindings_t *bindings,
+    uint64_t operation_identity)
+{
+    const wl_columnar_eval_stack_cleanup_frame_t *frame = session
+        ? session->cleanup_active : NULL;
+    if (!wl_columnar_eval_stack_unary_frame_valid(frame)
+        || frame->session != session || frame->prepared_unary || !bindings)
+        return 0;
+    const wl_columnar_eval_serial_framed_attempt_t *ctx = &frame->framed;
+    if (ctx->identity != ctx || ctx->frame != frame || ctx->session != session
+        || !ctx->pin_owned || !ctx->thread_valid || !ctx->child_bound
+        || !ctx->control || !ctx->attempt_id
+        || ctx->private_bindings != bindings || ctx->plan != bindings->plan
+        || ctx->control != bindings->control ||
+        ctx->attempt_id != bindings->attempt_id
+        || ctx->operation_identity != operation_identity || !ctx->primary_result
+        || !ctx->plan || !ctx->plan->ops) return 0;
+    const wl_columnar_eval_plan_numeric_attempt_t *n = &ctx->child;
+    const wl_columnar_eval_stack_auto_t *a =
+        &((const wl_columnar_eval_stack_allocation_t *)frame)->automatic;
+    if (frame->numeric_plan_owner != n || n->identity != n || n->frame != frame
+        || n->session != session || n->plan != ctx->plan ||
+        n->control != ctx->control
+        || n->attempt_id != ctx->attempt_id || !n->thread_valid ||
+        !n->semantic_result
+        || n->private_bindings != bindings || a->saved_binding != bindings
+        || a->saved_binding_generation != bindings->generation)
+        return 0;
+#if defined(WL_HAVE_C11_THREADS)
+    if (!thrd_equal(ctx->owner_thread, n->owner_thread)) return 0;
+#elif defined(_WIN32) || defined(_WIN64)
+    if (ctx->owner_thread != n->owner_thread) return 0;
+#else
+    if (!pthread_equal(ctx->owner_thread, n->owner_thread)) return 0;
+#endif
+    if (a->identity != a || a->frame != frame || !a->abort_requested
+        || a->launch || a->busy || a->cursor >= ctx->plan->op_count
+        || a->operation != &ctx->plan->ops[a->cursor]
+        || a->operation->op != WL_PLAN_OP_JOIN || n->cursor != a->cursor)
+        return 0;
+    bool acked = a->receipt.identity == &a->receipt
+        && a->receipt.phase == WL_COLUMNAR_EVAL_STACK_PREPARED_ACKED;
+    if (a->phase == WL_COLUMNAR_EVAL_STACK_AUTO_SKIPPED) {
+        if (a->finish || !a->launch_protocol || (!acked && (a->receipt.identity
+            || a->receipt.phase !=
+            WL_COLUMNAR_EVAL_STACK_PREPARED_INERT))) return 0;
+    } else if (!acked || (a->phase != WL_COLUMNAR_EVAL_STACK_AUTO_WAIT_FINISH
+        && a->phase != WL_COLUMNAR_EVAL_STACK_AUTO_FINISHED)) return 0;
+    wl_columnar_eval_plan_numeric_phase_t phase = n->phase ==
+        WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_PENDING ? n->pending_action :
+        n->phase;
+    if (phase == WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_UNARY_CHILD) {
+        unsigned stage = frame->filter.stage;
+        if (stage != WL_COLUMNAR_FILTER_STAGE_JOIN_DECIDE
+            && stage != WL_COLUMNAR_FILTER_STAGE_CONTROL
+            && stage != WL_COLUMNAR_FILTER_STAGE_FINISH
+            && stage != WL_COLUMNAR_FILTER_STAGE_RESET
+            && stage != WL_COLUMNAR_FILTER_STAGE_DONE) return 0;
+    } else if (phase != WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_UNARY_ACK
+        && phase != WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_UNARY_ADVANCE
+        && phase != WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_RELEASE
+        && phase != WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_DONE) return 0;
+    return ctx->primary_result;
+}
+
+bool
+wl_columnar_eval_stack_auto_cleanup_current(const wl_col_session_t *session)
+{
+    const wl_columnar_eval_stack_cleanup_frame_t *frame = session
+        ? session->cleanup_active : NULL;
+    if (!wl_columnar_eval_stack_unary_frame_valid(frame)
+        || frame->session != session) return false;
+    const wl_columnar_eval_serial_framed_attempt_t *ctx = &frame->framed;
+    if (!ctx->thread_valid || !ctx->child.thread_valid) return false;
+#if defined(WL_HAVE_C11_THREADS)
+    return thrd_equal(ctx->owner_thread, thrd_current())
+           && thrd_equal(ctx->child.owner_thread, thrd_current());
+#elif defined(_WIN32) || defined(_WIN64)
+    return ctx->owner_thread == GetCurrentThreadId()
+           && ctx->child.owner_thread == GetCurrentThreadId();
+#else
+    return pthread_equal(ctx->owner_thread, pthread_self())
+           && pthread_equal(ctx->child.owner_thread, pthread_self());
+#endif
+}
+
+int
+wl_columnar_eval_stack_auto_cleanup_shape(const wl_col_session_t *session,
+    const wl_columnar_eval_serial_framed_attempt_t *ctx)
+{
+    const wl_columnar_eval_stack_cleanup_frame_t *frame = session
+        ? session->cleanup_active : NULL;
+    if (!wl_columnar_eval_stack_unary_frame_valid(frame)
+        || frame->session != session || ctx != &frame->framed
+        || frame->prepared_unary) return EINVAL;
+    const wl_columnar_eval_plan_numeric_attempt_t *n = &ctx->child;
+    if (!ctx->phase || ctx->phase > WL_COLUMNAR_EVAL_SERIAL_FRAMED_PENDING
+        || !n->composed_mode || n->composed_busy
+        || n->runtime_depth > COL_STACK_MAX ||
+        n->preflight_depth > COL_STACK_MAX
+        || n->cursor < n->begin || n->cursor >= n->end
+        || !n->plan || n->end > n->plan->op_count
+        || n->source_initialized || n->source_bare || n->join_host
+        || n->join_host_admitted || n->join_host_governor || n->lftj.identity
+        || n->lftj_metadata.phase != WL_COLUMNAR_LFTJ_METADATA_INERT)
+        return EINVAL;
+    wl_columnar_eval_plan_numeric_phase_t phase = n->phase ==
+        WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_PENDING ? n->pending_action :
+        n->phase;
+    if (phase == WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_UNARY_CHILD) {
+        const wl_columnar_filter_context_t *c = &frame->filter;
+        const wl_columnar_eval_stack_auto_t *a =
+            &((const wl_columnar_eval_stack_allocation_t *)frame)->automatic;
+        if (c->identity != c || c->frame != frame || c->session != session
+            || c->busy || !c->thread_valid || c->attempt_id != ctx->attempt_id)
+            return EINVAL;
+        if (c->stage == WL_COLUMNAR_FILTER_STAGE_JOIN_DECIDE
+            && (!c->pin_owned || !c->join_decision_pending
+            || c->join_operation != a->operation || c->control != ctx->control
+            || c->join_disposition != WL_COLUMNAR_JOIN_DISPOSITION_REPLACE
+            || c->committed || frame->unary_committed || !c->execution_result
+            || c->execution_result != c->semantic_result)) return EINVAL;
+    }
+    return 0;
+}
+
+int
+wl_columnar_eval_stack_auto_cleanup_ready(const wl_col_session_t *session)
+{
+    const wl_columnar_eval_stack_cleanup_frame_t *frame = session
+        ? session->cleanup_active : NULL;
+    if (!wl_columnar_eval_stack_unary_frame_valid(frame)
+        || frame->session != session || frame->prepared_unary) return EINVAL;
+    const wl_columnar_eval_serial_framed_attempt_t *ctx = &frame->framed;
+    const wl_columnar_eval_plan_numeric_attempt_t *n = &ctx->child;
+    if (!ctx->thread_valid || !n->thread_valid) return EBUSY;
+#if defined(WL_HAVE_C11_THREADS)
+    if (!thrd_equal(ctx->owner_thread, thrd_current())
+        || !thrd_equal(n->owner_thread, thrd_current())) return EBUSY;
+#elif defined(_WIN32) || defined(_WIN64)
+    if (ctx->owner_thread != GetCurrentThreadId()
+        || n->owner_thread != GetCurrentThreadId()) return EBUSY;
+#else
+    if (!pthread_equal(ctx->owner_thread, pthread_self())
+        || !pthread_equal(n->owner_thread, pthread_self())) return EBUSY;
+#endif
+    if (!ctx->phase || ctx->phase > WL_COLUMNAR_EVAL_SERIAL_FRAMED_PENDING
+        || !n->composed_mode || n->composed_busy
+        || n->runtime_depth > COL_STACK_MAX
+        || n->preflight_depth > COL_STACK_MAX
+        || n->cursor < n->begin || n->cursor >= n->end
+        || !n->plan || n->end > n->plan->op_count
+        || n->source_initialized || n->source_bare || n->join_host
+        || n->join_host_admitted || n->join_host_governor || n->lftj.identity
+        || n->lftj_metadata.phase != WL_COLUMNAR_LFTJ_METADATA_INERT)
+        return EINVAL;
+    wl_columnar_eval_plan_numeric_phase_t phase = n->phase ==
+        WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_PENDING ? n->pending_action :
+        n->phase;
+    if (phase == WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_UNARY_CHILD) {
+        const wl_columnar_filter_context_t *c = &frame->filter;
+        const wl_columnar_eval_stack_auto_t *a =
+            &((const wl_columnar_eval_stack_allocation_t *)frame)->automatic;
+        if (c->identity != c || c->frame != frame || c->session != session
+            || c->busy || !c->thread_valid || c->attempt_id != ctx->attempt_id)
+            return EINVAL;
+        if (c->stage == WL_COLUMNAR_FILTER_STAGE_JOIN_DECIDE
+            && (!c->pin_owned || !c->join_decision_pending
+            || c->join_operation != a->operation || c->control != ctx->control
+            || c->join_disposition != WL_COLUMNAR_JOIN_DISPOSITION_REPLACE
+            || c->committed || frame->unary_committed || !c->execution_result
+            || c->execution_result != c->semantic_result)) return EINVAL;
+    }
+    return 0;
 }
 
 int
