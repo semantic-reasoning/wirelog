@@ -120,8 +120,10 @@ unchanged(wl_session_t *s, unsigned source, const source_image_t *before,
     if (exact) CHECK(after.relation == before->relation
             && wl_columnar_relation_snapshot_equal(before->snapshot,
             after.snapshot));
+    size_t cells = (size_t)after.rows * after.width;
+    CHECK(cells <= sizeof(after.values) / sizeof(after.values[0]));
     CHECK(!memcmp(after.values, before->values,
-        after.rows * after.width * sizeof(int64_t)));
+        cells * sizeof(after.values[0])));
     for (unsigned r = 0; after.timestamped && r < after.rows; ++r) {
         const col_delta_timestamp_t *a = &after.stamps[r],
             *b = &before->stamps[r];

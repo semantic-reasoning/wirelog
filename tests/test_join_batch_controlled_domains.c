@@ -358,7 +358,11 @@ trial(fixture_t *f, uint64_t limit, unsigned turn, bool short_one)
         sort_width = f->width;
         qsort(actual, count, f->width * sizeof(int64_t), row_order);
         qsort(expected, count, f->width * sizeof(int64_t), row_order);
-        CHECK(!memcmp(actual, expected, count * f->width * sizeof(int64_t)));
+        CHECK(!f->width || (size_t)count <= SIZE_MAX / (size_t)f->width);
+        size_t count_cells = (size_t)count * f->width;
+        CHECK(count_cells <= cells &&
+            count_cells <= SIZE_MAX / sizeof(*actual));
+        CHECK(!memcmp(actual, expected, count_cells * sizeof(*actual)));
         if (expected_count) CHECK(batches >= 3);
     }
     CHECK(!col_join_batch_control_discard(&producer) && !producer);
@@ -403,7 +407,10 @@ raw_reference(fixture_t *f)
     sort_width = f->width;
     qsort(actual, count, f->width * sizeof(int64_t), row_order);
     qsort(expected, count, f->width * sizeof(int64_t), row_order);
-    CHECK(!memcmp(actual, expected, count * f->width * sizeof(int64_t)));
+    CHECK(!f->width || (size_t)count <= SIZE_MAX / (size_t)f->width);
+    size_t count_cells = (size_t)count * f->width;
+    CHECK(count_cells <= cells && count_cells <= SIZE_MAX / sizeof(*actual));
+    CHECK(!memcmp(actual, expected, count_cells * sizeof(*actual)));
     col_rel_destroy(out); free(actual); free(expected);
 }
 
