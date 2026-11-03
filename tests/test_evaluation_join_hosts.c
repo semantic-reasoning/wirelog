@@ -1155,6 +1155,7 @@ metadata_refusal(setup_fixture_t *s, uint64_t limit, uint64_t paid)
 
 static setup_fixture_t *metadata_fixture;
 static unsigned metadata_starts, metadata_steps, metadata_acks;
+static bool metadata_cancel;
 
 static void
 metadata_checkpoint(wl_evaluation_control_t *control, unsigned event,
@@ -1177,6 +1178,55 @@ metadata_checkpoint(wl_evaluation_control_t *control, unsigned event,
         && !wl_evaluation_control_attach(grant, &owner)
         && !wl_evaluation_control_begin(grant, &owner));
     uint64_t id = wl_evaluation_control_active_attempt_id(grant);
+    wl_col_session_t *session = (wl_col_session_t *)s->fixture.session;
+    wl_columnar_eval_stack_cleanup_frame_t *nested = NULL;
+    wl_columnar_eval_cleanup_receipt_key_t key, sentinel;
+    memset(&key, 0xa5, sizeof(key));
+    sentinel = key;
+    uint64_t next_id = session->cleanup_receipt_next_id;
+    uint64_t next_epoch = session->cleanup_receipt_next_plan_epoch;
+    uint64_t generation_before = session->cleanup_receipt_session_generation;
+    uint64_t reserved = session->cleanup_reserved_bytes;
+    uint32_t active_count = session->cleanup_active_count;
+    wl_columnar_eval_cleanup_receipt_t receipts[
+        sizeof(session->cleanup_receipts) /
+        sizeof(session->cleanup_receipts[0])];
+    memcpy(receipts, session->cleanup_receipts, sizeof(receipts));
+    CHECK(wl_columnar_eval_stack_cleanup_begin(session, &nested) == EBUSY);
+    CHECK(wl_columnar_eval_stack_cleanup_begin_attempt_controlled(session,
+        &nested, grant, id) == EBUSY);
+    CHECK(wl_columnar_eval_stack_cleanup_begin_attempt_controlled(session,
+        &nested, NULL, 0) == EBUSY);
+    CHECK(wl_columnar_eval_stack_cleanup_begin_receipted_attempt_controlled(
+            session, &nested, grant, id, 1, &key) == EBUSY);
+    CHECK(!nested && !memcmp(&key, &sentinel, sizeof(key))
+        && session->cleanup_active == s->frame
+        && session->cleanup_active_count == active_count
+        && session->cleanup_reserved_bytes == reserved
+        && session->cleanup_receipt_next_id == next_id
+        && session->cleanup_receipt_next_plan_epoch == next_epoch
+        && session->cleanup_receipt_session_generation == generation_before
+        && !memcmp(receipts, session->cleanup_receipts, sizeof(receipts)));
+    uint64_t grant_work;
+    CHECK(!wl_evaluation_control_test_active_consumed(grant, id, &grant_work)
+        && !grant_work);
+    CHECK(wl_columnar_eval_stack_cleanup_begin(NULL, &nested) == EINVAL);
+    CHECK(wl_columnar_eval_stack_cleanup_begin_receipted_attempt_controlled(
+            session, &nested, grant, id, 0, &key) == EINVAL);
+    CHECK(!memcmp(&key, &sentinel, sizeof(key)));
+    wl_columnar_eval_stack_cleanup_frame_t *existing = s->frame;
+    CHECK(wl_columnar_eval_stack_cleanup_begin(session, NULL) == EINVAL);
+    CHECK(wl_columnar_eval_stack_cleanup_begin(session, &existing) == EINVAL);
+    CHECK(wl_columnar_eval_stack_cleanup_begin_attempt_controlled(session,
+        NULL, grant, id) == EINVAL);
+    CHECK(wl_columnar_eval_stack_cleanup_begin_attempt_controlled(session,
+        &existing, grant, id) == EINVAL);
+    CHECK(wl_columnar_eval_stack_cleanup_begin_receipted_attempt_controlled(
+            session, &existing, grant, id, 1, &key) == EINVAL);
+    CHECK(wl_columnar_eval_stack_cleanup_begin_receipted_attempt_controlled(
+            session, &nested, grant, id, 1, NULL) == EINVAL);
+    CHECK(existing == s->frame && !nested
+        && !memcmp(&key, &sentinel, sizeof(key)));
     CHECK(wl_columnar_eval_plan_numeric_composed_attempt_step(&s->record,
         grant, id) == EBUSY);
     CHECK(wl_columnar_join_pipeline_numeric_step(&s->record, grant, id)
@@ -1190,6 +1240,28 @@ metadata_checkpoint(wl_evaluation_control_t *control, unsigned event,
         && report.consumed == 256);
     CHECK(!wl_evaluation_control_detach(grant, &owner));
     wl_evaluation_control_release(grant);
+    if (metadata_cancel) wl_evaluation_control_request_cancel(control);
+}
+
+static void
+metadata_nested_retry(setup_fixture_t *s)
+{
+    /* A parked stream permits nesting between consumer dispatches. */
+    wl_columnar_eval_stack_cleanup_frame_t *nested = NULL;
+    CHECK(!wl_columnar_eval_stack_cleanup_begin(
+            (wl_col_session_t *)s->fixture.session, &nested));
+    CHECK(!wl_columnar_eval_stack_cleanup_finish(&nested));
+    wl_columnar_eval_cleanup_receipt_key_t key;
+    wl_col_session_t *session = (wl_col_session_t *)s->fixture.session;
+    CHECK(!wl_columnar_eval_stack_cleanup_begin_receipted_attempt_controlled(
+            session, &nested, s->fixture.control, s->original, 1, &key));
+    CHECK(!wl_columnar_eval_stack_cleanup_receipt_prepare(nested, &key, 0,
+        false));
+    wl_columnar_eval_cleanup_outcome_t outcome;
+    CHECK(!wl_columnar_eval_stack_cleanup_finish_receipted(&nested, &key,
+        &outcome) && !nested
+        && outcome == WL_COLUMNAR_EVAL_CLEANUP_OUTCOME_FREED);
+    CHECK(!wl_columnar_eval_stack_cleanup_receipt_ack(session, &key));
 }
 
 static void
@@ -1207,6 +1279,7 @@ funding_metadata(void)
     metadata_starts = metadata_steps = metadata_acks = 0;
     wl_columnar_join_pipeline_test_numeric_checkpoint = metadata_checkpoint;
     unsigned consumers = 0;
+    bool parked_nested = false;
     for (unsigned turns = 0; s.record.phase !=
         WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_DONE; ++turns) {
         CHECK(turns < 100000);
@@ -1218,6 +1291,15 @@ funding_metadata(void)
         if (!consumer) {
             CHECK(!setup_turn(&s, 0)); continue;
         }
+        const col_rel_t *input;
+        uint64_t generation;
+        bool schema;
+        const wl_plan_op_t *op;
+        if (!parked_nested && !wl_columnar_join_pipeline_test_stream_view(
+                &s.record, &input, &generation, &schema, &op)) {
+            metadata_nested_retry(&s);
+            parked_nested = true;
+        }
         metadata_refusal(&s, 383, 0);
         metadata_refusal(&s, 639, 384);
         /* Exactly640 paid metadata precedes the isolated383/384 child fee. */
@@ -1228,9 +1310,26 @@ funding_metadata(void)
     }
     wl_columnar_join_pipeline_test_numeric_checkpoint = NULL;
     metadata_fixture = NULL;
-    CHECK(consumers > 64 && metadata_starts > 1 && metadata_steps
+    CHECK(parked_nested && consumers > 64 && metadata_starts > 1 &&
+        metadata_steps
         && metadata_acks == metadata_starts);
     setup_close_result(&s, 0);
+}
+
+static void
+funding_metadata_cancel(void)
+{
+    setup_fixture_t s; setup_begin(&s); metadata_ready(&s);
+    metadata_fixture = &s;
+    metadata_starts = metadata_steps = metadata_acks = 0;
+    metadata_cancel = true;
+    wl_columnar_join_pipeline_test_numeric_checkpoint = metadata_checkpoint;
+    setup_close_result(&s, WL_EVALUATION_CONTROL_CANCELLED);
+    wl_columnar_join_pipeline_test_numeric_checkpoint = NULL;
+    metadata_fixture = NULL;
+    metadata_cancel = false;
+    CHECK(metadata_starts == 1 && metadata_steps
+        && metadata_acks == metadata_starts);
 }
 
 static void *
@@ -1428,7 +1527,7 @@ static void
 funding(void)
 {
     funding_setup(); funding_setup_turnover();
-    funding_metadata(); funding_metadata_authority();
+    funding_metadata(); funding_metadata_cancel(); funding_metadata_authority();
     funding_composed(); funding_public();
 }
 

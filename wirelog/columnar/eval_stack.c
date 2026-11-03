@@ -398,7 +398,8 @@ wl_columnar_eval_stack_cleanup_begin(wl_col_session_t *sess,
     if (!sess || !out || *out)
         return EINVAL;
     if (sess->cleanup_active &&
-        sess->cleanup_active->prepared_unary) return EBUSY;
+        (sess->cleanup_active->prepared_unary ||
+        sess->cleanup_active->stream_dispatch)) return EBUSY;
     if (sess->cleanup_pending)
         return EBUSY;
     if (sess->cleanup_active_count >= WL_COLUMNAR_EVAL_STACK_CLEANUP_MAX_FRAMES
@@ -464,7 +465,7 @@ wl_columnar_eval_stack_cleanup_begin(wl_col_session_t *sess,
  * F56 rounded64 includes all marker/pointer/retirement-selection/abort/return
  * decisions and full move40; only allocator, original physical-credit-ref
  * retirement internals, control internals and instrumentation are excluded.
- * ENTRY103<=112, SETUP135<=144, RESERVE156<=192, ALLOC128<=144,
+ * ENTRY104<=112, SETUP135<=144, RESERVE156<=192, ALLOC128<=144,
  * ZERO202<=208, TOKEN125<=128 (self/IDLE/segment-owner stores3), MOVE161<=176, COMMIT104<=128,
  * EXTERNAL133<=144 including BOTH T29 tails on one debit. Six terminal
  * publication slots include active_count arithmetic/store2, no later hook.
@@ -472,7 +473,7 @@ wl_columnar_eval_stack_cleanup_begin(wl_col_session_t *sess,
  * setup/transitions, tail and NEXT refused debit through full F64.
  * Nested reserve last-poll return84+status19+T29+R10+C13+refusal3+F64=222;
  * nested commit final4+rc3+check6+C13+refusal3+F64=93. Conservative240.
- * Read-only invalid/first-refused bootstrap<=28 may run at consumed0.
+ * Read-only invalid/first-refused bootstrap<=29 may run at consumed0.
  * Ungoverned928+224*N; governed1726+224*N, one failed total CAS adds84;
  * N=ceil(actual frame bytes/16). No unfinished frame field is inspected. */
 enum {
@@ -588,7 +589,8 @@ wl_columnar_eval_stack_cleanup_begin_attempt_controlled(wl_col_session_t *sess,
     if (!sess || !out || *out)
         return EINVAL;
     if (sess->cleanup_active &&
-        sess->cleanup_active->prepared_unary) return EBUSY;
+        (sess->cleanup_active->prepared_unary ||
+        sess->cleanup_active->stream_dispatch)) return EBUSY;
     int rc = wl_columnar_eval_stack_attempt_charge(control, attempt_id,
             WL_COLUMNAR_EVAL_STACK_ENTRY_WORK);
     if (rc)
@@ -2566,7 +2568,8 @@ wl_columnar_eval_stack_cleanup_begin_receipted_attempt_controlled(
     if (!session || !out || *out || !operation_id || !key)
         return EINVAL;
     if (session->cleanup_active &&
-        session->cleanup_active->prepared_unary) return EBUSY;
+        (session->cleanup_active->prepared_unary ||
+        session->cleanup_active->stream_dispatch)) return EBUSY;
     memset(key, 0, sizeof(*key));
     int rc = wl_columnar_eval_stack_cleanup_receipt_reserve(session,
             operation_attempt_id, operation_id, key);
