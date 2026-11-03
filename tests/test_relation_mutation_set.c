@@ -2795,6 +2795,11 @@ dedup_append_tests(void)
         }
         col_rel_t *delta = NULL;
         uint32_t keep = 0;
+        /* A worker image may arrive with runs covering only the canonical
+         * prefix (#2240).  Dedup reorders the tail, so it must leave the
+         * image without runs, as commit requires. */
+        image->run_count = 1;
+        image->run_ends[0] = EXISTING;
         uint64_t before = wl_columnar_relation_test_mutation_nonce_peek();
         assert(wl_columnar_eval_test_dedup_append(image, EXISTING, ref,
             &delta, &keep) == 0);
@@ -2804,6 +2809,7 @@ dedup_append_tests(void)
          * most a few more. */
         assert(acquisitions >= 1 && acquisitions <= 16);
         assert(keep == EXISTING + NEW && delta && delta->nrows == NEW);
+        assert(image->run_count == 0 && image->run_ends[0] == 0);
         for (uint32_t j = 0; j < NEW; j++) {
             assert(image->columns[0][EXISTING + j] == 10000 + (int64_t)j
                 && image->columns[1][EXISTING + j] == (int64_t)j);

@@ -409,6 +409,124 @@ done:
     }
 }
 
+/* #2240: a worker source can hold sorted runs that interleave and cover only
+ * a canonical prefix, followed by an appended tail.  Do what the worker does
+ * -- prepare, consolidate the tail into the image, commit -- and check the
+ * published relation: every value exactly once, every run strictly ascending,
+ * and runs that end at the last row.  Before the image kept the prefix runs,
+ * the consolidation treated the interleaved prefix as one sorted run and
+ * published an existing row again once the prefix was large enough for the
+ * binary-search path (64 and 256 rows here; 4 rows take the merge path). */
+enum { PREFIX_TAIL_DUPLICATE, PREFIX_TAIL_NOVEL, PREFIX_TAIL_SORTED };
+
+static void
+check_prefix_runs_with_tail(uint32_t prefix_rows, int kind)
+{
+    char label[96];
+    snprintf(label, sizeof(label), "prefix runs + tail: prefix=%u kind=%d",
+        prefix_rows, kind);
+    wl_columnar_memory_resolution_t resolution;
+    make_resolution(&resolution, UINT64_C(1) << 24);
+    wl_columnar_memory_governor_ref_t *ref
+        = wl_columnar_memory_governor_ref_create(&resolution);
+    col_rel_t *source = col_rel_new_auto("prefix-runs-source", 1);
+    col_rel_t *delta = col_rel_new_auto("prefix-runs-delta", 1);
+    col_rel_mutable_image_t txn = { 0 };
+    uint32_t half = prefix_rows / 2u;
+    bool ok = ref && source && delta;
+    /* Values 1..2h.  Two runs interleave: evens, then odds.  The sorted
+     * control holds them as one run. */
+    for (uint32_t i = 0; ok && i < 2u * half; i++) {
+        int64_t v = kind == PREFIX_TAIL_SORTED ? (int64_t)i + 1
+            : i < half ? 2 * ((int64_t)i + 1)
+            : 2 * (int64_t)(i - half) + 1;
+        ok = col_rel_append_row(source, &v) == 0;
+    }
+    int64_t tail = kind == PREFIX_TAIL_NOVEL ? 0 : 2;
+    ok = ok && col_rel_append_row(source, &tail) == 0
+        && col_rel_attach_memory_governor(source, ref) == 0
+        && col_rel_reserve_merge_grid(source, source->nrows + 8u) == 0;
+    CHECK(ok, "prefix runs + tail fixture");
+    if (!ok)
+        goto done;
+    if (kind == PREFIX_TAIL_SORTED) {
+        source->run_count = 1;
+        source->run_ends[0] = 2u * half;
+    } else {
+        source->run_count = 2;
+        source->run_ends[0] = half;
+        source->run_ends[1] = 2u * half;
+    }
+    source->sorted_nrows = 2u * half;
+
+    int fast = 0;
+    int rc = col_rel_mutable_image_prepare(source, &txn);
+    col_rel_t *image = col_rel_mutable_image_get(&txn);
+    if (rc == 0 && image)
+        rc = col_op_consolidate_incremental_delta(image, 2u * half, delta,
+                &fast);
+    if (rc == 0 && image)
+        rc = col_rel_mutable_image_commit(&txn);
+    else if (image)
+        col_rel_mutable_image_discard(&txn);
+    if (rc != 0) {
+        fprintf(stderr, "FAIL: %s: prepare/consolidate/commit rc=%d\n",
+            label, rc);
+        failures++;
+        goto done;
+    }
+
+    uint32_t want_rows = 2u * half + (kind == PREFIX_TAIL_NOVEL ? 1u : 0u);
+    uint32_t want_delta = kind == PREFIX_TAIL_NOVEL ? 1u : 0u;
+    bool rows_ok = source->nrows == want_rows && delta->nrows == want_delta
+        && (want_delta == 0 || delta->columns[0][0] == 0);
+    uint32_t seen[513] = { 0 };
+    for (uint32_t r = 0; rows_ok && r < source->nrows; r++) {
+        int64_t v = source->columns[0][r];
+        if (v < 0 || v > (int64_t)(2u * half))
+            rows_ok = false;
+        else
+            seen[v]++;
+    }
+    for (uint32_t v = kind == PREFIX_TAIL_NOVEL ? 0u : 1u;
+        rows_ok && v <= 2u * half; v++)
+        rows_ok = seen[v] == 1;
+    bool runs_ok = source->run_count >= 1
+        && source->run_ends[source->run_count - 1] == source->nrows;
+    for (uint32_t k = 0; runs_ok && k < source->run_count; k++) {
+        uint32_t begin = k ? source->run_ends[k - 1] : 0;
+        uint32_t end = source->run_ends[k];
+        runs_ok = end > begin;
+        for (uint32_t r = begin + 1; runs_ok && r < end; r++)
+            runs_ok = source->columns[0][r - 1] < source->columns[0][r];
+    }
+    if (!rows_ok || !runs_ok) {
+        fprintf(stderr, "FAIL: %s: nrows=%u (want %u) delta=%u (want %u) "
+            "rows_ok=%d runs_ok=%d run_count=%u\n", label, source->nrows,
+            want_rows, delta->nrows, want_delta, rows_ok, runs_ok,
+            source->run_count);
+        failures++;
+    }
+done:
+    if (source)
+        col_rel_destroy(source);
+    if (delta)
+        col_rel_destroy(delta);
+    if (ref)
+        wl_columnar_memory_governor_ref_release(ref);
+}
+
+static void
+test_mutable_image_prefix_runs_with_tail(void)
+{
+    static const uint32_t prefixes[] = { 4, 64, 256 };
+    for (size_t i = 0; i < sizeof(prefixes) / sizeof(prefixes[0]); i++) {
+        check_prefix_runs_with_tail(prefixes[i], PREFIX_TAIL_DUPLICATE);
+        check_prefix_runs_with_tail(prefixes[i], PREFIX_TAIL_NOVEL);
+        check_prefix_runs_with_tail(prefixes[i], PREFIX_TAIL_SORTED);
+    }
+}
+
 static void
 test_mutable_image_pool_name_handoff(void)
 {
@@ -4799,6 +4917,7 @@ main(void)
     test_growth_error_provenance();
     test_mutable_image_transaction();
     test_mutable_image_pool_name_handoff();
+    test_mutable_image_prefix_runs_with_tail();
     test_dedup_attach_init_growth_and_clear();
     test_dedup_full_probe_and_malformed_shape();
     test_dedup_growth_rehash_collision_and_duplicate();

@@ -17034,6 +17034,141 @@ cleanup:
 }
 #endif
 
+#ifdef WL_SESSION_TEST_HOOKS
+/* #2240: before the worker consolidates its tail into the private image, it
+ * requires the image's runs to end where the pass started.  Rows of the
+ * prefix outside every run would otherwise be folded into one unsorted run
+ * and could be published again.  Force the mismatch on every worker image
+ * that takes the consolidation branch and check the worker refuses with
+ * EINVAL, leaves its published relation as it was, and fails the step. */
+#define RUN_GUARD_SLOTS 64
+static struct {
+    wl_mutex_t mutex;
+    uint32_t forced;
+    uint32_t refused;
+    uint32_t other;
+    uint32_t count;
+    const col_rel_t *source[RUN_GUARD_SLOTS];
+    uint32_t nrows[RUN_GUARD_SLOTS];
+    uint64_t generation[RUN_GUARD_SLOTS];
+} run_guard;
+
+static int
+run_guard_before_dedup(wl_col_session_t *sess, col_rel_t *r,
+    col_rel_t *image, col_rel_t *delta)
+{
+    (void)sess;
+    (void)delta;
+    if (!image || image->dedup_slots || image->nrows == 0)
+        return 0;
+    wl_mutex_lock(&run_guard.mutex);
+    if (run_guard.count < RUN_GUARD_SLOTS) {
+        run_guard.source[run_guard.count] = r;
+        run_guard.nrows[run_guard.count] = r->nrows;
+        run_guard.generation[run_guard.count] = r->view_generation;
+        run_guard.count++;
+        if (image->run_count == 0)
+            image->run_count = 1;
+        /* The tail has rows, so the pass started below nrows. */
+        image->run_ends[image->run_count - 1] = image->nrows;
+        run_guard.forced++;
+    }
+    wl_mutex_unlock(&run_guard.mutex);
+    return 0;
+}
+
+static void
+run_guard_after_dedup(wl_col_session_t *sess, col_rel_t *r, int rc)
+{
+    (void)sess;
+    wl_mutex_lock(&run_guard.mutex);
+    for (uint32_t i = 0; i < run_guard.count; i++) {
+        if (run_guard.source[i] != r)
+            continue;
+        if (rc == EINVAL && r->nrows == run_guard.nrows[i]
+            && r->view_generation == run_guard.generation[i])
+            run_guard.refused++;
+        else
+            run_guard.other++;
+        run_guard.source[i] = NULL;
+        break;
+    }
+    wl_mutex_unlock(&run_guard.mutex);
+}
+
+static void
+test_worker_image_run_guard(void)
+{
+    static const int64_t chain[][2] = {
+        { 1, 2 }, { 2, 3 }, { 3, 4 }, { 4, 5 }, { 5, 6 }, { 6, 7 }
+    };
+    const char *saved = getenv("WIRELOG_TDD_MIN_ROWS_PER_WORKER");
+    char saved_value[32] = "";
+    wl_session_t *session = NULL;
+    wl_plan_t *plan = NULL;
+    int rc = 0;
+
+    TEST("worker refuses an image whose runs end past the pass start");
+    if (saved)
+        snprintf(saved_value, sizeof(saved_value), "%s", saved);
+    if (wl_mutex_init(&run_guard.mutex) != 0) {
+        FAIL("guard probe mutex");
+        return;
+    }
+#ifdef _WIN32
+    (void)_putenv_s("WIRELOG_TDD_MIN_ROWS_PER_WORKER", "1");
+#else
+    (void)setenv("WIRELOG_TDD_MIN_ROWS_PER_WORKER", "1", 1);
+#endif
+    plan = build_plan(".decl e(x: int64, y: int64)\n"
+            ".decl p(x: int64, y: int64)\n"
+            "p(x,y) :- e(x,y).\n"
+            "p(x,w) :- p(x,y), p(y,z), p(z,w).\n");
+    rc = plan ? wl_session_create(wl_backend_columnar(), plan, 2, &session)
+              : ENOMEM;
+    for (size_t i = 0; rc == 0 && i < sizeof(chain) / sizeof(chain[0]); i++)
+        rc = wl_session_insert(session, "e", chain[i], 1, 2);
+    if (rc == 0) {
+        wl_columnar_eval_test_before_worker_dedup = run_guard_before_dedup;
+        wl_columnar_eval_test_after_worker_dedup = run_guard_after_dedup;
+        rc = wl_session_step(session);
+        wl_columnar_eval_test_before_worker_dedup = NULL;
+        wl_columnar_eval_test_after_worker_dedup = NULL;
+    } else {
+        rc = -rc - 1000;
+    }
+    wl_mutex_lock(&run_guard.mutex);
+    uint32_t forced = run_guard.forced;
+    uint32_t refused = run_guard.refused;
+    uint32_t other = run_guard.other;
+    wl_mutex_unlock(&run_guard.mutex);
+    if (session)
+        wl_session_destroy(session);
+    if (plan)
+        wl_plan_free(plan);
+#ifdef _WIN32
+    (void)_putenv_s("WIRELOG_TDD_MIN_ROWS_PER_WORKER",
+        saved ? saved_value : "");
+#else
+    if (saved)
+        (void)setenv("WIRELOG_TDD_MIN_ROWS_PER_WORKER", saved_value, 1);
+    else
+        (void)unsetenv("WIRELOG_TDD_MIN_ROWS_PER_WORKER");
+#endif
+    wl_mutex_destroy(&run_guard.mutex);
+    if (forced == 0) {
+        FAIL("no worker image reached the consolidation branch");
+    } else if (rc != EINVAL || refused != forced || other != 0) {
+        printf(" (rc=%d forced=%u refused=%u other=%u)", rc, forced,
+            refused, other);
+        FAIL("worker consolidated an image whose runs disagree with the "
+            "pass start");
+    } else {
+        PASS();
+    }
+}
+#endif
+
 int
 main(void)
 {
@@ -17046,6 +17181,7 @@ main(void)
     }
     test_plain_step_ordinary_error(true, 0);
     test_plain_step_ordinary_error(true, 1);
+    test_worker_image_run_guard();
 #endif
 #ifdef WL_SESSION_TEST_HOOKS
     test_governed_retraction_transaction();
