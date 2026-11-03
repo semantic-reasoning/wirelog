@@ -1722,3 +1722,33 @@ passing entry threshold certifies the unchanged helper interiors.
 Plain, controlled and receipted cleanup constructors reject an active stream dispatch with `EBUSY` after their existing argument validation. The refusal precedes allocation, work debit and receipt output normalization, preserving the active frame and receipt counters. Between dispatches, a parked stream still permits nested cleanup; the caller must finish the nested frame before resuming its parent.
 
 The additional entry predicate changes the controlled source count from 103 to 104 within the existing 112 envelope and 128 work fee; the read-only bootstrap bound is 29. Successful receipted delegation executes both the wrapper and delegated entry predicates. The receipt reservation generation CAS retry remains outside any claimed fixed whole-wrapper bound. Complete consumer/forward/cleanup containing qualification remains open.
+
+### Stream START first-boundary qualification
+
+The callback-free NONE probe proof now omits only a redundant private-binding
+getter after the real stack/native/frame proof; explicit session/control/ID
+checks and the full non-NULL getter remain. There is no new fee or grant.
+See SEMANTICS, "Stream START first-admission and ownerless completion", for the
+unique source/payment allocation: FILTER/MAP344, fixed activation64, mandatory
+stopped suffix192; probe NONE358 and stopped suffix168; empty host259/384,
+empty child80 within a separate prepaid128 if present, and separate ACK363/384.
+The proposed empty-host256 ceiling was insufficient for ABORT/DONE branches;
+259 fits the unchanged384 fee. No actual fee excess is waived.
+
+Genuine host tests calibrate the first nonempty FILTER and MAP START, exercise
+first224 one-short/exact and lifecycle k0..10 exact/next-one-short boundaries,
+then verify initialized ownership flags, ten empty child steps and one ACK,
+source snapshots, cancellation, saved-generation turnover with zero successor
+work, and complete resource cleanup. Probe session tests exercise SEMI/ANTI
+first192 one-short/exact and cancellation, followed by real reset/retry and
+literal/raw parity; ownerless refusal legitimately restores with zero ACK.
+A real bound READY compatibility call exercises the changed legacy wrapper's
+non-NULL path (the normal funded adapter bypasses that wrapper), with private
+RHS/public-shadow canaries, actual native/copy/session/ID refusals and stale
+bindings rejected by a fresh constructor. No phase, ownership or generation is
+seeded to reach these states.
+
+This qualifies the first boundary and fixed ownerless completion only.
+Successful nonempty START/STEP and owner retirement, forwarding/cleanup/direct
+routes, automatic publication/FINISH, configured policy/caps and general
+transaction intersections remain OPEN.

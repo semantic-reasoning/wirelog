@@ -4,6 +4,7 @@
 #include "../wirelog/exec_plan_gen.h"
 #include "../wirelog/session.h"
 #include "../wirelog/session_options.h"
+#include "../wirelog/thread.h"
 #include "../wirelog/wirelog.h"
 #include <errno.h>
 #include <limits.h>
@@ -26,6 +27,48 @@ static bool stopped, work_stop;
 static int allocation_failure = -1;
 static bool deny_schema;
 static wl_columnar_memory_reservation_t peer;
+static unsigned first_probe_op, first_probe_mode, first_probe_followups,
+    first_probe_acks;
+static uint64_t first_probe_limit, first_probe_prefix, first_probe_paid;
+static bool first_probe_found, first_probe_inert_start;
+
+static void
+first_probe_checkpoint(wl_evaluation_control_t *control,
+    wl_columnar_eval_plan_numeric_attempt_t *record)
+{
+    if (!first_probe_mode) return;
+    if (first_probe_found) {
+        if (first_probe_mode >= 2) {
+            wl_columnar_filter_context_t *ctx = NULL;
+            CHECK(!wl_columnar_eval_stack_filter_context_owned(record->frame,
+                &ctx, record));
+            CHECK(ctx->stage != WL_COLUMNAR_FILTER_STAGE_INERT
+                && !ctx->program && !ctx->output && !ctx->private_output
+                && !ctx->unary_started && !ctx->source_initialized
+                && !ctx->batch_initialized && !ctx->join_right_initialized);
+            ++first_probe_followups;
+            if (ctx->stage == WL_COLUMNAR_FILTER_STAGE_DONE)
+                ++first_probe_acks;
+        }
+        return;
+    }
+    const col_rel_t *input;
+    const wl_plan_op_t *op;
+    uint64_t generation;
+    bool schema;
+    if (wl_columnar_join_pipeline_test_stream_view(record, &input, &generation,
+        &schema, &op) || op->op != first_probe_op || schema || !input->nrows)
+        return;
+    wl_columnar_filter_context_t *ctx = NULL;
+    CHECK(!wl_columnar_eval_stack_filter_context_owned(record->frame, &ctx,
+        record));
+    CHECK(ctx->stage == WL_COLUMNAR_FILTER_STAGE_INERT && !ctx->control
+        && !ctx->pin_owned && !ctx->program && !ctx->output);
+    first_probe_found = first_probe_inert_start = true;
+    CHECK(!wl_evaluation_control_test_active_consumed(control,
+        wl_evaluation_control_active_attempt_id(control), &first_probe_prefix));
+    if (first_probe_mode == 3) wl_evaluation_control_request_cancel(control);
+}
 
 static void
 stop(void)
@@ -89,6 +132,8 @@ host_checkpoint(wl_evaluation_control_t *control, unsigned event,
             CHECK(col_rel_append_row(right, &value) == EBUSY);
             ++probe_starts;
         }
+        /* Include the existing real source-validation debit in calibration. */
+        first_probe_checkpoint(control, &root->child);
     }
     if (event == stop_event) stop();
 }
@@ -274,8 +319,8 @@ run(unsigned kind, unsigned schema_stop, unsigned event_stop, bool work)
     wl_plan_t plan = *original;
     if (kind != 9) plan.strata = &stratum;
     else CHECK(plan.stratum_count > 1 || stratum.relation_count > 1);
-    CHECK(!wl_evaluation_control_create(work ? UINT64_C(1000000000) : 0,
-        &active));
+    CHECK(!wl_evaluation_control_create(first_probe_mode == 2
+        ? first_probe_limit : work ? UINT64_C(1000000000) : 0, &active));
     wl_columnar_memory_resolution_t resolution = {
         .budget_bytes = UINT64_C(512) << 20,
             .usable_bytes = UINT64_C(512) << 20,
@@ -323,6 +368,8 @@ run(unsigned kind, unsigned schema_stop, unsigned event_stop, bool work)
     active_session = controlled; ordinary_decline = kind == 10;
     bare_gate_case = kind == 17; bare_gate_starts = 0;
     probe_starts = refused_grants = paid_grants = 0; short_grant = true;
+    first_probe_found = first_probe_inert_start = false;
+    first_probe_followups = first_probe_acks = 0;
     if (funding_test) {
         wl_columnar_session_test_framed_grant_limit = funding_limit;
         wl_columnar_session_test_framed_grant_finished = funding_finished;
@@ -336,6 +383,26 @@ run(unsigned kind, unsigned schema_stop, unsigned event_stop, bool work)
     wl_columnar_join_test_attempt_fail_allocation = allocation_failure;
     int rc = finish(controlled);
     wl_columnar_join_test_attempt_fail_allocation = -1;
+    if (first_probe_mode >= 2) {
+        CHECK(first_probe_found && first_probe_inert_start
+            && (first_probe_paid ? first_probe_followups > 0 &&
+            first_probe_acks == 1
+                : !first_probe_followups && !first_probe_acks)
+            && rc == (first_probe_mode == 2 ? WL_EVALUATION_CONTROL_WORK_LIMIT
+                : WL_EVALUATION_CONTROL_CANCELLED));
+        wl_evaluation_control_report_t first_report;
+        CHECK(!wl_evaluation_control_report(active, &first_report)
+            && first_report.consumed == first_probe_prefix + first_probe_paid
+            && !session_find_rel((wl_col_session_t *)controlled, "output")
+            && !((wl_col_session_t *)controlled)->cleanup_active
+            && !((wl_col_session_t *)controlled)->cleanup_pending);
+        first_probe_mode = 0;
+        wl_columnar_session_test_framed_grant_finished = NULL;
+        CHECK(!wl_evaluation_control_reset(active));
+        CHECK(!wl_evaluation_control_configure(active, 0));
+        prepared = consumers = indexes = schemas = 0;
+        rc = finish(controlled);
+    }
     if (schema_stop || event_stop || allocation_failure >= 0 || deny_schema) {
         if ((schema_stop || event_stop) &&
             (!stopped ||
@@ -414,9 +481,194 @@ run(unsigned kind, unsigned schema_stop, unsigned event_stop, bool work)
     return report.consumed;
 }
 
+static void
+bound_probe_turn(wl_columnar_eval_plan_numeric_attempt_t *record,
+    wl_evaluation_control_t *funding, uint64_t id)
+{
+    CHECK(!(record->phase == WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_PENDING
+        ? wl_columnar_eval_plan_numeric_composed_consume_result(record, 0,
+        funding, id)
+        : wl_columnar_eval_plan_numeric_composed_attempt_step(record,
+        funding, id)));
+}
+
+static void *
+bound_probe_foreign_thread(void *argument)
+{
+    wl_columnar_eval_plan_numeric_attempt_t *record = argument;
+    wl_columnar_filter_status_t status = {0};
+    CHECK(wl_columnar_join_probe_op_attempt_start_owned(
+            &record->plan->ops[record->cursor], record->frame, record->session,
+            record->control, record->attempt_id, &status, record) == EINVAL);
+    return NULL;
+}
+
+static void
+bound_probe_compatibility(void)
+{
+    for (unsigned anti = 0; anti < 2; ++anti) {
+        wirelog_error_t error;
+        wirelog_program_t *program = wirelog_parse_string(
+            ".decl left(x:int64)\n.decl right(x:int64)\n"
+            ".decl output(x:int64)\noutput(x):-left(x),right(x).\n", &error);
+        wl_plan_t *plan = NULL;
+        CHECK(program && !wl_plan_from_program(program, &plan));
+        const char *key = "col0";
+        wl_plan_op_t ops[] = {
+            {.op = WL_PLAN_OP_VARIABLE, .relation_name = "left",
+             .delta_mode = WL_DELTA_FORCE_FULL},
+            {.op = anti ? WL_PLAN_OP_ANTIJOIN : WL_PLAN_OP_SEMIJOIN,
+             .right_relation = "right", .key_count = 1,
+             .left_keys = &key, .right_keys = &key},
+            {.op = WL_PLAN_OP_CONSOLIDATE}
+        };
+        wl_plan_relation_t body = plan->strata[0].relations[0];
+        body.ops = ops; body.op_count = 3;
+        wl_evaluation_control_t *original = NULL, *funding = NULL;
+        CHECK(!wl_evaluation_control_create(0, &original));
+        wl_session_options_t options; wl_session_options_init(&options);
+        options.evaluation_control = original;
+        wl_session_t *base = NULL;
+        CHECK(!wl_session_create_with_options(wl_backend_columnar(), plan, 1,
+            &options, &base));
+        wl_col_session_t *session = (wl_col_session_t *)base;
+        session->join_batch_bytes = 0; session->join_batch_strict = false;
+        int64_t shadow = 99, left[] = {1, 2}, right = 2;
+        const char *names[] = {"left", "right"};
+        col_rel_t *private_relations[2], *public_relations[2];
+        col_relation_snapshot_t snapshots[2];
+        for (unsigned i = 0; i < 2; ++i) {
+            CHECK(!wl_session_insert(base, names[i], &shadow, 1, 1));
+            public_relations[i] = session_find_rel(session, names[i]);
+            private_relations[i] = col_rel_new_like(names[i],
+                    public_relations[i]);
+            CHECK(private_relations[i]);
+            CHECK(!col_rel_append_rows_atomic(private_relations[i],
+                i ? &right : left, i ? 1 : 2, 1, NULL));
+            snapshots[i] = wl_columnar_relation_snapshot(private_relations[i]);
+        }
+        CHECK(!wl_evaluation_control_begin(original,
+            base->operation_admission));
+        uint64_t id = wl_evaluation_control_active_attempt_id(original);
+        wl_columnar_eval_stack_cleanup_frame_t *frame = NULL;
+        CHECK(!wl_columnar_eval_stack_cleanup_begin_attempt_controlled(session,
+            &frame, original, id));
+        int funding_owner;
+        CHECK(!wl_evaluation_control_create(0, &funding)
+            && !wl_evaluation_control_attach(funding, &funding_owner)
+            && !wl_evaluation_control_begin(funding, &funding_owner));
+        uint64_t fid = wl_evaluation_control_active_attempt_id(funding);
+        wl_columnar_eval_private_bindings_t bindings = {0};
+        CHECK(!wl_columnar_eval_private_bindings_begin(&bindings, session,
+            &body, original, id, names, private_relations, 2));
+        wl_columnar_eval_plan_numeric_attempt_t record;
+        wl_columnar_eval_plan_numeric_attempt_init(&record);
+        CHECK(!wl_columnar_eval_plan_numeric_composed_attempt_begin_bound(
+                &record, &body, 0, 3, frame, session, 0, original, id,
+                funding, fid, &bindings));
+        for (unsigned turn = 0; record.phase !=
+            WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_READY || record.cursor != 1;
+            ++turn) {
+            CHECK(turn < 10000);
+            bound_probe_turn(&record, funding, fid);
+        }
+        CHECK(record.private_bindings == &bindings);
+        wl_columnar_filter_status_t status;
+        memset(&status, 0, sizeof(status));
+        unsigned char status_before[sizeof(status)];
+        memcpy(status_before, &status, sizeof(status));
+        uint64_t original_before, original_after;
+        CHECK(!wl_evaluation_control_test_active_consumed(original, id,
+            &original_before));
+        wl_session_t *other = NULL;
+        CHECK(!wl_session_create(wl_backend_columnar(), plan, 1, &other));
+        CHECK(wl_columnar_join_probe_op_attempt_start_owned(&ops[1], frame,
+            (wl_col_session_t *)other, original, id, &status,
+            &record) == EINVAL);
+        CHECK(wl_columnar_join_probe_op_attempt_start_owned(&ops[1], frame,
+            session, funding, fid, &status, &record) == EINVAL);
+        CHECK(wl_columnar_join_probe_op_attempt_start_owned(&ops[1], frame,
+            session, original, id + 1, &status, &record) == EINVAL);
+        wl_columnar_eval_plan_numeric_attempt_t copy = record;
+        CHECK(wl_columnar_join_probe_op_attempt_start_owned(&ops[1], frame,
+            session, original, id, &status, &copy) == EBUSY);
+        wl_thread_t thread;
+        CHECK(!wl_thread_create(&thread, bound_probe_foreign_thread, &record)
+            && !wl_thread_join(&thread));
+        CHECK(!memcmp(status_before, &status, sizeof(status))
+            && !wl_evaluation_control_test_active_consumed(original, id,
+            &original_after) && original_after == original_before);
+        wl_session_destroy(other);
+        /* The normal funded parent bypasses this legacy wrapper. Exercise
+         * its real nonNULL branch directly at the genuine READY boundary. */
+        CHECK(!wl_columnar_join_probe_op_attempt_start_owned(&ops[1], frame,
+            session, original, id, &status, &record));
+        for (unsigned turn = 0; status.progress !=
+            WL_COLUMNAR_FILTER_PROGRESS_DONE; ++turn) {
+            CHECK(turn < 10000);
+            CHECK(!wl_columnar_filter_op_attempt_step_owned(frame, &status,
+                &record));
+        }
+        CHECK(!status.semantic_result);
+        CHECK(!wl_columnar_filter_op_attempt_ack_owned(frame, &record));
+        eval_stack_t *stack = wl_columnar_eval_stack_cleanup_stack(frame);
+        CHECK(stack && stack->top == 1 && stack->items[0].rel->nrows == 1
+            && col_rel_get(stack->items[0].rel, 0, 0) == (anti ? 1 : 2));
+        /* SEMI/ANTI with the same RHS is idempotent; resume the actual parent
+         * without modifying its cursor, phase or completed counters. */
+        for (unsigned turn = 0; record.phase !=
+            WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_DONE; ++turn) {
+            CHECK(turn < 10000);
+            bound_probe_turn(&record, funding, fid);
+        }
+        CHECK(!record.semantic_result && stack->top == 1
+            && stack->items[0].rel->nrows == 1
+            && col_rel_get(stack->items[0].rel, 0, 0) == (anti ? 1 : 2));
+        CHECK(!wl_columnar_eval_plan_numeric_composed_attempt_ack(&record,
+            funding, fid));
+        CHECK(!wl_columnar_eval_stack_cleanup_finish(&frame));
+        CHECK(!wl_evaluation_control_finish(original, base->operation_admission,
+            0, 0));
+        CHECK(!wl_evaluation_control_reset(original)
+            && !wl_evaluation_control_begin(original,
+            base->operation_admission));
+        uint64_t successor = wl_evaluation_control_active_attempt_id(original);
+        CHECK(successor != id);
+        CHECK(!wl_columnar_eval_stack_cleanup_begin_attempt_controlled(session,
+            &frame, original, successor));
+        uint64_t before, after;
+        CHECK(!wl_evaluation_control_test_active_consumed(original, successor,
+            &before));
+        wl_columnar_eval_plan_numeric_attempt_init(&record);
+        CHECK(wl_columnar_eval_plan_numeric_composed_attempt_begin_bound(
+                &record, &body, 0, 3, frame, session, 0, original, successor,
+                funding, fid, &bindings) == EINVAL);
+        CHECK(!wl_evaluation_control_test_active_consumed(original, successor,
+            &after) && after == before);
+        CHECK(!wl_columnar_eval_stack_cleanup_finish(&frame));
+        CHECK(!wl_evaluation_control_finish(original, base->operation_admission,
+            0, 0));
+        CHECK(!wl_evaluation_control_finish(funding, &funding_owner, 0, 0)
+            && !wl_evaluation_control_detach(funding, &funding_owner));
+        wl_evaluation_control_release(funding);
+        for (unsigned i = 0; i < 2; ++i) {
+            CHECK(wl_columnar_relation_snapshot_equal(snapshots[i],
+                wl_columnar_relation_snapshot(private_relations[i]))
+                && session_find_rel(session, names[i]) == public_relations[i]
+                && public_relations[i]->nrows == 1
+                && col_rel_get(public_relations[i], 0, 0) == shadow);
+            col_rel_destroy(private_relations[i]);
+        }
+        wl_session_destroy(base);
+        wl_evaluation_control_release(original);
+        wl_plan_free(plan); wirelog_program_free(program);
+    }
+}
+
 int
 main(void)
 {
+    bound_probe_compatibility();
     for (unsigned kind = 0; kind < 18; ++kind) run(kind, 0, 0, false);
     for (unsigned point = 1; point <= 7; ++point)
         for (unsigned work = 0; work < 2; ++work) run(0, point, 0, work);
@@ -430,6 +682,25 @@ main(void)
         run(3, 0, WL_COLUMNAR_JOIN_PIPELINE_TEST_SCHEMA_FINAL, work);
     wl_columnar_memory_reservation_init(&peer);
     deny_schema = true; run(0, 0, 0, false);
+    const unsigned first_ops[] = {WL_PLAN_OP_SEMIJOIN, WL_PLAN_OP_ANTIJOIN};
+    for (unsigned i = 0; i < 2; ++i) {
+        first_probe_op = first_ops[i];
+        first_probe_mode = 1;
+        run(0, 0, 0, false);
+        CHECK(first_probe_found && first_probe_prefix);
+        uint64_t prefix = first_probe_prefix;
+        for (unsigned exact = 0; exact < 2; ++exact) {
+            first_probe_mode = 2;
+            first_probe_limit = prefix + (exact ? 192 : 191);
+            first_probe_paid = exact ? 192 : 0;
+            run(0, 0, 0, false);
+            CHECK(first_probe_prefix == prefix);
+        }
+        first_probe_mode = 3;
+        first_probe_paid = 0;
+        run(0, 0, 0, false);
+        CHECK(first_probe_prefix == prefix);
+    }
     uint64_t measured = run(0, 0, 0, false);
     funding_test = true;
     CHECK(run(0, 0, 0, false) == measured);

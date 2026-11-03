@@ -2154,3 +2154,58 @@ forward, consumer or cleanup helper interiors.
 Plain, controlled and receipted cleanup constructors reject an active stream dispatch with `EBUSY` after their existing argument validation. The refusal precedes allocation, work debit and receipt output normalization, preserving the active frame and receipt counters. Between dispatches, a parked stream still permits nested cleanup; the caller must finish the nested frame before resuming its parent.
 
 The additional entry predicate changes the controlled source count from 103 to 104 within the existing 112 envelope and 128 work fee; the read-only bootstrap bound is 29. Successful receipted delegation executes both the wrapper and delegated entry predicates. The receipt reservation generation CAS retry remains outside any claimed fixed whole-wrapper bound. Complete consumer/forward/cleanup containing qualification remains open.
+
+### Stream START first-admission and ownerless completion
+
+The probe START wrapper reuses the actual callback-free consumer-stack ownership
+proof for an absent private binding. It still checks the record's session,
+control and saved attempt ID. A non-NULL binding always passes through the full
+checked getter, including its generation and snapshot checks. This removes a
+repeated NONE proof without adding a fee, phase, API or persistent capability.
+
+The following expanded-source ceilings distinguish current paid work from the
+existing fixed bootstrap and mandatory completion boundaries. They are logical
+source counts, with the established native/control/reference interiors qualified
+separately; they are not latency or native-instruction guarantees.
+
+| Region | Source ceiling | Assignment |
+| --- | ---: | --- |
+| FILTER/MAP ordinary prefix through first224 admission | 344 | Current host384 |
+| FILTER/MAP fixed context/control activation | 64 | Existing fixed bootstrap |
+| Stopped FILTER/MAP immediate status/state/close suffix | 192 | Existing mandatory ownerless completion; no additional debit |
+| Probe NONE ordinary prefix through first192 admission | 358 | Current host384 |
+| Stopped probe immediate status/state/close suffix | 168 | Existing mandatory ownerless completion; no additional debit |
+| Empty host STEP, including ABORT and DONE branches | 259 | Current host384 |
+| Empty child STEP | 80 | Separate earlier lifecycle128, if paid; otherwise the existing fixed empty-cleanup exception |
+| Separate consumer ACK | 363 | Its own current host384 |
+
+The FILTER/MAP prefix excludes only the listed fixed activation: initialized
+context stores, one control retain and native identity capture. Before INIT
+there is no child source, reader, writer, program, heap, output or unary owner.
+Initialized flags establish this absence; uninitialized reservation or scratch
+identities must not be read. Parent producer/source owners remain subject to
+those owners' independent cleanup contracts.
+
+After a successful224 entry, its first tail/loop scaffold fits64. Each actually
+paid lifecycle192 assigns at most64 to its current loop/tail/refusal scaffold
+and128 to the corresponding future child stage. Missing payments cannot finance
+future work. Before INIT, the existing fixed exception permits at most ten empty
+child stages (BATCH, PROGRAM, PHYSICAL, CREDIT, REFERENCE, SOURCE, DECIDE,
+CONTROL, FINISH, RESET) and a separate ACK. CONTROL clears the handle before
+releasing its retained reference. Host259 is paid by the current host384,
+independently of the earlier child allocation. RESET does not finance the later
+ACK. No allocation is counted twice or reused for unrelated work.
+
+First192 refusal in a probe acquires no context owner. The next original1 poll
+can route the stopped operation to ABORT, where the host restores the parked
+entry directly. Zero consumer ACK is legitimate on this branch; an ACK must not
+be manufactured. In contrast, an activated FILTER/MAP context must complete its
+real empty STEP/ACK lifecycle. The calibrated first-admission prefix includes
+all work already consumed before the child admission; a failed child debit does
+not imply the entire original operation consumed zero.
+
+The stopped suffixes are narrowly qualified fixed operation completion. Neither
+344+64+192 nor358+168 is claimed to fit one384 ordinary window. These bounds do
+not qualify successful nonempty START/STEP, nonempty owner retirement, forwarding,
+FINISH, configured policy or the complete consumer call. Those containing
+ledgers remain separate obligations.

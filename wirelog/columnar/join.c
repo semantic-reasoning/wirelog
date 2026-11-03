@@ -7282,16 +7282,20 @@ wl_columnar_join_probe_op_attempt_start_owned(const wl_plan_op_t *op,
     int rc = wl_columnar_eval_stack_consumer_stack_owned(frame, session, &stack,
             owner, op);
     if (rc) return rc;
-    if (owner) {
-        const wl_columnar_eval_plan_numeric_attempt_t *record = owner;
-        if (record->control != control || record->attempt_id != id)
-            return EINVAL;
-    }
     const wl_columnar_eval_private_bindings_t *private_bindings = NULL;
     if (owner) {
-        rc = wl_columnar_eval_plan_numeric_private_bindings_get(owner, frame,
-                session, control, id, &private_bindings);
-        if (rc) return rc;
+        const wl_columnar_eval_plan_numeric_attempt_t *record = owner;
+        if (record->session != session || record->control != control
+            || record->attempt_id != id)
+            return EINVAL;
+        /* The checked stack already established this live owner's frame,
+         * native thread and active session. NONE needs no repeated getter;
+         * actual bindings still require all generation/snapshot checks. */
+        if (record->private_bindings) {
+            rc = wl_columnar_eval_plan_numeric_private_bindings_get(owner,
+                    frame, session, control, id, &private_bindings);
+            if (rc) return rc;
+        }
     }
     if (!control) {
         int result = op->op == WL_PLAN_OP_SEMIJOIN
