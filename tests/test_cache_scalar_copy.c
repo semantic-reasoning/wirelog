@@ -390,10 +390,11 @@ test_failures(void)
         CHECK(!wl_columnar_memory_reserved(wl_columnar_memory_governor_ref_get(
                 g)));
     }
-    wl_columnar_memory_governor_ref_t *small = governor_new(1);
+    wl_columnar_memory_governor_ref_t *limited_governor = governor_new(1);
     copy_t a = {0}; int owner = 0; bool complete = false;
     wl_evaluation_control_t *c = control_new(0, &owner);
-    CHECK(!wl_columnar_relation_cache_scalar_copy_begin(&a, source, small, c,
+    CHECK(!wl_columnar_relation_cache_scalar_copy_begin(&a, source,
+        limited_governor, c,
         wl_evaluation_control_active_attempt_id(c)));
     int rc = 0;
     while (!rc) rc = wl_columnar_relation_cache_scalar_copy_step(&a, &complete);
@@ -401,8 +402,8 @@ test_failures(void)
     CHECK(!turn(&a, 6, 128, NULL, NULL, NULL));
     control_close(c, &owner, rc);
     CHECK(!wl_columnar_memory_reserved(wl_columnar_memory_governor_ref_get(
-            small)));
-    wl_columnar_memory_governor_ref_release(small);
+            limited_governor)));
+    wl_columnar_memory_governor_ref_release(limited_governor);
     col_rel_t *future = clone_scalar(source, g); col_rel_destroy(future);
     CHECK(!wl_columnar_memory_reserved(wl_columnar_memory_governor_ref_get(g)));
     col_rel_destroy(source); wl_columnar_memory_governor_ref_release(g);
