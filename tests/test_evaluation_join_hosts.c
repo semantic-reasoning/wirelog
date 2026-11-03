@@ -1332,6 +1332,131 @@ funding_metadata_cancel(void)
         && metadata_acks == metadata_starts);
 }
 
+typedef struct {
+    setup_fixture_t *fixture;
+    unsigned op, mode, steps, acks;
+    bool found, ended;
+    uint64_t prefix, successor;
+} start_boundary_case_t;
+
+static start_boundary_case_t *start_boundary_case;
+
+static void
+start_boundary_checkpoint(wl_evaluation_control_t *control, unsigned event,
+    uint64_t generation, uint32_t extent, uint64_t producer_work)
+{
+    (void)generation; (void)extent; (void)producer_work;
+    start_boundary_case_t *test = start_boundary_case;
+    CHECK(test && control == test->fixture->fixture.control);
+    if (event != WL_COLUMNAR_JOIN_PIPELINE_TEST_CONSUMER || test->ended)
+        return;
+    setup_fixture_t *s = test->fixture;
+    wl_columnar_filter_context_t *ctx = NULL;
+    CHECK(!wl_columnar_eval_stack_filter_context_owned(s->frame, &ctx,
+        &s->record));
+    if (!test->found) {
+        const col_rel_t *input;
+        const wl_plan_op_t *op;
+        uint64_t gen;
+        bool schema;
+        if (wl_columnar_join_pipeline_test_stream_view(&s->record, &input,
+            &gen, &schema, &op) || op->op != test->op || schema
+            || !input->nrows) return;
+        CHECK(ctx->stage == WL_COLUMNAR_FILTER_STAGE_INERT);
+        test->found = true;
+        test->prefix = setup_original_work(s);
+        if (test->mode == 2) wl_evaluation_control_request_cancel(control);
+        if (test->mode == 3) {
+            CHECK(!wl_evaluation_control_finish(control,
+                s->fixture.session->operation_admission, 0, 0));
+            CHECK(!wl_evaluation_control_reset(control));
+            CHECK(!wl_evaluation_control_begin(control,
+                s->fixture.session->operation_admission));
+            test->successor = wl_evaluation_control_active_attempt_id(control);
+            CHECK(test->successor != s->original);
+        }
+        return;
+    }
+    if (ctx->stage == WL_COLUMNAR_FILTER_STAGE_DONE) {
+        ++test->acks;
+        test->ended = true;
+    } else ++test->steps;
+    if (test->mode) {
+        /* Only initialized ownership flags are read after first refusal. */
+        CHECK(!ctx->program && !ctx->output && !ctx->private_output
+            && !ctx->governor && !ctx->heap && !ctx->admitted
+            && !ctx->ref_held && !ctx->unary_started
+            && !ctx->source_initialized && !ctx->source_bare
+            && !ctx->batch_initialized && !ctx->table.initialized);
+        if (ctx->stage == WL_COLUMNAR_FILTER_STAGE_FINISH
+            || ctx->stage == WL_COLUMNAR_FILTER_STAGE_RESET
+            || ctx->stage == WL_COLUMNAR_FILTER_STAGE_DONE)
+            CHECK(!ctx->control && !ctx->pin_owned);
+        else CHECK(ctx->control == control && ctx->pin_owned);
+    }
+}
+
+static uint64_t
+start_boundary_run(unsigned op, unsigned mode, uint64_t limit,
+    uint64_t prefix, uint64_t paid)
+{
+    setup_fixture_t s; setup_begin_limit(&s, limit); metadata_ready(&s);
+    col_rel_t *inputs[2];
+    col_relation_snapshot_t snapshots[2];
+    for (unsigned i = 0; i < 2; ++i) {
+        inputs[i] = session_find_rel((wl_col_session_t *)s.fixture.session,
+                i ? "b" : "a");
+        CHECK(inputs[i]);
+        snapshots[i] = wl_columnar_relation_snapshot(inputs[i]);
+    }
+    start_boundary_case_t test = {.fixture = &s, .op = op, .mode = mode};
+    start_boundary_case = &test;
+    wl_columnar_join_pipeline_test_numeric_checkpoint =
+        start_boundary_checkpoint;
+    for (unsigned turns = 0; s.record.phase !=
+        WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_DONE; ++turns)
+        CHECK(turns < 100000 && !setup_turn(&s, 0));
+    wl_columnar_join_pipeline_test_numeric_checkpoint = NULL;
+    start_boundary_case = NULL;
+    CHECK(test.found && test.ended && test.acks == 1);
+    if (mode) {
+        CHECK(test.prefix == prefix && test.steps == 10
+            && !session_find_rel((wl_col_session_t *)s.fixture.session,
+            "output"));
+        if (mode == 3) {
+            uint64_t work;
+            CHECK(!wl_evaluation_control_test_active_consumed(s.fixture.control,
+                test.successor, &work) && !work);
+        } else CHECK(setup_original_work(&s) == prefix + paid);
+    }
+    for (unsigned i = 0; i < 2; ++i)
+        CHECK(wl_columnar_relation_snapshot_equal(snapshots[i],
+            wl_columnar_relation_snapshot(inputs[i])));
+    int result = mode == 1 ? WL_EVALUATION_CONTROL_WORK_LIMIT
+        : mode == 2 ? WL_EVALUATION_CONTROL_CANCELLED : mode == 3 ? EINVAL : 0;
+    setup_close_result(&s, result);
+    return test.prefix;
+}
+
+static void
+funding_start_boundaries(void)
+{
+    const unsigned ops[] = {WL_PLAN_OP_FILTER, WL_PLAN_OP_MAP};
+    for (unsigned i = 0; i < 2; ++i) {
+        uint64_t prefix = start_boundary_run(ops[i], 0, 0, 0, 0);
+        CHECK(prefix);
+        start_boundary_run(ops[i], 1, prefix + 223, prefix, 0);
+        for (unsigned k = 0; k <= 10; ++k)
+            for (unsigned short_next = 0; short_next < 2; ++short_next) {
+                uint64_t paid = 224 + 192 * k;
+                start_boundary_run(ops[i], 1,
+                    prefix + paid + (short_next ? 191 : 0), prefix, paid);
+            }
+        start_boundary_run(ops[i], 2, 0, prefix, 0);
+        start_boundary_run(ops[i], 3, 0, prefix, 0);
+    }
+}
+
 static void *
 metadata_foreign_thread(void *argument)
 {
@@ -1528,6 +1653,7 @@ funding(void)
 {
     funding_setup(); funding_setup_turnover();
     funding_metadata(); funding_metadata_cancel(); funding_metadata_authority();
+    funding_start_boundaries();
     funding_composed(); funding_public();
 }
 
