@@ -2148,3 +2148,9 @@ charge is shared once by both readiness branches, including retained-resource
 cleanup reroutes. Standalone checked APIs and source/consumer error ordering
 remain unchanged. These fixed metadata bounds do not certify the nested
 forward, consumer or cleanup helper interiors.
+
+### Cleanup construction during consumer dispatch
+
+Plain, controlled and receipted cleanup constructors reject an active stream dispatch with `EBUSY` after their existing argument validation. The refusal precedes allocation, work debit and receipt output normalization, preserving the active frame and receipt counters. Between dispatches, a parked stream still permits nested cleanup; the caller must finish the nested frame before resuming its parent.
+
+The additional entry predicate changes the controlled source count from 103 to 104 within the existing 112 envelope and 128 work fee; the read-only bootstrap bound is 29. Successful receipted delegation executes both the wrapper and delegated entry predicates. The receipt reservation generation CAS retry remains outside any claimed fixed whole-wrapper bound. Complete consumer/forward/cleanup containing qualification remains open.
