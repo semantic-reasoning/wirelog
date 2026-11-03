@@ -6,6 +6,24 @@ All notable changes to wirelog are documented in this file.
 
 ### Added
 
+- Recursive TDD strata carry worker deltas to the coordinator through a
+  byte-bounded batch channel that the coordinator pumps while workers run.
+  A batch larger than the capacity is still admitted into an empty
+  channel. `WIRELOG_TDD_CHANNEL_BYTES` overrides the capacity, by default
+  an eighth of an enforcing budget clamped to [4 MiB, 1 GiB], or 256 MiB
+  when no budget is enforced. When the session has a `spill_directory`
+  and the taken batches the coordinator holds exceed a held cap, it spills
+  the largest spillable ones to the session's spill store; batches with
+  STRING or compound columns cannot be spilled, so the held bytes can stay
+  above the cap. The held cap is a quarter of an enforcing budget by
+  default and none when no budget is enforced; `WIRELOG_TDD_HELD_BYTES`
+  overrides it. Each exchange stages one relation at a time. A value of
+  either variable that is not a positive decimal integer fitting in 64
+  bits is ignored silently. `WIRELOG_TDD_STRATUM_PROFILE` lines gain the
+  channel's cancels, first error, orphan reclaims and rejected
+  reservations, the stratum's spills, over-cap passes and stagings, its
+  staging peak and a worker's refusal (#1373).
+
 - `wirelog_session_source_count()` reports how many times the host inserted a
   tuple into a relation and has not removed it, without evaluating: a rule
   head's host input rather than its derived rows, pending inserts included.
@@ -184,6 +202,14 @@ All notable changes to wirelog are documented in this file.
   Its self-test is `abi:subprojects_ignored_selftest`.
 
 ### Changed
+
+- The unions, gathered partitions, broadcast copies and BDX combinations a
+  recursive TDD exchange creates are now created under the session's
+  governor, and scattered partitions are attached to it after allocation,
+  so near an enforcing budget a stratum can fail with ENOSPC and report
+  `wl_session_budget_denied()` where it used to succeed. A refused append
+  to the owner or global-read combined delta now reads ENOSPC instead of
+  ENOMEM (#1373).
 
 - **Bounded join pipelines consume expression MAPs** (#1777): with
   `WIRELOG_JOIN_BATCH_BYTES` set, a `JOIN -> FILTER* -> MAP` pipeline
