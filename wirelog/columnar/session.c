@@ -467,6 +467,33 @@ wl_columnar_session_observed_bindings_authorized(
            == step->operation_id;
 }
 
+/* Existing registered child cleanup only: an ended original generation is
+ * allowed, but no changed transaction/head/binding tuple is revived. */
+bool
+wl_columnar_session_observed_bindings_cleanup_authorized(
+    const wl_col_session_t *sess,
+    const wl_columnar_eval_private_bindings_t *bindings,
+    const wl_plan_relation_t *plan, wl_evaluation_control_t *control,
+    uint64_t id, uint64_t generation)
+{
+    const wl_columnar_controlled_step_t *step =
+        sess ? sess->controlled_step : NULL;
+    const wl_columnar_session_observed_transaction_t *tx =
+        step ? step->transaction : NULL;
+    return tx && step->transaction_initialized
+           && step->general_observed && step->operation_active
+           && tx->child_active && tx->head < tx->head_count
+           && bindings == &tx->bindings
+           && bindings->identity == (uintptr_t)bindings
+           && bindings->dynamic_entries == tx->entries
+           && bindings->count == tx->count
+           && bindings->generation == generation && generation == tx->generation
+           && bindings->plan == plan && plan == &tx->heads[tx->head].plan
+           && bindings->session == sess && bindings->control == control
+           && control == sess->base.evaluation_control
+           && bindings->attempt_id == id && id == step->operation_id;
+}
+
 int
 wl_columnar_session_diff_index(wl_col_session_t *sess,
     const wl_columnar_eval_private_bindings_t *bindings,

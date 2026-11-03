@@ -439,15 +439,16 @@ frame_admit(wl_col_session_t *s, wl_columnar_eval_stack_cleanup_frame_t **out)
 static uint64_t
 frame_cost(bool governed)
 {
-    uint64_t n = (wl_columnar_eval_stack_test_frame_size() + 15) / 16;
+    uint64_t n = (wl_columnar_eval_stack_test_allocation_size() + 15) / 16;
     return (governed ? UINT64_C(1726) : UINT64_C(928)) + UINT64_C(224) * n;
 }
 
 static void
 test_frame_literal_admissions(void)
 {
-    /* Independent literal debit schedule; getter supplies physical size only. */
-    uint64_t n = (wl_columnar_eval_stack_test_frame_size() + 15) / 16;
+    /* Independent literal debit schedule; count ZERO chunks over the complete
+     * physical allocation, including the private automatic receipt tail. */
+    uint64_t n = (wl_columnar_eval_stack_test_allocation_size() + 15) / 16;
     for (unsigned governed = 0; governed < 2; governed++) {
         wl_col_session_t *s = new_session();
         wl_columnar_memory_governor_ref_t *saved = s->memory_governor;
@@ -813,7 +814,7 @@ unary_other_thread(void *arg)
 static void
 test_unary_frame_initialization(void)
 {
-    uint64_t bytes = wl_columnar_eval_stack_test_frame_size();
+    uint64_t bytes = wl_columnar_eval_stack_test_allocation_size();
     CHECK(bytes > sizeof(eval_stack_t) + sizeof(eval_entry_t)
         + sizeof(wl_columnar_memory_reservation_t) + 3 * sizeof(void *));
     for (unsigned type = 0; type < 4; type++) {

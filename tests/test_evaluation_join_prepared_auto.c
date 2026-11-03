@@ -291,6 +291,206 @@ test_production_abort_consume(void)
     wirelog_program_free(program);
 }
 
+static unsigned bound_failure_mode;
+static bool bound_failure_injected;
+static bool bound_expect_lftj, bound_saw_lftj;
+
+static uint64_t
+bound_failure_limit(const wl_col_session_t *session,
+    wl_columnar_eval_serial_framed_host_action_t action, uint64_t limit)
+{
+    (void)action;
+    if (bound_failure_injected || !session->cleanup_active) return limit;
+    wl_columnar_eval_stack_test_auto_observation_t observation;
+    CHECK(!wl_columnar_eval_stack_test_auto_observe(session->cleanup_active,
+        session, &observation));
+    if (bound_failure_mode >= 2) {
+        if (observation.finish || observation.receipt_phase !=
+            WL_COLUMNAR_EVAL_STACK_PREPARED_JOIN_HEAD) return limit;
+        CHECK(observation.saved_binding && observation.launch);
+        if (bound_failure_mode == 2)
+            wl_evaluation_control_request_cancel(
+                session->base.evaluation_control);
+        else CHECK(wl_evaluation_control_charge(
+                    session->base.evaluation_control,
+                    UINT64_MAX) == WL_EVALUATION_CONTROL_WORK_LIMIT);
+    } else {
+        wl_columnar_eval_serial_framed_attempt_t *ctx = NULL;
+        if (wl_columnar_eval_stack_framed_context(session->cleanup_active,
+            (wl_col_session_t *)session, &ctx) || !ctx->child_bound
+            || ctx->phase != WL_COLUMNAR_EVAL_SERIAL_FRAMED_CHILD
+            || ctx->child.phase !=
+            WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_UNARY_CHILD)
+            return limit;
+        wl_columnar_filter_context_t *filter = NULL;
+        CHECK(!wl_columnar_eval_stack_filter_context_owned(
+                session->cleanup_active,
+                &filter, &ctx->child));
+        if (filter->stage != WL_COLUMNAR_FILTER_STAGE_JOIN_DECIDE) return limit;
+        unsigned joins = 0;
+        for (unsigned i = 0; i <= ctx->child.cursor; ++i)
+            if (ctx->child.plan->ops[i].op == WL_PLAN_OP_JOIN) ++joins;
+        if (joins != bound_failure_mode + 1) return limit;
+        if (bound_expect_lftj) {
+            CHECK(ctx->child.lftj.identity == &ctx->child.lftj
+                && ctx->child.lftj.phase == WL_COLUMNAR_LFTJ_ATTEMPT_DONE);
+            bound_saw_lftj = true;
+        }
+        CHECK(ctx->private_bindings && ctx->private_bindings->dynamic_entries
+            && observation.saved_binding == ctx->private_bindings
+            && observation.saved_binding_generation ==
+            ctx->private_bindings->generation);
+        if (bound_failure_mode == 1)
+            CHECK(observation.receipt_phase ==
+                WL_COLUMNAR_EVAL_STACK_PREPARED_ACKED && observation.committed);
+        uint64_t consumed;
+        wl_evaluation_control_t *control = session->base.evaluation_control;
+        uint64_t id = wl_evaluation_control_active_attempt_id(control);
+        CHECK(!wl_evaluation_control_test_active_consumed(control, id,
+            &consumed)
+            && consumed < UINT64_MAX - 256);
+        CHECK(!wl_evaluation_control_charge(control,
+            UINT64_MAX - 1 - consumed - 255));
+    }
+    bound_failure_injected = true;
+    return limit;
+}
+
+static void
+test_dynamic_bound_active_failure(void)
+{
+    bound_expect_lftj = false;
+    const char *text = ".decl a(k:int64,x:int64)\n"
+        ".decl b(k:int64,t:int64,y:int64)\n.decl c(t:int64,z:int64)\n"
+        ".decl output(x:int64,y:int64,z:int64)\n"
+        "output(x,y,z) :- a(k,x), b(k,t,y), c(t,z).\n";
+    for (unsigned mode = 0; mode < 4; ++mode) {
+        wirelog_error_t error;
+        wirelog_program_t *program = wirelog_parse_string(text, &error);
+        wl_plan_t *plan = NULL;
+        CHECK(program && !wl_plan_from_program(program, &plan));
+        wl_evaluation_control_t *control = NULL;
+        CHECK(!wl_evaluation_control_create(UINT64_MAX - 1, &control));
+        wl_session_options_t options;
+        wl_session_options_init(&options);
+        options.evaluation_control = control;
+        wl_session_t *session = NULL;
+        CHECK(!wl_session_create_with_options(wl_backend_columnar(), plan, 1,
+            &options, &session));
+        const int64_t a[] = {1, 10, 2, 20};
+        const int64_t b[] = {1, 7, 100, 2, 8, 200};
+        const int64_t c[] = {7, 1000, 8, 2000};
+        CHECK(!wl_session_insert(session, "a", a, 2, 2));
+        CHECK(!wl_session_insert(session, "b", b, 2, 3));
+        CHECK(!wl_session_insert(session, "c", c, 2, 2));
+        capture_t events = {0};
+        wl_session_set_delta_cb(session, on_delta, &events);
+        col_relation_snapshot_t before[3];
+        const char *names[] = {"a", "b", "c"};
+        for (unsigned i = 0; i < 3; ++i)
+            before[i] = wl_columnar_relation_snapshot(
+                session_find_rel((wl_col_session_t *)session, names[i]));
+        bound_failure_mode = mode;
+        bound_failure_injected = false;
+        publication_heads = finish_heads = acknowledgments = 0;
+        wl_columnar_session_test_framed_grant_limit = bound_failure_limit;
+        wl_columnar_eval_stack_test_unary_prepared_checkpoint =
+            prepared_checkpoint;
+        int cause = mode == 2 ? WL_EVALUATION_CONTROL_CANCELLED
+            : WL_EVALUATION_CONTROL_WORK_LIMIT;
+        CHECK(drive(session, false, NULL) == cause && bound_failure_injected);
+        wl_columnar_session_test_framed_grant_limit = NULL;
+        wl_columnar_eval_stack_test_unary_prepared_checkpoint = NULL;
+        wl_col_session_t *columnar = (wl_col_session_t *)session;
+        CHECK(!events.count && !session_find_rel(columnar, "output")
+            && !columnar->cleanup_active && !columnar->cleanup_pending
+            && !columnar->cleanup_reserved_bytes);
+        CHECK(finish_heads == (mode == 0 ? 0u : 1u));
+        for (unsigned i = 0; i < 3; ++i)
+            CHECK(wl_columnar_relation_snapshot_equal(before[i],
+                wl_columnar_relation_snapshot(session_find_rel(columnar,
+                names[i]))));
+        wl_evaluation_control_report_t report;
+        CHECK(!wl_evaluation_control_report(control, &report)
+            && report.result == cause && !report.cleanup_status
+            && !wl_evaluation_control_active_attempt_id(control));
+        CHECK(!wl_evaluation_control_reset(control));
+        CHECK(!wl_evaluation_control_configure(control, 0));
+        CHECK(!drive(session, false, NULL));
+        const col_rel_t *output = session_find_rel(columnar, "output");
+        CHECK(output && output->nrows == 2 && output->ncols == 3
+            && output->columns[0][0] == 10 && output->columns[1][0] == 100
+            && output->columns[2][0] == 1000 && output->columns[0][1] == 20
+            && output->columns[1][1] == 200 && output->columns[2][1] == 2000
+            && events.count == 2);
+        CHECK(!wl_session_try_destroy(&session));
+        wl_evaluation_control_release(control);
+        wl_plan_free(plan);
+        wirelog_program_free(program);
+    }
+}
+
+static void
+test_dynamic_lftj_then_join_failure(void)
+{
+    const char *text = ".decl a(k:int64,x:int64)\n.decl b(k:int64,y:int64)\n"
+        ".decl c(k:int64,z:int64)\n.decl d(z:int64,w:int64)\n"
+        ".decl output(x:int64,y:int64,w:int64)\n"
+        "output(x,y,w) :- a(k,x), b(k,y), c(k,z), d(z,w).\n";
+    wirelog_error_t error;
+    wirelog_program_t *program = wirelog_parse_string(text, &error);
+    wl_plan_t *plan = NULL;
+    CHECK(program && !wl_plan_from_program(program, &plan));
+    CHECK(plan->stratum_count == 1 && plan->strata[0].relation_count == 1
+        && plan->strata[0].relations[0].ops[0].op == WL_PLAN_OP_LFTJ
+        && plan->strata[0].relations[0].ops[1].op == WL_PLAN_OP_JOIN);
+    wl_evaluation_control_t *control = NULL;
+    CHECK(!wl_evaluation_control_create(UINT64_MAX - 1, &control));
+    wl_session_options_t options;
+    wl_session_options_init(&options);
+    options.evaluation_control = control;
+    wl_session_t *session = NULL;
+    CHECK(!wl_session_create_with_options(wl_backend_columnar(), plan, 1,
+        &options, &session));
+    const int64_t a[] = {1, 10, 2, 20}, b[] = {1, 100, 2, 200};
+    const int64_t c[] = {1, 7, 2, 8}, d[] = {7, 1000, 8, 2000};
+    CHECK(!wl_session_insert(session, "a", a, 2, 2));
+    CHECK(!wl_session_insert(session, "b", b, 2, 2));
+    CHECK(!wl_session_insert(session, "c", c, 2, 2));
+    CHECK(!wl_session_insert(session, "d", d, 2, 2));
+    capture_t events = {0};
+    wl_session_set_delta_cb(session, on_delta, &events);
+    bound_failure_mode = 0;
+    bound_failure_injected = bound_saw_lftj = false;
+    bound_expect_lftj = true;
+    wl_columnar_session_test_framed_grant_limit = bound_failure_limit;
+    int result = drive(session, false, NULL);
+    if (result != WL_EVALUATION_CONTROL_WORK_LIMIT) fprintf(stderr,
+            "mixed LFTJ/JOIN cleanup result%d injected%d completed-LFTJ%d\n",
+            result, bound_failure_injected, bound_saw_lftj);
+    CHECK(result == WL_EVALUATION_CONTROL_WORK_LIMIT
+        && bound_failure_injected && bound_saw_lftj);
+    wl_columnar_session_test_framed_grant_limit = NULL;
+    bound_expect_lftj = false;
+    wl_col_session_t *columnar = (wl_col_session_t *)session;
+    CHECK(!events.count && !session_find_rel(columnar, "output")
+        && !columnar->cleanup_active && !columnar->cleanup_pending
+        && !columnar->cleanup_reserved_bytes);
+    CHECK(!wl_evaluation_control_reset(control));
+    CHECK(!wl_evaluation_control_configure(control, 0));
+    CHECK(!drive(session, false, NULL));
+    const col_rel_t *output = session_find_rel(columnar, "output");
+    CHECK(output && output->nrows == 2 && output->ncols == 3
+        && output->columns[0][0] == 10 && output->columns[1][0] == 100
+        && output->columns[2][0] == 1000 && output->columns[0][1] == 20
+        && output->columns[1][1] == 200 && output->columns[2][1] == 2000
+        && events.count == 2);
+    CHECK(!wl_session_try_destroy(&session));
+    wl_evaluation_control_release(control);
+    wl_plan_free(plan);
+    wirelog_program_free(program);
+}
+
 int
 main(void)
 {
@@ -299,5 +499,7 @@ main(void)
             for (unsigned empty = 0; empty < 2; ++empty)
                 test_generated(snapshot, observed, empty);
     test_production_abort_consume();
+    test_dynamic_bound_active_failure();
+    test_dynamic_lftj_then_join_failure();
     return 0;
 }
