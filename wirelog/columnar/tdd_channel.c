@@ -473,6 +473,8 @@ close_lane_locked(wl_tdd_channel_t *ch, uint32_t index, int rc)
         rc = EPROTO;
         if (ch->channel_rc == 0)
             ch->channel_rc = EPROTO;
+        if (ch->stats.first_channel_rc == 0)
+            ch->stats.first_channel_rc = ch->channel_rc;
     }
     lane->closed = true;
     lane->close_rc = rc;
@@ -533,9 +535,13 @@ wl_tdd_channel_cancel(wl_tdd_channel_t *ch, int rc)
     if (!ch)
         return;
     wl_mutex_lock(&ch->mu);
+    if (!ch->cancelled)
+        ch->stats.cancelled_rounds++;
     ch->cancelled = true;
     if (ch->channel_rc == 0)
         ch->channel_rc = rc ? rc : ECANCELED;
+    if (ch->stats.first_channel_rc == 0)
+        ch->stats.first_channel_rc = ch->channel_rc;
     wl_cond_broadcast(&ch->cond_space);
     wl_cond_broadcast(&ch->cond_state);
     channel_changed(ch);

@@ -193,9 +193,23 @@ Measurement boundaries:
 - Worker min/max are **individual worker-subpass extrema**, not accumulated
   per-worker lifetime distributions. Worker sum includes all completed-barrier
   subpasses. Unequal extrema alone do not prove persistent worker skew.
-- `worker_delta_rows` counts worker-local deduplicated deltas after queue
-  reconstruction and before exchange. It is neither raw JOIN candidates nor
-  globally accepted tuples nor transmitted bytes; repeated proposals can occur.
+- `worker_delta_rows` counts worker-local deduplicated deltas as the
+  coordinator takes them from the TDD channel, in rounds whose rc, chosen
+  after the join, is 0: no worker, channel, consumer or worker-cleanup error.
+  The rows are counted before the exchange, so a round whose exchange then
+  fails keeps them. It is neither raw JOIN candidates nor globally accepted
+  tuples nor transmitted bytes; repeated proposals can occur.
+- The channel fields (#1373) describe the stratum's TDD batch channel:
+  `channel_cancelled` counts the rounds a cancel took effect in, `channel_rc`
+  is the first error the channel recorded, kept when a worker's error
+  outranks it as the round's rc, `orphan_reclaims` counts descriptors
+  reclaimed from closed lanes, and `rejected` counts reservations refused
+  because their descriptor belonged to another round. `consumer_spills`,
+  `held_over_cap`, `stage_over_cap` and `stage_peak_bytes` are the stratum's
+  consumer counts as `wl_tdd_consumer_stats_t` defines them. `refusal` names
+  the reason the worker whose error failed a round gave, or `none`. The
+  audit script parses these fields when present; evidence recorded before
+  them lacks them.
 - `wait_ms` includes computation while waiting. It is not pure removable
   synchronization overhead. Worker/exchange/parent timers overlap and must not
   be added together. Synthetic JSON controls retain existing exchange phase

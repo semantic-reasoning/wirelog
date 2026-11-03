@@ -786,6 +786,13 @@ test_pump_error_selects_channel_rc(const program_t *p, uint32_t workers)
         CHECK(strategy && strcmp(strategy, p->strategy) == 0,
             "%s W=%u strategy %s", p->name, workers,
             strategy ? strategy : "(none)");
+        /* The stratum's audit records the cancel and its error. */
+        CHECK(f.coord->tdd_audit.channel_cancelled == 1
+            && f.coord->tdd_audit.channel_rc == EPROTO
+            && !f.coord->tdd_audit.refusal,
+            "%s W=%u audit cancelled=%llu channel_rc=%d", p->name, workers,
+            (unsigned long long)f.coord->tdd_audit.channel_cancelled,
+            f.coord->tdd_audit.channel_rc);
         CHECK(load(&publish_timeouts) == 0,
             "%s W=%u no batch was published while a producer waited",
             p->name, workers);
@@ -1371,6 +1378,13 @@ test_worker_error_outranks_cancel(uint32_t workers)
             CHECK(final_valid && final_stats.cancelled
                 && final_stats.channel_rc == EPROTO,
                 "W=%u the pump error did not cancel the round", workers);
+            /* The audit keeps the channel's EPROTO although the worker's
+             * EOVERFLOW is the round's rc. */
+            CHECK(f.coord->tdd_audit.channel_cancelled == 1
+                && f.coord->tdd_audit.channel_rc == EPROTO,
+                "W=%u audit cancelled=%llu channel_rc=%d", workers,
+                (unsigned long long)f.coord->tdd_audit.channel_cancelled,
+                f.coord->tdd_audit.channel_rc);
             CHECK(replay && strcmp(replay, "global_read_overflow") == 0
                 && f.coord->tdd_audit.replay_rc == EOVERFLOW,
                 "W=%u replay %s rc=%d", workers, replay ? replay : "(none)",

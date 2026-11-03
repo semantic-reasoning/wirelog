@@ -5775,8 +5775,9 @@ col_worker_session_create(wl_col_session_t *coordinator,
     out_worker->last_removed_relation = NULL;
 
     /* Step 5: Initialize an attribution-only worker ledger. The governor is
-     * shared; only the legacy ledger threshold uses an equal reporting share
-     * so its aggregate backpressure does not multiply by worker count. */
+     * shared; the ledger gets an equal share of the coordinator's budget,
+     * which the worker's report measures against and which limits no
+     * allocation. */
     uint32_t active_workers = coordinator->tdd_active_workers > 0
         ? coordinator->tdd_active_workers : coordinator->num_workers;
     if (active_workers == 0)
@@ -12987,7 +12988,12 @@ col_session_snapshot_impl(wl_session_t *session, wirelog_on_tuple_fn callback,
                 "selected_workers=%u submitted_tasks=%" PRIu64 " "
                 "completed_rounds=%" PRIu64 " replay=%s replay_rc=%d rc=%d "
                 "worker_min_ms=%.3f worker_max_ms=%.3f worker_sum_ms=%.3f "
-                "worker_delta_rows=%" PRIu64 " wait_ms=%.3f merge_ms=%.3f\n",
+                "worker_delta_rows=%" PRIu64 " wait_ms=%.3f merge_ms=%.3f "
+                "channel_cancelled=%" PRIu64 " channel_rc=%d "
+                "orphan_reclaims=%" PRIu64 " rejected=%" PRIu64 " "
+                "consumer_spills=%" PRIu64 " held_over_cap=%" PRIu64 " "
+                "stage_over_cap=%" PRIu64 " stage_peak_bytes=%" PRIu64 " "
+                "refusal=%s\n",
                 si, first_rel ? first_rel : "(null)",
                 (int)plan->strata[si].is_recursive, (int)use_tdd,
                 wl_columnar_session_tdd_fallback_reason_name(
@@ -13008,7 +13014,13 @@ col_session_snapshot_impl(wl_session_t *session, wirelog_on_tuple_fn callback,
                 (double)sess->tdd_audit.worker_sum_ns / 1e6,
                 sess->tdd_audit.worker_delta_rows,
                 (double)(sess->tdd_wait_barrier_ns - wait_base) / 1e6,
-                (double)(sess->tdd_final_merge_ns - merge_base) / 1e6);
+                (double)(sess->tdd_final_merge_ns - merge_base) / 1e6,
+                sess->tdd_audit.channel_cancelled, sess->tdd_audit.channel_rc,
+                sess->tdd_audit.orphan_reclaims, sess->tdd_audit.rejected,
+                sess->tdd_audit.consumer_spills, sess->tdd_audit.held_over_cap,
+                sess->tdd_audit.stage_over_cap,
+                sess->tdd_audit.stage_peak_bytes,
+                sess->tdd_audit.refusal ? sess->tdd_audit.refusal : "none");
         }
 
         if (tdd_cc_active && rc == 0 && pre_saved

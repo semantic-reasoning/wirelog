@@ -178,6 +178,18 @@ class AuditTests(unittest.TestCase):
         overflow = audit.parse_strata(evidence(strategy="global_read", replay="global_read_overflow", replay_rc="75"), 8)[0]
         self.assertEqual(overflow["replay_rc"], 75)
 
+    def test_channel_fields(self):
+        row = audit.parse_strata(evidence(
+            channel_cancelled="0", channel_rc="0", orphan_reclaims="0", rejected="0",
+            consumer_spills="3", held_over_cap="1", stage_over_cap="2",
+            stage_peak_bytes="4096", refusal="none"), 8)[0]
+        self.assertEqual((row["consumer_spills"], row["held_over_cap"], row["stage_over_cap"],
+                          row["stage_peak_bytes"]), (3, 1, 2, 4096))
+        for changes in (dict(consumer_spills="-1"), dict(stage_peak_bytes="x"),
+                        dict(refusal="bogus"), dict(channel_rc="none")):
+            with self.subTest(changes=changes), self.assertRaises(ValueError):
+                audit.parse_strata(evidence(**changes), 8)
+
     def test_adaptive_is_not_rejected(self):
         row = audit.parse_strata(evidence(selected_workers="1", submitted_tasks="0",
                                           completed_rounds="0"), 8)[0]
@@ -234,6 +246,9 @@ class AuditTests(unittest.TestCase):
             self.assertEqual(len(frames), 3)
             rows = [audit.parse_strata(s, 8, require_full=False) for s in frames]
             self.assertEqual([[r["idx"] for r in snapshot] for snapshot in rows], [[0, 1, 2], [0, 1, 2], []])
+            for row in rows[0]:
+                for key in audit.CHANNEL_COUNTS + ("channel_rc", "refusal"):
+                    self.assertIn(key, row)
             for option in ("--audit-error", "--audit-partial"):
                 proc = subprocess.run([binary, option], env=env, capture_output=True,
                                       text=True, timeout=30, check=True, encoding="utf-8")

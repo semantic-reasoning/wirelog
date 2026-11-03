@@ -436,8 +436,8 @@ test_coverage_tdd(void)
     if (check_common(&r))
         return 1;
     if (r.selected_workers == 8) {
-        /* The stratum ran under TDD: deltas crossed the MPSC channel and
-         * every worker teardown folded its ledger peak into the
+        /* The stratum ran under TDD: deltas crossed the TDD batch channel
+         * and every worker teardown folded its ledger peak into the
          * coordinator aggregates. */
         if (r.stats.subsys_peak_bytes[WL_MEM_SUBSYS_CHANNEL] == 0) {
             FAIL("CHANNEL peak is zero although TDD ran at W=8");

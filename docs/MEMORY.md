@@ -148,10 +148,11 @@ reserve(bytes) -> commit/transfer(owner) -> release(bytes)
   reporting, and worker teardown. It is not handed out as ordinary work
   capacity.
 
-Coordinator and worker operations use one shared governor. A worker share is
-only a fairness hint used for scheduling; `W` workers do not receive `W`
-independent hard budgets. RSS sampling, allocator retention, and sampling
-lag may trigger a safety brake, but they do not rewrite committed ownership.
+Coordinator and worker operations use one shared governor. A worker's ledger
+share is an attribution and reporting figure that no scheduling reads; `W`
+workers do not receive `W` independent hard budgets. RSS sampling, allocator
+retention, and sampling lag may trigger a safety brake, but they do not rewrite
+committed ownership.
 
 ## Failure and retry contract
 
@@ -293,11 +294,11 @@ still follows its existing admission contract.
 The fixed delta-pool slab and data arena follow the same lifecycle through
 `delta_pool_create_managed()`. Coordinator, ordinary worker, and K-fusion
 branch arenas and pools all use the same shared governor; legacy standalone
-constructors remain unmanaged. Their ledgers remain attribution-only; while the legacy join
-backpressure path still reads ledger thresholds, each worker gets an equal
-reporting share so the aggregate threshold does not multiply by the worker
-count. The removed `tdd_budget_per_party` value is no longer a second governor
-admission domain.
+constructors remain unmanaged. Their ledgers remain attribution-only: each
+TDD worker's ledger gets an equal share of the coordinator's budget, which the
+worker's report measures against and which limits no allocation (section 6),
+and a K-fusion branch's ledger copies the coordinator's. The removed
+`tdd_budget_per_party` value is no longer a second governor admission domain.
 Explicit invalid budgets fail session creation with the existing public
 execution error mapping and leave output handles null. Parser AST, IR/program,
 execution plan, executor wrapper, caller-owned fact buffers, CSV staging, and
@@ -419,7 +420,7 @@ every stratum that ran under TDD.
 | `CACHE` | event | Materialization-cache entries. On insert the cached result is re-parented: its RELATION (and TIMESTAMP) charge is credited and the same bytes are charged to CACHE, so a cached join is counted once. Credited on eviction, truncation and clear. | `cache.c` |
 | `ARRANGEMENT` | event | Hash arrangements (`ht_head` + `ht_next`), delta and filtered arrangements, sorted copies for LFTJ (`nrows × ncols × 8`, a full duplicate of the relation), differential arrangements (struct + keys + buckets + chain), and differential-registry arrays plus each entry's relation name and key columns. Worker clones are charged to the worker ledger. | `arrangement.c`, `diff_arrangement.c` |
 | `TIMESTAMP` | event | `timestamps[]` arrays (24 bytes per row of capacity) of ledger-attached relations. Reconciled together with RELATION. | `relation.c` |
-| `CHANNEL` | event | TDD delta transport: the stratum's channel side buffers (channel object, lanes and consumer list heads, charged at channel creation) plus the transport bytes reserved for every published batch (columns + timestamps) between the worker's publish and the coordinator's take or discard. Charged on the coordinator's ledger because ownership transfers at publish. | `eval.c`, `eval_tdd_channel.c` |
+| `CHANNEL` | event | TDD delta transport: the stratum's channel side buffers (channel object, lanes, consumer list heads and staging flags, charged at channel creation) plus the transport bytes reserved for every published batch (columns + timestamps) between the worker's publish and the coordinator's take or discard. Charged on the coordinator's ledger because ownership transfers at publish. Batch descriptors are admitted under the governor with tokens of their own and are not charged here. | `eval.c`, `eval_tdd_channel.c` |
 | `STORED` | gauge | Session-owned relations in `rels[]`: EDB and IDB relations on the coordinator, partitions on a worker. Column buffers plus timestamps; arena-owned columns count 0. | sampled, see §2.2 |
 | `TEMPORARY` | gauge | Delta-pool temporaries whose column buffers spilled to the heap because the pool arena was full (`pool_owned && !arena_owned`), excluding those already attached to RELATION, plus admitted evaluator cleanup frames and retained delta-step rollback records. | sampled, see §2.2 |
 
@@ -565,15 +566,15 @@ batches; the batches it has taken are not counted against the capacity.
 
 The batches the coordinator has taken are held until the round's exchange
 stages their relation into the delta matrix. While the round runs, each
-take is followed by a cap pass: when the charges of the resident batches
-held exceed the held cap and the session has a spill store
-(`spill_directory`), the coordinator spills the largest of them until they
-fit. The held cap is a quarter of an enforcing budget, or none when no
-budget is enforced. `WIRELOG_TDD_HELD_BYTES=<bytes>` overrides it with a
-positive decimal that fits in 64 bits; any other value is ignored. A batch
-whose spill fails stays resident and governed, so the held bytes can exceed
-the cap; `held_over_cap` in the consumer statistics counts the passes that
-ended over it.
+take onto a (worker, relation) list is followed by a cap pass: when the
+charges of the resident batches held exceed the held cap and the session
+has a spill store (`spill_directory`), the coordinator spills the largest
+of them until they fit. The held cap is a quarter of an enforcing budget,
+or none when no budget is enforced. `WIRELOG_TDD_HELD_BYTES=<bytes>`
+overrides it with a positive decimal that fits in 64 bits; any other value
+is ignored. A batch whose spill fails stays resident and governed, so the
+held bytes can exceed the cap; `held_over_cap` in the consumer statistics
+counts the passes that ended over it.
 
 The exchange stages one relation at a time. Before it coalesces a
 relation's batches into the delta matrix, reading the spilled ones back, it
@@ -591,15 +592,46 @@ in the consumer statistics). The cap does not bound that relation's staged
 slots, the buffers the exchange builds from them, the publication
 candidates owner mode has built for the relations exchanged before it, or
 the next round's inputs. The exchange creates its unions, gathered
-partitions, broadcast copies and BDX combinations under the governor; the
-partitions `col_rel_exchange_partition` writes are accounted after
-allocation. The shared views it installs on workers hold no storage of
-their own and are not put under the governor, and neither is the
-destination of the deep copy a view falls back to.
+partitions, broadcast copies and BDX combinations under the governor. The
+partitions `col_rel_exchange_partition` writes for the hash scatter, BDX,
+owner and global-read exchanges are accounted after allocation, when the
+exchange attaches them to the governor; global-read's exchange attaches
+each partition it installs once it is renamed and destroys the empty ones
+unattached. The partitions global-read's stratum-start seed
+(`tdd_seed_global_read_initial_deltas`) installs on the workers are not put
+under the governor. The shared views the exchange installs on workers hold
+no storage of their own and are not put under the governor, and neither is
+the destination of the deep copy a view falls back to.
 
-The ledger's RELATION worker-share hint can still trigger join backpressure
-at 80% (`wl_mem_ledger_should_backpressure(RELATION, 80)`). The governor also
-admits covered allocations and reports refusals upstream. The legacy
+Three more things exceed the caps: one batch larger than the channel
+capacity, which an empty channel admits, batches that cannot be spilled,
+and batches taken in discard mode. The spill refuses, among others, a
+batch with a `STRING` column, a batch with compound columns, inline or
+not, and a batch without timestamps; such a batch stays resident, and each
+cap pass that ends over the cap for it counts in `held_over_cap`. Without
+a spill store nothing is spilled, and only the governor limits what the
+coordinator holds. Once a round cannot succeed, because a lane has closed
+with an error, a batch was invalid or a pump failed, the coordinator
+pushes each batch it takes onto its discard list with no cap pass: those
+batches stay resident and governed until the round's producers are joined
+and the list is disposed of, and neither the held bytes nor
+`held_over_cap` count them. A worker error does not cancel the round, so
+the other workers may publish the rest of their round's output, which the
+coordinator takes onto that list before the join.
+
+Each worker's ledger is initialized with an equal share of the coordinator
+ledger's budget, which the worker's report measures against and which
+limits no allocation: the workers allocate under the coordinator's one
+governor, so a skewed worker may use far more than its share of the
+budget. Producing a JOIN's output as sub-batches through the channel,
+evaluating batches downstream as they arrive within a round, and their SCC
+and frontier integration remain with #1383, and qualifying DOOP under a
+budget with #1385.
+
+The ledger's RELATION worker-share hint,
+`wl_mem_ledger_should_backpressure(RELATION, 80)`, has no caller in the
+library, so it triggers no join backpressure. The governor admits covered
+allocations and reports refusals upstream. The legacy
 `WIRELOG_JOIN_OUTPUT_LIMIT` row cap is disabled when unset, empty, or zero; a
 positive decimal keeps the optional per-join cap, clamped to `UINT32_MAX`.
 Malformed values fail session creation. This row cap is not the memory budget
@@ -723,7 +755,7 @@ the evaluation stack. Paths below are relative to `wirelog/columnar/`.
 | Differential arrangement | Session owns persistent index; transaction owns unpublished replacement; pin binds source snapshot | Replacement/invalidation cannot overwrite a leased index; abort discards staged work; final release applies deferred reset | `diff_arrangement.c`, `diff_join_batch.c` |
 | Filtered-relation cache | Cache owns filtered relation; explicit cache pins defer replacement | Last pin release destroys an invalidated entry; immediate-release lookup wrapper does not retain a pin for its caller | `filter.c` |
 | Materialization cache | Cache exclusively owns accepted heap results; lookup pin protects copying | JOIN exposes an independent copy to the stack; eviction/clear waits for pins and destroys the cached result once | `cache.c`, `join.c` |
-| Delta transport payload | Producer transfers an owned relation to the channel at publish, then to the coordinator matrix | A (worker, relation) slot may receive several batches; the held cap may replace a taken batch's relation with its spilled payload, which coalescing reads back; coalescing unions them into one matrix slot; discard destroys each owned queued or listed payload; owner mode keeps refused retirements on the lifetime's retained list | `eval_tdd_channel.c`, `eval.c` |
+| Delta transport payload | Producer transfers an owned relation to the channel at publish, then to the coordinator matrix | A (worker, relation) slot may receive several batches; the held cap may replace a taken batch's relation with its spilled payload, which coalescing reads back; coalescing unions them into one matrix slot; discard destroys each owned queued or listed payload; owner mode destroys a slot that staging built for the coordinator alone once its exchange has copied it, unless the destroy is refused, and keeps refused retirements on the lifetime's retained list | `eval_tdd_channel.c`, `eval.c` |
 | Continuation scratch and published batches | Producer owns scratch and input/index leases; synchronous sink owns committed output | Cursor advances at publication commit; destroy releases producer state; no asynchronous lifetime is implied for scratch-backed payloads | `continuation.c`, `join_batch.c`, `diff_join_batch.c` |
 | Delta-step rollback snapshots | Session owns admitted metadata, copied names and flat rows; stable relation identities prevent restoration into replacement registrations; a GC-only compound hold preserves handle IDs | Capture completes before detachment; checked restoration retains refused backups; successful evaluation or recovery releases them once; teardown discards pending backups after evaluator cleanup | `eval_delta.c`, `relation.c`, `session.c` |
 
@@ -850,7 +882,7 @@ it.
 | Sorted arrangement | Session; see §11 below | `arrangement.c:col_session_acquire_sorted_arrangement_probe_with_source_reader` | LFTJ probe holder | Source change requires rebuild, deferred while pinned | `arrangement.c:col_sorted_arrangement_probe_release` | Yes, re-sort | reviewer-read |
 | Filtered-relation cache entry | Filter cache | `filter.c:filt_cache_pin_take` | Pin holder | Replacement deferred while pinned | `filter.c:col_filt_cache_pin_release`, and only when eviction was deferred; the ordinary destruction sites are stale rebuild in `filter.c`, session invalidation and teardown in `session.c`, and worker teardown in `kfusion.c` | Yes, re-filter | reviewer-read |
 | Materialization cache entry | Cache, exclusively | `cache.c:col_mat_cache_lookup_pin_keyed` | Pin holder; the stack gets a copy, not the entry | `cache.c:mat_cache_evict_lru` skips pinned entries and returns false; admission in `cache.c:col_mat_cache_insert_pin_keyed` then returns `ENOSPC` | `cache.c:col_mat_cache_pin_release` on the last pin, and only when eviction was deferred | Yes, recompute the join | reviewer-read |
-| Delta transport payload | Producer, then channel, then consumer | Ownership transfers at publish | Consumer matrix | Coalescing unions the batches of one (worker, relation) slot | `eval_tdd_channel.c:wl_columnar_eval_tdd_batch_discard` on discard and `eval_tdd_channel.c:wl_columnar_eval_tdd_coalesce_slot` for coalesced sources; in owner mode a refused retirement stays on the lifetime's retained list until `eval.c:wl_columnar_eval_tdd_owner_lifetime_retry`; matrix slots are destroyed by `eval.c:tdd_destroy_delta_slots` and by several open-coded sites in `eval.c` | No | reviewer-read |
+| Delta transport payload | Producer, then channel, then consumer | Ownership transfers at publish | Consumer matrix | Coalescing unions the batches of one (worker, relation) slot; the held cap may replace a held batch's relation with its spilled payload | `eval_tdd_channel.c:wl_columnar_eval_tdd_batch_discard`, `wl_columnar_eval_tdd_discard_list`, `wl_columnar_eval_tdd_channel_discard_lists` and `wl_columnar_eval_tdd_discard_sink` on discard; `eval_tdd_channel.c:wl_columnar_eval_tdd_coalesce_slot` for coalesced sources; `eval_tdd_channel.c:wl_columnar_eval_tdd_batch_spill`, through `wl_columnar_batch_payload_take`, for a relation it spills; in owner mode `eval.c:tdd_owner_release_private_slots` destroys the slots staging built for the coordinator alone unless the destroy is refused, and a refused retirement stays on the lifetime's retained list until `eval.c:wl_columnar_eval_tdd_owner_lifetime_retry`; matrix slots are destroyed by `eval.c:tdd_destroy_delta_slots` and by several open-coded sites in `eval.c` | No | reviewer-read |
 | Continuation scratch and published batches | Producer owns scratch; sink owns committed output | `continuation.c:wl_columnar_continuation_create` for the continuation; `continuation.c:wl_columnar_continuation_publish` for each batch | The sink's append, before the cursor advances | Cursor advance at publication commit | `continuation.c:wl_columnar_continuation_destroy` | No | reviewer-read |
 
 Continuation producers that install the optional disposition callback use two
@@ -1672,9 +1704,8 @@ Ownership and admission:
   retry costs no new reservation.
 - The legacy row cap `WIRELOG_JOIN_OUTPUT_LIMIT` stays distinct and is
   checked once per committed batch, so it may be overshot by at most
-  `rows_per_batch - 1` rows in bounded mode.  The ledger backpressure
-  heuristic of the one-shot loop is not consulted per row in bounded mode;
-  admission is the bound.
+  `rows_per_batch - 1` rows in bounded mode.  No ledger backpressure
+  heuristic is consulted per row in bounded mode; admission is the bound.
 
 Differential keyed joins use `wirelog/columnar/diff_join_batch.c` when
 bounded mode is enabled for a normal keyed join.  Its scratch grows lazily

@@ -291,11 +291,22 @@ run_audit_boundary(int mode)
             && col->tdd_audit.replay
             && strcmp(col->tdd_audit.replay, "owner_tiny_frontier") == 0;
     } else if (mode == 1 || mode == 3) {
+        /* The refused submission cancels the channel with its ENOMEM
+         * before it drains the tasks already queued, if any (#1373). */
         ok = rc == ENOMEM && col->tdd_audit.selected_workers == 8
             && col->tdd_audit.submitted_tasks == (mode == 1 ? 0u : 4u)
-            && col->tdd_audit.completed_rounds == 0;
+            && col->tdd_audit.completed_rounds == 0
+            && col->tdd_audit.channel_cancelled == 1
+            && col->tdd_audit.channel_rc == ENOMEM
+            && col->tdd_audit.orphan_reclaims == 0
+            && col->tdd_audit.rejected == 0
+            && col->tdd_audit.consumer_spills == 0
+            && col->tdd_audit.refusal == NULL;
     } else if (mode == 0) {
         ok = rc == 0 && exact_chain(sess)
+            && col->tdd_audit.channel_cancelled == 0
+            && col->tdd_audit.channel_rc == 0
+            && col->tdd_audit.held_over_cap == 0
             && col->tdd_audit.completed_rounds > 0
             && col->tdd_audit.replay
             && strcmp(col->tdd_audit.replay, "owner_tiny_frontier") == 0;

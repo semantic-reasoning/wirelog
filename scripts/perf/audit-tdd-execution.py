@@ -24,6 +24,10 @@ DECISION_FLAGS = ("recursive", "snapshot", "exchange", "safe", "global_read_cand
                   "self_join", "single_key_aligned", "use_tdd")
 DECISION_COUNTS = ("idb_atoms", "segments", "segment_seed", "segment_global_read",
                    "segment_unsafe", "segment_max_idb", "segment_max_joins")
+# TDD channel fields (#1373); optional, as evidence recorded earlier lacks them.
+CHANNEL_COUNTS = ("channel_cancelled", "orphan_reclaims", "rejected", "consumer_spills",
+                  "held_over_cap", "stage_over_cap", "stage_peak_bytes")
+REFUSALS = ("none", "outbound_growth")
 FALLBACKS = ("none", "non_recursive", "snapshot_ineligible", "no_exchange", "unsafe_plan", "adaptive_workers")
 RESULT_CONTENT_HEADER = b"wirelog-result-content-v1\n"
 RESULT_VALUE_TYPES = ("int32", "int64", "uint32", "uint64", "bool", "float64", "string", "compound")
@@ -178,6 +182,13 @@ def parse_strata(stderr, workers, require_full=True):
             require(row[key] >= 0, f"negative {key}")
         for key in TIMINGS:
             row[key] = number(row[key])
+        for key in CHANNEL_COUNTS:
+            if key in row:
+                row[key] = int(row[key])
+                require(row[key] >= 0, f"negative {key}")
+        if "channel_rc" in row:
+            row["channel_rc"] = int(row["channel_rc"])
+        require(row.get("refusal", "none") in REFUSALS, "unknown refusal")
         require(row["idx"] == index, "duplicate/missing/reordered stratum")
         require(row["requested_workers"] == workers and row["rc"] == 0,
                 "wrong width or failed stratum")

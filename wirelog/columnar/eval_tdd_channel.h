@@ -97,6 +97,8 @@ typedef struct {
  * - owner_private_at_commit: private slots still in the matrix when the
  *   owner exchange prepared its input retirements; 0 unless a release was
  *   refused.
+ * - stratum_stage_peak_bytes: stage_peak_bytes over the current recursive
+ *   stratum alone; col_eval_stratum_tdd_recursive() restarts it at 0.
  */
 typedef struct {
     uint64_t held_cap;
@@ -114,6 +116,7 @@ typedef struct {
     uint64_t stage_spills;
     uint64_t owner_private_released;
     uint64_t owner_private_at_commit;
+    uint64_t stratum_stage_peak_bytes;
 } wl_tdd_consumer_stats_t;
 
 /*
@@ -127,6 +130,16 @@ typedef struct {
     uint64_t cap;
     wl_tdd_consumer_stats_t *stats;
 } wl_tdd_hold_t;
+
+/*
+ * An evaluation stop wl_columnar_eval_tdd_channel_collect() polls before
+ * each pump until it has cancelled the channel: @fn returns 0 to go on, or
+ * the error that stops the round.
+ */
+typedef struct {
+    int (*fn)(void *ctx);
+    void *ctx;
+} wl_tdd_stop_t;
 
 /* The errno a spill status maps to, as the cold-relation reader maps it:
  * MEMORY -> ENOSPC, ALLOCATION -> ENOMEM, IO/QUOTA/CAPACITY -> EIO,
@@ -336,6 +349,12 @@ wl_columnar_eval_tdd_channel_publish_delta(struct col_eval_tdd_worker_ctx *ctx,
  * be spilled while producers still run.  Without @hold the call touches
  * descriptors only, never a payload.
  *
+ * With @stop, its function is polled before each pump until the call has
+ * cancelled the channel, and a non-zero result is handled as a pump error
+ * with that value.  The cancel that follows returns ECANCELED to a
+ * producer waiting for space, so a stop reaches producers blocked in
+ * wl_tdd_channel_reserve() as well.
+ *
  * Once the round cannot succeed the call keeps pumping in discard mode, so
  * producers still make progress, and pushes every later batch onto
  * *@discard instead; the caller disposes that list after the producers are
@@ -358,7 +377,7 @@ int
 wl_columnar_eval_tdd_channel_collect(wl_tdd_channel_t *ch,
     wl_mem_ledger_t *ledger, wl_tdd_batch_t **lists, uint32_t nworkers,
     uint32_t nrels, wl_tdd_batch_t **discard, uint64_t *rows,
-    const wl_tdd_hold_t *hold);
+    const wl_tdd_hold_t *hold, const wl_tdd_stop_t *stop);
 
 /*
  * Consumer: coalesce every list built by

@@ -712,6 +712,7 @@ test_tdd_channel_spill_exe = executable(
   include_directories: [wirelog_inc, wirelog_src_inc],
   dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
   link_with: [testlib_prod],
+  c_args: ['-DWL_TDD_CHANNEL_TEST_HOOKS=1'],
 )
 test('tdd_channel_spill', test_tdd_channel_spill_exe,
      env: ['WL_TDD_CHANNEL_SPILL_DIR=' + meson.current_build_dir()],

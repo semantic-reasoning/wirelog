@@ -229,10 +229,11 @@ typedef struct {
 
 /*
  * Memory subsystem identifiers.
- * Each subsystem gets a fraction of the total budget (the per-subsystem
- * caps only drive wl_mem_ledger_subsys_over_budget() and
- * wl_mem_ledger_should_backpressure(); the RELATION share is the one the
- * join operator polls, so it is kept at 50%):
+ * Each subsystem gets a fraction of the total budget.  The per-subsystem
+ * caps are read by wl_mem_ledger_subsys_over_budget(), which
+ * col_session_reclaim_quiescent() calls for CACHE, by
+ * wl_mem_ledger_should_backpressure(), which has no caller in the
+ * library, and by the ledger report, which prints them:
  *   RELATION:    50% - operator output relations (join outputs) whose
  *                      col_rel_t.mem_ledger is attached
  *   ARENA:       10% - eval arenas and delta pools (fixed capacity,
@@ -418,8 +419,7 @@ wl_mem_ledger_subsys_over_budget(const wl_mem_ledger_t *ledger, int subsys);
  *
  * Returns true when the subsystem has consumed >= threshold% of its cap.
  * Values above 100 are invalid and return false.  This accounting hint is
- * not an admission decision.
- * Callers use this to trigger cache eviction, worker scaling, etc.
+ * not an admission decision, and nothing in the library calls it.
  * Returns false when budget is 0 (unlimited).
  * Thread-safe.
  */

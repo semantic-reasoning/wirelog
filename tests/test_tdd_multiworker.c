@@ -560,7 +560,7 @@ fixture_deliver(channel_fixture_t *f, col_eval_tdd_worker_ctx_t *ctxs,
     wl_tdd_refusal_sink_t sink = { fixture_refusal, f };
     wl_tdd_batch_t *discard = NULL;
     int rc = wl_columnar_eval_tdd_channel_collect(f->ch, &f->coord->mem_ledger,
-            f->lists, f->workers, f->nrels, &discard, rows, NULL);
+            f->lists, f->workers, f->nrels, &discard, rows, NULL, NULL);
     wl_columnar_eval_tdd_discard_list(f->ch, &discard, &sink);
     if (rc == 0)
         rc = wl_columnar_eval_tdd_channel_coalesce_all(f->coord, f->ch,
@@ -870,7 +870,8 @@ test_channel_delivery_duplicate(void)
         wl_tdd_batch_t *discard = NULL;
         wl_tdd_channel_close_lane(f.ch, 0, 0);
         ok = wl_columnar_eval_tdd_channel_collect(f.ch, &f.coord->mem_ledger,
-                f.lists, 1, 4, &discard, &rows, NULL) == EPROTO && rows == 1
+                f.lists, 1, 4, &discard, &rows, NULL, NULL) == EPROTO
+            && rows == 1
             && discard && !discard->next && discard->payload == invalid;
         wl_columnar_eval_tdd_discard_list(f.ch, &discard, &sink);
         ok = ok && wl_columnar_eval_tdd_channel_coalesce_all(f.coord, f.ch,
@@ -917,7 +918,8 @@ test_channel_orphan_and_occupied_slot(void)
     if (ok) {
         wl_tdd_channel_close_lane(f.ch, 0, 0);
         collect_rc = wl_columnar_eval_tdd_channel_collect(f.ch,
-                &f.coord->mem_ledger, f.lists, 1, 3, &discard, &rows, NULL);
+                &f.coord->mem_ledger, f.lists, 1, 3, &discard, &rows, NULL,
+                NULL);
         /* The orphan failed its lane before the take, so the valid batch is
          * discarded, not listed, and its rows are not counted. */
         ok = discard && !discard->next && discard->payload == valid;
@@ -943,7 +945,7 @@ test_channel_orphan_and_occupied_slot(void)
         dr[1] = occupant;
         wl_tdd_channel_close_lane(f.ch, 0, 0);
         ok = wl_columnar_eval_tdd_channel_collect(f.ch, &f.coord->mem_ledger,
-                f.lists, 1, 3, &discard, &rows, NULL) == 0 && rows == 3
+                f.lists, 1, 3, &discard, &rows, NULL, NULL) == 0 && rows == 3
             && discard == NULL;
         ok = ok && wl_columnar_eval_tdd_channel_coalesce_all(f.coord, f.ch,
                 f.lists, ctxs, 1, 3, &sink, NULL) == EPROTO;

@@ -255,6 +255,8 @@ test_orphan_reclaim(void)
     wl_tdd_channel_stats_t s = stats_of(ch);
     check(s.orphan_reclaims == 2, "both orphaned descriptors are reclaimed");
     check(s.channel_rc == EPROTO, "an orphan on a clean lane is EPROTO");
+    check(s.first_channel_rc == EPROTO && s.cancelled_rounds == 0,
+        "the orphan's EPROTO is the channel's first error, with no cancel");
     check(wl_tdd_channel_failed_lanes(ch), "the orphaning lane failed");
     check(s.reserved_bytes == 0, "orphaned reservation is returned");
     check(wl_columnar_memory_reserved(&governor) == 0,
@@ -454,11 +456,30 @@ test_cancel_blocked(void)
         "every queued batch is discarded once");
     wl_tdd_channel_stats_t s = stats_of(ch);
     check(s.channel_rc == ENOSPC, "the first cancel rc is kept");
+    check(s.cancelled_rounds == 1 && s.first_channel_rc == ENOSPC,
+        "one cancelled round, and its error, are recorded");
+    wl_tdd_channel_cancel(ch, EIO);
+    s = stats_of(ch);
+    check(s.cancelled_rounds == 1 && s.channel_rc == ENOSPC,
+        "a second cancel in the round counts nothing new");
     check(s.queued_batches == 0 && s.reserved_bytes == 0,
         "nothing is left queued or reserved");
     check(s.retired == s.published, "every published batch is retired");
     check(wl_columnar_memory_reserved(&governor) == 0,
         "cancelled round releases every token");
+    /* The next round clears the round's error but not the lifetime ones. */
+    REQUIRE(wl_tdd_channel_begin_round(ch, 0, 1) == 0);
+    s = stats_of(ch);
+    check(!s.cancelled && s.channel_rc == 0 && s.cancelled_rounds == 1
+        && s.first_channel_rc == ENOSPC,
+        "a new round keeps the lifetime cancel count and first error");
+    wl_tdd_channel_cancel(ch, EIO);
+    s = stats_of(ch);
+    check(s.cancelled_rounds == 2 && s.channel_rc == EIO
+        && s.first_channel_rc == ENOSPC,
+        "a cancel in a later round counts again");
+    for (uint32_t w = 0; w < lanes; w++)
+        wl_tdd_channel_close_lane(ch, w, ECANCELED);
     REQUIRE(wl_tdd_channel_destroy(ch) == 0);
 }
 

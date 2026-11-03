@@ -867,6 +867,20 @@ and resumable independently.
 | `columnar/relation.c`, `arrangement.c`, `eval_dedup.c`, `merge.c`, `partition.c` | One compare/hash action or copied/visited scalar cell; fresh contiguous relation lanes additionally admit one unit per requested 64-bit cell before allocation; sort, consolidation, materialization and coordinator partitioning require bounded chunks |
 | `columnar/eval_tdd_plan.c`, `eval_tdd_channel.c`, `tdd_channel.c`, `kfusion.c`, `workqueue.c` | One dispatch/exchange/progress action; payload processing additionally charges rows/cells, and blocking waits must observe stop |
 
+The recursive TDD batch channel (#1373), in `tdd_channel.c` and
+`eval_tdd_channel.c`, charges no work units yet, because no recursive TDD
+stratum runs under an evaluation control: `col_eval_stratum_tdd` returns
+ENOTSUP when one is attached. Its consumer's spill, read-back and
+coalescing charge nothing either. A producer's wait in
+`wl_tdd_channel_reserve` observes a stop through the coordinator, which
+polls the control for one before each pump until it has cancelled the
+channel, and cancels the channel on a stop; the cancel returns the producer
+ECANCELED. The control reports a latched accounting error ahead of any
+stop, so once one is latched the poll finds no stop. Neither reserve nor
+pump polls the control itself, and the coordinator's own wait in pump does
+not observe a stop: it ends only when a producer publishes, closes its lane
+or cancels a reservation, or the channel is cancelled.
+
 The internal `wl_columnar_merge_incremental_delta_attempt_advance` path charges
 each copied or compared scalar cell, each copied evaluator-dedup slot, and each
 nullary tuple action before touching it, and caps each call at 256 units.

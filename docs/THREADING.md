@@ -2334,13 +2334,26 @@ The test-only `wl_tdd_channel_test_wait`, built under
 `ch->mu` on a stats snapshot, so the predicate must not call into the
 channel.
 
+The consumer's adapters in `eval_tdd_channel.c` (spill, read-back,
+coalesce and discard) call the governor, the spill store and relation
+source gates without holding `ch->mu`, and reach the channel only through
+calls that take and drop it, such as `wl_tdd_channel_retire` and
+`wl_tdd_channel_stats`. They run on the coordinator's thread. The
+evaluation-stop poll that `wl_columnar_eval_tdd_channel_collect` makes
+before each pump, until it has cancelled the channel, is made without
+`ch->mu` held and takes only the evaluation control's mutex, a leaf held
+for the charge alone.
+
 ### Who waits on whom
 
-- **A producer blocked in `wl_tdd_channel_reserve`** waits for the consumer
-  to take a batch, for another producer to cancel a reservation, for an
-  earlier ticket to be admitted, or for `wl_tdd_channel_cancel`. The wait
-  on an earlier ticket cannot form a cycle: tickets are served in the order
-  they were taken.
+- **A producer blocked in `wl_tdd_channel_reserve`** waits for the
+  consumer to take a batch, for another producer to cancel a reservation,
+  for an earlier ticket to be admitted, or for `wl_tdd_channel_cancel`.
+  The wait on an earlier ticket cannot form a cycle: tickets are served in
+  the order they were taken. The reserve does not poll an evaluation stop
+  itself; the consumer polls for one before each pump until it has
+  cancelled the channel, and cancels the channel on a stop, which returns
+  the waiting producer ECANCELED.
 - **The consumer blocked in `wl_tdd_channel_pump`** waits for a publish, a
   cancelled reservation, a lane close, or a cancel.
 - **Lane close.** Each task wrapper ends its lane with
@@ -2381,6 +2394,47 @@ After a cancel, pump returns CANCELLED once every lane is closed. The
 batches still queued are taken by `wl_tdd_channel_discard_all`, which
 allocates nothing.
 
+### Progress
+
+The argument below assumes that each producer's work outside the channel
+terminates; the channel cannot bound a producer that never returns to it.
+A round has three kinds of wait: a producer waits in
+`wl_tdd_channel_reserve` for space, the consumer waits in
+`wl_tdd_channel_pump` for a producer, and the coordinator waits on the
+workqueue for the round's tasks.
+
+- **P1, pump returns.** With a batch queued, pump returns DATA, or
+  CANCELLED once a cancelled round has no open lane and no reservation,
+  leaving the batch to `wl_tdd_channel_discard_all`. With none queued but
+  bytes reserved, the lane holding the reservation publishes or cancels it
+  without waiting on the channel, since a lane holds at most one
+  reservation, and `wl_tdd_channel_close_lane` reclaims what a returning
+  producer left. With nothing queued or reserved, the head waiter is
+  admitted by the empty-channel rule. A task that has not started waits
+  only for a workqueue thread, which a running producer holds and frees,
+  so every task runs even with fewer threads than lanes, every lane
+  closes, and pump reaches COMPLETE or, after a cancel, CANCELLED.
+- **P2, the consumer does not wait on producers between pumps.** After a
+  take it frees the batch's CHANNEL bytes, checks whether the batch is
+  valid and, unless discard mode has begun, whether a lane has failed. It
+  then pushes the batch onto the discard list in discard mode, or links it
+  onto its list and runs the held cap's pass. Before the next pump, until
+  it has cancelled the channel, it polls the evaluation stop, which takes
+  only the evaluation control's mutex. The pass spills only published
+  batches, on which no producer holds a lease. Its spill writes to the
+  coordinator's spill store, which no worker writes to (see below), and
+  goes through the governor, whose tokens are atomic, and through memory
+  ledgers, whose writer gate is held only for a finite accounting section
+  that takes no other lock.
+- **P3, admission is bounded.** A producer that blocks is admitted within
+  the batches queued at that moment plus W - 1 takes (see Admission).
+- **P4, every wait or drain after the dispatch returns.** The join follows
+  COMPLETE, when every lane is closed. Every other wait or drain follows a
+  cancel (I1 below), after which a blocked reserve returns ECANCELED and a
+  task that starts closes its lane without running.
+- **P5, staging does not block producers.** The per-relation staging runs
+  after the join, when no producer is left.
+
 ### Use on the recursive TDD path
 
 `col_eval_stratum_tdd_recursive` creates one channel per stratum, with
@@ -2407,7 +2461,9 @@ round. The spill does not race the producers that are still running:
 - A published delta is a heap relation of its own: the ordinary path
   copies the new rows of the worker's relation into it, and the outbound
   path publishes a frame's private delta once no relation borrows its
-  storage. The worker keeps no pointer to it after the publish.
+  storage. The worker keeps no pointer to it after the publish and holds
+  no lease on it: the outbound path releases the source writer it stamps
+  the timestamps under before it reserves and publishes.
 - take accepts only a relation that owns its storage, is not an alias,
   and holds no memory token that is not its own, and it leaves the
   relation unchanged when it fails.
@@ -2474,11 +2530,31 @@ for space that only the pump frees. The sites are:
   `wl_columnar_eval_tdd_channel_cancel_for_teardown`, which does the same
   for the session's channels, before they drain the workqueue.
 
+**Evaluation stop.** Before each pump, until it has cancelled the channel,
+the consumer polls the session's evaluation control with
+`wl_evaluation_control_charge(control, 0)` while an attempt is active. A
+stop it reports, `WL_EVALUATION_CONTROL_CANCELLED` or
+`WL_EVALUATION_CONTROL_WORK_LIMIT`, is handled as a pump error: the
+channel is cancelled with it, it becomes the channel's error unless the
+channel already holds one, and the consumer keeps pumping until every lane
+has closed; the round's rc is then chosen as below. Any other result of
+the poll, such as the control's sticky accounting EOVERFLOW, does not end
+the round. Today no recursive TDD round runs under an evaluation control,
+because `col_eval_stratum_tdd` returns ENOTSUP when one is attached; the
+poll keeps a stop from leaving a producer blocked in
+`wl_tdd_channel_reserve` should that change. The control reports a latched
+accounting error ahead of any stop, so once one is latched the poll finds
+no stop.
+
 **Error of a round.** After the join, the round's rc is the first worker
 rc, in worker order, that is neither 0 nor ECANCELED; otherwise the
 channel's error; otherwise the consumer's; otherwise ECANCELED if a worker
 saw the cancel. A worker that only saw the cancel records neither its
-expression status nor a budget denial on the coordinator.
+expression status nor a budget denial on the coordinator. With
+`WIRELOG_TDD_STRATUM_PROFILE` set, the stratum's profile line records the
+first error the channel recorded as `channel_rc` even when a worker's
+error outranks it, and the rounds a cancel took effect in as
+`channel_cancelled`.
 
 In owner mode a batch whose retirement is refused stays on the owner
 lifetime record's retained list, and the record keeps the channel until
