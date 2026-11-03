@@ -1819,7 +1819,113 @@ Known-owner binding getter refusals preserve parked native storage, and native
 key queries retain the pre-native embedded-key initialization path. Exact bounds require recapture
 after any evaluated source change.
 
-Bound ended-generation cleanup still needs qualification before complete integration. Consumer helper
+Dynamic ended-generation outer cleanup still needs qualification before complete integration. Consumer helper
 and retained retry accounting, configured strict/cache/local/shared policies and
 general transaction intersections remain separate required bundle work. This
 section does not close #2297/#2298 or declare the PR Ready.
+
+### Bound native JOIN error cleanup
+
+The actual framed numeric child retains one private binding pointer/generation
+snapshot across its JOINs. The first paid BIND validates either the complete
+STATIC header and current original generation or the full actual dynamic
+transaction registration. Later BIND calls compare the immutable pair without
+polling a new original generation. Actual child ACK clears the snapshot before
+the parent consumes its completed grant. The private allocation grows by the
+two actual fields; constructor ZERO and governor accounting use its complete
+`sizeof`, independently of logical-frame geometry.
+
+The native cleanup entry authenticates the actual active frame and embedded
+context once, admits the existing numeric HOST384, and checks current native
+error history, numeric owner, immutable binding and cleanup phase. Each action
+reauthenticates; no proof token or permission boolean survives a return. Generic
+numeric/private-binding validation and normal observed authorization retain
+their original generation checks. Cleanup cannot dispatch sources, READY work,
+new evaluation or successor control operations.
+
+Actual precommit error JOIN_DECIDE invokes the existing nonzero-error branch,
+which skips publication and original polling, then advances to CONTROL. A genuine
+current ACKED receipt retains typed FINISH. A consumed failed original begin
+with SKIPPED history uses the remaining generic disposer, whether receipt storage
+is initially INERT or still ACKED from the previous completed JOIN. Historical
+`receipt.committed` is not the current JOIN's cutoff.
+
+Real ACK validates work and reader ownership before clearing fields and assigning
+ACKED. Fresh INERT storage and failed pre-activation constructors preserve that
+terminal invariant; all legal activations install nonterminal phases without a
+callback. The native entry checks current identity/history and excludes marker,
+launch and busy states, instead of repeating the complete inert-field scan.
+Manual constructor, query, ACK and final frame-close checks retain their existing
+proofs. Geometry applies to the associated known allocation; arbitrary foreign
+output storage is not a receipt ownership capability.
+
+The shared normal ACK still clears the complete LFTJ record. Native ACK omits
+that redundant clear only for a genuinely never-used framed LFTJ state, proven
+by constructor/transition history plus absent identity and inert metadata. Both
+destinations retain actual source-release proof, meaningful numeric field clears,
+phase reset and the original owned-reference drop. A native preference excludes
+live or completed LFTJ identity before dispatch; other cases retain the existing
+fully validated generic composed path.
+
+The emitted source ledger assigns the canonical admission's pre-debit55 to the
+actual enclosing framed HOST384, which also owns pending tuples, snapshot clear
+and host return. Numeric HOST384 owns post-debit proof and its action. Complete
+admission205 includes post-proof150; these are overlapping envelopes, not two
+payments or205+150 work. BIND172 fits its separate192 admission. Framed own work
+is347/384, including the additional mixed-LFTJ eligibility predicates.
+
+| Numeric cleanup action | Own source bound | Actual admission |
+| --- | ---: | ---: |
+| Error JOIN_DECIDE | 237 | 384 |
+| CONTROL | 230 | 384 |
+| FINISH | 354 | 384 |
+| RESET | 303 | 384 |
+| Child DONE status | 217 | 384 |
+| Filter ACK | 242 | 384 |
+| UNARY_ADVANCE | 161 | 384 |
+| RELEASE | 141 | 384 |
+| Pending result consumption | 186 | 384 |
+| Numeric ACK | 283 | 384 |
+
+A uniform conservative envelope is361/384. FINISH includes199 fixed source
+outside the existing exact `col_rel_destroy_checked` cooperative terminal
+boundary, including native/frame/current-unary proof, entry selection, refusal,
+retained state and status. That named destructor interior remains synchronous
+mandatory cleanup with its existing lifetime/gate qualifications; no finite CAS
+or whole-destructor quantum is asserted. The fixed wrapper work is freshly
+counted on every retry. No earlier one-time or unused grant credit pays retries.
+
+`evaluation_serial` uses the actual compiler-generated supported eight-op STATIC
+two-JOIN capture plan, retaining the separate exact seven-op fixture. Its literal
+baseline has four tuples. Tests exercise initial-INERT constructor failure,
+second-JOIN constructor failure with prior ACKED history, and genuine current
+ACKED cancellation/work exhaustion. Each ends/resets the original, begins a live
+successor, drains the retained old owner and proves successor consumption/result
+zero. Actual typed FINISH counts distinguish current ACKED from SKIPPED cleanup.
+Binding snapshots persist across the changed JOIN operation and clear at genuine
+numeric ACK. Parent ACK consumption at383/767 refuses without replacing the
+tuple;768 succeeds after the numeric record has become inert. Never-used LFTJ
+bytes remain zero before/after native ACK; numeric-plan tests separately prove
+that a genuinely completed LFTJ still receives the full generic ACK clear.
+
+`evaluation_join_prepared_auto_domains` uses actual registered observed a/b/c
+two-JOIN transactions for first/second constructor refusal and precommit
+cancellation/work exhaustion while the original ID remains current. It proves
+no public output/events, unchanged source images, actual error reports and full
+normal cleanup followed by literal reset/retry. A compiler-generated LFTJ then
+ordinary-JOIN plan exercises its genuine completed LFTJ identity, failed ordinary
+constructor, generic cleanup and successful retry; no phase or generation is
+seeded to manufacture that route.
+
+`eval_cleanup` derives the physical ZERO extent and reserved bytes from the
+allocation-size observation. Its independent literal tariff schedule, every
+prefix's exact/one-short assertion and failure rollback checks remain intact.
+Using logical-frame size for this physical allocation caused the reproducible
+CI assertion failure; increasing the allowance or relaxing the assertion is not
+the correction.
+
+These tests do not establish ended dynamic outer transaction/admission cleanup.
+The existing outer generation guard and public continuation rules require that
+separate mandatory destination and genuine public leak-free tests before grouped
+readiness. Consumer accounting, policy/cap/cache/shared and general transaction
+acceptance remain open.

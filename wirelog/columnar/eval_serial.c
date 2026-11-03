@@ -414,6 +414,14 @@ wl_columnar_eval_serial_framed_attempt_step(
             WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_PENDING;
         wl_columnar_eval_serial_framed_pending(ctx, ctx->phase, funding,
             funding_id);
+        if (ctx->private_bindings && !ctx->child.lftj.identity
+            && ctx->child.lftj_metadata.phase == WL_COLUMNAR_LFTJ_METADATA_INERT
+            && wl_columnar_eval_stack_auto_error_drain(ctx))
+            return ctx->pending_inner_consume
+                ? wl_columnar_eval_plan_numeric_native_cleanup_consume(ctx,
+                       ctx->inner_protocol, funding, funding_id)
+                : wl_columnar_eval_plan_numeric_native_cleanup_step(ctx,
+                       funding, funding_id);
         if (ctx->pending_inner_consume)
             return wl_columnar_eval_plan_numeric_composed_consume_result(
                 &ctx->child, ctx->inner_protocol, funding, funding_id);
@@ -615,8 +623,15 @@ wl_columnar_eval_serial_framed_attempt_step(
         }
         wl_columnar_eval_serial_framed_pending(ctx, ctx->phase, funding,
             funding_id);
-        return wl_columnar_eval_plan_numeric_composed_attempt_ack(&ctx->child,
-                   funding, funding_id);
+        rc = ctx->private_bindings && !ctx->child.lftj.identity
+            && ctx->child.lftj_metadata.phase == WL_COLUMNAR_LFTJ_METADATA_INERT
+            && wl_columnar_eval_stack_auto_error_drain(ctx)
+            ? wl_columnar_eval_plan_numeric_native_cleanup_ack(ctx, funding,
+                funding_id)
+            : wl_columnar_eval_plan_numeric_composed_attempt_ack(&ctx->child,
+                funding, funding_id);
+        if (!rc) wl_columnar_eval_stack_auto_child_acked(ctx);
+        return rc;
     case WL_COLUMNAR_EVAL_SERIAL_FRAMED_SPARE_PROOF:
         /* This state is reached only after genuine child ACK (or no child).
          * The committed image still owns the old source registry until now. */

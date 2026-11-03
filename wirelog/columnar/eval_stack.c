@@ -387,6 +387,8 @@ typedef struct wl_columnar_eval_stack_auto {
     wl_evaluation_control_t *launch;
     uint64_t launch_identity, launch_id;
     const wl_plan_op_t *operation;
+    const wl_columnar_eval_private_bindings_t *saved_binding;
+    uint64_t saved_binding_generation;
     uint32_t cursor;
     wl_columnar_eval_stack_auto_phase_t phase;
     int launch_protocol, stop_result;
@@ -5172,7 +5174,28 @@ wl_columnar_eval_stack_auto_bind(
     if (ctx->capture_out && !wl_columnar_eval_stack_frame_copy_output(f,
         (const void *)ctx->capture_out,
         sizeof(*ctx->capture_out))) return EINVAL;
-    return a->busy ? EBUSY : 0;
+    if (a->busy) return EBUSY;
+    const wl_columnar_eval_private_bindings_t *bindings = n->private_bindings;
+    if (a->saved_binding) {
+        if (a->saved_binding != bindings
+            || a->saved_binding_generation != bindings->generation)
+            return EINVAL;
+    } else if (bindings) {
+        if (bindings->dynamic_entries
+            ? !wl_columnar_session_observed_bindings_authorized(ctx->session,
+            bindings)
+            : bindings->identity != (uintptr_t)bindings
+            || bindings->session != ctx->session || bindings->plan != ctx->plan
+            || bindings->control != ctx->control
+            || bindings->attempt_id != ctx->attempt_id || !bindings->count
+            || bindings->count > WL_COLUMNAR_EVAL_PRIVATE_BINDING_MAX
+            || wl_evaluation_control_active_attempt_id(ctx->control)
+            != ctx->attempt_id)
+            return EINVAL;
+        a->saved_binding = bindings;
+        a->saved_binding_generation = bindings->generation;
+    }
+    return 0;
 }
 
 int
@@ -5459,6 +5482,95 @@ wl_columnar_eval_stack_auto_error_drain(
 }
 
 int
+wl_columnar_eval_stack_auto_cleanup_admit(
+    const wl_columnar_eval_serial_framed_attempt_t *ctx,
+    wl_evaluation_control_t *funding, uint64_t id)
+{
+    if (!ctx || !ctx->session || ctx->session->cleanup_active != ctx->frame)
+        return EINVAL;
+    int rc = wl_columnar_eval_stack_framed_authenticate(ctx->frame,
+            ctx->session, ctx);
+    if (rc) return rc;
+    rc = wl_columnar_eval_stack_auto_fund(funding, id, ctx->control,
+            WL_COLUMNAR_EVAL_PLAN_NUMERIC_HOST_WORK);
+    if (rc) return rc;
+    wl_columnar_eval_stack_cleanup_frame_t *frame = ctx->frame;
+    const wl_columnar_eval_stack_auto_t *a =
+        wl_columnar_eval_stack_automatic(frame);
+    const wl_columnar_eval_plan_numeric_attempt_t *n = &ctx->child;
+    if (!ctx->child_bound || frame->prepared_unary
+        || !wl_columnar_eval_stack_auto_error_drain(ctx)
+        || !wl_columnar_eval_plan_numeric_owner_valid(n, frame)
+        || n->session != ctx->session || n->control != ctx->control
+        || n->attempt_id != ctx->attempt_id || n->plan != ctx->plan
+        || !n->composed_mode || n->composed_busy
+        || n->runtime_depth > COL_STACK_MAX ||
+        n->preflight_depth > COL_STACK_MAX
+        || n->cursor < n->begin || n->cursor >= n->end
+        || n->end > n->plan->op_count || n->source_initialized || n->source_bare
+        || n->join_host || n->join_host_admitted || n->join_host_governor
+        || n->lftj.identity
+        || n->lftj_metadata.phase != WL_COLUMNAR_LFTJ_METADATA_INERT)
+        return EINVAL;
+    const wl_columnar_eval_private_bindings_t *bindings = a->saved_binding;
+    if (!bindings || n->private_bindings != bindings
+        || ctx->private_bindings != bindings
+        || bindings->generation != a->saved_binding_generation)
+        return EINVAL;
+    if (bindings->dynamic_entries
+        ? !wl_columnar_session_observed_bindings_cleanup_authorized(
+            ctx->session, bindings, ctx->plan, ctx->control, ctx->attempt_id,
+            a->saved_binding_generation)
+        : bindings->identity != (uintptr_t)bindings
+        || bindings->session != ctx->session || bindings->plan != ctx->plan
+        || bindings->control != ctx->control
+        || bindings->attempt_id != ctx->attempt_id || !bindings->count
+        || bindings->count > WL_COLUMNAR_EVAL_PRIVATE_BINDING_MAX)
+        return EINVAL;
+    /* Real ACK validates and clears every owning field before assigning ACKED.
+     * Fresh INERT and failed pre-activation constructors preserve that state.
+     * All legal mutations install nonterminal phases callback-free; the real
+     * history proof above rejects them and any marker/launch/busy owner. */
+    if (a->phase == WL_COLUMNAR_EVAL_STACK_AUTO_SKIPPED) {
+        if (a->finish || !a->launch_protocol) return EINVAL;
+    } else if (a->receipt.identity != &a->receipt
+        || a->receipt.phase != WL_COLUMNAR_EVAL_STACK_PREPARED_ACKED
+        || (a->phase != WL_COLUMNAR_EVAL_STACK_AUTO_WAIT_FINISH
+        && a->phase != WL_COLUMNAR_EVAL_STACK_AUTO_FINISHED))
+        return EINVAL;
+    wl_columnar_eval_plan_numeric_phase_t phase = n->phase ==
+        WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_PENDING ? n->pending_action
+        : n->phase;
+    if (phase == WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_UNARY_CHILD) {
+        wl_columnar_filter_context_t *c = &frame->filter;
+        if (c->identity != c || c->frame != frame || c->session != ctx->session
+            || c->busy || !c->thread_valid || c->attempt_id != ctx->attempt_id)
+            return EINVAL;
+        if (c->stage == WL_COLUMNAR_FILTER_STAGE_JOIN_DECIDE
+            && (!c->pin_owned || !c->join_decision_pending
+            || c->join_operation != a->operation || c->control != ctx->control
+            || c->join_disposition != WL_COLUMNAR_JOIN_DISPOSITION_REPLACE
+            || c->committed || frame->unary_committed
+            || !c->execution_result ||
+            c->execution_result != c->semantic_result))
+            return EINVAL;
+    }
+    return 0;
+}
+
+/* The caller has just successfully ACKed this real framed numeric child.
+ * No callback or yield separates its ACK proof and these lifetime clears. */
+void
+wl_columnar_eval_stack_auto_child_acked(
+    wl_columnar_eval_serial_framed_attempt_t *ctx)
+{
+    wl_columnar_eval_stack_auto_t *a =
+        wl_columnar_eval_stack_automatic(ctx->frame);
+    a->saved_binding = NULL;
+    a->saved_binding_generation = 0;
+}
+
+int
 wl_columnar_eval_stack_auto_close_ready(
     wl_columnar_eval_serial_framed_attempt_t *ctx,
     wl_evaluation_control_t *funding, uint64_t id)
@@ -5497,6 +5609,9 @@ wl_columnar_eval_stack_test_auto_observe(
     if (a->identity != a || a->frame != f) return EINVAL;
     out->receipt = &a->receipt; out->launch = a->launch;
     out->launch_id = a->launch_id;
+    out->saved_binding = a->saved_binding;
+    out->saved_binding_generation = a->saved_binding_generation;
+    out->operation = a->operation;
     out->phase = a->phase; out->receipt_phase = a->receipt.phase;
     out->parent_phase = f->framed.phase;
     out->numeric_phase = f->framed.child.phase;

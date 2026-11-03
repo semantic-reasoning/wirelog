@@ -7545,6 +7545,9 @@ typedef struct wl_columnar_eval_private_bindings {
 
 bool wl_columnar_session_observed_bindings_authorized(
     const wl_col_session_t *, const wl_columnar_eval_private_bindings_t *);
+bool wl_columnar_session_observed_bindings_cleanup_authorized(
+    const wl_col_session_t *, const wl_columnar_eval_private_bindings_t *,
+    const wl_plan_relation_t *, wl_evaluation_control_t *, uint64_t, uint64_t);
 /* Iteration-zero scalar selectors admitted by the materialized batch host.
  * JOIN-right has no VARIABLE FORCE_EMPTY semantics. */
 bool wl_columnar_eval_plan_scalar_selector_supported(const wl_plan_op_t *);
@@ -8328,8 +8331,8 @@ int wl_columnar_eval_stack_framed_writable(
 extern void (*wl_columnar_eval_stack_test_unary_prepared_checkpoint)(
     wl_columnar_eval_stack_unary_prepared_t *);
 typedef struct {
-    const void *receipt, *launch;
-    uint64_t launch_id;
+    const void *receipt, *launch, *saved_binding, *operation;
+    uint64_t launch_id, saved_binding_generation;
     unsigned phase, receipt_phase, parent_phase, numeric_phase, cursor;
     int launch_protocol, first_result;
     bool busy, committed, finish, abort_requested;
@@ -8460,6 +8463,20 @@ int wl_columnar_eval_stack_auto_consume(
     uint64_t, bool, bool *);
 bool wl_columnar_eval_stack_auto_error_drain(
     const wl_columnar_eval_serial_framed_attempt_t *);
+int wl_columnar_eval_stack_auto_cleanup_admit(
+    const wl_columnar_eval_serial_framed_attempt_t *, wl_evaluation_control_t *,
+    uint64_t);
+void wl_columnar_eval_stack_auto_child_acked(
+    wl_columnar_eval_serial_framed_attempt_t *);
+int wl_columnar_eval_plan_numeric_native_cleanup_step(
+    wl_columnar_eval_serial_framed_attempt_t *, wl_evaluation_control_t *,
+    uint64_t);
+int wl_columnar_eval_plan_numeric_native_cleanup_consume(
+    wl_columnar_eval_serial_framed_attempt_t *, int, wl_evaluation_control_t *,
+    uint64_t);
+int wl_columnar_eval_plan_numeric_native_cleanup_ack(
+    wl_columnar_eval_serial_framed_attempt_t *, wl_evaluation_control_t *,
+    uint64_t);
 bool wl_columnar_eval_stack_host_geometry(const wl_col_session_t *,
     const wl_columnar_eval_serial_framed_host_request_t *);
 

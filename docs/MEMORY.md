@@ -5857,7 +5857,7 @@ release use the complete allocation size. Logical-frame geometry and allocation
 size are separate internal test observations.
 
 On the native LP64 test build the logical frame is 11,440 bytes, the private
-tail is 464 bytes and the allocation is 11,904 bytes; the prepared receipt is
+tail is 480 bytes and the allocation is 11,920 bytes; the prepared receipt is
 392 bytes. These are observations, not cross-platform constants. Original
 frame construction still charges 224 per actual 16-byte zeroing chunk, with
 the existing constructor tariffs. Two native identity anchors are installed
@@ -5879,6 +5879,30 @@ output, so a parked-owner refusal leaves its dormant receipt untouched. The
 pre-native constructor may still initialize its embedded cleanup key. Session-only
 receipt reads protect the current active allocation; they do not derive an
 arbitrary parked allocation from a receipt key.
+
+The private tail also records one immutable binding pointer and generation for
+the framed numeric child's lifetime. Its first paid BIND validates the complete
+STATIC header or actual registered dynamic transaction while the original
+generation is current. Later JOINs compare the saved pair; they cannot refresh
+it after the original ends. The existing child/transaction keeps binding storage
+live; the snapshot acquires no extra resource. Actual numeric ACK clears the
+pair before parent consumption can release the containing owner.
+
+An ended-original STATIC owner may use the authenticated native error cleanup
+entry under a fresh numeric HOST allowance. It checks actual frame, child,
+binding and consumed current-JOIN history on every action and performs no new
+data work or original/successor poll. Failed publication begin can leave either
+initial INERT storage or a previous JOIN's terminal ACKED receipt; both use the
+remaining generic disposer, while genuine current ACKED publication history
+retains typed FINISH. Terminal receipt ownership follows the real ACK transition,
+whose existing full owning-field checks remain intact.
+
+Native cleanup ACK retains full source unbinding and meaningful record/reference
+release. It omits the whole LFTJ clear only for the constructor-owned framed
+child that has never acquired LFTJ identity or active metadata. Generic ACK keeps
+that clear. Actual mixed LFTJ-to-JOIN plans retain the fully validated generic
+route. Dynamic cleanup with its original generation still current is covered;
+ended dynamic outer transaction/admission cleanup remains required separately.
 
 ## Host source inspection memory (#2321)
 

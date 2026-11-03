@@ -4019,6 +4019,8 @@ composed_lftj_finish_stop(fixture_t *f, int stop, int result)
     CHECK(f->record.phase == WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_DONE
         && f->record.semantic_result == result);
     CHECK(!composed_host_turn(f, true));
+    const unsigned char cleared_lftj[sizeof(f->record.lftj)] = {0};
+    CHECK(!memcmp(&f->record.lftj, cleared_lftj, sizeof(cleared_lftj)));
     CHECK(!wl_columnar_eval_stack_cleanup_finish(&f->frame));
     CHECK(!f->session.cleanup_active_count
         && !f->session.cleanup_reserved_bytes);
@@ -5925,7 +5927,8 @@ test_composed_lftj_stopped_cleanup(void)
             WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_DONE);
         composed_action(&f);
     }
-    CHECK(f.record.lftj.phase == WL_COLUMNAR_LFTJ_ATTEMPT_DONE);
+    CHECK(f.record.lftj.phase == WL_COLUMNAR_LFTJ_ATTEMPT_DONE
+        && f.record.lftj.identity == &f.record.lftj);
     eval_stack_t *stack = wl_columnar_eval_stack_cleanup_stack(f.frame);
     CHECK(stack->top == 1 && stack->items[0].owned);
     CHECK(!session_find_rel(&f.session, "result"));

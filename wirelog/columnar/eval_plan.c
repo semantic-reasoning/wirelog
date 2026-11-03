@@ -3061,6 +3061,32 @@ wl_columnar_eval_plan_numeric_lftj_metadata_ack_ended(
     return rc;
 }
 
+/* Shared advancement follows either complete normal or native cleanup proof;
+ * both callers hold composed_busy throughout this callback-free action. */
+static int
+wl_columnar_eval_plan_composed_unary_advance(
+    wl_columnar_eval_plan_numeric_attempt_t *record)
+{
+    if (record->join_host || record->join_host_admitted
+        || record->join_host_governor) return EBUSY;
+    record->join_host_declined = false;
+    record->join_host_terminal = record->join_host_committed = false;
+    record->join_host_busy = false;
+    record->join_host_initialized_bytes = 0;
+    if (record->phase ==
+        WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_CONCAT_ADVANCE
+        && record->child_status.committed) --record->runtime_depth;
+    uint32_t consumed = 1u + record->join_host_tail_count;
+    record->join_host_tail_count = 0;
+    if (!record->semantic_result) record->completed += consumed;
+    if (!record->semantic_result) record->cursor += consumed - 1u;
+    record->phase = record->semantic_result ||
+        ++record->cursor == record->end
+        ? WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_RELEASE
+        : WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_READY;
+    return 0;
+}
+
 /* The sole caller has completed the full composed attempt proof and set
  * composed_busy immediately before entry, without a callback or yield.
  * This lexical proof is never retained across a return. */
@@ -3415,24 +3441,7 @@ wl_columnar_eval_plan_numeric_composed_attempt_step_validated_body(
                    funding, funding_id, record);
     case WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_UNARY_ADVANCE:
     case WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_CONCAT_ADVANCE:
-        if (record->join_host || record->join_host_admitted
-            || record->join_host_governor) return EBUSY;
-        record->join_host_declined = false;
-        record->join_host_terminal = record->join_host_committed = false;
-        record->join_host_busy = false;
-        record->join_host_initialized_bytes = 0;
-        if (record->phase ==
-            WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_CONCAT_ADVANCE
-            && record->child_status.committed) --record->runtime_depth;
-        uint32_t consumed = 1u + record->join_host_tail_count;
-        record->join_host_tail_count = 0;
-        if (!record->semantic_result) record->completed += consumed;
-        if (!record->semantic_result) record->cursor += consumed - 1u;
-        record->phase = record->semantic_result ||
-            ++record->cursor == record->end
-            ? WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_RELEASE
-            : WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_READY;
-        return 0;
+        return wl_columnar_eval_plan_composed_unary_advance(record);
     case WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_SOURCE_FULL:
     case WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_SOURCE_DELTA:
     case WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_SOURCE_SELECT:
@@ -3632,21 +3641,10 @@ wl_columnar_eval_plan_numeric_composed_cleanup_source(
     return 0;
 }
 
-int
-wl_columnar_eval_plan_numeric_composed_consume_result(
-    wl_columnar_eval_plan_numeric_attempt_t *record, int child_protocol,
-    wl_evaluation_control_t *funding, uint64_t funding_id)
+static int
+wl_columnar_eval_plan_composed_consume_body(
+    wl_columnar_eval_plan_numeric_attempt_t *record, int child_protocol)
 {
-    if (record && (record->composed_busy
-        || wl_columnar_eval_stack_frame_mutation_blocked(
-            record->frame))) return EBUSY;
-    int rc = wl_columnar_eval_plan_composed_validate(record);
-    if (rc) return rc;
-    if (record->phase != WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_PENDING)
-        return EBUSY;
-    rc = wl_columnar_eval_plan_composed_fund(funding, funding_id,
-            record->control);
-    if (rc) return rc;
     if (record->pending_action >=
         WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_SOURCE_INIT
         && record->pending_action <=
@@ -3707,6 +3705,24 @@ wl_columnar_eval_plan_numeric_composed_consume_result(
 }
 
 int
+wl_columnar_eval_plan_numeric_composed_consume_result(
+    wl_columnar_eval_plan_numeric_attempt_t *record, int child_protocol,
+    wl_evaluation_control_t *funding, uint64_t funding_id)
+{
+    if (record && (record->composed_busy
+        || wl_columnar_eval_stack_frame_mutation_blocked(
+            record->frame))) return EBUSY;
+    int rc = wl_columnar_eval_plan_composed_validate(record);
+    if (rc) return rc;
+    if (record->phase != WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_PENDING)
+        return EBUSY;
+    rc = wl_columnar_eval_plan_composed_fund(funding, funding_id,
+            record->control);
+    if (rc) return rc;
+    return wl_columnar_eval_plan_composed_consume_body(record, child_protocol);
+}
+
+int
 wl_columnar_eval_plan_numeric_composed_attempt_status(
     const wl_columnar_eval_plan_numeric_attempt_t *record,
     wl_columnar_eval_plan_numeric_status_t *status,
@@ -3764,6 +3780,41 @@ wl_columnar_eval_plan_numeric_composed_abort_request(
     return 0;
 }
 
+static void
+wl_columnar_eval_plan_composed_ack_clear(
+    wl_columnar_eval_plan_numeric_attempt_t *record)
+{
+    wl_evaluation_control_t *control = record->control;
+    record->control = NULL; record->identity = NULL;
+    record->frame = NULL; record->session = NULL; record->plan = NULL;
+    record->source_registry = NULL; record->source_mode = false;
+    record->source_output = NULL; record->source_installed = false;
+    record->thread_valid = false; record->attempt_id = 0;
+    record->composed_mode = false; record->preflight_depth = 0;
+    record->runtime_depth = 0;
+    record->controlled_materialized_batch_fallback = false;
+    record->join_host_terminal = record->join_host_declined = false;
+    record->join_host_busy = false;
+    record->private_bindings = NULL;
+    record->lftj_metadata_dispatch = false;
+    record->abort_supported = false; record->abort_requested = false;
+    record->composed_busy = record->lftj_cleanup_authorized = false;
+    record->phase = WL_COLUMNAR_EVAL_PLAN_NUMERIC_INERT;
+    wl_evaluation_control_release(control);
+}
+
+static int
+wl_columnar_eval_plan_composed_ack_body(
+    wl_columnar_eval_plan_numeric_attempt_t *record)
+{
+    int rc = wl_columnar_eval_stack_composed_source_release(record->frame,
+            record->session, record);
+    if (rc) return rc;
+    memset(&record->lftj, 0, sizeof(record->lftj));
+    wl_columnar_eval_plan_composed_ack_clear(record);
+    return 0;
+}
+
 int
 wl_columnar_eval_plan_numeric_composed_attempt_ack(
     wl_columnar_eval_plan_numeric_attempt_t *record,
@@ -3781,27 +3832,77 @@ wl_columnar_eval_plan_numeric_composed_attempt_ack(
     rc = wl_columnar_eval_plan_composed_fund(funding, funding_id,
             record->control);
     if (rc) return rc;
-    rc = wl_columnar_eval_stack_composed_source_release(record->frame,
-            record->session, record);
+    return wl_columnar_eval_plan_composed_ack_body(record);
+}
+
+int
+wl_columnar_eval_plan_numeric_native_cleanup_step(
+    wl_columnar_eval_serial_framed_attempt_t *ctx,
+    wl_evaluation_control_t *funding, uint64_t id)
+{
+    int rc = wl_columnar_eval_stack_auto_cleanup_admit(ctx, funding, id);
     if (rc) return rc;
-    wl_evaluation_control_t *control = record->control;
-    record->control = NULL; record->identity = NULL;
-    record->frame = NULL; record->session = NULL; record->plan = NULL;
-    record->source_registry = NULL; record->source_mode = false;
-    record->source_output = NULL; record->source_installed = false;
-    record->thread_valid = false; record->attempt_id = 0;
-    record->composed_mode = false; record->preflight_depth = 0;
-    record->runtime_depth = 0;
-    record->controlled_materialized_batch_fallback = false;
-    record->join_host_terminal = record->join_host_declined = false;
-    record->join_host_busy = false;
-    record->private_bindings = NULL;
-    record->lftj_metadata_dispatch = false;
-    record->abort_supported = false; record->abort_requested = false;
-    record->composed_busy = record->lftj_cleanup_authorized = false;
-    memset(&record->lftj, 0, sizeof(record->lftj));
-    record->phase = WL_COLUMNAR_EVAL_PLAN_NUMERIC_INERT;
-    wl_evaluation_control_release(control);
+    wl_columnar_eval_plan_numeric_attempt_t *n = &ctx->child;
+    n->composed_busy = true;
+    switch (n->phase) {
+    case WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_UNARY_CHILD:
+        n->pending_action = n->phase;
+        n->phase = WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_PENDING;
+        rc = wl_columnar_filter_op_attempt_step_owned(n->frame,
+                &n->child_status, n);
+        break;
+    case WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_UNARY_ACK:
+        n->pending_action = n->phase;
+        n->phase = WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_PENDING;
+        rc = wl_columnar_filter_op_attempt_ack_owned(n->frame, n);
+        break;
+    case WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_UNARY_ADVANCE:
+        rc = wl_columnar_eval_plan_composed_unary_advance(n);
+        break;
+    case WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_RELEASE:
+        n->phase = WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_DONE;
+        break;
+    default:
+        rc = EBUSY;
+        break;
+    }
+    n->composed_busy = false;
+    return rc;
+}
+
+int
+wl_columnar_eval_plan_numeric_native_cleanup_consume(
+    wl_columnar_eval_serial_framed_attempt_t *ctx, int child_protocol,
+    wl_evaluation_control_t *funding, uint64_t id)
+{
+    int rc = wl_columnar_eval_stack_auto_cleanup_admit(ctx, funding, id);
+    if (rc) return rc;
+    wl_columnar_eval_plan_numeric_attempt_t *n = &ctx->child;
+    if (n->phase != WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_PENDING
+        || (n->pending_action !=
+        WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_UNARY_CHILD
+        && n->pending_action !=
+        WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_UNARY_ACK))
+        return EBUSY;
+    return wl_columnar_eval_plan_composed_consume_body(n, child_protocol);
+}
+
+int
+wl_columnar_eval_plan_numeric_native_cleanup_ack(
+    wl_columnar_eval_serial_framed_attempt_t *ctx,
+    wl_evaluation_control_t *funding, uint64_t id)
+{
+    int rc = wl_columnar_eval_stack_auto_cleanup_admit(ctx, funding, id);
+    if (rc) return rc;
+    if (ctx->child.phase != WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_DONE)
+        return EBUSY;
+    /* This confined framed child has never acquired LFTJ identity. The full
+     * native proof excludes all active/completed LFTJ state; generic ACK still
+     * clears that whole record. Preserve the real source unbind in both paths. */
+    rc = wl_columnar_eval_stack_composed_source_release(ctx->child.frame,
+            ctx->child.session, &ctx->child);
+    if (rc) return rc;
+    wl_columnar_eval_plan_composed_ack_clear(&ctx->child);
     return 0;
 }
 
