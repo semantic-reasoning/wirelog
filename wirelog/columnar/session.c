@@ -5700,6 +5700,7 @@ col_worker_session_create(wl_col_session_t *coordinator,
     out_worker->tdd_owner_lifetime = NULL;
     out_worker->tdd_channel = NULL;
     out_worker->tdd_channel_lists = NULL;
+    out_worker->tdd_channel_private = NULL;
     out_worker->tdd_channel_list_count = 0;
     out_worker->tdd_channel_discard = NULL;
     /* This struct began as a copy of the coordinator, so clear the flag

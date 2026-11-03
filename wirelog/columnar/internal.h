@@ -2558,9 +2558,12 @@ typedef struct wl_col_session_t {
      * makes while the workers run; tdd_dispatch_wait_ns is the sum of the
      * two.  tdd_idle_estimate_ns adds how far each round's wait exceeded
      * its slowest worker's runtime, so it includes pump and spill time
-     * too.  tdd_queue_drain_ns covers only the coalesce of the collected
-     * batches after the join.  Coordinator-only; reset at the start of
-     * each wl_session_snapshot(). */
+     * too.  tdd_queue_drain_ns covers the staging of the collected
+     * batches after the join (each relation's spill-down and coalesce),
+     * which the exchanges run; the driver takes that time out of
+     * exchange_time_ns and tdd_exchange_ns, though the exchanges' own
+     * tdd_exchange_*_ns breakdowns can still include it.  Coordinator-only;
+     * reset at the start of each wl_session_snapshot(). */
     uint64_t tdd_total_ns;
     uint64_t tdd_dispatch_wait_ns;
     uint64_t tdd_submit_loop_ns;
@@ -2914,6 +2917,10 @@ typedef struct wl_col_session_t {
      * or until the driver's cleanup disposes of them. */
     wl_tdd_batch_t **tdd_channel_lists;
     size_t tdd_channel_list_count;
+    /* One flag per list, set by staging when the (worker, relation) slot
+     * it built is private to the coordinator rather than an adopted batch.
+     * Allocated with tdd_channel_lists, after its list heads. */
+    bool *tdd_channel_private;
     /* Batches taken from tdd_channel in discard mode, once its round
      * cannot succeed, linked through batch->next.  They are disposed after
      * the round's producers are joined, or by the driver's cleanup. */
@@ -6072,8 +6079,9 @@ int
 wl_columnar_eval_nonrec_relation_parallel(const wl_plan_relation_t *rp,
     wl_col_session_t *coord);
 /* The bytes of a TDD channel's side buffers for @workers lanes and @nrels
- * relations: the channel object, its lanes and the consumer list heads.
- * Returns 0, EINVAL for zero workers, or EOVERFLOW. */
+ * relations: the channel object, its lanes, and the consumer list heads
+ * with one staging flag each.  Returns 0, EINVAL for zero workers, or
+ * EOVERFLOW. */
 int
 wl_columnar_eval_tdd_channel_side_bytes(uint32_t workers, uint32_t nrels,
     uint64_t *bytes);

@@ -563,18 +563,39 @@ once, apart from one batch larger than the capacity, which is admitted into
 an empty channel. Producers wait for space while the coordinator takes
 batches; the batches it has taken are not counted against the capacity.
 
-The batches the coordinator has taken are held until the round's producers
-are joined and the batches are coalesced into the delta matrix. While the
-round runs, each take is followed by a cap pass: when the charges of the
-resident batches held exceed the held cap and the session has a spill store
+The batches the coordinator has taken are held until the round's exchange
+stages their relation into the delta matrix. While the round runs, each
+take is followed by a cap pass: when the charges of the resident batches
+held exceed the held cap and the session has a spill store
 (`spill_directory`), the coordinator spills the largest of them until they
 fit. The held cap is a quarter of an enforcing budget, or none when no
 budget is enforced. `WIRELOG_TDD_HELD_BYTES=<bytes>` overrides it with a
 positive decimal that fits in 64 bits; any other value is ignored. A batch
 whose spill fails stays resident and governed, so the held bytes can exceed
 the cap; `held_over_cap` in the consumer statistics counts the passes that
-ended over it. The coalesce after the join reads every spilled batch back,
-so the cap does not bound the delta matrix the round leaves.
+ended over it.
+
+The exchange stages one relation at a time. Before it coalesces a
+relation's batches into the delta matrix, reading the spilled ones back, it
+spills the other relations' resident batches, largest first, while their
+charges, the matrix slots the other relations still hold, and an estimate
+of the staging's peak together exceed the held cap. The estimate counts an
+adopted batch's charge; for a fresh slot it counts the resident inputs and
+the slot's row bytes, and when two or more batches may be consolidated, the
+row bytes again and 4 bytes a row. Owner mode keeps the batches it adopted
+until its commit retires them, but destroys a slot that staging built as
+soon as its exchange has copied it, unless the destroy is refused. Unless
+`stage_over_cap` counts a staging, the other relations' held batches and
+matrix slots fit within the cap while a relation stages (`stage_peak_bytes`
+in the consumer statistics). The cap does not bound that relation's staged
+slots, the buffers the exchange builds from them, the publication
+candidates owner mode has built for the relations exchanged before it, or
+the next round's inputs. The exchange creates its unions, gathered
+partitions, broadcast copies and BDX combinations under the governor; the
+partitions `col_rel_exchange_partition` writes are accounted after
+allocation. The shared views it installs on workers hold no storage of
+their own and are not put under the governor, and neither is the
+destination of the deep copy a view falls back to.
 
 The ledger's RELATION worker-share hint can still trigger join backpressure
 at 80% (`wl_mem_ledger_should_backpressure(RELATION, 80)`). The governor also

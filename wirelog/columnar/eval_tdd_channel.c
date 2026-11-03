@@ -914,6 +914,67 @@ wl_columnar_eval_tdd_hold_batch(const wl_tdd_hold_t *hold,
     return held;
 }
 
+/* Coalesce relation @ri's lists into ctxs[w].delta_rels[ri]; see
+ * wl_columnar_eval_tdd_channel_coalesce_all().  Once @rc is non-zero, on
+ * entry or after a failure, the remaining lists are disposed instead. */
+static int
+tdd_coalesce_relation(wl_col_session_t *coord, wl_tdd_channel_t *ch,
+    wl_tdd_batch_t **lists, col_eval_tdd_worker_ctx_t *ctxs,
+    uint32_t nworkers, uint32_t ri, const wl_tdd_refusal_sink_t *sink,
+    wl_tdd_consumer_stats_t *stats, bool *private_out, int rc)
+{
+    for (uint32_t w = 0; w < nworkers; w++) {
+        wl_tdd_batch_t **list = &lists[(size_t)ri * nworkers + w];
+        if (private_out)
+            private_out[w] = false;
+        if (!*list)
+            continue;
+        if (rc == 0 && ctxs[w].delta_rels[ri])
+            rc = EPROTO;
+        if (rc != 0) {
+            wl_columnar_eval_tdd_discard_list(ch, list, sink);
+            continue;
+        }
+        /* Collect pushed newest first; coalesce wants seq order. */
+        tdd_list_reverse(list);
+        const wl_tdd_batch_t *head = *list;
+        const char *name = ctxs[w].sp
+            ? ctxs[w].sp->relations[ri].delta_name : NULL;
+        /* A slot of spilled batches takes the schema of worker w's relation
+         * ri, which the ordinary path creates its deltas like.  In owner and
+         * global-read mode an adopted slot is created like the relation
+         * plan's result instead, so the two kinds of slot need only be
+         * compatible under the exchanges' tdd_relation_schema_compatible(),
+         * which accepts a declared width of 0 against any other. */
+        const col_rel_t *schema = ctxs[w].sp && ctxs[w].worker_sess
+            ? session_find_rel(ctxs[w].worker_sess,
+                ctxs[w].sp->relations[ri].name) : NULL;
+        uint64_t spilled = 0;
+        for (const wl_tdd_batch_t *b = head; b; b = b->next)
+            if (b->kind == WL_TDD_BATCH_SPILLED)
+                spilled++;
+        /* A single RESIDENT batch is adopted; any other slot is new. */
+        const void *adoptable = head && !head->next
+            && head->kind == WL_TDD_BATCH_RESIDENT ? head->payload : NULL;
+        rc = wl_columnar_eval_tdd_coalesce_slot(coord, ch, list, nworkers,
+                name, schema, sink, &ctxs[w].delta_rels[ri]);
+        if (rc != 0) {
+            wl_columnar_eval_tdd_discard_list(ch, list, sink);
+            continue;
+        }
+        bool adopted = adoptable
+            && (const void *)ctxs[w].delta_rels[ri] == adoptable;
+        if (stats) {
+            stats->rehydrated_batches += spilled;
+            if (adopted)
+                stats->stage_adopted++;
+        }
+        if (private_out)
+            private_out[w] = ctxs[w].delta_rels[ri] && !adopted;
+    }
+    return rc;
+}
+
 int
 wl_columnar_eval_tdd_channel_coalesce_all(wl_col_session_t *coord,
     wl_tdd_channel_t *ch, wl_tdd_batch_t **lists,
@@ -923,43 +984,139 @@ wl_columnar_eval_tdd_channel_coalesce_all(wl_col_session_t *coord,
     if (!coord || !ch || !lists || !ctxs || !sink || !sink->fn)
         return EINVAL;
     int rc = 0;
-    for (uint32_t ri = 0; ri < nrels; ri++) {
-        for (uint32_t w = 0; w < nworkers; w++) {
-            wl_tdd_batch_t **list = &lists[(size_t)ri * nworkers + w];
-            if (!*list)
-                continue;
-            if (rc == 0 && ctxs[w].delta_rels[ri])
-                rc = EPROTO;
-            if (rc != 0) {
-                wl_columnar_eval_tdd_discard_list(ch, list, sink);
-                continue;
+    for (uint32_t ri = 0; ri < nrels; ri++)
+        rc = tdd_coalesce_relation(coord, ch, lists, ctxs, nworkers, ri, sink,
+                stats, NULL, rc);
+    return rc;
+}
+
+static uint64_t
+tdd_mul_saturated(uint64_t a, uint64_t b)
+{
+    return a && b > UINT64_MAX / a ? UINT64_MAX : a * b;
+}
+
+/* What staging @list holds at its peak; see
+ * wl_columnar_eval_tdd_channel_stage_relation(). */
+static uint64_t
+tdd_stage_estimate(const wl_tdd_batch_t *list)
+{
+    uint64_t inputs = 0;
+    uint64_t rows = 0;
+    uint32_t count = 0;
+    uint32_t ncols = 0;
+    for (const wl_tdd_batch_t *b = list; b; b = b->next) {
+        uint32_t nrows = 0;
+        count++;
+        if (b->kind == WL_TDD_BATCH_RESIDENT) {
+            const col_rel_t *rel = b->payload;
+            inputs = tdd_add_saturated(inputs, b->charge);
+            if (rel) {
+                nrows = rel->nrows;
+                ncols = rel->ncols;
             }
-            /* Collect pushed newest first; coalesce wants seq order. */
-            tdd_list_reverse(list);
-            const char *name = ctxs[w].sp
-                ? ctxs[w].sp->relations[ri].delta_name : NULL;
-            /* A slot of spilled batches takes the schema of worker w's
-             * relation ri, which the ordinary path creates its deltas
-             * like.  In owner and global-read mode an adopted slot is
-             * created like the relation plan's result instead, so the two
-             * kinds of slot need only be compatible under the exchanges'
-             * tdd_relation_schema_compatible(), which accepts a declared
-             * width of 0 against any other. */
-            const col_rel_t *schema = ctxs[w].sp && ctxs[w].worker_sess
-                ? session_find_rel(ctxs[w].worker_sess,
-                    ctxs[w].sp->relations[ri].name) : NULL;
-            uint64_t spilled = 0;
-            for (const wl_tdd_batch_t *b = *list; b; b = b->next)
-                if (b->kind == WL_TDD_BATCH_SPILLED)
-                    spilled++;
-            rc = wl_columnar_eval_tdd_coalesce_slot(coord, ch, list, nworkers,
-                    name, schema, sink, &ctxs[w].delta_rels[ri]);
-            if (rc == 0 && stats)
-                stats->rehydrated_batches += spilled;
-            if (rc != 0)
-                wl_columnar_eval_tdd_discard_list(ch, list, sink);
+        } else if (b->payload) {
+            (void)wl_columnar_batch_payload_schema(b->payload, &ncols,
+                &nrows);
+        }
+        rows += nrows;
+    }
+    if (count == 1 && list->kind == WL_TDD_BATCH_RESIDENT)
+        return inputs;
+    uint64_t row_bytes = tdd_add_saturated(
+        tdd_mul_saturated(ncols, sizeof(int64_t)),
+        sizeof(col_delta_timestamp_t));
+    uint64_t slot = tdd_mul_saturated(rows, row_bytes);
+    uint64_t estimate = tdd_add_saturated(inputs, slot);
+    if (count >= 2)
+        estimate = tdd_add_saturated(tdd_add_saturated(estimate, slot),
+                tdd_mul_saturated(rows, 4u));
+    return estimate;
+}
+
+/* The transport bytes of the matrix slots of every relation but @skip_rel,
+ * or of @skip_rel alone when @only is set. */
+static uint64_t
+tdd_matrix_bytes(const col_eval_tdd_worker_ctx_t *ctxs, uint32_t nworkers,
+    uint32_t nrels, uint32_t skip_rel, bool only)
+{
+    uint64_t bytes = 0;
+    for (uint32_t w = 0; w < nworkers; w++) {
+        if (!ctxs[w].delta_rels)
+            continue;
+        for (uint32_t ri = 0; ri < nrels; ri++) {
+            if ((ri == skip_rel) != only || !ctxs[w].delta_rels[ri])
+                continue;
+            bytes = tdd_add_saturated(bytes,
+                    col_rel_transport_bytes(ctxs[w].delta_rels[ri]));
         }
     }
+    return bytes;
+}
+
+#ifdef WL_SESSION_TEST_HOOKS
+int (*wl_columnar_eval_test_after_stage)(wl_col_session_t *coord,
+    uint32_t ri);
+#endif
+
+int
+wl_columnar_eval_tdd_channel_stage_relation(wl_col_session_t *coord,
+    wl_tdd_channel_t *ch, wl_tdd_batch_t **lists,
+    col_eval_tdd_worker_ctx_t *ctxs, uint32_t nworkers, uint32_t nrels,
+    uint32_t ri, uint64_t held_cap, bool *private_out,
+    const wl_tdd_refusal_sink_t *sink, wl_tdd_consumer_stats_t *stats)
+{
+    if (!coord || !ch || !lists || !ctxs || !sink || !sink->fn
+        || ri >= nrels)
+        return EINVAL;
+    if (private_out)
+        for (uint32_t w = 0; w < nworkers; w++)
+            private_out[w] = false;
+    uint64_t estimate = 0;
+    bool any = false;
+    for (uint32_t w = 0; w < nworkers; w++) {
+        const wl_tdd_batch_t *list = lists[(size_t)ri * nworkers + w];
+        if (list) {
+            any = true;
+            estimate = tdd_add_saturated(estimate, tdd_stage_estimate(list));
+        }
+    }
+    if (!any)
+        return 0;
+    wl_tdd_consumer_stats_t local;
+    if (!stats) {
+        memset(&local, 0, sizeof(local));
+        stats = &local;
+    }
+
+    /* Spill down: make room for this relation's staging peak. */
+    uint64_t retained = tdd_matrix_bytes(ctxs, nworkers, nrels, ri, false);
+    uint64_t need = tdd_add_saturated(retained, estimate);
+    uint64_t target = held_cap > need ? held_cap - need : 0;
+    uint64_t held_other = wl_columnar_eval_tdd_held_bytes(lists, nworkers,
+            nrels, ri);
+    if (held_other > target) {
+        uint64_t spills = stats->consumer_spills;
+        held_other = wl_columnar_eval_tdd_spill_held(coord, lists, nworkers,
+                nrels, ri, target, stats);
+        stats->stage_spills += stats->consumer_spills - spills;
+    }
+    if (held_other > target || retained > held_cap)
+        stats->stage_over_cap++;
+
+    int rc = tdd_coalesce_relation(coord, ch, lists, ctxs, nworkers, ri,
+            sink, stats, private_out, 0);
+    uint64_t staged = tdd_matrix_bytes(ctxs, nworkers, nrels, ri, true);
+    uint64_t peak = tdd_add_saturated(tdd_add_saturated(held_other, retained),
+            staged);
+    if (peak > stats->stage_peak_bytes)
+        stats->stage_peak_bytes = peak;
+    if (staged > stats->max_stage_bytes)
+        stats->max_stage_bytes = staged;
+#ifdef WL_SESSION_TEST_HOOKS
+    if (rc == 0 && wl_columnar_eval_test_after_stage)
+        rc = wl_columnar_eval_test_after_stage(coord, ri);
+#endif
     return rc;
 }
 

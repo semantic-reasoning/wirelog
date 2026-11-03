@@ -977,7 +977,7 @@ test_channel_side_sizing_boundaries(void)
         && wl_columnar_eval_tdd_channel_side_bytes(1, 0, &bytes) == 0
         && bytes == one
         && wl_columnar_eval_tdd_channel_side_bytes(2, 3, &bytes) == 0
-        && bytes == two + 6u * sizeof(wl_tdd_batch_t *)
+        && bytes == two + 6u * (sizeof(wl_tdd_batch_t *) + sizeof(bool))
         && wl_columnar_eval_tdd_channel_side_bytes(0, 3, &bytes) == EINVAL
         && wl_columnar_eval_tdd_channel_side_bytes(2, 3, NULL) == EINVAL
         && wl_columnar_eval_tdd_channel_side_bytes(UINT32_MAX, 1, &bytes)

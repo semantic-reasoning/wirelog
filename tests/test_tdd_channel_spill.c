@@ -1374,6 +1374,195 @@ typedef struct {
     void (*fn)(void);
 } test_case_t;
 
+/* ------------------------------------------------------------------ */
+/* Staging one relation                                                */
+/* ------------------------------------------------------------------ */
+
+/* Three relations on two workers: relation 0's slot for worker 0 already
+ * in the matrix, relation 1 to stage, relation 2 held for worker 1. */
+typedef struct {
+    wl_tdd_batch_t *lists[6];
+    col_rel_t *slots[2][3];
+    col_eval_tdd_worker_ctx_t ctxs[2];
+    wl_tdd_batch_t *staged[2]; /* relation 1's batches, retired by staging */
+    const void *payload;       /* the payload of the first of them */
+    wl_tdd_batch_t *other;     /* relation 2's batch */
+    uint64_t retained;         /* relation 0's slot, in transport bytes */
+} stage_fixture_t;
+
+/*
+ * Start round @round of @ch with relation 0's slot in the matrix and, for
+ * relation 1, two batches of 2 and 3 rows on worker 0 (@pair) or one batch
+ * of 3 rows on worker 1; with @other, a batch of 4 rows of relation 2 on
+ * worker 1.
+ */
+static void
+stage_fixture(stage_fixture_t *f, wl_tdd_channel_t *ch,
+    wl_columnar_memory_governor_ref_t *g, uint32_t round, bool pair,
+    bool other)
+{
+    const int64_t v[8] = { 1, 2, 3, 4, 5, 6, 7, 8 };
+    col_delta_timestamp_t s0[8], s1[8];
+    for (uint32_t i = 0; i < 8; i++) {
+        s0[i] = ts(round, 4, 0, 1);
+        s1[i] = ts(round, 4, 1, 1);
+    }
+    memset(f, 0, sizeof(*f));
+    for (uint32_t w = 0; w < 2; w++)
+        f->ctxs[w].delta_rels = f->slots[w];
+    f->slots[0][0] = make_rel(g, "a", v, s0, 8);
+    f->retained = col_rel_transport_bytes(f->slots[0][0]);
+    CHECK(wl_tdd_channel_begin_round(ch, 4, round) == 0);
+    if (pair) {
+        publish(ch, 0, 1, make_rel(g, "b", v, s0, 2));
+        publish(ch, 0, 1, make_rel(g, "b", v + 2, s0, 3));
+    } else {
+        publish(ch, 1, 1, make_rel(g, "b", v, s1, 3));
+    }
+    if (other)
+        publish(ch, 1, 2, make_rel(g, "c", v, s1, 4));
+    wl_tdd_batch_t *b[3];
+    uint32_t n = 0;
+    take_all(ch, 2, b, &n, 3);
+    CHECK(n == (pair ? 2u : 1u) + (other ? 1u : 0u));
+    for (uint32_t i = 0; i < n; i++) {
+        hold(f->lists, 2, b[i]);
+        if (b[i]->rel_idx == 2)
+            f->other = b[i];
+        else if (b[i]->worker == 0)
+            f->staged[f->staged[0] ? 1 : 0] = b[i];
+        else
+            f->staged[0] = b[i];
+    }
+    f->payload = f->staged[0]->payload;
+}
+
+static void
+stage_fixture_done(stage_fixture_t *f, wl_tdd_channel_t *ch)
+{
+    sink_log_t log;
+    memset(&log, 0, sizeof(log));
+    wl_tdd_refusal_sink_t sink = { record_refusal, &log };
+    wl_columnar_eval_tdd_channel_discard_lists(ch, f->lists, 6, &sink);
+    CHECK(log.count == 0);
+    for (uint32_t w = 0; w < 2; w++)
+        for (uint32_t ri = 0; ri < 3; ri++)
+            if (f->slots[w][ri])
+                CHECK(col_rel_destroy_checked(f->slots[w][ri]) == 0);
+}
+
+/* What staging two RESIDENT batches of @rows rows in all holds at its
+ * peak: their charges, the fresh slot's rows, and the same rows again plus
+ * a 4-byte index per row for the consolidation of two batches. */
+static uint64_t
+pair_estimate(const stage_fixture_t *f, uint64_t rows)
+{
+    uint64_t slot = rows * (2u * sizeof(int64_t)
+        + sizeof(col_delta_timestamp_t));
+    return f->staged[0]->charge + f->staged[1]->charge + 2u * slot
+           + 4u * rows;
+}
+
+/*
+ * wl_columnar_eval_tdd_channel_stage_relation(): the spill-down spills
+ * another relation's held batch only when that batch, the other
+ * relations' matrix slots and the staging's estimate together exceed the
+ * cap, so a cap of exactly that total spills nothing and one byte less
+ * spills it.  Two batches make a fresh slot that is private to the
+ * coordinator; a single resident batch is adopted.  When the other
+ * relations' slots alone exceed the cap, stage_over_cap counts the
+ * staging even though nothing is held to spill.
+ */
+static void
+test_stage_relation(void)
+{
+    wl_columnar_memory_governor_ref_t *g = governor(UINT64_C(1) << 28);
+    wl_session_t *session = make_session(g);
+    wl_col_session_t *coord = COL_SESSION(session);
+    wl_columnar_memory_governor_ref_t *cg = coord->memory_governor;
+    wl_tdd_channel_t *ch = open_channel(cg, 2);
+    wl_tdd_batch_t *none[1];
+    uint32_t n = 0;
+    take_all(ch, 2, none, &n, 0);
+    sink_log_t log;
+    memset(&log, 0, sizeof(log));
+    wl_tdd_refusal_sink_t sink = { record_refusal, &log };
+    uint32_t round = 2;
+
+    for (int below = 0; below < 2; below++) {
+        stage_fixture_t f;
+        stage_fixture(&f, ch, cg, round++, true, true);
+        uint64_t held = f.other->charge;
+        uint64_t cap = held + f.retained + pair_estimate(&f, 5) - (below
+            ? 1u : 0u);
+        wl_tdd_consumer_stats_t stats;
+        memset(&stats, 0, sizeof(stats));
+        bool private_out[2] = { false, true };
+        CHECK(wl_columnar_eval_tdd_channel_stage_relation(coord, ch, f.lists,
+            f.ctxs, 2, 3, 1, cap, private_out, &sink, &stats) == 0);
+        CHECK(log.count == 0);
+        CHECK(f.other->kind == (below ? WL_TDD_BATCH_SPILLED
+            : WL_TDD_BATCH_RESIDENT));
+        CHECK(stats.stage_spills == (below ? 1u : 0u));
+        CHECK(stats.consumer_spills == stats.stage_spills);
+        CHECK(stats.stage_over_cap == 0 && stats.held_over_cap == 0);
+        CHECK(!f.lists[2] && !f.lists[3]);
+        col_rel_t *slot = f.slots[0][1];
+        CHECK(slot && slot->nrows == 5 && !f.slots[1][1]);
+        CHECK(private_out[0] && !private_out[1]);
+        CHECK(stats.stage_adopted == 0);
+        uint64_t staged = col_rel_transport_bytes(slot);
+        CHECK(stats.max_stage_bytes == staged);
+        CHECK(stats.stage_peak_bytes == (below ? 0u : held) + f.retained
+            + staged);
+        stage_fixture_done(&f, ch);
+    }
+
+    for (int over = 0; over < 2; over++) {
+        stage_fixture_t f;
+        stage_fixture(&f, ch, cg, round++, false, false);
+        uint64_t cap = f.retained - (over ? 1u : 0u);
+        wl_tdd_consumer_stats_t stats;
+        memset(&stats, 0, sizeof(stats));
+        bool private_out[2] = { true, true };
+        CHECK(wl_columnar_eval_tdd_channel_stage_relation(coord, ch, f.lists,
+            f.ctxs, 2, 3, 1, cap, private_out, &sink, &stats) == 0);
+        CHECK(f.slots[1][1] && (const void *)f.slots[1][1] == f.payload);
+        CHECK(f.slots[1][1]->nrows == 3);
+        CHECK(!private_out[0] && !private_out[1]);
+        CHECK(stats.stage_adopted == 1 && stats.stage_spills == 0);
+        CHECK(stats.stage_over_cap == (over ? 1u : 0u));
+        CHECK(stats.held_over_cap == 0);
+        stage_fixture_done(&f, ch);
+    }
+
+    /* No batch held for the relation: only @private_out changes. */
+    {
+        stage_fixture_t f;
+        memset(&f, 0, sizeof(f));
+        for (uint32_t w = 0; w < 2; w++)
+            f.ctxs[w].delta_rels = f.slots[w];
+        wl_tdd_consumer_stats_t stats;
+        memset(&stats, 0, sizeof(stats));
+        bool private_out[2] = { true, true };
+        CHECK(wl_columnar_eval_tdd_channel_stage_relation(coord, ch, f.lists,
+            f.ctxs, 2, 3, 1, 0, private_out, &sink, &stats) == 0);
+        CHECK(!private_out[0] && !private_out[1]);
+        wl_tdd_consumer_stats_t zero;
+        memset(&zero, 0, sizeof(zero));
+        CHECK(memcmp(&stats, &zero, sizeof(stats)) == 0);
+        CHECK(wl_columnar_eval_tdd_channel_stage_relation(coord, ch, f.lists,
+            f.ctxs, 2, 3, 3, 0, NULL, &sink, NULL) == EINVAL);
+    }
+
+    CHECK(log.count == 0);
+    CHECK(wl_columnar_spill_store_bytes(coord->spill_store) == 0);
+    CHECK(wl_tdd_channel_destroy(ch) == 0);
+    wl_session_destroy(session);
+    CHECK(reserved(g) == 0);
+    wl_columnar_memory_governor_ref_release(g);
+}
+
 static const test_case_t tests[] = {
     { "round_trip", test_round_trip },
     { "string_refused", test_string_refused },
@@ -1391,6 +1580,7 @@ static const test_case_t tests[] = {
     { "held_cap_pass", test_held_cap_pass },
     { "collect_hold", test_collect_hold },
     { "coalesce_schema_template", test_coalesce_schema_template },
+    { "stage_relation", test_stage_relation },
 };
 
 static void
