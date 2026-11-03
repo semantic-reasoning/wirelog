@@ -1360,7 +1360,12 @@ wl_columnar_value_equal(const col_rel_t *left, uint32_t left_col,
         ? left->column_types[left_col] : WIRELOG_TYPE_INT64;
     wirelog_column_type_t right_type = right && right->column_types
         ? right->column_types[right_col] : WIRELOG_TYPE_INT64;
-    if (left_type != right_type)
+    /* Join admission and bulk append accept non-float lanes with the same
+     * int64 representation, including intern IDs from side compounds whose
+     * schema is deliberately all-int64. Metadata differences must not make
+     * those equal keys fail a probe. Float bits remain a separate domain. */
+    if ((left_type == WIRELOG_TYPE_FLOAT || right_type == WIRELOG_TYPE_FLOAT)
+        && left_type != right_type)
         return false;
     if (left_type == WIRELOG_TYPE_FLOAT)
         return wl_columnar_float_compare_bits(left_bits, right_bits) == 0;
