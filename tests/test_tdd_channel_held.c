@@ -17,8 +17,9 @@
  * which cannot spill, must stay over the cap and still succeed.  A cap
  * between the batches' charges mixes adopted and spilled slots in one
  * exchange, and a round that fails holding a spilled batch must release
- * it.  The directory must be empty at the end, so no spill segment may
- * leak.
+ * it.  With several relations in one stratum, the exchange stages one
+ * relation at a time and spills the others down to make room for it.
+ * The directory must be empty at the end, so no spill segment may leak.
  *
  * Usage: test_tdd_channel_held [test-name]   (no name runs every test)
  */
@@ -89,24 +90,32 @@ static char spill_dir[1024];
 /* ------------------------------------------------------------------------ */
 
 typedef struct {
+    int64_t rel; /* index into collect_t.relations */
     int64_t x;
     int64_t y;
 } pair_t;
 
 typedef struct {
-    const char *relation;
+    const char *const *relations; /* the relations collected */
+    size_t nrelations;
     pair_t *rows;
     size_t count;
     size_t cap;
     bool bad;
 } collect_t;
 
+static const char *const tc_relation[] = { "tc" };
+
 static void
 collect_rows(const char *relation, const int64_t *row, uint32_t ncols,
     void *arg)
 {
     collect_t *out = arg;
-    if (!relation || strcmp(relation, out->relation) != 0)
+    size_t rel = 0;
+    while (relation && rel < out->nrelations
+        && strcmp(relation, out->relations[rel]) != 0)
+        rel++;
+    if (!relation || rel == out->nrelations)
         return;
     if (ncols != 2) {
         out->bad = true;
@@ -122,6 +131,7 @@ collect_rows(const char *relation, const int64_t *row, uint32_t ncols,
         out->rows = rows;
         out->cap = cap;
     }
+    out->rows[out->count].rel = (int64_t)rel;
     out->rows[out->count].x = row[0];
     out->rows[out->count].y = row[1];
     out->count++;
@@ -132,6 +142,8 @@ pair_cmp(const void *a, const void *b)
 {
     const pair_t *l = a;
     const pair_t *r = b;
+    if (l->rel != r->rel)
+        return l->rel < r->rel ? -1 : 1;
     if (l->x != r->x)
         return l->x < r->x ? -1 : 1;
     if (l->y != r->y)
@@ -184,6 +196,7 @@ typedef struct {
     bool advisory;         /* an advisory governor instead of enforcing */
     bool spill;            /* open a spill store */
     uint64_t budget;       /* the governor's budget, 0 for BUDGET */
+    uint64_t spill_quota;  /* the spill store's quota, 0 for 256 MiB */
 } run_config_t;
 
 /* What a run observed. */
@@ -197,6 +210,7 @@ typedef struct {
     uint64_t channel_cap;     /* the channel capacity at the last of them */
     uint64_t mixed_rounds;    /* rounds that ended with mixed lists */
     uint64_t open_spills;     /* pumps that saw a spill with a lane open */
+    const char *replay;       /* the stratum's replay, "none" without one */
 } run_info_t;
 
 /* The coordinator of the run in progress, for pump_hook(). */
@@ -428,7 +442,8 @@ open_session(const wl_plan_t *plan, uint32_t workers,
     options.memory_governor = g;
     if (cfg->spill) {
         options.spill_directory = spill_dir;
-        options.spill_quota_bytes = UINT64_C(1) << 28;
+        options.spill_quota_bytes = cfg->spill_quota ? cfg->spill_quota
+            : UINT64_C(1) << 28;
         options.spill_max_row_bytes = 256;
     }
     int rc = wl_session_create_with_options(wl_backend_columnar(), plan,
@@ -447,6 +462,7 @@ note_run(wl_session_t *session, run_info_t *info)
     const wl_col_session_t *coord = COL_SESSION(session);
     info->strategy = coord->tdd_audit.strategy;
     info->selected = coord->tdd_audit.selected_workers;
+    info->replay = coord->tdd_audit.replay;
     info->consumer = coord->tdd_consumer;
     info->spill_store = coord->spill_store != NULL;
     info->pumps = pump_count;
@@ -484,8 +500,10 @@ release_governor(wl_columnar_memory_governor_ref_t *g)
 
 typedef struct {
     const char *name;
-    const char *rule;      /* the recursive tc rule(s) */
+    const char *rule;      /* the recursive rule(s); see mutual[] */
     const char *strategy;  /* the strategy the program reaches */
+    bool linear;           /* with no rule: run_aligned_plan()'s linear form */
+    bool replicate;        /* with no rule: as if no input was inserted */
 } program_t;
 
 static const program_t programs[] = {
@@ -553,7 +571,8 @@ run_program(const program_t *p, bool strings, uint32_t workers,
         watch_pumps(session, workers);
         rc = wl_session_load_facts(session, prog);
     }
-    out->relation = "tc";
+    out->relations = tc_relation;
+    out->nrelations = 1;
     if (rc == 0)
         rc = wl_session_snapshot(session, collect_rows, out);
     if (session) {
@@ -588,56 +607,121 @@ tree_edges(int64_t *edges)
     }
 }
 
+/* The closure the hand-built plans reach, once for each of @relations:
+ * with @linear the transitive closure of the edges, otherwise the closure
+ * under r(y, z) :- r(x, y), r(x, z). */
 static void
-aligned_oracle(collect_t *out)
+aligned_oracle_for(collect_t *out, const char *const *relations,
+    size_t nrelations, bool linear)
 {
+    static bool edge[TREE_NODES][TREE_NODES];
     static bool in[TREE_NODES][TREE_NODES];
     int64_t edges[2 * 30];
+    memset(edge, 0, sizeof(edge));
     memset(in, 0, sizeof(in));
     tree_edges(edges);
-    for (int i = 0; i < 30; i++)
+    for (int i = 0; i < 30; i++) {
+        edge[edges[2 * i]][edges[2 * i + 1]] = true;
         in[edges[2 * i]][edges[2 * i + 1]] = true;
+    }
     for (bool changed = true; changed;) {
         changed = false;
         for (int x = 0; x < TREE_NODES; x++)
             for (int y = 0; y < TREE_NODES; y++)
-                for (int z = 0; in[x][y] && z < TREE_NODES; z++)
-                    if (in[x][z] && !in[y][z]) {
+                for (int z = 0; in[x][y] && z < TREE_NODES; z++) {
+                    if (linear && edge[y][z] && !in[x][z]) {
+                        in[x][z] = true;
+                        changed = true;
+                    } else if (!linear && in[x][z] && !in[y][z]) {
                         in[y][z] = true;
                         changed = true;
                     }
+                }
     }
-    out->relation = "tc";
-    for (int x = 0; x < TREE_NODES; x++)
-        for (int y = 0; y < TREE_NODES; y++)
-            if (in[x][y]) {
-                int64_t row[2] = { x, y };
-                collect_rows("tc", row, 2, out);
-            }
+    out->relations = relations;
+    out->nrelations = nrelations;
+    for (size_t r = 0; r < nrelations; r++)
+        for (int x = 0; x < TREE_NODES; x++)
+            for (int y = 0; y < TREE_NODES; y++)
+                if (in[x][y]) {
+                    int64_t row[2] = { x, y };
+                    collect_rows(relations[r], row, 2, out);
+                }
 }
 
+static void
+aligned_oracle(collect_t *out)
+{
+    aligned_oracle_for(out, tc_relation, 1, false);
+}
+
+#define ALIGNED_MAX_RELS 3u
+
+/*
+ * Evaluate a hand-built stratum of @nrels relations, at most
+ * ALIGNED_MAX_RELS, that reaches the aligned strategy, and collect them.
+ * Each relation r closes over r(y, z) :- r(x, y), r(x, z), a self-join that
+ * tdd_exchange_deltas() broadcasts, or with @linear over
+ * r(x, z) :- r(x, y), input(y, z), whose deltas it scatters by hash and
+ * gathers; that form runs with WIRELOG_TDD_GLOBAL_READ=0, since it would
+ * otherwise take the global-read exchange.  With @replicate the session
+ * forgets that input was inserted, as when no input changed since the last
+ * step, which sends the stratum to the replicate strategy and
+ * tdd_broadcast_deltas().  The first relation is seeded by input and, with
+ * several, fed by the last; every other relation is fed by the one before
+ * it, so all of them reach the same closure.  The serial evaluator does not
+ * iterate these hand-built strata, so their results are checked against
+ * aligned_oracle_for().
+ */
 static int
-run_aligned(uint32_t workers, const run_config_t *cfg, collect_t *out,
-    run_info_t *info)
+run_aligned_plan(const char *const *names, uint32_t nrels, bool linear,
+    bool replicate, uint32_t workers, const run_config_t *cfg,
+    collect_t *out, run_info_t *info)
 {
     uint32_t key = 0;
     uint32_t projection[] = { 1, 3 };
+    uint32_t linear_projection[] = { 0, 3 };
     const char *keys[] = { "col0" };
+    const char *left_keys[] = { "col1" };
     wl_plan_op_exchange_t exchange = { .num_workers = 1,
                                        .key_col_idxs = &key,
                                        .key_col_count = 1 };
-    wl_plan_op_t ops[] = {
-        { .op = WL_PLAN_OP_VARIABLE, .relation_name = "out" },
-        { .op = WL_PLAN_OP_JOIN, .right_relation = "out", .left_keys = keys,
-          .right_keys = keys, .key_count = 1, .project_indices = projection,
-          .project_count = 2 },
-        { .op = WL_PLAN_OP_VARIABLE, .relation_name = "input" },
-        { .op = WL_PLAN_OP_CONCAT },
-        { .op = WL_PLAN_OP_EXCHANGE, .opaque_data = &exchange },
-    };
-    wl_plan_relation_t rel = { .name = "out", .delta_name = "$d$out",
-                               .ops = ops, .op_count = 5 };
-    wl_plan_stratum_t stratum = { .relations = &rel, .relation_count = 1,
+    wl_plan_op_t ops[ALIGNED_MAX_RELS][7];
+    wl_plan_relation_t rels[ALIGNED_MAX_RELS];
+    char delta_names[ALIGNED_MAX_RELS][32];
+    if (nrels == 0 || nrels > ALIGNED_MAX_RELS)
+        return EINVAL;
+    memset(ops, 0, sizeof(ops));
+    memset(rels, 0, sizeof(rels));
+    for (uint32_t r = 0; r < nrels; r++) {
+        uint32_t n = 0;
+        ops[r][n].op = WL_PLAN_OP_VARIABLE;
+        ops[r][n++].relation_name = names[r];
+        ops[r][n].op = WL_PLAN_OP_JOIN;
+        ops[r][n].right_relation = linear ? "input" : names[r];
+        ops[r][n].left_keys = linear ? left_keys : keys;
+        ops[r][n].right_keys = keys;
+        ops[r][n].key_count = 1;
+        ops[r][n].project_indices = linear ? linear_projection : projection;
+        ops[r][n++].project_count = 2;
+        ops[r][n].op = WL_PLAN_OP_VARIABLE;
+        ops[r][n++].relation_name = r == 0 ? "input" : names[r - 1];
+        ops[r][n++].op = WL_PLAN_OP_CONCAT;
+        if (r == 0 && nrels > 1) {
+            ops[r][n].op = WL_PLAN_OP_VARIABLE;
+            ops[r][n++].relation_name = names[nrels - 1];
+            ops[r][n++].op = WL_PLAN_OP_CONCAT;
+        }
+        ops[r][n].op = WL_PLAN_OP_EXCHANGE;
+        ops[r][n++].opaque_data = &exchange;
+        snprintf(delta_names[r], sizeof(delta_names[r]), "$d$%s", names[r]);
+        rels[r].name = names[r];
+        rels[r].delta_name = delta_names[r];
+        rels[r].ops = ops[r];
+        rels[r].op_count = n;
+    }
+    wl_plan_stratum_t stratum = { .relations = rels,
+                                  .relation_count = nrels,
                                   .is_recursive = true };
     const char *edb[] = { "input" };
     wl_plan_t plan = { .strata = &stratum, .stratum_count = 1,
@@ -654,34 +738,45 @@ run_aligned(uint32_t workers, const run_config_t *cfg, collect_t *out,
         tree_edges(edges);
         rc = wl_session_insert(session, "input", edges, 30, 2);
     }
-    if (rc == 0) {
-        empty = col_rel_new_auto("out", 2);
+    for (uint32_t r = 0; rc == 0 && r < nrels; r++) {
+        empty = col_rel_new_auto(names[r], 2);
         rc = empty ? 0 : ENOMEM;
-    }
-    if (rc == 0) {
-        wirelog_column_type_t types[2] = { WIRELOG_TYPE_INT64,
-                                           WIRELOG_TYPE_INT64 };
-        rc = col_rel_set_column_types(empty, types, 2);
-    }
-    if (rc == 0) {
-        rc = session_add_rel(sess, empty);
-        if (rc == 0)
-            empty = NULL;
+        if (rc == 0) {
+            wirelog_column_type_t types[2] = { WIRELOG_TYPE_INT64,
+                                               WIRELOG_TYPE_INT64 };
+            rc = col_rel_set_column_types(empty, types, 2);
+        }
+        if (rc == 0) {
+            rc = session_add_rel(sess, empty);
+            if (rc == 0)
+                empty = NULL;
+        }
     }
     if (rc == 0) {
         memset(&sess->tdd_consumer, 0, sizeof(sess->tdd_consumer));
         sess->tdd_audit.enabled = true;
+        if (replicate)
+            sess->last_inserted_relation = NULL;
+        if (linear)
+            setenv("WIRELOG_TDD_GLOBAL_READ", "0", 1);
         rc = col_eval_stratum_tdd(&stratum, sess, 0);
+        if (linear)
+            unsetenv("WIRELOG_TDD_GLOBAL_READ");
         sess->tdd_audit.enabled = false;
     }
-    const col_rel_t *result = rc == 0 ? session_find_rel(sess, "out") : NULL;
-    if (rc == 0 && (!result || result->ncols != 2))
-        rc = EPROTO;
-    out->relation = "tc";
-    for (uint32_t i = 0; rc == 0 && i < result->nrows; i++) {
-        int64_t row[2] = { col_rel_get(result, i, 0),
-                           col_rel_get(result, i, 1) };
-        collect_rows("tc", row, 2, out);
+    out->relations = names;
+    out->nrelations = nrels;
+    for (uint32_t r = 0; rc == 0 && r < nrels; r++) {
+        const col_rel_t *result = session_find_rel(sess, names[r]);
+        if (!result || result->ncols != 2) {
+            rc = EPROTO;
+            break;
+        }
+        for (uint32_t i = 0; i < result->nrows; i++) {
+            int64_t row[2] = { col_rel_get(result, i, 0),
+                               col_rel_get(result, i, 1) };
+            collect_rows(names[r], row, 2, out);
+        }
     }
     col_rel_destroy(empty);
     if (session) {
@@ -692,6 +787,16 @@ run_aligned(uint32_t workers, const run_config_t *cfg, collect_t *out,
     if (rc == 0 && out->bad)
         rc = EIO;
     return rc;
+}
+
+static const char *const aligned_relation[] = { "out" };
+
+static int
+run_aligned(uint32_t workers, const run_config_t *cfg, collect_t *out,
+    run_info_t *info)
+{
+    return run_aligned_plan(aligned_relation, 1, false, false, workers, cfg,
+               out, info);
 }
 
 /* ------------------------------------------------------------------------ */
@@ -812,11 +917,14 @@ test_numeric_spill(void)
  * A cap between the batches' charges, as the default quarter of a budget
  * is under pressure: a round spills its largest batches and keeps the
  * others resident, so one relation's slots can be adopted and built from
- * spilled batches in the same exchange.  The relations carry named
- * columns, and the owner and global-read exchanges refuse slots whose
- * names disagree (U3-R9).  The cap is the largest charge an uncapped run
- * saw, so it does not depend on the platform's charges.  Owner and
- * global-read runs must end at least two rounds with such mixed slots.
+ * spilled batches in the same exchange.  The owner and global-read
+ * exchanges refuse slots whose schemas are incompatible.  These
+ * relations carry the default col<N> names on both kinds of slot, so the
+ * runs cannot tell whether a slot of spilled batches takes the worker's
+ * relation as its template; test_tdd_channel_spill checks that.  The cap
+ * is the largest charge an uncapped run saw, so it does not depend on the
+ * platform's charges.  Owner and global-read runs must end at least two
+ * rounds with such mixed slots.
  */
 static void
 test_mixed_spill(void)
@@ -930,7 +1038,8 @@ test_spill_then_fail(void)
     }
 }
 
-/* T7: the aligned hash exchange (ordinary worker publication). */
+/* T7: the aligned strategy, whose self-join stratum tdd_exchange_deltas()
+ * broadcasts (ordinary worker publication). */
 static void
 test_aligned_spill(void)
 {
@@ -1085,6 +1194,495 @@ test_injected_floor(void)
 }
 
 /* ------------------------------------------------------------------------ */
+/* T8: staging one relation at a time                                       */
+/* ------------------------------------------------------------------------ */
+
+/* Hook state: the main thread arms the split before a snapshot starts its
+ * workers; workers only read it. */
+static wl_atomic_u64 split_parts;
+
+static uint32_t
+split_hook(wl_col_session_t *worker, uint32_t rel_idx, uint32_t rows,
+    bool *overlap)
+{
+    (void)worker;
+    (void)rel_idx;
+    (void)rows;
+    *overlap = false;
+    return (uint32_t)atomic_load_explicit(&split_parts, memory_order_relaxed);
+}
+
+/*
+ * Three relations in one stratum, each recursive on its own and each fed
+ * by the one before it, cyclically, so later rounds deliver batches of all
+ * three at once.  The entries without a rule are run_aligned_plan()'s
+ * hand-built strata of three relations, which reach the aligned and
+ * replicate strategies that none of the planned programs here reaches.
+ */
+static const program_t mutual[] = {
+    { "mutual-linear",
+      "a(x, z) :- a(x, y), edge(y, z).\n"
+      "b(x, z) :- b(x, y), edge(y, z).\n"
+      "c(x, z) :- c(x, y), edge(y, z).\n"
+      "b(x, y) :- a(x, y).\nc(x, y) :- b(x, y).\na(x, y) :- c(x, y).\n",
+      "owner" },
+    { "mutual-two-sided",
+      "a(x, z) :- a(x, y), edge(y, z).\na(x, z) :- edge(x, y), a(y, z).\n"
+      "b(x, z) :- b(x, y), edge(y, z).\nb(x, z) :- edge(x, y), b(y, z).\n"
+      "c(x, z) :- c(x, y), edge(y, z).\nc(x, z) :- edge(x, y), c(y, z).\n"
+      "b(x, y) :- a(x, y).\nc(x, y) :- b(x, y).\na(x, y) :- c(x, y).\n",
+      "global_read" },
+    { "mutual-non-linear",
+      "a(x, z) :- a(x, y), a(y, z).\n"
+      "b(x, z) :- b(x, y), edge(y, z).\n"
+      "c(x, z) :- c(x, y), edge(y, z).\n"
+      "b(x, y) :- a(x, y).\nc(x, y) :- b(x, y).\na(x, y) :- c(x, y).\n",
+      "bdx" },
+    { "mutual-self-join", NULL, "aligned", false, false },
+    { "mutual-scatter", NULL, "aligned", true, false },
+    { "mutual-replicate", NULL, "replicate", false, true },
+};
+
+static const char *const mutual_relations[] = { "a", "b", "c" };
+
+/* The result @p must reach: the serial (W=1) result, or for a hand-built
+ * stratum the closure every relation of it reaches. */
+static int run_mutual(const program_t *p, bool strings, uint32_t workers,
+    const run_config_t *cfg, collect_t *out, run_info_t *info);
+
+static int
+mutual_expected(const program_t *p, bool strings, collect_t *out)
+{
+    run_info_t info;
+    memset(&info, 0, sizeof(info));
+    if (!p->rule) {
+        aligned_oracle_for(out, mutual_relations, 3, p->linear);
+        return 0;
+    }
+    wl_columnar_eval_test_channel_split = NULL;
+    return run_mutual(p, strings, 1, NULL, out, &info);
+}
+
+/* Evaluate the mutual program @p, over STRING columns with @strings (only
+ * with a rule), and collect a, b and c. */
+static int
+run_mutual(const program_t *p, bool strings, uint32_t workers,
+    const run_config_t *cfg, collect_t *out, run_info_t *info)
+{
+    if (!p->rule)
+        return run_aligned_plan(mutual_relations, 3, p->linear, p->replicate,
+                   workers, cfg, out, info);
+    static char src[8192];
+    const char *type = strings ? "string" : "int32";
+    snprintf(src, sizeof(src),
+        ".decl edge(x: %s, y: %s)\n"
+        ".decl a(x: %s, y: %s)\n"
+        ".decl b(x: %s, y: %s)\n"
+        ".decl c(x: %s, y: %s)\n"
+        "a(x, y) :- edge(x, y).\n%s", type, type, type, type, type, type,
+        type, type, p->rule);
+    append_edges(src, sizeof(src), strings);
+    wirelog_error_t err;
+    wirelog_program_t *prog = wirelog_parse_string(src, &err);
+    if (!prog)
+        return EINVAL;
+    wl_fusion_apply(prog, NULL);
+    wl_jpp_apply(prog, NULL);
+    wl_sip_apply(prog, NULL);
+    wl_plan_t *plan = NULL;
+    int rc = wl_plan_from_program(prog, &plan);
+    if (rc != 0 || !plan) {
+        wirelog_program_free(prog);
+        return rc ? rc : EINVAL;
+    }
+    plan_fixture_hold(prog);
+    wl_columnar_memory_governor_ref_t *g = NULL;
+    wl_session_t *session = NULL;
+    rc = open_session(plan, workers, cfg, &g, &session);
+    if (rc == 0)
+        rc = wl_session_load_facts(session, prog);
+    out->relations = mutual_relations;
+    out->nrelations = 3;
+    if (rc == 0)
+        rc = wl_session_snapshot(session, collect_rows, out);
+    if (session) {
+        note_run(session, info);
+        close_session(session);
+    }
+    wl_plan_free(plan);
+    plan_fixture_release();
+    release_governor(g);
+    if (rc == 0 && out->bad)
+        rc = EIO;
+    return rc;
+}
+
+/* Stage hook state: the main thread arms it before a snapshot, and the
+ * hooks run on the coordinator, which is the main thread. */
+static int stage_fault_rc;
+static bool stage_fault_fired;
+static uint32_t stage_fault_workers;
+static uint64_t stage_deltas_seen;     /* workers with rows in $d$a */
+static uint64_t stage_deltas_governed; /* of those, governed ones */
+
+/* When relation 1 is staged, every exchange but the owner one has
+ * installed relation a's new delta on the workers that receive rows; owner
+ * mode publishes at its commit, so its workers still hold the previous
+ * round's.  Count the non-empty deltas and those that carry a governor. */
+static int
+stage_observe_hook(wl_col_session_t *coord, uint32_t ri)
+{
+    if (ri != 1)
+        return 0;
+    for (uint32_t w = 0; w < coord->tdd_workers_count; w++) {
+        const col_rel_t *d = session_find_rel(&coord->tdd_workers[w], "$d$a");
+        if (!d || d->nrows == 0)
+            continue;
+        stage_deltas_seen++;
+        if (d->memory_governor)
+            stage_deltas_governed++;
+    }
+    return 0;
+}
+
+/* The bound a staging run keeps: what one staging holds is at most the cap
+ * plus the slots staged for the relation itself, unless stage_over_cap
+ * counts a staging. */
+static void
+check_stage_bound(const char *name, uint32_t workers,
+    const wl_tdd_consumer_stats_t *c)
+{
+    CHECK(c->stage_peak_bytes <= c->held_cap + c->max_stage_bytes
+        || c->stage_over_cap > 0,
+        "%s W=%u: stage_peak=%llu > cap %llu + max_stage %llu", name,
+        workers, (unsigned long long)c->stage_peak_bytes,
+        (unsigned long long)c->held_cap,
+        (unsigned long long)c->max_stage_bytes);
+}
+
+/*
+ * T8: with every delta of three or more rows published as three batches
+ * (a smaller one as one batch a row), staging a relation builds fresh
+ * slots and consolidates them, which needs room the held bytes of the
+ * other relations must give up.  A calibration run with no
+ * effective cap measures the most bytes one relation's staged slots took;
+ * the measured run caps the held bytes at twice that, so the cap does not
+ * depend on the platform's charges.  Staging must then spill the other
+ * relations down, keep its peak within the cap plus one relation's staged
+ * slots with no staging over the cap, release owner mode's private slots
+ * before the commit, and leave the results exact, in the owner,
+ * global-read, BDX, self-join broadcast, hash scatter and replicate
+ * exchanges.
+ */
+static void
+test_stage_bound(void)
+{
+    char held[32];
+    for (size_t i = 0; i < sizeof(mutual) / sizeof(mutual[0]); i++) {
+        const program_t *p = &mutual[i];
+        collect_t serial = { 0 };
+        run_info_t info;
+        int rc = mutual_expected(p, false, &serial);
+        CHECK(rc == 0 && serial.count > 0, "%s: serial rc=%d rows=%zu",
+            p->name, rc, serial.count);
+        (void)sort_has_duplicate(&serial);
+        for (size_t wi = 0; wi < sizeof(widths) / sizeof(widths[0]); wi++) {
+            uint32_t workers = widths[wi];
+            atomic_store_explicit(&split_parts, 3, memory_order_relaxed);
+            wl_columnar_eval_test_channel_split = split_hook;
+
+            run_config_t cfg = { "1099511627776", false, true };
+            collect_t got = { 0 };
+            memset(&info, 0, sizeof(info));
+            rc = run_mutual(p, false, workers, &cfg, &got, &info);
+            const wl_tdd_consumer_stats_t *c = &info.consumer;
+            uint64_t stage = c->max_stage_bytes;
+            (void)sort_has_duplicate(&got);
+            CHECK(rc == 0 && c->consumer_spills == 0 && stage > 0,
+                "%s W=%u calibration: rc=%d spills=%llu max_stage=%llu",
+                p->name, workers, rc, (unsigned long long)c->consumer_spills,
+                (unsigned long long)stage);
+            CHECK(same_set(&got, &serial),
+                "%s W=%u calibration: %zu rows, serial %zu", p->name,
+                workers, got.count, serial.count);
+            free(got.rows);
+
+            snprintf(held, sizeof(held), "%llu",
+                (unsigned long long)(2 * stage));
+            cfg.held_env = held;
+            memset(&got, 0, sizeof(got));
+            memset(&info, 0, sizeof(info));
+            stage_deltas_seen = 0;
+            stage_deltas_governed = 0;
+            wl_columnar_eval_test_after_stage = stage_observe_hook;
+            rc = run_mutual(p, false, workers, &cfg, &got, &info);
+            wl_columnar_eval_test_after_stage = NULL;
+            wl_columnar_eval_test_channel_split = NULL;
+            bool dup = sort_has_duplicate(&got);
+            fprintf(stderr, "  %s W=%u: strategy=%s selected=%u cap=%s "
+                "spills=%llu stage_spills=%llu over_cap=%llu "
+                "stage_peak=%llu max_stage=%llu private=%llu/%llu "
+                "deltas=%llu/%llu rows=%zu/%zu\n", p->name, workers,
+                info.strategy ? info.strategy : "(none)", info.selected,
+                held, (unsigned long long)c->consumer_spills,
+                (unsigned long long)c->stage_spills,
+                (unsigned long long)c->stage_over_cap,
+                (unsigned long long)c->stage_peak_bytes,
+                (unsigned long long)c->max_stage_bytes,
+                (unsigned long long)c->owner_private_released,
+                (unsigned long long)c->owner_private_at_commit,
+                (unsigned long long)stage_deltas_governed,
+                (unsigned long long)stage_deltas_seen, got.count,
+                serial.count);
+            CHECK(rc == 0, "%s W=%u: rc=%d", p->name, workers, rc);
+            CHECK(info.selected == workers && info.strategy
+                && strcmp(info.strategy, p->strategy) == 0,
+                "%s W=%u: strategy %s on %u workers, expected %s", p->name,
+                workers, info.strategy ? info.strategy : "(none)",
+                info.selected, p->strategy);
+            CHECK(c->stage_spills > 0, "%s W=%u: staging never spilled",
+                p->name, workers);
+            CHECK(c->stage_peak_bytes > 0, "%s W=%u: no staging recorded",
+                p->name, workers);
+            /* The spill-down spills only what its target needs: some
+             * staging held more than its own slots, so other relations'
+             * batches (or, in owner mode, their slots) stayed resident. */
+            CHECK(c->stage_peak_bytes > c->max_stage_bytes,
+                "%s W=%u: no staging held more than its own slots",
+                p->name, workers);
+            CHECK(c->stage_over_cap == 0, "%s W=%u: %llu stagings over the cap",
+                p->name, workers, (unsigned long long)c->stage_over_cap);
+            check_stage_bound(p->name, workers, c);
+            check_held_bound(p->name, workers, c);
+            /* The exchanges create the deltas they install under the
+             * governor, except the shared views a broadcast installs next
+             * to the one relation it builds; owner mode's deltas are the
+             * candidates its commit publishes. */
+            bool owner = strcmp(p->strategy, "owner") == 0;
+            CHECK(owner || stage_deltas_governed > 0,
+                "%s W=%u: no installed delta is governed", p->name, workers);
+            CHECK(!(p->linear || strcmp(p->strategy, "global_read") == 0)
+                || stage_deltas_governed == stage_deltas_seen,
+                "%s W=%u: %llu of %llu installed deltas governed", p->name,
+                workers, (unsigned long long)stage_deltas_governed,
+                (unsigned long long)stage_deltas_seen);
+            if (info.strategy && strcmp(info.strategy, "owner") == 0) {
+                CHECK(c->owner_private_released > 0,
+                    "%s W=%u: no private slot released", p->name, workers);
+                CHECK(c->owner_private_at_commit == 0,
+                    "%s W=%u: %llu private slots reached the commit",
+                    p->name, workers,
+                    (unsigned long long)c->owner_private_at_commit);
+            }
+            CHECK(!dup, "%s W=%u: duplicate rows", p->name, workers);
+            CHECK(same_set(&got, &serial), "%s W=%u: %zu rows, serial %zu",
+                p->name, workers, got.count, serial.count);
+            free(got.rows);
+        }
+        free(serial.rows);
+    }
+}
+
+/* The spill attempts that failed, whatever their status. */
+static uint64_t
+failed_spills(const wl_tdd_consumer_stats_t *c)
+{
+    uint64_t n = 0;
+    for (size_t i = 0; i < WL_TDD_SPILL_STATUS_SLOTS; i++)
+        n += c->consumer_spill_fail[i];
+    return n;
+}
+
+/*
+ * Owner mode keeps the slots it adopted until its commit, and they count
+ * against the spill-down of every relation staged after them.  With every
+ * delta published as one batch, staging adopts each batch still resident.
+ * One run caps the held bytes at twice the most one relation's staged
+ * slots took in an uncapped run: some slots are adopted, the staging bound
+ * holds, and no private slot reaches the commit.  Another caps them at 1
+ * byte with a spill quota of 1 byte, so no batch can spill and the held
+ * batches and adopted slots stay over the cap: stage_over_cap must count
+ * those stagings, and the results stay exact.  test_tdd_channel_spill
+ * checks the staging whose other relations' slots alone exceed the cap.
+ */
+static void
+test_stage_adopted(void)
+{
+    const program_t *p = &mutual[0];
+    char held[32];
+    wl_columnar_eval_test_channel_split = NULL;
+    collect_t serial = { 0 };
+    int rc = mutual_expected(p, false, &serial);
+    CHECK(rc == 0 && serial.count > 0, "adopted: serial rc=%d rows=%zu", rc,
+        serial.count);
+    (void)sort_has_duplicate(&serial);
+    for (int s = 0; s < 2; s++) {
+        bool starved = s == 1;
+        const char *kind = starved ? "starved" : "capped";
+        for (size_t wi = 0; wi < sizeof(widths) / sizeof(widths[0]); wi++) {
+            uint32_t workers = widths[wi];
+            run_config_t cfg = { "1", false, true, 0, starved ? 1u : 0u };
+            collect_t got = { 0 };
+            run_info_t info;
+            if (!starved) {
+                cfg.held_env = "1099511627776";
+                memset(&info, 0, sizeof(info));
+                rc = run_mutual(p, false, workers, &cfg, &got, &info);
+                uint64_t stage = info.consumer.max_stage_bytes;
+                CHECK(rc == 0 && stage > 0,
+                    "adopted %s W=%u calibration: rc=%d max_stage=%llu", kind,
+                    workers, rc, (unsigned long long)stage);
+                free(got.rows);
+                memset(&got, 0, sizeof(got));
+                snprintf(held, sizeof(held), "%llu",
+                    (unsigned long long)(2 * stage));
+                cfg.held_env = held;
+            }
+            memset(&info, 0, sizeof(info));
+            rc = run_mutual(p, false, workers, &cfg, &got, &info);
+            const wl_tdd_consumer_stats_t *c = &info.consumer;
+            bool dup = sort_has_duplicate(&got);
+            fprintf(stderr, "  adopted %s W=%u: strategy=%s cap=%s "
+                "adopted=%llu spills=%llu failed=%llu stage_spills=%llu "
+                "stage_over_cap=%llu stage_peak=%llu max_stage=%llu "
+                "private=%llu/%llu rows=%zu/%zu\n", kind, workers,
+                info.strategy ? info.strategy : "(none)", cfg.held_env,
+                (unsigned long long)c->stage_adopted,
+                (unsigned long long)c->consumer_spills,
+                (unsigned long long)failed_spills(c),
+                (unsigned long long)c->stage_spills,
+                (unsigned long long)c->stage_over_cap,
+                (unsigned long long)c->stage_peak_bytes,
+                (unsigned long long)c->max_stage_bytes,
+                (unsigned long long)c->owner_private_released,
+                (unsigned long long)c->owner_private_at_commit, got.count,
+                serial.count);
+            CHECK(rc == 0, "adopted %s W=%u: rc=%d", kind, workers, rc);
+            CHECK(info.strategy && strcmp(info.strategy, "owner") == 0,
+                "adopted %s W=%u: strategy %s", kind, workers,
+                info.strategy ? info.strategy : "(none)");
+            CHECK(c->stage_adopted > 0, "adopted %s W=%u: nothing adopted",
+                kind, workers);
+            check_stage_bound(kind, workers, c);
+            CHECK(c->owner_private_at_commit == 0,
+                "adopted %s W=%u: %llu private slots reached the commit", kind,
+                workers, (unsigned long long)c->owner_private_at_commit);
+            CHECK(!starved || (c->consumer_spills == 0
+                && failed_spills(c) > 0 && c->stage_over_cap > 0),
+                "adopted %s W=%u: spills=%llu failed=%llu stage_over_cap=%llu",
+                kind, workers, (unsigned long long)c->consumer_spills,
+                (unsigned long long)failed_spills(c),
+                (unsigned long long)c->stage_over_cap);
+            CHECK(!dup, "adopted %s W=%u: duplicate rows", kind, workers);
+            CHECK(same_set(&got, &serial),
+                "adopted %s W=%u: %zu rows, serial %zu", kind, workers,
+                got.count, serial.count);
+            free(got.rows);
+        }
+    }
+    free(serial.rows);
+}
+
+/* Fail the staging of relation 1 once, while relation 2's lists still
+ * hold a spilled batch. */
+static int
+stage_fault_hook(wl_col_session_t *coord, uint32_t ri)
+{
+    uint32_t workers = stage_fault_workers;
+    if (stage_fault_fired || ri != 1 || !coord->tdd_channel_lists
+        || coord->tdd_channel_list_count != (size_t)workers * 3u)
+        return 0;
+    bool spilled = false;
+    for (uint32_t w = 0; w < workers && !spilled; w++)
+        for (const wl_tdd_batch_t *b =
+            coord->tdd_channel_lists[(size_t)2u * workers + w];
+            b && !spilled; b = b->next)
+            spilled = b->kind == WL_TDD_BATCH_SPILLED;
+    if (!spilled)
+        return 0;
+    stage_fault_fired = true;
+    return stage_fault_rc;
+}
+
+/*
+ * An exchange that fails between the relations it stages: with every batch
+ * spilled as it is taken, the staging of relation 1 fails once, with its
+ * staged slots in the matrix, while relation 2's lists still hold spilled
+ * batches that no staging will read.  The stratum must report the
+ * failure, and the batches must go down the failure path, so more batches
+ * were spilled than read back.  Releasing them and the slots is checked by
+ * the governor returning to 0 after the session, by the spill directory
+ * ending empty and, under ASan, by the leak check; in owner mode they go
+ * through the lifetime record.  In global-read mode an EOVERFLOW replays
+ * the stratum serially instead, which must give the expected result.
+ */
+static void
+test_stage_fault(void)
+{
+    static const run_config_t cfg = { "1", false, true };
+    static const int faults[] = { ENOMEM, EOVERFLOW };
+    for (size_t i = 0; i < sizeof(mutual) / sizeof(mutual[0]); i++) {
+        const program_t *p = &mutual[i];
+        collect_t expected = { 0 };
+        int rc = mutual_expected(p, false, &expected);
+        CHECK(rc == 0 && expected.count > 0, "%s: expected rc=%d rows=%zu",
+            p->name, rc, expected.count);
+        (void)sort_has_duplicate(&expected);
+        bool global = strcmp(p->strategy, "global_read") == 0;
+        for (size_t wi = 0; wi < sizeof(widths) / sizeof(widths[0]); wi++) {
+            uint32_t workers = widths[wi];
+            for (size_t k = 0; k < sizeof(faults) / sizeof(faults[0]); k++) {
+                int injected = faults[k];
+                atomic_store_explicit(&split_parts, 3, memory_order_relaxed);
+                wl_columnar_eval_test_channel_split = split_hook;
+                stage_fault_rc = injected;
+                stage_fault_fired = false;
+                stage_fault_workers = workers;
+                wl_columnar_eval_test_after_stage = stage_fault_hook;
+                collect_t got = { 0 };
+                run_info_t info;
+                memset(&info, 0, sizeof(info));
+                rc = run_mutual(p, false, workers, &cfg, &got, &info);
+                wl_columnar_eval_test_after_stage = NULL;
+                wl_columnar_eval_test_channel_split = NULL;
+                const wl_tdd_consumer_stats_t *c = &info.consumer;
+                bool replay = global && injected == EOVERFLOW;
+                fprintf(stderr, "  %s W=%u fault=%d: rc=%d strategy=%s "
+                    "replay=%s spills=%llu rehydrated=%llu rows=%zu\n",
+                    p->name, workers, injected, rc,
+                    info.strategy ? info.strategy : "(none)",
+                    info.replay ? info.replay : "(none)",
+                    (unsigned long long)c->consumer_spills,
+                    (unsigned long long)c->rehydrated_batches, got.count);
+                CHECK(stage_fault_fired, "%s W=%u fault=%d: never fired",
+                    p->name, workers, injected);
+                CHECK(info.strategy && strcmp(info.strategy, p->strategy) == 0,
+                    "%s W=%u fault=%d: strategy %s", p->name, workers,
+                    injected, info.strategy ? info.strategy : "(none)");
+                CHECK(c->consumer_spills > c->rehydrated_batches,
+                    "%s W=%u fault=%d: no spilled batch reached the failure "
+                    "path", p->name, workers, injected);
+                if (replay) {
+                    CHECK(rc == 0 && info.replay
+                        && strcmp(info.replay, "global_read_overflow") == 0,
+                        "%s W=%u fault=%d: rc=%d replay=%s", p->name, workers,
+                        injected, rc, info.replay ? info.replay : "(none)");
+                    bool dup = sort_has_duplicate(&got);
+                    CHECK(!dup && same_set(&got, &expected),
+                        "%s W=%u fault=%d: %zu rows, expected %zu", p->name,
+                        workers, injected, got.count, expected.count);
+                } else {
+                    CHECK(rc == injected, "%s W=%u fault=%d: rc=%d",
+                        p->name, workers, injected, rc);
+                }
+                free(got.rows);
+            }
+        }
+        free(expected.rows);
+    }
+}
+
+/* ------------------------------------------------------------------------ */
 
 typedef struct {
     const char *name;
@@ -1099,6 +1697,9 @@ static const test_case_t tests[] = {
     { "string_over_cap", test_string_over_cap },
     { "held_cap_defaults", test_held_cap_defaults },
     { "injected_floor", test_injected_floor },
+    { "stage_bound", test_stage_bound },
+    { "stage_adopted", test_stage_adopted },
+    { "stage_fault", test_stage_fault },
 };
 
 static int

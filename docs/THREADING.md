@@ -2420,9 +2420,13 @@ round. The spill does not race the producers that are still running:
   and has at most one worker, which rules out both the workers and the
   coordinator of a round.
 
-After the join the coordinator coalesces each list into the delta matrix,
-reading spilled batches back, when the round succeeds, and disposes of
-the batches when it fails.
+After the join, each exchange stages one relation at a time at the top
+of its per-relation loop, on the coordinator's thread: it spills the other
+relations' resident batches down to make room, then coalesces that
+relation's lists into the delta matrix, reading spilled batches back.
+Every producer has been joined by then, so the spill-down races nothing.
+A round that fails, before its exchange or during it, disposes of the
+batches still on the lists.
 
 The held cap is `WIRELOG_TDD_HELD_BYTES` when that is a positive decimal
 integer that fits in 64 bits; otherwise a quarter of an enforcing

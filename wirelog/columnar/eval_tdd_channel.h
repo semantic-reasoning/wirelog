@@ -74,6 +74,29 @@ typedef struct {
  * - consumer_spill_fail[s]: spill attempts that failed with status s;
  *   a batch without timestamps counts as WL_COLUMNAR_SPILL_INVALID.
  * - rehydrated_batches: SPILLED batches read back into a staged slot.
+ *
+ * Staging (wl_columnar_eval_tdd_channel_stage_relation()):
+ * - stage_peak_bytes: the largest, over the stagings, of the held bytes of
+ *   the other relations after their spill-down, plus the matrix slots of
+ *   other relations still in place (owner mode keeps its adopted ones
+ *   until its commit), plus the transport bytes of the slots staged for the
+ *   relation itself, taken once the staging has coalesced.  It does not
+ *   count the inputs and scratch the coalesce frees, the buffers the
+ *   exchange then builds from those slots, the publication candidates owner
+ *   mode has built for the relations exchanged before, nor the next round's
+ *   inputs.
+ * - max_stage_bytes: the most transport bytes one relation's staged slots
+ *   held.
+ * - stage_over_cap: stagings whose spill-down ended above its target, for
+ *   the reasons a cap pass does, or that found the other relations' matrix
+ *   slots alone over the cap.
+ * - stage_adopted: slots a staging adopted from a single RESIDENT batch.
+ * - stage_spills: the consumer_spills made by a spill-down.
+ * - owner_private_released: coordinator-private owner-mode slots destroyed
+ *   as soon as the exchange had copied them, before its commit.
+ * - owner_private_at_commit: private slots still in the matrix when the
+ *   owner exchange prepared its input retirements; 0 unless a release was
+ *   refused.
  */
 typedef struct {
     uint64_t held_cap;
@@ -84,6 +107,13 @@ typedef struct {
     uint64_t consumer_spills;
     uint64_t consumer_spill_fail[WL_TDD_SPILL_STATUS_SLOTS];
     uint64_t rehydrated_batches;
+    uint64_t stage_peak_bytes;
+    uint64_t max_stage_bytes;
+    uint64_t stage_over_cap;
+    uint64_t stage_adopted;
+    uint64_t stage_spills;
+    uint64_t owner_private_released;
+    uint64_t owner_private_at_commit;
 } wl_tdd_consumer_stats_t;
 
 /*
@@ -331,9 +361,12 @@ wl_columnar_eval_tdd_channel_collect(wl_tdd_channel_t *ch,
     const wl_tdd_hold_t *hold);
 
 /*
- * Consumer: coalesce every list built by wl_columnar_eval_tdd_channel_collect()
- * into ctxs[w].delta_rels[ri] with wl_columnar_eval_tdd_coalesce_slot(), in
- * seq order, naming each slot after relation ri's delta in ctxs[w].sp and
+ * Consumer: coalesce every list built by
+ * wl_columnar_eval_tdd_channel_collect() into ctxs[w].delta_rels[ri] with
+ * wl_columnar_eval_tdd_coalesce_slot(), in seq order, all relations at once
+ * (the exchanges stage one relation at a time with
+ * wl_columnar_eval_tdd_channel_stage_relation() instead; the unit tests use
+ * this form), naming each slot after relation ri's delta in ctxs[w].sp and
  * taking its schema from relation ri in worker w's session when every batch
  * was spilled.  The SPILLED batches of each list that coalesces are added to
  * @stats->rehydrated_batches (@stats is optional).  Unless an argument is
@@ -346,6 +379,39 @@ int
 wl_columnar_eval_tdd_channel_coalesce_all(struct wl_col_session_t *coord,
     wl_tdd_channel_t *ch, wl_tdd_batch_t **lists,
     struct col_eval_tdd_worker_ctx *ctxs, uint32_t nworkers, uint32_t nrels,
+    const wl_tdd_refusal_sink_t *sink, wl_tdd_consumer_stats_t *stats);
+
+/*
+ * Consumer, at the top of an exchange's per-relation loop (#1373): stage
+ * relation @ri of the round held on @lists into ctxs[w].delta_rels[ri],
+ * one relation at a time, so the round's other relations need not be
+ * resident while this one is coalesced.
+ *
+ * First the held RESIDENT batches of the other relations are spilled down,
+ * largest first, while their held bytes, plus the matrix slots other
+ * relations still hold, plus an estimate of what staging @ri holds at its
+ * peak, exceed @held_cap.  The estimate counts an adopted batch's charge.
+ * For a fresh slot it counts the resident inputs and the rows' bytes, and
+ * when two or more batches may be consolidated, the rows' bytes a second
+ * time and a 4-byte index per row.  When the spill-down cannot get under
+ * its target, or the other relations' matrix slots alone exceed
+ * @held_cap, stage_over_cap is counted.  Then relation @ri's lists are
+ * coalesced as wl_columnar_eval_tdd_channel_coalesce_all() coalesces them.
+ *
+ * @private_out (optional, @nworkers entries) records, per worker, whether
+ * its slot is a fresh relation private to the coordinator; it is false for
+ * an adopted batch and for no slot.  With no batch held for @ri the call
+ * only clears @private_out and returns 0.  Returns EINVAL for invalid
+ * arguments, otherwise what the coalesce returns; on failure the slots
+ * already built for @ri stay in the matrix for the caller and ri's other
+ * lists are disposed through @sink.  @stats (optional) receives the staging
+ * counts.
+ */
+int
+wl_columnar_eval_tdd_channel_stage_relation(struct wl_col_session_t *coord,
+    wl_tdd_channel_t *ch, wl_tdd_batch_t **lists,
+    struct col_eval_tdd_worker_ctx *ctxs, uint32_t nworkers, uint32_t nrels,
+    uint32_t ri, uint64_t held_cap, bool *private_out,
     const wl_tdd_refusal_sink_t *sink, wl_tdd_consumer_stats_t *stats);
 
 /* Dispose every batch on lists[0..@count) through
@@ -376,6 +442,13 @@ extern int (*wl_columnar_eval_test_channel_reserve)(
 extern uint32_t (*wl_columnar_eval_test_channel_split)(
     struct wl_col_session_t *worker, uint32_t rel_idx, uint32_t rows,
     bool *overlap);
+
+/* Test hook, called on the coordinator thread when
+ * wl_columnar_eval_tdd_channel_stage_relation() has staged relation @ri.
+ * A non-zero return is returned as the staging's failure, with ri's staged
+ * slots left in the matrix. */
+extern int (*wl_columnar_eval_test_after_stage)(
+    struct wl_col_session_t *coord, uint32_t ri);
 #endif
 
 #endif /* WL_COLUMNAR_EVAL_TDD_CHANNEL_H */

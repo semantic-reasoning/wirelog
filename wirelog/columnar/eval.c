@@ -102,8 +102,8 @@ wl_columnar_eval_tdd_channel_side_bytes(uint32_t workers, uint32_t nrels,
     if (rc != 0)
         return rc;
     if (!wl_columnar_memory_size_mul(workers, nrels, &lists)
-        || !wl_columnar_memory_size_mul(lists, sizeof(wl_tdd_batch_t *),
-        &lists)
+        || !wl_columnar_memory_size_mul(lists,
+        sizeof(wl_tdd_batch_t *) + sizeof(bool), &lists)
         || !wl_columnar_memory_size_add(channel, lists, bytes))
         return EOVERFLOW;
     return 0;
@@ -238,8 +238,9 @@ tdd_create_channel(wl_col_session_t *coord, uint32_t workers,
     int rc = tdd_reserve_channel(coord, workers, nrels, &bytes);
     if (rc != 0)
         return rc;
+    /* The staging flags follow the list heads in the same allocation. */
     wl_tdd_batch_t **lists = (wl_tdd_batch_t **)calloc(
-        list_count ? list_count : 1u, sizeof(*lists));
+        list_count ? list_count : 1u, sizeof(*lists) + sizeof(bool));
     wl_tdd_channel_t *ch = lists
         ? wl_tdd_channel_create(workers, tdd_channel_cap_bytes(coord),
             coord->memory_governor
@@ -256,6 +257,8 @@ tdd_create_channel(wl_col_session_t *coord, uint32_t workers,
         abort();
     coord->tdd_channel = ch;
     coord->tdd_channel_lists = lists;
+    coord->tdd_channel_private = (bool *)(void *)(lists
+        + (list_count ? list_count : 1u));
     coord->tdd_channel_list_count = list_count;
     coord->mem_channel_side_bytes = bytes;
     wl_mem_ledger_alloc(&coord->mem_ledger, WL_MEM_SUBSYS_CHANNEL, bytes);
@@ -277,6 +280,7 @@ tdd_channel_release(wl_col_session_t *coord)
     }
     free((void *)coord->tdd_channel_lists);
     coord->tdd_channel_lists = NULL;
+    coord->tdd_channel_private = NULL;
     coord->tdd_channel_list_count = 0;
     if (coord->mem_channel_side_bytes) {
         wl_mem_ledger_free(&coord->mem_ledger, WL_MEM_SUBSYS_CHANNEL,
@@ -4442,6 +4446,81 @@ static int tdd_broadcast_deltas(const wl_plan_stratum_t *sp,
     wl_col_session_t *coord, col_eval_tdd_worker_ctx_t *ctxs, uint32_t W);
 
 /*
+ * Stage relation @ri of the round the channel delivered (#1373) at the top
+ * of an exchange's per-relation loop; see
+ * wl_columnar_eval_tdd_channel_stage_relation().  A no-op without channel
+ * lists, as for the test-only exchange callers.  On failure the slots it
+ * built for @ri stay in the matrix: the driver destroys what a failed
+ * exchange leaves there, except in owner mode, whose lifetime record owns
+ * the matrix.
+ */
+static int
+tdd_stage_relation(wl_col_session_t *coord, col_eval_tdd_worker_ctx_t *ctxs,
+    uint32_t W, uint32_t nrels, uint32_t ri)
+{
+    if (!coord->tdd_channel || !coord->tdd_channel_lists
+        || coord->tdd_channel_list_count != (size_t)W * nrels)
+        return 0;
+    uint64_t t0 = now_ns();
+    wl_tdd_refusal_sink_t sink = tdd_channel_refusal_sink(coord);
+    int rc = wl_columnar_eval_tdd_channel_stage_relation(coord,
+            coord->tdd_channel, coord->tdd_channel_lists, ctxs, W, nrels, ri,
+            coord->tdd_consumer.held_cap,
+            coord->tdd_channel_private
+            ? &coord->tdd_channel_private[(size_t)ri * W] : NULL, &sink,
+            &coord->tdd_consumer);
+    coord->tdd_queue_drain_ns += now_ns() - t0;
+    return rc;
+}
+
+/* @rc for an operation on @rel, which the exchange created: a governor
+ * refusal reads ENOSPC and is recorded on @coord. */
+static int
+tdd_exchange_status(wl_col_session_t *coord, col_rel_t *rel, int rc)
+{
+    rc = eval_relation_status(rel, rc);
+    if (rc == ENOSPC)
+        coord->memory_budget_denied = true;
+    return rc;
+}
+
+/* A relation the exchange creates (#1373): governed from the start under
+ * @coord's governor when it has one, else as col_rel_new_auto() makes it. */
+static int
+tdd_exchange_relation_new(wl_col_session_t *coord, const char *name,
+    uint32_t ncols, col_rel_t **out)
+{
+    *out = NULL;
+    if (!coord->memory_governor) {
+        *out = col_rel_new_auto(name, ncols);
+        return *out ? 0 : ENOMEM;
+    }
+    int rc = wl_columnar_relation_new_auto_governed(name, ncols,
+            COL_REL_INIT_CAP, false, coord->memory_governor, out);
+    return tdd_exchange_status(coord, *out, rc);
+}
+
+/* Put the @W partitions col_rel_exchange_partition() wrote to @parts under
+ * @coord's governor.  The partitioner admits nothing itself, so these are
+ * accounted after allocation: attaching admits the bytes already there. */
+static int
+tdd_exchange_govern_parts(wl_col_session_t *coord, col_rel_t **parts,
+    uint32_t W)
+{
+    if (!coord->memory_governor)
+        return 0;
+    for (uint32_t w = 0; w < W; w++) {
+        if (!parts[w] || parts[w]->memory_governor == coord->memory_governor)
+            continue;
+        int rc = col_rel_attach_memory_governor(parts[w],
+                coord->memory_governor);
+        if (rc != 0)
+            return tdd_exchange_status(coord, parts[w], rc);
+    }
+    return 0;
+}
+
+/*
  * tdd_broadcast_relation_delta:
  * Union all worker deltas for relation index ri and install the union as
  * $d$<relname> on every worker.  Used by tdd_exchange_deltas for relations
@@ -4455,6 +4534,9 @@ tdd_broadcast_relation_delta(const wl_plan_stratum_t *sp, uint32_t ri,
     wl_col_session_t *coord, col_eval_tdd_worker_ctx_t *ctxs, uint32_t W)
 {
     const char *dname = sp->relations[ri].delta_name;
+    int rc = tdd_stage_relation(coord, ctxs, W, sp->relation_count, ri);
+    if (rc != 0)
+        return rc;
 
     /* #1661: a refusal leaves the worker's registry owner in place and is
      * surfaced by the same-name session_add_rel below, which re-attempts
@@ -4487,16 +4569,17 @@ tdd_broadcast_relation_delta(const wl_plan_stratum_t *sp, uint32_t ri,
         return 0;
     }
 
-    col_rel_t *union_d = col_rel_new_auto(dname, ncols);
-    if (!union_d)
-        return ENOMEM;
+    col_rel_t *union_d = NULL;
+    rc = tdd_exchange_relation_new(coord, dname, ncols, &union_d);
+    if (rc != 0)
+        return rc;
 
-    int rc = 0;
     for (uint32_t w = 0; w < W; w++) {
         col_rel_t *d = ctxs[w].delta_rels[ri];
         ctxs[w].delta_rels[ri] = NULL;
         if (d && d->nrows > 0)
-            rc = col_rel_append_all(union_d, d, NULL);
+            rc = tdd_exchange_status(coord, union_d,
+                    col_rel_append_all(union_d, d, NULL));
         col_rel_destroy(d);
         if (rc != 0) {
             col_rel_destroy(union_d);
@@ -4644,15 +4727,17 @@ tdd_gather_for_worker(wl_col_session_t *coord, uint32_t dst, uint32_t W,
     if (total_rows == 0 || ncols == 0)
         return 0;
 
-    col_rel_t *gathered = col_rel_new_auto(dname, ncols);
-    if (!gathered)
-        return ENOMEM;
+    col_rel_t *gathered = NULL;
+    int rc = tdd_exchange_relation_new(coord, dname, ncols, &gathered);
+    if (rc != 0)
+        return rc;
 
     for (uint32_t src = 0; src < W; src++) {
         col_rel_t *part = coord->exchange_bufs[src][dst];
         if (!part || part->nrows == 0)
             continue;
-        int rc = col_rel_append_all(gathered, part, NULL);
+        rc = tdd_exchange_status(coord, gathered,
+                col_rel_append_all(gathered, part, NULL));
         if (rc != 0) {
             col_rel_destroy(gathered);
             return rc;
@@ -4750,6 +4835,9 @@ tdd_exchange_deltas(const wl_plan_stratum_t *sp,
 
     for (uint32_t ri = 0; ri < nrels; ri++) {
         const char *dname = sp->relations[ri].delta_name;
+        rc = tdd_stage_relation(coord, ctxs, W, nrels, ri);
+        if (rc != 0)
+            goto exchange_done;
 
         /* Locate EXCHANGE key columns for this relation (if any). */
         uint64_t prepare_t0 = now_ns();
@@ -4828,15 +4916,16 @@ tdd_exchange_deltas(const wl_plan_stratum_t *sp,
                     ctxs[w].delta_rels[ri] = NULL;
                 }
             } else {
-                col_rel_t *union_d = col_rel_new_auto(dname, ncols);
-                if (!union_d) {
-                    rc = ENOMEM; goto exchange_done;
-                }
+                col_rel_t *union_d = NULL;
+                rc = tdd_exchange_relation_new(coord, dname, ncols, &union_d);
+                if (rc != 0)
+                    goto exchange_done;
                 for (uint32_t w = 0; w < W; w++) {
                     col_rel_t *d = ctxs[w].delta_rels[ri];
                     ctxs[w].delta_rels[ri] = NULL;
                     if (d && d->nrows > 0)
-                        rc = col_rel_append_all(union_d, d, NULL);
+                        rc = tdd_exchange_status(coord, union_d,
+                                col_rel_append_all(union_d, d, NULL));
                     col_rel_destroy(d);
                     if (rc != 0) {
                         col_rel_destroy(union_d); goto exchange_done;
@@ -4845,12 +4934,14 @@ tdd_exchange_deltas(const wl_plan_stratum_t *sp,
                 for (uint32_t dst = 0; dst < W; dst++) {
                     col_rel_t *copy;
                     if (dst < W - 1) {
-                        copy = col_rel_new_auto(dname, ncols);
-                        if (!copy) {
-                            col_rel_destroy(union_d); rc = ENOMEM;
+                        rc = tdd_exchange_relation_new(coord, dname, ncols,
+                                &copy);
+                        if (rc != 0) {
+                            col_rel_destroy(union_d);
                             goto exchange_done;
                         }
-                        rc = col_rel_append_all(copy, union_d, NULL);
+                        rc = tdd_exchange_status(coord, copy,
+                                col_rel_append_all(copy, union_d, NULL));
                         if (rc != 0) {
                             col_rel_destroy(copy); col_rel_destroy(union_d);
                             goto exchange_done;
@@ -4883,6 +4974,9 @@ tdd_exchange_deltas(const wl_plan_stratum_t *sp,
                 rc = col_rel_exchange_partition(d, key_cols, key_count,
                         W, coord->exchange_bufs[w]);
                 col_rel_destroy(d);
+                if (rc == 0)
+                    rc = tdd_exchange_govern_parts(coord,
+                            coord->exchange_bufs[w], W);
 
                 if (rc != 0)
                     goto exchange_done;
@@ -5312,6 +5406,9 @@ tdd_broadcast_deltas(const wl_plan_stratum_t *sp,
 
     for (uint32_t ri = 0; ri < nrels; ri++) {
         const char *dname = sp->relations[ri].delta_name;
+        int stage_rc = tdd_stage_relation(coord, ctxs, W, nrels, ri);
+        if (stage_rc != 0)
+            return stage_rc;
 
         /* Count total rows and find ncols */
         uint32_t total_rows = 0;
@@ -5351,13 +5448,14 @@ tdd_broadcast_deltas(const wl_plan_stratum_t *sp,
             union_d = slot0;
             union_from_session = true;
         } else {
-            union_d = col_rel_new_auto(dname, ncols);
-            if (!union_d) {
+            int new_rc = tdd_exchange_relation_new(coord, dname, ncols,
+                    &union_d);
+            if (new_rc != 0) {
                 for (uint32_t w = 0; w < W; w++) {
                     col_rel_destroy(ctxs[w].delta_rels[ri]);
                     ctxs[w].delta_rels[ri] = NULL;
                 }
-                return ENOMEM;
+                return new_rc;
             }
         }
 
@@ -5367,7 +5465,8 @@ tdd_broadcast_deltas(const wl_plan_stratum_t *sp,
             ctxs[w].delta_rels[ri] = NULL;
             if (!d) continue;
             if (append_rc == 0 && d->nrows > 0)
-                append_rc = col_rel_append_all(union_d, d, NULL);
+                append_rc = tdd_exchange_status(coord, union_d,
+                        col_rel_append_all(union_d, d, NULL));
             col_rel_destroy(d);
         }
 
@@ -6232,6 +6331,9 @@ tdd_bdx_exchange_deltas(const wl_plan_stratum_t *sp,
     for (uint32_t ri = 0; ri < nrels; ri++) {
         const char *dname = sp->relations[ri].delta_name;
         const char *rel_name = sp->relations[ri].name;
+        rc = tdd_stage_relation(coord, ctxs, W, nrels, ri);
+        if (rc != 0)
+            return rc;
 
         uint64_t prepare_t0 = now_ns();
 
@@ -6271,15 +6373,17 @@ tdd_bdx_exchange_deltas(const wl_plan_stratum_t *sp,
             continue;
         }
 
-        col_rel_t *combined = col_rel_new_auto(dname, ncols);
-        if (!combined)
-            return ENOMEM;
+        col_rel_t *combined = NULL;
+        rc = tdd_exchange_relation_new(coord, dname, ncols, &combined);
+        if (rc != 0)
+            return rc;
 
         for (uint32_t w = 0; w < W; w++) {
             col_rel_t *d = ctxs[w].delta_rels[ri];
             ctxs[w].delta_rels[ri] = NULL;
             if (d && d->nrows > 0)
-                rc = col_rel_append_all(combined, d, NULL);
+                rc = tdd_exchange_status(coord, combined,
+                        col_rel_append_all(combined, d, NULL));
             col_rel_destroy(d);
             if (rc != 0) {
                 col_rel_destroy(combined);
@@ -6369,6 +6473,8 @@ tdd_bdx_exchange_deltas(const wl_plan_stratum_t *sp,
         }
         rc = col_rel_exchange_partition(combined, key_cols, key_count, W,
                 parts);
+        if (rc == 0)
+            rc = tdd_exchange_govern_parts(coord, parts, W);
         if (rc != 0) {
             for (uint32_t w = 0; w < W; w++)
                 col_rel_destroy(parts[w]);
@@ -6652,6 +6758,47 @@ tdd_owner_commit_input_retirements(col_eval_tdd_worker_ctx_t *ctxs,
     free(entries);
 }
 
+/* Whether staging built worker @w's slot for relation @ri privately. */
+static bool
+tdd_owner_slot_private(const wl_col_session_t *coord, uint32_t W,
+    uint32_t nrels, uint32_t w, uint32_t ri)
+{
+    return coord->tdd_channel_private && coord->tdd_channel_lists
+           && coord->tdd_channel_list_count == (size_t)W * nrels
+           && coord->tdd_channel_private[(size_t)ri * W + w];
+}
+
+/* Destroy relation @ri's coordinator-private slots once the exchange has
+ * copied them into its combined delta.  A refused destroy leaves the slot
+ * to the input retirement. */
+static void
+tdd_owner_release_private_slots(wl_col_session_t *coord,
+    col_eval_tdd_worker_ctx_t *ctxs, uint32_t W, uint32_t nrels, uint32_t ri)
+{
+    for (uint32_t w = 0; w < W; w++) {
+        if (!ctxs[w].delta_rels[ri]
+            || !tdd_owner_slot_private(coord, W, nrels, w, ri))
+            continue;
+        if (col_rel_destroy_checked(ctxs[w].delta_rels[ri]) != 0)
+            continue;
+        ctxs[w].delta_rels[ri] = NULL;
+        coord->tdd_channel_private[(size_t)ri * W + w] = false;
+        coord->tdd_consumer.owner_private_released++;
+    }
+}
+
+/* Count the private slots the input retirement is about to see. */
+static void
+tdd_owner_count_private_slots(wl_col_session_t *coord,
+    const col_eval_tdd_worker_ctx_t *ctxs, uint32_t W, uint32_t nrels)
+{
+    for (uint32_t w = 0; w < W; w++)
+        for (uint32_t ri = 0; ri < nrels; ri++)
+            if (ctxs[w].delta_rels[ri]
+                && tdd_owner_slot_private(coord, W, nrels, w, ri))
+                coord->tdd_consumer.owner_private_at_commit++;
+}
+
 static int
 tdd_owner_exchange_deltas(const wl_plan_stratum_t *sp,
     wl_col_session_t *coord, col_eval_tdd_worker_ctx_t *ctxs, uint32_t W,
@@ -6684,6 +6831,9 @@ tdd_owner_exchange_deltas(const wl_plan_stratum_t *sp,
         uint32_t ncols = 0;
         uint32_t accepted_rows;
 
+        rc = tdd_stage_relation(coord, ctxs, W, nrels, ri);
+        if (rc != 0)
+            goto fail;
         for (uint32_t w = 0; w < W; w++) {
             col_rel_t *d = ctxs[w].delta_rels[ri];
             if (!d || d->nrows == 0)
@@ -6733,11 +6883,18 @@ tdd_owner_exchange_deltas(const wl_plan_stratum_t *sp,
         for (uint32_t w = 0; w < W; w++) {
             col_rel_t *d = ctxs[w].delta_rels[ri];
             if (d && d->nrows > 0) {
-                rc = col_rel_append_all(combined, d, NULL);
+                rc = tdd_exchange_status(coord, combined,
+                        col_rel_append_all(combined, d, NULL));
                 if (rc != 0)
                     goto fail;
             }
         }
+        /* combined holds every row now.  A slot staging built for this
+         * relation is the coordinator's own and borrowed by nobody, so it
+         * goes at once rather than at the commit, which retires the
+         * adopted batches and any private slot whose destroy was refused
+         * (#1373). */
+        tdd_owner_release_private_slots(coord, ctxs, W, nrels, ri);
         if (combined->nrows > 1) {
             rc = tdd_bdx_sort_candidate(combined);
             if (rc != 0)
@@ -6814,6 +6971,8 @@ tdd_owner_exchange_deltas(const wl_plan_stratum_t *sp,
             uint64_t scatter_t0 = now_ns();
             rc = col_rel_exchange_partition(combined, key_cols, key_count,
                     W, parts);
+            if (rc == 0)
+                rc = tdd_exchange_govern_parts(coord, parts, W);
             coord->tdd_exchange_scatter_ns += now_ns() - scatter_t0;
             if (rc != 0)
                 goto fail;
@@ -6882,6 +7041,7 @@ tdd_owner_exchange_deltas(const wl_plan_stratum_t *sp,
     }
     if (rc != 0)
         goto fail;
+    tdd_owner_count_private_slots(coord, ctxs, W, nrels);
     rc = tdd_owner_prepare_input_retirements(coord, ctxs, W, nrels,
             &retirements, &retirement_count);
     if (rc != 0)
@@ -6946,6 +7106,9 @@ tdd_global_read_exchange_deltas(const wl_plan_stratum_t *sp,
     for (uint32_t ri = 0; ri < nrels; ri++) {
         const char *dname = sp->relations[ri].delta_name;
         const char *rel_name = sp->relations[ri].name;
+        rc = tdd_stage_relation(coord, ctxs, W, nrels, ri);
+        if (rc != 0)
+            return rc;
 
         uint32_t total = 0;
         const col_rel_t *prototype = NULL;
@@ -6982,7 +7145,8 @@ tdd_global_read_exchange_deltas(const wl_plan_stratum_t *sp,
             col_rel_t *d = ctxs[w].delta_rels[ri];
             ctxs[w].delta_rels[ri] = NULL;
             if (d && d->nrows > 0)
-                rc = col_rel_append_all(combined, d, NULL);
+                rc = tdd_exchange_status(coord, combined,
+                        col_rel_append_all(combined, d, NULL));
             col_rel_destroy(d);
             if (rc != 0) {
                 col_rel_destroy(combined);
@@ -7132,6 +7296,12 @@ tdd_global_read_exchange_deltas(const wl_plan_stratum_t *sp,
             if (!part->name) {
                 col_rel_destroy(part);
                 rc = ENOMEM;
+                break;
+            }
+            /* Governed only once it carries its final name. */
+            rc = tdd_exchange_govern_parts(coord, &part, 1);
+            if (rc != 0) {
+                col_rel_destroy(part);
                 break;
             }
             rc = session_add_rel(&coord->tdd_workers[w], part);
@@ -7936,24 +8106,14 @@ col_eval_stratum_tdd_recursive(const wl_plan_stratum_t *sp,
             }
 
             /* Issue #1373: the round is complete and every producer has
-             * been joined.  Coalesce each (worker, relation) list of
-             * batches into its matrix slot, reading spilled batches back.
-             * worker_delta_rows counts the rows the batches carried. */
-            {
-                uint64_t queue_t0 = now_ns();
-                wl_tdd_refusal_sink_t sink = tdd_channel_refusal_sink(coord);
-                rc = wl_columnar_eval_tdd_channel_coalesce_all(coord,
-                        coord->tdd_channel, coord->tdd_channel_lists,
-                        ctxs, W, nrels, &sink, &coord->tdd_consumer);
-                coord->tdd_queue_drain_ns += now_ns() - queue_t0;
-                if (coord->tdd_audit.enabled)
-                    coord->tdd_audit.worker_delta_rows += delivered;
-                if (rc != 0) {
-                    if (!coord->tdd_owner_lifetime)
-                        tdd_destroy_delta_slots(ctxs, W, nrels);
-                    goto done;
-                }
-            }
+             * been joined.  Each exchange then stages one relation at a
+             * time (tdd_stage_relation), coalescing that relation's
+             * (worker, relation) lists into its matrix slots and reading
+             * spilled batches back; an exit before the exchange leaves the
+             * lists to done:.  worker_delta_rows counts the rows the
+             * batches carried. */
+            if (coord->tdd_audit.enabled)
+                coord->tdd_audit.worker_delta_rows += delivered;
             uint64_t convergence_t0 = now_ns();
 
             /* Stratum-level early exit: all workers have all_empty_delta */
@@ -8033,6 +8193,7 @@ col_eval_stratum_tdd_recursive(const wl_plan_stratum_t *sp,
             uint32_t owner_accepted_rows = 0;
             {
                 uint64_t t0 = now_ns();
+                uint64_t stage0 = coord->tdd_queue_drain_ns;
                 coord->current_iteration = eff_iter;
                 if (owner_exchange_mode)
                     brc = tdd_owner_exchange_deltas(sp, coord, ctxs, W,
@@ -8046,7 +8207,12 @@ col_eval_stratum_tdd_recursive(const wl_plan_stratum_t *sp,
                 else
                     brc = tdd_exchange_deltas(sp, coord, ctxs, W,
                             !replicate_mode, self_join_mode);
+                /* The exchange stages its relations; that time counts as
+                 * queue drain, not as exchange. */
+                uint64_t stage_ns = coord->tdd_queue_drain_ns - stage0;
                 uint64_t exchange_ns = now_ns() - t0;
+                exchange_ns = exchange_ns > stage_ns ? exchange_ns - stage_ns
+                    : 0;
                 coord->exchange_time_ns += exchange_ns;
                 coord->tdd_exchange_ns += exchange_ns;
             }
@@ -8058,7 +8224,9 @@ col_eval_stratum_tdd_recursive(const wl_plan_stratum_t *sp,
                         "owner=%d global=%d bdx=%d replicate=%d\n",
                         stratum_idx, eff_iter, brc, owner_exchange_mode,
                         global_read_mode, bdx_mode, replicate_mode);
-                if (global_read_mode)
+                /* Outside owner mode, whose lifetime record owns the
+                 * matrix, drop the slots the exchange did not consume. */
+                if (!owner_exchange_mode)
                     tdd_destroy_delta_slots(ctxs, W, nrels);
                 rc = brc;
                 goto done;
