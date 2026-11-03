@@ -542,31 +542,36 @@ test_parity_with_advanced(void)
 /* Large history: the query's auxiliary state does not grow                 */
 /* ======================================================================== */
 
+/* Two copies of every (i % 97, i % 3) pair, then remove one copy. */
+enum { HISTORY_PREFIX_ROWS = 582, HISTORY_REMOVED_ROWS = 291 };
+
 static void
 measure_history(uint32_t rows, int64_t *heap_delta, uint64_t *reserve_delta,
     uint64_t *count_out, unsigned long *alloc_calls)
 {
     wirelog_easy_session_t *s = open_easy(
         ".decl audit(k: int64, v: int64)\n");
-    int64_t *batch = (int64_t *)malloc((size_t)rows * 2 * sizeof(int64_t));
-    if (!batch) {
-        fprintf(stderr, "batch alloc failed\n");
-        exit(2);
-    }
-    /* Insert, step, and remove half of it again, so the history includes
-     * evaluated rows, removals and duplicates. */
-    for (uint32_t i = 0; i < rows; i++) {
+    /* Exercise evaluated duplicates and removals on a bounded prefix.
+     * Removing half of the full history one row at a time repeatedly
+     * compacts it, making fixture setup quadratic under sanitizers. The
+     * measured contract is query memory, not deletion throughput. */
+    CHECK(rows >= HISTORY_PREFIX_ROWS, "history must contain the prefix");
+    for (uint32_t i = 0; i < HISTORY_PREFIX_ROWS; i++) {
         int64_t row[2] = { (int64_t)(i % 97), (int64_t)(i % 3) };
         CHECK(wirelog_easy_insert(s, "audit", row, 2) == WIRELOG_OK, "ins");
-        batch[(size_t)2 * i] = row[0];
-        batch[(size_t)2 * i + 1] = row[1];
     }
     step(s);
-    for (uint32_t i = 0; i < rows / 2; i++)
-        CHECK(wirelog_easy_remove(s, "audit", &batch[(size_t)2 * i], 2)
+    for (uint32_t i = 0; i < HISTORY_REMOVED_ROWS; i++) {
+        int64_t row[2] = { (int64_t)(i % 97), (int64_t)(i % 3) };
+        CHECK(wirelog_easy_remove(s, "audit", row, 2)
             == WIRELOG_OK, "rem");
+    }
     step(s);
-    free(batch);
+    for (uint32_t i = HISTORY_PREFIX_ROWS; i < rows; i++) {
+        int64_t row[2] = { (int64_t)(i % 97), (int64_t)(i % 3) };
+        CHECK(wirelog_easy_insert(s, "audit", row, 2) == WIRELOG_OK, "ins");
+    }
+    step(s);
 
     wl_col_session_t *cs = COL_SESSION(wirelog_easy_testhook_inner(s));
     wl_columnar_memory_governor_t *g
@@ -607,9 +612,9 @@ static uint64_t
 expected_count(uint32_t rows)
 {
     /* Rows i with i % 97 == 5 and i % 3 == 2, inserted for every i and
-     * removed again for i < rows / 2. */
+     * removed again for i < HISTORY_REMOVED_ROWS. */
     uint64_t n = 0;
-    for (uint32_t i = rows / 2; i < rows; i++)
+    for (uint32_t i = HISTORY_REMOVED_ROWS; i < rows; i++)
         if (i % 97 == 5 && i % 3 == 2)
             n++;
     return n;
