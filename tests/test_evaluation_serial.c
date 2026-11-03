@@ -11372,6 +11372,101 @@ test_entry_generated_lftj(void)
 }
 
 static void
+test_entry_generated_lftj_output_policy(void)
+{
+    static const char source[] =
+        ".decl input(x:int64)\n.decl a(x:int64)\n.decl b(x:int64)\n"
+        ".decl output(x:int64)\noutput(x) :- input(x), a(x), b(x).\n";
+    const entry_input_t inputs[] = {
+        {"input", entry_rows, 4, 1}, {"a", entry_rows, 4, 1},
+        {"b", entry_rows, 4, 1}
+    };
+    entry_fixture_t f;
+    entry_init_inputs(&f, source, inputs, 3, 0);
+    bool lftj = false;
+    for (uint32_t i = 0; i < f.relation->op_count; ++i) {
+        lftj |= f.relation->ops[i].op == WL_PLAN_OP_LFTJ;
+        CHECK(f.relation->ops[i].op != WL_PLAN_OP_JOIN);
+    }
+    CHECK(lftj);
+    f.session->join_output_limit = 1;
+    f.session->join_output_peak = 73;
+    entry_complete(&f);
+    CHECK(!f.reply.execution_result && f.reply.committed);
+    const col_rel_t *actual = session_find_rel(f.session, "output");
+    CHECK(actual && actual->nrows == 3 && actual->ncols == 1
+        && actual->column_types[0] == WIRELOG_TYPE_INT64
+        && f.session->join_output_limit == 1
+        && f.session->join_output_peak == 73);
+    for (uint32_t row = 0; row < 3; ++row)
+        CHECK(col_rel_get(actual, row, 0) == (int64_t)row + 1);
+    for (unsigned unlimited = 0; unlimited < 2; ++unlimited) {
+        wl_session_t *base = NULL;
+        CHECK(!wl_session_create(wl_backend_columnar(), f.plan, 1, &base));
+        wl_col_session_t *raw = (wl_col_session_t *)base;
+        raw->join_batch_bytes = 0;
+        raw->join_batch_strict = false;
+        for (unsigned i = 0; i < 3; ++i)
+            CHECK(!wl_session_insert(base, inputs[i].name, inputs[i].rows,
+                inputs[i].count, inputs[i].width));
+        atomic_uint_fast64_t shared;
+        atomic_init(&shared, 19);
+        raw->join_output_limit = 1;
+        raw->join_output_peak = 73;
+        raw->join_output_shared_count = &shared;
+        raw->join_output_shared_limit = unlimited ? 0 : 1;
+        CHECK(!wl_columnar_eval_serial_framed_relation(f.relation, raw,
+            false, NULL));
+        const col_rel_t *expected = session_find_rel(raw, "output");
+        CHECK(expected && expected->nrows == actual->nrows
+            && expected->ncols == actual->ncols
+            && expected->column_types[0] == actual->column_types[0]
+            && !strcmp(expected->col_names[0], actual->col_names[0])
+            && !expected->timestamps && !actual->timestamps
+            && raw->join_output_peak == 73
+            && atomic_load_explicit(&shared, memory_order_acquire) == 19);
+        for (uint32_t row = 0; row < actual->nrows; ++row)
+            CHECK(col_rel_get(expected, row, 0) == col_rel_get(actual, row, 0));
+        wl_session_destroy(base);
+    }
+    entry_destroy(&f);
+
+    /* Shared policy admission is still unsupported by the controlled entry. */
+    entry_init_inputs(&f, source, inputs, 3, 0);
+    atomic_uint_fast64_t shared;
+    atomic_init(&shared, 19);
+    f.session->join_output_shared_count = &shared;
+    f.session->join_output_shared_limit = 1;
+    f.session->join_output_limit = 1;
+    f.session->join_output_peak = 73;
+    col_rel_t *sources[3];
+    col_relation_snapshot_t snapshots[3];
+    for (unsigned i = 0; i < 3; ++i) {
+        sources[i] = session_find_rel(f.session, inputs[i].name);
+        CHECK(sources[i]);
+        snapshots[i] = wl_columnar_relation_snapshot(sources[i]);
+    }
+    uint64_t reserved = wl_columnar_memory_reserved(
+        wl_columnar_memory_governor_ref_get(f.session->memory_governor));
+    entry_complete(&f);
+    CHECK(f.reply.execution_result == ENOTSUP && !f.reply.committed
+        && !session_find_rel(f.session, "output")
+        && f.session->join_output_peak == 73
+        && atomic_load_explicit(&shared, memory_order_acquire) == 19
+        && wl_columnar_memory_reserved(wl_columnar_memory_governor_ref_get(
+            f.session->memory_governor)) == reserved);
+    for (unsigned i = 0; i < 3; ++i) {
+        CHECK(session_find_rel(f.session, inputs[i].name) == sources[i]
+            && wl_columnar_relation_snapshot_equal(snapshots[i],
+            wl_columnar_relation_snapshot(sources[i])));
+        CHECK(sources[i]->nrows == inputs[i].count);
+        for (uint32_t row = 0; row < inputs[i].count; ++row)
+            CHECK(col_rel_get(sources[i], row, 0) == inputs[i].rows[row]);
+    }
+    entry_destroy(&f);
+}
+
+static void
 test_entry_generated_lftj_float_nonleading_duplicate_keys(void)
 {
     static const char source[] =
@@ -14343,6 +14438,7 @@ main(void)
     test_entry_refuses_join_batch_knob();
     test_entry_retained_publication(); test_entry_reverse();
     test_entry_authority(); test_entry_generated_lftj();
+    test_entry_generated_lftj_output_policy();
     test_entry_generated_lftj_float_nonleading_duplicate_keys();
     test_entry_generated_lftj_bounded_source_resolution();
     test_entry_generated_lftj_empty_sources();

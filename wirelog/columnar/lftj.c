@@ -1237,9 +1237,9 @@ wl_columnar_lftj_attempt_sort(wl_columnar_lftj_attempt_t *a)
 static int
 wl_columnar_lftj_attempt_limit_output(wl_columnar_lftj_attempt_t *a)
 {
-    if (a->output_rows >= UINT32_MAX
-        || (a->session->join_output_limit
-        && a->output_rows >= a->session->join_output_limit))
+    /* Like raw LFTJ, this route ignores ordinary JOIN output-policy caps.
+     * The destination row-count representation still imposes its own limit. */
+    if (a->output_rows >= UINT32_MAX)
         return EOVERFLOW;
     ++a->output_rows;
     return 0;
