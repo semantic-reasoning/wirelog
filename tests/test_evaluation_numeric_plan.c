@@ -9790,9 +9790,7 @@ metadata_shape_add(metadata_fixture_t *m, bool result_slot)
     if (result_slot) {
         eval_entry_t *slot = wl_columnar_eval_stack_cleanup_result(f->frame);
         CHECK(slot && !slot->rel);
-        eval_entry_t borrowed = eval_stack_pop(stack);
-        *slot = borrowed;
-        memset(&borrowed, 0, sizeof(borrowed));
+        *slot = eval_stack_pop(stack);
     }
 }
 

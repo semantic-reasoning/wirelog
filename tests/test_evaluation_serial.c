@@ -11,6 +11,7 @@
 #include <errno.h>
 #include <math.h>
 #include <signal.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -1647,29 +1648,66 @@ entry_compare(entry_fixture_t *f, const char *source, const int64_t *rows,
     entry_compare_inputs(f, source, &input, 1);
 }
 
+static bool
+program_append(char *buffer, size_t capacity, size_t *used,
+    const char *format, ...)
+{
+    if (*used >= capacity) return false;
+    size_t remaining = capacity - *used;
+    va_list args;
+    va_start(args, format);
+    int written = vsnprintf(buffer + *used, remaining, format, args);
+    va_end(args);
+    if (written < 0 || (size_t)written >= remaining) return false;
+    *used += (size_t)written;
+    return true;
+}
+
+static void
+test_program_append_bounds(void)
+{
+    struct { char before; char text[4]; char after; } buffer = {'L', {0}, 'R'};
+    size_t used = 0;
+    CHECK(program_append(buffer.text, sizeof(buffer.text), &used, "%s", "")
+        && !used && !buffer.text[0]);
+    CHECK(program_append(buffer.text, sizeof(buffer.text), &used, "%s", "abc")
+        && used == 3 && !strcmp(buffer.text, "abc"));
+    CHECK(!program_append(buffer.text, sizeof(buffer.text), &used, "%s", "x")
+        && used == 3);
+    used = 0;
+    CHECK(!program_append(buffer.text, sizeof(buffer.text), &used, "%s", "abcd")
+        && !used && buffer.before == 'L' && buffer.after == 'R');
+    used = sizeof(buffer.text);
+    CHECK(!program_append(buffer.text, sizeof(buffer.text), &used, "%s", "x")
+        && used == sizeof(buffer.text));
+    used = 0;
+    CHECK(!program_append(buffer.text, 0, &used, "%s", "x") && !used);
+    used = SIZE_MAX;
+    CHECK(!program_append(buffer.text, sizeof(buffer.text), &used, "%s", "x")
+        && used == SIZE_MAX && buffer.before == 'L' && buffer.after == 'R');
+}
+
 static char *
 entry_program(unsigned width, bool floating)
 {
     char *source = calloc(1, 32768); CHECK(source);
     size_t offset = 0;
     for (unsigned declaration = 0; declaration < 2; ++declaration) {
-        offset += snprintf(source + offset, 32768 - offset, ".decl %s(",
-                declaration ? "output" : "input");
+        CHECK(program_append(source, 32768, &offset, ".decl %s(",
+            declaration ? "output" : "input"));
         for (unsigned c = 0; c < width; ++c)
-            offset += snprintf(source + offset, 32768 - offset,
-                    "%sc%u:%s", c ? "," : "", c,
-                    floating ? "float" : "int64");
-        offset += snprintf(source + offset, 32768 - offset, ")\n");
+            CHECK(program_append(source, 32768, &offset, "%sc%u:%s",
+                c ? "," : "", c,
+                floating ? "float" : "int64"));
+        CHECK(program_append(source, 32768, &offset, ")\n"));
     }
-    offset += snprintf(source + offset, 32768 - offset, "output(");
+    CHECK(program_append(source, 32768, &offset, "output("));
     for (unsigned c = 0; c < width; ++c)
-        offset += snprintf(source + offset, 32768 - offset,
-                "%sx%u", c ? "," : "", c);
-    offset += snprintf(source + offset, 32768 - offset, ") :- input(");
+        CHECK(program_append(source, 32768, &offset, "%sx%u", c ? "," : "", c));
+    CHECK(program_append(source, 32768, &offset, ") :- input("));
     for (unsigned c = 0; c < width; ++c)
-        offset += snprintf(source + offset, 32768 - offset,
-                "%sx%u", c ? "," : "", c);
-    offset += snprintf(source + offset, 32768 - offset, ").\n");
+        CHECK(program_append(source, 32768, &offset, "%sx%u", c ? "," : "", c));
+    CHECK(program_append(source, 32768, &offset, ").\n"));
     CHECK(offset < 32768); return source;
 }
 
@@ -5470,25 +5508,25 @@ observed_wide_program(unsigned width, bool floating, const char *head)
     size_t offset = 0;
     const char *names[] = {"input", head, "mirror", "other", "independent"};
     for (unsigned d = 0; d < 5; ++d) {
-        offset += snprintf(source + offset, 65536 - offset, ".decl %s(",
-                names[d]);
+        CHECK(program_append(source, 65536, &offset, ".decl %s(",
+            names[d]));
         for (unsigned c = 0; c < width; ++c)
-            offset += snprintf(source + offset, 65536 - offset, "%sc%u:%s",
-                    c ? "," : "", c, floating ? "float" : "int64");
-        offset += snprintf(source + offset, 65536 - offset, ")\n");
+            CHECK(program_append(source, 65536, &offset, "%sc%u:%s",
+                c ? "," : "", c, floating ? "float" : "int64"));
+        CHECK(program_append(source, 65536, &offset, ")\n"));
     }
     for (unsigned rule = 0; rule < 3; ++rule) {
         unsigned d = rule == 2 ? 4 : rule + 1;
-        offset += snprintf(source + offset, 65536 - offset, "%s(", names[d]);
+        CHECK(program_append(source, 65536, &offset, "%s(", names[d]));
         for (unsigned c = 0; c < width; ++c)
-            offset += snprintf(source + offset, 65536 - offset, "%sx%u",
-                    c ? "," : "", c);
-        offset += snprintf(source + offset, 65536 - offset, ") :- %s(",
-                names[d - 1]);
+            CHECK(program_append(source, 65536, &offset, "%sx%u",
+                c ? "," : "", c));
+        CHECK(program_append(source, 65536, &offset, ") :- %s(",
+            names[d - 1]));
         for (unsigned c = 0; c < width; ++c)
-            offset += snprintf(source + offset, 65536 - offset, "%sx%u",
-                    c ? "," : "", c);
-        offset += snprintf(source + offset, 65536 - offset, ").\n");
+            CHECK(program_append(source, 65536, &offset, "%sx%u",
+                c ? "," : "", c));
+        CHECK(program_append(source, 65536, &offset, ").\n"));
     }
     CHECK(offset < 65536);
     return source;
@@ -14351,6 +14389,7 @@ test_framed_actual_prepared_exclusion(void)
 int
 main(void)
 {
+    test_program_append_bounds();
     /* Issue #2262: session.c reads WIRELOG_JOIN_BATCH_BYTES and _STRICT when
      * a session is created, and controlled STEP refuses strict mode and the
      * batch-configured shapes other than the one in SEMANTICS.md (#1821).
