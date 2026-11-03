@@ -1929,3 +1929,41 @@ The existing outer generation guard and public continuation rules require that
 separate mandatory destination and genuine public leak-free tests before grouped
 readiness. Consumer accounting, policy/cap/cache/shared and general transaction
 acceptance remain open.
+
+### Repeated native integer CRC source accounting (#2297, #2298)
+
+The caller-attempt evaluator now uses two immutable 256-entry byte tables
+(2048 bytes of static data) for Ethernet and Castagnoli CRC. It keeps native
+int64 byte order, zero-extended uint32 results, the existing positive fees and
+all saved-attempt-ID checkpoints. The raw CRC implementations are unchanged.
+
+Each CRC instruction admits FETCH64, STEP224 and its own 16+8+8*17+8 lane,
+for456 units. Complete expanded CRC success source is bounded by390, or411
+including the next first-refused admission. A disjoint allocation uses
+FETCH64, CRC168 and STEP158, with21 further STEP units reserved for that
+refusal; STEP therefore needs at most179 of its224. No compiler, ENTRY,
+FINAL, prior instruction or containing host credit finances this bound.
+Each repeated instruction has fresh payments; unused source slack is not
+accumulated. The maximum expanded forward interval is76, below224/256.
+These are conservative source bounds under the existing logical metric,
+including engine hook fronts, rather than measured CPU costs or new fees.
+
+`test_evaluation_numeric_operators` compiles actual immutable programs under
+separate setup attempts and evaluates1,2,17 and65 repeated unary CRCs, both
+variants and alternating variants. Independent raw CRC calls on copied native
+bytes supply the result oracle, including zero, all-one, signed extrema and
+alternating-bit operands. Exact evaluation budgets are1056+456*N for the
+three ordinary instructions plus CRC chain; one-short refusal leaves outputs
+untouched. Every byte of first/interior/last CRC has genuine positive-budget
+boundary, cancellation, sticky work-limit and finish/reset/successor tests.
+A successor receives no old-attempt charge; real reset/rebegin can reuse the
+same immutable program without leaking cancellation.
+
+Containing FILTER and MAP fixtures witness CRC byte checkpoints during actual
+START, before the host adapter returns. Three-row successes match raw values
+and metadata. Every byte in the first/interior/last CRC also reaches genuine
+cancellation/work exhaustion before publication, with the original stack entry
+preserved. Full ACK/report/frame destruction drains source/program credit and
+independent host funding; fresh source/frame/control retries then succeed.
+This closes the CRC lane only; remaining consumer, automatic lifecycle and
+policy/cap obligations retain their separate coverage requirements.

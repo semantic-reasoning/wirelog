@@ -4,6 +4,7 @@
  * per-dispatch contract. */
 #include "../wirelog/columnar/internal.h"
 #include "../wirelog/exec_plan_gen.h"
+#include "../wirelog/crc32.h"
 #include "../wirelog/wirelog.h"
 #include "../wirelog/thread.h"
 #include <errno.h>
@@ -979,6 +980,271 @@ wl_columnar_filter_test_constant(wl_columnar_filter_test_program_t *program,
     CHECK(program->size + sizeof(value) <= sizeof(program->bytes));
     memcpy(program->bytes + program->size, &value, sizeof(value));
     program->size += sizeof(value);
+}
+
+/* Real compiled unary chains use a separate setup attempt. Each CRC owns
+ * FETCH64+STEP224+16+8+8*17+8=456; three ordinary ops and ENTRY/FINAL
+ * cost1056. Repetition cannot borrow a compilation or finalization budget. */
+typedef struct {
+    wl_evaluation_control_t *control;
+    const void *owner;
+    unsigned mode, stop_crc, stop_byte, crcs, bytes, phase24, steps, finals;
+    bool stopped, historical_available;
+    wl_evaluation_control_report_t historical;
+} crc_test_observer_t;
+static crc_test_observer_t crc_test_observer;
+
+static void
+crc_test_checkpoint(wl_evaluation_control_t *control, unsigned phase,
+    uint64_t progress, bool failed)
+{
+    crc_test_observer_t *observer = &crc_test_observer;
+    if (control != observer->control) return;
+    CHECK(!observer->stopped && !failed);
+    if (phase == 24) {
+        unsigned part = observer->phase24++ % 3;
+        CHECK(progress == (part == 2 ? 1u : 0u));
+        if (part == 0) ++observer->crcs;
+    } else if (phase == 20) ++observer->steps;
+    else if (phase == 22) ++observer->finals;
+    else if (phase == 25) {
+        CHECK(progress == observer->bytes % 8 + 1);
+        ++observer->bytes;
+        if (!observer->mode || observer->crcs != observer->stop_crc + 1
+            || progress != observer->stop_byte) return;
+        observer->stopped = true;
+        if (observer->mode == 1 || observer->mode == 7) {
+            wl_evaluation_control_request_cancel(control);
+            if (observer->mode == 7)
+                CHECK(wl_evaluation_control_charge(control, UINT64_MAX) ==
+                    WL_EVALUATION_CONTROL_CANCELLED);
+        } else if (observer->mode == 2 || observer->mode == 6) {
+            CHECK(wl_evaluation_control_charge(control, UINT64_MAX) ==
+                WL_EVALUATION_CONTROL_WORK_LIMIT);
+            if (observer->mode == 6)
+                wl_evaluation_control_request_cancel(control);
+        } else {
+            CHECK(wl_evaluation_control_finish(control, observer->owner, 0,
+                0) == 0);
+            CHECK(wl_evaluation_control_report(control,
+                &observer->historical) == 0);
+            observer->historical_available = true;
+            if (observer->mode >= 4)
+                CHECK(wl_evaluation_control_reset(control) == 0);
+            if (observer->mode == 5)
+                CHECK(wl_evaluation_control_begin(control,
+                    observer->owner) == 0);
+        }
+    }
+}
+
+static int64_t
+crc_test_expected(int64_t operand, unsigned count, unsigned variant)
+{
+    for (unsigned k = 0; k < count; ++k) {
+        uint8_t native[sizeof(operand)];
+        memcpy(native, &operand, sizeof(native));
+        operand = variant == 0 || (variant == 2 && !(k % 2))
+            ? ethernet_crc32(native, sizeof(native))
+            : castagnoli_crc32(native, sizeof(native));
+    }
+    return operand;
+}
+
+static wl_columnar_expr_attempt_numeric_t *
+crc_test_compile(int64_t operand, unsigned count, unsigned variant)
+{
+    wl_columnar_filter_test_program_t bytecode = {0};
+    wl_columnar_filter_test_constant(&bytecode, WL_PLAN_EXPR_CONST_INT,
+        operand);
+    for (unsigned k = 0; k < count; ++k)
+        wl_columnar_filter_test_opcode(&bytecode,
+            variant == 0 || (variant == 2 && !(k % 2))
+            ? WL_PLAN_EXPR_ARITH_CRC32_ETH : WL_PLAN_EXPR_ARITH_CRC32_CAST);
+    wl_columnar_filter_test_constant(&bytecode, WL_PLAN_EXPR_CONST_INT, 0);
+    wl_columnar_filter_test_opcode(&bytecode, WL_PLAN_EXPR_ARITH_ADD);
+    int owner = 0;
+    wl_evaluation_control_t *setup = wl_columnar_filter_test_control(0, &owner);
+    uint64_t id = wl_evaluation_control_active_attempt_id(setup);
+    wl_columnar_expr_attempt_numeric_t *program = NULL;
+    bool supported = false;
+    CHECK(wl_columnar_expr_compile_attempt_controlled(bytecode.bytes,
+        bytecode.size, NULL, &program, &supported, setup, id) == 0);
+    CHECK(supported && program);
+    CHECK(wl_evaluation_control_finish(setup, &owner, 0, 0) == 0);
+    CHECK(wl_evaluation_control_detach(setup, &owner) == 0);
+    wl_evaluation_control_release(setup);
+    return program;
+}
+
+static void
+crc_test_case(int64_t operand, unsigned count, unsigned variant,
+    unsigned mode, unsigned stop_crc, unsigned stop_byte, bool short_limit)
+{
+    wl_columnar_expr_attempt_numeric_t *program =
+        crc_test_compile(operand, count, variant);
+    uint64_t exact = 1056 + 456u * count;
+    uint64_t limit = mode ? UINT64_MAX - 1 : exact - short_limit;
+    int owner = 0;
+    wl_evaluation_control_t *control = wl_columnar_filter_test_control(limit,
+            &owner);
+    uint64_t id = wl_evaluation_control_active_attempt_id(control);
+    crc_test_observer = (crc_test_observer_t){.control = control,
+                                              .owner = &owner, .mode = mode,
+                                              .stop_crc = stop_crc,
+                                              .stop_byte = stop_byte};
+    wl_columnar_expr_test_checkpoint = crc_test_checkpoint;
+    int64_t value = INT64_MIN;
+    bool failed = true;
+    int rc = wl_columnar_expr_eval_attempt_controlled(program, NULL, 0,
+            &value, &failed, control, id);
+    wl_columnar_expr_test_checkpoint = NULL;
+    int expected = !mode ? (short_limit ? WL_EVALUATION_CONTROL_WORK_LIMIT : 0)
+        : mode == 1 || mode == 7 ? WL_EVALUATION_CONTROL_CANCELLED
+        : mode == 2 || mode == 6 ? WL_EVALUATION_CONTROL_WORK_LIMIT : EINVAL;
+    CHECK(rc == expected);
+    if (rc) CHECK(value == INT64_MIN && failed);
+    else CHECK(!failed && value == crc_test_expected(operand, count, variant));
+    crc_test_observer_t *observer = &crc_test_observer;
+    uint64_t consumed;
+    if (mode) {
+        CHECK(observer->stopped && observer->crcs == stop_crc + 1 &&
+            observer->bytes == stop_crc * 8 + stop_byte && !observer->finals);
+        consumed = 696 + 456u * stop_crc + 17u * stop_byte;
+    } else {
+        CHECK(observer->crcs == count && observer->bytes == count * 8 &&
+            observer->phase24 == count * 3 && observer->steps == count + 3 &&
+            observer->finals == !short_limit);
+        consumed = exact - (short_limit ? 96 : 0);
+    }
+    wl_evaluation_control_report_t report;
+    if (observer->historical_available) {
+        CHECK(observer->historical.attempt_id == id &&
+            observer->historical.consumed == consumed &&
+            observer->historical.result == 0);
+        CHECK(wl_evaluation_control_report(control, &report) == 0);
+        CHECK(report.attempt_id == id && report.consumed == consumed);
+        if (mode == 5) {
+            uint64_t successor =
+                wl_evaluation_control_active_attempt_id(control);
+            CHECK(successor && successor != id);
+            CHECK(wl_evaluation_control_finish(control, &owner, 0, 0) == 0);
+            CHECK(wl_evaluation_control_report(control, &report) == 0);
+            CHECK(report.attempt_id == successor && report.consumed == 0);
+        } else CHECK(!wl_evaluation_control_active_attempt_id(control));
+    } else {
+        CHECK(wl_evaluation_control_finish(control, &owner, 0, 0) == expected);
+        CHECK(wl_evaluation_control_report(control, &report) == 0);
+        CHECK(report.attempt_id == id && report.consumed == consumed);
+    }
+    /* Same immutable owner after real finish/reset; no stopped generation
+     * or cancellation leaks into a new actual attempt. */
+    CHECK(wl_evaluation_control_reset(control) == 0);
+    CHECK(wl_evaluation_control_begin(control, &owner) == 0);
+    uint64_t retry = wl_evaluation_control_active_attempt_id(control);
+    CHECK(retry && retry != id);
+    value = INT64_MIN; failed = true;
+    CHECK(wl_columnar_expr_eval_attempt_controlled(program, NULL, 0,
+        &value, &failed, control, retry) == (short_limit ?
+        WL_EVALUATION_CONTROL_WORK_LIMIT : 0));
+    if (!short_limit)
+        CHECK(!failed && value == crc_test_expected(operand, count, variant));
+    CHECK(wl_evaluation_control_finish(control, &owner, 0, 0) ==
+        (short_limit ? WL_EVALUATION_CONTROL_WORK_LIMIT : 0));
+    CHECK(wl_evaluation_control_detach(control, &owner) == 0);
+    wl_evaluation_control_release(control);
+    wl_columnar_expr_attempt_numeric_free(program);
+}
+
+static void
+crc_test_matrix(void)
+{
+    CHECK(crc_test_expected(0, 1, 0) == INT64_C(0x6522df69));
+    CHECK(crc_test_expected(0, 1, 1) == INT64_C(0x8c28b28a));
+    const int64_t operands[] = {0, -1, INT64_MIN, INT64_MAX,
+                                INT64_C(0x5555555555555555), -42};
+    const unsigned counts[] = {1, 2, 17, 65};
+    for (unsigned variant = 0; variant < 3; ++variant)
+        for (unsigned n = 0; n < 4; ++n)
+            for (unsigned operand = 0; operand < 6; ++operand) {
+                crc_test_case(operands[operand], counts[n], variant,
+                    0, 0, 0, false);
+                crc_test_case(operands[operand], counts[n], variant,
+                    0, 0, 0, true);
+            }
+    const unsigned positions[] = {0, 8, 16};
+    for (unsigned variant = 0; variant < 2; ++variant)
+        for (unsigned position = 0; position < 3; ++position)
+            for (unsigned byte = 1; byte <= 8; ++byte)
+                for (unsigned mode = 1; mode <= 7; ++mode)
+                    crc_test_case(-42, 17, variant, mode,
+                        positions[position], byte, false);
+}
+
+/* Every byte's genuine positive admission: exact prefix reaches that byte;
+ * one less refuses it before its checkpoint, without completing an output. */
+static void
+crc_test_byte_limits(void)
+{
+    for (unsigned variant = 0; variant < 2; ++variant) {
+        wl_columnar_expr_attempt_numeric_t *program = crc_test_compile(-42,
+                17, variant);
+        const unsigned positions[] = {0, 8, 16};
+        for (unsigned p = 0; p < 3; ++p)
+            for (unsigned byte = 1; byte <= 8; ++byte)
+                for (unsigned short_limit = 0; short_limit < 2; ++short_limit) {
+                    uint64_t prefix = 696 + 456u * positions[p] + 17u * byte;
+                    int owner = 0;
+                    wl_evaluation_control_t *control =
+                        wl_columnar_filter_test_control(prefix - short_limit,
+                            &owner);
+                    uint64_t id =
+                        wl_evaluation_control_active_attempt_id(control);
+                    crc_test_observer =
+                        (crc_test_observer_t){.control = control};
+                    wl_columnar_expr_test_checkpoint = crc_test_checkpoint;
+                    int64_t value = INT64_MIN;
+                    bool failed = true;
+                    CHECK(wl_columnar_expr_eval_attempt_controlled(program,
+                        NULL, 0, &value, &failed, control, id) ==
+                        WL_EVALUATION_CONTROL_WORK_LIMIT);
+                    wl_columnar_expr_test_checkpoint = NULL;
+                    CHECK(value == INT64_MIN && failed);
+                    CHECK(crc_test_observer.bytes == positions[p] * 8 + byte -
+                        short_limit && !crc_test_observer.finals);
+                    CHECK(wl_evaluation_control_finish(control, &owner, 0,
+                        0) == WL_EVALUATION_CONTROL_WORK_LIMIT);
+                    wl_evaluation_control_report_t report;
+                    CHECK(wl_evaluation_control_report(control, &report) == 0);
+                    CHECK(report.consumed == prefix - 17u * short_limit);
+                    CHECK(wl_evaluation_control_detach(control, &owner) == 0);
+                    wl_evaluation_control_release(control);
+                }
+        for (unsigned cancel = 0; cancel < 2; ++cancel) {
+            int owner = 0;
+            wl_evaluation_control_t *control = wl_columnar_filter_test_control(
+                UINT64_MAX - 1, &owner);
+            uint64_t id = wl_evaluation_control_active_attempt_id(control);
+            if (cancel) wl_evaluation_control_request_cancel(control);
+            else CHECK(wl_evaluation_control_charge(control, UINT64_MAX) ==
+                    WL_EVALUATION_CONTROL_WORK_LIMIT);
+            int expected = cancel ? WL_EVALUATION_CONTROL_CANCELLED
+                : WL_EVALUATION_CONTROL_WORK_LIMIT;
+            crc_test_observer = (crc_test_observer_t){.control = control};
+            wl_columnar_expr_test_checkpoint = crc_test_checkpoint;
+            int64_t value = INT64_MIN;
+            bool failed = true;
+            CHECK(wl_columnar_expr_eval_attempt_controlled(program, NULL, 0,
+                &value, &failed, control, id) == expected);
+            wl_columnar_expr_test_checkpoint = NULL;
+            CHECK(value == INT64_MIN && failed && !crc_test_observer.crcs);
+            CHECK(wl_evaluation_control_finish(control, &owner, 0,
+                0) == expected);
+            CHECK(wl_evaluation_control_detach(control, &owner) == 0);
+            wl_evaluation_control_release(control);
+        }
+        wl_columnar_expr_attempt_numeric_free(program);
+    }
 }
 
 static void
@@ -2772,6 +3038,127 @@ wl_columnar_filter_test_map_case(uint32_t width, uint32_t rows,
     CHECK(report.result == expected);
     free(scenario); free(indices); free(expressions); free(programs);
     return report;
+}
+
+static wl_columnar_filter_test_scenario_t *crc_test_host;
+static unsigned crc_test_host_bytes, crc_test_host_stop, crc_test_host_mode;
+static bool crc_test_host_stopped;
+
+static void
+crc_test_host_checkpoint(wl_evaluation_control_t *control, unsigned phase,
+    uint64_t progress, bool failed)
+{
+    if (!crc_test_host || control != crc_test_host->target || phase != 25)
+        return;
+    CHECK(!failed && !crc_test_host_stopped);
+    /* CRC executes synchronously inside real START, before the adapter has
+     * returned and marked started; an imaginary RUNNING retry is not used. */
+    CHECK(!crc_test_host->filter.started);
+    wl_columnar_filter_context_t *ctx = NULL;
+    CHECK(wl_columnar_eval_stack_filter_context(crc_test_host->filter.frame,
+        &ctx) == 0);
+    CHECK(ctx->stage == WL_COLUMNAR_FILTER_STAGE_RUNNING);
+    CHECK(progress == crc_test_host_bytes % 8 + 1);
+    ++crc_test_host_bytes;
+    if (!crc_test_host_stop ||
+        crc_test_host_bytes != crc_test_host_stop) return;
+    crc_test_host_stopped = true;
+    if (crc_test_host_mode == 1) wl_evaluation_control_request_cancel(control);
+    else CHECK(wl_evaluation_control_charge(control, UINT64_MAX) ==
+            WL_EVALUATION_CONTROL_WORK_LIMIT);
+}
+
+static void
+crc_test_host_case(bool map, unsigned variant, unsigned stop, unsigned mode)
+{
+    wl_columnar_filter_test_program_t bytecode = {0};
+    wl_columnar_filter_test_constant(&bytecode, WL_PLAN_EXPR_CONST_INT, -42);
+    for (unsigned k = 0; k < 17; ++k)
+        wl_columnar_filter_test_opcode(&bytecode, variant
+            ? WL_PLAN_EXPR_ARITH_CRC32_CAST : WL_PLAN_EXPR_ARITH_CRC32_ETH);
+    wl_columnar_filter_test_constant(&bytecode, WL_PLAN_EXPR_CONST_INT, 0);
+    wl_columnar_filter_test_opcode(&bytecode, WL_PLAN_EXPR_ARITH_ADD);
+    wl_plan_expr_buffer_t expression = {.data = bytecode.bytes,
+                                        .size = bytecode.size};
+    uint32_t index = 0;
+    wl_plan_op_t op = {.op = WL_PLAN_OP_MAP, .project_count = 1,
+                       .project_indices = &index, .map_exprs = &expression,
+                       .map_expr_count = 1};
+    wl_columnar_filter_test_scenario_t *scenario = calloc(1, sizeof(*scenario));
+    CHECK(scenario);
+    if (map) wl_columnar_filter_test_map_prepare(scenario, 1, 3, false, true,
+            &op, UINT64_MAX - 1);
+    else wl_columnar_filter_test_prepare(scenario,
+            wl_columnar_filter_test_source(1, 3, false, true, false), true,
+            &bytecode, UINT64_MAX - 1, false);
+    eval_stack_t *stack =
+        wl_columnar_eval_stack_cleanup_stack(scenario->filter.frame);
+    eval_entry_t original = stack->items[0];
+    crc_test_host = scenario;
+    crc_test_host_bytes = 0; crc_test_host_stop = stop;
+    crc_test_host_mode = mode;
+    crc_test_host_stopped = false;
+    wl_columnar_expr_test_checkpoint = crc_test_host_checkpoint;
+    if (map) wl_columnar_filter_test_map_run(scenario);
+    else wl_columnar_filter_test_run(scenario);
+    wl_columnar_expr_test_checkpoint = NULL;
+    crc_test_host = NULL;
+    int expected = !stop ? 0 : mode == 1 ? WL_EVALUATION_CONTROL_CANCELLED
+        : WL_EVALUATION_CONTROL_WORK_LIMIT;
+    CHECK(scenario->filter.done && !scenario->filter.parked &&
+        scenario->filter.status.execution_result == expected);
+    CHECK(crc_test_host_bytes == (stop ? stop : 3u * 17u * 8u));
+    if (stop) {
+        CHECK(crc_test_host_stopped && !scenario->filter.status.committed);
+        wl_columnar_filter_test_map_original(scenario, &original);
+    } else {
+        CHECK(scenario->filter.status.committed && scenario->reset_turns == 1);
+        wl_col_session_t *raw = wl_columnar_filter_test_session();
+        eval_stack_t raw_stack = {0};
+        CHECK(eval_stack_push(&raw_stack,
+            wl_columnar_filter_test_source(1, 3, false, true, false),
+            true) == 0);
+        if (map) CHECK(col_op_map(&op, &raw_stack, raw) == 0);
+        else {
+            wl_plan_op_t filter = {.op = WL_PLAN_OP_FILTER,
+                                   .filter_expr = expression};
+            CHECK(wl_columnar_filter_op(&filter, &raw_stack, raw) == 0);
+        }
+        CHECK(stack->top == 1 && raw_stack.top == 1);
+        wl_columnar_filter_test_equal(stack->items[0].rel,
+            raw_stack.items[0].rel);
+        CHECK(stack->items[0].rel->nrows == 3);
+        if (map)
+            for (unsigned r = 0; r < 3; ++r)
+                CHECK(stack->items[0].rel->columns[0][r] ==
+                    crc_test_expected(-42, 17, variant));
+        CHECK(eval_stack_dispose_entry(&raw_stack, &raw_stack.items[0]) == 0);
+        CHECK(!wl_columnar_filter_test_reserved(raw));
+        wl_columnar_memory_governor_ref_release(raw->memory_governor);
+        free(raw);
+    }
+    wl_evaluation_control_report_t report =
+        wl_columnar_filter_test_complete(scenario);
+    CHECK(report.result == expected);
+    free(scenario);
+}
+
+static void
+crc_test_hosts(void)
+{
+    const unsigned positions[] = {0, 8, 16};
+    for (unsigned map = 0; map < 2; ++map)
+        for (unsigned variant = 0; variant < 2; ++variant) {
+            crc_test_host_case(map != 0, variant, 0, 0);
+            for (unsigned p = 0; p < 3; ++p)
+                for (unsigned byte = 1; byte <= 8; ++byte)
+                    for (unsigned mode = 1; mode <= 2; ++mode)
+                        crc_test_host_case(map != 0, variant,
+                            positions[p] * 8 + byte, mode);
+            /* Fresh actual source/frame/control after complete failed ACK
+            * and resource recovery, with the same semantic raw oracle. */
+            crc_test_host_case(map != 0, variant, 0, 0);
+        }
 }
 
 static void
@@ -6269,6 +6656,9 @@ concat_inert_ack_funding(void)
 int
 main(void)
 {
+    crc_test_matrix();
+    crc_test_byte_limits();
+    crc_test_hosts();
     concat_inert_ack_funding();
     concat_raw_single_marker(); concat_authority_and_reserve_stop();
     concat_quota_retry(); concat_nested_host_funding();
