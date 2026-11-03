@@ -5782,6 +5782,40 @@ pre-JOIN prefixes, reader/key state, distinct groups and final output remain
 independent governed floors. Dedicated default/unit/TSan budget registrations
 run serially outside the duplicated regular/environment tests.
 
+## Automatic ordinary JOIN receipt storage
+
+The framed serial driver allocates its logical cleanup frame as the first
+member of a private allocation that also owns automatic JOIN receipt storage.
+The receipt remains at its final address outside the logical frame and numeric
+child extents. The installed API and the manual prepared receipt layout do not
+change. Governor admission, reserved-byte accounting, zeroing and physical
+release use the complete allocation size. Logical-frame geometry and allocation
+size are separate internal test observations.
+
+On the native LP64 test build the logical frame is 11,440 bytes, the private
+tail is 464 bytes and the allocation is 11,904 bytes; the prepared receipt is
+392 bytes. These are observations, not cross-platform constants. Original
+frame construction still charges 224 per actual 16-byte zeroing chunk, with
+the existing constructor tariffs. Two native identity anchors are installed
+inside the existing EXTERNAL admission, without another registration fee.
+
+An automatic lease holds an additional reference to the actual launch grant.
+The session retains its own completed grant and pending result while distinct
+maintenance grants perform preparation, drain, FINISH and ACK. Marker ACK alone
+does not release the launch grant: successful checked parent consumption releases
+the native reference, followed by the session's reference. A refused consume
+retains both owners. Physical frame release refuses a held launch or busy native
+adapter. Request and reply output geometry protects the complete known allocation
+even while its receipt is dormant.
+
+After native selection, copied keys exclude that frame's complete allocation
+through ACK and FINISH, including while a lawful nested frame parks the owner.
+Binding getters validate the supplied numeric owner before normalizing their
+output, so a parked-owner refusal leaves its dormant receipt untouched. The
+pre-native constructor may still initialize its embedded cleanup key. Session-only
+receipt reads protect the current active allocation; they do not derive an
+arbitrary parked allocation from a receipt key.
+
 ## Host source inspection memory (#2321)
 
 Source inspection reads the resident source rows that inserts already store

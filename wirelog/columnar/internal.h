@@ -3539,6 +3539,7 @@ extern void (*wl_columnar_eval_stack_test_checkpoint)(
 extern int wl_columnar_eval_stack_test_fail_allocation;
 /* Physical layout only, never an observed work total. */
 size_t wl_columnar_eval_stack_test_frame_size(void);
+size_t wl_columnar_eval_stack_test_allocation_size(void);
 void wl_columnar_eval_stack_test_receipt_next_session_generation(uint64_t);
 #endif
 /* Persistent unary replacement, opt-in only. Begin binds nonNULL control and
@@ -8326,6 +8327,16 @@ int wl_columnar_eval_stack_framed_writable(
 #ifdef WL_SESSION_TEST_HOOKS
 extern void (*wl_columnar_eval_stack_test_unary_prepared_checkpoint)(
     wl_columnar_eval_stack_unary_prepared_t *);
+typedef struct {
+    const void *receipt, *launch;
+    uint64_t launch_id;
+    unsigned phase, receipt_phase, parent_phase, numeric_phase, cursor;
+    int launch_protocol, first_result;
+    bool busy, committed, finish, abort_requested;
+} wl_columnar_eval_stack_test_auto_observation_t;
+int wl_columnar_eval_stack_test_auto_observe(
+    const wl_columnar_eval_stack_cleanup_frame_t *, const wl_col_session_t *,
+    wl_columnar_eval_stack_test_auto_observation_t *);
 /* Test-only copied observation; addresses are comparison tokens, never loans. */
 typedef struct {
     const void *relation, *segments, *continuation;
@@ -8372,6 +8383,9 @@ typedef enum {
     WL_COLUMNAR_EVAL_SERIAL_FRAMED_REPLY_MORE,
     WL_COLUMNAR_EVAL_SERIAL_FRAMED_REPLY_BOOTSTRAP_RECEIPT,
     WL_COLUMNAR_EVAL_SERIAL_FRAMED_REPLY_STATUS,
+    /* Native maintenance: preserve the completed launch tuple through ACK
+     * and the following successful checked parent consumption. */
+    WL_COLUMNAR_EVAL_SERIAL_FRAMED_REPLY_PREPARED_MORE,
     WL_COLUMNAR_EVAL_SERIAL_FRAMED_REPLY_TERMINAL,
     WL_COLUMNAR_EVAL_SERIAL_FRAMED_REPLY_TERMINAL_CLEANUP_PENDING
 } wl_columnar_eval_serial_framed_host_reply_kind_t;
@@ -8428,6 +8442,26 @@ struct wl_columnar_eval_serial_framed_host_request {
     uint64_t previous_funding_id;
     wl_columnar_eval_serial_framed_host_reply_t *reply;
 };
+
+/* Actual framed owner only. These adapters never lend a mutable receipt. */
+int wl_columnar_eval_stack_auto_select(
+    wl_columnar_eval_serial_framed_attempt_t *, wl_evaluation_control_t *,
+    uint64_t, bool *);
+int wl_columnar_eval_stack_auto_maintain(
+    wl_columnar_eval_stack_cleanup_frame_t *, wl_col_session_t *,
+    const wl_columnar_eval_serial_framed_host_request_t *);
+bool wl_columnar_eval_stack_auto_present(
+    const wl_columnar_eval_stack_cleanup_frame_t *);
+int wl_columnar_eval_stack_auto_close_ready(
+    wl_columnar_eval_serial_framed_attempt_t *, wl_evaluation_control_t *,
+    uint64_t);
+int wl_columnar_eval_stack_auto_consume(
+    wl_columnar_eval_serial_framed_attempt_t *, wl_evaluation_control_t *,
+    uint64_t, bool, bool *);
+bool wl_columnar_eval_stack_auto_error_drain(
+    const wl_columnar_eval_serial_framed_attempt_t *);
+bool wl_columnar_eval_stack_host_geometry(const wl_col_session_t *,
+    const wl_columnar_eval_serial_framed_host_request_t *);
 
 /* Serialized caller keeps session/control handles live. Copied outputs must
  * be external to the whole frame and disjoint from each other. Status keeps
@@ -8541,6 +8575,7 @@ extern int wl_columnar_session_test_fail_framed_funding_after_stop;
 extern uint64_t (*wl_columnar_session_test_framed_grant_limit)(
     const wl_col_session_t *, wl_columnar_eval_serial_framed_host_action_t,
     uint64_t);
+int wl_columnar_session_test_host_abort(wl_col_session_t *);
 extern void (*wl_columnar_session_test_framed_grant_finished)(
     const wl_col_session_t *, wl_columnar_eval_serial_framed_host_action_t,
     wl_evaluation_control_t *, int);

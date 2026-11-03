@@ -8424,7 +8424,8 @@ col_controlled_step_host_action(wl_col_session_t *sess,
         && step->transaction->child_active;
     bool capture_only = ordinary_capture || (step->recursive_route && recursive
         && recursive->body_active);
-    bool consume = action == WL_COLUMNAR_EVAL_SERIAL_FRAMED_ADVANCE
+    bool consume = (action == WL_COLUMNAR_EVAL_SERIAL_FRAMED_ADVANCE
+        || action == WL_COLUMNAR_EVAL_SERIAL_FRAMED_ABORT)
         && col_controlled_step_receipt_consumed(sess, step);
     wl_columnar_eval_serial_framed_host_request_t request = {
         .funding = grant,
@@ -8460,8 +8461,18 @@ col_controlled_step_host_action(wl_col_session_t *sess,
             protocol);
 #endif
 
-    if (action == WL_COLUMNAR_EVAL_SERIAL_FRAMED_STATUS) {
+    if (action == WL_COLUMNAR_EVAL_SERIAL_FRAMED_STATUS
+        || step->reply.kind ==
+        WL_COLUMNAR_EVAL_SERIAL_FRAMED_REPLY_PREPARED_MORE
+        || step->reply.kind == WL_COLUMNAR_EVAL_SERIAL_FRAMED_REPLY_REJECTED) {
         col_controlled_step_grant_release(step, &grant);
+        if (action != WL_COLUMNAR_EVAL_SERIAL_FRAMED_STATUS
+            && ((protocol && step->reply.kind ==
+            WL_COLUMNAR_EVAL_SERIAL_FRAMED_REPLY_PREPARED_MORE)
+            || (step->previous_valid && sess->cleanup_active
+            && (protocol == WL_EVALUATION_CONTROL_WORK_LIMIT
+            || protocol == WL_EVALUATION_CONTROL_CANCELLED))))
+            return EAGAIN;
         return protocol;
     }
 
@@ -8483,6 +8494,24 @@ col_controlled_step_host_action(wl_col_session_t *sess,
     col_controlled_step_grant_release(step, &grant);
     return protocol;
 }
+
+#ifdef WL_SESSION_TEST_HOOKS
+/* Exercise the real host classifier at a naturally parked operation. No
+ * engine phase, pending tuple, grant or authorization is manufactured here. */
+int
+wl_columnar_session_test_host_abort(wl_col_session_t *sess)
+{
+    wl_columnar_controlled_step_t *step = sess ? sess->controlled_step : NULL;
+    if (!step || !step->operation_active ||
+        !sess->cleanup_active) return EINVAL;
+    wl_columnar_eval_serial_framed_view_t view;
+    int rc = wl_columnar_eval_stack_framed_inspect(sess->cleanup_active, sess,
+            &view);
+    if (rc) return rc;
+    return col_controlled_step_host_action(sess, step, view.plan,
+               WL_COLUMNAR_EVAL_SERIAL_FRAMED_ABORT);
+}
+#endif
 
 static void
 col_controlled_step_advance_cursor(wl_col_session_t *sess,

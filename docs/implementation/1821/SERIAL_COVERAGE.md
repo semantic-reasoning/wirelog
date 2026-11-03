@@ -1519,16 +1519,18 @@ loop transitions and actual first-child admission prefix, are:
 | Parent public proof and caller/result tails | 380 | 384 |
 | DISPATCH | 98 | 128 |
 | STACK (nonstream probe worst case) | 161 | 192 |
-| Binding HEADER | 117 | 128 |
+| Binding HEADER (static worst case; NONE116, dynamic123) | 128 | 128 |
 | Each ENTRY | 58 | 64 |
 | Each PAIR, including terminal outer-loop transition | 31 | 32 |
 | DYNAMIC authorization | 53 | 64 |
 | Binding FINISH and actual caller | 61 | 64 |
 | PRECHILD and typed handoff | 125 | 128 |
 
-The STACK-to-HEADER checkpoint window also includes the new preadmission
-geometry/self/funding-role prefix and remains bounded by189/192. This is a
-separate latency check, not additional summable financing. The private
+The STACK body remains161/192. Dormant native output protection requires
+re-expanding the following HEADER geometry: its read-only entry is at most56
+between the existing zero-tail checkpoints; the complete HEADER region is
+bounded by128/128. The earlier whole-positive STACK-to-HEADER189 certificate
+is retired. Checkpoint bounds are not additional summable financing. The private
 post-HEADER head omits only immutable funding pointer/nonzero comparisons;
 every saved-generation charge and every real entry/pair check remains.
 HEADER proves the actual module/native owner before any original-control
@@ -1601,8 +1603,8 @@ full zeroing; it is not a destruction lease or transferable proof.
 | Paid setup region | Complete source upper bound | Fee |
 |---|---:|---:|
 | Parent proof/dispatch/result | 213 | 384 |
-| STACK through next HEADER admission | 189 | 192 |
-| Optional NONE HEADER / FINISH core | 117 / 56 | 128 / 64 |
+| STACK own body | 161 | 192 |
+| Optional NONE HEADER / FINISH core | 116 / 56 | 128 / 64 |
 | Full or delta LOOKUP wrapper, including posthook lineage | 101 | 128 |
 | SELECT | 71 | 128 |
 | RESERVE wrapper / COMMIT wrapper | 104 / 82 | 256 / 192 |
@@ -1618,6 +1620,9 @@ expanded. The nine NONE getter conversion/caller slots belong to this paid
 parent, separately from the getter FINISH core. The lookup original128 regions
 and attempt-governor interiors keep their own admissions; allocator, control
 and mandatory library cleanup retain the existing cooperative boundaries.
+The following read-only HEADER entry is at most56 between existing zero-tail
+checkpoints. The old composite189 window is not reused after the full dormant
+output guard; the complete HEADER bound is recaptured above.
 
 Actual native C11 layout is host5392 versus5376: the20-byte private cursor uses
 four old padding bytes. Zeroing therefore adds16 original bytes and one final
@@ -1693,9 +1698,10 @@ predicate15, child-admission/cancel/PENDING12, old wrapper31/body guard27,
 fixed routing20, pending reconciliation13, semantic latch9, dispatch/call
 tails27 and return/busy-clear8. Adjacent prefunding windows are conservative
 latency bounds, not double-spendable source credit. The parent envelope remains
-380/384. Public wrapper, old checked step/body, Unit29 setup leaves and
-STACK-to-HEADER189/192 are byte-identical. There is no field, reservation,
-reader, layout or production allowance change.
+380/384. Public wrapper and old checked step/body remain unchanged. The later
+automatic adapter extends dormant output protection; its changed binding
+HEADER and checkpoint bounds are recaptured in the setup tables above. This
+initialized-entry bookkeeping introduces no field, reader or allowance change.
 
 Constructor-driven tests apply383/639/1023 short funding before every actual
 consumer START/STEP/ACK, followed by exact1024 and consume-first. Byte snapshots
@@ -1752,3 +1758,68 @@ This qualifies the first boundary and fixed ownerless completion only.
 Successful nonempty START/STEP and owner retirement, forwarding/cleanup/direct
 routes, automatic publication/FINISH, configured policy/caps and general
 transaction intersections remain OPEN.
+
+### Automatic ordinary JOIN publication and typed FINISH
+
+The framed CHILD adapter selects actual nonstream ordinary JOIN contexts at
+JOIN_DECIDE/REPLACE. It invokes the genuine prepared publication protocol;
+SEMI/ANTI, LFTJ, active stream consumers and unsupported dispositions continue
+their existing paths. The automatic receipt lives at its final address in a
+private allocation tail, outside the logical frame and numeric child. Manual
+external receipt APIs retain their own checked geometry and ownership rules.
+
+Preparation charges the original cumulative allowance. The final saved-ID poll
+immediately precedes nofail publication without a callback. Distinct maintenance
+grants own native routing, cleanup and typed FINISH. The completed launch grant
+remains held through marker ACK and the subsequent successful checked parent
+consume. PREPARED_MORE is maintenance progress; it cannot replace the old MORE
+tuple or authorize resetting its grant. Rejected short admissions and failed
+consume retain that tuple. FINISH uses the same genuinely ACKED receipt after
+the real CONTROL stage releases its context reference.
+
+Actual support admissions are SELECT_ENTRY128, BIND192, SELECT128 and NATIVE128;
+maintenance uses ENTRY128, BIND192, PREVIOUS192, ACTION128 and a RETURN128
+admitted before the primitive. Consume and native close readiness each admit
+128 separately. No installation payment or larger default grant is introduced.
+Actual allocation bytes determine the existing original constructor ZERO tariff;
+logical-frame size does not stand in for the larger allocation. These payment
+values alone are not a complete emitted-source certificate.
+
+`evaluation_join_prepared_auto_domains` exercises real generated two-JOIN plans
+through STEP/SNAPSHOT, plain/observed, empty inputs and dirty deletion/repeat.
+Literal and raw oracles accompany actual publication/FINISH/ACK witnesses. The
+entry fixture exercises a three-slot grant pool across 24 refused maintenance
+turns, retained old reports, ACK followed by consume895/896, and actual
+FINISH1599/1600 refusal/retry. Live and dormant protected-output geometry is
+checked before request-field reads or reply writes. First SEALED poll failures
+survive a short cancel grant and original finish/reset/successor, without billing
+the successor. A genuine original256 constructor refusal with255 remaining
+also preserves its saved first error across finish/reset/successor without an
+explicit ABORT or counterfeit ACKED receipt. Existing exact recursive tariffs include source-derived3328 per
+selected prepared JOIN, preserving their exact/one-short/reset-retry oracles.
+
+The entry fixture also creates a real nested cleanup frame while the outer
+native owner is dormant. Plain and funded binding getters refuse before changing
+the parked owner's output; HEADER127/128 retains its exact debit and refusal
+classification. Native-started key queries exclude the complete known outer
+allocation, while a safe external key copy still succeeds. Whole outer and inner
+allocations, pending tuples, original consumption and held launch reports remain
+unchanged, without restoring receipt bytes. Normal inner close then permits the
+outer consume and typed FINISH. These checks include original-begin refusal,
+publication ACK, WAIT_FINISH and refused FINISH launch. The existing physical
+publication observer runs only after the callback-free nofail commit returns.
+
+Expanded native bounds include geometry63/64, live/dormant facade entry215/248
+and271/304, complete facade347/384 and consume128/128 including actual caller
+and reference release. Manual JOIN constructor factoring is256/256; FINISH is
+207/256. EXTERNAL registration is139/144 within its existing160 fee. Raw NONE
+getter97 replaces the earlier79 bound. Session-only receipt reads exclude the
+current active allocation; they do not authenticate a parked frame from a key.
+Known-owner binding getter refusals preserve parked native storage, and native
+key queries retain the pre-native embedded-key initialization path. Exact bounds require recapture
+after any evaluated source change.
+
+Bound ended-generation cleanup still needs qualification before complete integration. Consumer helper
+and retained retry accounting, configured strict/cache/local/shared policies and
+general transaction intersections remain separate required bundle work. This
+section does not close #2297/#2298 or declare the PR Ready.

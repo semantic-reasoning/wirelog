@@ -1090,12 +1090,12 @@ wl_columnar_eval_plan_numeric_private_bindings_get(const void *owner,
     if (record->session != session
         && !wl_columnar_eval_stack_marked_copy_output(record->session, out,
         sizeof(*out))) return EINVAL;
-    *out = NULL;
     if (record->frame != frame
         || record->session != session || record->control != control
         || record->attempt_id != id
         || wl_columnar_eval_plan_numeric_validate(record))
         return EINVAL;
+    *out = NULL;
     if (record->private_bindings) {
         const wl_columnar_eval_private_bindings_t *bindings =
             record->private_bindings;
@@ -1181,12 +1181,12 @@ wl_columnar_eval_plan_numeric_private_bindings_get_funded(const void *owner,
             WL_COLUMNAR_JOIN_SETUP_HEADER_WORK);
     if (rc) return (wl_columnar_join_setup_result_t){ rc,
                                                       WL_COLUMNAR_JOIN_SETUP_FUNDING_REFUSED };
-    *out = NULL;
     if (record->frame != frame || record->session != session
         || record->control != control || record->attempt_id != id
         || !control || !id
         || wl_columnar_eval_stack_numeric_owner(frame, record)
         || session->cleanup_active != frame) goto invalid;
+    *out = NULL;
     const wl_columnar_eval_private_bindings_t *bindings =
         record->private_bindings;
     if (bindings && (bindings->identity != (uintptr_t)bindings

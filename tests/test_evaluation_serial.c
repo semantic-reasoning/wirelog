@@ -1397,6 +1397,9 @@ static wl_columnar_eval_serial_framed_attempt_t *
 entry_context(entry_fixture_t *f)
 {
     if (!f->session->cleanup_active) return NULL;
+    if (wl_columnar_eval_stack_frame_mutation_blocked(
+            f->session->cleanup_active))
+        return NULL;
     wl_columnar_eval_serial_framed_attempt_t *ctx = NULL;
     CHECK(!wl_columnar_eval_stack_framed_context(f->session->cleanup_active,
         f->session, &ctx));
@@ -1488,8 +1491,13 @@ entry_turn_action(entry_fixture_t *f,
         && (!report.execution_status || report.execution_status == EOVERFLOW)
         && !wl_evaluation_control_active_attempt_id(grant->control));
     if (action != WL_COLUMNAR_EVAL_SERIAL_FRAMED_STATUS
+        && f->reply.kind != WL_COLUMNAR_EVAL_SERIAL_FRAMED_REPLY_PREPARED_MORE
+        && f->reply.kind != WL_COLUMNAR_EVAL_SERIAL_FRAMED_REPLY_REJECTED
         && (!consume || !f->protocol)) {
-        f->previous.previous_valid = !consume;
+        f->previous.previous_valid = !consume
+            && (f->reply.kind == WL_COLUMNAR_EVAL_SERIAL_FRAMED_REPLY_MORE
+            || f->reply.kind ==
+            WL_COLUMNAR_EVAL_SERIAL_FRAMED_REPLY_BOOTSTRAP_RECEIPT);
         f->previous.previous_kind = f->reply.kind;
         f->previous.previous_protocol = f->protocol;
         f->previous.previous_funding = grant->control;
@@ -1531,6 +1539,8 @@ entry_complete(entry_fixture_t *f)
     while (f->reply.kind != WL_COLUMNAR_EVAL_SERIAL_FRAMED_REPLY_TERMINAL) {
         CHECK(++turns < 200000);
         int protocol = entry_turn(f, false, 0);
+        if (f->reply.kind == WL_COLUMNAR_EVAL_SERIAL_FRAMED_REPLY_PREPARED_MORE)
+            continue;
         if (protocol) {
             /* A child error is consumed through its genuine pending receipt;
              * it is not the final semantic outcome of this relation. */
@@ -2295,8 +2305,11 @@ test_controlled_recursive_two_join_step(void)
      * detached result: 18 descriptors, zeroed at 224 per eight-byte chunk.
      * Frames and descriptors embed ABI-dependent thread IDs (e.g. Windows).
      * Keep all other work pinned independently of observed consumption. */
-    const uint64_t expected_work = UINT64_C(1271246) + UINT64_C(3) * 224
-        * ((wl_columnar_eval_stack_test_frame_size() + 15) / 16)
+    /* Native publication replaces checked commit: (3776+128*d) minus
+     * (448+128*d) =3328 for each of two JOINs in three body frames. */
+    const uint64_t expected_work = UINT64_C(1271246) + UINT64_C(6) * 3328
+        + UINT64_C(3) * 224
+        * ((wl_columnar_eval_stack_test_allocation_size() + 15) / 16)
         + UINT64_C(18) * 224 * ((sizeof(col_rel_t) + 7) / 8);
     wl_plan_t *plan = NULL;
     wirelog_program_t *program = NULL;
@@ -2449,8 +2462,9 @@ test_controlled_recursive_step_publication_and_stops(void)
      * 224 per 16-byte chunk. Each round constructs MAP, JOIN, CONCAT,
      * CONSOLIDATE, and the detached result: 20 descriptors, zeroed at 224
      * per eight-byte chunk. Both sizes include ABI-dependent thread IDs. */
-    const uint64_t expected_work = UINT64_C(1391081) + UINT64_C(4) * 224
-        * ((wl_columnar_eval_stack_test_frame_size() + 15) / 16)
+    const uint64_t expected_work = UINT64_C(1391081) + UINT64_C(4) * 3328
+        + UINT64_C(4) * 224
+        * ((wl_columnar_eval_stack_test_allocation_size() + 15) / 16)
         + UINT64_C(20) * 224 * ((sizeof(col_rel_t) + 7) / 8);
     CHECK(successful_report.consumed == expected_work);
     CHECK(path && path->nrows == 6 && path->ncols == 2
@@ -2647,8 +2661,9 @@ test_controlled_recursive_step_after_public_edge_append(void)
         && successor_report.result == 0);
     /* Four edges require five body rounds (including empty convergence),
      * with five operator descriptors per round, using the tariffs above. */
-    const uint64_t successor_work = UINT64_C(1859706) + UINT64_C(5) * 224
-        * ((wl_columnar_eval_stack_test_frame_size() + 15) / 16)
+    const uint64_t successor_work = UINT64_C(1859706) + UINT64_C(5) * 3328
+        + UINT64_C(5) * 224
+        * ((wl_columnar_eval_stack_test_allocation_size() + 15) / 16)
         + UINT64_C(25) * 224 * ((sizeof(col_rel_t) + 7) / 8);
     CHECK(successor_report.consumed == successor_work);
     const int64_t expected[][2] = {
@@ -2685,8 +2700,9 @@ test_controlled_recursive_successor_work_boundaries(void)
     static const int64_t edges[] = { 1, 2, 2, 3, 3, 4 };
     static const int64_t later_edge[] = { 4, 5 };
     /* Same four-edge recomputation: five frames and 25 descriptors. */
-    const uint64_t successor_work = UINT64_C(1859706) + UINT64_C(5) * 224
-        * ((wl_columnar_eval_stack_test_frame_size() + 15) / 16)
+    const uint64_t successor_work = UINT64_C(1859706) + UINT64_C(5) * 3328
+        + UINT64_C(5) * 224
+        * ((wl_columnar_eval_stack_test_allocation_size() + 15) / 16)
         + UINT64_C(25) * 224 * ((sizeof(col_rel_t) + 7) / 8);
     wl_plan_t *plan = NULL;
     wirelog_program_t *program = NULL;
@@ -6942,6 +6958,7 @@ controlled_setup_exact_finished(const wl_col_session_t *session,
 {
     if (action != WL_COLUMNAR_EVAL_SERIAL_FRAMED_ADVANCE
         || !controlled_setup_injections || !session->cleanup_active) return;
+    if (controlled_setup_injections == 2 && !controlled_setup_boundary) return;
     wl_columnar_eval_serial_framed_attempt_t *ctx = NULL;
     CHECK(!wl_columnar_eval_stack_framed_context(session->cleanup_active,
         (wl_col_session_t *)session, &ctx));
@@ -10431,7 +10448,7 @@ static void
 test_entry_bootstrap_failures(void)
 {
     uint64_t frame_cost = 1726 + 224 *
-        ((wl_columnar_eval_stack_test_frame_size() + 15) / 16);
+        ((wl_columnar_eval_stack_test_allocation_size() + 15) / 16);
     const uint64_t limits[] = {1, 191, 192, 767, 768, 895,
                                768 + frame_cost - 1, 768 + frame_cost,
                                768 + frame_cost + 75519};
@@ -14350,6 +14367,10 @@ test_framed_actual_prepared_exclusion(void)
     CHECK(!wl_evaluation_control_test_active_consumed(f.operation, f.id,
         &after) && before == after);
     free(saved);
+    CHECK(wl_columnar_eval_stack_test_auto_observe(frame, f.session,
+        (void *)&prepared) == EINVAL);
+    CHECK(wl_columnar_eval_stack_test_auto_observe(frame, f.session,
+        (void *)child) == EINVAL);
     framed_prepared_until(&prepared, WL_COLUMNAR_EVAL_STACK_PREPARED_SEALED);
     wl_columnar_eval_stack_unary_commit_prepared_nofail(&prepared);
     grant = framed_prepared_grant(0, &owner);
@@ -14386,6 +14407,404 @@ test_framed_actual_prepared_exclusion(void)
         &status) && status.committed && !status.first_result);
 }
 
+static void
+entry_automatic_geometry(entry_fixture_t *f)
+{
+    wl_columnar_eval_stack_cleanup_frame_t *frame = f->session->cleanup_active;
+    wl_columnar_eval_stack_test_auto_observation_t observation;
+    CHECK(!wl_columnar_eval_stack_test_auto_observe(frame, f->session,
+        &observation));
+    size_t bytes = wl_columnar_eval_stack_test_allocation_size();
+    unsigned char *saved = malloc(bytes); CHECK(saved);
+    memcpy(saved, frame, bytes);
+    CHECK(wl_columnar_eval_stack_cleanup_receipt_read(f->session,
+        &f->reply.cleanup_receipt_key, (void *)observation.receipt) == EINVAL);
+    CHECK(!memcmp(saved, frame, bytes));
+    wl_columnar_eval_serial_framed_attempt_t *ctx = entry_context(f);
+    if (ctx) {
+        const wl_columnar_eval_private_bindings_t **out =
+            (void *)observation.receipt;
+        CHECK(wl_columnar_eval_plan_numeric_private_bindings_get(&ctx->child,
+            frame, f->session, f->operation, f->id, out) == EINVAL);
+        CHECK(!memcmp(saved, frame, bytes));
+        wl_col_session_t foreign = {0};
+        CHECK(wl_columnar_eval_plan_numeric_private_bindings_get(&ctx->child,
+            frame, &foreign, f->operation, f->id, out) == EINVAL);
+        CHECK(!memcmp(saved, frame, bytes));
+        grant_t *funding = entry_grant(f, 0);
+        wl_columnar_join_setup_result_t result =
+            wl_columnar_eval_plan_numeric_private_bindings_get_funded(
+            &ctx->child, frame, f->session, f->operation, f->id,
+            funding->control, funding->id, out);
+        CHECK(result.protocol == EINVAL && !memcmp(saved, frame, bytes));
+        CHECK(!wl_evaluation_control_finish(funding->control, &funding->owner,
+            0, 0));
+        wl_evaluation_control_report_t report;
+        CHECK(!wl_evaluation_control_report(funding->control, &report)
+            && !report.consumed);
+    }
+    grant_t *grant = entry_grant(f, 0);
+    wl_columnar_eval_serial_framed_host_request_t request = entry_request(f,
+            grant);
+    CHECK(entry_host(f, observation.receipt, grant) == EINVAL);
+    CHECK(!memcmp(saved, frame, bytes));
+    grant = entry_grant(f, 0); request = entry_request(f, grant);
+    request.reply = (void *)observation.receipt;
+    CHECK(entry_host(f, &request, grant) == EINVAL);
+    CHECK(!memcmp(saved, frame, bytes));
+    grant = entry_grant(f, 0); request = entry_request(f, grant);
+    request.reply = (void *)&request;
+    wl_columnar_eval_serial_framed_host_request_t request_before = request;
+    CHECK(entry_host(f, &request, grant) == EINVAL
+        && !memcmp(&request, &request_before, sizeof(request)));
+    CHECK(!memcmp(saved, frame, bytes));
+    grant = entry_grant(f, 0); request = entry_request(f, grant);
+    request.reply = (void *)(UINTPTR_MAX - 4);
+    CHECK(entry_host(f, &request, grant) == EINVAL);
+    CHECK(!memcmp(saved, frame, bytes));
+    grant = entry_grant(f, 0);
+    CHECK(entry_host(f, (void *)(UINTPTR_MAX - 4), grant) == EINVAL);
+    CHECK(!memcmp(saved, frame, bytes));
+    free(saved);
+}
+
+static void
+entry_automatic_parked_geometry(entry_fixture_t *f)
+{
+    wl_columnar_eval_stack_cleanup_frame_t *outer = f->session->cleanup_active;
+    wl_columnar_eval_serial_framed_attempt_t *ctx = entry_context(f);
+    wl_columnar_eval_stack_test_auto_observation_t observation;
+    CHECK(ctx && !wl_columnar_eval_stack_test_auto_observe(outer, f->session,
+        &observation));
+    CHECK(!wl_columnar_eval_stack_frame_mutation_blocked(outer));
+    wl_columnar_eval_cleanup_receipt_key_t key, copied_key;
+    CHECK(!wl_columnar_eval_stack_cleanup_receipt_key_for_frame(outer, &key));
+    wl_columnar_eval_serial_framed_host_request_t previous = f->previous;
+    wl_evaluation_control_report_t launch_before = {0}, launch_after = {0};
+    wl_evaluation_control_t *launch = f->previous.previous_funding;
+    if (observation.launch) {
+        CHECK(observation.launch == launch);
+        CHECK(!wl_evaluation_control_report(launch, &launch_before));
+    }
+    uint64_t active_id = wl_evaluation_control_active_attempt_id(f->operation);
+    uint64_t original_before, original_after;
+    CHECK(!wl_evaluation_control_test_active_consumed(f->operation, active_id,
+        &original_before));
+    wl_columnar_eval_stack_cleanup_frame_t *nested = NULL;
+    CHECK(!wl_columnar_eval_stack_cleanup_begin(f->session, &nested));
+    size_t bytes = wl_columnar_eval_stack_test_allocation_size();
+    unsigned char *outer_before = malloc(bytes), *nested_before = malloc(bytes);
+    CHECK(outer_before && nested_before);
+    memcpy(outer_before, outer, bytes);
+    memcpy(nested_before, nested, bytes);
+    const wl_columnar_eval_private_bindings_t **outputs[] = {
+        (void *)observation.receipt,
+        (void *)((const unsigned char *)observation.receipt
+        + offsetof(wl_columnar_eval_stack_unary_prepared_t, frame))
+    };
+    for (unsigned i = 0; i < 2; ++i) {
+        CHECK(wl_columnar_eval_plan_numeric_private_bindings_get(&ctx->child,
+            outer, f->session, f->operation, f->id, outputs[i]) == EINVAL);
+        CHECK(!memcmp(outer_before, outer, bytes));
+        int owner = 0;
+        grant_t short_grant = framed_prepared_grant(127, &owner);
+        wl_columnar_join_setup_result_t result =
+            wl_columnar_eval_plan_numeric_private_bindings_get_funded(
+            &ctx->child, outer, f->session, f->operation, f->id,
+            short_grant.control, short_grant.id, outputs[i]);
+        CHECK(result.protocol == WL_EVALUATION_CONTROL_WORK_LIMIT
+            && result.outcome == WL_COLUMNAR_JOIN_SETUP_FUNDING_REFUSED);
+        CHECK(!framed_prepared_grant_end(&short_grant, &owner));
+        CHECK(!memcmp(outer_before, outer, bytes));
+        grant_t exact_grant = framed_prepared_grant(128, &owner);
+        result = wl_columnar_eval_plan_numeric_private_bindings_get_funded(
+            &ctx->child, outer, f->session, f->operation, f->id,
+            exact_grant.control, exact_grant.id, outputs[i]);
+        CHECK(result.protocol == EINVAL
+            && result.outcome == WL_COLUMNAR_JOIN_SETUP_INVALID);
+        CHECK(framed_prepared_grant_end(&exact_grant, &owner) == 128);
+        CHECK(!memcmp(outer_before, outer, bytes));
+    }
+    CHECK(wl_columnar_eval_stack_cleanup_receipt_key_for_frame(outer,
+        (void *)observation.receipt) == EINVAL);
+    CHECK(!memcmp(outer_before, outer, bytes));
+    CHECK(!wl_columnar_eval_stack_cleanup_receipt_key_for_frame(outer,
+        &copied_key) && foundation_key_equal(&key, &copied_key));
+    CHECK(wl_columnar_eval_stack_framed_inspect(outer, f->session,
+        (void *)observation.receipt) == EBUSY);
+    CHECK(!memcmp(outer_before, outer, bytes));
+    CHECK(!memcmp(nested_before, nested, bytes));
+    CHECK(!memcmp(&f->previous, &previous, sizeof(previous)));
+    CHECK(!wl_evaluation_control_test_active_consumed(f->operation, active_id,
+        &original_after) && original_before == original_after);
+    if (observation.launch) {
+        CHECK(!wl_evaluation_control_report(launch, &launch_after));
+        CHECK(!memcmp(&launch_before, &launch_after, sizeof(launch_before)));
+    }
+    CHECK(!wl_columnar_eval_stack_cleanup_finish(&nested) && !nested);
+    CHECK(f->session->cleanup_active == outer
+        && !memcmp(outer_before, outer, bytes));
+    free(nested_before); free(outer_before);
+}
+
+static void
+test_entry_automatic_first_cause_turnover(void)
+{
+    const char *source = ".decl a(k:int64)\n.decl b(k:int64)\n"
+        ".decl output(k:int64)\noutput(k) :- a(k), b(k).\n";
+    const int64_t a[] = {1, 2}, b[] = {2, 3};
+    const entry_input_t inputs[] = {{"a", a, 2, 1}, {"b", b, 2, 1}};
+    for (unsigned trial = 0; trial < 4; ++trial) {
+        entry_fixture_t f;
+        entry_init_inputs(&f, source, inputs, 2, UINT64_MAX - 1);
+        wl_columnar_eval_stack_test_auto_observation_t observation;
+        for (unsigned turn = 0; ; ++turn) {
+            CHECK(turn < 100000);
+            if (f.session->cleanup_active) {
+                CHECK(!wl_columnar_eval_stack_test_auto_observe(
+                        f.session->cleanup_active, f.session, &observation));
+                unsigned target = trial < 2
+                    ? WL_COLUMNAR_EVAL_STACK_PREPARED_SEALED
+                    : trial ==
+                    2 ? WL_COLUMNAR_EVAL_STACK_PREPARED_COMMITTED_DRAIN
+                    : WL_COLUMNAR_EVAL_STACK_PREPARED_FINISH_HEAD;
+                if (observation.receipt_phase == target) break;
+            }
+            CHECK(!entry_turn(&f, false, 0));
+        }
+        int cause = trial == 1 ? WL_EVALUATION_CONTROL_WORK_LIMIT
+            : WL_EVALUATION_CONTROL_CANCELLED;
+        if (trial == 1)
+            CHECK(wl_evaluation_control_charge(f.operation,
+                UINT64_MAX) == cause);
+        else if (trial == 0) wl_evaluation_control_request_cancel(f.operation);
+        /*1152 metadata is admitted; the actual cancel128 is one short. */
+        CHECK((trial < 2 ? entry_turn(&f, false, 1279)
+                : entry_turn_action(&f, WL_COLUMNAR_EVAL_SERIAL_FRAMED_ABORT,
+            1279)) == WL_EVALUATION_CONTROL_WORK_LIMIT);
+        CHECK(!wl_columnar_eval_stack_test_auto_observe(
+                f.session->cleanup_active,
+                f.session, &observation));
+        if (trial < 2) CHECK(observation.receipt_phase ==
+                WL_COLUMNAR_EVAL_STACK_PREPARED_SEALED &&
+                !observation.committed);
+        else CHECK(observation.abort_requested
+                && (trial == 2 ? observation.committed : observation.finish));
+        /* Postcutoff ABORT stores native intent without polling original.
+         * Ending that still-unpolled generation therefore reports success. */
+        CHECK(wl_evaluation_control_finish(f.operation,
+            f.session->base.operation_admission, 0,
+            0) == (trial < 2 ? cause : 0));
+        CHECK(!wl_evaluation_control_reset(f.operation));
+        CHECK(!wl_evaluation_control_configure(f.operation, 0));
+        CHECK(!wl_evaluation_control_begin(f.operation,
+            f.session->base.operation_admission));
+        uint64_t successor =
+            wl_evaluation_control_active_attempt_id(f.operation);
+        CHECK(successor != f.id);
+        if (trial < 2) entry_complete(&f);
+        else {
+            for (unsigned turn = 0; f.reply.kind !=
+                WL_COLUMNAR_EVAL_SERIAL_FRAMED_REPLY_TERMINAL; ++turn) {
+                CHECK(turn < 10000);
+                CHECK(!entry_turn_action(&f,
+                    WL_COLUMNAR_EVAL_SERIAL_FRAMED_ABORT, 0));
+            }
+            /* Finish the genuine final receipt acknowledgment and checks. */
+            entry_complete(&f);
+        }
+        CHECK(f.reply.execution_result == cause && !f.reply.committed
+            && !session_find_rel(f.session, "output"));
+        uint64_t consumed;
+        CHECK(!wl_evaluation_control_test_active_consumed(f.operation,
+            successor,
+            &consumed) && consumed == 0);
+        CHECK(!wl_evaluation_control_finish(f.operation,
+            f.session->base.operation_admission, 0, 0));
+        entry_destroy(&f);
+    }
+}
+
+static void
+test_entry_automatic_begin_failure_turnover(void)
+{
+    const char *source = ".decl a(k:int64)\n.decl b(k:int64)\n"
+        ".decl output(k:int64)\noutput(k) :- a(k), b(k).\n";
+    const int64_t a[] = {1, 2}, b[] = {2, 3};
+    const entry_input_t inputs[] = {{"a", a, 2, 1}, {"b", b, 2, 1}};
+    entry_fixture_t f;
+    entry_init_inputs(&f, source, inputs, 2, UINT64_MAX - 1);
+    for (unsigned turn = 0; ; ++turn) {
+        CHECK(turn < 100000);
+        wl_columnar_eval_serial_framed_attempt_t *ctx = entry_context(&f);
+        if (ctx && ctx->child_bound && ctx->phase ==
+            WL_COLUMNAR_EVAL_SERIAL_FRAMED_CHILD && ctx->child.phase ==
+            WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_UNARY_CHILD) {
+            wl_columnar_filter_context_t *filter = NULL;
+            CHECK(!wl_columnar_eval_stack_filter_context_owned(
+                    f.session->cleanup_active, &filter, &ctx->child));
+            if (filter->stage == WL_COLUMNAR_FILTER_STAGE_JOIN_DECIDE) break;
+        }
+        CHECK(!entry_turn(&f, false, 0));
+    }
+    uint64_t consumed;
+    CHECK(!wl_evaluation_control_test_active_consumed(f.operation, f.id,
+        &consumed) && consumed < UINT64_MAX - 256);
+    /* Leave255 actual original units for the genuine256 constructor. */
+    CHECK(!wl_evaluation_control_charge(f.operation,
+        UINT64_MAX - 1 - consumed - 255));
+    CHECK(entry_turn(&f, false, 0) == WL_EVALUATION_CONTROL_WORK_LIMIT);
+    wl_columnar_eval_stack_test_auto_observation_t observation;
+    CHECK(!wl_columnar_eval_stack_test_auto_observe(f.session->cleanup_active,
+        f.session, &observation) && observation.launch
+        && observation.receipt_phase == WL_COLUMNAR_EVAL_STACK_PREPARED_INERT
+        && observation.launch_protocol == WL_EVALUATION_CONTROL_WORK_LIMIT);
+    entry_automatic_parked_geometry(&f);
+    CHECK(wl_evaluation_control_finish(f.operation,
+        f.session->base.operation_admission, 0,
+        0) == WL_EVALUATION_CONTROL_WORK_LIMIT);
+    CHECK(!wl_evaluation_control_reset(f.operation));
+    CHECK(!wl_evaluation_control_configure(f.operation, 0));
+    CHECK(!wl_evaluation_control_begin(f.operation,
+        f.session->base.operation_admission));
+    uint64_t successor = wl_evaluation_control_active_attempt_id(f.operation);
+    CHECK(successor != f.id);
+    CHECK(!entry_turn(&f, false, 896));
+    CHECK(!wl_columnar_eval_stack_test_auto_observe(f.session->cleanup_active,
+        f.session, &observation) && !observation.launch
+        && observation.receipt_phase == WL_COLUMNAR_EVAL_STACK_PREPARED_INERT);
+    entry_automatic_parked_geometry(&f);
+    entry_complete(&f);
+    CHECK(f.reply.execution_result == WL_EVALUATION_CONTROL_WORK_LIMIT
+        && !f.reply.committed && !session_find_rel(f.session, "output"));
+    CHECK(!wl_evaluation_control_test_active_consumed(f.operation, successor,
+        &consumed) && consumed == 0);
+    CHECK(!wl_evaluation_control_finish(f.operation,
+        f.session->base.operation_admission, 0, 0));
+    entry_destroy(&f);
+}
+
+static void
+test_entry_automatic_prepared_funding(void)
+{
+    const char *source = ".decl a(k:int64,x:int64)\n"
+        ".decl b(k:int64,t:int64,y:int64)\n.decl c(t:int64,z:int64)\n"
+        ".decl output(x:int64,y:int64,z:int64)\n"
+        "output(x,y,z) :- a(k,x), b(k,t,y), c(t,z).\n";
+    const int64_t a[] = {1, 10, 2, 20};
+    const int64_t b[] = {1, 7, 100, 2, 8, 200};
+    const int64_t c[] = {7, 1000, 8, 2000};
+    const entry_input_t inputs[] = {{"a", a, 2, 2}, {"b", b, 2, 3},
+                                    {"c", c, 2, 2}};
+    entry_fixture_t f;
+    entry_init_inputs(&f, source, inputs, 3, 0);
+    for (unsigned turn = 0; ; ++turn) {
+        CHECK(turn < 100000);
+        if (f.session->cleanup_active
+            && wl_columnar_eval_stack_frame_mutation_blocked(
+                f.session->cleanup_active)) break;
+        CHECK(!entry_turn(&f, false, 0));
+    }
+    wl_columnar_eval_stack_test_auto_observation_t observed;
+    CHECK(!wl_columnar_eval_stack_test_auto_observe(f.session->cleanup_active,
+        f.session, &observed));
+    CHECK(observed.receipt_phase == WL_COLUMNAR_EVAL_STACK_PREPARED_JOIN_HEAD
+        && observed.launch && !observed.busy);
+    entry_automatic_geometry(&f);
+    wl_evaluation_control_t *launch = f.previous.previous_funding;
+    CHECK(observed.launch == launch);
+    wl_evaluation_control_report_t before = {0}, after = {0};
+    CHECK(!wl_evaluation_control_report(launch, &before));
+    wl_columnar_eval_serial_framed_host_request_t previous = f.previous;
+    const uint64_t limits[] = {383, 511, 703, 895, 1023, 1151};
+    unsigned used_slots = 0;
+    for (unsigned turn = 0; turn < 24; ++turn) {
+        CHECK(entry_turn(&f, false, limits[turn % 6])
+            == WL_EVALUATION_CONTROL_WORK_LIMIT);
+        CHECK(!memcmp(&f.previous, &previous, sizeof(previous)));
+        CHECK(!wl_evaluation_control_report(launch, &after)
+            && !memcmp(&before, &after, sizeof(before))
+            && !wl_evaluation_control_active_attempt_id(launch));
+        CHECK(!wl_columnar_eval_stack_test_auto_observe(
+                f.session->cleanup_active,
+                f.session, &observed));
+        CHECK(observed.receipt_phase ==
+            WL_COLUMNAR_EVAL_STACK_PREPARED_JOIN_HEAD
+            && observed.launch == launch && !observed.busy);
+        unsigned slot = (f.next + 2) % 3;
+        CHECK(f.grants[slot].control != launch);
+        used_slots |= 1u << slot;
+    }
+    CHECK(used_slots && (used_slots & (used_slots - 1)));
+    CHECK(!entry_turn(&f, false, 1152));
+    CHECK(!wl_columnar_eval_stack_test_auto_observe(f.session->cleanup_active,
+        f.session, &observed));
+    CHECK(observed.receipt_phase == WL_COLUMNAR_EVAL_STACK_PREPARED_JOIN_STATE);
+    for (unsigned turn = 0; ; ++turn) {
+        CHECK(turn < 1000);
+        CHECK(!wl_columnar_eval_stack_test_auto_observe(
+                f.session->cleanup_active,
+                f.session, &observed));
+        if (observed.receipt_phase == WL_COLUMNAR_EVAL_STACK_PREPARED_ACKED)
+            break;
+        CHECK(!entry_turn(&f, false, 0));
+    }
+    CHECK(observed.launch == launch && observed.parent_phase ==
+        WL_COLUMNAR_EVAL_SERIAL_FRAMED_PENDING
+        && !wl_columnar_eval_stack_frame_mutation_blocked(
+            f.session->cleanup_active));
+    entry_automatic_geometry(&f);
+    entry_automatic_parked_geometry(&f);
+    previous = f.previous;
+    CHECK(entry_turn(&f, false, 895) == WL_EVALUATION_CONTROL_WORK_LIMIT);
+    CHECK(!memcmp(&f.previous, &previous, sizeof(previous)));
+    CHECK(!wl_evaluation_control_report(launch, &after)
+        && !memcmp(&before, &after, sizeof(before)));
+    CHECK(!entry_turn(&f, false, 896));
+    CHECK(!wl_columnar_eval_stack_test_auto_observe(f.session->cleanup_active,
+        f.session, &observed) && !observed.launch);
+    entry_automatic_parked_geometry(&f);
+    for (unsigned turn = 0; ; ++turn) {
+        CHECK(turn < 1000);
+        wl_columnar_eval_serial_framed_attempt_t *ctx = entry_context(&f);
+        wl_columnar_filter_context_t *filter = NULL;
+        CHECK(ctx && !wl_columnar_eval_stack_filter_context_owned(
+                f.session->cleanup_active, &filter, &ctx->child));
+        if (ctx->phase == WL_COLUMNAR_EVAL_SERIAL_FRAMED_CHILD
+            && ctx->child.phase ==
+            WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_UNARY_CHILD
+            && filter->stage == WL_COLUMNAR_FILTER_STAGE_FINISH) break;
+        CHECK(!entry_turn(&f, false, 0));
+    }
+    CHECK(entry_turn(&f, false, 1599) == WL_EVALUATION_CONTROL_WORK_LIMIT);
+    CHECK(!wl_columnar_eval_stack_test_auto_observe(f.session->cleanup_active,
+        f.session, &observed) && observed.launch && observed.finish
+        && observed.receipt_phase == WL_COLUMNAR_EVAL_STACK_PREPARED_ACKED);
+    entry_automatic_parked_geometry(&f);
+    CHECK(!entry_turn(&f, false, 896));
+    CHECK(!entry_turn(&f, false, 1600));
+    CHECK(!wl_columnar_eval_stack_test_auto_observe(f.session->cleanup_active,
+        f.session, &observed) && observed.launch && observed.finish
+        && observed.receipt_phase ==
+        WL_COLUMNAR_EVAL_STACK_PREPARED_FINISH_HEAD);
+    for (unsigned turn = 0; ; ++turn) {
+        CHECK(turn < 1000);
+        CHECK(!wl_columnar_eval_stack_test_auto_observe(
+                f.session->cleanup_active, f.session, &observed));
+        if (observed.receipt_phase == WL_COLUMNAR_EVAL_STACK_PREPARED_ACKED)
+            break;
+        CHECK(!entry_turn(&f, false, 0));
+    }
+    CHECK(observed.finish && observed.launch);
+    entry_automatic_parked_geometry(&f);
+    entry_complete(&f);
+    CHECK(!f.reply.execution_result && f.reply.committed);
+    const col_rel_t *output = session_find_rel(f.session, "output");
+    CHECK(output && output->nrows == 2 && output->ncols == 3
+        && output->columns[0][0] == 10 && output->columns[2][1] == 2000);
+    entry_destroy(&f);
+}
+
 int
 main(void)
 {
@@ -14398,6 +14817,9 @@ main(void)
      * process exists. */
     CHECK(!unsetenv("WIRELOG_JOIN_BATCH_BYTES"));
     CHECK(!unsetenv("WIRELOG_JOIN_BATCH_STRICT"));
+    test_entry_automatic_prepared_funding();
+    test_entry_automatic_first_cause_turnover();
+    test_entry_automatic_begin_failure_turnover();
     test_retirement_retained_work_native_owner();
     test_staging_native_pending_admission();
     test_session_retirement_initialization_stops();
