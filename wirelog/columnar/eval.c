@@ -2329,6 +2329,11 @@ bool (*wl_columnar_eval_test_outbound_head_growth)(wl_col_session_t *,
  * without pumping or joining it, as a driver that skipped its round close
  * would; the teardown paths must then end the round (I1). */
 bool (*wl_columnar_eval_test_abandon_round)(wl_col_session_t *);
+/* Issue #1373: called on the coordinator thread once an exchange has put
+ * the @count partitions of its array under the coordinator's governor;
+ * NULL slots hold no partition and are skipped. */
+void (*wl_columnar_eval_test_after_govern_parts)(wl_col_session_t *,
+    col_rel_t *const *, uint32_t);
 #endif
 
 /* Construct the worst-case outgoing image before a worker changes its source.
@@ -4582,6 +4587,10 @@ tdd_exchange_govern_parts(wl_col_session_t *coord, col_rel_t **parts,
         if (rc != 0)
             return tdd_exchange_status(coord, parts[w], rc);
     }
+#ifdef WL_SESSION_TEST_HOOKS
+    if (wl_columnar_eval_test_after_govern_parts)
+        wl_columnar_eval_test_after_govern_parts(coord, parts, W);
+#endif
     return 0;
 }
 
