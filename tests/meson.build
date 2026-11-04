@@ -5769,6 +5769,16 @@ test_string_eval_exe = executable(
 
 test('string_eval', test_string_eval_exe)
 
+test_idb_placeholder_types_exe = executable(
+  'test_idb_placeholder_types',
+  files('test_idb_placeholder_types.c'),
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
+  link_with: [testlib_prod],
+)
+
+test('idb_placeholder_types', test_idb_placeholder_types_exe, timeout: 120)
+
 test_wirelog_easy_exe = executable(
   'test_wirelog_easy',
   files('test_wirelog_easy.c'),

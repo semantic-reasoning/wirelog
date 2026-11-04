@@ -2688,6 +2688,18 @@ test_tdd_merge_schema_mismatch_rollback(void)
         FAIL("column type mismatch changed target");
         return 1;
     }
+    /* Issue #2334: integer-family lanes are compatible with each other,
+     * but a STRING lane holds intern ids and must not merge into the
+     * target's untyped (INT64) lanes. */
+    for (uint32_t col = 0; col < worker->ncols; col++)
+        worker->column_types[col] = WIRELOG_TYPE_STRING;
+    rc = wl_columnar_eval_test_tdd_merge(&target, workers, 1);
+    if (rc != EINVAL || !bdx_seed_snapshot_unchanged(target, &snapshot)) {
+        col_rel_destroy(target);
+        col_rel_destroy(worker);
+        FAIL("string column type mismatch changed target");
+        return 1;
+    }
     free(worker->column_types);
     worker->column_types = NULL;
 

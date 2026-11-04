@@ -3916,6 +3916,31 @@ tdd_compound_map_entries(const col_rel_t *rel, uint32_t *entries_out)
     return entries == rel->compound_arity_len;
 }
 
+/* Integer-family lane types: INT32, INT64, UINT32, UINT64 and BOOL all use
+ * the int64 storage lane (see col_rel_append_all()). */
+static bool
+tdd_lane_int_family(wirelog_column_type_t type)
+{
+    switch (type) {
+    case WIRELOG_TYPE_INT32:
+    case WIRELOG_TYPE_INT64:
+    case WIRELOG_TYPE_UINT32:
+    case WIRELOG_TYPE_UINT64:
+    case WIRELOG_TYPE_BOOL:
+        return true;
+    default:
+        return false;
+    }
+}
+
+static bool
+tdd_lane_types_compatible(wirelog_column_type_t expected,
+    wirelog_column_type_t actual)
+{
+    return expected == actual
+           || (tdd_lane_int_family(expected) && tdd_lane_int_family(actual));
+}
+
 /* Worker results must have compatible physical and logical schema metadata
  * before any result row is copied into the private candidate.  A missing
  * type vector is the legacy spelling of an all-INT64 schema; append promotes
@@ -3923,7 +3948,12 @@ tdd_compound_map_entries(const col_rel_t *rel, uint32_t *entries_out)
  * declared_ncols is the `.decl` width a relation that takes input checks
  * host inserts against; a worker's delta may carry none, so only two
  * different declared widths conflict (Issue #2105: a recursive head seeded
- * by an inline fact has one, and its workers' deltas were refused). */
+ * by an inline fact has one, and its workers' deltas were refused).
+ * Integer-family lanes (INT32, INT64, UINT32, UINT64, BOOL) share the int64
+ * storage lane, as col_rel_append_all() documents, so any two of them are
+ * compatible: a recursive rule that reads its head before the head has rows
+ * can label a lane INT64 in one round and INT32 in the next (#2334).
+ * Any other lane type, STRING and FLOAT included, must match exactly. */
 static bool
 tdd_relation_schema_compatible(const col_rel_t *expected,
     const col_rel_t *actual)
@@ -3948,7 +3978,7 @@ tdd_relation_schema_compatible(const col_rel_t *expected,
             ? expected->column_types[col] : WIRELOG_TYPE_INT64;
         wirelog_column_type_t actual_type = actual->column_types
             ? actual->column_types[col] : WIRELOG_TYPE_INT64;
-        if (expected_type != actual_type)
+        if (!tdd_lane_types_compatible(expected_type, actual_type))
             return false;
     }
 
