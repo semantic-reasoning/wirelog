@@ -6,9 +6,11 @@
 #include "../wirelog/session_options.h"
 #include "../wirelog/thread.h"
 #include "../wirelog/wirelog.h"
+#include "../wirelog/wirelog-internal.h"
 #include <errno.h>
 #include <limits.h>
 #include <stdio.h>
+#include <stdarg.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -665,9 +667,404 @@ bound_probe_compatibility(void)
     }
 }
 
+static wl_evaluation_control_t *
+key_control(uint64_t limit, const void *owner)
+{
+    wl_evaluation_control_t *control = NULL;
+    CHECK(!wl_evaluation_control_create(limit, &control)
+        && !wl_evaluation_control_attach(control, owner)
+        && !wl_evaluation_control_begin(control, owner));
+    return control;
+}
+
+static uint64_t
+key_source_open(wl_columnar_relation_scalar_source_t *source, col_rel_t *rel,
+    wl_evaluation_control_t *control)
+{
+    bool initialized = false;
+    uint64_t id = wl_evaluation_control_active_attempt_id(control);
+    CHECK(!wl_columnar_relation_scalar_source_init_attempt_controlled(source,
+        &initialized, control, id) && initialized
+        && !wl_columnar_relation_scalar_source_begin_attempt_controlled(
+            source, rel, false));
+    /* Independent existing scalar-source constructor schedule. */
+    uint64_t expected = 1632 + 224 * ((rel->ncols + 7u) / 8u), actual = 0;
+    CHECK(!wl_evaluation_control_test_active_consumed(control, id, &actual)
+        && actual == expected
+        && source->phase == WL_COLUMNAR_RELATION_SCALAR_SOURCE_HELD);
+    return expected;
+}
+
+static void
+key_control_release(wl_evaluation_control_t *control, const void *owner)
+{
+    CHECK(!wl_evaluation_control_detach(control, owner));
+    wl_evaluation_control_release(control);
+}
+
+static void
+key_literal(col_rel_t *rel, const char *name, uint64_t allowance,
+    int expected_rc, uint64_t key_paid, uint32_t expected_out)
+{
+    int owner = 0;
+    uint64_t setup = 1632 + 224 * ((rel->ncols + 7u) / 8u);
+    wl_evaluation_control_t *control = key_control(setup + allowance, &owner);
+    uint64_t id = wl_evaluation_control_active_attempt_id(control);
+    wl_columnar_relation_scalar_source_t source;
+    CHECK(key_source_open(&source, rel, control) == setup);
+    uint32_t out = UINT32_MAX;
+    int rc = wl_columnar_join_pipeline_key_attempt(&source, name, &out,
+            control, id);
+    CHECK(rc == expected_rc && out == expected_out);
+    if (rc == WL_EVALUATION_CONTROL_WORK_LIMIT) {
+        /* Sticky refusal cannot restart a free scan or normalize output. */
+        uint32_t again = UINT32_MAX;
+        CHECK(wl_columnar_join_pipeline_key_attempt(&source, name, &again,
+            control, id) == rc && again == UINT32_MAX);
+    }
+    CHECK(wl_columnar_relation_scalar_source_end(&source, rc) == rc);
+    CHECK(wl_evaluation_control_finish(control, &owner, rc > 0 ? rc : 0,
+        0) == rc);
+    wl_evaluation_control_report_t report;
+    CHECK(!wl_evaluation_control_report(control, &report)
+        && report.attempt_id == id && report.result == rc
+        && report.consumed == setup + key_paid && !report.cleanup_status);
+    key_control_release(control, &owner);
+}
+
+static void
+test_key_literal_boundaries(void)
+{
+    col_rel_t *rel = col_rel_new_auto("wide keys", 257);
+    CHECK(rel);
+    key_literal(rel, "col256", 95, WL_EVALUATION_CONTROL_WORK_LIMIT, 0,
+        UINT32_MAX);
+    key_literal(rel, "col256", 96, WL_EVALUATION_CONTROL_WORK_LIMIT, 96, 0);
+    /* Canonical comparisons through col0/col128/col256 have respectively
+    * 0/560/1098 preceding bytes, including the first differing byte.
+    * Each visited column and each compared byte owns32; entry owns96. */
+    const struct {
+        const char *name;
+        uint32_t column;
+        uint64_t before_column, exact;
+    } cases[] = {{"col0", 0, 96, 288}, {"col128", 128, 22112, 22368},
+                 {"col256", 256, 43424, 43680}};
+    for (unsigned i = 0; i < sizeof(cases) / sizeof(cases[0]); ++i) {
+        uint64_t prefix = cases[i].before_column;
+        key_literal(rel, cases[i].name, prefix + 31,
+            WL_EVALUATION_CONTROL_WORK_LIMIT, prefix, 0);
+        key_literal(rel, cases[i].name, prefix + 32,
+            WL_EVALUATION_CONTROL_WORK_LIMIT, prefix + 32, 0);
+        key_literal(rel, cases[i].name, prefix + 63,
+            WL_EVALUATION_CONTROL_WORK_LIMIT, prefix + 32, 0);
+        key_literal(rel, cases[i].name, prefix + 64,
+            WL_EVALUATION_CONTROL_WORK_LIMIT, prefix + 64, 0);
+        key_literal(rel, cases[i].name, cases[i].exact - 1,
+            WL_EVALUATION_CONTROL_WORK_LIMIT, cases[i].exact - 32, 0);
+        key_literal(rel, cases[i].name, cases[i].exact, 0, cases[i].exact,
+            cases[i].column);
+    }
+    key_literal(rel, NULL, 96, EINVAL, 96, 0);
+    CHECK(!col_rel_destroy_checked(rel));
+    rel = col_rel_new_auto("parser keys", 4);
+    CHECK(rel);
+    /* Four column misses consume16 compared bytes: entry96+20*32=736.
+     * Three prefix bytes bring832. Decimal units, including NUL, own64. */
+    for (unsigned prefix = 0; prefix < 3; ++prefix) {
+        uint64_t paid = 736 + prefix * 32;
+        key_literal(rel, "col+1", paid + 31,
+            WL_EVALUATION_CONTROL_WORK_LIMIT, paid, 0);
+        key_literal(rel, "col+1", paid + 32,
+            WL_EVALUATION_CONTROL_WORK_LIMIT, paid + 32, 0);
+    }
+    for (unsigned digit = 0; digit < 3; ++digit) {
+        uint64_t paid = 832 + digit * 64;
+        key_literal(rel, "col+1", paid + 63,
+            WL_EVALUATION_CONTROL_WORK_LIMIT, paid, 0);
+        key_literal(rel, "col+1", paid + 64,
+            digit == 2 ? 0 : WL_EVALUATION_CONTROL_WORK_LIMIT,
+            paid + 64, digit == 2 ? 1 : 0);
+    }
+    key_literal(rel, "col4294967297", 1535,
+        WL_EVALUATION_CONTROL_WORK_LIMIT, 1472, 0);
+    key_literal(rel, "col4294967297", 1536, 0, 1536,
+        LONG_MAX > INT_MAX ? 1 : 0);
+    CHECK(!col_rel_destroy_checked(rel));
+}
+
+static void
+key_raw_parity(col_rel_t *rel, const char *name)
+{
+    int owner = 0;
+    wl_evaluation_control_t *control = key_control(0, &owner);
+    wl_columnar_relation_scalar_source_t source;
+    key_source_open(&source, rel, control);
+    int raw = col_rel_col_idx(rel, name);
+    uint32_t out = UINT32_MAX;
+    CHECK(!wl_columnar_join_pipeline_key_attempt(&source, name, &out,
+        control, wl_evaluation_control_active_attempt_id(control))
+        && out == (raw >= 0 ? (uint32_t)raw : 0));
+    CHECK(!wl_columnar_relation_scalar_source_end(&source, 0)
+        && !wl_evaluation_control_finish(control, &owner, 0, 0));
+    key_control_release(control, &owner);
+}
+
+static void
+test_key_name_semantics(void)
+{
+    const char *names[] = {"col2", "col2", "custom", ""};
+    col_rel_t *rel = NULL;
+    CHECK(!col_rel_alloc(&rel, "named keys")
+        && !col_rel_set_schema(rel, 4, names));
+    const char *queries[] = {"col2", "custom", "", "missing", "c", "co",
+                             "col", "col+", "col-", "col+1", "col-0", "col-1",
+                             "col \t\n\r\f\v+1", "col1junk", "col2147483648",
+                             "col4294967297", "col4294967299",
+                             "col9223372036854775807",
+                             "col9999999999999999999999999999999999999999",
+                             "col\xc3\xa9"};
+    for (unsigned i = 0; i < sizeof(queries) / sizeof(queries[0]); ++i)
+        key_raw_parity(rel, queries[i]);
+    /* Partial name metadata is assembled privately before any source lease,
+     * as in the existing scalar-source tests. Arrow names stay consistent. */
+    free(rel->col_names[0]); rel->col_names[0] = NULL;
+    CHECK(!ArrowSchemaSetName(rel->schema.children[0], ""));
+    key_raw_parity(rel, "col2");
+    for (unsigned c = 1; c < 4; ++c) {
+        free(rel->col_names[c]); rel->col_names[c] = NULL;
+        CHECK(!ArrowSchemaSetName(rel->schema.children[c], ""));
+    }
+    free(rel->col_names); rel->col_names = NULL;
+    key_literal(rel, "col2", 96, 0, 96, 0);
+    key_raw_parity(rel, "col2");
+    CHECK(!col_rel_destroy_checked(rel));
+}
+
+static void
+test_key_saved_attempt(void)
+{
+    for (unsigned mode = 0; mode < 5; ++mode) {
+        col_rel_t *rel = col_rel_new_auto("old key source", 4);
+        CHECK(rel);
+        int owner = 0;
+        wl_evaluation_control_t *control = key_control(mode ==
+                1 ? UINT64_MAX - 1 : 0, &owner);
+        uint64_t old = wl_evaluation_control_active_attempt_id(control);
+        wl_columnar_relation_scalar_source_t source;
+        uint64_t setup = key_source_open(&source, rel, control);
+        int expected = EINVAL;
+        if (!mode) {
+            wl_evaluation_control_request_cancel(control);
+            expected = WL_EVALUATION_CONTROL_CANCELLED;
+        } else if (mode == 1) {
+            CHECK(wl_evaluation_control_charge(control, UINT64_MAX)
+                == WL_EVALUATION_CONTROL_WORK_LIMIT);
+            expected = WL_EVALUATION_CONTROL_WORK_LIMIT;
+        } else {
+            CHECK(!wl_evaluation_control_finish(control, &owner, 0, 0));
+            if (mode >= 3) CHECK(!wl_evaluation_control_reset(control));
+            if (mode == 4) CHECK(!wl_evaluation_control_begin(control, &owner));
+        }
+        uint32_t out = UINT32_MAX;
+        CHECK(wl_columnar_join_pipeline_key_attempt(&source, "col3", &out,
+            control, old) == expected && out == UINT32_MAX);
+        CHECK(wl_columnar_relation_scalar_source_end(&source, expected)
+            == expected);
+        if (mode < 2)
+            CHECK(wl_evaluation_control_finish(control, &owner, 0,
+                0) == expected);
+        if (mode == 4) {
+            uint64_t successor =
+                wl_evaluation_control_active_attempt_id(control);
+            uint64_t consumed = UINT64_MAX;
+            CHECK(successor && successor != old
+                && !wl_evaluation_control_test_active_consumed(control,
+                successor, &consumed) && !consumed
+                && !wl_evaluation_control_finish(control, &owner, 0, 0));
+        }
+        wl_evaluation_control_report_t report;
+        CHECK(!wl_evaluation_control_report(control, &report));
+        if (mode == 4) CHECK(report.attempt_id != old && !report.consumed
+                && !report.result);
+        else CHECK(report.attempt_id == old && report.consumed == setup
+                && report.result == (mode < 2 ? expected : 0));
+        key_control_release(control, &owner);
+        CHECK(!col_rel_destroy_checked(rel));
+    }
+}
+
+static void
+key_program_append(char **next, size_t *remaining, const char *format, ...)
+{
+    va_list args;
+    va_start(args, format);
+    int n = vsnprintf(*next, *remaining, format, args);
+    va_end(args);
+    CHECK(n >= 0 && (size_t)n < *remaining);
+    *next += n; *remaining -= (size_t)n;
+}
+
+enum { KEY_WIDE = 257, KEY_RESULT = 258 };
+static wl_session_t *key_wide_session;
+static unsigned key_wide_events, key_wide_stop_mode;
+
+static void
+key_wide_checkpoint(wl_evaluation_control_t *control, unsigned event,
+    uint64_t generation, uint32_t extent, uint64_t work)
+{
+    (void)generation; (void)extent; (void)work;
+    if (event != WL_COLUMNAR_JOIN_PIPELINE_TEST_PROBE_KEYS) return;
+    CHECK(key_wide_session && control == key_wide_session->evaluation_control);
+    ++key_wide_events;
+    if (key_wide_events == 129 && key_wide_stop_mode) {
+        if (key_wide_stop_mode ==
+            1) wl_evaluation_control_request_cancel(control);
+        else CHECK(wl_evaluation_control_charge(control, UINT64_MAX)
+                == WL_EVALUATION_CONTROL_WORK_LIMIT);
+    }
+}
+
+static void
+key_environment(const char *name, const char *value)
+{
+#ifdef _WIN32
+    CHECK(!_putenv_s(name, value ? value : ""));
+#else
+    CHECK(!(value ? setenv(name, value, 1) : unsetenv(name)));
+#endif
+}
+
+static void
+test_key_generated_wide(unsigned stop_mode)
+{
+    char text[65536], *next = text;
+    size_t remaining = sizeof(text);
+    const char *decls[] = {"a", "p", "output"};
+    for (unsigned d = 0; d < 3; ++d) {
+        key_program_append(&next, &remaining, ".decl %s(", decls[d]);
+        for (unsigned c = 0; c < KEY_WIDE; ++c)
+            key_program_append(&next, &remaining, "%sx%u:int64", c ? "," : "",
+                c);
+        key_program_append(&next, &remaining, d == 2 ? ",t:int64)\n" : ")\n");
+    }
+    key_program_append(&next, &remaining, ".decl b(x0:int64,t:int64)\noutput(");
+    for (unsigned c = 0; c < KEY_WIDE; ++c)
+        key_program_append(&next, &remaining, "%sx%u", c ? "," : "", c);
+    key_program_append(&next, &remaining, ",t) :- a(");
+    for (unsigned c = 0; c < KEY_WIDE; ++c)
+        key_program_append(&next, &remaining, "%sx%u", c ? "," : "", c);
+    key_program_append(&next, &remaining, "),b(x0,t),!p(");
+    for (unsigned c = 0; c < KEY_WIDE; ++c)
+        key_program_append(&next, &remaining, "%sx%u", c ? "," : "", c);
+    key_program_append(&next, &remaining, ").\n");
+    wirelog_error_t error;
+    wirelog_program_t *program = wirelog_parse_string(text, &error);
+    wl_plan_t *plan = NULL;
+    CHECK(program && !wl_plan_from_program(program, &plan));
+    unsigned anti = 0, joins = 0;
+    for (unsigned st = 0; st < plan->stratum_count; ++st)
+        for (unsigned r = 0; r < plan->strata[st].relation_count; ++r) {
+            const wl_plan_relation_t *relation = &plan->strata[st].relations[r];
+            for (unsigned i = 0; i < relation->op_count; ++i) {
+                const wl_plan_op_t *op = &relation->ops[i];
+                if (op->op == WL_PLAN_OP_JOIN) ++joins;
+                if (op->op == WL_PLAN_OP_ANTIJOIN) {
+                    CHECK(op->key_count == KEY_WIDE && op->right_keys
+                        && !strcmp(op->right_keys[KEY_WIDE - 1], "col256"));
+                    ++anti;
+                }
+            }
+        }
+    CHECK(anti == 1 && joins == 1);
+    const char *old_bytes = getenv("WIRELOG_JOIN_BATCH_BYTES");
+    const char *old_strict = getenv("WIRELOG_JOIN_BATCH_STRICT");
+    char *saved_bytes = old_bytes ? wl_strdup(old_bytes) : NULL;
+    char *saved_strict = old_strict ? wl_strdup(old_strict) : NULL;
+    CHECK((!old_bytes || saved_bytes) && (!old_strict || saved_strict));
+    key_environment("WIRELOG_JOIN_BATCH_BYTES", "1048576");
+    key_environment("WIRELOG_JOIN_BATCH_STRICT", "0");
+    wl_evaluation_control_t *control = NULL;
+    CHECK(!wl_evaluation_control_create(stop_mode == 2 ? UINT64_MAX - 1 : 0,
+        &control));
+    wl_columnar_memory_resolution_t resolution = {
+        .budget_bytes = UINT64_C(512) << 20,
+            .usable_bytes = UINT64_C(512) << 20,
+            .mode = WL_COLUMNAR_MEMORY_MODE_ENFORCING,
+            .source = WL_COLUMNAR_MEMORY_SOURCE_ENV,
+            .status = WL_COLUMNAR_MEMORY_OK
+    };
+    wl_columnar_memory_governor_ref_t *governor =
+        wl_columnar_memory_governor_ref_create(&resolution);
+    CHECK(governor);
+    wl_session_options_t options;
+    wl_session_options_init(&options);
+    options.evaluation_control = control; options.memory_governor = governor;
+    wl_session_t *session = NULL, *raw = NULL;
+    CHECK(!wl_session_create_with_options(wl_backend_columnar(), plan, 1,
+        &options, &session)
+        && !wl_session_create(wl_backend_columnar(), plan, 1, &raw));
+    CHECK(((wl_col_session_t *)session)->join_batch_bytes == 1048576
+        && !((wl_col_session_t *)session)->join_batch_strict);
+    int64_t a[2 * KEY_WIDE], b[] = {1, 99};
+    for (unsigned c = 0; c < KEY_WIDE; ++c)
+        a[c] = a[KEY_WIDE + c] = c ? c : 1;
+    a[KEY_WIDE - 1] = 42; a[2 * KEY_WIDE - 1] = 43;
+    wl_session_t *sessions[] = {session, raw};
+    for (unsigned i = 0; i < 2; ++i)
+        CHECK(!wl_session_insert(sessions[i], "a", a, 2, KEY_WIDE)
+            && !wl_session_insert(sessions[i], "b", b, 1, 2)
+            && !wl_session_insert(sessions[i], "p", a, 1, KEY_WIDE));
+    key_wide_session = session; key_wide_stop_mode = stop_mode;
+    key_wide_events = 0;
+    wl_columnar_join_pipeline_test_numeric_checkpoint = key_wide_checkpoint;
+    int rc = EAGAIN;
+    for (unsigned turn = 0; rc == EAGAIN && turn < 1000000; ++turn)
+        rc = wl_session_step(session);
+    if (stop_mode) {
+        CHECK(rc == (stop_mode == 1 ? WL_EVALUATION_CONTROL_CANCELLED
+                : WL_EVALUATION_CONTROL_WORK_LIMIT)
+            && key_wide_events == 129
+            && !session_find_rel((wl_col_session_t *)session, "output"));
+        CHECK(!wl_evaluation_control_reset(control)
+            && !wl_evaluation_control_configure(control, 0));
+        key_wide_stop_mode = 0; key_wide_events = 0;
+        rc = EAGAIN;
+        for (unsigned turn = 0; rc == EAGAIN && turn < 1000000; ++turn)
+            rc = wl_session_step(session);
+    }
+    CHECK(!rc && key_wide_events == KEY_WIDE + 1);
+    wl_columnar_join_pipeline_test_numeric_checkpoint = NULL;
+    key_wide_session = NULL;
+    CHECK(!finish(raw));
+    const col_rel_t *actual = session_find_rel((wl_col_session_t *)session,
+            "output");
+    const col_rel_t *reference = session_find_rel((wl_col_session_t *)raw,
+            "output");
+    CHECK(actual && reference && actual->nrows == 1 && reference->nrows == 1
+        && actual->ncols == KEY_RESULT && reference->ncols == KEY_RESULT);
+    for (unsigned c = 0; c < KEY_WIDE; ++c)
+        CHECK(actual->columns[c][0] == a[KEY_WIDE + c]
+            && reference->columns[c][0] == a[KEY_WIDE + c]);
+    CHECK(actual->columns[KEY_WIDE][0] == 99
+        && reference->columns[KEY_WIDE][0] == 99);
+    CHECK(!wl_session_try_destroy(&session) && !wl_session_try_destroy(&raw));
+    wl_evaluation_control_release(control);
+    wl_plan_free(plan); wirelog_program_free(program);
+    CHECK(!wl_columnar_memory_reserved(
+            wl_columnar_memory_governor_ref_get(governor)));
+    wl_columnar_memory_governor_ref_release(governor);
+    key_environment("WIRELOG_JOIN_BATCH_BYTES", saved_bytes);
+    key_environment("WIRELOG_JOIN_BATCH_STRICT", saved_strict);
+    free(saved_bytes); free(saved_strict);
+}
+
 int
 main(void)
 {
+    test_key_literal_boundaries();
+    test_key_name_semantics();
+    test_key_saved_attempt();
+    for (unsigned mode = 0; mode < 3; ++mode) test_key_generated_wide(mode);
     bound_probe_compatibility();
     for (unsigned kind = 0; kind < 18; ++kind) run(kind, 0, 0, false);
     for (unsigned point = 1; point <= 7; ++point)
