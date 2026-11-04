@@ -1244,7 +1244,16 @@ tdd_shared_view_deep_copy_fallback(wl_col_session_t *sess, col_rel_t *dst,
         dst->nrows = 0;
         wl_columnar_relation_touch_view(dst);
     }
-    rc = col_rel_append_all(dst, src, NULL);
+    /* An empty, untyped destination takes the source's lane types, as the
+     * shared view would have: an untyped relation refuses FLOAT rows
+     * (#2334).  A destination that is itself a shared view is left to
+     * col_rel_append_all() as before: its alias would make
+     * col_rel_set_column_types() refuse with EBUSY. */
+    if (rc == 0 && dst->nrows == 0 && !dst->column_types && !dst->col_shared
+        && src->column_types && dst->ncols == src->ncols)
+        rc = col_rel_set_column_types(dst, src->column_types, src->ncols);
+    if (rc == 0)
+        rc = col_rel_append_all(dst, src, NULL);
     int release_rc = reader_acquired
         ? col_rel_source_reader_release(&reader) : 0;
     if (rc == 0 && release_rc != 0)
@@ -4574,6 +4583,27 @@ tdd_stage_relation(wl_col_session_t *coord, col_eval_tdd_worker_ctx_t *ctxs,
     return rc;
 }
 
+#ifdef WL_SESSION_TEST_HOOKS
+/* Test hook (#2334): while nonzero, each new shared view of an exchange
+ * union fails with ENOMEM, as under memory pressure, and decrements it,
+ * so the deep-copy fallback runs.  Read and written on the coordinator
+ * thread only. */
+uint32_t wl_columnar_eval_test_fail_exchange_shared_views;
+#endif
+
+/* col_rel_install_shared_view() for a new view of an exchange union. */
+static int
+tdd_exchange_install_shared_view(col_rel_t *view, const col_rel_t *src)
+{
+#ifdef WL_SESSION_TEST_HOOKS
+    if (wl_columnar_eval_test_fail_exchange_shared_views > 0) {
+        wl_columnar_eval_test_fail_exchange_shared_views--;
+        return ENOMEM;
+    }
+#endif
+    return col_rel_install_shared_view(view, src);
+}
+
 /* @rc for an operation on @rel, which the exchange created: a governor
  * refusal reads ENOSPC and is recorded on @coord. */
 static int
@@ -4586,19 +4616,35 @@ tdd_exchange_status(wl_col_session_t *coord, col_rel_t *rel, int rc)
 }
 
 /* A relation the exchange creates (#1373): governed from the start under
- * @coord's governor when it has one, else as col_rel_new_auto() makes it. */
+ * @coord's governor when it has one, else as col_rel_new_auto() makes it.
+ * When @like is typed with @ncols lanes, the new relation takes its lane
+ * types (#2334): an untyped relation refuses FLOAT rows. */
 static int
 tdd_exchange_relation_new(wl_col_session_t *coord, const char *name,
-    uint32_t ncols, col_rel_t **out)
+    uint32_t ncols, const col_rel_t *like, col_rel_t **out)
 {
+    int rc = 0;
     *out = NULL;
     if (!coord->memory_governor) {
         *out = col_rel_new_auto(name, ncols);
-        return *out ? 0 : ENOMEM;
+        if (!*out)
+            return ENOMEM;
+    } else {
+        rc = wl_columnar_relation_new_auto_governed(name, ncols,
+                COL_REL_INIT_CAP, false, coord->memory_governor, out);
+        rc = tdd_exchange_status(coord, *out, rc);
+        if (rc != 0)
+            return rc;
     }
-    int rc = wl_columnar_relation_new_auto_governed(name, ncols,
-            COL_REL_INIT_CAP, false, coord->memory_governor, out);
-    return tdd_exchange_status(coord, *out, rc);
+    if (like && like->column_types && like->ncols == ncols) {
+        rc = tdd_exchange_status(coord, *out,
+                col_rel_set_column_types(*out, like->column_types, ncols));
+        if (rc != 0) {
+            col_rel_destroy(*out);
+            *out = NULL;
+        }
+    }
+    return rc;
 }
 
 /* Put the @W partitions col_rel_exchange_partition() wrote to @parts under
@@ -4654,6 +4700,7 @@ tdd_broadcast_relation_delta(const wl_plan_stratum_t *sp, uint32_t ri,
         (void)session_remove_rel(&coord->tdd_workers[w], dname);
 
     uint32_t total = 0, ncols = 0;
+    const col_rel_t *first = NULL;
     for (uint32_t w = 0; w < W; w++) {
         col_rel_t *d = ctxs[w].delta_rels[ri];
         if (d && d->nrows > 0) {
@@ -4662,8 +4709,10 @@ tdd_broadcast_relation_delta(const wl_plan_stratum_t *sp, uint32_t ri,
                 tdd_destroy_delta_slots(ctxs, W, sp->relation_count);
                 return EOVERFLOW;
             }
-            if (ncols == 0)
+            if (ncols == 0) {
                 ncols = d->ncols;
+                first = d;
+            }
         }
     }
     if (total == 0) {
@@ -4675,7 +4724,7 @@ tdd_broadcast_relation_delta(const wl_plan_stratum_t *sp, uint32_t ri,
     }
 
     col_rel_t *union_d = NULL;
-    rc = tdd_exchange_relation_new(coord, dname, ncols, &union_d);
+    rc = tdd_exchange_relation_new(coord, dname, ncols, first, &union_d);
     if (rc != 0)
         return rc;
 
@@ -4715,7 +4764,7 @@ tdd_broadcast_relation_delta(const wl_plan_stratum_t *sp, uint32_t ri,
         col_rel_t *view = col_rel_new_auto(dname, ncols);
         if (!view)
             return ENOMEM;
-        rc = col_rel_install_shared_view(view, union_d);
+        rc = tdd_exchange_install_shared_view(view, union_d);
         bool shared = rc == 0;
         if (!shared) {
             /* Fallback: deep copy on shared-view alloc failure */
@@ -4813,6 +4862,7 @@ tdd_gather_for_worker(wl_col_session_t *coord, uint32_t dst, uint32_t W,
 {
     uint32_t total_rows = 0;
     uint32_t ncols = 0;
+    const col_rel_t *first = NULL;
 
     for (uint32_t src = 0; src < W; src++) {
         col_rel_t *part = coord->exchange_bufs[src][dst];
@@ -4822,8 +4872,10 @@ tdd_gather_for_worker(wl_col_session_t *coord, uint32_t dst, uint32_t W,
                 tdd_free_exchange_bufs(coord);
                 return EOVERFLOW;
             }
-            if (ncols == 0)
+            if (ncols == 0) {
                 ncols = part->ncols;
+                first = part;
+            }
         }
     }
 
@@ -4833,7 +4885,8 @@ tdd_gather_for_worker(wl_col_session_t *coord, uint32_t dst, uint32_t W,
         return 0;
 
     col_rel_t *gathered = NULL;
-    int rc = tdd_exchange_relation_new(coord, dname, ncols, &gathered);
+    int rc = tdd_exchange_relation_new(coord, dname, ncols, first,
+            &gathered);
     if (rc != 0)
         return rc;
 
@@ -5003,6 +5056,7 @@ tdd_exchange_deltas(const wl_plan_stratum_t *sp,
              * Used for replicate-mode strata where IDB is not partitioned. */
             uint64_t broadcast_t0 = now_ns();
             uint32_t total = 0, ncols = 0;
+            const col_rel_t *first = NULL;
             for (uint32_t w = 0; w < W; w++) {
                 col_rel_t *d = ctxs[w].delta_rels[ri];
                 if (d && d->nrows > 0) {
@@ -5012,7 +5066,10 @@ tdd_exchange_deltas(const wl_plan_stratum_t *sp,
                         rc = EOVERFLOW;
                         goto exchange_done;
                     }
-                    if (ncols == 0) ncols = d->ncols;
+                    if (ncols == 0) {
+                        ncols = d->ncols;
+                        first = d;
+                    }
                 }
             }
             if (total == 0) {
@@ -5022,7 +5079,8 @@ tdd_exchange_deltas(const wl_plan_stratum_t *sp,
                 }
             } else {
                 col_rel_t *union_d = NULL;
-                rc = tdd_exchange_relation_new(coord, dname, ncols, &union_d);
+                rc = tdd_exchange_relation_new(coord, dname, ncols, first,
+                        &union_d);
                 if (rc != 0)
                     goto exchange_done;
                 for (uint32_t w = 0; w < W; w++) {
@@ -5040,7 +5098,7 @@ tdd_exchange_deltas(const wl_plan_stratum_t *sp,
                     col_rel_t *copy;
                     if (dst < W - 1) {
                         rc = tdd_exchange_relation_new(coord, dname, ncols,
-                                &copy);
+                                union_d, &copy);
                         if (rc != 0) {
                             col_rel_destroy(union_d);
                             goto exchange_done;
@@ -5518,6 +5576,7 @@ tdd_broadcast_deltas(const wl_plan_stratum_t *sp,
         /* Count total rows and find ncols */
         uint32_t total_rows = 0;
         uint32_t ncols = 0;
+        const col_rel_t *first = NULL;
         for (uint32_t w = 0; w < W; w++) {
             col_rel_t *d = ctxs[w].delta_rels[ri];
             if (d && d->nrows > 0) {
@@ -5526,8 +5585,10 @@ tdd_broadcast_deltas(const wl_plan_stratum_t *sp,
                     tdd_destroy_delta_slots(ctxs, W, nrels);
                     return EOVERFLOW;
                 }
-                if (ncols == 0)
+                if (ncols == 0) {
                     ncols = d->ncols;
+                    first = d;
+                }
             }
         }
 
@@ -5554,7 +5615,7 @@ tdd_broadcast_deltas(const wl_plan_stratum_t *sp,
             union_from_session = true;
         } else {
             int new_rc = tdd_exchange_relation_new(coord, dname, ncols,
-                    &union_d);
+                    first, &union_d);
             if (new_rc != 0) {
                 for (uint32_t w = 0; w < W; w++) {
                     col_rel_destroy(ctxs[w].delta_rels[ri]);
@@ -5624,7 +5685,7 @@ tdd_broadcast_deltas(const wl_plan_stratum_t *sp,
                 col_rel_t *new_d = col_rel_new_auto(dname, ncols);
                 if (!new_d)
                     return ENOMEM;
-                int rc = col_rel_install_shared_view(new_d, union_d);
+                int rc = tdd_exchange_install_shared_view(new_d, union_d);
                 bool shared = rc == 0;
                 if (!shared) {
                     /* Fallback: deep copy on shared-view alloc failure */
@@ -6456,6 +6517,7 @@ tdd_bdx_exchange_deltas(const wl_plan_stratum_t *sp,
 
         /* Step 1: Union all worker deltas */
         uint32_t total = 0, ncols = 0;
+        const col_rel_t *first = NULL;
         for (uint32_t w = 0; w < W; w++) {
             col_rel_t *d = ctxs[w].delta_rels[ri];
             if (d && d->nrows > 0) {
@@ -6464,8 +6526,10 @@ tdd_bdx_exchange_deltas(const wl_plan_stratum_t *sp,
                     tdd_destroy_delta_slots(ctxs, W, nrels);
                     return EOVERFLOW;
                 }
-                if (ncols == 0)
+                if (ncols == 0) {
                     ncols = d->ncols;
+                    first = d;
+                }
             }
         }
 
@@ -6478,8 +6542,14 @@ tdd_bdx_exchange_deltas(const wl_plan_stratum_t *sp,
             continue;
         }
 
+        /* The union takes the coordinator IDB's lane types when it has
+         * them, so its labels do not depend on which worker derived the
+         * first rows (#2334). */
+        col_rel_t *coord_idb = session_find_rel(coord, rel_name);
         col_rel_t *combined = NULL;
-        rc = tdd_exchange_relation_new(coord, dname, ncols, &combined);
+        rc = tdd_exchange_relation_new(coord, dname, ncols,
+                coord_idb && coord_idb->column_types
+                && coord_idb->ncols == ncols ? coord_idb : first, &combined);
         if (rc != 0)
             return rc;
 
@@ -6501,7 +6571,6 @@ tdd_bdx_exchange_deltas(const wl_plan_stratum_t *sp,
         if (combined->nrows > 1)
             tdd_dedup_rel(combined);
 
-        col_rel_t *coord_idb = session_find_rel(coord, rel_name);
         if (coord_idb && coord_idb->nrows > 0 && combined->nrows > 0) {
             rc = tdd_hashset_diff(combined, coord_idb);
             if (rc != 0) {
@@ -6626,7 +6695,7 @@ tdd_bdx_exchange_deltas(const wl_plan_stratum_t *sp,
             col_rel_t *view = col_rel_new_auto(dname, ncols);
             if (!view)
                 return ENOMEM;
-            rc = col_rel_install_shared_view(view, combined);
+            rc = tdd_exchange_install_shared_view(view, combined);
             bool shared = rc == 0;
             if (!shared) {
                 rc = tdd_shared_view_deep_copy_fallback(NULL, view,
