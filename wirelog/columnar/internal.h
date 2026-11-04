@@ -5049,13 +5049,23 @@ col_rel_t *
 session_find_rel(wl_col_session_t *sess, const char *name);
 
 /*
+ * The entry of @sess's plan->idb_schemas for the IDB @name, or NULL when
+ * the plan has none (Issue #2334).
+ */
+const wl_plan_idb_schema_t *
+wl_columnar_session_idb_schema(const wl_col_session_t *sess, const char *name);
+
+/*
  * The empty relation an IDB @name of @sess's stratum starts as before any
  * rule has produced rows for it (Issue #2334).  When the session's plan
- * declares @name in plan->idb_schemas, it has that width and those lane
- * types; otherwise it is zero-width and untyped, and the first rows
- * published into it define its schema.  The caller registers it.
- * Returns 0, EINVAL for a NULL @name or @out, ENOMEM, or ENOSPC when the
- * governor refused the schema.
+ * lists @name in plan->idb_schemas, it has that width and, for a declared
+ * relation, those lane types; an undeclared one has no lane types until
+ * rows are published into it (see tdd_idb_adopts_first_rows() in eval.c).
+ * Otherwise, and for a NULL @sess or a session without a plan, it is
+ * zero-width and untyped, and the first rows published into it define its
+ * schema.  The caller registers it.  Returns 0, EINVAL for a NULL @name or
+ * @out, or the error col_rel_alloc(), col_rel_set_schema() or
+ * col_rel_set_column_types() returned (ENOMEM, EOVERFLOW, EINVAL).
  */
 int
 wl_columnar_session_idb_placeholder_new(const wl_col_session_t *sess,

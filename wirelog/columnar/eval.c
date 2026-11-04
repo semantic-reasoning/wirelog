@@ -4017,6 +4017,22 @@ tdd_relation_schema_compatible(const col_rel_t *expected,
     return true;
 }
 
+/* True when @target, an empty relation of @session holding the IDB @name
+ * or its delta, takes the schema of the first rows published into it
+ * (#2334): @target is still untyped and the plan lists @name as an
+ * undeclared relation.  Its placeholder has the rule heads' width but no
+ * lane types, which those rows define. */
+static bool
+tdd_idb_adopts_first_rows(const wl_col_session_t *session, const char *name,
+    const col_rel_t *target)
+{
+    if (!target || target->nrows != 0 || target->column_types)
+        return false;
+    const wl_plan_idb_schema_t *schema
+        = wl_columnar_session_idb_schema(session, name);
+    return schema && !schema->declared;
+}
+
 /*
  * Merge one coordinator relation transactionally.  The target is never
  * changed while worker results are being checked, appended, sorted, or
@@ -4074,7 +4090,8 @@ tdd_merge_relation_results(wl_col_session_t *coord, col_rel_t **target_io,
         return 0;
     }
 
-    if (target && target->ncols != 0) {
+    if (target && target->ncols != 0
+        && !tdd_idb_adopts_first_rows(coord, rel_name, target)) {
         rc = wl_columnar_relation_deep_copy_governed(target, &candidate,
                 coord ? coord->memory_governor : target->memory_governor);
         if (rc == ENOSPC && coord)
@@ -6728,11 +6745,13 @@ tdd_bdx_exchange_deltas(const wl_plan_stratum_t *sp,
     return 0;
 }
 
+/* @adopt: build from the first input even though @target has a width,
+ * as tdd_idb_adopts_first_rows() decides. */
 static int
 tdd_owner_build_candidate(wl_col_session_t *session, col_rel_t *target,
     const char *name,
     col_rel_t *const *inputs, uint32_t input_count, bool preserve_target_rows,
-    wl_columnar_memory_governor_ref_t *governor, col_rel_t **out)
+    bool adopt, wl_columnar_memory_governor_ref_t *governor, col_rel_t **out)
 {
     col_rel_t *source = target;
     col_rel_t *candidate = NULL;
@@ -6740,7 +6759,7 @@ tdd_owner_build_candidate(wl_col_session_t *session, col_rel_t *target,
     if (!name || !out || (!inputs && input_count > 0))
         return EINVAL;
     *out = NULL;
-    if (!source || source->ncols == 0) {
+    if (!source || source->ncols == 0 || adopt) {
         for (uint32_t i = 0; i < input_count; i++) {
             if (inputs[i] && inputs[i]->ncols > 0) {
                 source = inputs[i];
@@ -6748,10 +6767,11 @@ tdd_owner_build_candidate(wl_col_session_t *session, col_rel_t *target,
             }
         }
     }
-    if (target && target->nrows == 0 && target->ncols == 0
+    if (target && target->nrows == 0 && (target->ncols == 0 || adopt)
         && source && source->ncols > 0) {
         /* Preserve the previous exchange behavior for an existing empty,
-         * schema-less IDB: the first accepted delta supplies its schema.
+         * schema-less IDB, or an undeclared one with only its width: the
+         * first accepted delta supplies its schema.
          * The target has no rows to carry over, so building from the input
          * also preserves its complete logical metadata. */
         rc = eval_relation_new_like_checked(session, name, source,
@@ -6836,7 +6856,7 @@ wl_columnar_eval_test_owner_build_candidate(col_rel_t *target,
     bool preserve_target_rows, col_rel_t **out)
 {
     return tdd_owner_build_candidate(NULL, target, name, inputs, input_count,
-               preserve_target_rows, NULL, out);
+               preserve_target_rows, false, NULL, out);
 }
 #endif
 
@@ -7080,6 +7100,7 @@ tdd_owner_exchange_deltas(const wl_plan_stratum_t *sp,
         if (coord_idb && combined->nrows > 0) {
             wl_columnar_source_access_reader_t reader = { 0 };
             if (coord_idb->ncols != 0
+                && !tdd_idb_adopts_first_rows(coord, rel_name, coord_idb)
                 && !tdd_relation_schema_compatible(coord_idb, combined)) {
                 rc = EINVAL;
                 goto fail;
@@ -7109,6 +7130,7 @@ tdd_owner_exchange_deltas(const wl_plan_stratum_t *sp,
             col_rel_t *candidate = NULL;
             rc = tdd_owner_build_candidate(coord, coord_idb, rel_name,
                     (col_rel_t *const[]){ combined }, 1, true,
+                    tdd_idb_adopts_first_rows(coord, rel_name, coord_idb),
                     coord->memory_governor, &candidate);
             if (rc != 0)
                 goto fail;
@@ -7161,6 +7183,7 @@ tdd_owner_exchange_deltas(const wl_plan_stratum_t *sp,
                 col_rel_t *candidate = NULL;
                 rc = tdd_owner_build_candidate(worker, widb, rel_name,
                         (col_rel_t *const[]){ part }, 1, true,
+                        tdd_idb_adopts_first_rows(worker, rel_name, widb),
                         worker->memory_governor, &candidate);
                 if (rc != 0)
                     goto fail;
@@ -7182,8 +7205,9 @@ tdd_owner_exchange_deltas(const wl_plan_stratum_t *sp,
                 col_rel_t *candidate = NULL;
                 empty_inputs[0] = part;
                 rc = tdd_owner_build_candidate(worker, old_delta, dname,
-                        empty_inputs, 1, false, worker->memory_governor,
-                        &candidate);
+                        empty_inputs, 1, false,
+                        tdd_idb_adopts_first_rows(worker, rel_name,
+                        old_delta), worker->memory_governor, &candidate);
                 if (rc != 0)
                     goto fail;
                 rc = wl_columnar_eval_owner_publication_add(&txn, worker,
