@@ -47,6 +47,10 @@ wl_test_setenv_(const char *name, const char *value, int overwrite)
 #  define setenv wl_test_setenv_
 #endif
 
+/* eval.c test hook: while nonzero, each new shared view of an exchange
+ * union fails with ENOMEM and decrements it. */
+extern uint32_t wl_columnar_eval_test_fail_exchange_shared_views;
+
 static int tests_run = 0;
 static int tests_passed = 0;
 static int tests_failed = 0;
@@ -655,6 +659,138 @@ test_float_heads(void)
         "1.5,2.5 2.5,1.5 3.5,4.5 4.5,3.5 5.5,6.5 6.5,5.5");
 }
 
+/* ======================================================================== */
+/* Typed exchange unions (BDX self-join)                                    */
+/* ======================================================================== */
+
+static const uint32_t W1248[] = { 1, 2, 4, 8 };
+
+/*
+ * A head joined with itself in a recursive rule exchanges its deltas by
+ * broadcast: the coordinator unions every worker's delta and installs the
+ * union on each worker.  Before #2334 the union was untyped, so a FLOAT
+ * delta appended into it failed with EINVAL at two or more workers, in
+ * either rule order.  The string and int programs are controls.
+ */
+static void
+test_self_join(void)
+{
+    check_rows_at("float self-join, recursive rule first",
+        ".decl e(x: float, y: float)\n"
+        ".decl r(x: float, y: float)\n"
+        "r(x, z) :- r(x, y), r(y, z).\n"
+        "r(x, y) :- e(x, y).\n"
+        "e(0.5, 1.5). e(1.5, 2.5). e(2.5, 3.5).\n",
+        "r", W1248, 4, "bdx",
+        "0.5,1.5 0.5,2.5 0.5,3.5 1.5,2.5 1.5,3.5 2.5,3.5");
+    check_rows_at("float self-join, base rule first",
+        ".decl e(x: float, y: float)\n"
+        ".decl r(x: float, y: float)\n"
+        "r(x, y) :- e(x, y).\n"
+        "r(x, z) :- r(x, y), r(y, z).\n"
+        "e(0.5, 1.5). e(1.5, 2.5). e(2.5, 3.5).\n",
+        "r", W1248, 4, "bdx",
+        "0.5,1.5 0.5,2.5 0.5,3.5 1.5,2.5 1.5,3.5 2.5,3.5");
+    check_rows_at("float/int32 self-join",
+        ".decl e(x: int32, y: int32, w: float)\n"
+        ".decl r(x: int32, y: int32, w: float)\n"
+        "r(x, z, w) :- r(x, y, w), r(y, z, v).\n"
+        "r(x, y, w) :- e(x, y, w).\n"
+        "e(1, 2, 0.25). e(2, 3, 0.5). e(3, 4, 0.75).\n",
+        "r", W1248, 4, "bdx",
+        "1,2,0.25 1,3,0.25 1,4,0.25 2,3,0.5 2,4,0.5 3,4,0.75");
+    check_rows_at("string self-join",
+        ".decl e(x: string, y: string)\n"
+        ".decl r(x: string, y: string)\n"
+        "r(x, z) :- r(x, y), r(y, z).\n"
+        "r(x, y) :- e(x, y).\n"
+        "e(\"a\", \"b\"). e(\"b\", \"c\"). e(\"c\", \"d\").\n",
+        "r", W1248, 4, "bdx",
+        "\"a\",\"b\" \"a\",\"c\" \"a\",\"d\" \"b\",\"c\" \"b\",\"d\" "
+        "\"c\",\"d\"");
+    check_rows_at("int self-join",
+        ".decl e(x: int32, y: int32)\n"
+        ".decl r(x: int32, y: int32)\n"
+        "r(x, z) :- r(x, y), r(y, z).\n"
+        "r(x, y) :- e(x, y).\n"
+        "e(1, 2). e(2, 3). e(3, 4).\n",
+        "r", W1248, 4, "bdx", "1,2 1,3 1,4 2,3 2,4 3,4");
+    /* Joined on the column the head is partitioned by, the self-join
+     * broadcasts each round's union without the BDX diff. */
+    check_rows_at("float self-join on the partition key",
+        ".decl e(x: float, y: float)\n"
+        ".decl r(x: float, y: float)\n"
+        "r(y, z) :- r(x, y), r(x, z).\n"
+        "r(x, y) :- e(x, y).\n"
+        "e(0.5, 1.5). e(0.5, 2.5). e(1.5, 3.5).\n",
+        "r", W1248, 4, "aligned",
+        "0.5,1.5 0.5,2.5 1.5,1.5 1.5,2.5 1.5,3.5 2.5,1.5 2.5,2.5 2.5,3.5 "
+        "3.5,1.5 3.5,2.5 3.5,3.5");
+    check_rows_at("string self-join on the partition key",
+        ".decl e(x: string, y: string)\n"
+        ".decl r(x: string, y: string)\n"
+        "r(y, z) :- r(x, y), r(x, z).\n"
+        "r(x, y) :- e(x, y).\n"
+        "e(\"a\", \"b\"). e(\"a\", \"c\"). e(\"b\", \"d\").\n",
+        "r", W1248, 4, "aligned",
+        "\"a\",\"b\" \"a\",\"c\" \"b\",\"b\" \"b\",\"c\" \"b\",\"d\" "
+        "\"c\",\"b\" \"c\",\"c\" \"c\",\"d\" \"d\",\"b\" \"d\",\"c\" "
+        "\"d\",\"d\"");
+}
+
+/*
+ * When a worker's shared view of an exchange union cannot be installed,
+ * the exchange deep-copies the union into the view instead.  The view is
+ * created untyped, and before #2334 that copy refused the FLOAT union with
+ * EINVAL.  Every view fails here; the hook's count shows the copies ran.
+ */
+static void
+check_rows_deep_copied(const char *label, const char *src, uint32_t workers,
+    const char *strategy, const char *expected)
+{
+    const uint32_t budget = 1000000u;
+    wl_columnar_eval_test_fail_exchange_shared_views = budget;
+    check_rows(label, src, "r", workers, strategy, expected);
+    uint32_t left = wl_columnar_eval_test_fail_exchange_shared_views;
+    wl_columnar_eval_test_fail_exchange_shared_views = 0;
+    char name[128];
+    snprintf(name, sizeof(name), "%s W=%u: views deep-copied", label,
+        workers);
+    tests_run++;
+    printf("  [TEST] %-55s", name);
+    if (left == budget) {
+        tests_failed++;
+        printf(" FAIL: no shared view was attempted\n");
+        return;
+    }
+    tests_passed++;
+    printf(" PASS\n");
+}
+
+static void
+test_self_join_deep_copy(void)
+{
+    for (uint32_t i = 1; i < 4; i++) {
+        check_rows_deep_copied("float self-join, deep-copied views",
+            ".decl e(x: float, y: float)\n"
+            ".decl r(x: float, y: float)\n"
+            "r(x, z) :- r(x, y), r(y, z).\n"
+            "r(x, y) :- e(x, y).\n"
+            "e(0.5, 1.5). e(1.5, 2.5). e(2.5, 3.5).\n",
+            W1248[i], "bdx",
+            "0.5,1.5 0.5,2.5 0.5,3.5 1.5,2.5 1.5,3.5 2.5,3.5");
+        check_rows_deep_copied("float partition-key self-join, deep-copied",
+            ".decl e(x: float, y: float)\n"
+            ".decl r(x: float, y: float)\n"
+            "r(y, z) :- r(x, y), r(x, z).\n"
+            "r(x, y) :- e(x, y).\n"
+            "e(0.5, 1.5). e(0.5, 2.5). e(1.5, 3.5).\n",
+            W1248[i], "aligned",
+            "0.5,1.5 0.5,2.5 1.5,1.5 1.5,2.5 1.5,3.5 2.5,1.5 2.5,2.5 "
+            "2.5,3.5 3.5,1.5 3.5,2.5 3.5,3.5");
+    }
+}
+
 /* The lane types an IDB ends with at one worker, where nothing compares
  * them across rounds: they must be the declared ones in canonical form
  * (STRING and FLOAT as declared, other lanes INT64). */
@@ -971,6 +1107,8 @@ main(void)
     test_int_family();
     test_string_heads();
     test_float_heads();
+    test_self_join();
+    test_self_join_deep_copy();
     test_idb_types();
     test_incremental();
     test_plan_idb_schemas();
