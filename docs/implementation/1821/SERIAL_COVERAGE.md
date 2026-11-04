@@ -1967,3 +1967,61 @@ preserved. Full ACK/report/frame destruction drains source/program credit and
 independent host funding; fresh source/frame/control retries then succeed.
 This closes the CRC lane only; remaining consumer, automatic lifecycle and
 policy/cap obligations retain their separate coverage requirements.
+
+### Pipeline KEY scanner admissions (#2297, #2298)
+
+The controlled pipeline key lookup retains name-first resolution, the first
+matching column, NULL-name-table fallback, and the host's existing `strtol`
+saturation/narrowing behavior. Five existing positive admission sites now own
+the actual source/native validation, column and byte work under the same saved
+original attempt. There is no width/name-length cap or budget restart on retry.
+
+| Actual action | Expanded source upper bound | Work admission |
+|---|---:|---:|
+| Entry, full HELD/native/source validation and local call interface |80|96|
+| Column slot, including NULL-name continuation |21|32|
+| Name byte, including mismatch/NUL and next refusal |24|32|
+| Prefix byte, including final parser initialization |24|32|
+| Decimal byte, including overflow/termination and next refusal |42|64|
+
+The complete scalar-source check and validation bounds are29 and39. Every
+current/next refusal front and engine argument/address/return edge is included
+in its owning region; a refused positive admission adds no credit. Before the
+first entry admission, the read-only local refusal and selected call edge are
+bounded by23 and do not traverse source metadata. The maximum expanded forward
+window is80, below256. The unchanged owned-probe per-key front admits192,
+with its own86-slot interface bound; the following type-cell admission is128.
+These local interfaces do not certify the remaining containing coordinator,
+consumer, type/metadata or forward source interiors.
+
+Actual admitted work is96+32*C+32*B+32*P+64*D: C counts visited column slots,
+B compared name bytes including mismatch/NUL, P the reached prefix bytes and
+D decimal bytes including termination. Each arbitrary scan/retry pays its own
+units cumulatively. Name priority, duplicate names, partial/absent name tables,
+whitespace/sign/no-digit/trailing/non-ASCII suffixes and LONG_MAX/LP64 wrapping
+retain raw signed-index/fallback parity. No new runtime callback or API is added.
+
+`evaluation_join_probes` now tests a real HELD257-column source. Looking up
+`col256` visits257 columns and1105 name bytes, so its exact scanner work is43680;
+43679 refuses the last32-unit action after43648 admitted units. The independently
+specified source construction adds9024. Tests cover first/interior/last column
+and name-byte boundaries, every prefix and decimal boundary of `col+1`, entry95
+and96, parser saturation/narrowing, sticky stops and original finish/reset/live
+successor histories. A refused entry leaves its output sentinel untouched;
+accepted entry normalizes output before later refusal. Source leases are ended
+through their real cleanup protocol, including after original generation end.
+
+A parsed public program declares257-column `a` and `p`, joins `a` with `b(x0,t)`
+and applies a257-key ANTIJOIN. Its head retains all258 fields. The actual generated
+ANTI key includes `col256`; existing PROBE_KEYS callbacks witness all257 keys and
+the real terminal stage turn. Two input rows differ at column256, and `p` contains
+only the first: controlled and raw results are exactly the second row plus t99.
+Cancellation/work exhaustion at the129th stage turn publishes no head; real
+reset/retry traverses the full stage and returns the same literal result. Batch
+settings are configured before session creation and restored after teardown;
+full governor ownership returns to zero.
+
+This closes the KEY leaf and its stated local call interfaces. Remaining writer,
+constructor, forward/cleanup, ordinary publication/FINISH, generic receipt and
+strict/cache/local/shared/general policy source obligations remain required
+before the grouped PR is ready.

@@ -499,13 +499,24 @@ pipeline_resolve_key(const col_rel_t *rel, const char *name, uint32_t *out)
     return 0;
 }
 
+/* Each actual scanner action admits its own source work under the original
+ * saved attempt. No later byte, column or caller grant funds earlier reads. */
+enum {
+    WL_COLUMNAR_JOIN_PIPELINE_KEY_ENTRY_WORK = 96,
+    WL_COLUMNAR_JOIN_PIPELINE_KEY_COLUMN_WORK = 32,
+    WL_COLUMNAR_JOIN_PIPELINE_KEY_NAME_BYTE_WORK = 32,
+    WL_COLUMNAR_JOIN_PIPELINE_KEY_PREFIX_BYTE_WORK = 32,
+    WL_COLUMNAR_JOIN_PIPELINE_KEY_DECIMAL_BYTE_WORK = 64
+};
+
 int
 wl_columnar_join_pipeline_key_attempt(
     const wl_columnar_relation_scalar_source_t *source, const char *name,
     uint32_t *out, wl_evaluation_control_t *control, uint64_t id)
 {
     if (!out) return EINVAL;
-    int rc = wl_evaluation_control_charge_attempt(control, id, 1);
+    int rc = wl_evaluation_control_charge_attempt(control, id,
+            WL_COLUMNAR_JOIN_PIPELINE_KEY_ENTRY_WORK);
     if (rc) return rc;
     *out = 0;
     rc = wl_columnar_relation_scalar_source_validate_attempt_controlled(source,
@@ -514,12 +525,14 @@ wl_columnar_join_pipeline_key_attempt(
     if (!name) return EINVAL;
     if (!source->names) return 0;
     for (uint32_t c = 0; c < source->width; ++c) {
-        rc = wl_evaluation_control_charge_attempt(control, id, 1);
+        rc = wl_evaluation_control_charge_attempt(control, id,
+                WL_COLUMNAR_JOIN_PIPELINE_KEY_COLUMN_WORK);
         if (rc) return rc;
         const char *actual = source->names[c];
         if (!actual) continue;
         for (size_t byte = 0; ; ++byte) {
-            rc = wl_evaluation_control_charge_attempt(control, id, 1);
+            rc = wl_evaluation_control_charge_attempt(control, id,
+                    WL_COLUMNAR_JOIN_PIPELINE_KEY_NAME_BYTE_WORK);
             if (rc) return rc;
             if (name[byte] != actual[byte]) break;
             if (!name[byte]) {
@@ -530,7 +543,8 @@ wl_columnar_join_pipeline_key_attempt(
         }
     }
     for (unsigned byte = 0; byte < 3; ++byte) {
-        rc = wl_evaluation_control_charge_attempt(control, id, 1);
+        rc = wl_evaluation_control_charge_attempt(control, id,
+                WL_COLUMNAR_JOIN_PIPELINE_KEY_PREFIX_BYTE_WORK);
         if (rc) return rc;
         if (name[byte] != "col"[byte]) return 0;
     }
@@ -541,7 +555,8 @@ wl_columnar_join_pipeline_key_attempt(
     unsigned long magnitude = 0;
     bool initial = true, negative = false, overflow = false;
     for (size_t byte = 3; ; ++byte) {
-        rc = wl_evaluation_control_charge_attempt(control, id, 1);
+        rc = wl_evaluation_control_charge_attempt(control, id,
+                WL_COLUMNAR_JOIN_PIPELINE_KEY_DECIMAL_BYTE_WORK);
         if (rc) return rc;
         unsigned char ch = (unsigned char)name[byte];
         if (initial && isspace(ch)) continue;
