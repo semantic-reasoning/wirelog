@@ -4528,9 +4528,10 @@ tdd_preregister_idb_on_workers(const wl_plan_stratum_t *sp,
             if (session_find_rel(&coord->tdd_workers[w], rname))
                 continue;
             col_rel_t *empty = NULL;
-            int rc = col_rel_alloc(&empty, rname);
+            int rc = wl_columnar_session_idb_placeholder_new(
+                &coord->tdd_workers[w], rname, &empty);
             if (rc != 0)
-                return ENOMEM;
+                return rc;
             rc = session_add_rel(&coord->tdd_workers[w], empty);
             if (rc != 0) {
                 col_rel_destroy(empty);
@@ -7499,10 +7500,11 @@ col_eval_stratum_tdd_recursive(const wl_plan_stratum_t *sp,
         if (session_find_rel(coord, sp->relations[ri].name))
             continue;
         col_rel_t *empty = NULL;
-        int alloc_rc = col_rel_alloc(&empty, sp->relations[ri].name);
+        int alloc_rc = wl_columnar_session_idb_placeholder_new(coord,
+                sp->relations[ri].name, &empty);
         if (alloc_rc != 0) {
             coord->tdd_total_ns += now_ns() - tdd_total_t0;
-            return ENOMEM;
+            return alloc_rc;
         }
         alloc_rc = session_add_rel(coord, empty);
         if (alloc_rc != 0) {

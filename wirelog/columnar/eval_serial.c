@@ -1749,9 +1749,10 @@ col_eval_stratum(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
         col_rel_t *existing = session_find_rel(sess, sp->relations[ri].name);
         if (!existing) {
             col_rel_t *empty = NULL;
-            int rc = col_rel_alloc(&empty, sp->relations[ri].name);
+            int rc = wl_columnar_session_idb_placeholder_new(sess,
+                    sp->relations[ri].name, &empty);
             if (rc != 0)
-                return ENOMEM;
+                return rc;
             rc = session_add_rel(sess, empty);
             if (rc != 0) {
                 col_rel_destroy(empty);
