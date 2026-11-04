@@ -1190,14 +1190,18 @@ Global-read exchange prepares admitted empty replacements for every worker view
 of a changed IDB, then retires those views with checked registration replacement
 before publishing coordinator rows. External readers still refuse publication;
 a retired prefix remains independently owned. Combined deltas preserve schema,
-compound metadata and timestamps and use checked normalization. First publication
-into a schema-less target adopts complete metadata through checked replacement.
-A pure IDB with a `.decl` and no compound or graph column is not schema-less:
-its empty placeholder starts with the declared width and lane types, STRING and
-FLOAT as declared and every other lane INT64 (#2334). Worker views refresh only
-after publication; zero-progress targets and empty next-delta registrations
-retain their existing semantics. An exchange failure
-reclaims every untransferred fresh matrix payload before checked cohort cleanup.
+compound metadata and timestamps and use checked normalization. First
+publication into a schema-less target adopts complete metadata through checked
+replacement. A recursive stratum's placeholder for a pure IDB (rules, no inline
+facts, no compound or graph column, width above 0) is not schema-less when the
+plan records it (#2334). With a `.decl` it starts with the declared width and
+lane types, STRING and FLOAT as declared and every other lane INT64. Without
+one, when no rule head has an aggregate and all agree on one arity, it starts
+with that arity and no lane types, and the first rows published into it, while
+it is empty and untyped, define those types. Worker views refresh only after
+publication; zero-progress targets and empty next-delta registrations retain
+their existing semantics. An exchange failure reclaims every untransferred fresh
+matrix payload before checked cohort cleanup.
 Publication is atomic per target, not per exchange: a successful prefix can
 remain, and public snapshot retry completes the exact set after dependencies
 release without emitting callbacks for the failed attempt.

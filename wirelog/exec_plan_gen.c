@@ -4365,24 +4365,41 @@ wl_plan_free(wl_plan_t *plan)
     free(plan);
 }
 
-/* Issue #2334: true when @rel is a pure IDB of @prog whose declared schema
- * an empty placeholder can start with: it has a `.decl` and rules, no
- * inline facts, and neither a compound nor a graph column. */
-static bool
-plan_idb_schema_eligible(const struct wirelog_program *prog,
+/* Issue #2334: the width an empty placeholder of the pure IDB @rel of
+ * @prog can start with, or 0 when it has none.  @rel has rules, no inline
+ * facts and no graph column.  With a `.decl` it has no compound column
+ * and the width is the declared one.  Without one no rule head has an
+ * aggregate, so every rule's IR root is a PROJECT, or the FLATMAP the
+ * fusion pass makes of a PROJECT over a FILTER, and all agree on the
+ * arity, which is the width. */
+static uint32_t
+plan_idb_schema_width(const struct wirelog_program *prog,
     const wl_ir_relation_info_t *rel)
 {
-    if (!rel->name || !rel->has_decl || rel->has_graph_column
+    if (!rel->name || rel->has_graph_column
         || (rel->fact_count > 0 && rel->fact_data != NULL))
-        return false;
-    for (uint32_t c = 0; c < rel->column_count; c++)
-        if (rel->columns[c].compound_kind != WIRELOG_COMPOUND_KIND_NONE)
-            return false;
-    for (uint32_t r = 0; r < prog->rule_count; r++)
-        if (prog->rules[r].head_relation
-            && strcmp(prog->rules[r].head_relation, rel->name) == 0)
-            return true;
-    return false;
+        return 0;
+    if (rel->has_decl) {
+        for (uint32_t c = 0; c < rel->column_count; c++)
+            if (rel->columns[c].compound_kind != WIRELOG_COMPOUND_KIND_NONE)
+                return 0;
+    }
+    uint32_t arity = 0;
+    for (uint32_t r = 0; r < prog->rule_count; r++) {
+        if (!prog->rules[r].head_relation
+            || strcmp(prog->rules[r].head_relation, rel->name) != 0)
+            continue;
+        if (rel->has_decl)
+            return rel->column_count;
+        const wirelog_ir_node_t *root = prog->rules[r].ir_root;
+        if (!root || (root->type != WIRELOG_IR_PROJECT
+            && root->type != WIRELOG_IR_FLATMAP)
+            || root->project_count == 0
+            || (arity != 0 && root->project_count != arity))
+            return 0;
+        arity = root->project_count;
+    }
+    return arity;
 }
 
 /* Issue #2334: fill plan->idb_schemas from @prog.  The plan owns every
@@ -4393,7 +4410,7 @@ plan_build_idb_schemas(wl_plan_t *plan, const struct wirelog_program *prog)
 {
     uint32_t count = 0;
     for (uint32_t i = 0; i < prog->relation_count; i++)
-        if (plan_idb_schema_eligible(prog, &prog->relations[i]))
+        if (plan_idb_schema_width(prog, &prog->relations[i]) > 0)
             count++;
     if (count == 0)
         return 0;
@@ -4404,15 +4421,17 @@ plan_build_idb_schemas(wl_plan_t *plan, const struct wirelog_program *prog)
     plan->idb_schemas = schemas;
     for (uint32_t i = 0; i < prog->relation_count; i++) {
         const wl_ir_relation_info_t *rel = &prog->relations[i];
-        if (!plan_idb_schema_eligible(prog, rel))
+        uint32_t width = plan_idb_schema_width(prog, rel);
+        if (width == 0)
             continue;
         wl_plan_idb_schema_t *dst = &schemas[plan->idb_schema_count];
         dst->name = dup_str(rel->name);
         if (!dst->name)
             return ENOMEM;
         plan->idb_schema_count++;
-        dst->width = rel->column_count;
-        if (rel->column_count == 0)
+        dst->width = width;
+        dst->declared = rel->has_decl;
+        if (!rel->has_decl)
             continue;
         wirelog_column_type_t *types = (wirelog_column_type_t *)calloc(
             rel->column_count, sizeof(*types));

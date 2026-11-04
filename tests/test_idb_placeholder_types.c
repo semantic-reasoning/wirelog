@@ -791,6 +791,113 @@ test_self_join_deep_copy(void)
     }
 }
 
+/* ======================================================================== */
+/* Undeclared IDBs                                                          */
+/* ======================================================================== */
+
+/*
+ * A head with no `.decl` has no declared types.  Its placeholder starts
+ * with the width of the rule heads and no lane types, and at two or more
+ * workers the owner exchange lets the first rows published into it define
+ * them.  Before #2334 the placeholder was
+ * zero-width, and the owner exchange met a recursive-first result labelled
+ * differently in a later round and failed with EINVAL at two or more
+ * workers.  Rows of an undeclared string relation render as intern ids,
+ * so these runs are compared with one worker.
+ */
+static void
+test_undeclared_heads(void)
+{
+    const char *edges
+        = "edge(\"n0\", \"n1\"). edge(\"n1\", \"n2\"). edge(\"n2\", \"n3\").\n";
+    char src[512];
+    snprintf(src, sizeof(src),
+        ".decl edge(x: string, y: string)\n"
+        "b(x, z) :- b(x, y), edge(y, z).\n"
+        "b(x, y) :- edge(x, y).\n%s", edges);
+    check_same_as_one_worker("undeclared string tc, recursive rule first",
+        src, "b", W1248 + 1, 3, "owner", 6);
+    check_same_as_one_worker("undeclared string+int32 shift",
+        ".decl s(x: string, n: int32, m: int32)\n"
+        ".decl step(m: int32, k: int32, t: string)\n"
+        "b(x, m, k) :- b(x, n, m), step(m, k, t).\n"
+        "b(x, n, m) :- s(x, n, m).\n"
+        "s(\"a\", 0, 1).\n"
+        "step(1, 2, \"t\"). step(2, 3, \"t\"). step(3, 4, \"t\").\n",
+        "b", W1248 + 1, 3, "owner", 4);
+    /* A body comparison makes the fusion pass turn the rule's root into a
+     * FLATMAP; the head's arity still gives the width. */
+    check_same_as_one_worker("undeclared string tc with a comparison",
+        ".decl e(x: string, y: string)\n"
+        "b(x, z) :- b(x, y), e(y, z), x != z.\n"
+        "b(x, y) :- e(x, y).\n"
+        "e(\"a\", \"b\"). e(\"b\", \"c\"). e(\"c\", \"d\").\n",
+        "b", W1248 + 1, 3, "owner", 6);
+    check_same_as_one_worker("undeclared string+int32 walk with a comparison",
+        ".decl e(x: string, y: string, w: int32)\n"
+        "p(x, z, v) :- p(x, y, w), e(y, z, v), w < 6.\n"
+        "p(x, y, w) :- e(x, y, w).\n"
+        "e(\"a\", \"b\", 1). e(\"b\", \"c\", 2). e(\"c\", \"a\", 3).\n",
+        "p", W1248 + 1, 3, "owner", 9);
+    check_same_as_one_worker("undeclared string tc under negation",
+        ".decl e(x: string, y: string)\n"
+        "b(x, z) :- b(x, y), e(y, z), !c(z).\n"
+        "b(x, y) :- e(x, y).\n"
+        "c(x) :- e(x, \"c\").\n"
+        "c(x) :- c(y), e(x, y).\n"
+        "e(\"a\", \"b\"). e(\"b\", \"c\"). e(\"c\", \"d\"). "
+        "e(\"d\", \"e\").\n",
+        "b", W1248 + 1, 3, "owner", 10);
+    snprintf(src, sizeof(src),
+        ".decl edge(x: string, y: string)\n"
+        "b(x, y) :- edge(x, y).\n"
+        "b(x, z) :- b(x, y), edge(y, z).\n%s", edges);
+    check_same_as_one_worker("control: undeclared string tc, base rule first",
+        src, "b", W1248 + 1, 3, "owner", 6);
+    snprintf(src, sizeof(src),
+        ".decl edge(x: string, y: string)\n"
+        "b(x, z) :- edge(x, y), b(y, z).\n"
+        "b(x, y) :- edge(x, y).\n%s", edges);
+    check_same_as_one_worker("control: undeclared string tc, right-linear",
+        src, "b", W1248 + 1, 3, "owner", 6);
+    snprintf(src, sizeof(src),
+        ".decl edge(x: string, y: string)\n"
+        "b(x, z) :- b(x, y), b(y, z).\n"
+        "b(x, y) :- edge(x, y).\n%s", edges);
+    check_same_as_one_worker("control: undeclared string self-join", src,
+        "b", W1248 + 1, 3, "bdx", 6);
+    /* Joined on the partition key, the self-join takes the aligned
+     * exchange, which merges the workers' rows into the coordinator's
+     * relation at the end of the stratum: that merge must adopt the rows'
+     * schema too. */
+    check_same_as_one_worker("undeclared string self-join on the partition key",
+        ".decl e(x: string, y: string)\n"
+        "b(x, y) :- e(x, y).\n"
+        "b(y, z) :- b(x, y), b(x, z).\n"
+        "e(\"a\", \"b\"). e(\"b\", \"c\"). e(\"c\", \"d\"). "
+        "e(\"d\", \"e\"). e(\"e\", \"f\").\n",
+        "b", W1248 + 1, 3, "aligned", 26);
+}
+
+static void
+test_undeclared_mutual(void)
+{
+    static char src[8192];
+    build_mutual(src, sizeof(src), "string", false);
+    /* Drop the three IDB declarations. */
+    char *a = strstr(src, ".decl a(");
+    char *rules = strstr(src, "a(x, y) :- edge");
+    if (!a || !rules) {
+        tests_run++;
+        tests_failed++;
+        printf("  [TEST] undeclared issue program FAIL: fixture\n");
+        return;
+    }
+    memmove(a, rules, strlen(rules) + 1);
+    check_same_as_one_worker("undeclared issue program", src, "a",
+        W124 + 1, 2, "owner", 276);
+}
+
 /* The lane types an IDB ends with at one worker, where nothing compares
  * them across rounds: they must be the declared ones in canonical form
  * (STRING and FLOAT as declared, other lanes INT64). */
@@ -1037,13 +1144,16 @@ test_incremental(void)
     }
 }
 
-/* The plan records a declared schema for pure IDBs only: not for an EDB,
- * an IDB with inline facts, or an IDB without a `.decl`. */
+/* The plan records a starting schema for pure IDBs only: not for an EDB,
+ * an IDB with inline facts, a nullary IDB, or an undeclared IDB whose rule
+ * heads disagree on the arity or aggregate.  An undeclared IDB gets its
+ * width and no lane types, also when the fusion pass has turned a rule's
+ * root into a FLATMAP. */
 static void
 test_plan_idb_schemas(void)
 {
     tests_run++;
-    printf("  [TEST] %-55s", "plan: idb_schemas cover declared pure IDBs");
+    printf("  [TEST] %-55s", "plan: idb_schemas cover pure IDBs");
     fflush(stdout);
     wirelog_error_t err;
     wirelog_program_t *prog = wirelog_parse_string(
@@ -1055,9 +1165,19 @@ test_plan_idb_schemas(void)
         "f(1.5, x) :- edge(x, _).\n"
         "seeded(x) :- edge(x, _).\n"
         "seeded(\"s\").\n"
-        "u(x) :- edge(x, _).\n"
+        ".decl p()\n"
+        "p() :- edge(_, _).\n"
+        "u(x, y) :- edge(x, y).\n"
+        "u(y, x) :- u(x, y), x != y.\n"
+        "v(x) :- edge(x, _).\n"
+        "v(x, y) :- edge(x, y).\n"
+        "w(x) :- edge(x, _).\n"
+        "w(\"w\").\n"
+        "g(x, min(y)) :- edge(x, y).\n"
         "edge(\"a\", 1).\n", &err);
     wl_plan_t *plan = NULL;
+    if (prog)
+        wl_fusion_apply(prog, NULL);
     if (!prog || wl_plan_from_program(prog, &plan) != 0) {
         tests_failed++;
         printf(" FAIL: fixture setup failed\n");
@@ -1067,6 +1187,7 @@ test_plan_idb_schemas(void)
     }
     const wl_plan_idb_schema_t *b = NULL;
     const wl_plan_idb_schema_t *f = NULL;
+    const wl_plan_idb_schema_t *u = NULL;
     bool unexpected = false;
     for (uint32_t i = 0; i < plan->idb_schema_count; i++) {
         const wl_plan_idb_schema_t *e = &plan->idb_schemas[i];
@@ -1074,10 +1195,14 @@ test_plan_idb_schemas(void)
             b = e;
         else if (strcmp(e->name, "f") == 0)
             f = e;
+        else if (strcmp(e->name, "u") == 0)
+            u = e;
         else
             unexpected = true;
     }
-    bool ok = !unexpected && plan->idb_schema_count == 2 && b && f
+    bool ok = !unexpected && plan->idb_schema_count == 3 && b && f && u
+        && b->declared && f->declared && !u->declared
+        && u->width == 2 && !u->column_types
         && b->width == 2 && b->column_types
         && b->column_types[0] == WIRELOG_TYPE_STRING
         && b->column_types[1] == WIRELOG_TYPE_INT64
@@ -1109,6 +1234,8 @@ main(void)
     test_float_heads();
     test_self_join();
     test_self_join_deep_copy();
+    test_undeclared_heads();
+    test_undeclared_mutual();
     test_idb_types();
     test_incremental();
     test_plan_idb_schemas();

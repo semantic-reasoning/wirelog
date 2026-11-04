@@ -3195,6 +3195,18 @@ session_pool_rel_rollback(col_rel_t *src, col_rel_t *heap,
     }
 }
 
+const wl_plan_idb_schema_t *
+wl_columnar_session_idb_schema(const wl_col_session_t *sess, const char *name)
+{
+    const wl_plan_t *plan = sess ? sess->plan : NULL;
+    for (uint32_t i = 0; name && plan && i < plan->idb_schema_count; i++) {
+        if (plan->idb_schemas[i].name
+            && strcmp(plan->idb_schemas[i].name, name) == 0)
+            return &plan->idb_schemas[i];
+    }
+    return NULL;
+}
+
 int
 wl_columnar_session_idb_placeholder_new(const wl_col_session_t *sess,
     const char *name, col_rel_t **out)
@@ -3206,23 +3218,14 @@ wl_columnar_session_idb_placeholder_new(const wl_col_session_t *sess,
     int rc = col_rel_alloc(&r, name);
     if (rc != 0)
         return rc;
-    const wl_plan_t *plan = sess ? sess->plan : NULL;
-    const wl_plan_idb_schema_t *schema = NULL;
-    for (uint32_t i = 0; plan && i < plan->idb_schema_count; i++) {
-        if (plan->idb_schemas[i].name
-            && strcmp(plan->idb_schemas[i].name, name) == 0) {
-            schema = &plan->idb_schemas[i];
-            break;
-        }
-    }
+    const wl_plan_idb_schema_t *schema = wl_columnar_session_idb_schema(sess,
+            name);
     if (schema && schema->width > 0) {
         rc = col_rel_set_schema(r, schema->width, NULL);
         if (rc == 0 && schema->column_types)
             rc = col_rel_set_column_types(r, schema->column_types,
                     schema->width);
         if (rc != 0) {
-            rc = rc == ENOMEM && r->memory_budget_denial_pending
-                ? ENOSPC : rc;
             col_rel_destroy(r);
             return rc;
         }

@@ -243,6 +243,27 @@ All notable changes to wirelog are documented in this file.
 
 ### Fixed
 
+- **String and float recursive relations evaluate on several workers**
+  (#2334): a recursive relation with no rows yet started an evaluation as
+  an empty, zero-width and untyped placeholder.  When a recursive rule read
+  it before the rule that seeds it, the rule's result was labelled with
+  lane types taken from the wrong columns, and a later round met the right
+  ones.  With string columns, `b(x, z) :- b(x, y), edge(y, z).` listed
+  before `b(x, y) :- edge(x, y).` failed with `EINVAL` at two or more
+  workers.  So did the issue's three mutually recursive string relations,
+  an int32 relation whose recursive rule, listed first, joins a relation
+  with a string column, and the same closure with no `.decl` for
+  `b`.  Several recursive float programs failed with `EINVAL` even at one
+  worker, in either rule order.  A declared recursive relation with no
+  inline facts and no compound or graph column now starts with its
+  declared width and types, every integer column as int64.  An undeclared
+  one with no inline facts whose rule heads have no aggregate and agree on
+  one arity starts with that arity, and its first rows give it their
+  types.  The unions the exchange between workers builds keep the
+  relation's types, and integer-family columns (int32, int64, uint32,
+  uint64 and bool) are accepted as the same storage.  An undeclared float
+  relation still has no types to start from and is not covered.
+
 - **Recursive strata keep their model when an input relation is
   partitioned across workers** (#2118): a recursive stratum evaluated on
   several workers may hash-partition one input relation instead of
