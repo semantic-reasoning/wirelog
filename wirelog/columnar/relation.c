@@ -14658,17 +14658,23 @@ wl_columnar_relation_constructor_attempt_charge(
     wl_evaluation_control_t *control,
     uint64_t attempt_id, uint64_t work)
 {
-    int rc = wl_columnar_relation_attempt_guard(control, attempt_id);
-    return rc ? rc : wl_evaluation_control_charge(control, work);
+    return wl_evaluation_control_charge_attempt(control, attempt_id, work);
 }
 
 static int
 wl_columnar_relation_constructor_attempt_tail(wl_evaluation_control_t *control,
     uint64_t attempt_id, uint64_t work)
 {
-    int rc = wl_columnar_relation_attempt_guard(control, attempt_id);
-    return rc ? rc : wl_columnar_relation_attempt_tail(control, attempt_id,
-               work);
+    uint64_t active = wl_evaluation_control_active_attempt_id(control);
+    if (!active || active != attempt_id)
+        return EINVAL;
+#ifdef WL_SESSION_TEST_HOOKS
+    if (wl_columnar_relation_test_work_checkpoint)
+        wl_columnar_relation_test_work_checkpoint(control, work);
+#else
+    (void)work;
+#endif
+    return wl_evaluation_control_charge_attempt(control, attempt_id, 0);
 }
 
 static void
@@ -15059,13 +15065,23 @@ wl_columnar_relation_constructor_attempt_dispose(
     if (wl_columnar_relation_test_constructor_retired)
         wl_columnar_relation_test_constructor_retired();
 #endif
-    for (unsigned i = 0; i < 3; i++) {
-        if (!ctx->admitted[i])
-            continue;
-        if (ctx->committed[i])
-            col_rel_release_reservation_or_abort(&ctx->tokens[i]);
+    if (ctx->admitted[0]) {
+        if (ctx->committed[0])
+            col_rel_release_reservation_or_abort(&ctx->tokens[0]);
         else
-            col_rel_reservation_rollback(&ctx->tokens[i]);
+            col_rel_reservation_rollback(&ctx->tokens[0]);
+    }
+    if (ctx->admitted[1]) {
+        if (ctx->committed[1])
+            col_rel_release_reservation_or_abort(&ctx->tokens[1]);
+        else
+            col_rel_reservation_rollback(&ctx->tokens[1]);
+    }
+    if (ctx->admitted[2]) {
+        if (ctx->committed[2])
+            col_rel_release_reservation_or_abort(&ctx->tokens[2]);
+        else
+            col_rel_reservation_rollback(&ctx->tokens[2]);
     }
     if (ctx->ref_held)
         wl_columnar_memory_governor_ref_release(ctx->saved_ref);
@@ -15722,10 +15738,12 @@ wl_columnar_relation_constructor_attempt_build_operator(const char *name,
     ctx.timestamps = NULL; ctx.columns_owned = 0; ctx.names_owned = 0;
     ctx.schema_initialized = false; ctx.saved_ref = governor;
     ctx.ref_held = false;
-    for (unsigned i = 0; i < 3; i++) {
-        ctx.admitted[i] = false; ctx.committed[i] = false;
-        wl_columnar_relation_row_scratch_init(&ctx.tokens[i]);
-    }
+    ctx.admitted[0] = false; ctx.committed[0] = false;
+    wl_columnar_relation_row_scratch_init(&ctx.tokens[0]);
+    ctx.admitted[1] = false; ctx.committed[1] = false;
+    wl_columnar_relation_row_scratch_init(&ctx.tokens[1]);
+    ctx.admitted[2] = false; ctx.committed[2] = false;
+    wl_columnar_relation_row_scratch_init(&ctx.tokens[2]);
     metadata_bytes = 3;
     if (governor) {
         wl_columnar_memory_governor_ref_retain(governor);

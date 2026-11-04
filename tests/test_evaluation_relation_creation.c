@@ -2859,6 +2859,138 @@ scalar_source_domains(void)
 /* Typed JOIN constructor/append reuse: these tests use real credits and the
  * original checked row wrapper, not a separate unguarded append entrypoint. */
 static void
+operator_init_retry(wl_evaluation_control_t *ctl, uint32_t width,
+    uint64_t baseline)
+{
+    const wirelog_column_type_t type = WIRELOG_TYPE_INT64;
+    retry(ctl, 0);
+    col_rel_t *out = NULL;
+    CHECK(!wl_columnar_relation_new_typed_operator_attempt_controlled("$join",
+        width, width ? &type : NULL, watched, &out, ctl,
+        wl_evaluation_control_active_attempt_id(ctl)));
+    col_rel_t *raw = col_rel_new_auto("$join", width);
+    CHECK(out && raw && out->ncols == width && !out->nrows &&
+        out->schema_ok && out->schema.n_children == width);
+    CHECK(!strcmp(out->schema.format, raw->schema.format));
+    if (width) {
+        CHECK(out->column_types[0] == type);
+        CHECK(!strcmp(out->schema.children[0]->name,
+            raw->schema.children[0]->name));
+        CHECK(!strcmp(out->schema.children[0]->format,
+            raw->schema.children[0]->format));
+    }
+    CHECK(finish(ctl, 0) > 0);
+    const int64_t value = 42;
+    CHECK(!col_rel_append_row(out, &value) &&
+        !col_rel_append_row(raw, &value));
+    CHECK(out->nrows == 1 && raw->nrows == 1);
+    if (width) CHECK(out->columns[0][0] == value &&
+            raw->columns[0][0] == value);
+    CHECK(!col_rel_destroy_checked(out) && !col_rel_destroy_checked(raw));
+    CHECK(reserved() == baseline &&
+        (!watched || wl_columnar_memory_governor_ref_is_sole(watched)));
+}
+
+static void
+operator_init_boundaries(void)
+{
+    const wirelog_column_type_t type = WIRELOG_TYPE_INT64;
+    for (unsigned governed = 0; governed < 2; ++governed) {
+        watched = governed ? governor() : NULL;
+        wl_columnar_memory_reservation_t peer_reservation;
+        wl_columnar_memory_reservation_init(&peer_reservation);
+        if (watched) {
+            CHECK(wl_columnar_memory_reserve(
+                    wl_columnar_memory_governor_ref_get(watched), 17,
+                    &peer_reservation));
+            CHECK(wl_columnar_memory_commit(&peer_reservation,
+                &peer_reservation));
+        }
+        const uint64_t baseline = reserved();
+        for (uint32_t width = 0; width < 2; ++width) {
+            /* ENTRY, TYPE (if present), PREPARE and BUILD_CALL are128 each. */
+            const uint64_t prefix = 384 + 128 * width;
+            const uint64_t limits[] = {prefix + 191, prefix + 192,
+                                       prefix + 287, prefix + 288};
+            for (unsigned hooks = 0; hooks < 2; ++hooks)
+                for (unsigned i = 0; i < 4; ++i) {
+                    wl_evaluation_control_t *ctl = control(limits[i]);
+                    col_rel_t *out = NULL;
+                    wl_columnar_relation_test_work_checkpoint = hooks
+                        ? checkpoint : NULL;
+                    CHECK(
+                        wl_columnar_relation_new_typed_operator_attempt_controlled
+                        (
+                            "$join", width, width ? &type : NULL, watched, &out,
+                            ctl,
+                            wl_evaluation_control_active_attempt_id(ctl)) ==
+                        WL_EVALUATION_CONTROL_WORK_LIMIT);
+                    CHECK(!out && retired == (i != 0) &&
+                        reserved() == baseline);
+                    CHECK(wl_evaluation_control_finish(ctl, &owner, 0, 0) ==
+                        WL_EVALUATION_CONTROL_WORK_LIMIT);
+                    wl_evaluation_control_report_t report;
+                    CHECK(!wl_evaluation_control_report(ctl, &report));
+                    const uint64_t expected = prefix +
+                        (i == 0 ? 0 : i == 3 ? 288 : 192);
+                    CHECK(report.consumed == expected);
+                    if (hooks) CHECK(seen == expected);
+                    CHECK(!watched ||
+                        wl_columnar_memory_governor_ref_is_sole(watched));
+                    wl_columnar_relation_test_work_checkpoint = checkpoint;
+                    operator_init_retry(ctl, width, baseline);
+                    release(ctl);
+                }
+            for (scalar_fault_mode = 0; scalar_fault_mode < 3;
+                ++scalar_fault_mode) {
+                wl_evaluation_control_t *ctl = control(0);
+                const uint64_t id =
+                    wl_evaluation_control_active_attempt_id(ctl);
+                col_rel_t *out = NULL;
+                scalar_fault_at = prefix + 192;
+                attempt_restarted = false; attempt_successor_callbacks = 0;
+                wl_columnar_relation_test_work_checkpoint =
+                    scalar_source_checkpoint;
+                int rc =
+                    wl_columnar_relation_new_typed_operator_attempt_controlled(
+                    "$join", width, width ? &type : NULL, watched, &out,
+                    ctl, id);
+                wl_columnar_relation_test_work_checkpoint = checkpoint;
+                CHECK(rc == (scalar_fault_mode == 0 ?
+                    WL_EVALUATION_CONTROL_CANCELLED : scalar_fault_mode == 1 ?
+                    EOVERFLOW : EINVAL));
+                CHECK(!out && retired == 1 && reserved() == baseline &&
+                    !attempt_successor_callbacks);
+                if (attempt_restarted) {
+                    CHECK(attempt_old_report.attempt_id == id &&
+                        attempt_old_report.consumed == prefix + 192);
+                    CHECK(
+                        wl_columnar_relation_new_typed_operator_attempt_controlled
+                        (
+                            "$join", width, width ? &type : NULL, watched, &out,
+                            ctl, id) == EINVAL);
+                    CHECK(!out && retired == 1 &&
+                        seen == prefix + 192 && reserved() == baseline);
+                    CHECK(!wl_evaluation_control_finish(ctl, &owner, 0, 0));
+                    wl_evaluation_control_report_t successor;
+                    CHECK(!wl_evaluation_control_report(ctl, &successor) &&
+                        successor.consumed == 0);
+                } else CHECK(finish(ctl, rc) == prefix + 192);
+                attempt_restarted = false;
+                operator_init_retry(ctl, width, baseline);
+                release(ctl);
+            }
+        }
+        if (watched) {
+            CHECK(wl_columnar_memory_release(&peer_reservation));
+            CHECK(!reserved());
+            wl_columnar_memory_governor_ref_release(watched);
+        }
+        watched = NULL;
+    }
+}
+
+static void
 join_typed_operator_fixtures(void)
 {
     const uint32_t widths[] = {0, 1, 17, 129};
@@ -3243,6 +3375,7 @@ main(void)
             scalar_source_twins(17, typed != 0, ts != 0, true);
         }
     scalar_source_twins(300, true, true, false);
+    operator_init_boundaries();
     join_typed_operator_fixtures();
     sorted_stamp_cases();
     sorted_stamp_faults();

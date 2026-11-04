@@ -2025,3 +2025,25 @@ This closes the KEY leaf and its stated local call interfaces. Remaining writer,
 constructor, forward/cleanup, ordinary publication/FINISH, generic receipt and
 strict/cache/local/shared/general policy source obligations remain required
 before the grouped PR is ready.
+
+### Constructor INIT failure completion
+
+The selected operator constructor retains its INIT192 fee. Attempt-scoped
+charge/poll primitives preserve the saved ID before and after the existing
+checkpoint hook; fixed three-token initialization and retirement keep their
+ascending order without a runtime index loop. The actual first-NAME-refusal
+source is bounded by127 current slots,56 common fixed disposal slots and8
+immediate caller slots:191 within the unique192 payment. No refused NAME debit,
+object allocation, selected token or ancestor pays this interval. Generic
+relation guard/tail and governor implementations remain unchanged.
+
+`evaluation_relation_creation` covers actual typed widths0 and1 with NULL and
+pinned governors, a live17-byte peer, hooks present/absent, INIT exact/one-short
+and the following NAME96 boundary. Its source-derived INIT tail totals are576
+and704. Cancellation, accounting overflow and real finish/reset/new-attempt
+turnover at those tails preserve nonpublication, one physical retirement and
+peer credit; the successor consumes zero. Real reset/retry constructs the same
+schema as raw and accepts the same literal row. Existing allocation/commit
+failure sweeps remain active. This qualifies INIT/common fixed completion only;
+ALLOC112, RESERVE160, their item/token shares, installation, complete constructor
+callers and the remaining consumer/policy paths still require their own audits.
