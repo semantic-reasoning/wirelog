@@ -736,6 +736,18 @@ typedef struct {
     bool has_unsupported_inline_cold_use;
 } wl_plan_edb_schema_t;
 
+/* Issue #2334: the schema an empty, declared pure-IDB relation starts with,
+ * before any rule has produced rows for it.  Without it the placeholder is
+ * zero-width and untyped, and a recursive rule that reads it before the
+ * rule seeding it invents its result's lane types.  @column_types has
+ * @width entries in canonical form: STRING and FLOAT lanes as declared,
+ * every other lane INT64, the meaning of an untyped lane. */
+typedef struct {
+    const char *name;
+    uint32_t width;
+    const wirelog_column_type_t *column_types;
+} wl_plan_idb_schema_t;
+
 typedef struct {
     const wl_plan_stratum_t *strata;
     uint32_t stratum_count;
@@ -758,6 +770,12 @@ typedef struct {
     const uint32_t *edb_column_type_counts;
     const wl_plan_edb_schema_t *edb_schemas;
     struct wl_intern *intern; /* borrowed from program; lifetime >= plan */
+    /* Issue #2334: declared schemas of pure IDB relations (a `.decl`, no
+     * inline facts, no compound or graph column), owned by the plan and
+     * freed in wl_plan_free.  NULL with a count of 0 in a hand-built plan,
+     * whose IDB placeholders keep starting zero-width and untyped. */
+    const wl_plan_idb_schema_t *idb_schemas;
+    uint32_t idb_schema_count;
 } wl_plan_t;
 
 #endif /* WL_EXEC_PLAN_H */

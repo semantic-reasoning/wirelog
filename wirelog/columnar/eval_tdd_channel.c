@@ -952,7 +952,8 @@ tdd_coalesce_relation(wl_col_session_t *coord, wl_tdd_channel_t *ch,
          * global-read mode an adopted slot is created like the relation
          * plan's result instead, so the two kinds of slot need only be
          * compatible under the exchanges' tdd_relation_schema_compatible(),
-         * which accepts a declared width of 0 against any other. */
+         * which accepts a declared width of 0 against any other and any two
+         * integer-family lane types (#2334). */
         const col_rel_t *schema = ctxs[w].sp && ctxs[w].worker_sess
             ? session_find_rel(ctxs[w].worker_sess,
                 ctxs[w].sp->relations[ri].name) : NULL;

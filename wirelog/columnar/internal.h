@@ -5047,6 +5047,19 @@ col_session_peak_rss_bytes(void);
 
 col_rel_t *
 session_find_rel(wl_col_session_t *sess, const char *name);
+
+/*
+ * The empty relation an IDB @name of @sess's stratum starts as before any
+ * rule has produced rows for it (Issue #2334).  When the session's plan
+ * declares @name in plan->idb_schemas, it has that width and those lane
+ * types; otherwise it is zero-width and untyped, and the first rows
+ * published into it define its schema.  The caller registers it.
+ * Returns 0, EINVAL for a NULL @name or @out, ENOMEM, or ENOSPC when the
+ * governor refused the schema.
+ */
+int
+wl_columnar_session_idb_placeholder_new(const wl_col_session_t *sess,
+    const char *name, col_rel_t **out);
 int
 session_add_rel(wl_col_session_t *sess, col_rel_t *r);
 int
