@@ -11544,6 +11544,218 @@ mixed_cleanup:
 #undef MIXED_CHECK
 }
 
+/* A finalization that fails with the same non-EBUSY code on every retry keeps
+ * the cursor and keeps input refused (#2329). */
+enum {
+    COMPLETION_FAIL_BUDGET = 0,
+    COMPLETION_FAIL_ALLOC = 1
+};
+enum {
+    COMPLETION_EXIT_STEP = 0,
+    COMPLETION_EXIT_SNAPSHOT = 1,
+    COMPLETION_EXIT_DESTROY = 2
+};
+
+static unsigned completion_fail_mode;
+static unsigned completion_fail_hits;
+/* Only worker 0 writes this; the caller reads it after the join. */
+static unsigned completion_dispatch_hits;
+
+static void
+count_completion_dispatch(wl_col_session_t *worker, eval_stack_t *stack,
+    eval_entry_t *result)
+{
+    (void)stack;
+    (void)result;
+    if (worker->coordinator && worker->worker_id == 0)
+        completion_dispatch_hits++;
+}
+
+static void
+inject_repeated_finalize_failure(wl_col_session_t *coord, col_rel_t *target)
+{
+    if (coord->coordinator || strcmp(target->name, "later") != 0)
+        return;
+    completion_fail_hits++;
+    if (completion_fail_mode == COMPLETION_FAIL_BUDGET) {
+        /* Once: a second call would save the denied limit as the original. */
+        if (!idb_budget_changed)
+            idb_set_budget(coord);
+#ifdef WL_TEST_ALLOC_WRAP
+    } else {
+        /* One-shot, so every attempt arms it again. */
+        fail_next_alloc = true;
+#endif
+    }
+}
+
+static void
+test_completion_repeated_failure(uint32_t workers, unsigned mode,
+    unsigned exit_kind)
+{
+    TEST("W>=2 repeated non-EBUSY finalization keeps the cursor and input "
+        "refused");
+    uint8_t predicate[] = { WL_PLAN_EXPR_BOOL, 1 };
+    uint32_t key = 0;
+    wl_plan_op_exchange_t exchange = { .num_workers = 1,
+                                       .key_col_idxs = &key,
+                                       .key_col_count = 1 };
+    wl_plan_op_t ops[] = {
+        { .op = WL_PLAN_OP_VARIABLE, .relation_name = "input" },
+        { .op = WL_PLAN_OP_FILTER, .filter_expr = { predicate, 2 } },
+        { .op = WL_PLAN_OP_CONSOLIDATE },
+        { .op = WL_PLAN_OP_EXCHANGE, .opaque_data = &exchange }
+    };
+    wl_plan_relation_t first = { .name = "output", .delta_name = "$d$output",
+                                 .ops = ops, .op_count = 4 };
+    wl_plan_relation_t later = { .name = "later", .delta_name = "$d$later",
+                                 .ops = ops, .op_count = 4 };
+    wl_plan_stratum_t strata[] = {
+        { .relations = &first, .relation_count = 1, .is_recursive = false },
+        { .relations = &later, .relation_count = 1, .is_recursive = false }
+    };
+    const char *edb[] = { "input" };
+    wl_plan_t plan = { .strata = strata, .stratum_count = 2,
+                       .edb_relations = edb, .edb_count = 1 };
+    wl_session_t *session = NULL;
+    wl_columnar_memory_governor_ref_t *governor = NULL;
+    int64_t *values = NULL;
+    const char *failure = NULL;
+    const int expected_rc = mode == COMPLETION_FAIL_BUDGET ? ENOSPC : ENOMEM;
+    const bool expected_denied = mode == COMPLETION_FAIL_BUDGET;
+#define REPEAT_CHECK(c, m) do { if (!(c)) { failure = (m); \
+                                            goto repeat_cleanup; \
+                                } } while (0)
+    completion_fail_mode = mode;
+    completion_fail_hits = 0;
+    completion_dispatch_hits = 0;
+    idb_budget_changed = false;
+    REPEAT_CHECK(wl_session_create(wl_backend_columnar(), &plan, workers,
+        &session) == 0, "repeat session");
+    wl_col_session_t *coord = COL_SESSION(session);
+    governor = coord->memory_governor;
+    wl_columnar_memory_governor_ref_retain(governor);
+    values = malloc(65536 * sizeof(*values));
+    REPEAT_CHECK(values, "repeat values");
+    for (uint32_t i = 0; i < 65536; i++)
+        values[i] = i & 1 ? 42 : 7;
+    REPEAT_CHECK(wl_session_insert(session, "input", values, 65536, 1) == 0,
+        "repeat input");
+    wl_columnar_eval_test_before_final_normalize =
+        inject_repeated_finalize_failure;
+    /* Stays installed through recovery so a re-dispatch would be counted. */
+    wl_columnar_eval_serial_test_after_plan = count_completion_dispatch;
+    REPEAT_CHECK(wl_session_step(session) == expected_rc
+        && completion_fail_hits == 1, "repeat first refusal");
+    const unsigned dispatches = completion_dispatch_hits;
+    REPEAT_CHECK(dispatches != 0, "repeat workers were dispatched");
+    REPEAT_CHECK(coord->plain_step_completion_pending
+        && !coord->plain_step_completion_active
+        && coord->plain_step_completion_stratum == 1
+        && coord->plain_step_completion_phase
+        == WL_COLUMNAR_PLAIN_STEP_COMPLETION_FINALIZE_NONREC
+        && coord->plain_step_completion_relation == 0
+        && coord->plain_step_completion_workers_retired
+        && coord->tdd_workers_count == 0,
+        "repeat cursor after the first refusal");
+    col_rel_t *target = session_find_rel(coord, "later");
+    col_rel_t *input = session_find_rel(coord, "input");
+    REPEAT_CHECK(target && input, "repeat relations");
+    const uint32_t target_rows = target->nrows;
+    const uint32_t input_rows = input->nrows;
+    int64_t *const *const target_columns = (int64_t *const *)target->columns;
+    const uint64_t target_view = target->view_generation;
+    const uint64_t target_storage = target->storage_generation;
+    const col_frontier_2d_t frontier = coord->frontiers[1];
+    const col_frontier_2d_t rule_frontier = coord->rule_frontiers[1];
+    const uint32_t iterations = coord->total_iterations;
+    for (unsigned attempt = 0; attempt < 4; attempt++) {
+        const unsigned hits = completion_fail_hits;
+        uint64_t tuple_count = 0;
+        int64_t blocked = 9;
+        REPEAT_CHECK(completion_finish(session, attempt % 2 == 0, &tuple_count)
+            == expected_rc && tuple_count == 0,
+            "repeat retry returns the same code and no rows");
+        REPEAT_CHECK(completion_fail_hits == hits + 1,
+            "repeat retry reaches the same finalization");
+        REPEAT_CHECK(completion_dispatch_hits == dispatches,
+            "repeat retry re-dispatched");
+#ifdef WL_TEST_ALLOC_WRAP
+        REPEAT_CHECK(!fail_next_alloc, "repeat allocation failure consumed");
+#endif
+        /* Before the insert: the public insert clears the denial. */
+        REPEAT_CHECK(wl_session_budget_denied(session) == expected_denied,
+            "repeat budget denial flag");
+        REPEAT_CHECK(coord->plain_step_completion_pending
+            && !coord->plain_step_completion_active
+            && coord->plain_step_completion_stratum == 1
+            && coord->plain_step_completion_phase
+            == WL_COLUMNAR_PLAIN_STEP_COMPLETION_FINALIZE_NONREC
+            && coord->plain_step_completion_relation == 0,
+            "repeat cursor unchanged by a retry");
+        REPEAT_CHECK(session_find_rel(coord, "later") == target
+            && target->nrows == target_rows
+            && (int64_t *const *)target->columns == target_columns
+            && target->view_generation == target_view
+            && target->storage_generation == target_storage
+            && memcmp(&coord->frontiers[1], &frontier, sizeof(frontier)) == 0
+            && memcmp(&coord->rule_frontiers[1], &rule_frontier,
+            sizeof(rule_frontier)) == 0
+            && coord->total_iterations == iterations,
+            "repeat retry changed the target");
+        REPEAT_CHECK(wl_session_insert(session, "input", &blocked, 1, 1)
+            == EBUSY && wl_session_remove(session, "input", &values[0], 1, 1)
+            == EBUSY && input->nrows == input_rows,
+            "repeat input stays refused");
+        REPEAT_CHECK(!wl_session_budget_denied(session),
+            "repeat refused input clears the denial flag");
+    }
+    wl_columnar_eval_test_before_final_normalize = NULL;
+    idb_restore_budget(coord);
+    if (exit_kind == COMPLETION_EXIT_DESTROY)
+        goto repeat_cleanup;
+    {
+        static const char *const names[] = { "input", "output", "later" };
+        static const int64_t after_insert[] = { 7, 42, 99 };
+        const bool finish_with_step = exit_kind == COMPLETION_EXIT_STEP;
+        uint64_t tuple_count = 0;
+        REPEAT_CHECK(completion_finish(session, finish_with_step, &tuple_count)
+            == 0 && !coord->plain_step_completion_pending
+            && !coord->plain_step_completion_active,
+            "repeat recovery clears the cursor");
+        REPEAT_CHECK(completion_dispatch_hits == dispatches,
+            "repeat recovery re-dispatched");
+        wl_columnar_eval_serial_test_after_plan = NULL;
+        failure = completion_check_reference(session, &plan, workers, values,
+                NULL, 0, finish_with_step, names, 3);
+        if (failure)
+            goto repeat_cleanup;
+        REPEAT_CHECK(completion_rows_equal(session, "output", after_insert, 3)
+            && completion_rows_equal(session, "later", after_insert, 3),
+            "repeat rows after the insert");
+    }
+repeat_cleanup:
+    wl_columnar_eval_test_before_final_normalize = NULL;
+    wl_columnar_eval_serial_test_after_plan = NULL;
+#ifdef WL_TEST_ALLOC_WRAP
+    fail_next_alloc = false;
+#endif
+    if (session)
+        idb_restore_budget(COL_SESSION(session));
+    free(values);
+    wl_session_destroy(session);
+    if (governor) {
+        if (reserved_on(governor) != 0 && !failure)
+            failure = "repeat reservation leak";
+        wl_columnar_memory_governor_ref_release(governor);
+    }
+    if (failure) {
+        FAIL(failure); return;
+    }
+    PASS();
+#undef REPEAT_CHECK
+}
+
 static void
 test_specialized_publication(uint32_t workers, unsigned initial, unsigned mode,
     bool baseline)
@@ -17947,6 +18159,16 @@ main(void)
             test_later_stratum_completion_retry(workers, verb == 0);
             test_mixed_completion_specialized_retry(workers, verb == 0);
         }
+        test_completion_repeated_failure(workers, COMPLETION_FAIL_BUDGET,
+            COMPLETION_EXIT_STEP);
+        test_completion_repeated_failure(workers, COMPLETION_FAIL_BUDGET,
+            COMPLETION_EXIT_SNAPSHOT);
+        test_completion_repeated_failure(workers, COMPLETION_FAIL_BUDGET,
+            COMPLETION_EXIT_DESTROY);
+#ifdef WL_TEST_ALLOC_WRAP
+        test_completion_repeated_failure(workers, COMPLETION_FAIL_ALLOC,
+            COMPLETION_EXIT_STEP);
+#endif
         for (unsigned mode = 0; mode < 6; mode++) {
 #ifndef WL_TEST_ALLOC_WRAP
             if (mode == 3)
