@@ -5925,3 +5925,48 @@ functions in the test executable (glibc, unsanitized builds), so the queries
 allocate no transient heap state through them. The governor's reserved bytes
 and, where `mallinfo2` is available, the allocator's in-use bytes also change
 by exactly 0, while the exact count still matches the history.
+
+### Private scalar-copy constructor cleanup and source funding
+
+The selected scalar-copy constructor retains initialized storage, its three
+real reservations and saved governor reference when forward construction
+stops. Each independent192 CONSTRUCTOR_END action disposes one physical
+constructor item or retires the saved reference. Refunding an admitted token
+requires a separate121 check before its native operation: total313 progresses
+one token, while312 consumes192 and preserves its credit, flags and phase.
+The complete containing source is at most240, including the Windows C11-thread
+hybrid; real checks split it into intervals of at most133. The last physical disposal
+precedes token credit, and the saved reference is released last. Original END
+and a live successor do not supply cleanup work. A committed17-byte peer
+remains owned and unchanged until its own physical free and release.
+
+Only this selected constructor pairs reserve caller160 with the existing
+SOURCE protocol: complete current77 and a one-use native-front/restoration
+share76 fit153. Each arbitrary ROUND164 funds its own complete retry work;
+the76 share can cover one final native supplement, not every retry. The
+commit caller128 owns current80 and one-use48. SOURCE100 alone does not
+qualify the MSVC frontend, and these shares do not qualify other callers.
+Actual reports remain admitted work; no current margin is refunded or reused.
+The owning-TU original-restoration credit helper preserves the initial counter
+observation and CAS ordering, including expected-value refresh. Its typed64
+MSVC CAS removes generic width forwarding without excluding its ordinary
+fronts or first iteration. Credited restoration including its caller fits64;
+the uniform simultaneous bound is ROUND164 + one-use76 + builder16 =256.
+Generic release/refund helpers and unrelated capture callers need their own
+complete first-iteration source proof.
+
+Selected output retirement uses PREPARE192+192 per finite native turn and
+STEP256 plus the reached existing native1 or64 charge. Complete PREPARE
+source is at most360 under384 admitted work; its longest actual interval
+is246. Its child admission retains only57 one-use parent source, giving249
+actual live obligations. A CREDIT turn can have whole source258 while the
+actual64 and saved-ID zero checks split its intervals, with320 admitted
+work. Whole source, between-check bounds and simultaneous unfinished source
+are separate checks. Shared primitive prices and native validation remain.
+
+The issuer creates flat no-timestamp output and never installs a ledger
+before TAKE. The generic payload phase21 remains present, but a future
+legitimate issuer reaching it needs576 plus new containing source evidence;
+current512-driver tests establish no such positive. This qualification does
+not enable the pending registered cache owner, default materialized driver,
+strict/shared caps or general transaction intersections.

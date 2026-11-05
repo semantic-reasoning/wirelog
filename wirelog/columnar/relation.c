@@ -15736,25 +15736,6 @@ done:
     return rc;
 }
 
-/* Original private constructor ownership, distinct from the legacy context. */
-typedef struct {
-    col_rel_t *relation;
-    char *name;
-    int64_t **columns;
-    int64_t *scratch;
-    char **names;
-    wirelog_column_type_t *types;
-    col_delta_timestamp_t *timestamps;
-    uint32_t columns_owned;
-    uint32_t names_owned;
-    bool schema_initialized;
-    wl_columnar_memory_governor_ref_t *saved_ref;
-    bool ref_held;
-    bool admitted[3];
-    bool committed[3];
-    wl_columnar_memory_reservation_t tokens[3];
-} wl_columnar_relation_constructor_attempt_t;
-
 static int
 wl_columnar_relation_constructor_attempt_bytes(void *destination,
     const void *source, uint64_t bytes, wl_evaluation_control_t *control,
@@ -17084,6 +17065,652 @@ done:
     return rc;
 }
 
+static int
+wl_columnar_relation_cache_constructor_reserve_source(
+    wl_columnar_relation_constructor_attempt_t *ctx, unsigned index,
+    uint64_t bytes, wl_evaluation_control_t *control, uint64_t attempt_id)
+{
+    int rc = wl_columnar_relation_constructor_attempt_charge(control,
+            attempt_id,
+            WL_COLUMNAR_RELATION_CONSTRUCTOR_ATTEMPT_RESERVE_CALLER_WORK);
+    if (rc)
+        return rc;
+    if (!ctx->saved_ref || !bytes)
+        return wl_columnar_relation_constructor_attempt_tail(control,
+                   attempt_id,
+                   WL_COLUMNAR_RELATION_CONSTRUCTOR_ATTEMPT_RESERVE_CALLER_WORK);
+    uint64_t active = wl_evaluation_control_active_attempt_id(control);
+    if (!active || active != attempt_id)
+        return EINVAL;
+#ifdef WL_SESSION_TEST_HOOKS
+    if (wl_columnar_relation_test_work_checkpoint)
+        wl_columnar_relation_test_work_checkpoint(control,
+            WL_COLUMNAR_RELATION_CONSTRUCTOR_ATTEMPT_RESERVE_CALLER_WORK);
+#endif
+    rc = wl_evaluation_control_charge_attempt(control, attempt_id, 0);
+    if (rc)
+        return rc;
+    wl_columnar_memory_admission_status_t status;
+    rc = wl_columnar_memory_governor_reserve_source_attempt_controlled(
+        wl_columnar_memory_governor_ref_get(ctx->saved_ref), bytes,
+        &ctx->tokens[index], &status, control, attempt_id);
+    if (rc)
+        return rc;
+    if (status == WL_COLUMNAR_MEMORY_ADMISSION_OK
+        || status == WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY) {
+        ctx->admitted[index] = true;
+        rc = 0;
+    } else
+        rc = status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED ? ENOSPC
+            : status == WL_COLUMNAR_MEMORY_ADMISSION_OVERFLOW ? EOVERFLOW
+            : EINVAL;
+    active = wl_evaluation_control_active_attempt_id(control);
+    if (!active || active != attempt_id)
+        return EINVAL;
+#ifdef WL_SESSION_TEST_HOOKS
+    if (wl_columnar_relation_test_work_checkpoint)
+        wl_columnar_relation_test_work_checkpoint(control, 0);
+#endif
+    int tail = wl_evaluation_control_charge_attempt(control, attempt_id, 0);
+    return tail > 0 || !rc ? tail : rc;
+}
+
+static int
+wl_columnar_relation_cache_constructor_build(
+    wl_columnar_relation_cache_scalar_copy_attempt_t *a, const char *name,
+    uint32_t ncols, uint32_t initial_capacity, bool timestamps,
+    wl_columnar_memory_governor_ref_t *governor,
+    const wl_columnar_relation_constructor_recipe_t *recipe,
+    col_rel_t **local_out,
+    wl_evaluation_control_t *control, uint64_t attempt_id)
+{
+    wl_columnar_relation_constructor_attempt_t *ctx = &a->constructor;
+    uint64_t name_length, descriptor_bytes, metadata_bytes;
+    uint64_t table_bytes, names_bytes, lane_bytes, scratch_bytes, ts_bytes;
+    uint64_t payload_bytes, type_bytes;
+    char generated[14];
+    int rc;
+    rc = wl_columnar_relation_constructor_attempt_charge(control, attempt_id,
+            WL_COLUMNAR_RELATION_CONSTRUCTOR_ATTEMPT_BUILD_INIT_WORK);
+    if (rc)
+        return rc;
+    ctx->relation = NULL; ctx->name = NULL; ctx->columns = NULL;
+    ctx->scratch = NULL; ctx->names = NULL; ctx->types = NULL;
+    ctx->timestamps = NULL; ctx->columns_owned = 0; ctx->names_owned = 0;
+    ctx->schema_initialized = false; ctx->saved_ref = governor;
+    ctx->ref_held = false;
+    ctx->admitted[0] = false; ctx->committed[0] = false;
+    wl_columnar_relation_row_scratch_init(&ctx->tokens[0]);
+    ctx->admitted[1] = false; ctx->committed[1] = false;
+    wl_columnar_relation_row_scratch_init(&ctx->tokens[1]);
+    ctx->admitted[2] = false; ctx->committed[2] = false;
+    wl_columnar_relation_row_scratch_init(&ctx->tokens[2]);
+    a->constructor_initialized = true;
+    a->constructor_cleanup = WL_COLUMNAR_RELATION_CACHE_CTOR_SCHEMA_FORMAT;
+    a->constructor_cleanup_index = 0;
+    metadata_bytes = 3;
+    if (governor) {
+        wl_columnar_memory_governor_ref_retain(governor);
+        ctx->ref_held = true;
+    }
+    rc = wl_columnar_relation_constructor_attempt_tail(control, attempt_id,
+            WL_COLUMNAR_RELATION_CONSTRUCTOR_ATTEMPT_BUILD_INIT_WORK);
+    if (rc)
+        goto done;
+    rc = wl_columnar_relation_constructor_attempt_name_length(name,
+            &name_length, control, attempt_id);
+    if (rc) goto done;
+#define WL_COLUMNAR_RELATION_CONSTRUCTOR_ATTEMPT_ADD(a, b, out) do { \
+            rc = wl_columnar_relation_constructor_attempt_add((a), (b), (out), \
+                    control, attempt_id); if (rc) goto done; \
+} while (0)
+#define WL_COLUMNAR_RELATION_CONSTRUCTOR_ATTEMPT_MUL(a, b, out) do { \
+            rc = wl_columnar_relation_constructor_attempt_mul((a), (b), (out), \
+                    control, attempt_id); if (rc) goto done; \
+} while (0)
+    WL_COLUMNAR_RELATION_CONSTRUCTOR_ATTEMPT_ADD(sizeof(col_rel_t), name_length,
+        &descriptor_bytes);
+    WL_COLUMNAR_RELATION_CONSTRUCTOR_ATTEMPT_MUL(ncols, sizeof(int64_t *),
+        &table_bytes);
+    WL_COLUMNAR_RELATION_CONSTRUCTOR_ATTEMPT_MUL(ncols, sizeof(char *),
+        &names_bytes);
+    WL_COLUMNAR_RELATION_CONSTRUCTOR_ATTEMPT_MUL(initial_capacity ?
+        initial_capacity : 1u,
+        sizeof(int64_t), &lane_bytes);
+    WL_COLUMNAR_RELATION_CONSTRUCTOR_ATTEMPT_MUL(ncols, sizeof(int64_t),
+        &scratch_bytes);
+    WL_COLUMNAR_RELATION_CONSTRUCTOR_ATTEMPT_MUL(timestamps ? initial_capacity :
+        0,
+        sizeof(col_delta_timestamp_t), &ts_bytes);
+    rc = wl_columnar_relation_constructor_attempt_charge(control, attempt_id,
+            WL_COLUMNAR_RELATION_CONSTRUCTOR_ATTEMPT_SMALL_SETUP_WORK);
+    if (rc) goto done;
+    bool typed = recipe->types != NULL || recipe->type_codes != NULL;
+    type_bytes = 0;
+    rc = wl_columnar_relation_constructor_attempt_tail(control, attempt_id,
+            WL_COLUMNAR_RELATION_CONSTRUCTOR_ATTEMPT_SMALL_SETUP_WORK);
+    if (rc) goto done;
+    if (typed) {
+        WL_COLUMNAR_RELATION_CONSTRUCTOR_ATTEMPT_MUL(ncols, sizeof(*ctx->types),
+            &type_bytes);
+        WL_COLUMNAR_RELATION_CONSTRUCTOR_ATTEMPT_ADD(metadata_bytes, type_bytes,
+            &metadata_bytes);
+    }
+    WL_COLUMNAR_RELATION_CONSTRUCTOR_ATTEMPT_MUL(ncols, lane_bytes,
+        &payload_bytes);
+    WL_COLUMNAR_RELATION_CONSTRUCTOR_ATTEMPT_ADD(payload_bytes, table_bytes,
+        &payload_bytes);
+    WL_COLUMNAR_RELATION_CONSTRUCTOR_ATTEMPT_ADD(payload_bytes, ts_bytes,
+        &payload_bytes);
+    if (governor)
+        WL_COLUMNAR_RELATION_CONSTRUCTOR_ATTEMPT_ADD(payload_bytes,
+            scratch_bytes, &payload_bytes);
+    int tail;
+    rc = wl_columnar_relation_constructor_attempt_charge(control, attempt_id,
+            WL_COLUMNAR_RELATION_CONSTRUCTOR_ATTEMPT_FITS_WORK);
+    if (rc) goto done;
+    bool fits = descriptor_bytes <= SIZE_MAX && table_bytes <= SIZE_MAX
+        && names_bytes <= SIZE_MAX && lane_bytes <= SIZE_MAX
+        && scratch_bytes <= SIZE_MAX && ts_bytes <= SIZE_MAX
+        && type_bytes <= SIZE_MAX && table_bytes <= INT64_MAX;
+    tail = wl_columnar_relation_constructor_attempt_tail(control, attempt_id,
+            WL_COLUMNAR_RELATION_CONSTRUCTOR_ATTEMPT_FITS_WORK);
+    rc = tail > 0 || fits ? tail : EOVERFLOW;
+    if (rc) goto done;
+    for (uint32_t c = 0; c < ncols; c++) {
+        uint64_t length, repeated;
+        const char *effective;
+        rc = wl_columnar_relation_constructor_attempt_effective_name(recipe, c,
+                generated, &effective, &length, control, attempt_id);
+        if (rc) goto done;
+        WL_COLUMNAR_RELATION_CONSTRUCTOR_ATTEMPT_MUL(2u, length, &repeated);
+        WL_COLUMNAR_RELATION_CONSTRUCTOR_ATTEMPT_ADD(metadata_bytes,
+            sizeof(char *) + sizeof(struct ArrowSchema *)
+            + sizeof(struct ArrowSchema) + 2u, &metadata_bytes);
+        WL_COLUMNAR_RELATION_CONSTRUCTOR_ATTEMPT_ADD(metadata_bytes, repeated,
+            &metadata_bytes);
+    }
+    rc = wl_columnar_relation_constructor_attempt_charge(control, attempt_id,
+            WL_COLUMNAR_RELATION_CONSTRUCTOR_ATTEMPT_SMALL_SETUP_WORK);
+    if (rc) goto done;
+    uint64_t credits[3] = { descriptor_bytes, metadata_bytes, payload_bytes };
+    rc = wl_columnar_relation_constructor_attempt_tail(control, attempt_id,
+            WL_COLUMNAR_RELATION_CONSTRUCTOR_ATTEMPT_SMALL_SETUP_WORK);
+    if (rc) goto done;
+    rc = wl_columnar_relation_cache_constructor_reserve_source(ctx, 0,
+            descriptor_bytes, control, attempt_id);
+    if (rc != 0)
+        goto done;
+#define WL_COLUMNAR_RELATION_CONSTRUCTOR_ALLOC(ptr, type, bytes, arrow) do { \
+            rc = wl_columnar_relation_constructor_attempt_charge(control, \
+                    attempt_id, \
+                    WL_COLUMNAR_RELATION_CONSTRUCTOR_ATTEMPT_ALLOC_WORK); \
+            if (rc != 0) goto done; \
+            (ptr) = (type)wl_columnar_relation_constructor_allocate((bytes), \
+                    (arrow)); \
+            if (!(ptr)) { rc = ENOMEM; goto done; } \
+            rc = wl_columnar_relation_constructor_attempt_tail(control, \
+                    attempt_id, \
+                    WL_COLUMNAR_RELATION_CONSTRUCTOR_ATTEMPT_ALLOC_WORK); \
+            if (rc != 0) goto done; \
+} while (0)
+    WL_COLUMNAR_RELATION_CONSTRUCTOR_ALLOC(ctx->relation, col_rel_t *,
+        sizeof(col_rel_t), false);
+    rc = wl_columnar_relation_constructor_attempt_bytes_operator(ctx->relation,
+            NULL,
+            sizeof(col_rel_t), control, attempt_id);
+    if (rc != 0)
+        goto done;
+    col_rel_t *r = ctx->relation;
+    wl_columnar_memory_reservation_t *embedded[] = {
+        &r->descriptor_reservation, &r->metadata_reservation,
+        &r->pool_name_reservation, &r->dedup_reservation,
+        &r->retained_reservation,
+    };
+    /* Each original inert token initializer has seven meaningful stores plus
+     * its ordinary return. No bulk zeroing or live credit is hidden here. */
+    for (unsigned i = 0; i < 5; i++) {
+        uint64_t work =
+            WL_COLUMNAR_RELATION_CONSTRUCTOR_ATTEMPT_SMALL_SETUP_WORK;
+        rc = wl_columnar_relation_constructor_attempt_charge(control,
+                attempt_id, work);
+        if (rc != 0)
+            goto done;
+        wl_columnar_relation_row_scratch_init(embedded[i]);
+        rc = wl_columnar_relation_constructor_attempt_tail(control, attempt_id,
+                work);
+        if (rc != 0)
+            goto done;
+    }
+    WL_COLUMNAR_RELATION_CONSTRUCTOR_ALLOC(ctx->name, char *, name_length,
+        false);
+    rc = wl_columnar_relation_constructor_attempt_bytes_operator(ctx->name,
+            name,
+            name_length,
+            control, attempt_id);
+    if (rc != 0)
+        goto done;
+    rc =
+        wl_columnar_relation_constructor_attempt_identity(&r->relation_identity,
+            control, attempt_id);
+    if (rc != 0)
+        goto done;
+    rc = wl_columnar_relation_constructor_attempt_charge(control, attempt_id,
+            WL_COLUMNAR_RELATION_CONSTRUCTOR_ATTEMPT_SMALL_SETUP_WORK);
+    if (rc) goto done;
+    r->view_generation = recipe->view_generation;
+    r->storage_generation = recipe->storage_generation;
+    col_rel_storage_owner_init(r);
+    rc = wl_columnar_relation_constructor_attempt_tail(control, attempt_id,
+            WL_COLUMNAR_RELATION_CONSTRUCTOR_ATTEMPT_SMALL_SETUP_WORK);
+    if (rc) goto done;
+    for (unsigned i = 1; i < 3; i++) {
+        rc = wl_columnar_relation_cache_constructor_reserve_source(ctx, i,
+                credits[i], control, attempt_id);
+        if (rc != 0)
+            goto done;
+    }
+    if (ncols) {
+        WL_COLUMNAR_RELATION_CONSTRUCTOR_ALLOC(ctx->columns, int64_t **,
+            table_bytes, false);
+        /* No uninitialized slot is read during cleanup; only owned prefix. */
+        for (uint32_t c = 0; c < ncols;) {
+            uint32_t count = ncols - c;
+            if (count > 8u)
+                count = 8u;
+            rc = wl_columnar_relation_constructor_attempt_charge(control,
+                    attempt_id,
+                    WL_COLUMNAR_RELATION_CONSTRUCTOR_ATTEMPT_POINTER_WORK);
+            if (rc != 0)
+                goto done;
+            for (uint32_t i = 0; i < count; i++)
+                ctx->columns[c + i] = NULL;
+            c += count;
+            rc = wl_columnar_relation_constructor_attempt_tail(control,
+                    attempt_id,
+                    WL_COLUMNAR_RELATION_CONSTRUCTOR_ATTEMPT_POINTER_WORK);
+            if (rc != 0)
+                goto done;
+        }
+        for (uint32_t c = 0; c < ncols; c++) {
+            /* Record ownership before the allocation tail can stop. */
+            rc = wl_columnar_relation_constructor_attempt_charge(control,
+                    attempt_id,
+                    WL_COLUMNAR_RELATION_CONSTRUCTOR_ATTEMPT_ALLOC_WORK);
+            if (rc != 0)
+                goto done;
+            ctx->columns[c] = wl_columnar_relation_constructor_allocate(
+                lane_bytes, false);
+            if (!ctx->columns[c]) {
+                rc = ENOMEM; goto done;
+            }
+            ctx->columns_owned++;
+            rc = wl_columnar_relation_constructor_attempt_tail(control,
+                    attempt_id,
+                    WL_COLUMNAR_RELATION_CONSTRUCTOR_ATTEMPT_ALLOC_WORK);
+            if (rc != 0)
+                goto done;
+        }
+        if (governor)
+            WL_COLUMNAR_RELATION_CONSTRUCTOR_ALLOC(ctx->scratch, int64_t *,
+                scratch_bytes, false);
+        WL_COLUMNAR_RELATION_CONSTRUCTOR_ALLOC(ctx->names, char **, names_bytes,
+            false);
+        for (uint32_t c = 0; c < ncols;) {
+            uint32_t count = ncols - c;
+            if (count > 8u)
+                count = 8u;
+            rc = wl_columnar_relation_constructor_attempt_charge(control,
+                    attempt_id,
+                    WL_COLUMNAR_RELATION_CONSTRUCTOR_ATTEMPT_POINTER_WORK);
+            if (rc != 0)
+                goto done;
+            for (uint32_t i = 0; i < count; i++)
+                ctx->names[c + i] = NULL;
+            c += count;
+            rc = wl_columnar_relation_constructor_attempt_tail(control,
+                    attempt_id,
+                    WL_COLUMNAR_RELATION_CONSTRUCTOR_ATTEMPT_POINTER_WORK);
+            if (rc != 0)
+                goto done;
+        }
+        for (uint32_t c = 0; c < ncols; c++) {
+            uint64_t length;
+            const char *effective;
+            rc = wl_columnar_relation_constructor_attempt_effective_name(recipe,
+                    c,
+                    generated, &effective, &length, control, attempt_id);
+            if (rc != 0)
+                goto done;
+            rc = wl_columnar_relation_constructor_attempt_charge(control,
+                    attempt_id,
+                    WL_COLUMNAR_RELATION_CONSTRUCTOR_ATTEMPT_ALLOC_WORK);
+            if (rc != 0)
+                goto done;
+            ctx->names[c] = wl_columnar_relation_constructor_allocate(length,
+                    false);
+            if (!ctx->names[c]) {
+                rc = ENOMEM; goto done;
+            }
+            ctx->names_owned++;
+            rc = wl_columnar_relation_constructor_attempt_tail(control,
+                    attempt_id,
+                    WL_COLUMNAR_RELATION_CONSTRUCTOR_ATTEMPT_ALLOC_WORK);
+            if (rc != 0)
+                goto done;
+            rc =
+                wl_columnar_relation_constructor_attempt_bytes_operator(
+                ctx->names[c],
+                effective, length, control, attempt_id);
+            if (rc != 0)
+                goto done;
+        }
+    }
+    if (type_bytes) {
+        WL_COLUMNAR_RELATION_CONSTRUCTOR_ALLOC(ctx->types,
+            wirelog_column_type_t *, type_bytes, false);
+        for (uint32_t c = 0; c < ncols; c++) {
+            rc = wl_columnar_relation_constructor_attempt_charge(control,
+                    attempt_id,
+                    WL_COLUMNAR_RELATION_CONSTRUCTOR_ATTEMPT_SMALL_SETUP_WORK);
+            if (rc != 0) goto done;
+            ctx->types[c] = recipe->type_codes
+                ? (wirelog_column_type_t)recipe->type_codes[c]
+                : recipe->types[c];
+            rc = wl_columnar_relation_constructor_attempt_tail(control,
+                    attempt_id,
+                    WL_COLUMNAR_RELATION_CONSTRUCTOR_ATTEMPT_SMALL_SETUP_WORK);
+            if (rc != 0) goto done;
+        }
+    }
+    if (ts_bytes) {
+        WL_COLUMNAR_RELATION_CONSTRUCTOR_ALLOC(ctx->timestamps,
+            col_delta_timestamp_t *, ts_bytes, false);
+        rc =
+            wl_columnar_relation_constructor_attempt_bytes_operator(
+            ctx->timestamps,
+            NULL,
+            ts_bytes, control, attempt_id);
+        if (rc != 0)
+            goto done;
+    }
+    /* ArrowSchemaInit is exactly nine fixed field stores in pinned nanoarrow. */
+    rc = wl_columnar_relation_constructor_attempt_charge(control, attempt_id,
+            WL_COLUMNAR_RELATION_CONSTRUCTOR_ATTEMPT_SMALL_SETUP_WORK);
+    if (rc != 0)
+        goto done;
+    ArrowSchemaInit(&r->schema);
+    ctx->schema_initialized = true;
+    rc = wl_columnar_relation_constructor_attempt_tail(control, attempt_id,
+            WL_COLUMNAR_RELATION_CONSTRUCTOR_ATTEMPT_SMALL_SETUP_WORK);
+    if (rc != 0)
+        goto done;
+    WL_COLUMNAR_RELATION_CONSTRUCTOR_ALLOC(r->schema.format, const char *, 3,
+        true);
+    rc =
+        wl_columnar_relation_constructor_attempt_bytes_operator(
+        (char *)r->schema.format,
+        "+s", 3, control, attempt_id);
+    if (rc != 0)
+        goto done;
+    if (ncols) {
+        WL_COLUMNAR_RELATION_CONSTRUCTOR_ALLOC(r->schema.children,
+            struct ArrowSchema **, table_bytes, true);
+        /* Count stays zero through partial pointer-table initialization. */
+        for (uint32_t c = 0; c < ncols;) {
+            uint32_t count = ncols - c;
+            if (count > 8u)
+                count = 8u;
+            rc = wl_columnar_relation_constructor_attempt_charge(control,
+                    attempt_id,
+                    WL_COLUMNAR_RELATION_CONSTRUCTOR_ATTEMPT_POINTER_WORK);
+            if (rc != 0)
+                goto done;
+            for (uint32_t i = 0; i < count; i++)
+                r->schema.children[c + i] = NULL;
+            c += count;
+            rc = wl_columnar_relation_constructor_attempt_tail(control,
+                    attempt_id,
+                    WL_COLUMNAR_RELATION_CONSTRUCTOR_ATTEMPT_POINTER_WORK);
+            if (rc != 0)
+                goto done;
+        }
+        for (uint32_t c = 0; c < ncols; c++) {
+            rc = wl_columnar_relation_constructor_attempt_charge(control,
+                    attempt_id,
+                    WL_COLUMNAR_RELATION_CONSTRUCTOR_ATTEMPT_ARROW_CHILD_WORK);
+            if (rc != 0)
+                goto done;
+            /* Allocation1, header9, pointer/count2. Install before tail. */
+            struct ArrowSchema *child =
+                wl_columnar_relation_constructor_allocate(sizeof(*child), true);
+            if (!child) {
+                rc = ENOMEM; goto done;
+            }
+            ArrowSchemaInit(child);
+            r->schema.children[c] = child;
+            r->schema.n_children = (int64_t)c + 1;
+            rc = wl_columnar_relation_constructor_attempt_tail(control,
+                    attempt_id,
+                    WL_COLUMNAR_RELATION_CONSTRUCTOR_ATTEMPT_ARROW_CHILD_WORK);
+            if (rc != 0)
+                goto done;
+            WL_COLUMNAR_RELATION_CONSTRUCTOR_ALLOC(child->format, const char *,
+                2, true);
+            const char *format = "l";
+            if (ctx->types) {
+                rc = wl_columnar_relation_constructor_attempt_charge(control,
+                        attempt_id,
+                        WL_COLUMNAR_RELATION_CONSTRUCTOR_ATTEMPT_SMALL_SETUP_WORK);
+                if (rc != 0) goto done;
+                format = ctx->types[c] == WIRELOG_TYPE_FLOAT ? "g" : "l";
+                rc = wl_columnar_relation_constructor_attempt_tail(control,
+                        attempt_id,
+                        WL_COLUMNAR_RELATION_CONSTRUCTOR_ATTEMPT_SMALL_SETUP_WORK);
+                if (rc != 0) goto done;
+            }
+            rc =
+                wl_columnar_relation_constructor_attempt_bytes_operator(
+                (char *)child->format,
+                format, 2, control, attempt_id);
+            if (rc != 0)
+                goto done;
+            /* Measured generated length uses bounded digits, not strlen. */
+            uint64_t length;
+            const char *effective;
+            rc = wl_columnar_relation_constructor_attempt_effective_name(recipe,
+                    c,
+                    generated, &effective, &length, control, attempt_id);
+            if (rc != 0)
+                goto done;
+            WL_COLUMNAR_RELATION_CONSTRUCTOR_ALLOC(child->name, const char *,
+                length, true);
+            rc =
+                wl_columnar_relation_constructor_attempt_bytes_operator(
+                (char *)child->name,
+                ctx->names[c], length, control, attempt_id);
+            if (rc != 0)
+                goto done;
+        }
+    }
+    for (unsigned i = 0; i < 3; i++) {
+        rc = wl_columnar_relation_constructor_attempt_charge(control,
+                attempt_id,
+                WL_COLUMNAR_RELATION_CONSTRUCTOR_ATTEMPT_COMMIT_CALLER_WORK);
+        if (rc) goto done;
+        if (!ctx->admitted[i]) {
+            rc = wl_columnar_relation_constructor_attempt_tail(control,
+                    attempt_id,
+                    WL_COLUMNAR_RELATION_CONSTRUCTOR_ATTEMPT_COMMIT_CALLER_WORK);
+            if (rc) goto done;
+            continue;
+        }
+        rc =
+            wl_columnar_memory_governor_commit_source_attempt_controlled(
+            &ctx->tokens[i], r,
+            &ctx->committed[i], control, attempt_id);
+        if (rc != 0)
+            goto done;
+        if (!ctx->committed[i]) {
+            rc = EINVAL; goto done;
+        }
+        rc = wl_columnar_relation_attempt_guard(control, attempt_id);
+        if (rc) goto done;
+#ifdef WL_SESSION_TEST_HOOKS
+        if (wl_columnar_relation_test_constructor_committed)
+            wl_columnar_relation_test_constructor_committed(control, i);
+#endif
+        rc = wl_columnar_relation_constructor_attempt_tail(control, attempt_id,
+                WL_COLUMNAR_RELATION_CONSTRUCTOR_ATTEMPT_COMMIT_CALLER_WORK);
+        if (rc != 0)
+            goto done;
+    }
+    /* Fund the complete irreversible move/install and ordinary caller edge;
+     * no callback or poll can split the three original authority moves. */
+    rc = wl_columnar_relation_constructor_attempt_charge(control, attempt_id,
+            WL_COLUMNAR_RELATION_CONSTRUCTOR_ATTEMPT_INSTALL_WORK);
+    if (rc) goto done;
+    /* Actual address-only bindings belong to this already paid INSTALL
+     * activation BEFORE its real final saved-ID0 cutoff. No native payload or
+     * state proof is cached. The copier's actual busy/native ownership and
+     * final-address ctx/output lifetime keep the subobjects stable across the
+     * original work hook. Every native guard below still executes after it. */
+    wl_columnar_memory_reservation_t *destination0 = &r->descriptor_reservation;
+    wl_columnar_memory_reservation_t *source0 = &ctx->tokens[0];
+    wl_columnar_memory_reservation_t *destination1 = &r->metadata_reservation;
+    wl_columnar_memory_reservation_t *source1 = &ctx->tokens[1];
+    wl_columnar_memory_reservation_t *destination2 = &r->retained_reservation;
+    wl_columnar_memory_reservation_t *source2 = &ctx->tokens[2];
+    uint64_t install_active =
+        wl_evaluation_control_active_attempt_id(control);
+    if (!install_active || install_active != attempt_id) {
+        rc = EINVAL; goto done;
+    }
+#ifdef WL_SESSION_TEST_HOOKS
+    if (wl_columnar_relation_test_work_checkpoint)
+        wl_columnar_relation_test_work_checkpoint(control,
+            WL_COLUMNAR_RELATION_CONSTRUCTOR_ATTEMPT_INSTALL_WORK);
+#endif
+    rc = wl_evaluation_control_charge_attempt(control, attempt_id, 0);
+    if (rc) goto done;
+    if (ctx->admitted[0]) {
+        if (!destination0 || !source0 || destination0 == source0
+            || destination0->identity != destination0 ||
+            source0->identity != source0)
+            abort();
+        uint64_t destination_state = atomic_load_explicit(&destination0->state,
+                memory_order_acquire);
+        if (destination_state != WL_COLUMNAR_MEMORY_RESERVATION_EMPTY
+            && destination_state != WL_COLUMNAR_MEMORY_RESERVATION_RELEASED)
+            abort();
+        uint64_t state = atomic_load_explicit(&source0->state,
+                memory_order_acquire);
+        if (state != WL_COLUMNAR_MEMORY_RESERVATION_COMMITTED
+            && state != WL_COLUMNAR_MEMORY_RESERVATION_RESERVED) abort();
+        destination0->governor = source0->governor;
+        destination0->bytes = source0->bytes;
+        destination0->transition_kind = source0->transition_kind;
+        atomic_store_explicit(&destination0->owner_bits,
+            atomic_load_explicit(&source0->owner_bits, memory_order_relaxed),
+            memory_order_relaxed);
+        atomic_store_explicit(&destination0->state, state,
+            memory_order_release);
+        source0->governor = NULL; source0->bytes = 0;
+        source0->transition_kind = WL_COLUMNAR_MEMORY_TRANSITION_NONE;
+        atomic_store_explicit(&source0->owner_bits, 0, memory_order_relaxed);
+        atomic_store_explicit(&source0->state,
+            WL_COLUMNAR_MEMORY_RESERVATION_EMPTY,
+            memory_order_release);
+        /* Native identity fields retain their just-checked exact address.
+         * No callback/writer intervenes; only two plain self-stores elided. */
+    }
+    if (ctx->admitted[1]) {
+        if (!destination1 || !source1 || destination1 == source1
+            || destination1->identity != destination1 ||
+            source1->identity != source1)
+            abort();
+        uint64_t destination_state = atomic_load_explicit(&destination1->state,
+                memory_order_acquire);
+        if (destination_state != WL_COLUMNAR_MEMORY_RESERVATION_EMPTY
+            && destination_state != WL_COLUMNAR_MEMORY_RESERVATION_RELEASED)
+            abort();
+        uint64_t state = atomic_load_explicit(&source1->state,
+                memory_order_acquire);
+        if (state != WL_COLUMNAR_MEMORY_RESERVATION_COMMITTED
+            && state != WL_COLUMNAR_MEMORY_RESERVATION_RESERVED) abort();
+        destination1->governor = source1->governor;
+        destination1->bytes = source1->bytes;
+        destination1->transition_kind = source1->transition_kind;
+        atomic_store_explicit(&destination1->owner_bits,
+            atomic_load_explicit(&source1->owner_bits, memory_order_relaxed),
+            memory_order_relaxed);
+        atomic_store_explicit(&destination1->state, state,
+            memory_order_release);
+        source1->governor = NULL; source1->bytes = 0;
+        source1->transition_kind = WL_COLUMNAR_MEMORY_TRANSITION_NONE;
+        atomic_store_explicit(&source1->owner_bits, 0, memory_order_relaxed);
+        atomic_store_explicit(&source1->state,
+            WL_COLUMNAR_MEMORY_RESERVATION_EMPTY,
+            memory_order_release);
+        /* Native identity fields retain their just-checked exact address.
+         * No callback/writer intervenes; only two plain self-stores elided. */
+    }
+    if (ctx->admitted[2]) {
+        if (!destination2 || !source2 || destination2 == source2
+            || destination2->identity != destination2 ||
+            source2->identity != source2)
+            abort();
+        uint64_t destination_state = atomic_load_explicit(&destination2->state,
+                memory_order_acquire);
+        if (destination_state != WL_COLUMNAR_MEMORY_RESERVATION_EMPTY
+            && destination_state != WL_COLUMNAR_MEMORY_RESERVATION_RELEASED)
+            abort();
+        uint64_t state = atomic_load_explicit(&source2->state,
+                memory_order_acquire);
+        if (state != WL_COLUMNAR_MEMORY_RESERVATION_COMMITTED
+            && state != WL_COLUMNAR_MEMORY_RESERVATION_RESERVED) abort();
+        destination2->governor = source2->governor;
+        destination2->bytes = source2->bytes;
+        destination2->transition_kind = source2->transition_kind;
+        atomic_store_explicit(&destination2->owner_bits,
+            atomic_load_explicit(&source2->owner_bits, memory_order_relaxed),
+            memory_order_relaxed);
+        atomic_store_explicit(&destination2->state, state,
+            memory_order_release);
+        source2->governor = NULL; source2->bytes = 0;
+        source2->transition_kind = WL_COLUMNAR_MEMORY_TRANSITION_NONE;
+        atomic_store_explicit(&source2->owner_bits, 0, memory_order_relaxed);
+        atomic_store_explicit(&source2->state,
+            WL_COLUMNAR_MEMORY_RESERVATION_EMPTY,
+            memory_order_release);
+        /* Native identity fields retain their just-checked exact address.
+         * No callback/writer intervenes; only two plain self-stores elided. */
+    }
+    r->name = ctx->name; r->ncols = ncols; r->capacity = initial_capacity;
+    r->columns = ctx->columns; r->row_scratch = ctx->scratch;
+    r->col_names = ctx->names; r->timestamps = ctx->timestamps;
+    r->timestamp_capacity = timestamps ? initial_capacity : 0;
+    r->schema_ok = true; r->memory_governor = governor;
+    r->descriptor_reserved_bytes = governor ? descriptor_bytes : 0;
+    r->metadata_reserved_bytes = governor ? metadata_bytes : 0;
+    r->retained_reserved_bytes = governor ? payload_bytes : 0;
+    if (recipe) {
+        r->column_types = ctx->types;
+        r->has_graph_column = recipe->has_graph_column;
+        r->graph_col_idx = recipe->graph_col_idx;
+        r->declared_ncols = recipe->declared_ncols;
+    }
+    ctx->ref_held = false;
+    *local_out = r;
+    a->phase = WL_COLUMNAR_RELATION_CACHE_COPY_CELL;
+#undef WL_COLUMNAR_RELATION_CONSTRUCTOR_ALLOC
+#undef WL_COLUMNAR_RELATION_CONSTRUCTOR_ATTEMPT_ADD
+#undef WL_COLUMNAR_RELATION_CONSTRUCTOR_ATTEMPT_MUL
+    return 0;
+done:
+    return rc;
+}
+
 /* Attempt ID is caller supplied and remains immutable across nested readers,
  * governor admissions, identity claims and mandatory cleanup. The caller owns
  * an exclusive writable output slot containing no live owned result. */
@@ -18370,6 +18997,7 @@ enum {
     WL_COLUMNAR_RELATION_CACHE_COPY_INIT_WORK = 256,
     WL_COLUMNAR_RELATION_CACHE_COPY_ACTION_WORK = 128,
     WL_COLUMNAR_RELATION_CACHE_COPY_VALIDATE_WORK = 192,
+    WL_COLUMNAR_RELATION_CACHE_COPY_CONSTRUCTOR_CREDIT_WORK = 121,
     WL_COLUMNAR_RELATION_CACHE_COPY_RETIRE_ZERO_WORK = 256,
     WL_COLUMNAR_RELATION_CACHE_COPY_RETIRE_BEGIN_WORK = 256
 };
@@ -18466,6 +19094,7 @@ wl_columnar_relation_cache_scalar_copy_begin(
     if (a->identity || a->phase != WL_COLUMNAR_RELATION_CACHE_COPY_INERT
         || a->control_ref || a->control || a->thread_valid || a->source
         || a->output || a->held || a->retirement_started
+        || a->constructor_initialized
         || !wl_columnar_relation_cache_copy_reader_inert(
             &a->reader)) return EBUSY;
     if (!source || !control || !id) return EINVAL;
@@ -18498,6 +19127,7 @@ wl_columnar_relation_cache_scalar_copy_begin(
     a->held = false; a->run_valid = true; a->retirement_started = false;
     a->output = NULL; a->width = a->rows = a->capacity = 0;
     a->column = a->row = a->run = a->previous_end = 0;
+    a->constructor_initialized = false;
     a->semantic_result = 0; a->phase = WL_COLUMNAR_RELATION_CACHE_COPY_ACQUIRE;
     return wl_columnar_relation_cache_copy_leave(a, 0);
 }
@@ -18529,7 +19159,6 @@ wl_columnar_relation_cache_copy_action(
     wl_columnar_relation_cache_scalar_copy_attempt_t *a)
 {
     const col_rel_t *s = a->source;
-    col_rel_t *output = a->output;
     switch (a->phase) {
     case WL_COLUMNAR_RELATION_CACHE_COPY_ACQUIRE: {
         bool held = false;
@@ -18605,12 +19234,9 @@ wl_columnar_relation_cache_copy_action(
             .view_generation = 2u + (s->column_types != NULL),
             .storage_generation = 1
         };
-        int rc = wl_columnar_relation_constructor_attempt_build_operator(
-            s->name, a->width, a->capacity, false, a->governor, &recipe,
-            &a->output, a->control, a->attempt_id);
-        if (rc) return rc;
-        a->phase = WL_COLUMNAR_RELATION_CACHE_COPY_CELL;
-        return 0;
+        return wl_columnar_relation_cache_constructor_build(a,
+                   s->name, a->width, a->capacity, false, a->governor, &recipe,
+                   &a->output, a->control, a->attempt_id);
     }
     case WL_COLUMNAR_RELATION_CACHE_COPY_CELL:
         if (a->column == a->width || !a->rows) {
@@ -18639,14 +19265,16 @@ wl_columnar_relation_cache_copy_action(
         }
         a->output->run_ends[a->run] = s->run_ends[a->run]; a->run++;
         return 0;
-    case WL_COLUMNAR_RELATION_CACHE_COPY_METADATA:
+    case WL_COLUMNAR_RELATION_CACHE_COPY_METADATA: {
+        col_rel_t *r = a->output;
         a->output->nrows = a->rows;
-        output->base_nrows = s->base_nrows;
+        r->base_nrows = s->base_nrows;
         a->output->sorted_nrows = a->run_valid && s->sorted_nrows <= a->rows
             ? s->sorted_nrows : 0;
         a->output->run_count = a->run_valid ? s->run_count : 0;
         a->phase = WL_COLUMNAR_RELATION_CACHE_COPY_FINAL;
         return 0;
+    }
     case WL_COLUMNAR_RELATION_CACHE_COPY_FINAL: {
         int rc = wl_columnar_relation_cache_copy_source_valid(a);
         if (!rc) a->phase = WL_COLUMNAR_RELATION_CACHE_COPY_LATCH;
@@ -18676,7 +19304,8 @@ wl_columnar_relation_cache_scalar_copy_step(
         return wl_columnar_relation_cache_copy_leave(a, EINVAL);
     *ready = false;
     WL_COLUMNAR_RELATION_CACHE_COPY_HOOK(a, a->control, 2);
-    uint64_t work = a->phase == WL_COLUMNAR_RELATION_CACHE_COPY_VALIDATE
+    uint64_t work = a->phase == WL_COLUMNAR_RELATION_CACHE_COPY_ACQUIRE
+        || a->phase == WL_COLUMNAR_RELATION_CACHE_COPY_VALIDATE
         || a->phase == WL_COLUMNAR_RELATION_CACHE_COPY_OWNER
         || a->phase == WL_COLUMNAR_RELATION_CACHE_COPY_COLUMN
         || a->phase == WL_COLUMNAR_RELATION_CACHE_COPY_BUILD
@@ -18689,7 +19318,8 @@ wl_columnar_relation_cache_scalar_copy_step(
         if (!a->result_saved) {
             a->result_saved = true; a->semantic_result = rc;
         }
-        a->discarding = true; a->phase = WL_COLUMNAR_RELATION_CACHE_COPY_END;
+        a->discarding = true;
+        a->phase = WL_COLUMNAR_RELATION_CACHE_COPY_CONSTRUCTOR_END;
     } else *ready = a->phase == WL_COLUMNAR_RELATION_CACHE_COPY_READY;
     return wl_columnar_relation_cache_copy_leave(a, rc);
 }
@@ -18704,6 +19334,179 @@ wl_columnar_relation_cache_copy_fund(
         || wl_evaluation_control_active_attempt_id(funding) !=
         id) return EINVAL;
     return wl_evaluation_control_charge_attempt(funding, id, work);
+}
+
+/* Private finite native preparation. The existing wrapper192 owns its
+ * complete caller/current and one-use fixed native prefix; this real192
+ * source profile owns the remaining finite native action. Shared generic
+ * and finite APIs retain their original1 tariff and bodies unchanged. */
+static int
+wl_columnar_relation_cache_copy_prepare_source(
+    wl_columnar_relation_scalar_retirement_t *s,
+    wl_evaluation_control_t *control, uint64_t id)
+{
+    if (!s || s->storage.identity != (uintptr_t)&s->storage || s->committed)
+        return EINVAL;
+    if (s->ready) return 0;
+    int rc = wl_evaluation_control_charge_attempt(control, id,
+            WL_COLUMNAR_RELATION_CACHE_COPY_VALIDATE_WORK);
+    if (rc) return rc;
+    col_rel_t *r = s->storage.relation;
+    if (!r) return EINVAL;
+    struct ArrowSchema expected_schema;
+    ArrowSchemaInit(&expected_schema);
+    if (s->phase == WL_COLUMNAR_RELATION_SCALAR_FINITE_PAYLOAD) {
+        rc = wl_evaluation_control_charge_attempt(control, id, 192);
+        if (rc) return rc;
+        col_rel_payload_shape_t shape = {
+            .ncols = r->ncols, .owned_columns = s->owned_columns,
+            .column_capacity = r->capacity,
+            .timestamp_capacity = r->timestamp_capacity,
+            .merge_capacity = r->merge_buf_cap,
+            .active_table = r->columns != NULL,
+            .merge_table = r->merge_columns != NULL,
+            .scratch = r->row_scratch != NULL
+        };
+        uint64_t bytes;
+        if (!col_rel_payload_shape_bytes(&shape, &bytes)
+            || bytes > r->retained_reserved_bytes) return EINVAL;
+        s->column = 0; s->phase = 2; s->ready = true;
+        return wl_evaluation_control_charge_attempt(control, id, 0);
+    }
+    if (s->phase == 0) {
+        wl_columnar_source_access_gate_request_t requests[2] = {
+            {&r->descriptor_access, WL_COLUMNAR_SOURCE_ACCESS_GATE_WRITER},
+            {&r->source_access, WL_COLUMNAR_SOURCE_ACCESS_GATE_WRITER}
+        };
+        rc = wl_columnar_source_access_gate_round_acquire(
+            &s->storage.gate_round, requests, 1, 1);
+        if (rc) return rc;
+        s->phase = 1;
+    } else if (s->phase == 1) {
+        if (r->pool_owned || r->arena_owned || r->retract_backup_columns
+            || r->retract_backup_timestamps ||
+            r->retract_backup_timestamp_capacity
+            || r->retract_backup_nrows || r->retract_backup_base_nrows
+            || r->retract_backup_capacity || r->retract_backup_sorted_nrows
+            || r->col_shared || r->compound_kind != WIRELOG_COMPOUND_KIND_NONE
+            || r->compound_count || r->compound_arity_map ||
+            r->compound_arity_len
+            || r->inline_physical_offset || r->memory_budget_denial_pending
+            || r->pool_name_reserved_bytes
+            || r->deferred_relation_next || r->deferred_relation_session
+            || r->storage_owner != r || !r->relation_identity
+            || r->storage_owner_identity != r->relation_identity
+            || r->storage_owner_generation != r->storage_generation
+            || col_rel_storage_alias_borrow_count(r)
+            || r->schema.dictionary || r->schema.private_data
+            || (r->schema_ok && (r->schema.release != expected_schema.release
+            || r->schema.n_children != r->ncols
+            || (r->ncols && (!r->schema.children || !r->col_names))))
+            || (!r->schema_ok && (r->schema.release || r->schema.children
+            || r->schema.n_children || r->col_names))) return ENOTSUP;
+        if ((r->timestamps != NULL) != (r->timestamp_capacity != 0)
+            || (r->timestamps && r->timestamp_capacity < r->nrows)
+            || !wl_columnar_memory_size_mul(r->timestamp_capacity,
+            sizeof(col_delta_timestamp_t), &s->timestamp_bytes)
+            || (!r->mem_ledger && r->ledger_ts_bytes)) return EINVAL;
+        if (r->timestamps) {
+            const void *ts = r->timestamps;
+            if (ts == (const void *)r || ts == (const void *)r->columns
+                || ts == (const void *)r->merge_columns
+                || ts == (const void *)r->row_scratch
+                || ts == (const void *)r->col_names
+                || ts == (const void *)r->column_types
+                || ts == (const void *)r->dedup_slots
+                || ts == (const void *)r->name
+                || ts == (const void *)r->schema.children
+                || ts == (const void *)r->schema.name
+                || ts == (const void *)r->schema.format
+                || ts == (const void *)r->schema.metadata) return EINVAL;
+        }
+        s->storage.governor = r->memory_governor
+            ? wl_columnar_memory_governor_ref_get(r->memory_governor) : NULL;
+        s->phase = 16;
+    } else if (s->phase >= 16 && s->phase < 20) {
+        size_t i = s->phase - 16;
+        uint64_t *bytes;
+        wl_columnar_memory_reservation_t *token =
+            wl_columnar_relation_managed_token_at(r, i, &bytes);
+        if (s->storage.governor
+                ? !wl_columnar_relation_managed_token_valid(token,
+            s->storage.governor, r, *bytes)
+                : (*bytes || !wl_columnar_relation_managed_empty_token(token)))
+            return EINVAL;
+        s->phase++;
+    } else if (s->phase == 20) {
+        if (!wl_columnar_relation_managed_empty_token(
+                &r->pool_name_reservation))
+            return ENOTSUP;
+        s->ledger = r->mem_ledger;
+        /* Deferred accounting can leave either unbilled storage or an unpaid
+         * refund after raw consolidation already freed the stamp array.
+         * The recorded charge is authoritative, independently of live bytes. */
+        s->ledger_timestamp_bytes = r->ledger_ts_bytes;
+        s->phase = 2;
+    } else if (s->phase == 2) {
+        if (s->column == r->ncols) {
+            if ((r->timestamps || s->ledger_timestamp_bytes)
+                && s->storage.governor) {
+                /* Pending proof owns real writers, but is not READY. */
+                s->phase = WL_COLUMNAR_RELATION_SCALAR_FINITE_PAYLOAD;
+                rc = wl_evaluation_control_charge_attempt(control, id, 0);
+                return rc ? rc : EAGAIN;
+            }
+            s->column = 0;
+            s->ready = true;
+            return wl_evaluation_control_charge_attempt(control, id, 0);
+        }
+        uint32_t c = s->column;
+        if ((r->nrows && (!r->columns || !r->columns[c]))
+            || (r->column_types && (r->column_types[c] < WIRELOG_TYPE_INT32
+            || r->column_types[c] > WIRELOG_TYPE_BOOL))) return ENOTSUP;
+        if (r->schema_ok) {
+            const struct ArrowSchema *child = r->schema.children[c];
+            if (!child || child->n_children || child->dictionary
+                || child->private_data ||
+                child->release != expected_schema.release
+                || !r->col_names[c])
+                return ENOTSUP;
+            if (r->timestamps) {
+                const void *ts = r->timestamps;
+                if (ts == (const void *)child
+                    || ts == (const void *)child->name
+                    || ts == (const void *)child->format
+                    || ts == (const void *)child->metadata) return EINVAL;
+            }
+        }
+        if (r->timestamps
+            && ((r->columns && (void *)r->timestamps == r->columns[c])
+            || (r->merge_columns
+            && (void *)r->timestamps == r->merge_columns[c])
+            || (r->col_names
+            && (void *)r->timestamps == r->col_names[c]))) return EINVAL;
+        if (r->columns && r->columns[c]) {
+            ++s->owned_columns;
+            uint64_t bytes = (uint64_t)r->capacity * sizeof(int64_t);
+            if (!wl_columnar_memory_size_add(s->ledger_bytes, bytes,
+                &s->ledger_bytes)) return EOVERFLOW;
+        }
+        s->prior_column = 0;
+        s->phase = 3;
+    } else if (s->phase == 3) {
+        /* Reject duplicate backing pointers before any irreversible free. */
+        if (s->prior_column < s->column) {
+            uint32_t a = s->prior_column++, b = s->column;
+            if ((r->columns && r->columns[a]
+                && r->columns[a] == r->columns[b])
+                || (r->merge_columns && r->merge_columns[a]
+                && r->merge_columns[a] == r->merge_columns[b])) return EINVAL;
+        } else {
+            s->column++; s->phase = 2;
+        }
+    } else return EINVAL;
+    rc = wl_evaluation_control_charge_attempt(control, id, 0);
+    return rc ? rc : EAGAIN;
 }
 
 static int
@@ -18723,14 +19526,23 @@ wl_columnar_relation_cache_copy_end(
     if ((!aborting && a->phase < WL_COLUMNAR_RELATION_CACHE_COPY_READY)
         || (aborting && !initiating)) return EBUSY;
     *done = false;
-    WL_COLUMNAR_RELATION_CACHE_COPY_HOOK(a, funding, aborting ? 4 : 3);
-    uint64_t work = a->phase == WL_COLUMNAR_RELATION_CACHE_COPY_RETIRE_ZERO
-        ? WL_COLUMNAR_RELATION_CACHE_COPY_RETIRE_ZERO_WORK
-        : a->phase == WL_COLUMNAR_RELATION_CACHE_COPY_RETIRE_BEGIN
+#ifdef WL_SESSION_TEST_HOOKS
+    if (wl_columnar_relation_cache_scalar_copy_test_checkpoint)
+        wl_columnar_relation_cache_scalar_copy_test_checkpoint(a, funding,
+            aborting ? 4 : 3);
+#endif
+    uint64_t work = a->phase == WL_COLUMNAR_RELATION_CACHE_COPY_RETIRE_BEGIN
         ? WL_COLUMNAR_RELATION_CACHE_COPY_RETIRE_BEGIN_WORK
+        : a->phase == WL_COLUMNAR_RELATION_CACHE_COPY_CONSTRUCTOR_END
+        ? WL_COLUMNAR_RELATION_CACHE_COPY_VALIDATE_WORK
+        : a->phase == WL_COLUMNAR_RELATION_CACHE_COPY_RETIRE_ZERO
+        ? WL_COLUMNAR_RELATION_CACHE_COPY_RETIRE_ZERO_WORK
         : (a->phase == WL_COLUMNAR_RELATION_CACHE_COPY_RETIRE_PREPARE
-        || a->phase == WL_COLUMNAR_RELATION_CACHE_COPY_RETIRE_STEP)
-        ? WL_COLUMNAR_RELATION_CACHE_COPY_VALIDATE_WORK :
+        || a->phase == WL_COLUMNAR_RELATION_CACHE_COPY_RETIRE_STEP
+        || a->phase == WL_COLUMNAR_RELATION_CACHE_COPY_END)
+        ? (a->phase == WL_COLUMNAR_RELATION_CACHE_COPY_RETIRE_STEP
+        ? WL_COLUMNAR_RELATION_CACHE_COPY_RETIRE_BEGIN_WORK
+        : WL_COLUMNAR_RELATION_CACHE_COPY_VALIDATE_WORK) :
         WL_COLUMNAR_RELATION_CACHE_COPY_ACTION_WORK;
     int rc = wl_columnar_relation_cache_copy_fund(a, funding, id, work);
     if (rc) return rc;
@@ -18740,14 +19552,196 @@ wl_columnar_relation_cache_copy_end(
             a->semantic_result = initiating; a->result_saved = true;
         }
     }
-    if (a->phase < WL_COLUMNAR_RELATION_CACHE_COPY_END) {
+    if (a->phase < WL_COLUMNAR_RELATION_CACHE_COPY_CONSTRUCTOR_END) {
         if (!a->result_saved) {
             a->semantic_result = 0; a->result_saved = true;
+        }
+        a->phase = WL_COLUMNAR_RELATION_CACHE_COPY_CONSTRUCTOR_END;
+        return 0;
+    }
+    switch (a->phase) {
+    case WL_COLUMNAR_RELATION_CACHE_COPY_CONSTRUCTOR_END: {
+        if (!a->output && a->constructor_initialized) {
+            switch (a->constructor_cleanup) {
+            case WL_COLUMNAR_RELATION_CACHE_CTOR_SCHEMA_FORMAT:
+                if (a->constructor.schema_initialized &&
+                    a->constructor.relation->schema.format){
+                    ArrowFree((void *)a->constructor.relation->schema.format);
+                    a->constructor.relation->schema.format = NULL;
+                }
+                a->constructor_cleanup_index = 0;
+                a->constructor_cleanup =
+                    WL_COLUMNAR_RELATION_CACHE_CTOR_SCHEMA_CHILD;
+                return 0;
+            case WL_COLUMNAR_RELATION_CACHE_CTOR_SCHEMA_CHILD:
+                if (!a->constructor.schema_initialized ||
+                    a->constructor_cleanup_index ==
+                    (uint64_t)a->constructor.relation->schema.n_children) {
+                    if (a->constructor.schema_initialized) a->constructor.
+                        relation->schema.
+                        n_children = 0;
+                    a->constructor_cleanup_index = 0;
+                    a->constructor_cleanup =
+                        WL_COLUMNAR_RELATION_CACHE_CTOR_SCHEMA_ROOT;
+                    return 0;
+                } else {
+                    struct ArrowSchema *schema =
+                        &a->constructor.relation->schema;
+                    uint32_t index = a->constructor_cleanup_index;
+                    struct ArrowSchema *child = schema->children[index];
+                    /* Exact constructor-created scalar child: no children/dictionary/
+                     * metadata/private_data ever installed, no published mutable output.
+                     * Full pinned release body is counted, not a variable-loop waiver. */
+                    if (child) {
+                        ArrowSchemaRelease(child);
+                        ArrowFree(child);
+                        schema->children[index] = NULL;
+                    }
+                    ++a->constructor_cleanup_index;
+                    return 0;
+                }
+            case WL_COLUMNAR_RELATION_CACHE_CTOR_SCHEMA_ROOT:
+                if (a->constructor.schema_initialized) {
+                    /* All actual children already physically retired. The standard
+                     * release sees n_children0, frees the real pointer table/format. */
+                    ArrowSchemaRelease(&a->constructor.relation->schema);
+                    a->constructor.schema_initialized = false;
+                }
+                a->constructor_cleanup = WL_COLUMNAR_RELATION_CACHE_CTOR_NAME;
+                return 0;
+            case WL_COLUMNAR_RELATION_CACHE_CTOR_NAME:
+                if (a->constructor.names_owned) {
+                    uint32_t index = a->constructor_cleanup_index;
+                    free(a->constructor.names[index]);
+                    a->constructor.names[index] = NULL;
+                    --a->constructor.names_owned;
+                    ++a->constructor_cleanup_index;
+                } else {
+                    a->constructor_cleanup_index = 0;
+                    a->constructor_cleanup =
+                        WL_COLUMNAR_RELATION_CACHE_CTOR_NAMES_TABLE;
+                }
+                return 0;
+            case WL_COLUMNAR_RELATION_CACHE_CTOR_NAMES_TABLE:
+                free((void *)a->constructor.names); a->constructor.names = NULL;
+                a->constructor_cleanup = WL_COLUMNAR_RELATION_CACHE_CTOR_TYPES;
+                return 0;
+            case WL_COLUMNAR_RELATION_CACHE_CTOR_TYPES:
+                free(a->constructor.types); a->constructor.types = NULL;
+                a->constructor_cleanup =
+                    WL_COLUMNAR_RELATION_CACHE_CTOR_TIMESTAMPS;
+                return 0;
+            case WL_COLUMNAR_RELATION_CACHE_CTOR_TIMESTAMPS:
+                free(a->constructor.timestamps);
+                a->constructor.timestamps = NULL;
+                a->constructor_cleanup =
+                    WL_COLUMNAR_RELATION_CACHE_CTOR_SCRATCH;
+                return 0;
+            case WL_COLUMNAR_RELATION_CACHE_CTOR_SCRATCH:
+                free(a->constructor.scratch); a->constructor.scratch = NULL;
+                a->constructor_cleanup = WL_COLUMNAR_RELATION_CACHE_CTOR_COLUMN;
+                return 0;
+            case WL_COLUMNAR_RELATION_CACHE_CTOR_COLUMN:
+                if (a->constructor.columns_owned) {
+                    uint32_t index = a->constructor_cleanup_index;
+                    free(a->constructor.columns[index]);
+                    a->constructor.columns[index] = NULL;
+                    --a->constructor.columns_owned;
+                    ++a->constructor_cleanup_index;
+                } else {
+                    a->constructor_cleanup_index = 0;
+                    a->constructor_cleanup =
+                        WL_COLUMNAR_RELATION_CACHE_CTOR_COLUMNS_TABLE;
+                }
+                return 0;
+            case WL_COLUMNAR_RELATION_CACHE_CTOR_COLUMNS_TABLE:
+                free((void *)a->constructor.columns);
+                a->constructor.columns = NULL;
+                a->constructor_cleanup =
+                    WL_COLUMNAR_RELATION_CACHE_CTOR_NAME_STRING;
+                return 0;
+            case WL_COLUMNAR_RELATION_CACHE_CTOR_NAME_STRING:
+                free(a->constructor.name); a->constructor.name = NULL;
+                a->constructor_cleanup =
+                    WL_COLUMNAR_RELATION_CACHE_CTOR_DESCRIPTOR;
+                return 0;
+            case WL_COLUMNAR_RELATION_CACHE_CTOR_DESCRIPTOR:
+                free(a->constructor.relation); a->constructor.relation = NULL;
+                a->constructor_cleanup =
+                    WL_COLUMNAR_RELATION_CACHE_CTOR_RETIRED_HOOK;
+                return 0;
+            case WL_COLUMNAR_RELATION_CACHE_CTOR_RETIRED_HOOK:
+        #ifdef WL_SESSION_TEST_HOOKS
+                if (wl_columnar_relation_test_constructor_retired)
+                    wl_columnar_relation_test_constructor_retired();
+        #endif
+                a->constructor_cleanup = WL_COLUMNAR_RELATION_CACHE_CTOR_TOKEN0;
+                return 0;
+            case WL_COLUMNAR_RELATION_CACHE_CTOR_TOKEN0:
+                if (a->constructor.admitted[0]) {
+                    rc = wl_evaluation_control_charge_attempt(funding, id,
+                            WL_COLUMNAR_RELATION_CACHE_COPY_CONSTRUCTOR_CREDIT_WORK);
+                    if (rc) return rc;
+                    if (a->constructor.committed[0])
+                        col_rel_release_reservation_or_abort(
+                            &a->constructor.tokens[0]);
+                    else col_rel_reservation_rollback(
+                            &a->constructor.tokens[0]);
+                    a->constructor.admitted[0] = false;
+                    a->constructor.committed[0] = false;
+                }
+                a->constructor_cleanup = WL_COLUMNAR_RELATION_CACHE_CTOR_TOKEN1;
+                return 0;
+            case WL_COLUMNAR_RELATION_CACHE_CTOR_TOKEN1:
+                if (a->constructor.admitted[1]) {
+                    rc = wl_evaluation_control_charge_attempt(funding, id,
+                            WL_COLUMNAR_RELATION_CACHE_COPY_CONSTRUCTOR_CREDIT_WORK);
+                    if (rc) return rc;
+                    if (a->constructor.committed[1])
+                        col_rel_release_reservation_or_abort(
+                            &a->constructor.tokens[1]);
+                    else col_rel_reservation_rollback(
+                            &a->constructor.tokens[1]);
+                    a->constructor.admitted[1] = false;
+                    a->constructor.committed[1] = false;
+                }
+                a->constructor_cleanup = WL_COLUMNAR_RELATION_CACHE_CTOR_TOKEN2;
+                return 0;
+            case WL_COLUMNAR_RELATION_CACHE_CTOR_TOKEN2:
+                if (a->constructor.admitted[2]) {
+                    rc = wl_evaluation_control_charge_attempt(funding, id,
+                            WL_COLUMNAR_RELATION_CACHE_COPY_CONSTRUCTOR_CREDIT_WORK);
+                    if (rc) return rc;
+                    if (a->constructor.committed[2])
+                        col_rel_release_reservation_or_abort(
+                            &a->constructor.tokens[2]);
+                    else col_rel_reservation_rollback(
+                            &a->constructor.tokens[2]);
+                    a->constructor.admitted[2] = false;
+                    a->constructor.committed[2] = false;
+                }
+                a->constructor_cleanup = WL_COLUMNAR_RELATION_CACHE_CTOR_REF;
+                return 0;
+            case WL_COLUMNAR_RELATION_CACHE_CTOR_REF:
+                if (a->constructor.ref_held) {
+                    wl_columnar_memory_governor_ref_release(
+                        a->constructor.saved_ref);
+                    a->constructor.ref_held = false;
+                }
+                a->constructor.saved_ref = NULL;
+                a->constructor_cleanup = WL_COLUMNAR_RELATION_CACHE_CTOR_DONE;
+                a->constructor_initialized = false;
+                a->phase = WL_COLUMNAR_RELATION_CACHE_COPY_END;
+                return 0;
+            case WL_COLUMNAR_RELATION_CACHE_CTOR_DONE:
+                a->phase = WL_COLUMNAR_RELATION_CACHE_COPY_END;
+                return 0;
+            default: return EINVAL;
+            }
         }
         a->phase = WL_COLUMNAR_RELATION_CACHE_COPY_END;
         return 0;
     }
-    switch (a->phase) {
     case WL_COLUMNAR_RELATION_CACHE_COPY_END:
         if (a->reader.owner) {
             bool released = false;
@@ -18770,8 +19764,9 @@ wl_columnar_relation_cache_copy_end(
                 a->output ? WL_COLUMNAR_RELATION_CACHE_COPY_RETIRE_ZERO
                 : WL_COLUMNAR_RELATION_CACHE_COPY_DISCARDED;
         else a->phase = WL_COLUMNAR_RELATION_CACHE_COPY_READY_OUTPUT;
-        *done = a->phase == WL_COLUMNAR_RELATION_CACHE_COPY_DISCARDED
-            || a->phase == WL_COLUMNAR_RELATION_CACHE_COPY_READY_OUTPUT;
+        /* This activation assigned exactly RETIRE_ZERO, DISCARDED or
+         * READY_OUTPUT above; retain the explicit post-hook output store. */
+        *done = a->phase != WL_COLUMNAR_RELATION_CACHE_COPY_RETIRE_ZERO;
         return 0;
     case WL_COLUMNAR_RELATION_CACHE_COPY_READY_OUTPUT:
         /* Parent abort may discard a successful untaken clone while retaining
@@ -18786,16 +19781,45 @@ wl_columnar_relation_cache_copy_end(
         memset(&a->retirement, 0, sizeof(a->retirement));
         a->phase = WL_COLUMNAR_RELATION_CACHE_COPY_RETIRE_BEGIN;
         return 0;
-    case WL_COLUMNAR_RELATION_CACHE_COPY_RETIRE_BEGIN:
+    case WL_COLUMNAR_RELATION_CACHE_COPY_RETIRE_BEGIN: {
         if (!a->output || a->retirement_started) return EINVAL;
-        rc = wl_columnar_relation_managed_retirement_begin(
-            &a->retirement.storage, a->output);
-        if (rc) return rc;
+        wl_columnar_relation_managed_retirement_t *retirement
+            = &a->retirement.storage;
+        /* The outer guard just checked output; retirement is this live
+         * nonNULL copier subobject, with no callback in between. */
+        if (retirement->identity)
+            return EINVAL;
+        memset(retirement, 0, sizeof(*retirement));
+        retirement->identity = (uintptr_t)retirement;
+        retirement->relation = a->output;
+        retirement->original_relation_address = (uintptr_t)a->output;
+        retirement->phase
+            = WL_COLUMNAR_RELATION_MANAGED_RETIREMENT_ACQUIRE_WRITERS;
+        /* Full managed-record clear above already cleared all four complete
+         * token objects in THIS activation. No cross-return freshness assumption.
+         * Preserve the exact initializer's identity and relaxed atomic store. */
+        wl_columnar_memory_reservation_t *token = retirement->tokens;
+        token->identity = token;
+        atomic_store_explicit(&token->state,
+            WL_COLUMNAR_MEMORY_RESERVATION_EMPTY, memory_order_relaxed);
+        ++token;
+        token->identity = token;
+        atomic_store_explicit(&token->state,
+            WL_COLUMNAR_MEMORY_RESERVATION_EMPTY, memory_order_relaxed);
+        ++token;
+        token->identity = token;
+        atomic_store_explicit(&token->state,
+            WL_COLUMNAR_MEMORY_RESERVATION_EMPTY, memory_order_relaxed);
+        ++token;
+        token->identity = token;
+        atomic_store_explicit(&token->state,
+            WL_COLUMNAR_MEMORY_RESERVATION_EMPTY, memory_order_relaxed);
         a->retirement_started = true;
         a->phase = WL_COLUMNAR_RELATION_CACHE_COPY_RETIRE_PREPARE;
         return 0;
+    }
     case WL_COLUMNAR_RELATION_CACHE_COPY_RETIRE_PREPARE:
-        rc = wl_columnar_relation_scalar_retirement_prepare(&a->retirement,
+        rc = wl_columnar_relation_cache_copy_prepare_source(&a->retirement,
                 funding, id);
         if (rc == EAGAIN) return 0;
         if (rc) return rc;
@@ -18918,6 +19942,7 @@ wl_columnar_relation_cache_scalar_copy_ack(
     a->width = a->rows = a->capacity = 0;
     a->column = a->row = a->run = a->previous_end = 0;
     a->snapshot = (col_relation_snapshot_t){0};
+    a->constructor_initialized = false;
     a->phase = WL_COLUMNAR_RELATION_CACHE_COPY_INERT;
     wl_evaluation_control_release(owned);
     return wl_columnar_relation_cache_copy_leave(a, 0);

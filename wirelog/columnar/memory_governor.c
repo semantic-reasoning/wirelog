@@ -1456,13 +1456,46 @@ wl_columnar_memory_governor_attempt_guard(wl_evaluation_control_t *control,
  * Exchange supplies release publication on MSVC as well as C11. No hook,
  * positive admission or successor poll occurs in this cleanup.
  */
+/* Mandatory original credited-snapshot restoration only. All operands are
+ * the existing uint64_t reserved_bytes field. Preserve the initial observation
+ * and orders, specializing only the MSVC known-width CAS front. Complete FIRST
+ * attempts are ordinary source; original caller eligibility remains required. */
+static bool
+wl_columnar_memory_governor_source_credit_original(
+    wl_columnar_memory_governor_t *governor, uint64_t bytes)
+{
+    uint64_t old;
+    old = atomic_load_explicit(&governor->reserved_bytes, memory_order_relaxed);
+    for (;;) {
+        uint64_t next;
+        if (bytes > old)
+            return false;
+        next = old - bytes;
+#ifdef _MSC_VER
+        uint64_t seen = (uint64_t)_InterlockedCompareExchange64(
+            (volatile __int64 *)&governor->reserved_bytes,
+            (__int64)next, (__int64)old);
+        if (seen == old)
+            break;
+        old = seen;
+#else
+        if (atomic_compare_exchange_weak_explicit(
+                &governor->reserved_bytes, &old, next,
+                memory_order_release, memory_order_relaxed))
+            break;
+#endif
+    }
+    return true;
+}
+
 static int
 wl_columnar_memory_governor_attempt_restore(
     wl_columnar_memory_reservation_t *token,
     const wl_columnar_memory_governor_snapshot_t *snapshot, uint64_t state,
     wl_columnar_memory_governor_t *credited_governor, uint64_t credited, int rc)
 {
-    if (credited && !credit_reservation(credited_governor, credited))
+    if (credited && !wl_columnar_memory_governor_source_credit_original(
+            credited_governor, credited))
         abort();
     token->governor = snapshot->governor;
     token->bytes = snapshot->bytes;

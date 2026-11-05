@@ -372,7 +372,9 @@ test_failures(void)
             CHECK(!wl_columnar_memory_reserved(
                     wl_columnar_memory_governor_ref_get(g)));
         }
-    for (unsigned allocation = 1; allocation <= 10; ++allocation) {
+    unsigned allocation_failures = 0;
+    bool saw_partial_schema = false, allocator_success = false;
+    for (unsigned allocation = 1; allocation <= 128; ++allocation) {
         copy_t a = {0}; int owner = 0; bool complete = false;
         wl_evaluation_control_t *c = control_new(0, &owner);
         CHECK(!wl_columnar_relation_cache_scalar_copy_begin(&a, source, g, c,
@@ -384,12 +386,28 @@ test_failures(void)
             rc = wl_columnar_relation_cache_scalar_copy_step(&a, &complete);
         }
         wl_columnar_relation_test_constructor_fail_allocation = 0;
-        CHECK(rc == ENOMEM);
-        drain(&a, true); CHECK(!turn(&a, 6, 128, NULL, NULL, NULL));
+        if (rc) {
+            CHECK(rc == ENOMEM && !complete && !a.output
+                && a.constructor_initialized);
+            ++allocation_failures;
+            if (a.constructor.schema_initialized && a.constructor.relation
+                && a.constructor.relation->schema.n_children > 0)
+                saw_partial_schema = true;
+        } else {
+            CHECK(complete && a.output);
+            allocator_success = true;
+        }
+        drain(&a, true);
+        wl_columnar_relation_cache_scalar_copy_result_t result;
+        CHECK(!wl_columnar_relation_cache_scalar_copy_query(&a, &result)
+            && result.discarded && result.semantic_result == rc);
+        CHECK(!turn(&a, 6, 128, NULL, NULL, NULL));
         control_close(c, &owner, rc);
         CHECK(!wl_columnar_memory_reserved(wl_columnar_memory_governor_ref_get(
                 g)));
+        if (allocator_success) break;
     }
+    CHECK(allocator_success && allocation_failures > 10 && saw_partial_schema);
     wl_columnar_memory_governor_ref_t *limited_governor = governor_new(1);
     copy_t a = {0}; int owner = 0; bool complete = false;
     wl_evaluation_control_t *c = control_new(0, &owner);
@@ -585,22 +603,125 @@ commit_cancel(wl_evaluation_control_t *c, unsigned phase)
 }
 
 static void
-test_constructor_late_stop(void)
+test_constructor_refund_boundaries(bool allocation_failure)
 {
     col_rel_t *source = relation_new(3, 2);
     wl_columnar_memory_governor_ref_t *g = governor_new(UINT64_MAX);
+    wl_columnar_memory_governor_t *governor =
+        wl_columnar_memory_governor_ref_get(g);
+    wl_columnar_memory_reservation_t peer;
+    wl_columnar_memory_reservation_init(&peer);
+    unsigned char *peer_buffer = malloc(17); CHECK(peer_buffer);
+    memset(peer_buffer, 0x17, 17);
+    CHECK(wl_columnar_memory_reserve(governor, 17, &peer));
+    CHECK(wl_columnar_memory_commit(&peer, peer_buffer));
     copy_t a = {0}; int owner = 0; bool complete = false;
     wl_evaluation_control_t *c = control_new(0, &owner);
+    uint64_t original_id = wl_evaluation_control_active_attempt_id(c);
     CHECK(!wl_columnar_relation_cache_scalar_copy_begin(&a, source, g, c,
-        wl_evaluation_control_active_attempt_id(c)));
-    wl_columnar_relation_test_constructor_committed = commit_cancel;
+        original_id));
+    wl_columnar_relation_test_constructor_committed =
+        allocation_failure ? NULL : commit_cancel;
+    wl_columnar_relation_test_constructor_fail_allocation =
+        allocation_failure ? 1 : 0;
     int rc = 0;
     while (!rc) rc = wl_columnar_relation_cache_scalar_copy_step(&a, &complete);
     wl_columnar_relation_test_constructor_committed = NULL;
-    CHECK(rc == WL_EVALUATION_CONTROL_CANCELLED && !a.output);
-    CHECK(!wl_columnar_memory_reserved(wl_columnar_memory_governor_ref_get(g)));
-    drain(&a, true); CHECK(!turn(&a, 6, 128, NULL, NULL, NULL));
-    control_close(c, &owner, rc);
+    wl_columnar_relation_test_constructor_fail_allocation = 0;
+    CHECK(rc == (allocation_failure ? ENOMEM
+        : WL_EVALUATION_CONTROL_CANCELLED) && !a.output);
+    /* Partial constructor storage stays owned until independently funded
+     * physical retirement and token credit, including after original END. */
+    CHECK(wl_columnar_memory_reserved(governor) > 17);
+    CHECK(wl_evaluation_control_finish(c, &owner, rc, 0) == rc);
+    CHECK(!wl_evaluation_control_begin(c, &owner));
+    uint64_t successor_id = wl_evaluation_control_active_attempt_id(c);
+    CHECK(successor_id && successor_id != original_id);
+    unsigned retired_turns = 0, refunded_tokens = 0;
+    while (a.phase == WL_COLUMNAR_RELATION_CACHE_COPY_CONSTRUCTOR_END) {
+        CHECK(retired_turns++ < 1000);
+        uint64_t consumed;
+        bool done = true;
+        CHECK(turn(&a, 4, 191, NULL, &done,
+            &consumed) == WL_EVALUATION_CONTROL_WORK_LIMIT
+            && !consumed && !done);
+        if (a.constructor_cleanup >= WL_COLUMNAR_RELATION_CACHE_CTOR_TOKEN0
+            && a.constructor_cleanup <= WL_COLUMNAR_RELATION_CACHE_CTOR_TOKEN2
+            && a.constructor.admitted[a.constructor_cleanup
+            - WL_COLUMNAR_RELATION_CACHE_CTOR_TOKEN0]) {
+            /* Real allocator failure leaves RESERVED tokens; a late stop
+             * leaves COMMITTED tokens. Both reach this stage only after
+             * their actual physical storage has been retired. */
+            unsigned index = a.constructor_cleanup
+                - WL_COLUMNAR_RELATION_CACHE_CTOR_TOKEN0;
+            wl_columnar_memory_reservation_t *token =
+                &a.constructor.tokens[index];
+            uint64_t state = atomic_load_explicit(&token->state,
+                    memory_order_acquire);
+            uint64_t owner_bits = atomic_load_explicit(&token->owner_bits,
+                    memory_order_relaxed);
+            uint64_t bytes = token->bytes;
+            uint64_t reserved = wl_columnar_memory_reserved(governor);
+            bool committed = a.constructor.committed[index];
+            wl_columnar_relation_cache_constructor_cleanup_t stage =
+                a.constructor_cleanup;
+            CHECK(state == (allocation_failure
+                ? WL_COLUMNAR_MEMORY_RESERVATION_RESERVED
+                : WL_COLUMNAR_MEMORY_RESERVATION_COMMITTED));
+            CHECK(committed == !allocation_failure && bytes);
+            CHECK(!a.constructor.relation && !a.constructor.name
+                && !a.constructor.columns && !a.constructor.scratch
+                && !a.constructor.names && !a.constructor.types
+                && !a.constructor.timestamps && a.constructor.ref_held);
+            CHECK(turn(&a, 4, 312, NULL, &done,
+                &consumed) == WL_EVALUATION_CONTROL_WORK_LIMIT
+                && consumed == 192 && !done);
+            CHECK(a.constructor_cleanup == stage
+                && a.constructor.admitted[index]
+                && a.constructor.committed[index] == committed
+                && a.constructor.ref_held
+                && token->identity == token && token->bytes == bytes
+                && atomic_load_explicit(&token->state,
+                memory_order_acquire) == state
+                && atomic_load_explicit(&token->owner_bits,
+                memory_order_relaxed) == owner_bits
+                && wl_columnar_memory_reserved(governor) == reserved);
+            CHECK(!turn(&a, 4, 313, NULL, &done, &consumed)
+                && consumed == 313 && !done);
+            CHECK(!a.constructor.admitted[index]
+                && !a.constructor.committed[index]
+                && a.constructor.ref_held
+                && atomic_load_explicit(&token->state,
+                memory_order_acquire)
+                == WL_COLUMNAR_MEMORY_RESERVATION_RELEASED
+                && wl_columnar_memory_reserved(governor) == reserved - bytes);
+            ++refunded_tokens;
+        } else {
+            CHECK(!turn(&a, 4, 192, NULL, &done, &consumed)
+                && consumed == 192 && !done);
+        }
+        CHECK(!wl_evaluation_control_test_active_consumed(c, successor_id,
+            &consumed) && !consumed);
+        CHECK(peer.bytes == 17 && peer_buffer[16] == 0x17);
+    }
+    /* The first failed allocation owns only the descriptor reservation;
+     * cancellation after the last commit owns all three real reservations. */
+    CHECK(retired_turns > 1
+        && refunded_tokens == (allocation_failure ? 1u : 3u)
+        && !a.constructor.ref_held
+        && wl_columnar_memory_reserved(governor) == 17);
+    drain(&a, true);
+    wl_columnar_relation_cache_scalar_copy_result_t result;
+    CHECK(!wl_columnar_relation_cache_scalar_copy_query(&a, &result)
+        && result.discarded && result.semantic_result == rc);
+    CHECK(!turn(&a, 6, 128, NULL, NULL, NULL));
+    uint64_t successor_consumed;
+    CHECK(!wl_evaluation_control_test_active_consumed(c, successor_id,
+        &successor_consumed) && !successor_consumed);
+    CHECK(wl_columnar_memory_reserved(governor) == 17);
+    control_close(c, &owner, 0);
+    free(peer_buffer); CHECK(wl_columnar_memory_release(&peer));
+    CHECK(!wl_columnar_memory_reserved(governor));
     col_rel_destroy(source); wl_columnar_memory_governor_ref_release(g);
 }
 
@@ -608,9 +729,10 @@ static void
 test_retirement_funding(void)
 {
     col_rel_t *source = relation_new(3, 2);
+    wl_columnar_memory_governor_ref_t *g = governor_new(UINT64_MAX);
     copy_t a = {0}; int owner = 0; bool done = false;
     wl_evaluation_control_t *c = control_new(0, &owner);
-    CHECK(!wl_columnar_relation_cache_scalar_copy_begin(&a, source, NULL, c,
+    CHECK(!wl_columnar_relation_cache_scalar_copy_begin(&a, source, g, c,
         wl_evaluation_control_active_attempt_id(c)));
     ready(&a); drain(&a, false);
     /* Saved success may be discarded by its parent; source is already drained.
@@ -621,7 +743,7 @@ test_retirement_funding(void)
     control_close(c, &owner, 0);
     c = NULL; /* Sole record-owned original ref remains; cleanup never polls it. */
     bool saw_init = false, saw_begin = false, saw_prepare = false,
-        saw_step = false;
+        saw_step = false, saw_credit = false;
     for (unsigned n = 0; !done; ++n) {
         CHECK(n < 10000);
         uint64_t fee = 128, consumed = 0;
@@ -630,29 +752,51 @@ test_retirement_funding(void)
             saw_init = true;
         } else if (a.phase == WL_COLUMNAR_RELATION_CACHE_COPY_RETIRE_BEGIN) {
             fee = 256; saw_begin = true;
-        } else if (a.phase == WL_COLUMNAR_RELATION_CACHE_COPY_RETIRE_PREPARE
-            || a.phase == WL_COLUMNAR_RELATION_CACHE_COPY_RETIRE_STEP) {
-            fee = 192;
-            saw_prepare |= a.phase ==
-                WL_COLUMNAR_RELATION_CACHE_COPY_RETIRE_PREPARE;
-            saw_step |= a.phase == WL_COLUMNAR_RELATION_CACHE_COPY_RETIRE_STEP;
+        } else if (a.phase == WL_COLUMNAR_RELATION_CACHE_COPY_RETIRE_PREPARE) {
+            fee = 192; saw_prepare = true;
+        } else if (a.phase == WL_COLUMNAR_RELATION_CACHE_COPY_RETIRE_STEP) {
+            fee = 256; saw_step = true;
         }
         wl_columnar_relation_cache_scalar_copy_phase_t phase = a.phase;
         CHECK(turn(&a, 3, fee-1, NULL, &done,
             &consumed) == WL_EVALUATION_CONTROL_WORK_LIMIT
             && !consumed && a.phase == phase && !done);
-        /* One inherited leaf debit is additional, never paid by a fake wrapper
-         * counter. Leaf may have its own fixed cleanup debit in managed phase. */
-        CHECK(!turn(&a, 3, fee == 256 ? 256 : 512, NULL, &done, &consumed));
-        if (fee == 256) CHECK(consumed == 256);
+        if (phase == WL_COLUMNAR_RELATION_CACHE_COPY_RETIRE_PREPARE) {
+            unsigned native_phase = a.retirement.phase;
+            CHECK(turn(&a, 3, 383, NULL, &done,
+                &consumed) == WL_EVALUATION_CONTROL_WORK_LIMIT
+                && consumed == 192 && !done && a.phase == phase
+                && a.retirement.phase == native_phase);
+            CHECK(!turn(&a, 3, 384, NULL, &done, &consumed)
+                && consumed == 384);
+        } else if (phase == WL_COLUMNAR_RELATION_CACHE_COPY_RETIRE_STEP) {
+            unsigned native_phase = a.retirement.phase;
+            uint64_t reserved = wl_columnar_memory_reserved(
+                wl_columnar_memory_governor_ref_get(g));
+            CHECK(turn(&a, 3, 256, NULL, &done,
+                &consumed) == WL_EVALUATION_CONTROL_WORK_LIMIT
+                && consumed == 256 && !done && a.phase == phase
+                && a.retirement.phase == native_phase);
+            CHECK(wl_columnar_memory_reserved(
+                    wl_columnar_memory_governor_ref_get(g)) == reserved);
+            CHECK(!turn(&a, 3, 512, NULL, &done, &consumed)
+                && consumed <= 320);
+            saw_credit |= consumed == 320;
+        } else {
+            CHECK(!turn(&a, 3, fee, NULL, &done, &consumed)
+                && consumed == fee);
+        }
         CHECK(consumed >= fee && a.phase >= phase);
     }
-    CHECK(saw_init && saw_begin && saw_prepare && saw_step && !a.output);
+    CHECK(saw_init && saw_begin && saw_prepare && saw_step && saw_credit
+        && !a.output);
+    CHECK(!wl_columnar_memory_reserved(wl_columnar_memory_governor_ref_get(g)));
     wl_columnar_relation_cache_scalar_copy_result_t result;
     CHECK(!wl_columnar_relation_cache_scalar_copy_query(&a, &result)
         && result.discarded && !result.semantic_result);
     CHECK(!turn(&a, 6, 128, NULL, NULL, NULL));
     col_rel_destroy(source);
+    wl_columnar_memory_governor_ref_release(g);
 }
 
 /* Direct physical-retirement evidence, NOT a cache-owner transfer. CACHE debt
@@ -715,7 +859,8 @@ main(int argc, char **argv)
     if (!strcmp(argv[1], "domains")) {
         test_domains(); test_producers();
     }else if (!strcmp(argv[1], "failures")) {
-        test_failures(); test_constructor_late_stop();
+        test_failures(); test_constructor_refund_boundaries(false);
+        test_constructor_refund_boundaries(true);
         test_retirement_funding(); test_debt_boundaries();
         test_unsupported_boundary();
     }else if (!strcmp(argv[1], "authority")) {
