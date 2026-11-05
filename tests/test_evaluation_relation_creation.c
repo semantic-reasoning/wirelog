@@ -3583,6 +3583,20 @@ sorted_stamp_wrong_thread(void *arg)
 }
 
 static void
+sorted_stamp_finish(wl_evaluation_control_t *c, int result, uint64_t expected)
+{
+    /* Batch hook labels retain their old telemetry. This independent source
+    * oracle uses BEGIN1023 and real stamp admissions128/192/128 instead. */
+    uint64_t id = wl_evaluation_control_active_attempt_id(c);
+    CHECK(wl_evaluation_control_finish(c, &owner,
+        result > 0 ? result : 0, 0) == result);
+    wl_evaluation_control_report_t report;
+    CHECK(!wl_evaluation_control_report(c, &report)
+        && report.attempt_id == id && report.result == result
+        && report.consumed == expected);
+}
+
+static void
 sorted_stamp_faults(void)
 {
     for (unsigned mode = 0; mode < 4; ++mode) {
@@ -3601,9 +3615,11 @@ sorted_stamp_faults(void)
             CHECK(!wl_thread_create(&thread, sorted_stamp_wrong_thread,
                 &batch));
             CHECK(!wl_thread_join(&thread));
-        } else if (mode == 1) cancel_at = 1116;
-        else if (mode == 2) {
-            (void)finish(c, 0); retry(c, 0);
+        } else if (mode == 1) {
+            /* Legacy hook labels:668+448; real source price is1023+448. */
+            cancel_at = 1116;
+        }else if (mode == 2) {
+            sorted_stamp_finish(c, 0, 1023); retry(c, 0);
         } else {
             uint64_t nonce = batch.raw.single.set.acquisition_nonce;
             for (unsigned n = 0; n < 130; ++n) {
@@ -3633,7 +3649,10 @@ sorted_stamp_faults(void)
             CHECK(!wl_evaluation_control_report(c, &report));
             CHECK(report.attempt_id == id && !report.result &&
                 report.stop_reason == WL_EVALUATION_CONTROL_NONE);
-        } else (void)finish(c, mode == 2 ? 0 : rc);
+        } else sorted_stamp_finish(c, mode == 2 ? 0 : rc,
+                /* Foreign-thread stamp spends ENTRY128+native proof192 before
+                 * rejecting its real owner; the following valid stamp is448. */
+                mode == 2 ? 0 : 1471 + (mode == 0 ? 128 + 192 : 0));
         release(c); col_rel_destroy(r);
     }
 }
@@ -3646,9 +3665,9 @@ sorted_stamp_cases(void)
 {
     wl_columnar_relation_test_work_checkpoint = checkpoint;
     for (unsigned rows = 0; rows <= 2; ++rows) {
-        const uint64_t limits[] = {0, 668 + 127, 668 + 128,
-                                   668 + 128 + 191, 668 + 320, 668 + 447,
-                                   668 + 448};
+        const uint64_t limits[] = {0, 1023 + 127, 1023 + 128,
+                                   1023 + 128 + 191, 1023 + 320, 1023 + 447,
+                                   1023 + 448};
         for (unsigned j = 0; j < sizeof(limits) / sizeof(limits[0]); ++j) {
             col_rel_t *r = col_rel_new_auto("$stamp", 1);
             CHECK(r);
@@ -3679,7 +3698,7 @@ sorted_stamp_cases(void)
                 wl_columnar_relation_append_batch_mark_sorted_operator_controlled
                 (
                 &batch, c, id);
-            CHECK(rc == ((!limits[j] || limits[j] >= 1116) ? 0 :
+            CHECK(rc == ((!limits[j] || limits[j] >= 1471) ? 0 :
                 WL_EVALUATION_CONTROL_WORK_LIMIT));
             CHECK(r->nrows == rows && r->storage_generation == storage &&
                 r->view_generation == view);
@@ -3696,9 +3715,9 @@ sorted_stamp_cases(void)
             }
             if (!rc) CHECK(r->sorted_nrows == rows &&
                     r->run_count == (rows ? 1u : 0u));
-            uint64_t expected = !limits[j] || limits[j] >= 1116 ? 1116 :
-                limits[j] < 796 ? 668 : limits[j] < 988 ? 796 : 988;
-            CHECK(finish(c, rc) == expected);
+            uint64_t expected = !limits[j] || limits[j] >= 1471 ? 1471 :
+                limits[j] < 1151 ? 1023 : limits[j] < 1343 ? 1151 : 1343;
+            sorted_stamp_finish(c, rc, expected);
             release(c); col_rel_destroy(r);
         }
     }

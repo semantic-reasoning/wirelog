@@ -2519,7 +2519,12 @@ test_controlled_recursive_two_join_step(void)
     wl_evaluation_control_t *control = NULL;
     wl_session_t *session = controlled_recursive_two_join_session(edges, 4,
             &plan, &program, &control);
+    /* Each round begins MAP/CONCAT/CONSOLIDATE/detached writers. Both JOINs
+     * skip BEGIN in the empty-frontier seed round, then begin in each of
+     * the two later rounds:4+6+6=16. Width2 never uses wide capture and
+     * these outputs fit initial capacity, so no renewal is added. */
     const uint64_t expected_work = UINT64_C(1271246) + UINT64_C(6) * 3328
+        + UINT64_C(16) * (853 - 498)
         + 3u * recursive_capture_scan_work(plan, "path")
         + UINT64_C(3) * 224
         * ((wl_columnar_eval_stack_test_allocation_size() + 15) / 16)
@@ -2670,7 +2675,10 @@ test_controlled_recursive_step_publication_and_stops(void)
      * 224 per 16-byte chunk. Each round constructs MAP, JOIN, CONCAT,
      * CONSOLIDATE, and the detached result: 20 descriptors, zeroed at 224
      * per eight-byte chunk. Both sizes include ABI-dependent thread IDs. */
+    /* Four common writers per round plus JOIN on the three nonempty
+     * frontiers:4+5+5+5=19 actual BEGINs, each now853 rather than498. */
     const uint64_t expected_work = UINT64_C(1391081) + UINT64_C(4) * 3328
+        + UINT64_C(19) * (853 - 498)
         + 4u * recursive_capture_scan_work(plan, "path")
         + UINT64_C(4) * 224
         * ((wl_columnar_eval_stack_test_allocation_size() + 15) / 16)
@@ -2870,7 +2878,10 @@ test_controlled_recursive_step_after_public_edge_append(void)
         && successor_report.result == 0);
     /* Four edges require five body rounds (including empty convergence),
      * with five operator descriptors per round, using the tariffs above. */
+    /* Four common writers in all five rounds; JOIN skips only seed:
+     * 4+5+5+5+5=24 BEGINs, with no wide capture or renewed capacity. */
     const uint64_t successor_work = UINT64_C(1859706) + UINT64_C(5) * 3328
+        + UINT64_C(24) * (853 - 498)
         + 5u * recursive_capture_scan_work(plan, "path")
         + UINT64_C(5) * 224
         * ((wl_columnar_eval_stack_test_allocation_size() + 15) / 16)
@@ -2909,13 +2920,14 @@ test_controlled_recursive_successor_work_boundaries(void)
 {
     static const int64_t edges[] = { 1, 2, 2, 3, 3, 4 };
     static const int64_t later_edge[] = { 4, 5 };
-    /* Same four-edge recomputation: five frames and 25 descriptors. */
+    /* Same four-edge recomputation: five frames,25 descriptors and24 BEGINs. */
     wl_plan_t *plan = NULL;
     wirelog_program_t *program = NULL;
     wl_evaluation_control_t *control = NULL;
     wl_session_t *session = controlled_recursive_session(edges, 3, &plan,
             &program, &control);
     const uint64_t successor_work = UINT64_C(1859706) + UINT64_C(5) * 3328
+        + UINT64_C(24) * (853 - 498)
         + 5u * recursive_capture_scan_work(plan, "path")
         + UINT64_C(5) * 224
         * ((wl_columnar_eval_stack_test_allocation_size() + 15) / 16)

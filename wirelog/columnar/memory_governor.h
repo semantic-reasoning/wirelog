@@ -703,4 +703,15 @@ wl_columnar_memory_release_try(wl_columnar_memory_reservation_t *reservation);
 uint64_t
 wl_columnar_memory_reserved(const wl_columnar_memory_governor_t *governor);
 
+/* Source-qualified reservation/commit profile. Same original token/control
+ * protocol; distinct explicit source admissions, existing hook labels. */
+int wl_columnar_memory_governor_reserve_source_attempt_controlled(
+    wl_columnar_memory_governor_t *governor, uint64_t bytes,
+    wl_columnar_memory_reservation_t *token,
+    wl_columnar_memory_admission_status_t *out,
+    wl_evaluation_control_t *control, uint64_t attempt_id);
+int wl_columnar_memory_governor_commit_source_attempt_controlled(
+    wl_columnar_memory_reservation_t *token, const void *owner, bool *out,
+    wl_evaluation_control_t *control, uint64_t attempt_id);
+
 #endif /* WL_COLUMNAR_MEMORY_GOVERNOR_H */

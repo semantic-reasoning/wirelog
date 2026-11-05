@@ -1582,7 +1582,10 @@ test_join_literal_limits(void)
 #ifndef _MSC_VER
     /* Two opcode preflights256 + READY128, then the published standalone
      * width1 left3/right5 forced-full collision schedule H. */
-    const uint64_t prefix = 384u + 28476u + join_constructor_two();
+    /* One actual output batch BEGIN uses source853 rather than legacy498;
+     * pre-hash setup is otherwise unchanged and no output is emitted. */
+    const uint64_t prefix = 384u + 28476u + (853u - 498u)
+        + join_constructor_two();
     /* First candidate128 + comparison parent192 + first key128 ends at7296.
      * Next candidate adds128, then its comparison parent192. */
     const uint64_t boundaries[] = {7296, 7424, 7616};

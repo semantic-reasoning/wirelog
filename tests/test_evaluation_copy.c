@@ -534,7 +534,7 @@ literal_nullary(void)
             112, 224, 80, 112, 96, 160, 160, 96, 112, 224,
             128, 128, 128, 220, /* complete private no-ledger install */
             224, /* paid copy begin bootstrap and caller */
-            170, 94, 19, 39, 39, 45, 52, 45, 21, 144
+            170, 123, 33, 57, 84, 99, 60, 100, 33, 32, 28, 46, 18, 38, 39, 63
         };
         for (size_t i = 0; i < sizeof(constructor_and_begin)
             / sizeof(constructor_and_begin[0]); i++)
