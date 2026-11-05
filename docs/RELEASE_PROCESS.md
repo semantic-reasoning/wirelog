@@ -410,8 +410,9 @@ the cutover commit sets `project_version` to `1.0.0-rc1`.
 - At least one CODEOWNER review.
 - CLA signoff required via branch protection on the stable
   `CLA signoff gate` check.  This repository-owned gate verifies the
-  hosted cla-assistant external status context `license/cla`; do not
-  make `license/cla` itself the required protected check.
+  central `semantic-reasoning/sr-cla` consent records using a pinned action.
+  It publishes a Checks API result on the exact PR head; do not make the
+  evaluator job or the old hosted `license/cla` status the required check.
 - Linear history (no force-push, no merge commits).
 - Signed commits (GPG verified).
 - Tag protection on `v1.x.*`.
@@ -441,19 +442,35 @@ synthetic PR targeting `1.0` and verify:
 
 1. The required check contexts above are present and enforced.
 2. Merge is blocked until at least one CODEOWNER review is granted.
-3. Merge is blocked until `CLA signoff gate` passes by observing
-   hosted `license/cla: success` on the PR head SHA.
+3. Merge is blocked until the PR-head `CLA signoff gate` check passes using
+   authenticated central consent records for the opener and all authors/coauthors.
 4. Merge is blocked while any required check is failing or pending.
 5. Linear-history and signed-commit constraints are enforced.
 
-The repository-owned `CLA signoff gate` polls for a bounded 300-second window,
-with each API request capped at 10 seconds, for the hosted `license/cla` status
-to appear on the exact PR head SHA. This bounded grace period covers normal
-asynchronous publication delays; it does not treat a missing or pending status
-as success. If the status is still missing or pending after the deadline, the
-gate fails closed and the workflow must be rerun after the hosted status is
-published. An explicit `failure` or `error` status continues to fail
-immediately.
+The pinned sr-cla checker publishes `CLA signoff gate` on the current PR head,
+separately from its `CLA registry evaluator` workflow job. It reads public
+records, requires the pinned agreement hash, and fails closed on missing consent,
+unknown identities, malformed data, incomplete author coverage, or API errors.
+The action never checks out PR code and uses only the consumer's `GITHUB_TOKEN`.
+PR base edits trigger rechecks as well as head updates. Shared-head PRs are
+rejected to prevent one PR's check from authorizing another opener or base.
+
+Signing happens through the [central issue template](https://github.com/semantic-reasoning/sr-cla/issues/new?template=sign-cla.yml).
+After consent is recorded, `/cla recheck` on the PR refreshes its result; manual
+dispatch and hourly refresh are also available. GitHub events and check writes
+are asynchronous, so review the current-head result before merging. If the
+Checks API itself is unavailable, the evaluator fails and must be rerun.
+
+Rollout: publish the central registry and merge the consumer pin, verify a real
+unsigned PR fails, then have the contributor personally sign and verify a
+successful recheck. Only after those checks disable the hosted CLA Assistant
+webhook and remove obsolete required hosted contexts if present. Do not
+fabricate or silently migrate signatures. No ruleset changes are made by this
+migration; the Phase B cutover below remains a separate operation.
+
+Rollback: revert the consumer workflow/pin and restore the hosted webhook if it
+was disabled. Retain all central agreement versions and consent records as audit
+history. See [sr-cla operations](https://github.com/semantic-reasoning/sr-cla#versions-migration-and-rollout).
 
 Phase B prerequisites for final #746 acceptance are not fully present in
 this repository state yet: `CODEOWNERS` and the always-emitting

@@ -1,118 +1,36 @@
 name: CLA Required
 
 on:
-  pull_request:
+  pull_request_target:
     branches: [main, "1.0"]
-    types: [opened, reopened, synchronize, ready_for_review]
+    types: [opened, reopened, synchronize, ready_for_review, edited]
+  issue_comment:
+    types: [created]
+  workflow_dispatch:
+    inputs:
+      pr:
+        description: PR number (empty checks all open PRs)
+        type: string
+  schedule:
+    - cron: '23 * * * *'
 
 permissions:
-  statuses: read
+  contents: read
+  pull-requests: read
+  checks: write
 
 jobs:
   cla-signoff-gate:
-    name: CLA signoff gate
+    # The action publishes the stable "CLA signoff gate" check on the PR HEAD.
+    # This evaluator job is deliberately named differently: comment/target
+    # workflow runs are not themselves reliable PR-head checks.
+    name: CLA registry evaluator
+    if: >-
+      github.event_name != 'issue_comment' ||
+      (github.event.issue.pull_request && github.event.comment.body == '/cla recheck')
     runs-on: ubuntu-latest
-    env:
-      CLA_CONTEXT: license/cla
-      HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-      PR_AUTHOR_ASSOCIATION: ${{ github.event.pull_request.author_association }}
-      REPOSITORY: ${{ github.repository }}
     steps:
-      - name: Verify hosted CLA status
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-
-          # CLA Assistant publishes the hosted status asynchronously. Keep
-          # this bounded, but allow the provider roughly five minutes to
-          # publish it before failing closed.
-          attempts=31
-          interval=10
-          overall_timeout=300
-          max_request_timeout=10
-          deadline=$((SECONDS + overall_timeout))
-          status_url="https://api.github.com/repos/${REPOSITORY}/commits/${HEAD_SHA}/status"
-
-          echo "Checking ${CLA_CONTEXT} on PR head SHA ${HEAD_SHA}."
-
-          # Repository owners are trusted maintainers and do not need an
-          # external CLA Assistant status. This keeps the gate fail-closed
-          # for all external contributors while avoiding a deadlock when the
-          # hosted provider has not published a status for an owner PR.
-          if [ "${PR_AUTHOR_ASSOCIATION}" = "OWNER" ]; then
-            echo "${PR_AUTHOR_ASSOCIATION} PR: hosted CLA status is not required."
-            exit 0
-          fi
-
-          for attempt in $(seq 1 "$attempts"); do
-            remaining=$((deadline - SECONDS))
-            if [ "$remaining" -le 0 ]; then
-              break
-            fi
-            request_timeout="$remaining"
-            if [ "$request_timeout" -gt "$max_request_timeout" ]; then
-              request_timeout="$max_request_timeout"
-            fi
-            response="$(
-              curl --fail --silent --show-error --location \
-                --connect-timeout "$request_timeout" \
-                --max-time "$request_timeout" \
-                --header "Accept: application/vnd.github+json" \
-                --header "Authorization: Bearer ${GH_TOKEN}" \
-                --header "X-GitHub-Api-Version: 2022-11-28" \
-                "$status_url"
-            )"
-
-            cla_state="$(
-              jq -r --arg context "$CLA_CONTEXT" \
-                '[.statuses[] | select(.context == $context)][0].state // "missing"' \
-                <<<"$response"
-            )"
-            cla_url="$(
-              jq -r --arg context "$CLA_CONTEXT" \
-                '[.statuses[] | select(.context == $context)][0].target_url // ""' \
-                <<<"$response"
-            )"
-
-            case "$cla_state" in
-              success)
-                echo "${CLA_CONTEXT} is success."
-                if [ -n "$cla_url" ]; then
-                  echo "Source: ${cla_url}"
-                fi
-                exit 0
-                ;;
-              pending)
-                echo "${CLA_CONTEXT} is pending (attempt ${attempt}/${attempts})."
-                ;;
-              failure|error)
-                echo "::error::${CLA_CONTEXT} is ${cla_state} on ${HEAD_SHA}; CLA signoff is required before merge."
-                if [ -n "$cla_url" ]; then
-                  echo "::error::Source: ${cla_url}"
-                fi
-                exit 1
-                ;;
-              missing)
-                echo "${CLA_CONTEXT} is missing on ${HEAD_SHA} (attempt ${attempt}/${attempts})."
-                ;;
-              *)
-                echo "::error::${CLA_CONTEXT} returned unexpected state '${cla_state}' on ${HEAD_SHA}."
-                exit 1
-                ;;
-            esac
-
-            if [ "$attempt" -lt "$attempts" ]; then
-              remaining=$((deadline - SECONDS))
-              if [ "$remaining" -gt 0 ]; then
-                sleep_for="$interval"
-                if [ "$sleep_for" -gt "$remaining" ]; then
-                  sleep_for="$remaining"
-                fi
-                sleep "$sleep_for"
-              fi
-            fi
-          done
-
-          echo "::error::Timed out after ${overall_timeout}s (maximum ${attempts} attempts at ${interval}s intervals; request timeout capped at ${max_request_timeout}s) waiting for ${CLA_CONTEXT} to report success on ${HEAD_SHA}; latest state was ${cla_state}."
-          exit 1
+      # Trusted code only. Never check out or execute the PR's source here.
+      - uses: semantic-reasoning/sr-cla@367df706bcb50842c4103530a0656f4ce50cae70
+        with:
+          token: ${{ github.token }}
