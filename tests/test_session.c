@@ -11756,6 +11756,143 @@ repeat_cleanup:
 #undef REPEAT_CHECK
 }
 
+/* A reader on a worker relation refuses worker retirement after the merge.
+ * The cursor stays at the retirement step, and retries re-dispatch nothing
+ * (#2329).  Only worker 0 writes these; the caller reads them after the join. */
+static wl_columnar_source_access_reader_t completion_retire_reader;
+static unsigned completion_retire_hits;
+static int completion_retire_rc;
+
+static void
+hold_worker_input_reader(wl_col_session_t *worker, eval_stack_t *stack,
+    eval_entry_t *result)
+{
+    (void)stack;
+    (void)result;
+    if (!worker->coordinator || worker->worker_id != 0)
+        return;
+    if (completion_retire_hits++ == 0)
+        completion_retire_rc = col_rel_source_reader_acquire_transferable(
+            session_find_rel(worker, "input"), &completion_retire_reader);
+}
+
+static void
+test_completion_retirement_refusal(uint32_t workers, unsigned exit_kind)
+{
+    TEST("W>=2 refused worker retirement keeps the cursor without re-dispatch");
+    uint8_t predicate[] = { WL_PLAN_EXPR_BOOL, 1 };
+    uint32_t key = 0;
+    wl_plan_op_exchange_t exchange = { .num_workers = 1,
+                                       .key_col_idxs = &key,
+                                       .key_col_count = 1 };
+    wl_plan_op_t ops[] = {
+        { .op = WL_PLAN_OP_VARIABLE, .relation_name = "input" },
+        { .op = WL_PLAN_OP_FILTER, .filter_expr = { predicate, 2 } },
+        { .op = WL_PLAN_OP_CONSOLIDATE },
+        { .op = WL_PLAN_OP_EXCHANGE, .opaque_data = &exchange }
+    };
+    wl_plan_relation_t output = { .name = "output", .delta_name = "$d$output",
+                                  .ops = ops, .op_count = 4 };
+    wl_plan_stratum_t stratum = { .relations = &output, .relation_count = 1,
+                                  .is_recursive = false };
+    const char *edb[] = { "input" };
+    wl_plan_t plan = { .strata = &stratum, .stratum_count = 1,
+                       .edb_relations = edb, .edb_count = 1 };
+    wl_session_t *session = NULL;
+    int64_t *values = NULL;
+    const char *failure = NULL;
+#define RETIRE_CHECK(c, m) do { if (!(c)) { failure = (m); \
+                                            goto retire_cleanup; \
+                                } } while (0)
+    memset(&completion_retire_reader, 0, sizeof(completion_retire_reader));
+    completion_retire_hits = 0;
+    completion_retire_rc = EINVAL;
+    RETIRE_CHECK(wl_session_create(wl_backend_columnar(), &plan, workers,
+        &session) == 0, "retire session");
+    wl_col_session_t *coord = COL_SESSION(session);
+    values = malloc(65536 * sizeof(*values));
+    RETIRE_CHECK(values, "retire values");
+    for (uint32_t i = 0; i < 65536; i++)
+        values[i] = i & 1 ? 42 : 7;
+    RETIRE_CHECK(wl_session_insert(session, "input", values, 65536, 1) == 0,
+        "retire input");
+    /* Stays installed through recovery so a re-dispatch would be counted. */
+    wl_columnar_eval_serial_test_after_plan = hold_worker_input_reader;
+    RETIRE_CHECK(wl_session_step(session) == EBUSY
+        && completion_retire_hits == 1 && completion_retire_rc == 0,
+        "retire first refusal");
+    RETIRE_CHECK(coord->plain_step_completion_pending
+        && !coord->plain_step_completion_active
+        && coord->plain_step_completion_phase
+        == WL_COLUMNAR_PLAIN_STEP_COMPLETION_FINALIZE_NONREC
+        && !coord->plain_step_completion_workers_retired
+        && coord->tdd_workers_count == workers,
+        "retire cursor after the first refusal");
+    col_rel_t *target = session_find_rel(coord, "output");
+    RETIRE_CHECK(target, "retire relation");
+    const uint32_t target_rows = target->nrows;
+    int64_t *const *const target_columns = (int64_t *const *)target->columns;
+    const uint64_t target_view = target->view_generation;
+    const uint64_t target_storage = target->storage_generation;
+    for (unsigned attempt = 0; attempt < 4; attempt++) {
+        uint64_t tuple_count = 0;
+        int64_t blocked = 9;
+        RETIRE_CHECK(completion_finish(session, attempt % 2 == 0, &tuple_count)
+            == EBUSY && tuple_count == 0, "retire retry refused");
+        RETIRE_CHECK(completion_retire_hits == 1, "retire retry re-dispatched");
+        RETIRE_CHECK(coord->plain_step_completion_pending
+            && !coord->plain_step_completion_active
+            && coord->plain_step_completion_phase
+            == WL_COLUMNAR_PLAIN_STEP_COMPLETION_FINALIZE_NONREC,
+            "retire cursor unchanged by a retry");
+        RETIRE_CHECK(session_find_rel(coord, "output") == target
+            && target->nrows == target_rows
+            && (int64_t *const *)target->columns == target_columns
+            && target->view_generation == target_view
+            && target->storage_generation == target_storage,
+            "retire retry changed the target");
+        RETIRE_CHECK(wl_session_insert(session, "input", &blocked, 1, 1)
+            == EBUSY && wl_session_remove(session, "input", &values[0], 1, 1)
+            == EBUSY, "retire input stays refused");
+    }
+    RETIRE_CHECK(col_rel_source_reader_release(&completion_retire_reader) == 0,
+        "retire reader release");
+    if (exit_kind == COMPLETION_EXIT_DESTROY)
+        goto retire_cleanup;
+    {
+        static const char *const names[] = { "input", "output" };
+        static const int64_t after_insert[] = { 7, 42, 99 };
+        const bool finish_with_step = exit_kind == COMPLETION_EXIT_STEP;
+        uint64_t tuple_count = 0;
+        RETIRE_CHECK(completion_finish(session, finish_with_step, &tuple_count)
+            == 0 && !coord->plain_step_completion_pending
+            && !coord->plain_step_completion_active
+            && coord->tdd_workers_count == 0,
+            "retire recovery clears the cursor and retires the workers");
+        RETIRE_CHECK(completion_retire_hits == 1,
+            "retire recovery re-dispatched");
+        wl_columnar_eval_serial_test_after_plan = NULL;
+        failure = completion_check_reference(session, &plan, workers, values,
+                NULL, 0, finish_with_step, names, 2);
+        if (failure)
+            goto retire_cleanup;
+        RETIRE_CHECK(completion_rows_equal(session, "output", after_insert, 3),
+            "retire rows after the insert");
+    }
+retire_cleanup:
+    wl_columnar_eval_serial_test_after_plan = NULL;
+    /* Destroy aborts while a reader still blocks worker retirement. */
+    if (completion_retire_reader.owner)
+        (void)col_rel_source_reader_release(&completion_retire_reader);
+    free(values);
+    wl_session_destroy(session);
+    if (failure) {
+        FAIL(failure); return;
+    }
+    PASS();
+#undef RETIRE_CHECK
+}
+
 static void
 test_specialized_publication(uint32_t workers, unsigned initial, unsigned mode,
     bool baseline)
@@ -18169,6 +18306,9 @@ main(void)
         test_completion_repeated_failure(workers, COMPLETION_FAIL_ALLOC,
             COMPLETION_EXIT_STEP);
 #endif
+        test_completion_retirement_refusal(workers, COMPLETION_EXIT_STEP);
+        test_completion_retirement_refusal(workers, COMPLETION_EXIT_SNAPSHOT);
+        test_completion_retirement_refusal(workers, COMPLETION_EXIT_DESTROY);
         for (unsigned mode = 0; mode < 6; mode++) {
 #ifndef WL_TEST_ALLOC_WRAP
             if (mode == 3)
