@@ -13,7 +13,7 @@ SPEC = importlib.util.spec_from_file_location('qualify_aa', PATH)
 Q = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(Q)
 COLLECTOR = Q.COLLECTOR
-TEST_TMP = Path.home() / '.cache' / 'wirelog-test-tmp'
+TEST_TMP = (Path.home() / '.cache' / 'wirelog-test-tmp').resolve()
 TEST_TMP.mkdir(parents=True, exist_ok=True)
 
 

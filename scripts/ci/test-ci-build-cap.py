@@ -29,7 +29,7 @@ if INTEGRATION:
 
 def temp_directory():
     # CI fixtures follow the perf helpers' HOME temp policy on every platform.
-    parent = Path.home() / '.tmp'
+    parent = (Path.home() / '.tmp').resolve()
     parent.mkdir(parents=True, exist_ok=True)
     return tempfile.TemporaryDirectory(prefix='ci-build-cap-', dir=parent)
 

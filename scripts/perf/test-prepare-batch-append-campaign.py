@@ -39,7 +39,7 @@ class PreparePlanTests(unittest.TestCase):
         # more of them.  Build each side once here; make_source() hands every
         # caller a private copy, and the templates are proven unchanged after
         # each test and at class end.
-        home_tmp = Path.home() / '.tmp'
+        home_tmp = (Path.home() / '.tmp').resolve()
         home_tmp.mkdir(mode=0o700, exist_ok=True)
         cls.class_tmp = tempfile.TemporaryDirectory(dir=home_tmp)
         try:
@@ -65,7 +65,7 @@ class PreparePlanTests(unittest.TestCase):
             raise AssertionError('source templates changed during a test')
 
     def setUp(self):
-        home_tmp = Path.home() / '.tmp'
+        home_tmp = (Path.home() / '.tmp').resolve()
         home_tmp.mkdir(mode=0o700, exist_ok=True)
         self.tmp = tempfile.TemporaryDirectory(dir=home_tmp)
         self.addCleanup(self.tmp.cleanup)
@@ -455,7 +455,7 @@ class PreparePlanTests(unittest.TestCase):
             status=self.git(clone, 'status', '--porcelain'),
             index=(clone / '.git/index').read_bytes(),
             objects=object_inventory(clone))
-        temporary_root = Path.home() / '.tmp'
+        temporary_root = (Path.home() / '.tmp').resolve()
         temporary_root.mkdir(mode=0o700, exist_ok=True)
         temporary_pattern = f'batch-append-tree-{os.getpid()}-*'
         temporary_before = set(temporary_root.glob(temporary_pattern))
