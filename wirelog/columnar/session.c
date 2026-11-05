@@ -5650,6 +5650,8 @@ col_session_destroy(wl_session_t *session)
         abort();
     }
     memset(sess->cleanup_receipts, 0, sizeof(sess->cleanup_receipts));
+    memset((void *)sess->cleanup_pending_owners, 0,
+        sizeof(sess->cleanup_pending_owners));
     /* Issue #1435: differential arrangements hold registry-entry leases and
      * row links into relation positions.  Reject teardown while any lease or
      * replacement transaction is still active, before any relation storage is
@@ -6256,6 +6258,8 @@ col_worker_session_destroy(wl_col_session_t *worker)
     if (cleanup_rc != 0)
         return cleanup_rc;
     memset(worker->cleanup_receipts, 0, sizeof(worker->cleanup_receipts));
+    memset((void *)worker->cleanup_pending_owners, 0,
+        sizeof(worker->cleanup_pending_owners));
     worker->teardown_started = true;
     wl_columnar_delta_events_clear(worker);
     if (worker->filt_cache_active_pins != 0)

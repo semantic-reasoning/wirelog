@@ -3113,6 +3113,9 @@ typedef struct wl_col_session_t {
     uint64_t cleanup_receipt_next_plan_epoch;
     wl_columnar_eval_cleanup_receipt_t cleanup_receipts[
         WL_COLUMNAR_EVAL_STACK_CLEANUP_MAX_FRAMES];
+    /* Session-owned transferred frames, indexed only by a fresh full key. */
+    wl_columnar_eval_stack_cleanup_frame_t *cleanup_pending_owners[
+        WL_COLUMNAR_EVAL_STACK_CLEANUP_MAX_FRAMES];
     /* Set false on entry to col_eval_stratum, and true only at each of its
      * two completion points.  col_stratum_step_with_delta clears it again on
      * its own entry, which is the load-bearing clear: its detach loop can
@@ -3271,6 +3274,9 @@ wl_columnar_session_copy_without_ledger(wl_col_session_t *destination,
     destination->controlled_scalar_view = NULL;
     wl_columnar_memory_reservation_init(
         &destination->controlled_scalar_view_reservation);
+    /* Worker wrappers never inherit the coordinator's pending owners. */
+    memset((void *)destination->cleanup_pending_owners, 0,
+        sizeof(destination->cleanup_pending_owners));
 }
 
 bool
@@ -8469,6 +8475,10 @@ struct wl_columnar_eval_serial_framed_host_request {
     uint64_t previous_funding_id;
     wl_columnar_eval_serial_framed_host_reply_t *reply;
 };
+
+int wl_columnar_eval_stack_cleanup_receipt_host(const wl_plan_relation_t *,
+    wl_col_session_t *, bool,
+    const wl_columnar_eval_serial_framed_host_request_t *);
 
 /* Actual framed owner only. These adapters never lend a mutable receipt. */
 int wl_columnar_eval_stack_auto_select(
