@@ -62,7 +62,7 @@ class _FixtureContext:
 class CommandFreezeTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        home_tmp = Path.home() / '.tmp'
+        home_tmp = (Path.home() / '.tmp').resolve()
         home_tmp.mkdir(mode=0o700, exist_ok=True)
         cls.class_fallback_patchers = []
         for api in (FREEZER['PLAN']['FALLBACKS'], PROFILE['FALLBACKS'],

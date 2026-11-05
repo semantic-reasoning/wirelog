@@ -24,7 +24,7 @@ REAL_PLAN_VALIDATE_FALLBACKS = PLAN['FALLBACKS']['validate_fallbacks']
 
 class ExecutionPreflightTests(unittest.TestCase):
     def setUp(self):
-        home_tmp = Path.home() / '.tmp'
+        home_tmp = (Path.home() / '.tmp').resolve()
         home_tmp.mkdir(mode=0o700, exist_ok=True)
         self.tmp = tempfile.TemporaryDirectory(dir=home_tmp)
         self.addCleanup(self.tmp.cleanup)
