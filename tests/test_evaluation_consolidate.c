@@ -467,12 +467,30 @@ oracle_literal_commit(
         oracle_literal_add(literal, fees[i]);
 }
 
-/* Independent scalar original-single schedule, one uncontended nonce round. */
+/* Independent batch source profile, one uncontended nonce round. */
 static void
 oracle_literal_single(
     oracle_literal_t *literal)
 {
-    static const uint64_t fees[] = {94, 19, 39, 39, 45, 52, 45, 21, 144};
+    static const uint64_t fees[] = {
+        123, 33, 57, 84, 99, 60, 100, 33, 32, 28, 46, 18, 38, 39, 63
+    };
+    for (size_t i = 0; i < sizeof(fees) / sizeof(fees[0]); ++i)
+        oracle_literal_add(literal, fees[i]);
+}
+
+static void
+oracle_literal_capture_reserve(oracle_literal_t *literal)
+{
+    static const uint64_t fees[] = {100, 124, 164, 78};
+    for (size_t i = 0; i < sizeof(fees) / sizeof(fees[0]); ++i)
+        oracle_literal_add(literal, fees[i]);
+}
+
+static void
+oracle_literal_capture_commit(oracle_literal_t *literal)
+{
+    static const uint64_t fees[] = {98, 81, 63};
     for (size_t i = 0; i < sizeof(fees) / sizeof(fees[0]); ++i)
         oracle_literal_add(literal, fees[i]);
 }
@@ -556,12 +574,12 @@ oracle_literal_selected(
     if (timestamps) L(128);
     L(128); L(220); L(80);
     if (width > 16) {
-        L(80); oracle_literal_reserve(literal);
-        oracle_literal_commit(literal); L(32);
+        L(36); L(80); oracle_literal_capture_reserve(literal);
+        oracle_literal_capture_commit(literal); L(37);
     }
     R(36, width);
     if (renewal) {
-        L(128); oracle_literal_single(literal); L(220);
+        L(128); L(128); L(65); oracle_literal_single(literal); L(220);
     }
     L(63); L(103); R(36, (uint64_t)width * 2u);
     if (selected_before < capacity) {

@@ -970,11 +970,11 @@ hash_literal_prefixes(void)
 #ifndef _MSC_VER
     /* First key's compatibility ends at26208. Width192, scratch1 three192,
      * two type lanes128, constructor parent192 gives27424 before constructor.
-     * Two batch parents192 and child170+single(94+19+39+39+45+52+45+21+144)
-     * give H=28476+constructor. Five right rows:16 heads+5 next slots,
+     * Two batch parents192 and child170+source-single853 give
+     * H=28831+constructor, i.e. old28476 plus853-498. Five right rows:16 heads+5 next slots,
      * four doublings; each build row192+128 hash+128 link. All candidates
      * are deliberate collisions with unequal keys, so no output fees. */
-    const uint64_t h = 28476u + typed_constructor_two();
+    const uint64_t h = 28476u + (853u - 498u) + typed_constructor_two();
     const uint64_t boundaries[] = {192, 320, 704, 896, 1088, 1280, 1472, 1600,
                                    4160, 4352, 4480, 4608, 6400, 6592, 6720,
                                    6848, 6976, 7168, 7296};
@@ -1571,7 +1571,7 @@ probe_literal_prefixes(void)
         for (unsigned b = 0; b < sizeof(boundaries) / sizeof(boundaries[0]);
             ++b)
             for (unsigned minus = 0; minus < 2; ++minus) {
-                uint64_t h = 28476u + typed_constructor_two() +
+                uint64_t h = 28476u + (853u - 498u) + typed_constructor_two() +
                     (anti ? 1248u : 608u);
                 fixture_t f;
                 fixture_init(&f, 2, 3, 5, h + boundaries[b] - minus);

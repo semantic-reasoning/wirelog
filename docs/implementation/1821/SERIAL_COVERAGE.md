@@ -2332,3 +2332,63 @@ This factoring adds no tariff or authority. Its source delta is not a payment
 certificate: real composed successful guards add three scalar source cells for
 the forwarding edge. Full O2 fixed/scanner, ordinary owner/public32, all11,
 cutoff, consumer and policy accounting remain open.
+
+### Private batch writer and capture source profile (#2297, #2298)
+
+Controlled batch BEGIN and renewal use a private original-single constructor
+with15 actual metadata/native actions. The independent action prices are
+`123,33,57,84,99,60,100,33,32,28,46,18,38,39,63`: one uncontended
+constructor consumes853, BEGIN adds170 (1023 total), and renewal adds its
+original128, authority128 and terminal65 (1174 total). Each real extra nonce
+round consumes57. Legacy hook labels, including ENTRY94, remain labels; the
+source ENTRY debit is123. Generic/manual single APIs retain their own prices.
+
+The constructor forms one typed address of its actual embedded owner only
+after paid FRAME and before every failure edge. It rereads the real native
+fields after callbacks. Both remaining writers are validated before either
+release; identity, gate, secondary owner, thread and state checks remain, and
+the24 meaningful inert stores execute after actual releases. Actual fixed
+cleanup for zero/descriptor/both-held prefixes is30/71/113 within separately
+owned32/78/124. FRAME47+next-refusal5+prefix32=84; descriptor and owner each
+need97 within99/100. The genuine owner-success then BORROW refusal needs
+46+5+113=164 within its178 same-original source. No native/error permission,
+copied writer, whole-cleanup exception or source from another object is used.
+
+Governed wide capture uses a separate source reservation profile
+`100,124,164,78` and commit profile `98,81,63`. One real reserve round consumes
+466 and commit242; each additional real reserve round adds164. Preparation36
+and scratch allocation37 precede their actual protected work. Old generic
+reservation/growth/constructor prices remain independent. Each actual
+governed wide capture adds351 to its former schedule; narrow/nullary and
+ungoverned paths do not invent a reservation or saved-reference refund.
+Physical scratch free precedes credit release and saved-reference release.
+
+The complete selected source proof includes fixed native/hook/helper/caller,
+first-refusal, original restoration and actual capture states. Its largest
+simultaneously unfinished bound is255; outgoing CHECK also fits actual
+postpaid163+first-ROW-refusal20+allocated-capture72=255. Only the previously
+qualified native weak-CAS and terminal credit/claim retry interiors retain
+their exact boundaries. A successful constructor handoff forfeits its failure
+share; it cannot finance subsequent batch END or a different activation.
+
+`evaluation_work` checks independent exact/minus-one stage schedules, real
+zero/descriptor/both writer cleanup and owner-success/BORROW refusal with
+physical peer credit and release-hook failures. `memory_governor` checks the
+new source APIs' independent boundaries, genuine peer-induced CAS retries,
+cumulative reserve/commit on the same original allowance, and original
+cancellation/accounting-error/END-reset at every real seam. Existing generic
+primitive oracles remain separate. FILTER/MAP host literals retain the
+actual source-profile schedules across wide capture and renewal.
+The legacy two-JOIN recursive fixture begins4/6/6 writers across its three
+rounds; the single-JOIN fixture begins4/5/5/5 across four rounds. Their exact
+independent formulas add16/19 times `(853-498)`, preserving the existing ABI
+and cutoff terms. Width2 fits the original capacities, so neither case adds
+wide-capture or renewal work.
+Five-round successor recomputation similarly begins4/5/5/5/5 writers and adds
+24 times the same source-derived difference.
+
+This closes the selected activation-local writer/capture source gap. Returned
+native-error prefixes still need the existing checked drain. Complete generic
+drain/ROW/growth/compiler, ordinary coordinator/owner/public recovery,
+materialized-cache driver, strict/local/shared/general cap intersections and
+whole-bundle acceptance remain mandatory; no PR Ready claim follows here.

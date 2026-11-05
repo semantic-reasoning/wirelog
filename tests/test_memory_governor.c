@@ -3819,6 +3819,181 @@ test_attempt_admission_seams(void)
     PASS();
 }
 
+/* Capture-only source prices are independent of the legacy primitive prices
+ * above. Use real original tokens/peer allocations and the same public seams. */
+static int
+attempt_source_call(attempt_admission_fixture_t *fixture,
+    wl_columnar_memory_admission_status_t *status, bool *committed)
+{
+    if (fixture->kind == 0)
+        return wl_columnar_memory_governor_reserve_source_attempt_controlled(
+            &fixture->governor, 8, &fixture->token, status, fixture->control,
+            fixture->attempt_id);
+    WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(fixture->kind == 2);
+    return wl_columnar_memory_governor_commit_source_attempt_controlled(
+        &fixture->token, fixture->old_buffer, committed, fixture->control,
+        fixture->attempt_id);
+}
+
+static void
+attempt_source_hooks(bool enabled)
+{
+    wl_columnar_memory_governor_test_checkpoint =
+        enabled ? attempt_phase : NULL;
+    wl_columnar_memory_governor_test_work_checkpoint =
+        enabled ? attempt_work : NULL;
+    wl_columnar_memory_governor_test_before_total_cas =
+        enabled ? attempt_before_total : NULL;
+    wl_columnar_memory_governor_test_after_total_cas =
+        enabled ? attempt_after_total : NULL;
+}
+
+static void
+test_source_admission_boundaries(void)
+{
+    TEST(
+        "capture source exact/minus-one, real CAS retry and cumulative commit");
+    attempt_source_hooks(true);
+    const uint64_t limits[2][8] = {
+        {99, 100, 223, 224, 387, 388, 465, 466},
+        {97, 98, 178, 179, 241, 242}
+    };
+    const uint64_t consumed[2][8] = {
+        {0, 100, 100, 224, 224, 388, 388, 466},
+        {0, 98, 98, 179, 179, 242}
+    };
+    for (unsigned row = 0; row < 2; ++row)
+        for (unsigned i = 0; i < (row ? 6u : 8u); ++i) {
+            attempt_admission_fixture_t fixture;
+            attempt_init(&fixture, row ? 2 : 0, limits[row][i]);
+            wl_columnar_memory_reservation_t prior = fixture.token;
+            wl_columnar_memory_admission_status_t status =
+                WL_COLUMNAR_MEMORY_ADMISSION_INVALID;
+            bool committed = false;
+            bool success = i == (row ? 5u : 7u);
+            int rc = attempt_source_call(&fixture, &status, &committed);
+            WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(rc == (success ? 0
+                : WL_EVALUATION_CONTROL_WORK_LIMIT));
+            if (!success) controlled_token_equal(&fixture.token, &prior);
+            else {
+                WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(row ? committed
+                    : status == WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY);
+                WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(fixture.seams ==
+                    (row ? 7u : 12u));
+                WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(fixture.work[2] == 74
+                    && fixture.work[row ? 4 : 5] == 54
+                    && fixture.work[row ? 6 : 11] == 29);
+                if (!row) WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(
+                        fixture.work[8] == 84);
+            }
+            WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(controlled_end(fixture.control,
+                rc) == consumed[row][i]);
+            attempt_dispose(&fixture, success);
+        }
+    for (unsigned failed = 1; failed <= 4; ++failed)
+        for (unsigned boundary = 0; boundary < 3; ++boundary) {
+            const uint64_t totals[] = {630, 794, 958, 1122};
+            const uint64_t round_denied[] = {388, 552, 716, 880};
+            const uint64_t publication_denied[] = {552, 716, 880, 1044};
+            uint64_t limit = boundary == 0 ? totals[failed - 1]
+                : boundary == 1 ? totals[failed - 1] - 1
+                : publication_denied[failed - 1] - 1;
+            attempt_admission_fixture_t fixture;
+            attempt_init(&fixture, 0, limit);
+            fixture.contention_remaining = failed;
+            wl_columnar_memory_reservation_t prior = fixture.token;
+            wl_columnar_memory_admission_status_t status =
+                WL_COLUMNAR_MEMORY_ADMISSION_INVALID;
+            bool committed = false;
+            int rc = attempt_source_call(&fixture, &status, &committed);
+            WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(rc == (boundary == 0 ? 0
+                : WL_EVALUATION_CONTROL_WORK_LIMIT));
+            WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(!fixture.contention_remaining
+                && fixture.failed_cas == failed);
+            if (boundary) controlled_token_equal(&fixture.token, &prior);
+            uint64_t expected = boundary == 0 ? totals[failed - 1]
+                : boundary == 1 ? publication_denied[failed - 1]
+                : round_denied[failed - 1];
+            WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(controlled_end(fixture.control,
+                rc) == expected);
+            attempt_dispose(&fixture, boundary == 0);
+        }
+    /* Both operations consume the SAME original finite allowance. The real
+     * incoming buffer exists before committing its genuine RESERVED token. */
+    const uint64_t paired_limits[] = {563, 564, 644, 645, 707, 708};
+    const uint64_t paired_consumed[] = {466, 564, 564, 645, 645, 708};
+    for (unsigned i = 0; i < 6; ++i) {
+        attempt_admission_fixture_t fixture;
+        attempt_init(&fixture, 0, paired_limits[i]);
+        wl_columnar_memory_admission_status_t status =
+            WL_COLUMNAR_MEMORY_ADMISSION_INVALID;
+        bool committed = false;
+        WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(attempt_source_call(&fixture,
+            &status, &committed) == 0);
+        fixture.old_buffer = malloc(8);
+        WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(fixture.old_buffer);
+        memset(fixture.old_buffer, 0x22, 8);
+        fixture.kind = 2;
+        wl_columnar_memory_reservation_t prior = fixture.token;
+        int rc = attempt_source_call(&fixture, &status, &committed);
+        WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(rc == (i == 5 ? 0
+            : WL_EVALUATION_CONTROL_WORK_LIMIT));
+        if (i < 5) controlled_token_equal(&fixture.token, &prior);
+        WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(committed == (i == 5));
+        WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(controlled_end(fixture.control, rc)
+            == paired_consumed[i]);
+        attempt_dispose(&fixture, i == 5);
+    }
+    attempt_source_hooks(false);
+    PASS();
+}
+
+static void
+test_source_admission_original_seams(void)
+{
+    TEST(
+        "capture source preserves peer credit and original reports at every seam");
+    attempt_source_hooks(true);
+    const uint64_t prefixes[2][12] = {
+        {100, 100, 100, 224, 224, 224, 388, 388, 388, 388, 466, 466},
+        {98, 98, 98, 179, 179, 242, 242}
+    };
+    for (unsigned row = 0; row < 2; ++row)
+        for (unsigned at = 1; at <= (row ? 7u : 12u); ++at)
+            for (unsigned fault = 1; fault <= 3; ++fault) {
+                attempt_admission_fixture_t fixture;
+                attempt_init(&fixture, row ? 2 : 0, 0);
+                wl_columnar_memory_reservation_t prior = fixture.token;
+                fixture.fault_at = at;
+                fixture.fault_kind = fault;
+                wl_columnar_memory_admission_status_t status =
+                    WL_COLUMNAR_MEMORY_ADMISSION_INVALID;
+                bool committed = false;
+                int rc = attempt_source_call(&fixture, &status, &committed);
+                WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(rc == (fault == 1
+                    ? WL_EVALUATION_CONTROL_CANCELLED
+                    : fault == 2 ? EOVERFLOW : EINVAL));
+                WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(fixture.hits == 1
+                    && !committed &&
+                    status == WL_COLUMNAR_MEMORY_ADMISSION_INVALID);
+                controlled_token_equal(&fixture.token, &prior);
+                WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(wl_columnar_memory_reserved(
+                        &fixture.governor) == (row ? 28 : 20));
+                WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(fixture.peer.bytes == 17
+                    && fixture.extra.bytes == 3);
+                if (fault == 3) {
+                    WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(fixture.old_consumed
+                        == prefixes[row][at - 1]);
+                    WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(controlled_end(
+                            fixture.control, 0) == 0);
+                } else WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(controlled_end(
+                            fixture.control, rc) == prefixes[row][at - 1]);
+                attempt_dispose(&fixture, false);
+            }
+    attempt_source_hooks(false);
+    PASS();
+}
+
 int
 main(void)
 {
@@ -3867,6 +4042,8 @@ main(void)
     test_attempt_admission_seams();
     test_attempt_admission_boundaries();
     test_attempt_admission_typed_verdicts();
+    test_source_admission_boundaries();
+    test_source_admission_original_seams();
     wl_columnar_memory_governor_test_work_checkpoint = NULL;
     wl_columnar_memory_governor_test_checkpoint = NULL;
     wl_columnar_memory_governor_test_before_total_cas = NULL;

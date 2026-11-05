@@ -228,7 +228,7 @@ These exist so struct fields can be declared portably; the audit in
 
 Every `atomic_*` call site in `wirelog/` production sources. Counted
 mechanically by `scripts/ci/check-threading-doc.sh`; row count must
-match the script's count (currently **468**).
+match the script's count (currently **491**).
 
 Format: `file:function[#N]` | field | operation | order | justification.
 
@@ -665,7 +665,7 @@ concurrent alias removals cannot underflow the count.
 | `session.c:session_pool_rel_promote#3` | `src->storage_alias_borrows` | `atomic_store_explicit` | relaxed | Leave the closed pool tombstone with no child aliases |
 
 112 + 21 + 37 = **170 atomic call sites** in the summarized groups; the full
-symbol-anchored inventory below covers 468 sites.
+symbol-anchored inventory below covers 491 sites.
 
 The `#N` suffix counts all atomic sites in a symbol, regardless of operation;
 the first site remains unsuffixed. `scripts/ci/check-threading-doc.sh` uses
@@ -1752,7 +1752,7 @@ DONE. If a stop leaves the receipt holding a claim, its caller preserves that
 receipt and resumes with a fresh live maintenance attempt; it cannot abandon or
 reinitialize the receipt/token while the claim remains held.
 
-The complete current atomic-source inventory contains 468 call sites.
+The complete current atomic-source inventory contains 491 call sites.
 
 ### Caller-attempt-bound single mutation admission
 
@@ -2668,3 +2668,41 @@ and move, fixed release fronts, copies, counters and returns remain explicit
 source work. External callback bodies retain their existing boundary; engine
 dispatch fronts remain counted. Neither qualification promises finite CAS
 iterations, arbitrary callback time or hard terminal cleanup latency.
+
+
+### Batch source-profile native ownership
+
+The private batch source constructor and governed capture preserve final-address
+writer and reservation authority. The constructor address alias reads the same
+original embedded owner record after each hook; it copies no native token or
+validated permission. Both writers are checked before either failure release;
+counts and the24-field inert clear follow actual release success.
+
+The23 lexical sites below include mutually exclusive native implementations and
+optional test counters. They add no session/worker field or installed API.
+
+| Source anchor | Object | Atomic operation | Ordering | Synchronization purpose |
+|---|---|---|---|---|
+| `memory_governor.c:wl_columnar_memory_governor_reserve_source_attempt_controlled` | `token.owner_bits` | `atomic_exchange_explicit` | release | Clear the exclusive original reservation owner before source-profile preparation |
+| `memory_governor.c:wl_columnar_memory_governor_reserve_source_attempt_controlled#2` | `token.state` | `atomic_exchange_explicit` | release | Publish RELEASED after a genuine no-credit denial or overflow |
+| `memory_governor.c:wl_columnar_memory_governor_reserve_source_attempt_controlled#3` | `token.state` | `atomic_exchange_explicit` | release | Publish RESERVED after real credit admission |
+| `memory_governor.c:wl_columnar_memory_governor_commit_source_attempt_controlled` | `token.owner_bits` | `atomic_exchange_explicit` | release | Bind the caller-supplied owner tag after the final original cutoff; capture uses its reservation receipt before allocating scratch |
+| `memory_governor.c:wl_columnar_memory_governor_commit_source_attempt_controlled#2` | `token.state` | `atomic_exchange_explicit` | release | Publish COMMITTED after the supplied owner tag |
+| `relation.c:wl_columnar_relation_batch_validate` | `wl_lease_validations` | `atomic_fetch_add_explicit` | relaxed | Count a real fixed-prefix batch lease validation in the configured test target |
+| `relation.c:wl_columnar_relation_batch_nonce_source` | `wl_next_mutation_set_nonce` | `atomic_fetch_add_explicit` | acquire (MSVC branch) | Read the fresh original nonce through the existing neutral exchange-compatible path |
+| `relation.c:wl_columnar_relation_batch_nonce_source#2` | `wl_next_mutation_set_nonce` | `atomic_load_explicit` | acquire (non-MSVC branch) | Read the original nonce before a paid source retry round |
+| `relation.c:wl_columnar_relation_batch_nonce_source#3` | `wl_next_mutation_set_nonce` | `atomic_compare_exchange_weak_explicit` | relaxed/relaxed (MSVC branch) | Claim one fresh original nonce per paid weak-CAS round |
+| `relation.c:wl_columnar_relation_batch_nonce_source#4` | `wl_next_mutation_set_nonce` | `atomic_compare_exchange_strong_explicit` | relaxed/relaxed (non-MSVC branch) | Claim one fresh original nonce per paid strong-CAS round |
+| `relation.c:wl_columnar_relation_batch_single_acquire_source` | `relation.descriptor_access.state` | `atomic_compare_exchange_weak_explicit` | acquire/relaxed (MSVC branch) | Acquire the actual original descriptor writer |
+| `relation.c:wl_columnar_relation_batch_single_acquire_source#2` | `relation.descriptor_access.state` | `atomic_compare_exchange_strong_explicit` | acquire/relaxed (non-MSVC branch) | Acquire the actual original descriptor writer |
+| `relation.c:wl_columnar_relation_batch_single_acquire_source#3` | `relation.source_access.state` | `atomic_compare_exchange_weak_explicit` | acquire/relaxed (MSVC branch) | Acquire the same original storage-owner writer |
+| `relation.c:wl_columnar_relation_batch_single_acquire_source#4` | `relation.source_access.state` | `atomic_compare_exchange_strong_explicit` | acquire/relaxed (non-MSVC branch) | Acquire the same original storage-owner writer |
+| `relation.c:wl_columnar_relation_batch_single_acquire_source#5` | `wl_lease_validations` | `atomic_fetch_add_explicit` | relaxed | Count the real fresh-constructor lease validation in the configured test target |
+| `relation.c:wl_columnar_relation_batch_single_acquire_source#6` | `descriptor writer gate.state` | `atomic_load_explicit` | acquire | Validate the original descriptor before either failure-path writer release |
+| `relation.c:wl_columnar_relation_batch_single_acquire_source#7` | `owner writer gate.state` | `atomic_load_explicit` | acquire | Validate the original owner before either failure-path writer release |
+| `relation.c:wl_columnar_relation_batch_single_acquire_source#8` | `owner writer gate.state` | `atomic_load_explicit` | acquire | Revalidate owner gate state after its actual release callback |
+| `relation.c:wl_columnar_relation_batch_single_acquire_source#9` | `owner writer gate.state` | `atomic_compare_exchange_weak_explicit` | release/relaxed | Release the original owner writer before decrementing its acquired count |
+| `relation.c:wl_columnar_relation_batch_single_acquire_source#10` | `descriptor writer gate.state` | `atomic_load_explicit` | acquire | Revalidate descriptor gate state after its actual release callback |
+| `relation.c:wl_columnar_relation_batch_single_acquire_source#11` | `descriptor writer gate.state` | `atomic_compare_exchange_weak_explicit` | release/relaxed | Release the original descriptor writer before clearing the original prefix |
+| `relation.c:wl_columnar_relation_batch_capture` | `capture.credit.owner_bits` | `atomic_init` | initialization | Initialize the final-address scratch reservation owner before any admission |
+| `relation.c:wl_columnar_relation_batch_capture#2` | `capture.credit.state` | `atomic_init` | initialization | Initialize the final-address scratch reservation to EMPTY before any admission |

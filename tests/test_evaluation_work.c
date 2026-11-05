@@ -3960,11 +3960,11 @@ test_row_stops(void)
 static void
 test_controlled_batch_twins(void)
 {
-    const uint32_t widths[] = {0, 1, 16, 17};
-    int64_t values[17];
-    for (unsigned k = 0; k < 17; ++k) values[k] = 900 + k;
+    const uint32_t widths[] = {0, 1, 16, 17, 129, 257};
+    int64_t values[257];
+    for (unsigned k = 0; k < 257; ++k) values[k] = 900 + k;
     for (unsigned mode = 0; mode < 2; ++mode)
-        for (unsigned w = 0; w < 4; ++w)
+        for (unsigned w = 0; w < sizeof(widths) / sizeof(widths[0]); ++w)
             for (unsigned ts = 0; ts < 2; ++ts) {
                 col_rel_t *r = relation(widths[w], 2, 1, ts != 0, NULL);
                 col_rel_t *raw = relation(widths[w], 2, 1, ts != 0, NULL);
@@ -4518,14 +4518,15 @@ test_controlled_batch_attach_policy(void)
 static void
 test_controlled_batch_literal_boundaries(void)
 {
-    static const uint64_t begin_regions[] = {170, 94, 19, 39, 39, 45, 52, 45,
-                                             21, 144};
+    static const uint64_t begin_regions[] = {
+        170, 123, 33, 57, 84, 99, 60, 100, 33, 32, 28, 46, 18, 38, 39, 63
+    };
     static const uint64_t row_regions[] = {220, 80, 36, 63, 103, 36, 36, 36,
                                            48};
     static const uint64_t set_regions[] = {220, 70};
     static const uint64_t renew_regions[] = {
-        220, 80, 36, 128,
-        94, 19, 39, 39, 45, 52, 45, 21, 144, 220,
+        220, 80, 36, 128, 128, 65,
+        123, 33, 57, 84, 99, 60, 100, 33, 32, 28, 46, 18, 38, 39, 63, 220,
         63, 103, 36, 36, 83, 83, 83, 83, 83, 76,
         74, 54, 84, 29, 32, 32, 183, 183, 36, 69, 151, 26, 228, 48
     };
@@ -4537,7 +4538,10 @@ test_controlled_batch_literal_boundaries(void)
         sizeof(set_regions) / sizeof(set_regions[0]),
         sizeof(renew_regions) / sizeof(renew_regions[0])
     };
-    const uint64_t setup[] = {0, 668, 668, 3437};
+    /* BEGIN170 + single853. First growth uses the original held writer;
+    * renewal starts only at the later full, storage-transitioned image.
+    * Thus the two-row setup adds853-498=355 to the old3437 schedule. */
+    const uint64_t setup[] = {0, 1023, 1023, 3792};
     for (unsigned operation = 0; operation < 4; ++operation) {
         uint64_t prefix = 0;
         for (size_t region = 0; region < lengths[operation]; ++region) {
@@ -4597,6 +4601,79 @@ test_controlled_batch_literal_boundaries(void)
                 release(c); released(r); destroy(r);
             }
         }
+    }
+}
+
+static unsigned batch_source_release_count, batch_source_fail_slot;
+static int
+batch_source_release(wl_columnar_relation_mutation_single_t *single,
+    unsigned slot)
+{
+    CHECK(slot == (batch_source_release_count ? 0u : 1u));
+    ++batch_source_release_count;
+    CHECK(single->set.descriptors_acquired == 1);
+    CHECK(single->descriptor.writer.identity ==
+        (uintptr_t)&single->descriptor.writer);
+    CHECK(single->set.owners_acquired == (slot ? 1u : 0u));
+    if (slot) {
+        CHECK(single->owners[0].writer.identity ==
+            (uintptr_t)&single->owners[0].writer);
+        CHECK(atomic_load_explicit(
+                &single->owners[0].owner->source_access.state,
+                memory_order_acquire) == WL_COLUMNAR_SOURCE_ACCESS_WRITER);
+    } else {
+        CHECK(!single->owners[0].writer.owner
+            && !single->owners[0].writer.identity
+            && !single->owners[0].writer.thread_valid);
+    }
+    return slot == batch_source_fail_slot ? EIO : 0;
+}
+
+static void
+test_controlled_batch_source_refusal(void)
+{
+    /* Independent literal: BEGIN170 + ENTRY123+READ33+ROUND57+FRAME84
+     * +DESC99+BIND60+OWNER100 =726. BORROW33 needs759, so758 refuses
+     * only after both actual writers exist. No observed report sets a limit. */
+    for (unsigned fault = 0; fault < 3; ++fault) {
+        col_rel_t *r = relation(1, 4, 1, false, NULL);
+        wl_columnar_memory_governor_t *g =
+            wl_columnar_memory_governor_ref_get(r->memory_governor);
+        wl_columnar_memory_reservation_t peer;
+        wl_columnar_memory_reservation_init(&peer);
+        CHECK(wl_columnar_memory_reserve(g, 17, &peer));
+        unsigned char *buffer = malloc(17);
+        CHECK(buffer);
+        memset(buffer, 0x5d, 17);
+        CHECK(wl_columnar_memory_commit(&peer, buffer));
+        growth_snapshot_t before = snapshot(r);
+        wl_evaluation_control_t *c = control(758);
+        wl_columnar_relation_append_batch_t batch = {0};
+        batch_source_release_count = 0;
+        batch_source_fail_slot = fault == 0 ? 2 : fault == 1 ? 1 : 0;
+        wl_columnar_relation_test_single_release = batch_source_release;
+        int expected = fault ? EIO : WL_EVALUATION_CONTROL_WORK_LIMIT;
+        CHECK(wl_columnar_relation_append_batch_begin_controlled(&batch, r, c)
+            == expected);
+        wl_columnar_relation_test_single_release = NULL;
+        CHECK(batch_source_release_count == (fault == 1 ? 1u : 2u));
+        if (fault) {
+            CHECK(batch.phase == WL_COLUMNAR_RELATION_BATCH_DRAINING);
+            CHECK(batch.raw.single.set.descriptors_acquired == 1);
+            CHECK(batch.raw.single.set.owners_acquired == (fault == 1));
+        } else CHECK(batch.phase == WL_COLUMNAR_RELATION_BATCH_ENDED
+                && !batch.raw.single.set.identity);
+        unchanged(r, before);
+        CHECK(buffer[16] == 0x5d && peer.bytes == 17);
+        CHECK(wl_columnar_relation_append_batch_end_controlled(&batch,
+            expected) == expected);
+        CHECK(wl_columnar_relation_append_batch_end_controlled(&batch,
+            ENOTSUP) == expected);
+        CHECK(finish(c, expected) == 726);
+        unchanged(r, before); released(r);
+        free(buffer);
+        CHECK(wl_columnar_memory_release(&peer));
+        release(c); destroy(r);
     }
 }
 
@@ -5019,7 +5096,7 @@ selected_literal_prefixes(uint32_t width, bool ts)
     fees[n++] = 128;
     fees[n++] = 220; fees[n++] = 80;
     if (width > 16) {
-        const uint64_t wide[] = {80, 74, 54, 84, 29, 74, 54, 29, 32};
+        const uint64_t wide[] = {36, 80, 100, 124, 164, 78, 98, 81, 63, 37};
         for (size_t i = 0; i < sizeof(wide)/sizeof(wide[0]);
             i++) fees[n++] = wide[i];
     }
@@ -5041,11 +5118,11 @@ selected_literal_prefixes(uint32_t width, bool ts)
                 src->timestamps[1]._reserved = 77;
                 src->timestamps[1].multiplicity = -9;
             }
-            wl_evaluation_control_t *c = control(1632+224*((width+7u)/8u)+668+
+            wl_evaluation_control_t *c = control(1632+224*((width+7u)/8u)+1023+
                     prefix-below);
             uint64_t id = wl_evaluation_control_active_attempt_id(c);
             wl_columnar_relation_scalar_source_t s;
-            uint64_t setup = selected_source_setup(&s, src, ts, c)+668;
+            uint64_t setup = selected_source_setup(&s, src, ts, c)+1023;
             wl_columnar_relation_append_batch_t batch = {0};
             CHECK(wl_columnar_relation_append_batch_begin_controlled(&batch,
                 dst, c) == 0);
@@ -5084,7 +5161,7 @@ selected_literal_prefixes(uint32_t width, bool ts)
     }
     CHECK(prefix ==
         832+514+144*width+(width >
-        16?510:0)+(ts?256+183*((sizeof(col_delta_timestamp_t)+15)/16):0));
+        16?861:0)+(ts?256+183*((sizeof(col_delta_timestamp_t)+15)/16):0));
 }
 
 static unsigned selected_renewals;
@@ -5277,10 +5354,12 @@ selected_capture_retirement(void)
             wl_columnar_relation_test_work_checkpoint = checkpoint;
             wl_columnar_memory_governor_test_work_checkpoint = checkpoint;
             if (mode == 2) {
-                CHECK(selected_old_work == 8314);
+                /* One BEGIN355 and one governed capture351 source delta. */
+                CHECK(selected_old_work == 8314 + (853 - 498) + 351);
                 selected_report(c, wl_evaluation_control_active_attempt_id(c),
                     0, 0);
-            } else selected_report(c, selected_old_id, rc, 8314);
+            } else selected_report(c, selected_old_id, rc,
+                    8314 + (853 - 498) + 351);
             CHECK(wl_columnar_memory_release(&peer));
             CHECK(wl_columnar_memory_reserved(g) == baseline-17);
             released(src); released(dst); release(c); destroy(dst);
@@ -5308,7 +5387,7 @@ selected_domains(void)
         wl_evaluation_control_t *c = control(0);
         uint64_t id = wl_evaluation_control_active_attempt_id(c);
         wl_columnar_relation_scalar_source_t s;
-        selected_source_setup(&s, src, true, c);
+        uint64_t setup = selected_source_setup(&s, src, true, c) + 1023;
         wl_columnar_relation_append_batch_t batch = {0};
         CHECK(wl_columnar_relation_append_batch_begin_controlled(&batch, dst,
             c) == 0);
@@ -5328,7 +5407,7 @@ selected_domains(void)
         CHECK(wl_columnar_relation_append_batch_end_controlled(&batch,
             rc) == rc);
         CHECK(wl_columnar_relation_scalar_source_end(&s, rc) == rc);
-        selected_report(c, id, rc, 2524+(mode == 5?0:mode == 3?448:192));
+        selected_report(c, id, rc, setup+(mode == 5?0:mode == 3?448:192));
         release(c); destroy(dst); destroy(src);
     }
     /* Private wide capture allocation failure returns its original credit,
@@ -5355,8 +5434,10 @@ selected_domains(void)
         baseline);
     CHECK(wl_columnar_relation_append_batch_end_controlled(&batch, rc) == rc);
     CHECK(wl_columnar_relation_scalar_source_end(&s, rc) == rc);
-    /* setup2972 + wrapper576 + B2 capture220+80+80+241+157+32 */
-    selected_report(c, id, rc, 4358);
+    /* source2304+BEGIN1023, wrapper576, CHECK220, capture80+PREPARE36,
+     * wide80+reserve466+commit242+ALLOC37. Allocation fails before CELL. */
+    selected_report(c, id, rc,
+        3327 + 576 + 220 + 80 + 36 + 80 + 466 + 242 + 37);
     release(c); destroy(dst); destroy(src);
 }
 
@@ -5428,6 +5509,7 @@ main(void)
     test_controlled_batch_resources();
     test_controlled_batch_attach_policy();
     test_controlled_batch_literal_boundaries();
+    test_controlled_batch_source_refusal();
     test_controlled_batch_ended_result();
     test_row_alias_and_nullary();
     test_attempt_single_boundaries();
