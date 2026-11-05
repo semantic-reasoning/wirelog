@@ -25,6 +25,7 @@
 #endif
 
 #include "wirelog/wirelog-easy.h"
+#include "wirelog/columnar/internal.h"
 
 #include <stdbool.h>
 #include <stdint.h>
@@ -46,6 +47,8 @@ wl_test_setenv_(const char *name, const char *value, int overwrite)
 static int tests_run = 0;
 static int tests_passed = 0;
 static int tests_failed = 0;
+
+wl_session_t *wirelog_easy_testhook_inner(wirelog_easy_session_t *s);
 
 #define CHAIN 40
 
@@ -186,6 +189,152 @@ done:
     }
 }
 
+enum { GRAPH_NODES = 26 };
+
+typedef struct {
+    unsigned seen[GRAPH_NODES][GRAPH_NODES];
+    unsigned invalid;
+} graph_result_t;
+
+static int
+graph_index(int64_t value)
+{
+    if (value >= 0 && value < 24)
+        return (int)value;
+    return value == 1000 ? 24 : value == 1001 ? 25 : -1;
+}
+
+static void
+collect_graph(const char *relation, const int64_t *row, uint32_t ncols,
+    void *data)
+{
+    graph_result_t *result = data;
+    (void)relation;
+    int x = ncols == 2 ? graph_index(row[0]) : -1;
+    int y = ncols == 2 ? graph_index(row[1]) : -1;
+    if (x < 0 || y < 0)
+        result->invalid++;
+    else
+        result->seen[x][y]++;
+}
+
+static bool
+graph_parallel_ran(wirelog_easy_session_t *s)
+{
+    wl_col_session_t *inner = COL_SESSION(wirelog_easy_testhook_inner(s));
+    return inner->tdd_audit.strategy
+           && strcmp(inner->tdd_audit.strategy, "global_read") == 0
+           && inner->tdd_audit.selected_workers >= 2
+           && inner->tdd_audit.submitted_tasks >= 2
+           && inner->tdd_audit.completed_rounds > 0
+           && inner->tdd_workers_count == 0;
+}
+
+/* Independent finite-set evaluation of the two-sided rules. The seeds are
+ * deliberately unsorted: global-read workers must not sort borrowed heads. */
+static void
+test_global_seeded_graph(uint32_t workers, bool seeded, bool snapshot_only)
+{
+    bool edge[GRAPH_NODES][GRAPH_NODES] = { { false } };
+    bool expected[GRAPH_NODES][GRAPH_NODES] = { { false } };
+    char program[4096];
+    size_t used = (size_t)snprintf(program, sizeof(program),
+            ".decl edge(x: int32, y: int32)\n"
+            ".decl tc(x: int32, y: int32)\n.output tc\n"
+            "tc(x,y) :- edge(x,y).\n"
+            "tc(x,z) :- tc(x,y), edge(y,z).\n"
+            "tc(x,z) :- edge(x,y), tc(y,z).\n%s",
+            seeded ? "tc(1001,0).\ntc(1000,1001).\n" : "");
+    for (unsigned i = 0; i < 23; i++) {
+        edge[i][i + 1] = true;
+        used += (size_t)snprintf(program + used, sizeof(program) - used,
+                "edge(%u,%u).\n", i, i + 1);
+    }
+    for (unsigned i = 0; i <= 20; i += 2) {
+        edge[i][i + 3] = true;
+        used += (size_t)snprintf(program + used, sizeof(program) - used,
+                "edge(%u,%u).\n", i, i + 3);
+    }
+    memcpy(expected, edge, sizeof(expected));
+    if (seeded) {
+        expected[25][0] = true;
+        expected[24][25] = true;
+    }
+    bool changed;
+    do {
+        changed = false;
+        for (unsigned x = 0; x < GRAPH_NODES; x++)
+            for (unsigned y = 0; y < GRAPH_NODES; y++)
+                for (unsigned z = 0; z < GRAPH_NODES; z++)
+                    if (!expected[x][z]
+                        && ((expected[x][y] && edge[y][z])
+                        || (edge[x][y] && expected[y][z]))) {
+                        expected[x][z] = true;
+                        changed = true;
+                    }
+    } while (changed);
+
+    wirelog_easy_open_opts_t opts = WIRELOG_EASY_OPEN_OPTS_INIT;
+    wirelog_easy_session_t *s = NULL;
+    const char *why = NULL;
+    tests_run++;
+    printf("  [%d] global-read graph (workers=%u seeded=%d snapshot=%d)",
+        tests_run, workers, seeded, snapshot_only);
+    opts.num_workers = workers;
+    opts.eager_build = true;
+    if (wirelog_easy_open_opts(program, &opts, &s) != WIRELOG_OK) {
+        why = "open";
+        goto done;
+    }
+    /* Plain step does not enable the optional audit from the environment;
+     * snapshot does. Observe dispatch immediately after each entry point. */
+    COL_SESSION(wirelog_easy_testhook_inner(s))->tdd_audit.enabled = true;
+    if (!snapshot_only && wirelog_easy_step(s) != WIRELOG_OK) {
+        why = "step";
+        goto done;
+    }
+    if (!snapshot_only && workers > 1 && !graph_parallel_ran(s)) {
+        why = "parallel global-read step or cleanup";
+        goto done;
+    }
+    for (unsigned repeat = 0; repeat < 2; repeat++) {
+        graph_result_t result = { 0 };
+        if (wirelog_easy_snapshot(s, "tc", collect_graph, &result)
+            != WIRELOG_OK || result.invalid) {
+            why = "snapshot";
+            goto done;
+        }
+        unsigned count = 0;
+        for (unsigned x = 0; x < GRAPH_NODES; x++)
+            for (unsigned y = 0; y < GRAPH_NODES; y++) {
+                count += result.seen[x][y];
+                if (result.seen[x][y] != (unsigned)expected[x][y]) {
+                    why = "missing, extra or duplicate tuple";
+                    goto done;
+                }
+            }
+        if (count != (seeded ? 301u : 276u)) {
+            why = "oracle cardinality";
+            goto done;
+        }
+        if (repeat == 0 && snapshot_only && workers > 1
+            && !graph_parallel_ran(s)) {
+            why = "parallel global-read snapshot or cleanup";
+            goto done;
+        }
+    }
+done:
+    if (s)
+        wirelog_easy_close(s);
+    if (why) {
+        tests_failed++;
+        printf(" ... FAIL: %s\n", why);
+    } else {
+        tests_passed++;
+        printf(" ... PASS\n");
+    }
+}
+
 int
 main(void)
 {
@@ -201,6 +350,13 @@ main(void)
             test_seeded_closure((mode_t_)m, workers[w]);
     for (uint32_t w = 0; w < sizeof(workers) / sizeof(workers[0]); w++)
         test_float_seed_easy_contract(workers[w]);
+    if (setenv("WIRELOG_TDD_STRATUM_PROFILE", "1", 1) != 0)
+        return 1;
+    const uint32_t graph_workers[] = { 1, 2, 8 };
+    for (unsigned w = 0; w < 3; w++)
+        for (unsigned seeded = 0; seeded < 2; seeded++)
+            for (unsigned snapshot = 0; snapshot < 2; snapshot++)
+                test_global_seeded_graph(graph_workers[w], seeded, snapshot);
     printf("%d run, %d passed, %d failed\n", tests_run, tests_passed,
         tests_failed);
     return tests_failed ? 1 : 0;
