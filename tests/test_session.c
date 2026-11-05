@@ -10420,8 +10420,113 @@ inject_later_completion_refusal(wl_col_session_t *coord, col_rel_t *target)
     (void)coord;
 }
 
+/* Finish a pending completion, or evaluate, with the chosen public verb. */
+static int
+completion_finish(wl_session_t *session, bool finish_with_step,
+    uint64_t *tuple_count)
+{
+    return finish_with_step ? wl_session_step(session)
+           : wl_session_snapshot(session, count_tuple_only, tuple_count);
+}
+
+/* Same rows in the same order in each named one-column relation, and the same
+ * snapshot rows.  plain_error_compare_bags stops at 16 rows. */
+static const char *
+completion_sessions_match(wl_session_t *actual, wl_session_t *reference,
+    const char *const *names, unsigned name_count)
+{
+    static tuple_collector_t actual_rows, reference_rows;
+    wl_col_session_t *actual_sess = COL_SESSION(actual);
+    wl_col_session_t *reference_sess = COL_SESSION(reference);
+
+    for (unsigned i = 0; i < name_count; i++) {
+        col_rel_t *a = session_find_rel(actual_sess, names[i]);
+        col_rel_t *b = session_find_rel(reference_sess, names[i]);
+        if (!a || !b || a->ncols != 1 || b->ncols != 1)
+            return "completion compare: relation shape";
+        if (a->nrows != b->nrows
+            || (a->nrows > 0 && memcmp(a->columns[0], b->columns[0],
+            a->nrows * sizeof(int64_t)) != 0)) {
+            printf(" (%s: %u rows vs %u)", names[i], a->nrows, b->nrows);
+            return "completion compare: relation differs from the reference";
+        }
+    }
+    memset(&actual_rows, 0, sizeof(actual_rows));
+    memset(&reference_rows, 0, sizeof(reference_rows));
+    if (wl_session_snapshot(actual, collect_tuple, &actual_rows) != 0
+        || wl_session_snapshot(reference, collect_tuple, &reference_rows) != 0)
+        return "completion compare: snapshot";
+    if (actual_rows.count >= MAX_DELTAS
+        || actual_rows.count != reference_rows.count)
+        return "completion compare: snapshot row count";
+    for (int i = 0; i < actual_rows.count; i++) {
+        if (!has_tuple(&reference_rows, actual_rows.relations[i],
+            actual_rows.rows[i], actual_rows.ncols[i]))
+            return "completion compare: snapshot row missing from the reference";
+    }
+    return NULL;
+}
+
+/* After a recovered completion: compare with a session that never failed,
+ * then insert 99 into both, evaluate both with the same verb, and compare. */
+static const char *
+completion_check_reference(wl_session_t *session, wl_plan_t *plan,
+    uint32_t workers, const int64_t *values, const int64_t *later_values,
+    uint32_t later_count, bool finish_with_step, const char *const *names,
+    unsigned name_count)
+{
+    static const int64_t extra = 99;
+    wl_session_t *reference = NULL;
+    uint64_t tuple_count = 0;
+    const char *failure = NULL;
+
+    if (wl_session_create(wl_backend_columnar(), plan, workers, &reference)
+        != 0)
+        return "completion reference session";
+    if (wl_session_insert(reference, "input", values, 65536, 1) != 0
+        || (later_count > 0 && wl_session_insert(reference, "later_input",
+        later_values, later_count, 1) != 0)
+        || wl_session_step(reference) != 0) {
+        failure = "completion reference evaluation";
+        goto done;
+    }
+    failure = completion_sessions_match(session, reference, names, name_count);
+    if (failure)
+        goto done;
+    if (wl_session_insert(session, "input", &extra, 1, 1) != 0) {
+        failure = "insert after recovery";
+        goto done;
+    }
+    if (wl_session_insert(reference, "input", &extra, 1, 1) != 0) {
+        failure = "completion reference insert";
+        goto done;
+    }
+    if (completion_finish(session, finish_with_step, &tuple_count) != 0) {
+        failure = "evaluation after recovery";
+        goto done;
+    }
+    if (completion_finish(reference, finish_with_step, &tuple_count) != 0) {
+        failure = "completion reference second evaluation";
+        goto done;
+    }
+    failure = completion_sessions_match(session, reference, names, name_count);
+done:
+    wl_session_destroy(reference);
+    return failure;
+}
+
+/* Exact one-column contents of a relation. */
+static bool
+completion_rows_equal(wl_session_t *session, const char *name,
+    const int64_t *expected, uint32_t count)
+{
+    col_rel_t *rel = session_find_rel(COL_SESSION(session), name);
+    return rel && rel->ncols == 1 && rel->nrows == count
+           && memcmp(rel->columns[0], expected, count * sizeof(int64_t)) == 0;
+}
+
 static void
-test_later_stratum_completion_retry(uint32_t workers)
+test_later_stratum_completion_retry(uint32_t workers, bool finish_with_step)
 {
     TEST("plain STEP later-stratum completion resumes without replay");
     uint8_t predicate[] = { WL_PLAN_EXPR_BOOL, 1 };
@@ -10498,13 +10603,14 @@ test_later_stratum_completion_retry(uint32_t workers)
     LATER_CHECK(col_rel_source_reader_release(&compaction_reader) == 0,
         "later compaction release");
     tuple_count = 0;
-    LATER_CHECK(wl_session_snapshot(session, count_tuple_only, &tuple_count)
+    LATER_CHECK(completion_finish(session, finish_with_step, &tuple_count)
         == 0,
         "later callback-enabled retry");
     LATER_CHECK(!COL_SESSION(session)->plain_step_completion_pending
         && !COL_SESSION(session)->plain_step_completion_active,
         "later callback retry cleared completion");
-    LATER_CHECK(tuple_count == 4, "later exact callback count");
+    LATER_CHECK(tuple_count == (finish_with_step ? 0u : 4u),
+        "later exact callback count");
     LATER_CHECK(delta_count == 0, "later callback emitted no deferred deltas");
     wl_session_set_delta_cb(session, NULL, NULL);
     tuple_count = 0;
@@ -10519,6 +10625,17 @@ test_later_stratum_completion_retry(uint32_t workers)
         && later_relation->columns[0][0] == 7
         && later_relation->columns[0][1] == 42,
         "later exact stored values");
+    {
+        static const char *const names[] = { "input", "output", "later" };
+        static const int64_t after_insert[] = { 7, 42, 99 };
+        failure = completion_check_reference(session, &plan, workers, values,
+                NULL, 0, finish_with_step, names, 3);
+        if (failure)
+            goto later_cleanup;
+        LATER_CHECK(completion_rows_equal(session, "output", after_insert, 3)
+            && completion_rows_equal(session, "later", after_insert, 3),
+            "later rows after the insert");
+    }
 later_cleanup:
     wl_columnar_eval_test_before_final_normalize = NULL;
     if (later_completion_reader.owner)
@@ -11252,7 +11369,8 @@ inject_prefix_completion_refusal(wl_col_session_t *coord, col_rel_t *target)
 }
 
 static void
-test_mixed_completion_specialized_retry(uint32_t workers)
+test_mixed_completion_specialized_retry(uint32_t workers,
+    bool finish_with_step)
 {
     TEST("mixed plain completion and specialized refusal retry");
     uint8_t predicate[] = { WL_PLAN_EXPR_BOOL, 1 };
@@ -11352,7 +11470,8 @@ test_mixed_completion_specialized_retry(uint32_t workers)
         "mixed specialized cleanup");
     specialized_active = NULL;
     memset(&tuples, 0, sizeof(tuples));
-    MIXED_CHECK(wl_session_step(session) == 0, "mixed STEP retry");
+    MIXED_CHECK(!finish_with_step || wl_session_step(session) == 0,
+        "mixed STEP retry");
     MIXED_CHECK(wl_session_snapshot(session, collect_tuple, &tuples) == 0,
         "mixed SNAPSHOT retry");
     MIXED_CHECK(atomic_load_explicit(&specialized_workers,
@@ -11382,6 +11501,21 @@ test_mixed_completion_specialized_retry(uint32_t workers)
         && has_tuple(&tuples, "output", (int64_t[]){ 42 }, 1)
         && has_tuple(&tuples, "later", (int64_t[]){ 42 }, 1),
         "mixed duplicate callback");
+    {
+        static const char *const names[] = { "input", "later_input", "output",
+                                             "later" };
+        static const int64_t output_after[] = { 7, 42, 99 };
+        static const int64_t later_after[] = { 42 };
+        wl_columnar_eval_test_nonrec_worker = NULL;
+        wl_columnar_eval_test_nonrec_boundary = NULL;
+        failure = completion_check_reference(session, &plan, workers, values,
+                later_values, workers * 64, finish_with_step, names, 4);
+        if (failure)
+            goto mixed_cleanup;
+        MIXED_CHECK(completion_rows_equal(session, "output", output_after, 3)
+            && completion_rows_equal(session, "later", later_after, 1),
+            "mixed rows after the insert");
+    }
 mixed_cleanup:
     wl_columnar_eval_test_before_final_normalize = NULL;
     wl_columnar_eval_test_nonrec_worker = NULL;
@@ -17809,8 +17943,10 @@ main(void)
     test_idb_small_input(false, false);
     test_idb_small_input(false, true);
     for (uint32_t workers = 2; workers <= 8; workers += 6) {
-        test_later_stratum_completion_retry(workers);
-        test_mixed_completion_specialized_retry(workers);
+        for (unsigned verb = 0; verb < 2; verb++) {
+            test_later_stratum_completion_retry(workers, verb == 0);
+            test_mixed_completion_specialized_retry(workers, verb == 0);
+        }
         for (unsigned mode = 0; mode < 6; mode++) {
 #ifndef WL_TEST_ALLOC_WRAP
             if (mode == 3)
