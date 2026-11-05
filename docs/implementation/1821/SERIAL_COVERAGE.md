@@ -873,9 +873,11 @@ is still the caller's responsibility: these readers cannot substitute for an
 unpinned cache result's missing owner. No cache lookup, pin, statistic, victim
 transfer, insertion or public policy admission is added by this primitive.
 
-The held recipe reaches the existing metered operator constructor with the
-source's actual capacity, names/types and declared/graph fields. The private
-output has constructor-issued exclusive ownership until funded TAKE. Each
+The held recipe drives a private metered constructor with retained cleanup
+ownership at the final copier address, using the source's actual capacity,
+names/types and declared/graph fields. The shared ordinary constructor remains
+unchanged. The private output has constructor-issued exclusive ownership until
+funded TAKE. Each
 physical 64-bit cell is copied directly, including FLOAT bit patterns and
 STRING codes; typed append is not used. Base rows and valid sorted/run
 metadata match raw governed deep copy, including unused run slots; invalid
@@ -883,17 +885,43 @@ run metadata is normalized to zero. Fresh descriptor identity is independent.
 Only copied status/shape is queryable. A separate real128 grant transfers the
 completed output after source END. ACK rejects an untaken owned output.
 
-Late forward failure retains any created output at the original attempt
-address. Independently funded END releases actual source tokens, then abort
-lazily initializes the existing scalar-retirement owner with separate real256
-ZERO and BEGIN grants. ZERO clears the scalar receipt; BEGIN runs the actual
-managed initializer including its nested clear and all four token initializers.
-Their source inventories include both real bulk clears and caller work;
-existing primitive tariffs remain unchanged. Prepare, commit, physical and token/ledger
-retirement use actual cleanup funding, preserving the first semantic result.
-The wrapper pays192 in addition to inherited prepare/step charges. TAKE and
-ACK each require their own128, independent of the completed/stopped original.
-No raw deep-copy or raw destroy is hidden under a nominal fixed copy fee.
+Late forward failure retains the initialized constructor prefix and its real
+reservations, or the installed output, at the original copier address. Fresh
+CONSTRUCTOR_END192 turns dispose one actual child/name/column/table/descriptor
+or release the saved governor reference. Each admitted token adds a real121
+native refund admission:312 refuses after consuming192 with its token, flags,
+credit and phase unchanged; fresh313 progresses exactly one refund. Complete
+containing source is at most240 with real intervals at most133. No synchronous
+constructor destructor is hidden in the failing forward return. Original END
+and a live successor with zero consumption are covered alongside a genuine
+17-byte committed peer that survives all cleanup. Genuine first-allocation
+failure exercises a RESERVED token; cancellation after the last commit
+exercises all three COMMITTED tokens, without seeding native phases or flags.
+
+The selected reserve SOURCE caller160 owns current77 and one-use76 (153 total).
+The original-only known64 credit helper preserves counter/CAS semantics and
+counts the first native iteration. Full credited restoration fits64 including
+its caller; arbitrary ROUND164 retries fund themselves, and the uniform
+simultaneous bound is164+76+builder16=256. Generic capture/refund callers are
+separate source obligations; this selected correction does not certify them.
+
+Independently funded END drains source readers. Separate256 ZERO and BEGIN
+turns clear the scalar and managed records respectively. BEGIN establishes
+native identity and four final-address EMPTY tokens in that same activation.
+PREPARE takes192 wrapper plus192 native-source work, with exact383/384 refusal
+and progress tests; its existing finite phases validate one token or one
+column/pointer pair per turn. COMMIT uses128. STEP uses256 plus its reached
+native1 or64 debit, with255/256 outer boundaries and actual320 credit turns.
+TAKE and ACK each require128. All these controls are independent of the
+completed/stopped original; the shared scalar/managed API prices stay intact.
+
+The private issuer creates flat, no-timestamp, no-ledger output. Retained
+payload phase21 code is outside that positive provenance; a future genuine
+producer reaching it requires576 and a fresh source/caller/driver proof.
+The current512 cleanup driver does not qualify that future route. This unit
+qualifies only the selected issued copier and its reached native dependencies;
+other SOURCE callers, generic ownership and full materialized session policy
+remain separate obligations.
 
 Tests compare raw deep copy and literal metadata/cells for empty/nullary,
 wide257 and grown-capacity sources, native types, FLOAT raw bits, run metadata
@@ -2363,13 +2391,14 @@ governed wide capture adds351 to its former schedule; narrow/nullary and
 ungoverned paths do not invent a reservation or saved-reference refund.
 Physical scratch free precedes credit release and saved-reference release.
 
-The complete selected source proof includes fixed native/hook/helper/caller,
-first-refusal, original restoration and actual capture states. Its largest
-simultaneously unfinished bound is255; outgoing CHECK also fits actual
-postpaid163+first-ROW-refusal20+allocated-capture72=255. Only the previously
-qualified native weak-CAS and terminal credit/claim retry interiors retain
-their exact boundaries. A successful constructor handoff forfeits its failure
-share; it cannot finance subsequent batch END or a different activation.
+The writer source map includes fixed native/hook/helper/caller and first-refusal
+work. Its historical capture255 contour used native refund bounds that require
+fresh full first-iteration/ref-setup reconciliation. The selected private
+scalar-copy correction above does not establish that shared capture contour.
+Only the previously qualified repeated native weak-CAS and terminal credit/claim
+iterations retain their exact boundaries; the first iteration counts. A
+successful constructor handoff forfeits its failure share; it cannot finance
+subsequent batch END or a different activation.
 
 `evaluation_work` checks independent exact/minus-one stage schedules, real
 zero/descriptor/both writer cleanup and owner-success/BORROW refusal with
@@ -2387,8 +2416,9 @@ wide-capture or renewal work.
 Five-round successor recomputation similarly begins4/5/5/5/5 writers and adds
 24 times the same source-derived difference.
 
-This closes the selected activation-local writer/capture source gap. Returned
-native-error prefixes still need the existing checked drain. Complete generic
-drain/ROW/growth/compiler, ordinary coordinator/owner/public recovery,
+The selected activation-local writer constructor is qualified. Shared capture
+first-native/ref-setup accounting and returned native-error prefixes still need
+their complete source and checked drain. Complete generic drain/ROW/growth/compiler,
+ordinary coordinator/owner/public recovery,
 materialized-cache driver, strict/local/shared/general cap intersections and
 whole-bundle acceptance remain mandatory; no PR Ready claim follows here.

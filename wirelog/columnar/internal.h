@@ -2099,6 +2099,52 @@ extern void (*wl_columnar_cache_digest_test_checkpoint)(
  * output retains its own governor ref. Zero initialize final-address storage.
  * Original control ref lasts through funded ACK.
  * Independent cleanup may continue after original finish/reset/cancellation. */
+/* Original private constructor ownership, distinct from the legacy context. */
+typedef struct {
+    col_rel_t *relation;
+    char *name;
+    int64_t **columns;
+    int64_t *scratch;
+    char **names;
+    wirelog_column_type_t *types;
+    col_delta_timestamp_t *timestamps;
+    uint32_t columns_owned;
+    uint32_t names_owned;
+    bool schema_initialized;
+    wl_columnar_memory_governor_ref_t *saved_ref;
+    bool ref_held;
+    bool admitted[3];
+    bool committed[3];
+    wl_columnar_memory_reservation_t tokens[3];
+} wl_columnar_relation_constructor_attempt_t;
+
+typedef enum {
+    WL_COLUMNAR_RELATION_CACHE_CTOR_SCHEMA_FORMAT,
+    WL_COLUMNAR_RELATION_CACHE_CTOR_SCHEMA_CHILD,
+    WL_COLUMNAR_RELATION_CACHE_CTOR_SCHEMA_ROOT,
+    WL_COLUMNAR_RELATION_CACHE_CTOR_NAME,
+    WL_COLUMNAR_RELATION_CACHE_CTOR_NAMES_TABLE,
+    WL_COLUMNAR_RELATION_CACHE_CTOR_TYPES,
+    WL_COLUMNAR_RELATION_CACHE_CTOR_TIMESTAMPS,
+    WL_COLUMNAR_RELATION_CACHE_CTOR_SCRATCH,
+    WL_COLUMNAR_RELATION_CACHE_CTOR_COLUMN,
+    WL_COLUMNAR_RELATION_CACHE_CTOR_COLUMNS_TABLE,
+    WL_COLUMNAR_RELATION_CACHE_CTOR_NAME_STRING,
+    WL_COLUMNAR_RELATION_CACHE_CTOR_DESCRIPTOR,
+    WL_COLUMNAR_RELATION_CACHE_CTOR_RETIRED_HOOK,
+    WL_COLUMNAR_RELATION_CACHE_CTOR_TOKEN0,
+    WL_COLUMNAR_RELATION_CACHE_CTOR_TOKEN1,
+    WL_COLUMNAR_RELATION_CACHE_CTOR_TOKEN2,
+    WL_COLUMNAR_RELATION_CACHE_CTOR_REF,
+    WL_COLUMNAR_RELATION_CACHE_CTOR_DONE
+} wl_columnar_relation_cache_constructor_cleanup_t;
+
+#define WL_COLUMNAR_RELATION_CACHE_CONSTRUCTOR_OWNER_FIELDS \
+        bool constructor_initialized; \
+        wl_columnar_relation_cache_constructor_cleanup_t constructor_cleanup; \
+        unsigned constructor_cleanup_index; \
+        wl_columnar_relation_constructor_attempt_t constructor
+
 typedef enum {
     WL_COLUMNAR_RELATION_CACHE_COPY_INERT,
     WL_COLUMNAR_RELATION_CACHE_COPY_ACQUIRE,
@@ -2113,6 +2159,7 @@ typedef enum {
     WL_COLUMNAR_RELATION_CACHE_COPY_FINAL,
     WL_COLUMNAR_RELATION_CACHE_COPY_LATCH,
     WL_COLUMNAR_RELATION_CACHE_COPY_READY,
+    WL_COLUMNAR_RELATION_CACHE_COPY_CONSTRUCTOR_END,
     WL_COLUMNAR_RELATION_CACHE_COPY_END,
     WL_COLUMNAR_RELATION_CACHE_COPY_END_CLEAR,
     WL_COLUMNAR_RELATION_CACHE_COPY_RETIRE_ZERO,
@@ -2149,6 +2196,7 @@ typedef struct wl_columnar_relation_cache_scalar_copy_attempt {
     /* Lazy initialization is separately funded; ACK leaves only inert historic
      * bytes here. No terminal retirement pointer is dereferenced on reuse. */
     wl_columnar_relation_scalar_retirement_t retirement;
+    WL_COLUMNAR_RELATION_CACHE_CONSTRUCTOR_OWNER_FIELDS;
 } wl_columnar_relation_cache_scalar_copy_attempt_t;
 
 typedef struct {

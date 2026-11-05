@@ -228,7 +228,7 @@ These exist so struct fields can be declared portably; the audit in
 
 Every `atomic_*` call site in `wirelog/` production sources. Counted
 mechanically by `scripts/ci/check-threading-doc.sh`; row count must
-match the script's count (currently **491**).
+match the script's count (currently **518**).
 
 Format: `file:function[#N]` | field | operation | order | justification.
 
@@ -665,7 +665,7 @@ concurrent alias removals cannot underflow the count.
 | `session.c:session_pool_rel_promote#3` | `src->storage_alias_borrows` | `atomic_store_explicit` | relaxed | Leave the closed pool tombstone with no child aliases |
 
 112 + 21 + 37 = **170 atomic call sites** in the summarized groups; the full
-symbol-anchored inventory below covers 491 sites.
+symbol-anchored inventory below covers 518 sites.
 
 The `#N` suffix counts all atomic sites in a symbol, regardless of operation;
 the first site remains unsuffixed. `scripts/ci/check-threading-doc.sh` uses
@@ -1752,7 +1752,7 @@ DONE. If a stop leaves the receipt holding a claim, its caller preserves that
 receipt and resumes with a fresh live maintenance attempt; it cannot abandon or
 reinitialize the receipt/token while the claim remains held.
 
-The complete current atomic-source inventory contains 491 call sites.
+The complete current atomic-source inventory contains 518 call sites.
 
 ### Caller-attempt-bound single mutation admission
 
@@ -2706,3 +2706,63 @@ optional test counters. They add no session/worker field or installed API.
 | `relation.c:wl_columnar_relation_batch_single_acquire_source#11` | `descriptor writer gate.state` | `atomic_compare_exchange_weak_explicit` | release/relaxed | Release the original descriptor writer before clearing the original prefix |
 | `relation.c:wl_columnar_relation_batch_capture` | `capture.credit.owner_bits` | `atomic_init` | initialization | Initialize the final-address scratch reservation owner before any admission |
 | `relation.c:wl_columnar_relation_batch_capture#2` | `capture.credit.state` | `atomic_init` | initialization | Initialize the final-address scratch reservation to EMPTY before any admission |
+
+### Private scalar-copy construction and independent retirement
+
+The scalar-copy constructor retains its initialized physical prefix and three
+real reservations at the final copier address on a forward stop. Fresh192
+cleanup turns retire one constructor item or the saved governor reference.
+Each admitted token requires a separate121 check before its actual native
+refund, so313 progresses one token and312 leaves its native state intact
+after consuming192. Physical disposal precedes credit and reference release.
+These turns preserve the first result, including successful0, after original
+END or a new successor attempt. The source reader remains owned until END.
+
+Selected PREPARE uses real192 wrapper and192 finite native-source admissions
+per turn. Shape validation, four individual token checks and column/pointer
+checks retain the original native guards and writers. STEP admits256 before
+its existing native1 or64 actions, including the saved cleanup-ID zero check
+before credit. Generic scalar/managed primitive prices are unchanged.
+
+INSTALL keeps all native state/identity checks after the original final zero
+check. The21 sites below move the same descriptor, metadata and retained
+reservations, seven operations each. The last four sites establish EMPTY
+retirement tokens after a complete same-activation managed-record clear.
+The exact inventory is518; no atomic-site exception is added.
+
+Original credited restoration uses a known64 counter helper in the owning
+governor TU. Its initial observation, expected refresh, release/relaxed CAS
+orders and MSVC full barrier match the generic helper. All ordinary fronts and
+the first native iteration are counted; only the exact existing original
+mandatory-restoration repeated-iteration scope remains. No successor is polled
+or charged. This does not qualify other generic refund/capture callers.
+
+| Source anchor | Object | Atomic operation | Ordering | Synchronization purpose |
+|---|---|---|---|---|
+| `memory_governor.c:wl_columnar_memory_governor_source_credit_original` | `governor->reserved_bytes` | `atomic_load_explicit` | relaxed | Observe the aggregate counter before original-only restoration; CAS validates intervening peer updates |
+| `memory_governor.c:wl_columnar_memory_governor_source_credit_original#2` | `governor->reserved_bytes` | `atomic_compare_exchange_weak_explicit` | release / relaxed | Refund only the original credited bytes, preserving peer contributions and refreshing the expected counter on retry |
+| `relation.c:wl_columnar_relation_cache_constructor_build` | `descriptor destination.state` | `atomic_load_explicit` | acquire | Require EMPTY or RELEASED final-address destination before moving the exclusive reservation in the private scalar-copy constructor |
+| `relation.c:wl_columnar_relation_cache_constructor_build#2` | `constructor token0.state` | `atomic_load_explicit` | acquire | Require RESERVED or COMMITTED source authority before reading its payload in the private scalar-copy constructor |
+| `relation.c:wl_columnar_relation_cache_constructor_build#3` | `descriptor destination.owner_bits` | `atomic_store_explicit` | relaxed | Copy exclusive source owner payload before publishing destination state in the private scalar-copy constructor |
+| `relation.c:wl_columnar_relation_cache_constructor_build#4` | `constructor token0.owner_bits` | `atomic_load_explicit` | relaxed | Observe owner payload under exclusive token ownership in the private scalar-copy constructor |
+| `relation.c:wl_columnar_relation_cache_constructor_build#5` | `descriptor destination.state` | `atomic_store_explicit` | release | Publish the complete moved reservation at its final address in the private scalar-copy constructor |
+| `relation.c:wl_columnar_relation_cache_constructor_build#6` | `constructor token0.owner_bits` | `atomic_store_explicit` | relaxed | Clear transferred source owner payload before publishing EMPTY in the private scalar-copy constructor |
+| `relation.c:wl_columnar_relation_cache_constructor_build#7` | `constructor token0.state` | `atomic_store_explicit` | release | Publish EMPTY after source payload and ownership have been cleared in the private scalar-copy constructor |
+| `relation.c:wl_columnar_relation_cache_constructor_build#8` | `metadata destination.state` | `atomic_load_explicit` | acquire | Require EMPTY or RELEASED final-address destination before moving the exclusive reservation in the private scalar-copy constructor |
+| `relation.c:wl_columnar_relation_cache_constructor_build#9` | `constructor token1.state` | `atomic_load_explicit` | acquire | Require RESERVED or COMMITTED source authority before reading its payload in the private scalar-copy constructor |
+| `relation.c:wl_columnar_relation_cache_constructor_build#10` | `metadata destination.owner_bits` | `atomic_store_explicit` | relaxed | Copy exclusive source owner payload before publishing destination state in the private scalar-copy constructor |
+| `relation.c:wl_columnar_relation_cache_constructor_build#11` | `constructor token1.owner_bits` | `atomic_load_explicit` | relaxed | Observe owner payload under exclusive token ownership in the private scalar-copy constructor |
+| `relation.c:wl_columnar_relation_cache_constructor_build#12` | `metadata destination.state` | `atomic_store_explicit` | release | Publish the complete moved reservation at its final address in the private scalar-copy constructor |
+| `relation.c:wl_columnar_relation_cache_constructor_build#13` | `constructor token1.owner_bits` | `atomic_store_explicit` | relaxed | Clear transferred source owner payload before publishing EMPTY in the private scalar-copy constructor |
+| `relation.c:wl_columnar_relation_cache_constructor_build#14` | `constructor token1.state` | `atomic_store_explicit` | release | Publish EMPTY after source payload and ownership have been cleared in the private scalar-copy constructor |
+| `relation.c:wl_columnar_relation_cache_constructor_build#15` | `retained destination.state` | `atomic_load_explicit` | acquire | Require EMPTY or RELEASED final-address destination before moving the exclusive reservation in the private scalar-copy constructor |
+| `relation.c:wl_columnar_relation_cache_constructor_build#16` | `constructor token2.state` | `atomic_load_explicit` | acquire | Require RESERVED or COMMITTED source authority before reading its payload in the private scalar-copy constructor |
+| `relation.c:wl_columnar_relation_cache_constructor_build#17` | `retained destination.owner_bits` | `atomic_store_explicit` | relaxed | Copy exclusive source owner payload before publishing destination state in the private scalar-copy constructor |
+| `relation.c:wl_columnar_relation_cache_constructor_build#18` | `constructor token2.owner_bits` | `atomic_load_explicit` | relaxed | Observe owner payload under exclusive token ownership in the private scalar-copy constructor |
+| `relation.c:wl_columnar_relation_cache_constructor_build#19` | `retained destination.state` | `atomic_store_explicit` | release | Publish the complete moved reservation at its final address in the private scalar-copy constructor |
+| `relation.c:wl_columnar_relation_cache_constructor_build#20` | `constructor token2.owner_bits` | `atomic_store_explicit` | relaxed | Clear transferred source owner payload before publishing EMPTY in the private scalar-copy constructor |
+| `relation.c:wl_columnar_relation_cache_constructor_build#21` | `constructor token2.state` | `atomic_store_explicit` | release | Publish EMPTY after source payload and ownership have been cleared in the private scalar-copy constructor |
+| `relation.c:wl_columnar_relation_cache_copy_end` | `retirement.tokens[0].state` | `atomic_store_explicit` | relaxed | Initialize EMPTY at the final token address after this activation clears the complete managed record |
+| `relation.c:wl_columnar_relation_cache_copy_end#2` | `retirement.tokens[1].state` | `atomic_store_explicit` | relaxed | Initialize EMPTY at the final token address after this activation clears the complete managed record |
+| `relation.c:wl_columnar_relation_cache_copy_end#3` | `retirement.tokens[2].state` | `atomic_store_explicit` | relaxed | Initialize EMPTY at the final token address after this activation clears the complete managed record |
+| `relation.c:wl_columnar_relation_cache_copy_end#4` | `retirement.tokens[3].state` | `atomic_store_explicit` | relaxed | Initialize EMPTY at the final token address after this activation clears the complete managed record |
