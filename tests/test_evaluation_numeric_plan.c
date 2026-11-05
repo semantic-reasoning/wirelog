@@ -5303,6 +5303,7 @@ reject_composed_recursive_manifest(const wl_plan_relation_t *original,
 {
     wl_plan_relation_t changed = *original;
     changed.ops = ops;
+    CHECK(!wl_columnar_eval_plan_numeric_recursive_path_supported(&changed));
     fixture_t f;
     composed_fixture(&f, source_new(2, 0), 0);
     f.session.base.evaluation_control = f.operation;
@@ -5333,7 +5334,8 @@ test_composed_recursive_terminal_exchange(void)
     wl_plan_t *plan = NULL;
     CHECK(program && !wl_plan_from_program(program, &plan));
     const wl_plan_relation_t *path = composed_find_relation(plan, "path");
-    CHECK(path && path->op_count == 7
+    CHECK(path && wl_columnar_eval_plan_numeric_recursive_path_supported(path)
+        && path->op_count == 7
         && path->ops[5].op == WL_PLAN_OP_CONSOLIDATE
         && path->ops[6].op == WL_PLAN_OP_EXCHANGE);
 
@@ -5444,6 +5446,7 @@ test_composed_recursive_terminal_exchange(void)
     changed_exchange.num_workers = 1;
     changed_ops[6].opaque_data = &changed_exchange;
     changed.ops = changed_ops;
+    CHECK(!wl_columnar_eval_plan_numeric_recursive_path_supported(&changed));
     relations[0] = edge; relations[1] = seed;
     composed_fixture(&f, source_new(2, 0), 0);
     f.session.base.evaluation_control = f.operation;
@@ -5479,6 +5482,156 @@ test_composed_recursive_terminal_exchange(void)
     col_rel_destroy(edge); col_rel_destroy(seed);
     wl_plan_free(plan);
     wirelog_program_free(program);
+}
+
+/* Every positive is compiler-owned and authenticated through real bindings.
+ * Negative descriptors below borrow immutable compiler payloads; every changed
+ * key/projection/recipe/exchange has separate backed storage. */
+static void
+test_recursive_kernel_two_join_and_metadata(void)
+{
+    const char *sources[] = {
+        ".decl edge(x:int64,y:int64)\n.decl path(x:int64,y:int64)\n"
+        "path(x,y) :- edge(x,y).\n"
+        "path(x,z) :- path(x,y), edge(y,z).\n",
+        ".decl edge(x:int64,y:int64)\n.decl path(x:int64,y:int64)\n"
+        "path(x,y) :- edge(x,y).\n"
+        "path(x,w) :- path(x,y), edge(y,z), edge(z,w).\n"
+    };
+    CHECK(!wl_columnar_eval_plan_numeric_recursive_path_supported(NULL));
+    wl_plan_relation_t absent = {0};
+    CHECK(!wl_columnar_eval_plan_numeric_recursive_path_supported(&absent));
+    /* NonNULL ops must still not be indexed for any rejected extent. */
+    wl_plan_op_t one_op = {0};
+    absent.ops = &one_op;
+    absent.op_count = 6;
+    CHECK(!wl_columnar_eval_plan_numeric_recursive_path_supported(&absent));
+    absent.op_count = 9;
+    CHECK(!wl_columnar_eval_plan_numeric_recursive_path_supported(&absent));
+    for (unsigned variant = 0; variant < 2; ++variant) {
+        wirelog_error_t error;
+        wirelog_program_t *program = wirelog_parse_string(sources[variant],
+                &error);
+        wl_plan_t *plan = NULL;
+        CHECK(program && !wl_plan_from_program(program, &plan));
+        const wl_plan_relation_t *path = composed_find_relation(plan, "path");
+        CHECK(path && path->op_count == 7 + variant &&
+            wl_columnar_eval_plan_numeric_recursive_path_supported(path));
+        /* composed_source expands each row base to base+c per lane. */
+        const double edges[] = {1, 2, 3};
+        const double first[] = {1};
+        col_rel_t *edge = composed_source("private-edge", 2, edges, 3, false);
+        col_rel_t *frontier = composed_source("private-path", 2, first, 1,
+                false);
+        const char *names[] = {"edge", "path"};
+        col_rel_t *relations[] = {edge, frontier};
+        if (variant) {
+            fixture_t f;
+            composed_fixture(&f, source_new(2, 0), 0);
+            f.session.base.evaluation_control = f.operation;
+            wl_columnar_eval_private_bindings_t bindings = {0};
+            CHECK(!wl_columnar_eval_private_bindings_begin(&bindings,
+                &f.session, path, f.operation, f.operation_id, names,
+                relations, 2));
+            CHECK(!wl_columnar_eval_plan_numeric_composed_attempt_begin_bound(
+                    &f.record, path, 0, path->op_count, f.frame, &f.session, 0,
+                    f.operation, f.operation_id, f.funding, f.funding_id,
+                    &bindings));
+            composed_until(&f, WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_READY, 7);
+            eval_stack_t *stack = wl_columnar_eval_stack_cleanup_stack(f.frame);
+            CHECK(stack->top == 1 && stack->items[0].owned);
+            col_rel_t *candidate = stack->items[0].rel;
+            bool owned = stack->items[0].owned;
+            composed_action(&f);
+            CHECK(f.record.cursor == 8 && f.record.completed == 8 &&
+                f.record.phase == WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_RELEASE
+                && stack->top == 1 && stack->items[0].rel == candidate &&
+                stack->items[0].owned == owned);
+            composed_run(&f);
+            CHECK(!f.record.semantic_result && f.record.completed == 8 &&
+                candidate->nrows == 4 && candidate->ncols == 2);
+            const int64_t expected[][2] = {{1, 2}, {1, 4}, {2, 3}, {3, 4}};
+            for (unsigned row = 0; row < 4; ++row)
+                CHECK(candidate->columns[0][row] == expected[row][0] &&
+                    candidate->columns[1][row] == expected[row][1]);
+            CHECK(!f.session.nrels && !f.session.rels);
+            composed_close(&f);
+        }
+        for (unsigned mutation = 0; mutation < 15; ++mutation) {
+            wl_plan_relation_t changed = *path;
+            wl_plan_op_t ops[8];
+            memcpy(ops, path->ops, (size_t)path->op_count * sizeof(*ops));
+            changed.ops = ops;
+            uint32_t projection[] = {0, 0};
+            const char *const left_keys[] = {"col0"};
+            const char *const right_keys[] = {"col1"};
+            uint8_t recipe[] = {WL_PLAN_EXPR_VAR, 4, 0, 'c', 'o', 'l', '9'};
+            wl_plan_expr_buffer_t exprs[2];
+            memcpy(exprs, path->ops[1].map_exprs, sizeof(exprs));
+            wl_plan_op_exchange_t exchange =
+                *(const wl_plan_op_exchange_t *)path->ops[path->op_count -
+                    1].opaque_data;
+            uint32_t exchange_keys[] = {0};
+            switch (mutation) {
+            case 0: changed.name = "path-with-a-longer-valid-name"; break;
+            case 1: changed.delta_name = "$d$path-with-a-longer-name"; break;
+            case 2: ops[0].relation_name = "edge-with-a-longer-name"; break;
+            case 3: ops[3].right_relation = "edge-with-a-longer-name"; break;
+            case 4: ops[3].left_keys = left_keys; break;
+            case 5: ops[3].right_keys = right_keys; break;
+            case 6: ops[3].key_count = 0; break;
+            case 7: ops[1].project_indices = projection; break;
+            case 8:
+                exprs[0].data = recipe;
+                ops[1].map_exprs = exprs;
+                break;
+            case 9: ops[3].materialized = true; break;
+            case 10: ops[2].delta_mode = WL_DELTA_FORCE_DELTA; break;
+            case 11:
+                exchange.key_col_idxs = exchange_keys;
+                ops[path->op_count - 1].opaque_data = &exchange;
+                break;
+            case 12:
+                exchange.edb_rel_name = "edge";
+                ops[path->op_count - 1].opaque_data = &exchange;
+                break;
+            case 13:
+                ops[variant ? 4 : 3].project_indices = projection;
+                break;
+            default:
+                if (variant) ops[4].left_keys = left_keys;
+                else {
+                    exchange.edb_key_col_count = 0;
+                    exchange.edb_key_col_idxs = NULL;
+                    ops[6].opaque_data = &exchange;
+                }
+                break;
+            }
+            CHECK(!wl_columnar_eval_plan_numeric_recursive_path_supported(
+                    &changed));
+            /* Native preflight may reject malformed operator fields before
+             * the terminal predicate; both existing stages preserve zero
+             * completed operators and an empty real stack. */
+            fixture_t f;
+            composed_fixture(&f, source_new(2, 0), 0);
+            f.session.base.evaluation_control = f.operation;
+            wl_columnar_eval_private_bindings_t bindings = {0};
+            CHECK(!wl_columnar_eval_private_bindings_begin(&bindings,
+                &f.session, &changed, f.operation, f.operation_id, names,
+                relations, 2));
+            CHECK(!wl_columnar_eval_plan_numeric_composed_attempt_begin_bound(
+                    &f.record, &changed, 0, changed.op_count, f.frame,
+                    &f.session, 0, f.operation, f.operation_id, f.funding,
+                    f.funding_id, &bindings));
+            composed_run(&f);
+            CHECK(f.record.semantic_result == ENOTSUP && !f.record.completed
+                && !wl_columnar_eval_stack_cleanup_stack(f.frame)->top);
+            composed_close(&f);
+            CHECK(wl_columnar_eval_plan_numeric_recursive_path_supported(path));
+        }
+        col_rel_destroy(edge); col_rel_destroy(frontier);
+        wl_plan_free(plan); wirelog_program_free(program);
+    }
 }
 
 static void
@@ -13647,6 +13800,7 @@ main(void)
     test_composed_private_input_binding();
     test_composed_lftj_private_shadow();
     test_composed_recursive_terminal_exchange();
+    test_recursive_kernel_two_join_and_metadata();
     test_composed_lftj_stopped_cleanup();
     test_composed_source_stopped_cleanup();
     test_composed_source_cleanup_abort_retry();

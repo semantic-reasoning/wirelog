@@ -2318,3 +2318,17 @@ public controlled driver (MR2), actual containing payments/cutoffs, strict
 warm-cache behavior and the policy/cap matrix remain mandatory separate work.
 No controlled materialized route is enabled or qualified by these tests, and
 integration requires a fresh source/layout/caller carry before adoption.
+
+The recursive terminal metadata classifier now shares one pure predicate between
+its raw plan observation and the real guarded composed path. The raw path no
+longer constructs dummy attempt/binding objects. Parsed seven- and eight-op
+fixtures check raw classification; real private bindings and bound execution
+check literal rows and terminal EXCHANGE cursor/completion while preserving the
+same stack relation and ownership. Backed metadata negatives retain native
+preflight rejection, and existing capture, cancellation, successor and exact
+original-budget oracles remain unchanged.
+
+This factoring adds no tariff or authority. Its source delta is not a payment
+certificate: real composed successful guards add three scalar source cells for
+the forwarding edge. Full O2 fixed/scanner, ordinary owner/public32, all11,
+cutoff, consumer and policy accounting remain open.

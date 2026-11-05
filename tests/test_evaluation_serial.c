@@ -2162,6 +2162,7 @@ test_recursive_reachability_plan_manifest(void)
         CHECK(relation->ops[i].op == lowered_ops[i]);
         check_recursive_manifest_op_defaults(&relation->ops[i]);
     }
+    CHECK(wl_columnar_eval_plan_numeric_recursive_path_supported(relation));
     const wl_plan_op_t *ops = relation->ops;
     CHECK(!strcmp(ops[0].relation_name, "edge")
         && !strcmp(ops[2].relation_name, "path")
@@ -2241,6 +2242,7 @@ test_recursive_two_join_plan_manifest(void)
         CHECK(relation->ops[i].op == expected_ops[i]);
         check_recursive_manifest_op_defaults(&relation->ops[i]);
     }
+    CHECK(wl_columnar_eval_plan_numeric_recursive_path_supported(relation));
     const wl_plan_op_t *ops = relation->ops;
     CHECK(!strcmp(ops[0].relation_name, "edge")
         && !strcmp(ops[2].relation_name, "path")
