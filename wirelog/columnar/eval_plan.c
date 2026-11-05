@@ -1366,9 +1366,11 @@ wl_columnar_eval_plan_numeric_composed_join_setup_handoff(
  * is metadata for the ordinary multi-worker planner; under the controlled,
  * single-session composed evaluator it has no redistribution work to do.
  * Keep this bridge narrower than generic EXCHANGE support. */
+/* These two local wrappers prove the immutable plan/extent before this
+ * shared metadata observation. It carries no execution authority. */
 static bool
-wl_columnar_eval_plan_composed_terminal_exchange_valid(
-    const wl_columnar_eval_plan_numeric_attempt_t *record)
+wl_columnar_eval_plan_recursive_terminal_metadata_valid(
+    const wl_plan_relation_t *plan, uint32_t end)
 {
     static const uint8_t map_col0[] = {
         WL_PLAN_EXPR_VAR, 4, 0, 'c', 'o', 'l', '0'
@@ -1376,19 +1378,13 @@ wl_columnar_eval_plan_composed_terminal_exchange_valid(
     static const uint8_t map_col1[] = {
         WL_PLAN_EXPR_VAR, 4, 0, 'c', 'o', 'l', '1'
     };
-    if (!record || !record->composed_mode || !record->private_bindings
-        || record->begin != 0 || !record->plan || !record->plan->ops
-        || (record->end != 7 && record->end != 8)
-        || record->plan->op_count != record->end)
-        return false;
-    const wl_plan_relation_t *plan = record->plan;
     const wl_plan_op_t *ops = plan->ops;
-    uint32_t join_count = record->end == 7 ? 1 : 2;
+    uint32_t join_count = end == 7 ? 1 : 2;
     uint32_t last_join = 2 + join_count;
     uint32_t concat = last_join + 1;
     uint32_t consolidate = concat + 1;
     uint32_t exchange_index = consolidate + 1;
-    for (uint32_t i = 0; i < record->end; ++i) {
+    for (uint32_t i = 0; i < end; ++i) {
         const wl_plan_op_t *op = &ops[i];
         bool join = i >= 3 && i <= last_join;
         bool projected = i == 1 || (join
@@ -1473,19 +1469,27 @@ wl_columnar_eval_plan_composed_terminal_exchange_valid(
     return valid;
 }
 
+static bool
+wl_columnar_eval_plan_composed_terminal_exchange_valid(
+    const wl_columnar_eval_plan_numeric_attempt_t *record)
+{
+    if (!record || !record->composed_mode || !record->private_bindings
+        || record->begin != 0 || !record->plan || !record->plan->ops
+        || (record->end != 7 && record->end != 8)
+        || record->plan->op_count != record->end)
+        return false;
+    return wl_columnar_eval_plan_recursive_terminal_metadata_valid(
+        record->plan, record->end);
+}
+
 bool
 wl_columnar_eval_plan_numeric_recursive_path_supported(
     const wl_plan_relation_t *plan)
 {
     if (!plan || !plan->ops) return false;
-    wl_columnar_eval_plan_numeric_attempt_t shape = {0};
-    wl_columnar_eval_private_bindings_t bindings = {0};
-    shape.composed_mode = true;
-    shape.private_bindings = &bindings;
-    shape.begin = 0;
-    shape.plan = plan;
-    shape.end = plan->op_count;
-    return wl_columnar_eval_plan_composed_terminal_exchange_valid(&shape);
+    uint32_t end = plan->op_count;
+    if (end != 7 && end != 8) return false;
+    return wl_columnar_eval_plan_recursive_terminal_metadata_valid(plan, end);
 }
 
 void
