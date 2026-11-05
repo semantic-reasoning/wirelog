@@ -415,6 +415,7 @@ col_mat_cache_lookup_pin_keyed(col_mat_cache_t *cache, const col_rel_t *left,
                 pin->cache = cache;
                 pin->identity = entry->identity;
                 pin->active = true;
+                pin->self = pin;
             }
             return entry->result;
         }
@@ -426,7 +427,7 @@ col_mat_cache_lookup_pin_keyed(col_mat_cache_t *cache, const col_rel_t *left,
 void
 col_mat_cache_pin_release(col_mat_cache_pin_t *pin)
 {
-    if (!pin || !pin->active || !pin->cache)
+    if (!pin || pin->self != pin || !pin->active || !pin->cache)
         return;
     col_mat_cache_t *cache = pin->cache;
     uint32_t index = UINT32_MAX;
@@ -451,6 +452,32 @@ col_mat_cache_pin_release(col_mat_cache_pin_t *pin)
     pin->cache = NULL;
     pin->identity = 0;
     pin->active = false;
+    pin->self = NULL;
+}
+
+int
+wl_columnar_cache_pin_move(col_mat_cache_pin_t *destination,
+    col_mat_cache_pin_t *source)
+{
+    if (!destination || !source
+        || !wl_columnar_eval_stack_copy_ranges_disjoint(destination,
+        sizeof(*destination), source, sizeof(*source)))
+        return EINVAL;
+    if (destination->cache || destination->identity || destination->active
+        || destination->self)
+        return EBUSY;
+    if (source->self != source || !source->active || !source->cache
+        || !source->identity)
+        return EINVAL;
+    destination->cache = source->cache;
+    destination->identity = source->identity;
+    destination->active = true;
+    destination->self = destination;
+    source->cache = NULL;
+    source->identity = 0;
+    source->active = false;
+    source->self = NULL;
+    return 0;
 }
 
 int
@@ -543,6 +570,7 @@ col_mat_cache_insert_pin_keyed(col_mat_cache_t *cache, const col_rel_t *left,
         pin->cache = cache;
         pin->identity = e->identity;
         pin->active = true;
+        pin->self = pin;
     }
     return 0;
 }

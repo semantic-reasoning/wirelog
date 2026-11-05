@@ -1963,12 +1963,15 @@ typedef struct {
     col_relation_snapshot_t right_snapshot;
 } col_mat_entry_t;
 
-typedef struct {
-    /* The cache object must outlive this handle.  Production pins are
-     * synchronous; callers release them before session/worker teardown. */
+typedef struct wl_columnar_cache_pin {
+    /* The cache object must outlive this handle. Production pins are
+     * synchronous; callers release them before session/worker teardown.
+     * An issued active pin stays at its final address until release or an
+     * explicit move. Bitwise copies do not acquire resource authority. */
     struct col_mat_cache *cache;
     uint64_t identity;
     bool active;
+    struct wl_columnar_cache_pin *self;
 } col_mat_cache_pin_t;
 
 typedef struct col_mat_cache {
@@ -5365,6 +5368,14 @@ col_mat_cache_lookup_pin(col_mat_cache_t *cache, const col_rel_t *left,
     const col_rel_t *right, col_mat_cache_pin_t *pin);
 void
 col_mat_cache_pin_release(col_mat_cache_pin_t *pin);
+/* Source and destination are valid, separately backed writable objects.
+ * Initialize destination to all-zero at its final address before moving.
+ * Failure changes neither object; success transfers the one actual pin
+ * without callbacks or cache access and leaves source inert. Issuer output
+ * storage must likewise be nonaliasing and must not overwrite a live pin. */
+int
+wl_columnar_cache_pin_move(col_mat_cache_pin_t *destination,
+    col_mat_cache_pin_t *source);
 /* Keyed entry points (Issue #2127).  Two joins over the same left and right
  * inputs can produce different results when their kind, path, keys or right
  * filter differ, so a lookup hits only an entry inserted with the same

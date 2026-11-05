@@ -2276,3 +2276,45 @@ its count with this historical value.
 This is the exact accepted cooperative target-owner boundary, not a finite
 terminal-CAS/time guarantee or broad helper waiver. Complete ordinary/O0/O2,
 retirement-parent, policy and whole Ready obligations remain separate.
+
+### Raw cache pin native identity (P2-H)
+
+An explicitly issued materialization-cache pin owns debt only at its final
+address. Successful insert/lookup publishes `self = pin`; copying the structure
+creates no release authority. Raw release rejects a copy before touching its
+cache, and genuine release clears all four fields. Invalid lookup arguments
+still precede output normalization; a valid miss and non-NULL insertion output
+normalize the entire new pin layout before publication. The stale-pin test
+helper is only a nonnative output sentinel and is never released as authority.
+Cache storage must outlive genuine pins, with existing serialized,
+non-reentrant raw access requirements.
+
+`wl_columnar_cache_pin_move` checks NULL and full-range disjointness before
+reading either object's fields, requires an initialized inert destination and a
+native active source, then transfers authority to the destination address and
+clears the source. Failures leave both objects unchanged. It performs no cache
+lookup, callback, allocation, control admission or pin-count change. The
+independent emitted G1/G2 core audit bounds its complete successful callee at31
+source cells; the specifically modeled pointer/field/index callers yield37,
+39 or41 including their caller fronts. These are finite source bounds for
+those expressions, not a new fee or a qualification of arbitrary future
+callers. Raw release may run existing destruction and is not newly bounded.
+
+The lifetime regression uses the same existing insert/lookup/copy/clear/release
+APIs on the old layout and this layout. The old layout fails the deferred-debt
+assertion before any potentially freed result read; the new layout preserves
+that debt until genuine release. Tests cover both real issuers, normalization,
+NULL/same/partial-overlap rejection, exact adjacency, copied/inert sources,
+live-destination EBUSY and unchanged failed bytes. Actual moved pins survive
+clear before/after transfer and first/middle/last compaction. A real governed
+result and attached ledger/reclaimer preserve unrelated governor and17-byte
+ledger peers, then refund only their own result on last release. Existing
+64-pin admission, generation, reclaimer and ordinary/differential JOIN tests
+exercise the appended handle layout in current consumers.
+
+This is the raw native-handle prerequisite only. Registered receiver/root
+cleanup (P2-R), deferred last-pin retirement, bounded insertion (MR3-I), the
+public controlled driver (MR2), actual containing payments/cutoffs, strict
+warm-cache behavior and the policy/cap matrix remain mandatory separate work.
+No controlled materialized route is enabled or qualified by these tests, and
+integration requires a fresh source/layout/caller carry before adoption.

@@ -51,7 +51,306 @@ make_stale_pin(col_mat_cache_t *cache)
 static bool
 pin_is_inactive(const col_mat_cache_pin_t *pin)
 {
-    return pin->cache == NULL && pin->identity == 0 && !pin->active;
+    return pin->cache == NULL && pin->identity == 0 && !pin->active
+           && pin->self == NULL;
+}
+
+/* Existing-API regression shared byte-for-byte with the old-layout witness.
+ * Inspect debt before touching result: the old bug already freed it. */
+static void
+test_copied_pin_cannot_release_native_debt(void)
+{
+    tests_run++;
+    col_mat_cache_t cache = { 0 };
+    col_rel_t *left = make_relation(101);
+    col_rel_t *right = make_relation(102);
+    col_rel_t *result = make_relation(103);
+    ASSERT_TRUE(left && right && result, "copy witness relations allocated");
+    ASSERT_TRUE(col_mat_cache_insert(&cache, left, right, result) == 0,
+        "copy witness inserts a real cache result");
+    col_mat_cache_pin_t pin = { 0 };
+    ASSERT_TRUE(col_mat_cache_lookup_pin(&cache, left, right, &pin) == result,
+        "copy witness obtains a real issued pin");
+    col_mat_cache_pin_t copy = pin;
+    col_mat_cache_clear(&cache);
+    size_t debt = cache.total_bytes;
+    ASSERT_TRUE(debt > 0 && cache.count == 1 && cache.active_pins == 1
+        && cache.entries[0].pin_count == 1
+        && cache.entries[0].eviction_deferred,
+        "clear retains original native debt");
+    col_mat_cache_pin_release(&copy);
+    ASSERT_TRUE(cache.count == 1 && cache.active_pins == 1
+        && cache.total_bytes == debt && cache.entries[0].pin_count == 1,
+        "copied pin release preserves original deferred debt");
+    ASSERT_TRUE(col_rel_get(result, 0, 0) == 103,
+        "original issued pin still protects literal result");
+    col_mat_cache_pin_release(&copy);
+    col_mat_cache_pin_release(&pin);
+    ASSERT_TRUE(cache.count == 0 && cache.active_pins == 0
+        && cache.total_bytes == 0,
+        "original release retires debt exactly once");
+    col_mat_cache_pin_release(&pin);
+    col_mat_cache_pin_release(&copy);
+    col_rel_destroy(left);
+    col_rel_destroy(right);
+}
+
+/* No snapshot below is ever restored into a live resource handle. */
+static void
+test_pin_move_checks_and_adjacent_storage(void)
+{
+    tests_run++;
+    col_mat_cache_t cache = { 0 };
+    col_rel_t *left = make_relation(201), *right = make_relation(202);
+    col_rel_t *result = make_relation(203);
+    col_mat_cache_pin_t pair[2] = { 0 };
+    ASSERT_TRUE(left && right && result, "move fixture allocated");
+    ASSERT_TRUE(col_mat_cache_insert_pin(&cache, left, right, result,
+        &pair[0]) == 0, "insert issues real native pin");
+    ASSERT_TRUE(pair[0].self == &pair[0], "issuer binds final pin address");
+    col_mat_cache_pin_t copy = pair[0], inert = { 0 };
+    unsigned char before[sizeof(pair)], copy_before[sizeof(copy)];
+    memcpy(before, pair, sizeof(pair));
+    memcpy(copy_before, &copy, sizeof(copy));
+    ASSERT_TRUE(wl_columnar_cache_pin_move(NULL, &pair[0]) == EINVAL
+        && wl_columnar_cache_pin_move(&pair[1], NULL) == EINVAL
+        && wl_columnar_cache_pin_move(&pair[0], &pair[0]) == EINVAL,
+        "NULL and same-address moves reject");
+    ASSERT_TRUE(memcmp(before, pair, sizeof(pair)) == 0,
+        "NULL and same-address failures preserve all bytes");
+    ASSERT_TRUE(wl_columnar_cache_pin_move(&pair[1], &copy) == EINVAL
+        && wl_columnar_cache_pin_move(&pair[1], &inert) == EINVAL,
+        "copied and inert sources have no move authority");
+    ASSERT_TRUE(memcmp(before, pair, sizeof(pair)) == 0
+        && memcmp(copy_before, &copy, sizeof(copy)) == 0
+        && pin_is_inactive(&inert),
+        "invalid-source failures write neither pin");
+    col_mat_cache_pin_release(&copy);
+    ASSERT_TRUE(memcmp(copy_before, &copy, sizeof(copy)) == 0
+        && cache.active_pins == 1 && cache.entries[0].pin_count == 1,
+        "active original copy release is a byte-preserving no-op");
+
+    col_mat_cache_pin_t live = { 0 };
+    ASSERT_TRUE(col_mat_cache_lookup_pin(&cache, left, right, &live) == result,
+        "second genuine pin is a live move destination");
+    unsigned char live_before[sizeof(live)];
+    memcpy(live_before, &live, sizeof(live));
+    ASSERT_TRUE(wl_columnar_cache_pin_move(&live, &pair[0]) == EBUSY,
+        "live destination refuses without losing either resource");
+    ASSERT_TRUE(memcmp(live_before, &live, sizeof(live)) == 0
+        && memcmp(before, pair, sizeof(pair)) == 0
+        && cache.active_pins == 2 && cache.entries[0].pin_count == 2,
+        "EBUSY preserves exact bytes and both native debts");
+    col_mat_cache_pin_release(&live);
+
+    /* Backed aligned regions are never interpreted as pins: the full range
+     * check must refuse both directions before reading resource fields. */
+    union {
+        col_mat_cache_pin_t alignment;
+        unsigned char bytes[2 * sizeof(col_mat_cache_pin_t)];
+    } overlap;
+    memset(overlap.bytes, 0xa5, sizeof(overlap.bytes));
+    unsigned char overlap_before[sizeof(overlap.bytes)];
+    memcpy(overlap_before, overlap.bytes, sizeof(overlap.bytes));
+    col_mat_cache_pin_t *a = (col_mat_cache_pin_t *)overlap.bytes;
+    col_mat_cache_pin_t *b = (col_mat_cache_pin_t *)(overlap.bytes
+        + _Alignof(col_mat_cache_pin_t));
+    ASSERT_TRUE(wl_columnar_cache_pin_move(a, b) == EINVAL
+        && wl_columnar_cache_pin_move(b, a) == EINVAL,
+        "both partial-overlap directions reject before any field access");
+    ASSERT_TRUE(memcmp(overlap_before, overlap.bytes, sizeof(overlap.bytes))
+        == 0, "overlap failures preserve every backed byte");
+
+    size_t debt = cache.total_bytes;
+    ASSERT_TRUE(wl_columnar_cache_pin_move(&pair[1], &pair[0]) == 0,
+        "exactly adjacent objects permit real authority move");
+    ASSERT_TRUE(pin_is_inactive(&pair[0]) && pair[1].self == &pair[1]
+        && pair[1].active && pair[1].cache == &cache
+        && cache.total_bytes == debt && cache.active_pins == 1
+        && cache.entries[0].pin_count == 1,
+        "move changes addresses without changing one native debt");
+    ASSERT_TRUE(wl_columnar_cache_pin_move(&pair[0], &pair[1]) == 0
+        && pin_is_inactive(&pair[1]) && pair[0].self == &pair[0]
+        && wl_columnar_cache_pin_move(&pair[1], &pair[0]) == 0,
+        "both exactly adjacent address orders transfer native authority");
+    col_mat_cache_pin_t moved_copy = pair[1];
+    col_mat_cache_clear(&cache);
+    col_mat_cache_pin_release(&moved_copy);
+    col_mat_cache_pin_release(&copy);
+    col_mat_cache_pin_release(&pair[0]);
+    ASSERT_TRUE(cache.count == 1 && cache.active_pins == 1,
+        "old source and pre-move copy cannot release moved authority");
+    ASSERT_TRUE(col_rel_get(result, 0, 0) == 203,
+        "moved pin protects literal raw result after clear");
+    col_mat_cache_pin_release(&pair[1]);
+    ASSERT_TRUE(pin_is_inactive(&pair[1]) && cache.count == 0
+        && cache.active_pins == 0 && cache.total_bytes == 0,
+        "moved original releases once and clears all four fields");
+    col_mat_cache_pin_release(&pair[1]);
+    col_mat_cache_pin_release(&copy);
+    col_rel_destroy(left);
+    col_rel_destroy(right);
+}
+
+static void
+test_pin_move_clear_and_compaction(void)
+{
+    tests_run++;
+    /* Each identity is first to retire once; surviving identities shift after
+     * first/middle removal. Exercise clear on both sides of every move. */
+    for (unsigned clear_first = 0; clear_first < 2; clear_first++) {
+        for (unsigned first = 0; first < 3; first++) {
+            col_mat_cache_t cache = { 0 };
+            col_rel_t *left[3], *right[3], *result[3];
+            col_mat_cache_pin_t issued[3] = { 0 }, moved[3] = { 0 };
+            for (unsigned i = 0; i < 3; i++) {
+                left[i] = make_relation(300 + i);
+                right[i] = make_relation(310 + i);
+                result[i] = make_relation(320 + i);
+                ASSERT_TRUE(left[i] && right[i] && result[i],
+                    "compaction relations allocated");
+                ASSERT_TRUE(col_mat_cache_insert_pin(&cache, left[i],
+                    right[i], result[i], &issued[i]) == 0,
+                    "three actual issued identities");
+            }
+            size_t debt = cache.total_bytes;
+            if (clear_first)
+                col_mat_cache_clear(&cache);
+            for (unsigned i = 0; i < 3; i++)
+                ASSERT_TRUE(wl_columnar_cache_pin_move(&moved[i],
+                    &issued[i]) == 0 && pin_is_inactive(&issued[i]),
+                    "each pin moves to its final array address");
+            if (!clear_first)
+                col_mat_cache_clear(&cache);
+            ASSERT_TRUE(cache.count == 3 && cache.active_pins == 3
+                && cache.total_bytes == debt, "clear and moves preserve debt");
+            for (unsigned step = 0; step < 3; step++) {
+                unsigned i = (first + step) % 3;
+                ASSERT_TRUE(col_rel_get(result[i], 0, 0) == 320 + i,
+                    "stable moved identity protects row after compaction");
+                col_mat_cache_pin_release(&issued[i]);
+                col_mat_cache_pin_release(&moved[i]);
+                ASSERT_TRUE(cache.count == 2 - step
+                    && cache.active_pins == 2 - step
+                    && pin_is_inactive(&moved[i]),
+                    "first middle last release removes exactly one debt");
+            }
+            ASSERT_TRUE(cache.total_bytes == 0, "compaction refunds all bytes");
+            for (unsigned i = 0; i < 3; i++) {
+                col_rel_destroy(left[i]);
+                col_rel_destroy(right[i]);
+            }
+        }
+    }
+}
+
+static void
+test_pin_move_preserves_governor_and_ledger_peer(void)
+{
+    tests_run++;
+    wl_columnar_memory_resolution_t resolution = {
+        .budget_bytes = WL_COLUMNAR_MEMORY_MIN_BUDGET,
+        .usable_bytes = WL_COLUMNAR_MEMORY_MIN_BUDGET,
+        .mode = WL_COLUMNAR_MEMORY_MODE_ENFORCING,
+    };
+    wl_columnar_memory_governor_ref_t *g =
+        wl_columnar_memory_governor_ref_create(&resolution);
+    ASSERT_TRUE(g, "governor allocated");
+    wl_columnar_memory_governor_t *governor =
+        wl_columnar_memory_governor_ref_get(g);
+    col_rel_t *peer = NULL, *result = NULL;
+    ASSERT_TRUE(wl_columnar_relation_new_auto_governed("pin-peer", 1, 1,
+        false, g, &peer) == 0, "real governed peer allocated");
+    uint64_t peer_bytes = atomic_load_explicit(&governor->reserved_bytes,
+            memory_order_acquire);
+    ASSERT_TRUE(peer_bytes > 0, "peer has real committed credit");
+    ASSERT_TRUE(wl_columnar_relation_new_auto_governed("pin-result", 1, 1,
+        false, g, &result) == 0, "real governed result allocated");
+    int64_t value = 403;
+    ASSERT_TRUE(col_rel_append_row(result, &value) == 0,
+        "governed literal result populated");
+    wl_mem_ledger_t ledger;
+    wl_mem_ledger_init(&ledger, 0);
+    wl_mem_ledger_alloc(&ledger, WL_MEM_SUBSYS_CACHE, 17);
+    col_mat_cache_t cache = { 0 };
+    cache.ledger = &ledger;
+    ASSERT_TRUE(col_mat_cache_attach_reclaimer(&cache) == 0,
+        "real ledger reclaimer attached");
+    col_rel_t *left = make_relation(401), *right = make_relation(402);
+    col_mat_cache_pin_t source = { 0 }, destination = { 0 };
+    ASSERT_TRUE(left && right && col_mat_cache_insert_pin(&cache, left,
+        right, result, &source) == 0, "governed result genuinely inserted");
+    uint64_t reserved = atomic_load_explicit(&governor->reserved_bytes,
+            memory_order_acquire);
+    uint64_t accounted = atomic_load_explicit(&ledger.current_bytes,
+            memory_order_acquire);
+    ASSERT_TRUE(reserved > peer_bytes
+        && accounted == col_rel_transport_bytes(result) + 17,
+        "real result and unrelated peer separately accounted");
+    col_mat_cache_clear(&cache);
+    ASSERT_TRUE(wl_columnar_cache_pin_move(&destination, &source) == 0,
+        "deferred governed pin moves");
+    wl_mem_reclaim_result_t reclaim = wl_mem_ledger_reclaim(&ledger);
+    ASSERT_TRUE(reclaim.bytes_released == 0 && reclaim.candidates == 0
+        && atomic_load_explicit(&governor->reserved_bytes,
+        memory_order_acquire) == reserved
+        && atomic_load_explicit(&ledger.current_bytes,
+        memory_order_acquire) == accounted,
+        "move and reclaimer preserve pinned credit and ledger debt");
+    ASSERT_TRUE(col_rel_get(result, 0, 0) == 403,
+        "governed result remains readable under moved pin");
+    col_mat_cache_pin_release(&destination);
+    col_mat_cache_pin_release(&source);
+    ASSERT_TRUE(cache.count == 0 && cache.active_pins == 0
+        && atomic_load_explicit(&governor->reserved_bytes,
+        memory_order_acquire) == peer_bytes
+        && atomic_load_explicit(&ledger.current_bytes,
+        memory_order_acquire) == 17,
+        "actual last release refunds result only and preserves both peers");
+    col_mat_cache_detach_reclaimer(&cache);
+    wl_mem_ledger_free(&ledger, WL_MEM_SUBSYS_CACHE, 17);
+    col_rel_destroy(peer);
+    ASSERT_TRUE(atomic_load_explicit(&governor->reserved_bytes,
+        memory_order_acquire) == 0,
+        "peer destruction returns governor baseline");
+    wl_columnar_memory_governor_ref_release(g);
+    col_rel_destroy(left);
+    col_rel_destroy(right);
+}
+
+static void
+test_pin_output_normalization_order(void)
+{
+    tests_run++;
+    col_mat_cache_t cache = { 0 };
+    col_rel_t *left = make_relation(501), *right = make_relation(502);
+    col_rel_t *result = make_relation(503);
+    ASSERT_TRUE(left && right && result, "normalization fixture allocated");
+    /* A nonnative sentinel only tests output normalization. Never release it. */
+    col_mat_cache_pin_t pin = make_stale_pin(&cache);
+    unsigned char before[sizeof(pin)];
+    memcpy(before, &pin, sizeof(pin));
+    ASSERT_TRUE(col_mat_cache_lookup_pin(NULL, left, right, &pin) == NULL
+        && memcmp(before, &pin, sizeof(pin)) == 0,
+        "invalid lookup preserves prior output bytes before normalization");
+    ASSERT_TRUE(col_mat_cache_lookup_pin(&cache, left, right, &pin) == NULL
+        && pin_is_inactive(&pin), "valid lookup miss clears all four fields");
+    /* Fresh output bytes need no incoming active/self initialization. */
+    memset(&pin, 0xa5, sizeof(pin));
+    ASSERT_TRUE(col_mat_cache_insert_pin(&cache, left, right, result, &pin)
+        == 0 && pin.active && pin.self == &pin && pin.cache == &cache,
+        "insert normalizes fresh output before publishing native identity");
+    col_mat_cache_pin_release(&pin);
+    memset(&pin, 0xa5, sizeof(pin));
+    ASSERT_TRUE(col_mat_cache_lookup_pin(&cache, left, right, &pin) == result
+        && pin.active && pin.self == &pin && cache.active_pins == 1,
+        "lookup normalizes fresh output before publishing native identity");
+    col_mat_cache_clear(&cache);
+    col_mat_cache_pin_release(&pin);
+    ASSERT_TRUE(pin_is_inactive(&pin) && cache.count == 0,
+        "normalized issued output releases through native path");
+    col_rel_destroy(left);
+    col_rel_destroy(right);
 }
 
 static void
@@ -572,6 +871,11 @@ test_keyed_entries_match_only_their_signature(void)
 int
 main(void)
 {
+    test_copied_pin_cannot_release_native_debt();
+    test_pin_move_checks_and_adjacent_storage();
+    test_pin_move_clear_and_compaction();
+    test_pin_move_preserves_governor_and_ledger_peer();
+    test_pin_output_normalization_order();
     test_rejects_nonexclusive_results();
     test_insert_pin_failure_zeros_stale_pin();
     test_lookup_clear_and_release();
