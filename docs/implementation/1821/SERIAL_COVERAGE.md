@@ -2047,3 +2047,30 @@ schema as raw and accepts the same literal row. Existing allocation/commit
 failure sweeps remain active. This qualifies INIT/common fixed completion only;
 ALLOC112, RESERVE160, their item/token shares, installation, complete constructor
 callers and the remaining consumer/policy paths still require their own audits.
+
+### Constructor reservation completion
+
+The shared reservation helper expands its two governed attempt tails locally,
+preserving the same saved-ID checks, hook positions, work160/zero values and
+error precedence. Its current source bound falls from94 to84. The same
+successful160 admission owns76 additional slots for that token's later lexical
+refund, including the supported memory/resize instrumentation:84+76=160.
+No token credit transfers to the installed relation destructor.
+
+The descriptor SMALL96 header owns31 current slots and one outgoing refused
+admission: either initial RESERVE160 (24 slots), or, after its success, first
+descriptor ALLOC112 (11 slots). Its correlated bound is31+max(24,11)=55;
+the bridge expires on that allocation's successful admission or builder exit.
+The later SMALL96 header owns53 current slots,6 fixed loop-control slots and
+one outgoing refusal bounded by26:85 total. Neither bridge pays another
+token's cleanup or arbitrary subsequent work. The unchanged ALLOC112 action
+has76 current plus8 same-item retirement slots; INIT remains191/192.
+
+Real constructor tests interrupt all three reservations immediately before
+and after governor admission, using cancellation, accounting overflow and
+finish/reset/new-attempt turnover. They verify the actual RESERVED token,
+one context retirement, a live17-byte peer, zero successor work and successful
+reset/retry. First RESERVE/descriptor allocation one-short boundaries preserve
+the allocation-failure canary; exact allocation admission reaches its real
+failure. Full nested governor windows, COMMIT/INSTALL, installed cleanup,
+multi-token and outer caller windows remain separate required qualifications.

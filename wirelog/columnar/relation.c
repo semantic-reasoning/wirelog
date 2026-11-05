@@ -15101,8 +15101,15 @@ wl_columnar_relation_constructor_attempt_reserve(
         return wl_columnar_relation_constructor_attempt_tail(control,
                    attempt_id,
                    WL_COLUMNAR_RELATION_CONSTRUCTOR_ATTEMPT_RESERVE_CALLER_WORK);
-    rc = wl_columnar_relation_constructor_attempt_tail(control, attempt_id,
+    uint64_t active = wl_evaluation_control_active_attempt_id(control);
+    if (!active || active != attempt_id)
+        return EINVAL;
+#ifdef WL_SESSION_TEST_HOOKS
+    if (wl_columnar_relation_test_work_checkpoint)
+        wl_columnar_relation_test_work_checkpoint(control,
             WL_COLUMNAR_RELATION_CONSTRUCTOR_ATTEMPT_RESERVE_CALLER_WORK);
+#endif
+    rc = wl_evaluation_control_charge_attempt(control, attempt_id, 0);
     if (rc)
         return rc;
     wl_columnar_memory_admission_status_t status;
@@ -15119,8 +15126,14 @@ wl_columnar_relation_constructor_attempt_reserve(
         rc = status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED ? ENOSPC
             : status == WL_COLUMNAR_MEMORY_ADMISSION_OVERFLOW ? EOVERFLOW
             : EINVAL;
-    int tail = wl_columnar_relation_constructor_attempt_tail(control,
-            attempt_id, 0);
+    active = wl_evaluation_control_active_attempt_id(control);
+    if (!active || active != attempt_id)
+        return EINVAL;
+#ifdef WL_SESSION_TEST_HOOKS
+    if (wl_columnar_relation_test_work_checkpoint)
+        wl_columnar_relation_test_work_checkpoint(control, 0);
+#endif
+    int tail = wl_evaluation_control_charge_attempt(control, attempt_id, 0);
     return tail > 0 || !rc ? tail : rc;
 }
 

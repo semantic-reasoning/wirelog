@@ -2990,6 +2990,141 @@ operator_init_boundaries(void)
     }
 }
 
+static unsigned reserve_target, reserve_side, reserve_mode;
+static unsigned reserve_pre_tails, reserve_tokens;
+static bool reserve_hit;
+static wl_columnar_memory_reservation_t *reserve_observed;
+
+static void
+operator_reserve_observe(wl_evaluation_control_t *ctl,
+    wl_columnar_memory_reservation_t *token, unsigned phase)
+{
+    (void)ctl;
+    if (phase != WL_COLUMNAR_MEMORY_GOVERNOR_RESERVED) return;
+    ++reserve_tokens;
+    if (reserve_side && reserve_tokens == reserve_target + 1)
+        reserve_observed = token;
+}
+
+static void
+operator_reserve_checkpoint(wl_evaluation_control_t *ctl, uint64_t work)
+{
+    if (attempt_restarted) {
+        ++attempt_successor_callbacks;
+        return;
+    }
+    checkpoint(ctl, work);
+    if (work == 160) ++reserve_pre_tails;
+    bool stop = !reserve_hit && (reserve_side
+        ? work == 0 && reserve_observed != NULL
+        : work == 160 && reserve_pre_tails == reserve_target + 1);
+    if (!stop) return;
+    if (reserve_side) {
+        CHECK(reserve_observed->identity == reserve_observed &&
+            reserve_observed->bytes != 0 &&
+            atomic_load_explicit(&reserve_observed->state,
+            memory_order_acquire) == WL_COLUMNAR_MEMORY_RESERVATION_RESERVED);
+    }
+    reserve_observed = NULL;
+    reserve_hit = true;
+    CHECK(!wl_columnar_memory_governor_ref_is_sole(watched));
+    if (reserve_mode == 0) wl_evaluation_control_request_cancel(ctl);
+    else if (reserve_mode == 1)
+        CHECK(wl_evaluation_control_charge(ctl, UINT64_MAX) == EOVERFLOW);
+    else attempt_restart(ctl);
+}
+
+static void
+operator_reserve_boundaries(void)
+{
+    watched = governor();
+    wl_columnar_memory_reservation_t held_peer;
+    wl_columnar_memory_reservation_init(&held_peer);
+    CHECK(wl_columnar_memory_reserve(
+            wl_columnar_memory_governor_ref_get(watched), 17, &held_peer));
+    CHECK(wl_columnar_memory_commit(&held_peer, &held_peer));
+    const wirelog_column_type_t type = WIRELOG_TYPE_INT64;
+    for (reserve_side = 0; reserve_side < 2; ++reserve_side)
+        for (reserve_target = 0; reserve_target < 3; ++reserve_target)
+            for (reserve_mode = 0; reserve_mode < 3; ++reserve_mode) {
+                wl_evaluation_control_t *ctl = control(0);
+                const uint64_t id =
+                    wl_evaluation_control_active_attempt_id(ctl);
+                reserve_pre_tails = reserve_tokens = 0;
+                reserve_hit = false; reserve_observed = NULL;
+                attempt_restarted = false; attempt_successor_callbacks = 0;
+                wl_columnar_memory_governor_test_checkpoint =
+                    operator_reserve_observe;
+                wl_columnar_relation_test_work_checkpoint =
+                    operator_reserve_checkpoint;
+                col_rel_t *out = NULL;
+                int rc =
+                    wl_columnar_relation_new_typed_operator_attempt_controlled(
+                    "$reserve", 1, &type, watched, &out, ctl, id);
+                wl_columnar_relation_test_work_checkpoint = checkpoint;
+                wl_columnar_memory_governor_test_checkpoint = NULL;
+                CHECK(rc == (reserve_mode == 0 ?
+                    WL_EVALUATION_CONTROL_CANCELLED : reserve_mode == 1 ?
+                    EOVERFLOW : EINVAL));
+                CHECK(reserve_hit && !reserve_observed && !out &&
+                    reserve_pre_tails == reserve_target + 1 &&
+                    reserve_tokens == reserve_target + reserve_side &&
+                    retired == 1 && retired_credit >= 17 && reserved() == 17);
+                if (reserve_tokens) CHECK(retired_credit > 17);
+                CHECK(wl_columnar_memory_governor_ref_is_sole(watched) &&
+                    !attempt_successor_callbacks);
+                if (attempt_restarted) {
+                    CHECK(attempt_old_report.attempt_id == id &&
+                        attempt_old_report.consumed == seen);
+                    CHECK(!wl_evaluation_control_finish(ctl, &owner, 0, 0));
+                    wl_evaluation_control_report_t successor;
+                    CHECK(!wl_evaluation_control_report(ctl, &successor) &&
+                        successor.consumed == 0);
+                } else CHECK(finish(ctl, rc) == seen);
+                attempt_restarted = false;
+                operator_init_retry(ctl, 1, 17);
+                release(ctl);
+            }
+
+    /* The untyped/nullary pre-allocation schedule is identical for the
+     * legacy and operator builders; their byte-copy granularity differs
+     * only after this first allocation admission. */
+    auto_literal_t literal;
+    auto_literal("$frontier", 0, true, &literal);
+    uint64_t before_reserve = 0, previous = 0;
+    for (size_t i = 0; i < literal.count; ++i) {
+        if (literal.prefix[i] - previous == 160) {
+            before_reserve = previous;
+            break;
+        }
+        previous = literal.prefix[i];
+    }
+    CHECK(before_reserve && literal.allocation_count);
+    const uint64_t first_allocation = literal.allocations[0];
+    const uint64_t limits[] = {before_reserve + 159, first_allocation - 1,
+                               first_allocation};
+    for (unsigned i = 0; i < 3; ++i) {
+        wl_evaluation_control_t *ctl = control(limits[i]);
+        col_rel_t *out = NULL;
+        wl_columnar_relation_test_constructor_fail_allocation = 1;
+        int rc = wl_columnar_relation_new_auto_operator_attempt_controlled(
+            "$frontier", 0, COL_REL_INIT_CAP, watched, &out, ctl,
+            wl_evaluation_control_active_attempt_id(ctl));
+        CHECK(rc == (i == 2 ? ENOMEM : WL_EVALUATION_CONTROL_WORK_LIMIT));
+        CHECK(!out && retired == 1 && reserved() == 17 &&
+            wl_columnar_memory_governor_ref_is_sole(watched));
+        CHECK(wl_columnar_relation_test_constructor_fail_allocation ==
+            (i == 2 ? 0u : 1u));
+        wl_columnar_relation_test_constructor_fail_allocation = 0;
+        CHECK(finish(ctl, rc) == (i == 0 ? before_reserve :
+            i == 1 ? first_allocation - 112 : first_allocation));
+        operator_init_retry(ctl, 0, 17);
+        release(ctl);
+    }
+    CHECK(wl_columnar_memory_release(&held_peer) && !reserved());
+    wl_columnar_memory_governor_ref_release(watched); watched = NULL;
+}
+
 static void
 join_typed_operator_fixtures(void)
 {
@@ -3376,6 +3511,7 @@ main(void)
         }
     scalar_source_twins(300, true, true, false);
     operator_init_boundaries();
+    operator_reserve_boundaries();
     join_typed_operator_fixtures();
     sorted_stamp_cases();
     sorted_stamp_faults();
