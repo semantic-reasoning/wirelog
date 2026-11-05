@@ -1,5 +1,5 @@
 /*
- * test_easy_recursive_seed_workers.c - Issue #2105 regression test.
+ * test_easy_recursive_seed_workers.c - Issues #2105, #2109, #2333 regressions.
  *
  * Copyright (C) CleverPlant
  * Licensed under LGPL-3.0
@@ -219,31 +219,34 @@ collect_graph(const char *relation, const int64_t *row, uint32_t ncols,
 }
 
 static bool
-graph_parallel_ran(wirelog_easy_session_t *s)
+graph_parallel_ran(wirelog_easy_session_t *s, const char *strategy)
 {
     wl_col_session_t *inner = COL_SESSION(wirelog_easy_testhook_inner(s));
     return inner->tdd_audit.strategy
-           && strcmp(inner->tdd_audit.strategy, "global_read") == 0
+           && strcmp(inner->tdd_audit.strategy, strategy) == 0
            && inner->tdd_audit.selected_workers >= 2
            && inner->tdd_audit.submitted_tasks >= 2
            && inner->tdd_audit.completed_rounds > 0
            && inner->tdd_workers_count == 0;
 }
 
-/* Independent finite-set evaluation of the two-sided rules. The seeds are
+/* Independent finite-set evaluation of the recursive rules. The seeds are
  * deliberately unsorted: global-read workers must not sort borrowed heads. */
 static void
-test_global_seeded_graph(uint32_t workers, bool seeded, bool snapshot_only)
+test_seeded_graph(uint32_t workers, bool seeded, bool snapshot_only,
+    bool nonlinear)
 {
+    const char *strategy = nonlinear ? "bdx" : "global_read";
     bool edge[GRAPH_NODES][GRAPH_NODES] = { { false } };
     bool expected[GRAPH_NODES][GRAPH_NODES] = { { false } };
     char program[4096];
     size_t used = (size_t)snprintf(program, sizeof(program),
             ".decl edge(x: int32, y: int32)\n"
             ".decl tc(x: int32, y: int32)\n.output tc\n"
-            "tc(x,y) :- edge(x,y).\n"
-            "tc(x,z) :- tc(x,y), edge(y,z).\n"
-            "tc(x,z) :- edge(x,y), tc(y,z).\n%s",
+            "tc(x,y) :- edge(x,y).\n%s%s",
+            nonlinear ? "tc(x,z) :- tc(x,y), tc(y,z).\n"
+        : "tc(x,z) :- tc(x,y), edge(y,z).\n"
+            "tc(x,z) :- edge(x,y), tc(y,z).\n",
             seeded ? "tc(1001,0).\ntc(1000,1001).\n" : "");
     for (unsigned i = 0; i < 23; i++) {
         edge[i][i + 1] = true;
@@ -267,7 +270,9 @@ test_global_seeded_graph(uint32_t workers, bool seeded, bool snapshot_only)
             for (unsigned y = 0; y < GRAPH_NODES; y++)
                 for (unsigned z = 0; z < GRAPH_NODES; z++)
                     if (!expected[x][z]
-                        && ((expected[x][y] && edge[y][z])
+                        && (nonlinear
+                        ? expected[x][y] && expected[y][z]
+                        : (expected[x][y] && edge[y][z])
                         || (edge[x][y] && expected[y][z]))) {
                         expected[x][z] = true;
                         changed = true;
@@ -278,8 +283,8 @@ test_global_seeded_graph(uint32_t workers, bool seeded, bool snapshot_only)
     wirelog_easy_session_t *s = NULL;
     const char *why = NULL;
     tests_run++;
-    printf("  [%d] global-read graph (workers=%u seeded=%d snapshot=%d)",
-        tests_run, workers, seeded, snapshot_only);
+    printf("  [%d] %s graph (workers=%u seeded=%d snapshot=%d)",
+        tests_run, strategy, workers, seeded, snapshot_only);
     opts.num_workers = workers;
     opts.eager_build = true;
     if (wirelog_easy_open_opts(program, &opts, &s) != WIRELOG_OK) {
@@ -293,8 +298,8 @@ test_global_seeded_graph(uint32_t workers, bool seeded, bool snapshot_only)
         why = "step";
         goto done;
     }
-    if (!snapshot_only && workers > 1 && !graph_parallel_ran(s)) {
-        why = "parallel global-read step or cleanup";
+    if (!snapshot_only && workers > 1 && !graph_parallel_ran(s, strategy)) {
+        why = "parallel step or cleanup";
         goto done;
     }
     for (unsigned repeat = 0; repeat < 2; repeat++) {
@@ -313,13 +318,13 @@ test_global_seeded_graph(uint32_t workers, bool seeded, bool snapshot_only)
                     goto done;
                 }
             }
-        if (count != (seeded ? 301u : 276u)) {
+        if (count != (seeded ? (nonlinear ? 325u : 301u) : 276u)) {
             why = "oracle cardinality";
             goto done;
         }
         if (repeat == 0 && snapshot_only && workers > 1
-            && !graph_parallel_ran(s)) {
-            why = "parallel global-read snapshot or cleanup";
+            && !graph_parallel_ran(s, strategy)) {
+            why = "parallel snapshot or cleanup";
             goto done;
         }
     }
@@ -340,7 +345,7 @@ main(void)
 {
     static const uint32_t workers[] = { 1, 2, 4 };
 
-    printf("test_easy_recursive_seed_workers (Issues #2105, #2109)\n");
+    printf("test_easy_recursive_seed_workers (Issues #2105, #2109, #2333)\n");
     if (setenv("WIRELOG_TDD_MIN_ROWS_PER_WORKER", "1", 1) != 0) {
         printf("setenv failed\n");
         return 1;
@@ -356,7 +361,9 @@ main(void)
     for (unsigned w = 0; w < 3; w++)
         for (unsigned seeded = 0; seeded < 2; seeded++)
             for (unsigned snapshot = 0; snapshot < 2; snapshot++)
-                test_global_seeded_graph(graph_workers[w], seeded, snapshot);
+                for (unsigned nonlinear = 0; nonlinear < 2; nonlinear++)
+                    test_seeded_graph(graph_workers[w], seeded, snapshot,
+                        nonlinear);
     printf("%d run, %d passed, %d failed\n", tests_run, tests_passed,
         tests_failed);
     return tests_failed ? 1 : 0;

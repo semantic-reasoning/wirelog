@@ -4568,6 +4568,36 @@ tdd_preregister_idb_on_workers(const wl_plan_stratum_t *sp,
     return 0;
 }
 
+/* BDX workers consolidate into mutable images of their private heads.
+ * Unlike empty placeholders, nonempty seed partitions arrive ungoverned.
+ * Attach before sorting or dispatch so accounting and row scratch are ready
+ * for image publication. On refusal the caller tears down the whole cohort,
+ * including heads already admitted for earlier workers. */
+static int
+tdd_prepare_bdx_worker_heads(const wl_plan_stratum_t *sp,
+    wl_col_session_t *coord)
+{
+    if (!coord->memory_governor)
+        return 0;
+    for (uint32_t w = 0; w < coord->tdd_workers_count; w++) {
+        WL_COLUMNAR_EVAL_INIT_BOUNDARY(3, 0, w, coord);
+        for (uint32_t ri = 0; ri < sp->relation_count; ri++) {
+            col_rel_t *head = session_find_rel(&coord->tdd_workers[w],
+                    sp->relations[ri].name);
+            if (!head)
+                return EINVAL;
+            int rc = col_rel_attach_memory_governor(head,
+                    coord->memory_governor);
+            rc = eval_relation_status(head, rc);
+            if (rc == ENOSPC)
+                coord->memory_budget_denied = true;
+            if (rc != 0)
+                return rc;
+        }
+    }
+    return 0;
+}
+
 /* Forward declaration — defined below tdd_exchange_deltas. */
 static int tdd_broadcast_deltas(const wl_plan_stratum_t *sp,
     wl_col_session_t *coord, col_eval_tdd_worker_ctx_t *ctxs, uint32_t W);
@@ -7757,6 +7787,8 @@ col_eval_stratum_tdd_recursive(const wl_plan_stratum_t *sp,
 
     /* Pre-register empty IDB on each worker */
     rc = tdd_preregister_idb_on_workers(sp, coord);
+    if (rc == 0 && bdx_mode)
+        rc = tdd_prepare_bdx_worker_heads(sp, coord);
     if (rc != 0) {
         rc = tdd_cleanup_preserve_error(coord, rc);
         tdd_free_saved_coord_idb(sp, owner_fallback_saved);
