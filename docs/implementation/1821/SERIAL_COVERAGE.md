@@ -2240,3 +2240,39 @@ execution equivalence, or strict/local/shared/general policy acceptance. P2/MR3
 cache ownership and source qualification must precede MR2 runtime enablement;
 MR4 and the remaining consumer, ordinary coordinator and receipt obligations
 remain required before the grouped PR is ready.
+
+
+### Generic receipt target cleanup
+
+The standalone no-active generic receipt sibling owns its complete checked
+entry. Actual emitted source is189 for the rejected/failed-funding window
+within the accepted192 ceiling and383 for the successful terminal path against
+its unchanged384 payment, including both supported release-hook configurations.
+The former185/359 projections are not certificates. The seven-site private
+checked terminal move retains all actual native/state/atomic checks and omits
+only two proven redundant plain identity stores.
+
+Genuine issued keys at slots0,15 and31 cover32 active frames before any transfer,
+a held result plus maximal32 stack entries, lower-entry disposal past retained
+readers, read-only pending STATUS, exact383/384 and mixed raw/funded target
+unlinking. Additional raw/unreceipted middle removal and normal worker cloning
+exercise owner-cell isolation. Actual producer publishing defers destruction
+while finish consumes the frame; real continuation reader release then permits
+normal retry. Cleanup after original finish/reset leaves successor consumption
+zero, fully drains frame credit against a live17-byte peer and permits a fresh
+ordinary execution with literal/raw parity. Error and stale-funding tests use
+real control lifecycles and copied external request keys, never seeded engine
+receipt, link, owner, native or phase state.
+
+Physical frame ZERO work derives from
+`ceil(wl_columnar_eval_stack_test_allocation_size()/16)` at224 per actual chunk,
+not measured budget padding or a fixed POSIX size. The source gate's inspected
+allocation11928/token88 layout implies746 chunks locally; other supported ABIs
+and future integrated MR1 copy exclusions require fresh checks. The atomic
+inventory in this isolated base is458; integration must reconcile the actual
+current inventory, including separately committed sites, rather than overwrite
+its count with this historical value.
+
+This is the exact accepted cooperative target-owner boundary, not a finite
+terminal-CAS/time guarantee or broad helper waiver. Complete ordinary/O0/O2,
+retirement-parent, policy and whole Ready obligations remain separate.

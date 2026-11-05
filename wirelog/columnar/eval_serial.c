@@ -1343,6 +1343,14 @@ wl_columnar_eval_serial_framed_relation(const wl_plan_relation_t *rp,
     wl_col_session_t *sess, bool recursive,
     const wl_columnar_eval_serial_framed_host_request_t *request)
 {
+    /* The receipt sibling owns the complete checked no-active entry. */
+    if (request && (!sess || !sess->cleanup_active)
+        && (request->action == WL_COLUMNAR_EVAL_SERIAL_FRAMED_STATUS
+        || request->action == WL_COLUMNAR_EVAL_SERIAL_FRAMED_ABORT
+        || request->action == WL_COLUMNAR_EVAL_SERIAL_FRAMED_RECEIPT_RETRY
+        || request->action == WL_COLUMNAR_EVAL_SERIAL_FRAMED_RECEIPT_ACK))
+        return wl_columnar_eval_stack_cleanup_receipt_host(rp, sess,
+                   recursive, request);
     /* Check the request before reading its reply pointer, and the reply
      * before its ordinary reset can touch any live protected owner. */
     if (request && !wl_columnar_eval_stack_host_geometry(sess, request))

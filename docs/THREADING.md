@@ -228,7 +228,7 @@ These exist so struct fields can be declared portably; the audit in
 
 Every `atomic_*` call site in `wirelog/` production sources. Counted
 mechanically by `scripts/ci/check-threading-doc.sh`; row count must
-match the script's count (currently **461**).
+match the script's count (currently **468**).
 
 Format: `file:function[#N]` | field | operation | order | justification.
 
@@ -665,7 +665,7 @@ concurrent alias removals cannot underflow the count.
 | `session.c:session_pool_rel_promote#3` | `src->storage_alias_borrows` | `atomic_store_explicit` | relaxed | Leave the closed pool tombstone with no child aliases |
 
 112 + 21 + 37 = **170 atomic call sites** in the summarized groups; the full
-symbol-anchored inventory below covers 461 sites.
+symbol-anchored inventory below covers 468 sites.
 
 The `#N` suffix counts all atomic sites in a symbol, regardless of operation;
 the first site remains unsuffixed. `scripts/ci/check-threading-doc.sh` uses
@@ -1752,7 +1752,7 @@ DONE. If a stop leaves the receipt holding a claim, its caller preserves that
 receipt and resumes with a fresh live maintenance attempt; it cannot abandon or
 reinitialize the receipt/token while the claim remains held.
 
-The complete current atomic-source inventory contains 461 call sites.
+The complete current atomic-source inventory contains 468 call sites.
 
 ### Caller-attempt-bound single mutation admission
 
@@ -2630,3 +2630,41 @@ physical storage and returning its exact credit.
 | `session.c:wl_columnar_session_scalar_view_allocate` | `token->state` | `atomic_load_explicit` | acquire | Require the coordinator's final-address arena token to be EMPTY before real governor admission |
 | `session.c:wl_columnar_session_scalar_view_release` | `token->state` | `atomic_load_explicit` | acquire | Verify COMMITTED arena authority before physical storage is freed and its credit released |
 | `session.c:wl_columnar_session_scalar_view_release#2` | `token->owner_bits` | `atomic_load_explicit` | acquire | Verify that the actual committed reservation names this arena allocation before destruction |
+
+### Generic keyed pending-frame terminal ownership
+
+Generic receipt STATUS, ABORT, RETRY and ACK authenticate the complete issued
+key on every no-active-frame call. The32-entry owner sidecar is a redundant
+session resource view, never a locator permission. Genuine finish consumes the
+mutable frame handle, destroys continuation owners before pending publication,
+and maintains reciprocal previous/next links. Raw retry keeps its cross-frame
+continuation prepass; the funded target skips that redundant prepass under the
+consumed-owner induction, including genuinely deferred publishing destruction.
+STATUS never advances a transferred owner; retained-reader failure preserves
+its frame, key, list, result and credit until that reader actually releases.
+
+The checked terminal move validates distinct live token addresses, both native
+self identities and actual destination/source states. It preserves all seven
+atomic operations and memory orders; two redundant plain identity self-stores
+are omitted only after those checks in the exclusive callback-free transfer.
+The frame remains live until its genuine credit is moved to the initialized
+local. Physical frame free precedes local refund and the final governor ref
+release. No pointer into the freed frame is read afterward.
+
+| Source anchor | Atomic object | Operation | Order | Ownership purpose |
+| --- | --- | --- | --- | --- |
+| `eval_stack.c:wl_columnar_eval_stack_cleanup_receipt_reservation_move` | `destination->state` | `atomic_load_explicit` | acquire | Check actual initialized EMPTY/RELEASED destination before transfer |
+| `eval_stack.c:wl_columnar_eval_stack_cleanup_receipt_reservation_move#2` | `source->state` | `atomic_load_explicit` | acquire | Check actual RESERVED/COMMITTED source authority while frame remains live |
+| `eval_stack.c:wl_columnar_eval_stack_cleanup_receipt_reservation_move#3` | `destination->owner_bits` | `atomic_store_explicit` | relaxed | Copy actual owner to the exclusively owned final-address local token |
+| `eval_stack.c:wl_columnar_eval_stack_cleanup_receipt_reservation_move#4` | `source->owner_bits` | `atomic_load_explicit` | relaxed | Read existing committed owner without manufacturing a new pin |
+| `eval_stack.c:wl_columnar_eval_stack_cleanup_receipt_reservation_move#5` | `destination->state` | `atomic_store_explicit` | release | Publish transferred reservation state after payload and owner |
+| `eval_stack.c:wl_columnar_eval_stack_cleanup_receipt_reservation_move#6` | `source->owner_bits` | `atomic_store_explicit` | relaxed | Clear old frame token owner after transfer |
+| `eval_stack.c:wl_columnar_eval_stack_cleanup_receipt_reservation_move#7` | `source->state` | `atomic_store_explicit` | release | Return source to EMPTY before physical frame retirement |
+
+Only the accepted target's terminal result/unary/stack entry disposal and exact
+post-free repeated governor claim/credit interiors retain their cooperative
+qualifications. Key/native/top/list/geometry/funding checks, token initialization
+and move, fixed release fronts, copies, counters and returns remain explicit
+source work. External callback bodies retain their existing boundary; engine
+dispatch fronts remain counted. Neither qualification promises finite CAS
+iterations, arbitrary callback time or hard terminal cleanup latency.

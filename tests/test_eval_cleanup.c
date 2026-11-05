@@ -255,6 +255,130 @@ test_continuation_reader_cleanup(void)
     destroy_session(s);
 }
 
+struct deferred_cleanup {
+    struct reader_context reader;
+    wl_columnar_eval_stack_cleanup_frame_t *frame;
+    wl_col_session_t *session;
+    unsigned pending_during_publish;
+};
+
+static wl_columnar_continuation_status_t
+deferred_cleanup_produce(void *ctx,
+    const wl_columnar_continuation_cursor_t *cursor,
+    wl_columnar_continuation_batch_t *batch)
+{
+    (void)cursor; (void)batch;
+    struct deferred_cleanup *d = ctx;
+    /* The producer is genuinely publishing: destroy is deferred by its real
+     * protocol, while finish consumes the only mutable frame handle. */
+    CHECK(wl_columnar_eval_stack_cleanup_finish(&d->frame) == EBUSY &&
+        !d->frame && d->session->cleanup_pending_count == 1 &&
+        !d->reader.destroyed);
+    d->pending_during_publish++;
+    return WL_COLUMNAR_CONTINUATION_DONE;
+}
+
+static void
+deferred_cleanup_destroy(void *ctx)
+{
+    struct deferred_cleanup *d = ctx;
+    release_reader(&d->reader);
+}
+
+static wl_columnar_continuation_status_t
+unused_sink_batch(void *ctx, const wl_columnar_continuation_batch_t *batch)
+{
+    (void)ctx; (void)batch;
+    CHECK(false); return WL_COLUMNAR_CONTINUATION_INVALID;
+}
+
+static wl_columnar_continuation_status_t
+unused_sink_reserve(void *ctx, uint64_t bytes, uint32_t rows)
+{
+    (void)ctx; (void)bytes; (void)rows;
+    CHECK(false); return WL_COLUMNAR_CONTINUATION_INVALID;
+}
+
+static wl_columnar_continuation_status_t
+unused_sink_commit(void *ctx, bool *committed)
+{
+    (void)ctx; (void)committed;
+    CHECK(false); return WL_COLUMNAR_CONTINUATION_INVALID;
+}
+
+static void
+unused_sink_abort(void *ctx)
+{
+    (void)ctx; CHECK(false);
+}
+
+static void
+test_deferred_publishing_cleanup(void)
+{
+    wl_col_session_t *s = new_session();
+    struct deferred_cleanup d = {.session = s};
+    col_rel_t *r = col_rel_new_auto("deferred-publishing", 1);
+    CHECK(r && !col_rel_source_reader_acquire(r, &d.reader.reader));
+    CHECK(!wl_columnar_eval_stack_cleanup_begin(s, &d.frame));
+    wl_columnar_continuation_producer_t producer = {
+        .context = &d, .produce = deferred_cleanup_produce,
+        .destroy = deferred_cleanup_destroy
+    };
+    wl_columnar_continuation_cursor_t cursor = {0};
+    wl_columnar_continuation_t *cont =
+        wl_columnar_continuation_create(&producer, &cursor);
+    eval_stack_t *stack = wl_columnar_eval_stack_cleanup_stack(d.frame);
+    CHECK(cont && !eval_stack_push_continuation(stack, cont));
+    CHECK(!eval_stack_push(stack, r, true));
+    wl_columnar_continuation_sink_t sink = {
+        .begin = unused_sink_batch, .reserve = unused_sink_reserve,
+        .append = unused_sink_batch, .commit = unused_sink_commit,
+        .abort = unused_sink_abort
+    };
+    CHECK(wl_columnar_continuation_publish(cont,
+        &sink) == WL_COLUMNAR_CONTINUATION_DONE);
+    CHECK(d.pending_during_publish == 1 && d.reader.destroyed == 1);
+    CHECK(!wl_columnar_eval_stack_cleanup_retry(s) && !s->cleanup_pending);
+    CHECK(d.reader.destroyed == 1);
+    destroy_session(s);
+}
+
+static void
+test_worker_pending_owner_copy(void)
+{
+    wl_col_session_t *s = new_session();
+    wl_columnar_eval_stack_cleanup_frame_t *frame = NULL;
+    wl_columnar_eval_cleanup_receipt_key_t key;
+    CHECK(!wl_columnar_eval_stack_cleanup_begin_receipted_attempt_controlled(
+            s, &frame, NULL, 17, 99, &key));
+    col_rel_t *r = col_rel_new_auto("worker-copy-pending", 1);
+    wl_columnar_source_access_reader_t reader = {0};
+    CHECK(r && !col_rel_source_reader_acquire(r, &reader));
+    CHECK(!eval_stack_push(wl_columnar_eval_stack_cleanup_stack(frame), r,
+        true));
+    CHECK(!wl_columnar_eval_stack_cleanup_receipt_prepare(frame, &key, 37,
+        false));
+    wl_columnar_eval_cleanup_outcome_t outcome;
+    CHECK(wl_columnar_eval_stack_cleanup_finish_receipted(&frame, &key,
+        &outcome) == EBUSY && !frame);
+    CHECK(s->cleanup_pending_owners[0] == s->cleanup_pending &&
+        s->cleanup_pending);
+    wl_col_session_t *worker = calloc(1, sizeof(*worker));
+    CHECK(worker && !col_worker_session_create(s, 0, NULL, 0, worker));
+    for (unsigned i = 0; i < WL_COLUMNAR_EVAL_STACK_CLEANUP_MAX_FRAMES; ++i)
+        CHECK(!worker->cleanup_pending_owners[i] &&
+            worker->cleanup_receipts[i].state ==
+            WL_COLUMNAR_EVAL_CLEANUP_RECEIPT_FREE);
+    CHECK(!worker->cleanup_pending && !worker->cleanup_active &&
+        s->cleanup_pending_owners[0] == s->cleanup_pending);
+    CHECK(!col_worker_session_destroy(worker)); free(worker);
+    CHECK(!col_rel_source_reader_release(&reader));
+    CHECK(!wl_columnar_eval_stack_cleanup_receipt_retry(s, &key));
+    CHECK(!s->cleanup_pending_owners[0]);
+    CHECK(!wl_columnar_eval_stack_cleanup_receipt_ack(s, &key));
+    destroy_session(s);
+}
+
 static int frame_owner;
 static wl_evaluation_control_t *frame_control;
 static wl_columnar_memory_governor_t *frame_governor;
@@ -1541,6 +1665,8 @@ main(void)
         test_storage_refusal(storage);
     test_progress_past_refusal();
     test_continuation_reader_cleanup();
+    test_deferred_publishing_cleanup();
+    test_worker_pending_owner_copy();
     test_frame_literal_admissions();
     test_frame_all_interruptions();
     test_frame_faults_and_peer();

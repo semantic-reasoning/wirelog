@@ -2269,3 +2269,25 @@ The stopped suffixes are narrowly qualified fixed operation completion. Neither
 not qualify successful nonempty START/STEP, nonempty owner retirement, forwarding,
 FINISH, configured policy or the complete consumer call. Those containing
 ledgers remain separate obligations.
+
+
+A standalone generic receipt action retains the issued five-field key and its
+original operation association even after that operation finishes or a new
+generation begins. Missing/stale keys are rejected before funding is examined;
+a valid key with short383 funding consumes zero and changes no frame, receipt,
+list or resource owner. Geometry refusal precedes rejected-reply normalization.
+The exact bounded no-debit validation/refusal source window is189 within the
+accepted192 ceiling;192 is a contract ceiling, not a new charge. State-specific
+checks follow the existing successful384 admission. STATUS on TRANSFERRED only
+reports pending, ACK requires FREED and copies the terminal result before slot
+clear, and RETRY/ABORT disposes only the genuinely associated target.
+
+The complete supported generic terminal action is bounded by383/384 outside
+its exact cooperative target-disposal and post-physical-free governor retry
+interiors. It preserves manual32-frame capacity and existing raw retry behavior;
+no new progress result, per-slot fee or narrowed domain is introduced. Worker
+copies clear all32 new owner pointers, and frame allocation/zeroing/reservation
+use the actual physical allocation size including the native receipt tail.
+These local bounds do not qualify unrelated ordinary/coordinator actions or
+whole-consumer/policy completion; integrated adoption requires fresh layout,
+copy-exclusion, native and source carry.

@@ -10495,9 +10495,7 @@ test_entry_receipt_only_continuation(void)
     wl_columnar_source_access_reader_t reader = {0};
     CHECK(!col_rel_source_reader_acquire(owned, &reader));
     eval_stack_t *stack = wl_columnar_eval_stack_cleanup_stack(frame);
-    stack->items[0] = (eval_entry_t){.rel = owned, .owned = true,
-                                     .kind = WL_COLUMNAR_EVAL_ENTRY_RELATION};
-    stack->top = 1;
+    CHECK(!eval_stack_push(stack, owned, true));
     wl_columnar_eval_cleanup_outcome_t outcome;
     CHECK(wl_columnar_eval_stack_cleanup_finish_receipted(&frame, &key,
         &outcome) == EBUSY && !frame
@@ -10515,16 +10513,6 @@ test_entry_receipt_only_continuation(void)
     CHECK(f.reply.kind ==
         WL_COLUMNAR_EVAL_SERIAL_FRAMED_REPLY_TERMINAL_CLEANUP_PENDING
         && f.reply.execution_result == 37 && f.reply.committed);
-    wl_columnar_eval_stack_cleanup_frame_t *pending =
-        f.session->cleanup_pending;
-    CHECK(pending && f.session->cleanup_pending_count == 1);
-    f.session->cleanup_pending = NULL;
-    f.session->cleanup_pending_count = 0;
-    CHECK(entry_receipt_turn(&f,
-        WL_COLUMNAR_EVAL_SERIAL_FRAMED_RECEIPT_RETRY, &key) == ENOENT);
-    CHECK(f.reply.kind == WL_COLUMNAR_EVAL_SERIAL_FRAMED_REPLY_REJECTED);
-    f.session->cleanup_pending = pending;
-    f.session->cleanup_pending_count = 1;
     CHECK(!col_rel_source_reader_release(&reader));
     CHECK(!entry_receipt_turn(&f,
         WL_COLUMNAR_EVAL_SERIAL_FRAMED_RECEIPT_RETRY, &key));
@@ -10712,6 +10700,462 @@ test_entry_receipt_pool_position(unsigned peer_count)
     CHECK(wl_columnar_memory_reserved(
             wl_columnar_memory_governor_ref_get(f.governor)) == reserved);
     entry_finish_original(&f);
+    entry_destroy(&f);
+}
+
+/* Genuine issued keys and consumed frame owners; no pool/link/phase seeds. */
+static void
+generic_receipt_owners(wl_col_session_t *session, unsigned expected)
+{
+    unsigned owners = 0;
+    for (unsigned i = 0; i < WL_COLUMNAR_EVAL_STACK_CLEANUP_MAX_FRAMES; ++i) {
+        if (session->cleanup_pending_owners[i]) {
+            CHECK(session->cleanup_receipts[i].state ==
+                WL_COLUMNAR_EVAL_CLEANUP_RECEIPT_TRANSFERRED);
+            ++owners;
+        }
+    }
+    CHECK(owners == expected && session->cleanup_pending_count == expected);
+}
+
+static void
+test_generic_receipt_pending32(unsigned target)
+{
+    entry_fixture_t f;
+    entry_init(&f, entry_simple, entry_rows, 4, 1, 0);
+    wl_columnar_memory_governor_t *g =
+        wl_columnar_memory_governor_ref_get(f.governor);
+    wl_columnar_memory_reservation_t peer;
+    wl_columnar_memory_reservation_init(&peer);
+    CHECK(wl_columnar_memory_reserve(g, 17, &peer) &&
+        wl_columnar_memory_commit(&peer, &peer));
+    uint64_t baseline = wl_columnar_memory_reserved(g);
+    wl_columnar_eval_stack_cleanup_frame_t *frames[32] = {0};
+    wl_columnar_eval_cleanup_receipt_key_t keys[32];
+    wl_columnar_source_access_reader_t readers[32] = {0}, top_reader = {0};
+    eval_stack_t *observed = NULL;
+    col_rel_t *borrowed = source_new("borrowed", 1, 1, false, 9);
+    for (unsigned i = 0; i < 32; ++i) {
+        CHECK(
+            !wl_columnar_eval_stack_cleanup_begin_receipted_attempt_controlled(
+                f.session, &frames[i], f.operation, f.id, f.operation_identity,
+                &keys[i]));
+        CHECK(f.session->cleanup_receipts[i].key.receipt_id ==
+            keys[i].receipt_id);
+        col_rel_t *owned = NULL;
+        CHECK(!col_rel_deep_copy(session_find_rel(f.session, "input"), &owned,
+            NULL));
+        CHECK(!col_rel_source_reader_acquire(owned, &readers[i]));
+        eval_stack_t *stack = wl_columnar_eval_stack_cleanup_stack(frames[i]);
+        CHECK(stack && !eval_stack_push(stack, owned, true));
+        *wl_columnar_eval_stack_cleanup_result(frames[i]) =
+            eval_stack_pop(stack);
+        if (i == target) {
+            observed = stack;
+            CHECK(!eval_stack_push(stack, borrowed, false));
+            for (unsigned j = 1; j < COL_STACK_MAX; ++j) {
+                col_rel_t *lower = source_new("stack-owned", 1, 1, false,
+                        (int)j);
+                if (j == COL_STACK_MAX - 1)
+                    CHECK(!col_rel_source_reader_acquire(lower, &top_reader));
+                CHECK(!eval_stack_push(stack, lower, true));
+            }
+            CHECK(stack->top == COL_STACK_MAX);
+        }
+        CHECK(!wl_columnar_eval_stack_cleanup_receipt_prepare(frames[i],
+            &keys[i], 37, true));
+    }
+    CHECK(f.session->cleanup_active_count == 32 && !f.session->cleanup_pending);
+    const uint64_t frame_bytes = wl_columnar_eval_stack_test_allocation_size();
+    CHECK(wl_columnar_memory_reserved(g) == baseline + 32u * frame_bytes);
+    for (unsigned i = 32; i > 0; --i) {
+        wl_columnar_eval_cleanup_outcome_t outcome;
+        CHECK(wl_columnar_eval_stack_cleanup_finish_receipted(&frames[i - 1],
+            &keys[i - 1], &outcome) == EBUSY && !frames[i - 1] &&
+            outcome == WL_COLUMNAR_EVAL_CLEANUP_OUTCOME_TRANSFERRED_TO_PENDING);
+    }
+    generic_receipt_owners(f.session, 32);
+    CHECK(observed && observed->top == COL_STACK_MAX && borrowed->nrows == 1);
+    for (unsigned j = 1; j + 1 < COL_STACK_MAX; ++j)
+        CHECK(!observed->items[j].owned && !observed->items[j].rel);
+    CHECK(observed->items[COL_STACK_MAX - 1].owned);
+    /* Cleanup outlives the original: old key remains valid, successor gets0. */
+    if (target == 15) {
+        wl_evaluation_control_request_cancel(f.operation);
+        CHECK(wl_evaluation_control_charge_attempt(f.operation, f.id, 0) ==
+            WL_EVALUATION_CONTROL_CANCELLED);
+    }
+    CHECK(wl_evaluation_control_finish(f.operation,
+        f.session->base.operation_admission, 0, 0) ==
+        (target == 15 ? WL_EVALUATION_CONTROL_CANCELLED : 0));
+    wl_evaluation_control_report_t old;
+    CHECK(!wl_evaluation_control_report(f.operation,
+        &old) && old.attempt_id == f.id);
+    uint64_t inactive_work;
+    CHECK(!entry_receipt_turn_limit(&f, WL_COLUMNAR_EVAL_SERIAL_FRAMED_STATUS,
+        &keys[target], 384, &inactive_work) && inactive_work == 384);
+    wl_evaluation_control_report_t unchanged;
+    CHECK(!wl_evaluation_control_report(f.operation, &unchanged) &&
+        unchanged.attempt_id == old.attempt_id &&
+        unchanged.result == old.result && unchanged.consumed == old.consumed);
+    CHECK(!wl_evaluation_control_reset(f.operation));
+    CHECK(!wl_evaluation_control_begin(f.operation,
+        f.session->base.operation_admission));
+    uint64_t successor = wl_evaluation_control_active_attempt_id(f.operation);
+    CHECK(successor != f.id);
+    wl_columnar_eval_cleanup_receipt_t before, after;
+    CHECK(!wl_columnar_eval_stack_cleanup_receipt_read(f.session, &keys[target],
+        &before));
+    wl_columnar_eval_stack_cleanup_frame_t *head = f.session->cleanup_pending;
+    wl_columnar_eval_stack_cleanup_frame_t *owner_before[32];
+    memcpy(owner_before, f.session->cleanup_pending_owners,
+        sizeof(owner_before));
+    uint64_t consumed;
+    CHECK(entry_receipt_turn_limit(&f, WL_COLUMNAR_EVAL_SERIAL_FRAMED_STATUS,
+        &keys[target], 383,
+        &consumed) == WL_EVALUATION_CONTROL_WORK_LIMIT && !consumed);
+    CHECK(!entry_receipt_turn_limit(&f, WL_COLUMNAR_EVAL_SERIAL_FRAMED_STATUS,
+        &keys[target], 384, &consumed) && consumed == 384 &&
+        f.reply.kind ==
+        WL_COLUMNAR_EVAL_SERIAL_FRAMED_REPLY_TERMINAL_CLEANUP_PENDING);
+    CHECK(!wl_columnar_eval_stack_cleanup_receipt_read(f.session, &keys[target],
+        &after));
+    CHECK(!memcmp(&before, &after, sizeof(before)) &&
+        f.session->cleanup_pending == head &&
+        !memcmp(owner_before, f.session->cleanup_pending_owners,
+        sizeof(owner_before)) &&
+        wl_columnar_memory_reserved(g) == baseline + 32u * frame_bytes);
+    CHECK(!col_rel_source_reader_release(&readers[target]));
+    CHECK(entry_receipt_turn_limit(&f,
+        WL_COLUMNAR_EVAL_SERIAL_FRAMED_RECEIPT_RETRY,
+        &keys[target], 384, &consumed) == EBUSY && consumed == 384);
+    CHECK(!col_rel_source_reader_release(&top_reader));
+    CHECK(entry_receipt_turn_limit(&f,
+        WL_COLUMNAR_EVAL_SERIAL_FRAMED_RECEIPT_RETRY,
+        &keys[target], 383,
+        &consumed) == WL_EVALUATION_CONTROL_WORK_LIMIT && !consumed);
+    CHECK(!entry_receipt_turn_limit(&f,
+        WL_COLUMNAR_EVAL_SERIAL_FRAMED_RECEIPT_RETRY,
+        &keys[target], 384, &consumed) && consumed == 384);
+    generic_receipt_owners(f.session, 31);
+    CHECK(wl_columnar_memory_reserved(g) == baseline + 31u * frame_bytes);
+    CHECK(!entry_receipt_turn_limit(&f,
+        WL_COLUMNAR_EVAL_SERIAL_FRAMED_RECEIPT_ACK,
+        &keys[target], 384, &consumed) && consumed == 384);
+    CHECK(entry_receipt_turn_limit(&f,
+        WL_COLUMNAR_EVAL_SERIAL_FRAMED_RECEIPT_ACK,
+        &keys[target], 383, &consumed) == ENOENT && !consumed);
+    unsigned remaining = 31;
+    for (unsigned i = 0; i < 32; ++i) if (i != target) {
+            CHECK(!col_rel_source_reader_release(&readers[i]));
+            if (i &
+                1) CHECK(!wl_columnar_eval_stack_cleanup_receipt_retry(
+                        f.session, &keys[i]));
+            else CHECK(!entry_receipt_turn_limit(&f,
+                    WL_COLUMNAR_EVAL_SERIAL_FRAMED_ABORT,
+                    &keys[i], 384, &consumed) && consumed == 384);
+            CHECK(!wl_columnar_eval_stack_cleanup_receipt_ack(f.session,
+                &keys[i]));
+            generic_receipt_owners(f.session, --remaining);
+            CHECK(wl_columnar_memory_reserved(g) ==
+                baseline + remaining * frame_bytes);
+        }
+    CHECK(!f.session->cleanup_pending && !f.session->cleanup_reserved_bytes);
+    CHECK(!wl_evaluation_control_test_active_consumed(f.operation, successor,
+        &consumed) && !consumed);
+    CHECK(!wl_evaluation_control_finish(f.operation,
+        f.session->base.operation_admission, 0, 0));
+    wl_evaluation_control_report_t report;
+    CHECK(!wl_evaluation_control_report(f.operation, &report) &&
+        report.attempt_id == successor && !report.consumed);
+    wl_columnar_eval_cleanup_receipt_key_t reused;
+    CHECK(!wl_columnar_eval_stack_cleanup_receipt_reserve(f.session, f.id,
+        f.operation_identity,
+        &reused) && reused.receipt_id != keys[0].receipt_id);
+    CHECK(entry_receipt_turn_limit(&f, WL_COLUMNAR_EVAL_SERIAL_FRAMED_STATUS,
+        &keys[0], 383, &consumed) == ENOENT && !consumed);
+    CHECK(!wl_columnar_eval_stack_cleanup_receipt_release(f.session, &reused));
+    CHECK(wl_columnar_memory_release(&peer) &&
+        wl_columnar_memory_reserved(g) == baseline - 17);
+    CHECK(!col_rel_destroy_checked(borrowed));
+    CHECK(!wl_evaluation_control_reset(f.operation));
+    CHECK(!wl_evaluation_control_begin(f.operation,
+        f.session->base.operation_admission));
+    f.id = wl_evaluation_control_active_attempt_id(f.operation);
+    f.operation_identity = f.id + 1000;
+    entry_complete(&f); entry_compare(&f, entry_simple, entry_rows, 4, 1);
+    wl_columnar_memory_governor_ref_t *last_pin = f.governor;
+    wl_columnar_memory_governor_ref_retain(last_pin);
+    entry_destroy(&f);
+    CHECK(wl_columnar_memory_governor_ref_is_sole(last_pin) &&
+        !wl_columnar_memory_reserved(wl_columnar_memory_governor_ref_get(
+            last_pin)));
+    wl_columnar_memory_governor_ref_release(last_pin);
+}
+
+static void
+test_generic_receipt_mixed_unlink(void)
+{
+    entry_fixture_t f; entry_init(&f, entry_simple, entry_rows, 4, 1, 0);
+    wl_columnar_eval_stack_cleanup_frame_t *frames[3] = {0};
+    wl_columnar_eval_cleanup_receipt_key_t keys[3] = {0};
+    wl_columnar_source_access_reader_t readers[3] = {0};
+    uint64_t baseline =
+        wl_columnar_memory_reserved(wl_columnar_memory_governor_ref_get(
+                f.governor));
+    for (unsigned i = 0; i < 3; ++i) {
+        if (i == 1) CHECK(!wl_columnar_eval_stack_cleanup_begin(f.session,
+                &frames[i]));
+        else CHECK(
+                !
+                wl_columnar_eval_stack_cleanup_begin_receipted_attempt_controlled
+                (
+                    f.session, &frames[i], f.operation, f.id,
+                    f.operation_identity, &keys[i]));
+        col_rel_t *r = source_new("mixed", 1, 1, false, (int)i);
+        CHECK(!col_rel_source_reader_acquire(r, &readers[i]));
+        CHECK(!eval_stack_push(wl_columnar_eval_stack_cleanup_stack(frames[i]),
+            r, true));
+        if (i !=
+            1) CHECK(!wl_columnar_eval_stack_cleanup_receipt_prepare(frames[i],
+                &keys[i], 0, false));
+    }
+    for (unsigned i = 3; i > 0; --i) {
+        if (i ==
+            2) CHECK(wl_columnar_eval_stack_cleanup_finish(&frames[i - 1]) ==
+                EBUSY);
+        else {
+            wl_columnar_eval_cleanup_outcome_t outcome;
+            CHECK(wl_columnar_eval_stack_cleanup_finish_receipted(&frames[i -
+                1],
+                &keys[i - 1], &outcome) == EBUSY);
+        }
+    }
+    CHECK(f.session->cleanup_pending_count == 3);
+    CHECK(!col_rel_source_reader_release(&readers[1]));
+    CHECK(wl_columnar_eval_stack_cleanup_retry(f.session) == EBUSY &&
+        f.session->cleanup_pending_count == 2);
+    CHECK(!col_rel_source_reader_release(&readers[2]));
+    uint64_t consumed;
+    CHECK(!entry_receipt_turn_limit(&f,
+        WL_COLUMNAR_EVAL_SERIAL_FRAMED_RECEIPT_RETRY,
+        &keys[2], 384, &consumed) && consumed == 384);
+    CHECK(!wl_columnar_eval_stack_cleanup_receipt_ack(f.session, &keys[2]));
+    CHECK(!col_rel_source_reader_release(&readers[0]));
+    CHECK(!wl_columnar_eval_stack_cleanup_receipt_retry(f.session, &keys[0]));
+    CHECK(!entry_receipt_turn_limit(&f,
+        WL_COLUMNAR_EVAL_SERIAL_FRAMED_RECEIPT_ACK,
+        &keys[0], 384, &consumed) && consumed == 384);
+    generic_receipt_owners(f.session, 0);
+    CHECK(!f.session->cleanup_pending && !f.session->cleanup_reserved_bytes &&
+        wl_columnar_memory_reserved(wl_columnar_memory_governor_ref_get(
+            f.governor)) == baseline);
+    entry_destroy(&f);
+}
+
+struct generic_reader_owner {
+    wl_columnar_source_access_reader_t reader;
+    unsigned destroyed;
+};
+
+static wl_columnar_continuation_status_t
+generic_reader_produce(void *ctx,
+    const wl_columnar_continuation_cursor_t *cursor,
+    wl_columnar_continuation_batch_t *batch)
+{
+    (void)ctx; (void)cursor; (void)batch;
+    return WL_COLUMNAR_CONTINUATION_DONE;
+}
+
+static void
+generic_reader_destroy(void *ctx)
+{
+    struct generic_reader_owner *owner = ctx;
+    CHECK(!col_rel_source_reader_release(&owner->reader));
+    ++owner->destroyed;
+}
+
+static void
+test_generic_receipt_crossframe_continuation(void)
+{
+    entry_fixture_t f; entry_init(&f, entry_simple, entry_rows, 4, 1, 0);
+    wl_columnar_eval_stack_cleanup_frame_t *outer = NULL, *inner = NULL;
+    wl_columnar_eval_cleanup_receipt_key_t outer_key, inner_key;
+    struct generic_reader_owner owner = {0};
+    wl_columnar_source_access_reader_t outer_reader = {0};
+    col_rel_t *inner_rel = source_new("inner-owned", 1, 1, false, 0);
+    col_rel_t *outer_rel = source_new("outer-owned", 1, 1, false, 0);
+    CHECK(!col_rel_source_reader_acquire(inner_rel, &owner.reader));
+    CHECK(!col_rel_source_reader_acquire(outer_rel, &outer_reader));
+    wl_columnar_continuation_producer_t producer = {
+        .context = &owner, .produce = generic_reader_produce,
+        .destroy = generic_reader_destroy
+    };
+    wl_columnar_continuation_cursor_t cursor = {0};
+    wl_columnar_continuation_t *cont =
+        wl_columnar_continuation_create(&producer, &cursor);
+    CHECK(cont &&
+        !wl_columnar_eval_stack_cleanup_begin_receipted_attempt_controlled(
+            f.session, &outer, f.operation, f.id, f.operation_identity,
+            &outer_key));
+    eval_stack_t *stack = wl_columnar_eval_stack_cleanup_stack(outer);
+    CHECK(!eval_stack_push_continuation(stack, cont) && !eval_stack_push(stack,
+        outer_rel, true));
+    *wl_columnar_eval_stack_cleanup_result(outer) = eval_stack_pop(stack);
+    CHECK(!wl_columnar_eval_stack_cleanup_receipt_prepare(outer, &outer_key, 0,
+        false));
+    CHECK(!wl_columnar_eval_stack_cleanup_begin_receipted_attempt_controlled(
+            f.session, &inner, f.operation, f.id, f.operation_identity,
+            &inner_key));
+    CHECK(!eval_stack_push(wl_columnar_eval_stack_cleanup_stack(inner),
+        inner_rel, true));
+    CHECK(!wl_columnar_eval_stack_cleanup_receipt_prepare(inner, &inner_key, 0,
+        false));
+    wl_columnar_eval_cleanup_outcome_t outcome;
+    CHECK(wl_columnar_eval_stack_cleanup_finish_receipted(&inner, &inner_key,
+        &outcome) == EBUSY && !inner && !owner.destroyed);
+    CHECK(wl_columnar_eval_stack_cleanup_finish_receipted(&outer, &outer_key,
+        &outcome) == EBUSY && !outer && owner.destroyed == 1);
+    generic_receipt_owners(f.session, 2);
+    uint64_t consumed;
+    CHECK(!entry_receipt_turn_limit(&f,
+        WL_COLUMNAR_EVAL_SERIAL_FRAMED_RECEIPT_RETRY,
+        &inner_key, 384, &consumed) && consumed == 384 && owner.destroyed == 1);
+    generic_receipt_owners(f.session, 1);
+    CHECK(entry_receipt_turn_limit(&f,
+        WL_COLUMNAR_EVAL_SERIAL_FRAMED_RECEIPT_RETRY,
+        &outer_key, 384,
+        &consumed) == EBUSY && consumed == 384 && owner.destroyed == 1);
+    CHECK(!col_rel_source_reader_release(&outer_reader));
+    CHECK(!entry_receipt_turn_limit(&f,
+        WL_COLUMNAR_EVAL_SERIAL_FRAMED_RECEIPT_RETRY,
+        &outer_key, 384, &consumed) && consumed == 384 && owner.destroyed == 1);
+    CHECK(!wl_columnar_eval_stack_cleanup_receipt_ack(f.session, &inner_key));
+    CHECK(!wl_columnar_eval_stack_cleanup_receipt_ack(f.session, &outer_key));
+    generic_receipt_owners(f.session, 0);
+    entry_destroy(&f);
+}
+
+static void
+test_generic_receipt_entry_rejections(void)
+{
+    entry_fixture_t f; entry_init(&f, entry_simple, entry_rows, 4, 1, 0);
+    wl_columnar_eval_cleanup_receipt_key_t key;
+    CHECK(!wl_columnar_eval_stack_cleanup_receipt_reserve(f.session, f.id,
+        f.operation_identity, &key));
+    uint64_t baseline =
+        wl_columnar_memory_reserved(wl_columnar_memory_governor_ref_get(
+                f.governor));
+    for (unsigned trial = 0; trial < 18; ++trial) {
+        grant_t *grant = entry_grant(&f, 383);
+        wl_columnar_eval_serial_framed_host_request_t request = {
+            .operation = f.operation, .operation_id = f.id,
+            .operation_identity = f.operation_identity,
+            .funding = grant->control, .funding_id = grant->id,
+            .receipt_key = key, .action = WL_COLUMNAR_EVAL_SERIAL_FRAMED_STATUS,
+            .reply = &f.reply
+        };
+        const wl_plan_relation_t *rp = f.relation;
+        wl_col_session_t *session = f.session;
+        bool recursive = false; int expected = EINVAL;
+        wl_col_session_t raw = {0};
+        if (trial == 0) rp = NULL;
+        else if (trial == 1) session = NULL;
+        else if (trial == 2) request.reply = NULL;
+        else if (trial == 3) request.operation_id = 0;
+        else if (trial == 4) request.capture_only = true;
+        else if (trial == 5) {
+            recursive = true; expected = ENOTSUP;
+        }else if (trial == 6) {
+            request.receipt_key.receipt_id = 0; expected = ENOENT;
+        }else if (trial == 7) request.receipt_key.session_generation = 0;
+        else if (trial == 8) request.receipt_key.plan_epoch = 0;
+        else if (trial == 9) {
+            ++request.receipt_key.plan_epoch; expected = ENOENT;
+        }else if (trial == 10) session = &raw;
+        else if (trial == 11) request.funding = f.operation;
+        else if (trial == 12) {
+            wl_evaluation_control_request_cancel(grant->control);
+            ++request.receipt_key.receipt_id; expected = ENOENT;
+        } else if (trial == 13) request.reply = (void *)&request;
+        else if (trial == 14) expected = ENOTSUP;
+        else if (trial == 15) ++request.receipt_key.operation_attempt_id;
+        else if (trial == 16) ++request.receipt_key.operation_id;
+        else request.operation = NULL;
+        f.reply.execution_result = 777;
+        wl_columnar_eval_serial_framed_host_request_t before = request;
+        CHECK(wl_columnar_eval_serial_framed_relation(rp, session, recursive,
+            trial == 14 ? NULL : &request) == expected);
+        if (trial == 13) CHECK(!memcmp(&request, &before, sizeof(request)));
+        CHECK(f.reply.execution_result ==
+            (trial == 2 || trial == 13 || trial == 14 ? 777 : EINVAL));
+        (void)wl_evaluation_control_finish(grant->control, &grant->owner, 0, 0);
+        wl_evaluation_control_report_t report;
+        CHECK(!wl_evaluation_control_report(grant->control,
+            &report) && !report.consumed);
+        CHECK(wl_columnar_memory_reserved(wl_columnar_memory_governor_ref_get(
+                f.governor)) == baseline);
+        generic_receipt_owners(f.session, 0);
+    }
+    for (unsigned mode = 0; mode < 3; ++mode) {
+        grant_t *grant = entry_grant(&f, 384);
+        uint64_t saved = grant->id;
+        if (mode == 0) wl_evaluation_control_request_cancel(grant->control);
+        else {
+            CHECK(!wl_evaluation_control_finish(grant->control, &grant->owner,
+                0, 0));
+            if (mode == 2) {
+                CHECK(!wl_evaluation_control_reset(grant->control));
+                CHECK(!wl_evaluation_control_begin(grant->control,
+                    &grant->owner));
+            }
+        }
+        wl_columnar_eval_serial_framed_host_request_t request = {
+            .operation = f.operation, .operation_id = f.id,
+            .operation_identity = f.operation_identity,
+            .funding = grant->control,
+            .funding_id = saved, .receipt_key = key,
+            .action = WL_COLUMNAR_EVAL_SERIAL_FRAMED_STATUS, .reply = &f.reply
+        };
+        CHECK(wl_columnar_eval_serial_framed_relation(f.relation, f.session,
+            false,
+            &request) == (mode ? EINVAL : WL_EVALUATION_CONTROL_CANCELLED));
+        if (mode != 1) (void)wl_evaluation_control_finish(grant->control,
+                &grant->owner, 0, 0);
+        wl_evaluation_control_report_t report;
+        CHECK(!wl_evaluation_control_report(grant->control,
+            &report) && !report.consumed);
+    }
+    const wl_columnar_eval_serial_framed_host_action_t actions[] = {
+        WL_COLUMNAR_EVAL_SERIAL_FRAMED_STATUS,
+        WL_COLUMNAR_EVAL_SERIAL_FRAMED_RECEIPT_RETRY,
+        WL_COLUMNAR_EVAL_SERIAL_FRAMED_RECEIPT_ACK,
+        WL_COLUMNAR_EVAL_SERIAL_FRAMED_ABORT
+    };
+    for (unsigned i = 0; i < 4; ++i) {
+        uint64_t consumed;
+        CHECK(entry_receipt_turn_limit(&f, actions[i], &key, 383, &consumed)
+            == WL_EVALUATION_CONTROL_WORK_LIMIT && !consumed);
+        CHECK(entry_receipt_turn_limit(&f, actions[i], &key, 384, &consumed)
+            == EBUSY && consumed == 384);
+    }
+    CHECK(!wl_columnar_eval_stack_cleanup_receipt_release(f.session, &key));
+    f.reply.execution_result = 0;
+    CHECK(!entry_turn(&f, false, 0) && f.session->cleanup_active);
+    grant_t *active_grant = entry_grant(&f, 384);
+    wl_columnar_eval_serial_framed_host_request_t active = f.previous;
+    active.operation = f.operation; active.operation_id = f.id;
+    active.operation_identity = f.operation_identity;
+    active.funding = active_grant->control;
+    active.funding_id = active_grant->id;
+    active.action = WL_COLUMNAR_EVAL_SERIAL_FRAMED_RECEIPT_ACK;
+    active.receipt_key = entry_context(&f)->cleanup_receipt_key;
+    active.reply = &f.reply;
+    CHECK(entry_host(&f, &active, active_grant) == EBUSY);
+    wl_evaluation_control_report_t active_report;
+    CHECK(!wl_evaluation_control_report(active_grant->control, &active_report)
+        && !active_report.consumed);
+    entry_complete(&f); entry_compare(&f, entry_simple, entry_rows, 4, 1);
     entry_destroy(&f);
 }
 
@@ -15513,6 +15957,12 @@ main(void)
     test_entry_receipt_pool_position(0);
     test_entry_receipt_pool_position(15);
     test_entry_receipt_pool_position(31);
+    test_generic_receipt_pending32(0);
+    test_generic_receipt_pending32(15);
+    test_generic_receipt_pending32(31);
+    test_generic_receipt_entry_rejections();
+    test_generic_receipt_mixed_unlink();
+    test_generic_receipt_crossframe_continuation();
     test_cleanup_receipt_transfer_retry();
     test_entry_bootstrap_failures();
     test_entry_refuses_join_batch_knob();
