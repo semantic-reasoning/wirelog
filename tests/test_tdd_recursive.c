@@ -4157,6 +4157,143 @@ extern int wl_columnar_eval_test_initializer(unsigned, wl_col_session_t *,
 extern void (*wl_columnar_eval_test_initializer_boundary)(unsigned, unsigned,
     uint32_t, wl_col_session_t *);
 
+static unsigned bdx_admission_worker;
+static bool bdx_admission_hit, bdx_earlier_head_prepared;
+static uint64_t bdx_admission_limit;
+static wl_columnar_memory_mode_t bdx_admission_mode;
+
+static void
+deny_bdx_head_admission(unsigned mode, unsigned phase, uint32_t worker,
+    wl_col_session_t *coord)
+{
+    if (mode != 3 || phase != 0 || worker != bdx_admission_worker)
+        return;
+    bdx_admission_hit = true;
+    wl_columnar_eval_test_initializer_boundary = NULL;
+    col_rel_t *first = session_find_rel(&coord->tdd_workers[0], "tc");
+    bdx_earlier_head_prepared = worker == 0
+        || (first && first->memory_governor == coord->memory_governor
+        && first->row_scratch);
+    wl_columnar_memory_governor_t *governor =
+        wl_columnar_memory_governor_ref_get(coord->memory_governor);
+    bdx_admission_limit = atomic_load_explicit(&governor->usable_bytes,
+            memory_order_relaxed);
+    bdx_admission_mode = governor->mode;
+    governor->mode = WL_COLUMNAR_MEMORY_MODE_ENFORCING;
+    atomic_store_explicit(&governor->usable_bytes,
+        wl_columnar_memory_reserved(governor), memory_order_relaxed);
+}
+
+static void
+test_bdx_head_admission_retry(unsigned refused_worker)
+{
+    TEST("BDX seeded head admission: early/late refusal, cleanup and retry");
+    wirelog_error_t err;
+    wirelog_program_t *prog = wirelog_parse_string(
+        ".decl edge(x: int32, y: int32)\n"
+        ".decl tc(x: int32, y: int32)\n"
+        "tc(x,y) :- edge(x,y).\n"
+        "tc(x,z) :- tc(x,y), tc(y,z).\n", &err);
+    wl_plan_t *plan = NULL;
+    wl_session_t *session = NULL;
+    int64_t *edges = NULL;
+    col_rel_t *unowned = NULL;
+    const char *failure = NULL;
+    bdx_admission_worker = refused_worker;
+    bdx_admission_hit = bdx_earlier_head_prepared = false;
+#define BDX_ADMIT_CHECK(condition, message) \
+        do { if (!(condition)) { failure = message; goto cleanup; } } while (0)
+    BDX_ADMIT_CHECK(prog, "parse");
+    wl_fusion_apply(prog, NULL);
+    wl_jpp_apply(prog, NULL);
+    wl_sip_apply(prog, NULL);
+    BDX_ADMIT_CHECK(wl_plan_from_program(prog, &plan) == 0, "plan");
+    BDX_ADMIT_CHECK(wl_session_create(wl_backend_columnar(), plan, 2,
+        &session) == 0, "session");
+    wl_col_session_t *coord = COL_SESSION(session);
+    BDX_ADMIT_CHECK(wl_columnar_session_idb_placeholder_new(coord, "tc",
+        &unowned) == 0 && session_add_rel(coord, unowned) == 0,
+        "register seed head");
+    unowned = NULL;
+    int64_t seeds[] = { 1001, 0, 1000, 1001 };
+    BDX_ADMIT_CHECK(wl_session_insert(session, "tc", seeds, 2, 2) == 0,
+        "seed head");
+    /* Cross the default adaptive threshold without changing the model. */
+    edges = calloc(8192u * 2u, sizeof(*edges));
+    BDX_ADMIT_CHECK(edges, "edges");
+    for (unsigned i = 0; i < 8192; i++)
+        edges[2 * i + 1] = 1;
+    BDX_ADMIT_CHECK(wl_session_insert(session, "edge", edges, 8192, 2) == 0,
+        "insert edges");
+    uint32_t si = 0;
+    while (si < plan->stratum_count && !plan->strata[si].is_recursive)
+        si++;
+    BDX_ADMIT_CHECK(si < plan->stratum_count, "recursive stratum");
+    const wl_plan_stratum_t *sp = &plan->strata[si];
+    BDX_ADMIT_CHECK(wl_columnar_eval_test_hybrid_init(sp, coord, 2) == 0
+        && wl_columnar_eval_test_hybrid_cleanup(coord) == 0,
+        "warm infrastructure");
+    wl_columnar_memory_governor_t *governor =
+        wl_columnar_memory_governor_ref_get(coord->memory_governor);
+    uint64_t reserved = wl_columnar_memory_reserved(governor);
+    col_rel_t *head = session_find_rel(coord, "tc");
+    uint64_t view = head->view_generation, storage = head->storage_generation;
+    int64_t **columns = head->columns;
+    coord->tdd_audit.enabled = true;
+    wl_columnar_eval_test_initializer_boundary = deny_bdx_head_admission;
+    int rc = col_eval_stratum_tdd(sp, coord, si);
+    wl_columnar_eval_test_initializer_boundary = NULL;
+    if (bdx_admission_hit) {
+        governor->mode = bdx_admission_mode;
+        atomic_store_explicit(&governor->usable_bytes, bdx_admission_limit,
+            memory_order_relaxed);
+    }
+    BDX_ADMIT_CHECK(bdx_admission_hit && bdx_earlier_head_prepared
+        && rc == ENOSPC && coord->memory_budget_denied,
+        "head admission refusal or prior worker preparation");
+    BDX_ADMIT_CHECK(coord->tdd_audit.strategy
+        && strcmp(coord->tdd_audit.strategy, "bdx") == 0
+        && coord->tdd_audit.selected_workers == 2
+        && coord->tdd_audit.submitted_tasks == 0
+        && coord->tdd_workers_count == 0
+        && wl_columnar_memory_reserved(governor) == reserved,
+        "refusal dispatched tasks or leaked cohort credit");
+    BDX_ADMIT_CHECK(head->columns == columns && head->nrows == 2
+        && head->view_generation == view && head->storage_generation == storage
+        && col_rel_get(head, 0, 0) == 1001 && col_rel_get(head, 1, 0) == 1000
+        && col_rel_storage_alias_borrow_count(head) == 0,
+        "refusal changed coordinator seeds or retained aliases");
+    coord->memory_budget_denied = false;
+    BDX_ADMIT_CHECK(col_eval_stratum_tdd(sp, coord, si) == 0
+        && coord->tdd_audit.submitted_tasks >= 2
+        && coord->tdd_audit.completed_rounds > 0
+        && coord->tdd_workers_count == 0 && head->nrows == 6,
+        "same-session retry");
+    const int64_t expected[][2] = {
+        { 0, 1 }, { 1001, 0 }, { 1001, 1 },
+        { 1000, 1001 }, { 1000, 0 }, { 1000, 1 }
+    };
+    for (unsigned i = 0; i < 6; i++) {
+        unsigned matches = 0;
+        for (uint32_t row = 0; row < head->nrows; row++)
+            matches += col_rel_get(head, row, 0) == expected[i][0]
+                && col_rel_get(head, row, 1) == expected[i][1];
+        BDX_ADMIT_CHECK(matches == 1, "retry exact tuples");
+    }
+cleanup:
+    wl_columnar_eval_test_initializer_boundary = NULL;
+    free(edges);
+    col_rel_destroy(unowned);
+    wl_session_destroy(session);
+    wl_plan_free(plan);
+    wirelog_program_free(prog);
+    if (failure) {
+        FAIL(failure); return;
+    }
+    PASS();
+#undef BDX_ADMIT_CHECK
+}
+
 #ifdef WL_TEST_ALLOC_WRAP
 static unsigned initializer_fault_mode, initializer_fault_phase;
 static bool initializer_hold_worker, initializer_fault_hit,
@@ -5485,6 +5622,8 @@ test_wide_dedup_hash_parity(uint32_t width)
 int
 main(void)
 {
+    test_bdx_head_admission_retry(0);
+    test_bdx_head_admission_retry(1);
     TEST("wide dedup hash: 9 columns match one-shot without allocation");
     if (test_wide_dedup_hash_parity(9) == 0) PASS();
     else FAIL("9-column streaming parity or allocation");
