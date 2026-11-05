@@ -2127,17 +2127,81 @@ rows, since a smaller result makes the bulk reserve a no-op.
 cache-clear case proves that clearing releases exactly the output's token.
 A full report-level reconciliation for join outputs is not covered.
 
-## 10c. Plain STEP completion recovery (#1713)
+## 10c. Plain STEP completion recovery (#1713, #2329)
 
-When a nonrecursive TDD plain `STEP` has merged worker results but checked
-relation finalization or compaction returns `EBUSY`, the coordinator retains a
-bounded scalar completion cursor. A later public `STEP` or `SNAPSHOT` resumes
-that cursor before evaluating or emitting anything else; completed worker
-publication is not replayed. Relation and alias readers therefore keep their
-rows, generations, provenance, and reservations unchanged across refusal.
-Input and compound mutations remain refused while completion is pending. The
-continuation is limited to post-merge nonrecursive completion; arbitrary
-mid-operator or partial-merge rollback is outside this contract.
+A public `STEP` that starts with no delta callback and no delta observer can
+retain a bounded scalar completion cursor (`plain_step_completion_pending`).
+It is armed at these points:
+
+- At W>=2, in `col_eval_stratum_tdd_nonrecursive` only: after workers evaluated
+  a partitioned nonrecursive stratum and their results merged, before the
+  workers retire (phase `FINALIZE_NONREC`). A recursive stratum does not arm
+  it. Neither does a nonrecursive stratum evaluated through `col_eval_stratum`,
+  including its per-relation parallel path
+  (`wl_columnar_eval_nonrec_relation_parallel`).
+- At W=1, after each stratum commits (phase `EVALUATE_REMAINING`).
+- At any worker count, just before compaction (phase `COMPACT`).
+
+A failure in worker evaluation or in the merge arms nothing. If an earlier
+stratum of the same `STEP` already armed the cursor, it stays where it was.
+
+The cursor is kept for every nonzero return, not only `EBUSY`. The caller sees
+that return from `STEP` or `SNAPSHOT`. These are the codes traced at each
+point:
+
+- Worker retirement (`tdd_cleanup_workers`): `EBUSY` when a reader holds a
+  worker relation or a filter-cache pin is live. `EINVAL`, `EFAULT` and
+  `EOVERFLOW` report a broken internal invariant.
+- Finalization (`wl_columnar_eval_delta_consolidate`): `ENOSPC` with
+  `wl_session_budget_denied` set when the memory budget refuses it, `ENOMEM`,
+  `EBUSY`, `EINVAL`, and `ENOBUFS` or `EOVERFLOW` from frame admission.
+- A later stratum: whatever its evaluator returns. That stratum runs again on
+  retry; strata before it do not.
+- Compaction (`col_rel_compact_many`): `EBUSY`, `EAGAIN`, `EOVERFLOW`,
+  `EINVAL`, `EFAULT`. It does not return `ENOMEM` or `ENOSPC`: a failed
+  bookkeeping allocation, a denied admission and a failed buffer preparation
+  leave the relation as it was and report success, except that a refused
+  rollback reports `EAGAIN`.
+
+The publication cutoff in `col_session_step_impl` cannot fail while a cursor
+exists, because a session with evaluation control never arms one.
+
+A later public `STEP` or `SNAPSHOT` first runs its entry checks, which can
+return their own error with the cursor unchanged. It then resumes the cursor
+before evaluating anything else or emitting anything. Completed worker
+publication and relations already finalized are not repeated. A `SNAPSHOT`
+whose resume fails calls no tuple callback.
+
+A finalization refused before it publishes leaves its target's rows,
+generations and provenance unchanged. A refused worker retirement does not
+change coordinator relation rows. A refused compaction keeps every relation's
+rows, but members of the batch already compacted keep their new storage.
+
+While the cursor is set, `col_session_insert`,
+`col_session_insert_incremental`, `col_session_remove`,
+`col_session_remove_incremental` and `col_session_make_compound` return
+`EBUSY` once their argument and sealed-input checks pass. A zero-row insert or
+remove returns 0 and changes no relation. The public `wl_session_insert` and
+`wl_session_remove` clear `wl_session_budget_denied` before the backend call,
+so a refused or zero-row call clears it too: read the flag right after `STEP`
+or `SNAPSHOT`.
+
+Input stays refused because the session holds an uncommitted evaluation. After
+a merge, the relation holds rows that are neither normalized nor counted as
+completed, and a first evaluation that started over would keep them. This
+protection exists only where a cursor is armed: #2336 tracks a recursive
+stratum at W>=2, whose refused final normalization arms nothing.
+
+The cursor clears in two places only: the commit block of a `STEP`, or of the
+drain inside a `SNAPSHOT`, that succeeds, and a stratum that reaches its
+iteration cap. A `SNAPSHOT` can still fail after its drain has cleared the
+cursor. So a failure that repeats on every retry refuses input until the
+session is destroyed. A budget refusal at finalization is an ordinary
+production outcome: it can repeat like this unless other users of a shared
+governor release memory. `wl_session_destroy` needs no prior retry, but it
+aborts if a reader still blocks worker retirement. There is no reset.
+
+Arbitrary mid-operator or partial-merge rollback is outside this contract.
 
 ## 10d. TDD coverage assertion migration (#1396, unit 1)
 

@@ -226,8 +226,8 @@ wl_session_memory_governor(wl_session_t *session);
  * Returns:
  *    0 on success.
  *    ENOSPC if the compound arena is saturated.
- *    EBUSY if the compound arena is temporarily frozen, an observed step is
- *    pending retry, or a delta callback is running.
+ *    EBUSY if the compound arena is temporarily frozen, an observed or plain
+ *    step is pending retry, or a delta callback is running.
  *    ENOMEM on allocation failure.
  *    EINVAL or another errno-style value for invalid arguments/backend errors.
  */
