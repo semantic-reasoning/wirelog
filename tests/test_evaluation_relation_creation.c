@@ -3125,6 +3125,272 @@ operator_reserve_boundaries(void)
     wl_columnar_memory_governor_ref_release(watched); watched = NULL;
 }
 
+/* These are real operator-constructor boundary witnesses, not an independent
+ * literal fee/source oracle: operator copies use8 bytes, legacy copies16. */
+static wl_columnar_memory_reservation_t *install_tokens[3];
+static col_rel_t *install_relation;
+static unsigned install_reserves, install_commits, install_mode;
+static uint32_t install_width;
+static uint64_t install_at, install_external_at, install_stop;
+static bool install_hit, install_external_hit;
+
+static void
+operator_install_contents(col_rel_t *r)
+{
+    CHECK(r && r->schema_ok && r->ncols == install_width && !r->nrows &&
+        r->capacity == COL_REL_INIT_CAP && !strcmp(r->name, "$install"));
+    CHECK(r->storage_owner == r &&
+        r->storage_owner_identity == r->relation_identity &&
+        r->storage_owner_generation == r->storage_generation &&
+        r->relation_identity && !col_rel_storage_alias_borrow_count(r));
+    col_rel_t *canonical = NULL;
+    CHECK(!col_rel_storage_owner_resolve(r, &canonical) && canonical == r);
+    CHECK(r->memory_governor == watched &&
+        !atomic_load_explicit(&r->source_access.state, memory_order_acquire) &&
+        !atomic_load_explicit(&r->descriptor_access.state,
+        memory_order_acquire));
+    CHECK(!strcmp(r->schema.format, "+s") &&
+        r->schema.n_children == install_width);
+    if (install_width)
+        CHECK(r->column_types[0] == WIRELOG_TYPE_INT64 &&
+            !strcmp(r->schema.children[0]->name, "col0") &&
+            !strcmp(r->schema.children[0]->format, "l"));
+    wl_columnar_memory_reservation_t *tokens[] = {
+        &r->descriptor_reservation, &r->metadata_reservation,
+        &r->retained_reservation
+    };
+    uint64_t bytes[3];
+    credits("$install", install_width, COL_REL_INIT_CAP, false,
+        &bytes[0], &bytes[1], &bytes[2]);
+    bytes[1] += install_width * sizeof(wirelog_column_type_t);
+    const uint64_t recorded[] = {r->descriptor_reserved_bytes,
+                                 r->metadata_reserved_bytes,
+                                 r->retained_reserved_bytes};
+    for (unsigned i = 0; i < 3; ++i) {
+        CHECK(tokens[i]->identity == tokens[i]);
+        if (watched && bytes[i]) {
+            CHECK(tokens[i]->bytes == bytes[i] && recorded[i] == bytes[i] &&
+                tokens[i]->governor ==
+                wl_columnar_memory_governor_ref_get(watched) &&
+                atomic_load_explicit(&tokens[i]->state,
+                memory_order_acquire) ==
+                WL_COLUMNAR_MEMORY_RESERVATION_COMMITTED &&
+                atomic_load_explicit(&tokens[i]->owner_bits,
+                memory_order_acquire) == (uint64_t)(uintptr_t)r);
+        } else CHECK(!recorded[i] && !tokens[i]->bytes &&
+                atomic_load_explicit(&tokens[i]->state,
+                memory_order_acquire) == WL_COLUMNAR_MEMORY_RESERVATION_EMPTY);
+    }
+    if (watched) CHECK(!wl_columnar_memory_governor_ref_is_sole(watched));
+}
+
+static void
+operator_install_observe(wl_evaluation_control_t *ctl,
+    wl_columnar_memory_reservation_t *token, unsigned phase)
+{
+    (void)ctl;
+    if (phase != WL_COLUMNAR_MEMORY_GOVERNOR_RESERVED) return;
+    CHECK(install_reserves < 3 && token->identity == token && token->bytes);
+    install_tokens[install_reserves++] = token;
+}
+
+static void
+operator_install_committed(wl_evaluation_control_t *ctl, unsigned stage)
+{
+    (void)ctl;
+    CHECK(stage < install_reserves && stage == install_commits);
+    wl_columnar_memory_reservation_t *token = install_tokens[stage];
+    CHECK(token->identity == token && atomic_load_explicit(&token->state,
+        memory_order_acquire) == WL_COLUMNAR_MEMORY_RESERVATION_COMMITTED);
+    col_rel_t *r = (col_rel_t *)(uintptr_t)atomic_load_explicit(
+        &token->owner_bits, memory_order_acquire);
+    CHECK(r && (!install_relation || install_relation == r));
+    install_relation = r;
+    ++install_commits;
+}
+
+static void
+operator_install_checkpoint(wl_evaluation_control_t *ctl, uint64_t work)
+{
+    if (attempt_restarted) {
+        ++attempt_successor_callbacks;
+        return;
+    }
+    checkpoint(ctl, work);
+    if (work == 220) {
+        CHECK(!install_hit && install_commits == install_reserves &&
+            install_reserves == (watched ? install_width ? 3u : 2u : 0u));
+        install_hit = true;
+        install_at = seen;
+        /* These pointers still name the actual lexical ctx tokens here. */
+        for (unsigned i = 0; i < install_reserves; ++i)
+            CHECK(atomic_load_explicit(&install_tokens[i]->state,
+                memory_order_acquire) ==
+                WL_COLUMNAR_MEMORY_RESERVATION_COMMITTED);
+    } else if (install_hit && work == 128) {
+        CHECK(!install_external_hit && seen == install_at + 128);
+        install_external_hit = true;
+        install_external_at = seen;
+        if (watched) operator_install_contents(install_relation);
+    }
+    if (!install_stop || seen != install_stop) return;
+    if (install_mode == 0) wl_evaluation_control_request_cancel(ctl);
+    else if (install_mode == 1)
+        CHECK(wl_evaluation_control_charge(ctl, UINT64_MAX) == EOVERFLOW);
+    else attempt_restart(ctl);
+}
+
+static void
+operator_install_reset(void)
+{
+    install_relation = NULL;
+    install_reserves = install_commits = 0;
+    install_at = install_external_at = install_stop = 0;
+    install_hit = install_external_hit = false;
+    attempt_restarted = false; attempt_successor_callbacks = 0;
+    wl_columnar_memory_governor_test_checkpoint = operator_install_observe;
+    wl_columnar_relation_test_constructor_committed =
+        operator_install_committed;
+    wl_columnar_relation_test_work_checkpoint = operator_install_checkpoint;
+}
+
+static void
+operator_install_unhook(void)
+{
+    wl_columnar_memory_governor_test_checkpoint = NULL;
+    wl_columnar_relation_test_constructor_committed = committed;
+    wl_columnar_relation_test_work_checkpoint = checkpoint;
+    /* No lexical token pointer is inspected after its constructor returns. */
+    for (unsigned i = 0; i < 3; ++i) install_tokens[i] = NULL;
+    install_relation = NULL;
+}
+
+static void
+operator_install_success(col_rel_t *out, wl_evaluation_control_t *ctl,
+    uint64_t baseline)
+{
+    operator_install_contents(out);
+    CHECK(!retired && finish(ctl, 0) == seen);
+    col_rel_t *raw = col_rel_new_auto("$install", install_width);
+    const int64_t row = 42;
+    CHECK(raw && !strcmp(raw->schema.format, out->schema.format) &&
+        !col_rel_append_row(raw, &row) && !col_rel_append_row(out, &row) &&
+        raw->nrows == 1 && out->nrows == 1);
+    if (install_width) CHECK(raw->columns[0][0] == row &&
+            out->columns[0][0] == row);
+    CHECK(!col_rel_destroy_checked(raw) && !col_rel_destroy_checked(out) &&
+        reserved() == baseline &&
+        (!watched || wl_columnar_memory_governor_ref_is_sole(watched)));
+}
+
+static void
+operator_install_boundaries(void)
+{
+    const wirelog_column_type_t type = WIRELOG_TYPE_INT64;
+    for (unsigned governed = 0; governed < 2; ++governed) {
+        watched = governed ? governor() : NULL;
+        wl_columnar_memory_reservation_t held_peer;
+        wl_columnar_memory_reservation_init(&held_peer);
+        if (watched) {
+            CHECK(wl_columnar_memory_reserve(
+                    wl_columnar_memory_governor_ref_get(watched), 17,
+                    &held_peer));
+            CHECK(wl_columnar_memory_commit(&held_peer, &held_peer));
+        }
+        const uint64_t baseline = reserved();
+        for (install_width = 0; install_width < 2; ++install_width) {
+            wl_evaluation_control_t *ctl = control(0);
+            col_rel_t *out = NULL;
+            operator_install_reset();
+            external_out = &out;
+            CHECK(!wl_columnar_relation_new_typed_operator_attempt_controlled(
+                    "$install", install_width, install_width ? &type : NULL,
+                    watched, &out, ctl,
+                    wl_evaluation_control_active_attempt_id(ctl)));
+            external_out = NULL;
+            CHECK(install_hit && install_external_hit &&
+                install_commits == install_reserves);
+            const uint64_t install = install_at, external = install_external_at;
+            operator_install_unhook();
+            operator_install_success(out, ctl, baseline);
+            release(ctl);
+            const uint64_t limits[] = {install - 1, install, external - 1,
+                                       external};
+            for (unsigned boundary = 0; boundary < 4; ++boundary) {
+                ctl = control(limits[boundary]); out = NULL;
+                operator_install_reset();
+                external_out = &out;
+                const int rc =
+                    wl_columnar_relation_new_typed_operator_attempt_controlled(
+                    "$install", install_width, install_width ? &type : NULL,
+                    watched, &out, ctl,
+                    wl_evaluation_control_active_attempt_id(ctl));
+                external_out = NULL;
+                CHECK(install_hit == (boundary != 0) &&
+                    install_external_hit == (boundary == 3));
+                operator_install_unhook();
+                if (boundary == 3) {
+                    CHECK(!rc && out);
+                    operator_install_success(out, ctl, baseline);
+                } else {
+                    CHECK(rc == WL_EVALUATION_CONTROL_WORK_LIMIT && !out &&
+                        retired == (boundary == 0 ? 1u : 0u) &&
+                        reserved() == baseline && (!watched ||
+                        wl_columnar_memory_governor_ref_is_sole(watched)));
+                    if (boundary == 0 && watched)
+                        CHECK(retired_credit > baseline);
+                    CHECK(finish(ctl,
+                        rc) == (boundary ? install : install - 220));
+                }
+                operator_init_retry(ctl, install_width, baseline);
+                release(ctl);
+            }
+            for (unsigned site = 0; site < 2; ++site)
+                for (install_mode = 0; install_mode < 3; ++install_mode) {
+                    ctl = control(0); out = NULL;
+                    const uint64_t id =
+                        wl_evaluation_control_active_attempt_id(ctl);
+                    operator_install_reset();
+                    install_stop = site ? external : install;
+                    external_out = &out;
+                    const int rc =
+                        wl_columnar_relation_new_typed_operator_attempt_controlled
+                        (
+                        "$install", install_width, install_width ? &type : NULL,
+                        watched, &out, ctl, id);
+                    external_out = NULL;
+                    CHECK(install_hit && install_external_hit == (site != 0) &&
+                        install_commits == install_reserves);
+                    operator_install_unhook();
+                    CHECK(rc ==
+                        (install_mode == 0 ? WL_EVALUATION_CONTROL_CANCELLED :
+                        install_mode == 1 ? EOVERFLOW : EINVAL) && !out &&
+                        retired == (site ? 0u : 1u) && reserved() == baseline &&
+                        (!watched ||
+                        wl_columnar_memory_governor_ref_is_sole(watched)) &&
+                        !attempt_successor_callbacks);
+                    if (!site && watched) CHECK(retired_credit > baseline);
+                    if (attempt_restarted) {
+                        CHECK(attempt_old_report.attempt_id == id &&
+                            attempt_old_report.consumed == install_stop);
+                        CHECK(!wl_evaluation_control_finish(ctl, &owner, 0, 0));
+                        wl_evaluation_control_report_t successor;
+                        CHECK(!wl_evaluation_control_report(ctl, &successor) &&
+                            !successor.consumed);
+                    } else CHECK(finish(ctl, rc) == install_stop);
+                    attempt_restarted = false;
+                    operator_init_retry(ctl, install_width, baseline);
+                    release(ctl);
+                }
+        }
+        if (watched) {
+            CHECK(wl_columnar_memory_release(&held_peer) && !reserved());
+            wl_columnar_memory_governor_ref_release(watched);
+        }
+        watched = NULL;
+    }
+}
+
 static void
 join_typed_operator_fixtures(void)
 {
@@ -3512,6 +3778,7 @@ main(void)
     scalar_source_twins(300, true, true, false);
     operator_init_boundaries();
     operator_reserve_boundaries();
+    operator_install_boundaries();
     join_typed_operator_fixtures();
     sorted_stamp_cases();
     sorted_stamp_faults();

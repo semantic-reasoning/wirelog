@@ -15728,6 +15728,45 @@ wl_columnar_relation_constructor_attempt_bytes_operator(void *destination,
     return 0;
 }
 
+static bool
+wl_columnar_relation_constructor_reservation_move(
+    wl_columnar_memory_reservation_t *destination,
+    wl_columnar_memory_reservation_t *source)
+{
+    uint64_t destination_state;
+    uint64_t state;
+
+    if (!destination || !source || destination == source
+        || destination->identity != destination
+        || source->identity != source)
+        return false;
+    destination_state = atomic_load_explicit(&destination->state,
+            memory_order_acquire);
+    if (destination_state != WL_COLUMNAR_MEMORY_RESERVATION_EMPTY
+        && destination_state != WL_COLUMNAR_MEMORY_RESERVATION_RELEASED)
+        return false;
+    state = atomic_load_explicit(&source->state, memory_order_acquire);
+    if (state != WL_COLUMNAR_MEMORY_RESERVATION_RESERVED
+        && state != WL_COLUMNAR_MEMORY_RESERVATION_COMMITTED)
+        return false;
+    destination->governor = source->governor;
+    destination->bytes = source->bytes;
+    destination->transition_kind = source->transition_kind;
+    atomic_store_explicit(&destination->owner_bits,
+        atomic_load_explicit(&source->owner_bits, memory_order_relaxed),
+        memory_order_relaxed);
+    atomic_store_explicit(&destination->state, state, memory_order_release);
+    destination->identity = destination;
+    source->governor = NULL;
+    source->bytes = 0;
+    source->transition_kind = WL_COLUMNAR_MEMORY_TRANSITION_NONE;
+    atomic_store_explicit(&source->owner_bits, 0, memory_order_relaxed);
+    atomic_store_explicit(&source->state,
+        WL_COLUMNAR_MEMORY_RESERVATION_EMPTY, memory_order_release);
+    source->identity = source;
+    return true;
+}
+
 static int
 wl_columnar_relation_constructor_attempt_build_operator(const char *name,
     uint32_t ncols, uint32_t initial_capacity, bool timestamps,
@@ -16178,14 +16217,25 @@ wl_columnar_relation_constructor_attempt_build_operator(const char *name,
     rc = wl_columnar_relation_constructor_attempt_charge(control, attempt_id,
             WL_COLUMNAR_RELATION_CONSTRUCTOR_ATTEMPT_INSTALL_WORK);
     if (rc) goto done;
-    rc = wl_columnar_relation_constructor_attempt_tail(control, attempt_id,
+    uint64_t install_active =
+        wl_evaluation_control_active_attempt_id(control);
+    if (!install_active || install_active != attempt_id) {
+        rc = EINVAL; goto done;
+    }
+#ifdef WL_SESSION_TEST_HOOKS
+    if (wl_columnar_relation_test_work_checkpoint)
+        wl_columnar_relation_test_work_checkpoint(control,
             WL_COLUMNAR_RELATION_CONSTRUCTOR_ATTEMPT_INSTALL_WORK);
+#endif
+    rc = wl_evaluation_control_charge_attempt(control, attempt_id, 0);
     if (rc) goto done;
-    if ((ctx.admitted[0] && !wl_columnar_memory_reservation_move(
+    if ((ctx.admitted[0] && !wl_columnar_relation_constructor_reservation_move(
             &r->descriptor_reservation, &ctx.tokens[0]))
-        || (ctx.admitted[1] && !wl_columnar_memory_reservation_move(
+        || (ctx.admitted[1] &&
+        !wl_columnar_relation_constructor_reservation_move(
             &r->metadata_reservation, &ctx.tokens[1]))
-        || (ctx.admitted[2] && !wl_columnar_memory_reservation_move(
+        || (ctx.admitted[2] &&
+        !wl_columnar_relation_constructor_reservation_move(
             &r->retained_reservation, &ctx.tokens[2])))
         abort();
     r->name = ctx.name; r->ncols = ncols; r->capacity = initial_capacity;

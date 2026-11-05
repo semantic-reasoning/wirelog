@@ -2150,3 +2150,47 @@ body's scan once per independently specified capture round.
 Whole fixed constructor/public return, static recursive recognizer, O0/O2,
 retirement-parent, owner predicate, cutoff and general policy source obligations
 remain separate required work.
+
+### Constructor installation completion
+
+The selected operator constructor uses one private checked reservation move at
+its three existing INSTALL sites. It retains the NULL/distinct/native identity
+and EMPTY/RELEASED destination, RESERVED/COMMITTED source checks, every payload
+and atomic transfer, and the original memory orders. Its actual constructor
+history has EMPTY destinations and COMMITTED sources:41 body slots plus9 call
+slots per selected token. The INSTALL tail expands locally with the same
+saved-ID query, work220 hook and original-ID zero charge. No callback or poll
+splits the moves and installed field/reference/output transfer. Shared governor
+move and legacy constructor behavior remain unchanged.
+
+Actual INSTALL source is198 current plus20 for its one outgoing first EXTERNAL
+refusal:218/220. A successful EXTERNAL admission ends that bridge; installed
+checked destruction uses its existing named terminal qualification and receives
+no expired private-context token credit. The correlated post-INSTALL window
+through the immediate MAP/JOIN saved-ID zero cut is229/256. Direct typed
+MAP/JOIN caller source fits98/192. Full scalar-source native/HELD checks add37
+explicit prefix slots, yielding the corrected135/192 bound against that same
+already named parent payment; the original98 projection did not include that
+prefix. Cache BUILD uses its actual VALIDATE192 payment. Schema's original1
+semantic action does not establish a general fixed-source payment.
+
+Constructor tests observe genuine reservation and commit events, all three
+installed token self-identities/owners, canonical storage owner and governor
+reference, typed schema and literal-row parity. NULL-governor and width0 cases
+exercise skipped moves with a real17-byte peer on governed routes. INSTALL220
+and first EXTERNAL128 exact/one-short boundaries are witnessed from the actual
+operator construction schedule; these measured boundary positions are not an
+independent fee or source oracle. Both existing hooks exercise cancellation,
+accounting overflow and legal finish/reset/new-attempt turnover, with zero
+successor work and real reset/retry. Private failure retires one context;
+post-install failure uses checked installed disposal and never retires that
+context again. Peer credit and sole-reference checks verify final refund.
+Physical-free-before-credit ordering is established by the emitted source
+proof; these tests introduce no release hook or between-move failure point.
+
+These bounds qualify the selected INSTALL and immediate caller seams. Full
+nested governor/source stages, first-COMMIT predecessor, failed-context outer
+and multi-token windows, and remaining consumer/coordinator/compiler/receipt
+and policy obligations remain separate required work. Integrated adoption
+requires fresh source/header/native carry; this is no whole-constructor or
+PR Ready qualification.
