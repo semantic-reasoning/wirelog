@@ -17265,6 +17265,7 @@ test_worker_image_run_guard(void)
     TEST("worker refuses an image whose runs end past the pass start");
     if (saved)
         snprintf(saved_value, sizeof(saved_value), "%s", saved);
+    memset(&run_guard, 0, sizeof(run_guard));
     if (wl_mutex_init(&run_guard.mutex) != 0) {
         FAIL("guard probe mutex");
         return;
@@ -17500,6 +17501,10 @@ main(void)
     test_worker_image_run_guard();
     test_worker_failure_recovery(2);
     test_worker_failure_recovery(8);
+    /* Stale state from an earlier run must not satisfy the guard test. */
+    run_guard.other = 1;
+    run_guard.count = RUN_GUARD_SLOTS;
+    test_worker_image_run_guard();
 #endif
 #ifdef WL_SESSION_TEST_HOOKS
     test_governed_retraction_transaction();
