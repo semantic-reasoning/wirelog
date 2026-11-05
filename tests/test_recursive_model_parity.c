@@ -22,6 +22,7 @@
 #include "../wirelog/passes/jpp.h"
 #include "../wirelog/passes/sip.h"
 #include "../wirelog/session.h"
+#include "../wirelog/util/log.h"
 #include "../wirelog/wirelog.h"
 #include "plan_fixture.h"
 
@@ -29,6 +30,14 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+#ifdef _WIN32
+#include <process.h>
+#define getpid _getpid
+#define strdup _strdup
+#else
+#include <unistd.h>
+#endif
 
 #ifdef _WIN32
 static int
@@ -637,6 +646,25 @@ static const char program_m63[]
     "b(x0,x0) :- l0(x0,x1), a(x2,x1), !e2(x0,x1,x0).\n"
     "a(x1,x0) :- b(x0,x1), b(x1,x2), a(x3,x4), !l0(x4,x3).\n";
 
+/* #2241: the original two-round program.  Before #2334, an empty a
+ * placeholder had no columns, so the cross product below produced four
+ * columns while the ANTIJOIN correctly requested col4 and col5. */
+static const char program_cross_antijoin[]
+    = ".decl e0(c0: int64, c1: int64, c2: int64)\n"
+    ".decl e1(c0: int64, c1: int64)\n"
+    ".decl e2(c0: int64, c1: int64, c2: int64)\n"
+    ".decl e3(c0: int64, c1: int64)\n"
+    ".decl a(c0: int64, c1: int64)\n"
+    ".decl b(c0: int64, c1: int64)\n"
+    ".decl l0(c0: int64, c1: int64)\n"
+    "l0(x0,x1) :- e1(x0,x1).\n"
+    "b(x0,x0) :- e0(x0,x0,x0), e2(x0,x0,x0).\n"
+    "a(x3,x0) :- l0(x0,x1), e0(x1,x2,x3), !l0(x0,x1).\n"
+    "b(x0,x2) :- e1(x0,x0), e3(x1,x2).\n"
+    "a(x0,x1) :- b(x0,x1), !e3(x0,x1), x1 < x0.\n"
+    "b(x0,x0) :- l0(x0,x1), a(x2,x1), !e2(x0,x1,x0).\n"
+    "a(x1,x0) :- b(x0,x1), b(x1,x2), a(x3,x4), !l0(x4,x3).\n";
+
 /* m63 with one more rule for b that joins e1 as its right relation.  A
  * relation that a rule of the same plan joins on the right is never skipped,
  * so the static rule b(x0,x2) :- e1(x0,x0), e3(x1,x2) is evaluated at every
@@ -880,6 +908,95 @@ test_static_rule_still_skipped(void)
     }
 }
 
+/* Capture the production logger: the original bug returned the right
+ * model despite unresolved keys, so model equality alone is insufficient.
+ * A marker proves the sink and ERROR level were active; scan every line. */
+static void
+test_cross_product_antijoin(void)
+{
+    const char *old_spec = getenv("WL_LOG");
+    const char *old_file = getenv("WL_LOG_FILE");
+    char *saved_spec = old_spec ? strdup(old_spec) : NULL;
+    char *saved_file = old_file ? strdup(old_file) : NULL;
+    char path[96];
+    bool capture_ok = false;
+    bool marker = false;
+    bool key_error = false;
+    snprintf(path, sizeof(path), "wirelog-2241-%ld.log", (long)getpid());
+    if ((old_spec && !saved_spec) || (old_file && !saved_file)) {
+        free(saved_spec);
+        free(saved_file);
+        TEST("cross-product ANTIJOIN: log environment");
+        FAIL("cannot save log environment");
+        return;
+    }
+    /* wl_log_init appends: discard a stale file from a reused process ID. */
+    remove(path);
+    if (setenv("WL_LOG", "JOIN:1", 1) != 0
+        || setenv("WL_LOG_FILE", path, 1) != 0)
+        goto done;
+    if (wl_log_init() != 0)
+        goto done;
+    WL_LOG(WL_LOG_SEC_JOIN, WL_LOG_ERROR, "2241 capture active");
+
+    /* Round one: only b(6,2) and the two l0 rows.  Round two adds
+     * b(6,1) and b(6,6) from e3, then a(6,1), b(0,0), and the
+     * last rule derives a(6,6) and a(0,0).
+     * The remaining l0 rows are exactly the newly inserted e1 rows. */
+    check_fixture("cross-product ANTIJOIN: original two-round model",
+        program_cross_antijoin,
+        "e0 4 2 0; e0 0 5 4; e0 5 3 6; e1 0 1; e1 6 6; "
+        "e2 6 6 5; e3 6 2; e3 0 2|"
+        "e0 2 7 3; e0 4 3 4; e0 1 0 1; e1 4 5; e1 2 7; "
+        "e2 1 5 1; e2 5 5 2; e3 0 6; e3 7 1",
+        "b(6,2) l0(0,1) l0(6,6)|"
+        "a(0,0) a(6,1) a(6,6) b(0,0) b(6,1) b(6,2) b(6,6) "
+        "l0(0,1) l0(2,7) l0(4,5) l0(6,6)");
+    /* A nonempty product with keys distinct from col0.  Negation rejects
+     * (8,7), keeps (10,9), then the second round rejects that row too.
+     * Resolving either left key to col0 would keep the rejected rows. */
+    check_fixture("cross-product ANTIJOIN: nonzero keys filter rows",
+        ".decl e(x: int64, y: int64)\n"
+        ".decl f(x: int64, y: int64)\n"
+        ".decl ban(x: int64, y: int64)\n"
+        ".decl out(x: int64, y: int64)\n"
+        "out(v,u) :- e(x,y), e(y,z), f(u,v), !ban(v,u).\n",
+        "e 1 2; e 2 3; f 7 8; f 9 10; ban 8 7|ban 10 9",
+        "out(10,9)|");
+    wl_log_shutdown();
+    FILE *log = fopen(path, "r");
+    if (log) {
+        char line[1024];
+        while (fgets(line, sizeof(line), log)) {
+            if (strstr(line, "2241 capture active"))
+                marker = true;
+            if (strstr(line, "unresolved"))
+                key_error = true;
+        }
+        capture_ok = !ferror(log);
+        if (fclose(log) != 0)
+            capture_ok = false;
+    }
+done:
+    wl_log_shutdown();
+    if (saved_spec)
+        setenv("WL_LOG", saved_spec, 1);
+    else
+        unsetenv("WL_LOG");
+    if (saved_file)
+        setenv("WL_LOG_FILE", saved_file, 1);
+    else
+        unsetenv("WL_LOG_FILE");
+    free(saved_spec);
+    free(saved_file);
+    remove(path);
+    TEST("cross-product ANTIJOIN: no unresolved runtime keys");
+    if (capture_ok && marker && !key_error)
+        PASS();
+    else
+        FAIL("log capture failed or a JOIN key did not resolve");
+}
+
 /* The fixtures above are evaluated by the parallel strategy they target:
  * a check that only passed because the stratum ran on one worker would
  * test nothing about #2127. */
@@ -933,6 +1050,7 @@ main(void)
     test_step_with_static_rule_evaluated();
     test_static_rule_still_skipped();
     test_parallel_strategy_runs();
+    test_cross_product_antijoin();
     knobs_restore();
     printf("\n%d tests: %d passed, %d failed\n", tests_run, tests_passed,
         tests_failed);
