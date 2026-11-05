@@ -1575,6 +1575,10 @@ wl_columnar_join_pipeline_numeric_funding_work(
     const wl_columnar_join_host_t *h = wl_columnar_join_host_valid(r, r->frame);
     if (!h) return EINVAL;
     *work = wl_columnar_join_pipeline_phase_work(h, r->semantic_result);
+    if (h->phase == WL_COLUMNAR_JOIN_HOST_ACK)
+        *work += WL_COLUMNAR_JOIN_PIPELINE_ACK_PROOF_WORK
+            + WL_COLUMNAR_JOIN_PIPELINE_ACK_PRECOMMIT_WORK
+            + WL_COLUMNAR_JOIN_PIPELINE_ACK_COMMIT_WORK;
     return 0;
 }
 
@@ -2201,26 +2205,6 @@ wl_columnar_join_host_forward(wl_columnar_join_host_t *h)
             ? WL_COLUMNAR_JOIN_HOST_TRANSFORM_RETIRE :
                 WL_COLUMNAR_JOIN_HOST_ACK;
         return rc;
-    case WL_COLUMNAR_JOIN_HOST_ACK:
-        WL_COLUMNAR_JOIN_HOST_HOOK(h,
-            WL_COLUMNAR_JOIN_PIPELINE_TEST_BEFORE_ACK);
-        rc = wl_columnar_join_batch_prepare_sink_commit_ack(&h->prepare,
-                h->output,
-                h->base, h->generation, &h->writer, &h->source, &h->extent, r);
-        if (rc) {
-            /* The producer API reports errno stops; session evaluation keeps
-             * the initiating control's cancellation/work-limit result. */
-            int stop = wl_columnar_join_host_original(h, 0);
-            if (stop) return stop;
-        }
-        if (!rc) {
-            h->pending = NULL; h->phase = h->streaming
-                ? WL_COLUMNAR_JOIN_HOST_TRANSFORM_RETIRE :
-                WL_COLUMNAR_JOIN_HOST_PRODUCE;
-            WL_COLUMNAR_JOIN_HOST_HOOK(h,
-                WL_COLUMNAR_JOIN_PIPELINE_TEST_AFTER_ACK);
-        }
-        return rc;
     case WL_COLUMNAR_JOIN_HOST_FINAL_UNARY:
         r->join_host_tail_count = h->tail_end - r->cursor;
         rc = wl_columnar_eval_stack_unary_begin_attempt_owned(r->frame,
@@ -2637,6 +2621,36 @@ wl_columnar_join_pipeline_numeric_delta_owned(const void *owner,
     return 0;
 }
 
+static wl_columnar_join_batch_sink_ack_result_t
+wl_columnar_join_pipeline_host_ack(wl_columnar_join_host_t *h,
+    wl_evaluation_control_t *funding, uint64_t funding_id)
+{
+    int rc = wl_evaluation_control_charge_attempt(funding, funding_id,
+            WL_COLUMNAR_JOIN_PIPELINE_ACK_PROOF_WORK);
+    if (rc) return (wl_columnar_join_batch_sink_ack_result_t){rc, true};
+    WL_COLUMNAR_JOIN_HOST_HOOK(h,
+        WL_COLUMNAR_JOIN_PIPELINE_TEST_BEFORE_ACK);
+    wl_columnar_join_batch_sink_ack_result_t result =
+        wl_columnar_join_batch_prepare_sink_commit_ack_funded(&h->prepare,
+            h->output, h->base, h->generation, &h->writer, &h->source,
+            &h->extent, h->parent, funding, funding_id);
+    if (result.funding_refused) return result;
+    rc = result.protocol;
+    if (rc) {
+        int stop = wl_columnar_join_host_original(h, 0);
+        if (stop) return (wl_columnar_join_batch_sink_ack_result_t){stop,
+                                                                    false};
+    }
+    if (!rc) {
+        h->pending = NULL; h->phase = h->streaming
+            ? WL_COLUMNAR_JOIN_HOST_TRANSFORM_RETIRE :
+            WL_COLUMNAR_JOIN_HOST_PRODUCE;
+        WL_COLUMNAR_JOIN_HOST_HOOK(h,
+            WL_COLUMNAR_JOIN_PIPELINE_TEST_AFTER_ACK);
+    }
+    return (wl_columnar_join_batch_sink_ack_result_t){rc, false};
+}
+
 static int
 wl_columnar_join_pipeline_numeric_step_body(
     wl_columnar_eval_plan_numeric_attempt_t *r,
@@ -2719,7 +2733,12 @@ wl_columnar_join_pipeline_numeric_step_body(
             || h->phase == WL_COLUMNAR_JOIN_HOST_CONSUMER_ACK;
         rc = wl_columnar_join_host_original(h, 1);
         if (!rc) {
-            rc = wl_columnar_join_host_forward(h);
+            if (h->phase == WL_COLUMNAR_JOIN_HOST_ACK) {
+                wl_columnar_join_batch_sink_ack_result_t result =
+                    wl_columnar_join_pipeline_host_ack(h, funding, funding_id);
+                if (result.funding_refused) return result.protocol;
+                rc = result.protocol;
+            } else rc = wl_columnar_join_host_forward(h);
             if (consumer && h->consumer_pending) return rc;
         }
         if (rc) wl_columnar_join_host_fail(h, rc);

@@ -22,6 +22,11 @@ int wl_columnar_join_pipeline_numeric_step(
 int wl_columnar_join_pipeline_numeric_step_funded(
     wl_columnar_eval_plan_numeric_attempt_t *, wl_evaluation_control_t *,
     uint64_t);
+enum {
+    WL_COLUMNAR_JOIN_PIPELINE_ACK_PROOF_WORK = 242,
+    WL_COLUMNAR_JOIN_PIPELINE_ACK_PRECOMMIT_WORK = 227,
+    WL_COLUMNAR_JOIN_PIPELINE_ACK_COMMIT_WORK = 115
+};
 int wl_columnar_join_pipeline_numeric_delta_owned(const void *,
     const wl_columnar_eval_stack_cleanup_frame_t *, bool *);
 enum {

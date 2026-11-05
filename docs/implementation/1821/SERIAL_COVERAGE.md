@@ -2074,3 +2074,44 @@ reset/retry. First RESERVE/descriptor allocation one-short boundaries preserve
 the allocation-failure canary; exact allocation admission reaches its real
 failure. Full nested governor windows, COMMIT/INSTALL, installed cleanup,
 multi-token and outer caller windows remain separate required qualifications.
+
+### Nonconsumer sink ACK source admissions
+
+The materializing host retains its original1, phase1, module256 and containing
+parent payments. Its nonconsumer ACK now admits three separate source actions:
+proof242 before the existing BEFORE_ACK hook, precommit227 after full canonical
+sink/native/source/extent/gate validation, and commit115 after the producer's
+read-only precommit. The last admission precedes callback-free extent and ACK
+publication. No persistent stage, permission, layout or new hook is introduced;
+the generic sink ACK and producer primitives remain unchanged.
+
+Actual local source bounds are229/242,221/227 and87/115. Complete changed
+windows through the real containing grant finish are37 for initial refusal,
+252 for second refusal,243 for third refusal and107 for success; the existing
+original-error remap suffix is bounded by48. Module success/refusal/error bounds
+are245/253/253 within its separate256. Refused admissions supply no credit;
+their fronts belong once to the preceding admitted action, or to module256 for
+the first action. The largest newly interruptible admission is242, within256.
+
+The ordinary production grant remains2496. Facade384, root384, composed384,
+module256 and phase1 total1409; the three ACK actions bring genuine successful
+consumption to1993. The checked quote585 observes phase1 plus584 source work;
+it is not another debit. The existing capture capacity3072 does not itself
+authorize a previously unsupported capture route.
+
+Public session tests reach the actual compiler-selected nonempty ACK and apply
+a one-shot grant at1650/1651,1877/1878 and1992/1993. They check exact admitted
+consumption, original1, precommit nonpublication, BEFORE/AFTER counts and genuine
+outer/inner PENDING states. A further BEFORE_ACK case cancels the actual live
+grant through the control API; only proof242 was admitted. Normal fresh grants
+consume both real pending results, retry without duplicate ACK generations and
+produce the same literal content as raw execution. The finished grant report
+stays intact through actual outer consumption; that checked outer consume
+authenticates its report and carries the protocol to the later inner consume.
+The numeric protocol field is assigned by inner consume, not by the preceding
+ACK return. No report reset, private phase or token state is fabricated.
+
+This qualifies the changed ACK action and its stated containing windows only.
+Unchanged ordinary STATUS/consume/factory/coordinator envelopes, constructor,
+writer/compiler, generic receipt and strict/cache/local/shared/general policy
+obligations remain required before the grouped PR is Ready.
