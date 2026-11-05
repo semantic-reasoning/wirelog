@@ -228,7 +228,7 @@ These exist so struct fields can be declared portably; the audit in
 
 Every `atomic_*` call site in `wirelog/` production sources. Counted
 mechanically by `scripts/ci/check-threading-doc.sh`; row count must
-match the script's count (currently **451**).
+match the script's count (currently **458**).
 
 Format: `file:function[#N]` | field | operation | order | justification.
 
@@ -665,7 +665,7 @@ concurrent alias removals cannot underflow the count.
 | `session.c:session_pool_rel_promote#3` | `src->storage_alias_borrows` | `atomic_store_explicit` | relaxed | Leave the closed pool tombstone with no child aliases |
 
 112 + 21 + 37 = **170 atomic call sites** in the summarized groups; the full
-symbol-anchored inventory below covers 451 sites.
+symbol-anchored inventory below covers 458 sites.
 
 The `#N` suffix counts all atomic sites in a symbol, regardless of operation;
 the first site remains unsuffixed. `scripts/ci/check-threading-doc.sh` uses
@@ -1752,7 +1752,7 @@ DONE. If a stop leaves the receipt holding a claim, its caller preserves that
 receipt and resumes with a fresh live maintenance attempt; it cannot abandon or
 reinitialize the receipt/token while the claim remains held.
 
-The complete current atomic-source inventory contains 451 call sites.
+The complete current atomic-source inventory contains 458 call sites.
 
 ### Caller-attempt-bound single mutation admission
 
@@ -2598,3 +2598,21 @@ In owner mode a batch whose retirement is refused stays on the owner
 lifetime record's retained list, and the record keeps the channel until
 those batches are retired, because a taken batch retires through the
 channel that issued it.
+
+## Constructor reservation installation
+
+The operator constructor moves only its exclusively held reservation tokens
+into initialized final-address relation tokens. Identity and state checks precede
+the callback-free transfer; the source becomes EMPTY before control returns.
+Concurrent access to either token remains outside this serialized owner contract.
+The payload and memory orders match the shared reservation move operation.
+
+| Source anchor | Object | Atomic operation | Ordering | Synchronization purpose |
+| --- | --- | --- | --- | --- |
+| `relation.c:wl_columnar_relation_constructor_reservation_move` | `destination->state` | `atomic_load_explicit` | acquire | Require EMPTY or RELEASED final-address destination before moving the exclusive reservation |
+| `relation.c:wl_columnar_relation_constructor_reservation_move#2` | `source->state` | `atomic_load_explicit` | acquire | Require RESERVED or COMMITTED source authority before reading its payload |
+| `relation.c:wl_columnar_relation_constructor_reservation_move#3` | `destination->owner_bits` | `atomic_store_explicit` | relaxed | Copy exclusive source owner payload before publishing destination state |
+| `relation.c:wl_columnar_relation_constructor_reservation_move#4` | `source->owner_bits` | `atomic_load_explicit` | relaxed | Observe owner payload under exclusive token ownership |
+| `relation.c:wl_columnar_relation_constructor_reservation_move#5` | `destination->state` | `atomic_store_explicit` | release | Publish the complete moved reservation at its final address |
+| `relation.c:wl_columnar_relation_constructor_reservation_move#6` | `source->owner_bits` | `atomic_store_explicit` | relaxed | Clear transferred source owner payload before publishing EMPTY |
+| `relation.c:wl_columnar_relation_constructor_reservation_move#7` | `source->state` | `atomic_store_explicit` | release | Publish EMPTY after source payload and ownership have been cleared |
