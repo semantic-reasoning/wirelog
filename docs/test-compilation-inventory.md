@@ -350,3 +350,13 @@ use non-unity objects so subset extraction cannot accidentally include the
 excluded sources. LTO and sanitizer settings remain enabled as configured.
 Common sources are not compiled again for this variant. The original inventory
 counts above describe the #1572 conversion, not this later addition.
+
+## Scalar plan view dependency
+
+The immutable scalar-view implementation is a separate backend plan support
+translation unit, `wirelog/exec_plan_scalar_view.c`. Production backend sources,
+the shared test archive, direct backend test bundles and benchmark backend
+bundles each include it once. Backend-only session users therefore resolve view
+creation and destruction without linking the parser or IR generator. Targets
+combining IR and backend bundles retain one definition. The historical source
+and target totals above describe the original Issue #1572 conversion.

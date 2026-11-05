@@ -2194,3 +2194,49 @@ and multi-token windows, and remaining consumer/coordinator/compiler/receipt
 and policy obligations remain separate required work. Integrated adoption
 requires fresh source/header/native carry; this is no whole-constructor or
 PR Ready qualification.
+
+### Compiler-owned scalar branch view (MR1)
+
+The view builder lives in `exec_plan_scalar_view.c`, with its declarations and
+allocator/lifetime contract beside the representation in `exec_plan.h`.
+Production, archive, direct backend and benchmark bundles each include that
+leaf once; backend-only session users need no parser/IR generator linkage.
+The original compiler generator retains its own IDB schema ownership unchanged.
+
+A controlled session whose resolved worker count is one automatically prepares
+an immutable scalar branch view for the qualified default-generated recursive,
+nonaggregate K_FUSION group. One governed arena owns the maps, typed group and
+branch spans, and copied operator descriptors. Strings, keys, projections and
+expression buffers remain borrowed from the original immutable plan/program,
+which must outlive the session. The original plan and its K_FUSION/EXCHANGE
+operators stay unchanged. Each branch records its independent stack boundary;
+the typed group records sorted union after all alternatives, without executing
+that merge or granting scalar/native authority.
+
+This is synchronous creation work, with checked counts, alignment and allocation
+sizes, rather than a free STEP scan or an evaluation-control payment. The arena
+is freed before its exact governor credit, after all session consumers are
+quiescent and before the governor reference is released. Worker clones exclude
+the view pointer and noncopyable reservation even transiently and initialize
+an independent EMPTY token at the worker's final address.
+
+`plan_gen` verifies the actual default parsed triple-selfJOIN, three branches
+and24 ordered scalar descriptors, every descriptor field/borrowed payload,
+original descriptor and payload-byte preservation, mixed untouched relations,
+no-view selection, allocation refusal, misalignment cleanup and count overflow
+before branch reads. `evaluation_join_prepared_auto_domains` verifies automatic
+constructor selection, a raw literal result of {(1,2),(1,4),(2,3),(3,4)}, unchanged
+controlled ENOTSUP, checked destruction/control detach and original-plan reuse.
+It also exercises a real one-short arena governor admission with a live17-byte
+peer, a later actual spill-open failure, selected-coordinator worker cloning,
+TDD slot growth/reinitialization and raw parallel K_FUSION worker clones.
+The existing `plan_gen_oom` linker wrapper refuses the actual arena malloc only
+after its real RESERVED token exists; cleanup preserves peer credit and a real
+retry creates and destroys a view. The focused worker/K_FUSION/TDD suites pass.
+
+MR1 has no evaluator, cache, producer or support-predicate consumer. It does not
+claim materialized controlled execution, a controlled cache hit, scalar group
+execution equivalence, or strict/local/shared/general policy acceptance. P2/MR3
+cache ownership and source qualification must precede MR2 runtime enablement;
+MR4 and the remaining consumer, ordinary coordinator and receipt obligations
+remain required before the grouped PR is ready.

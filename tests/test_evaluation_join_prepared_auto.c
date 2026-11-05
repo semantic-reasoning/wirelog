@@ -1,6 +1,7 @@
 /* Production session selection, without manual prepared API calls. */
 #include "../wirelog/columnar/internal.h"
 #include "../wirelog/exec_plan_gen.h"
+#include "../wirelog/intern.h"
 #include "../wirelog/session.h"
 #include "../wirelog/session_options.h"
 #include "../wirelog/thread.h"
@@ -1072,6 +1073,247 @@ test_dynamic_lftj_then_join_failure(void)
     wirelog_program_free(program);
 }
 
+static const char mr1_source[] =
+    ".decl edge(x:int64,y:int64)\n.decl path(x:int64,y:int64)\n"
+    "path(x,y) :- edge(x,y).\n"
+    "path(x,z) :- path(x,y),path(y,w),path(w,z).\n";
+
+static unsigned mr1_clone_count, mr1_admissions;
+static uint64_t mr1_last_total;
+
+static void
+mr1_record_admission(wl_columnar_memory_governor_t *governor, uint64_t total)
+{
+    (void)governor;
+    ++mr1_admissions; mr1_last_total = total;
+}
+
+static void
+mr1_clone(wl_col_session_t *parent, wl_col_session_t *worker, bool before)
+{
+    CHECK(!parent->controlled_scalar_view);
+    if (before) return;
+    CHECK(!worker->controlled_scalar_view
+        && worker->controlled_scalar_view_reservation.identity
+        == &worker->controlled_scalar_view_reservation
+        && atomic_load_explicit(
+            &worker->controlled_scalar_view_reservation.state,
+            memory_order_relaxed) == WL_COLUMNAR_MEMORY_RESERVATION_EMPTY);
+    ++mr1_clone_count;
+}
+
+static void
+mr1_literal_rows(const char *name, const int64_t *row, uint32_t width,
+    void *data)
+{
+    if (strcmp(name, "path")) return;
+    unsigned *seen = data;
+    CHECK(width == 2);
+    static const int64_t expected[][2] = {{1, 2}, {1, 4}, {2, 3}, {3, 4}};
+    unsigned i;
+    for (i = 0; i < 4; ++i)
+        if (row[0] == expected[i][0] && row[1] == expected[i][1]) break;
+    CHECK(i < 4);
+    unsigned bit = 1u << i;
+    CHECK((*seen & bit) == 0);
+    *seen |= bit;
+}
+
+static void
+mr1_parse(wirelog_program_t **program, wl_plan_t **plan)
+{
+    wirelog_error_t error;
+    *program = wirelog_parse_string(mr1_source, &error);
+    CHECK(*program && !wl_plan_from_program(*program, plan));
+}
+
+static void
+mr1_control_untouched(wl_evaluation_control_t *control)
+{
+    wl_evaluation_control_report_t report, saved;
+    memset(&report, 0x5a, sizeof(report)); saved = report;
+    CHECK(!wl_evaluation_control_active_attempt_id(control)
+        && wl_evaluation_control_report(control, &report) == ENOENT
+        && !memcmp(&report, &saved, sizeof(report)));
+}
+
+static void
+test_mr1_constructor_and_workers(void)
+{
+    wirelog_program_t *program = NULL;
+    wl_plan_t *plan = NULL; mr1_parse(&program, &plan);
+    wl_evaluation_control_t *control = NULL;
+    CHECK(!wl_evaluation_control_create(0, &control));
+    wl_session_options_t options; wl_session_options_init(&options);
+    options.evaluation_control = control;
+    wl_session_t *session = NULL;
+    CHECK(!wl_session_create_with_options(wl_backend_columnar(), plan, 1,
+        &options, &session));
+    mr1_control_untouched(control);
+    wl_col_session_t *c = (wl_col_session_t *)session;
+    const wl_plan_scalar_view_t *view = c->controlled_scalar_view;
+    CHECK(view && view->origin == plan && c->plan == plan
+        && view->group_count == 1 && view->branch_count == 3
+        && view->op_count == 24 && view->allocator.context == c
+        && c->controlled_scalar_view_reservation.bytes == view->storage_bytes
+        && atomic_load_explicit(&c->controlled_scalar_view_reservation.state,
+        memory_order_relaxed) == WL_COLUMNAR_MEMORY_RESERVATION_COMMITTED);
+    const wl_plan_scalar_group_t *group = &view->groups[0];
+    const wl_plan_relation_t *origin =
+        &plan->strata[group->stratum_index].relations[group->relation_index];
+    CHECK(origin->op_count == 2 && origin->ops[0].op == WL_PLAN_OP_K_FUSION
+        && origin->ops[1].op == WL_PLAN_OP_EXCHANGE);
+    const wl_plan_op_k_fusion_t *meta = origin->ops[0].opaque_data;
+    CHECK(meta->k == 3);
+    for (uint32_t d = 0; d < meta->k; ++d) {
+        const wl_plan_scalar_branch_t *branch = &view->branches[d];
+        CHECK(branch->origin_ops == meta->k_ops[d]
+            && branch->scalar_relation.ops != meta->k_ops[d]
+            && branch->op_count == meta->k_op_counts[d]);
+    }
+    /* Actual worker creation clones a coordinator that OWNS a view. The
+     * worker has no arena/token authority, even while that owner remains live. */
+    wl_col_session_t *worker = calloc(1, sizeof(*worker)); CHECK(worker);
+    CHECK(!col_worker_session_create(c, 0, NULL, 0, worker));
+    CHECK(!worker->controlled_scalar_view
+        && worker->controlled_scalar_view_reservation.identity
+        == &worker->controlled_scalar_view_reservation
+        && atomic_load_explicit(
+            &worker->controlled_scalar_view_reservation.state,
+            memory_order_relaxed) == WL_COLUMNAR_MEMORY_RESERVATION_EMPTY
+        && c->controlled_scalar_view == view);
+    CHECK(!col_worker_session_destroy(worker)); free(worker);
+    const int64_t edges[] = {1, 2, 2, 3, 3, 4};
+    CHECK(!wl_session_insert(session, "edge", edges, 3, 2));
+    CHECK(drive(session, false, NULL) == ENOTSUP);
+    CHECK(c->controlled_scalar_view == view && c->plan == plan
+        && !c->controlled_materialized_batch_published_count);
+    CHECK(!wl_session_try_destroy(&session));
+    /* Generic creation's control attachment was released by real teardown. */
+    int owner;
+    CHECK(!wl_evaluation_control_attach(control, &owner));
+    CHECK(!wl_evaluation_control_detach(control, &owner));
+    wl_evaluation_control_release(control);
+
+    wl_session_t *raw = NULL;
+    CHECK(!wl_session_create(wl_backend_columnar(), plan, 1, &raw));
+    CHECK(!((wl_col_session_t *)raw)->controlled_scalar_view);
+    CHECK(!wl_session_insert(raw, "edge", edges, 3, 2));
+    unsigned seen = 0;
+    CHECK(!wl_session_snapshot(raw, mr1_literal_rows, &seen) && seen == 15);
+    CHECK(!wl_session_try_destroy(&raw));
+
+    /* Actual TDD slot resize after completed worker destruction, then a new
+     * clone initializes the moved/new token at its final address. */
+    CHECK(!wl_session_create(wl_backend_columnar(), plan, 2, &raw));
+    c = (wl_col_session_t *)raw;
+    CHECK(c->num_workers == 2 && !c->controlled_scalar_view);
+    CHECK(!wl_columnar_session_ensure_tdd_worker_slots(c, 1));
+    CHECK(!col_worker_session_create(c, 0, NULL, 0, &c->tdd_workers[0]));
+    CHECK(!col_worker_session_destroy(&c->tdd_workers[0]));
+    CHECK(!wl_columnar_session_ensure_tdd_worker_slots(c, 2));
+    CHECK(!col_worker_session_create(c, 1, NULL, 0, &c->tdd_workers[1]));
+    CHECK(!c->tdd_workers[1].controlled_scalar_view
+        && c->tdd_workers[1].controlled_scalar_view_reservation.identity
+        == &c->tdd_workers[1].controlled_scalar_view_reservation);
+    CHECK(!col_worker_session_destroy(&c->tdd_workers[1]));
+    CHECK(!wl_session_try_destroy(&raw));
+
+    /* The second actual shallow-copy site is exercised through a real raw
+     * default K_FUSION dispatch, not by invoking the copy helper directly. */
+    CHECK(!wl_session_create(wl_backend_columnar(), plan, 4, &raw));
+    const int64_t cycle[] = {1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 1};
+    CHECK(!wl_session_insert(raw, "edge", cycle, 6, 2));
+    mr1_clone_count = 0; wl_columnar_kfusion_test_clone = mr1_clone;
+    CHECK(!wl_session_step(raw));
+    wl_columnar_kfusion_test_clone = NULL;
+    const col_rel_t *path = session_find_rel((wl_col_session_t *)raw, "path");
+    CHECK(path && path->nrows == 18 && mr1_clone_count > 0);
+    CHECK(!wl_session_try_destroy(&raw));
+    wl_plan_free(plan); wirelog_program_free(program);
+}
+
+static void
+test_mr1_governed_failure(void)
+{
+    uint64_t target_total = 0, arena_bytes = 0;
+    unsigned successful_admissions = 0;
+    for (unsigned trial = 0; trial < 3; ++trial) {
+        wirelog_program_t *program = NULL;
+        wl_plan_t *plan = NULL; mr1_parse(&program, &plan);
+        wl_columnar_memory_resolution_t resolution = {
+            .budget_bytes = WL_COLUMNAR_MEMORY_MIN_BUDGET,
+            .usable_bytes = trial == 1 ? target_total - 1
+                : WL_COLUMNAR_MEMORY_MIN_BUDGET,
+            .mode = WL_COLUMNAR_MEMORY_MODE_ENFORCING
+        };
+        wl_columnar_memory_governor_ref_t *ref =
+            wl_columnar_memory_governor_ref_create(&resolution); CHECK(ref);
+        wl_columnar_memory_governor_t *g =
+            wl_columnar_memory_governor_ref_get(ref);
+        wl_columnar_memory_reservation_t peer;
+        wl_columnar_memory_reservation_init(&peer);
+        CHECK(wl_columnar_memory_reserve_checked(g, 17, &peer)
+            == WL_COLUMNAR_MEMORY_ADMISSION_OK);
+        CHECK(wl_columnar_memory_commit(&peer, &peer));
+        wl_evaluation_control_t *control = NULL;
+        CHECK(!wl_evaluation_control_create(0, &control));
+        wl_session_options_t options; wl_session_options_init(&options);
+        options.evaluation_control = control; options.memory_governor = ref;
+#if !defined(_WIN32) && !defined(_WIN64)
+        if (trial == 2) {
+            /* A real file is not a spill directory: failure occurs AFTER the
+             * already admitted view, not generic argument preflight. */
+            options.spill_directory = "/dev/null/wirelog-mr1";
+            options.spill_quota_bytes = 1048576;
+            options.spill_max_row_bytes = 256;
+        }
+#endif
+        mr1_admissions = 0; mr1_last_total = 0;
+        wl_columnar_memory_governor_test_admitted = mr1_record_admission;
+        wl_session_t *session = NULL;
+        int rc = wl_session_create_with_options(wl_backend_columnar(), plan, 1,
+                &options, &session);
+        wl_columnar_memory_governor_test_admitted = NULL;
+        mr1_control_untouched(control);
+        if (!trial) {
+            CHECK(!rc && session);
+            const wl_col_session_t *c = (wl_col_session_t *)session;
+            CHECK(c->controlled_scalar_view);
+            target_total = mr1_last_total;
+            arena_bytes = c->controlled_scalar_view->storage_bytes;
+            successful_admissions = mr1_admissions;
+            CHECK(target_total > arena_bytes && successful_admissions > 1
+                && target_total == atomic_load_explicit(&g->reserved_bytes,
+                memory_order_relaxed));
+            CHECK(!wl_session_try_destroy(&session));
+        } else if (trial == 1) {
+            CHECK(rc == WL_ERR_MEMORY_BUDGET && !session
+                && mr1_admissions + 1 == successful_admissions
+                && mr1_last_total == target_total - arena_bytes);
+        } else {
+#if !defined(_WIN32) && !defined(_WIN64)
+            CHECK(rc != 0 && !session &&
+                mr1_admissions >= successful_admissions);
+#else
+            CHECK(!rc && session); CHECK(!wl_session_try_destroy(&session));
+#endif
+        }
+        int owner;
+        CHECK(!wl_evaluation_control_attach(control, &owner));
+        CHECK(!wl_evaluation_control_detach(control, &owner));
+        wl_evaluation_control_release(control);
+        wl_plan_free(plan); wirelog_program_free(program);
+        CHECK(atomic_load_explicit(&g->reserved_bytes,
+            memory_order_relaxed) == 17
+            && atomic_load_explicit(&peer.state, memory_order_relaxed)
+            == WL_COLUMNAR_MEMORY_RESERVATION_COMMITTED);
+        CHECK(wl_columnar_memory_release(&peer));
+        CHECK(!atomic_load_explicit(&g->reserved_bytes, memory_order_relaxed));
+        wl_columnar_memory_governor_ref_release(ref);
+    }
+}
+
 int
 main(void)
 {
@@ -1097,5 +1339,7 @@ main(void)
     test_dynamic_bound_failure(4);
     bound_earlier_head = false;
     test_dynamic_lftj_then_join_failure();
+    test_mr1_constructor_and_workers();
+    test_mr1_governed_failure();
     return 0;
 }

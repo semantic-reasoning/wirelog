@@ -161,6 +161,7 @@ testlib_prod_src = files(
     '../wirelog/columnar/session_hash.c',
     '../wirelog/crc32.c',
     '../wirelog/exec_plan_gen.c',
+    '../wirelog/exec_plan_scalar_view.c',
     '../wirelog/extension_registry.c',
     '../wirelog/intern.c',
     '../wirelog/io/csv_adapter.c',
@@ -2154,6 +2155,7 @@ test('memory_admission_compound', test_memory_admission_compound_exe,
 # ============================================================================
 
 backend_src = files(
+  '../wirelog/exec_plan_scalar_view.c',
   '../wirelog/columnar/relation.c',
   '../wirelog/columnar/cache.c',
   '../wirelog/columnar/ops.c',
