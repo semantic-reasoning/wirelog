@@ -471,6 +471,164 @@ test_generated_union(void)
 }
 
 static void
+abort_scan_fresh_frame(fixture_t *f)
+{
+    CHECK(!f->ctx->identity && !f->ctx->pin_owned && !f->ctx->phase);
+    CHECK(!wl_columnar_eval_stack_cleanup_receipt_cancel_begin(f->frame,
+        &f->receipt_key));
+    CHECK(!wl_columnar_eval_stack_cleanup_finish(&f->frame));
+    f->ctx = NULL;
+}
+
+static void
+test_generated_abort_scan_captures(void)
+{
+    const unsigned branches[] = {3, 17, 65};
+    for (unsigned b = 0; b < 3; ++b) {
+        unsigned n = branches[b]; char text[16384]; size_t used = 0;
+        for (unsigned i = 0; i < n; ++i)
+            used += (size_t)snprintf(text + used, sizeof(text) - used,
+                    ".decl scan%u(x:int64)\n", i);
+        used += (size_t)snprintf(text + used, sizeof(text) - used,
+                ".decl output(x:int64)\n");
+        for (unsigned i = 0; i < n; ++i)
+            used += (size_t)snprintf(text + used, sizeof(text) - used,
+                    "output(x):-scan%u(x).\n", i);
+        CHECK(used < sizeof(text));
+        wirelog_error_t error;
+        wirelog_program_t *program = wirelog_parse_string(text, &error);
+        wl_plan_t *compiled = NULL;
+        CHECK(program && !wl_plan_from_program(program, &compiled));
+        wl_plan_relation_t body = {0};
+        for (uint32_t si = 0; si < compiled->stratum_count; ++si)
+            for (uint32_t ri = 0; ri < compiled->strata[si].relation_count;
+                ++ri)
+                if (!strcmp(compiled->strata[si].relations[ri].name,
+                    "output")) {
+                    CHECK(compiled->strata[si].bodies);
+                    body = compiled->strata[si].relations[ri];
+                    body.ops = compiled->strata[si].bodies[ri].ops;
+                    body.op_count = compiled->strata[si].bodies[ri].op_count;
+                }
+        CHECK(body.ops && body.ops[body.op_count - 1].op
+            == WL_PLAN_OP_CONSOLIDATE);
+        unsigned variables = 0, concats = 0, depth = 0, maximum = 0;
+        for (uint32_t i = 0; i < body.op_count; ++i) {
+            if (body.ops[i].op == WL_PLAN_OP_VARIABLE) {
+                ++variables; ++depth;
+                if (depth > maximum) maximum = depth;
+            } else if (body.ops[i].op == WL_PLAN_OP_CONCAT) {
+                ++concats; CHECK(depth >= 2); --depth;
+            }
+        }
+        CHECK(variables == n && concats + 1 == n && maximum == 2);
+        uint64_t scan_work = 33u + 64u * body.op_count + 17u;
+        const uint64_t limits[] = {32, 32, 33u + 63u, scan_work - 1u};
+        const uint64_t paid[] = {0, 0, 33, scan_work - 17u};
+        for (unsigned trial = 0; trial < 4; ++trial) {
+            fixture_t f; fixture_init(&f, 1, 1, false, false, limits[trial]);
+            grant_t *grant = grant_begin(&f, trial ? 384 : 383);
+            CHECK(host_begin(&f, &body, grant)
+                == WL_EVALUATION_CONTROL_WORK_LIMIT);
+            CHECK(grant->finish_status == (trial ? 0
+                : WL_EVALUATION_CONTROL_WORK_LIMIT));
+            wl_evaluation_control_report_t child;
+            CHECK(!wl_evaluation_control_report(grant->control, &child)
+                && child.consumed == (trial ? 384u : 0u));
+            abort_scan_fresh_frame(&f);
+            CHECK(wl_evaluation_control_finish(f.operation, &f.owner, 0, 0)
+                == (trial ? WL_EVALUATION_CONTROL_WORK_LIMIT : 0));
+            wl_evaluation_control_report_t original;
+            CHECK(!wl_evaluation_control_report(f.operation, &original)
+                && original.consumed == paid[trial]);
+            fixture_destroy(&f);
+        }
+        /* A real framed begin can consume exactly the complete scan followed
+         * by the independent392*192 bootstrap and256 activation. */
+        fixture_t exact;
+        fixture_init(&exact, 1, 1, false, false,
+            scan_work + 392u * 192u + 256u);
+        begin(&exact, &body);
+        CHECK(exact.ctx->abort_supported && exact.ctx->pin_owned);
+        run(&exact);
+        CHECK(exact.ctx->phase == WL_COLUMNAR_EVAL_SERIAL_FRAMED_DONE);
+        CHECK(close_frame(&exact) == WL_EVALUATION_CONTROL_WORK_LIMIT);
+        CHECK(wl_evaluation_control_finish(exact.operation, &exact.owner,
+            0, 0) == WL_EVALUATION_CONTROL_WORK_LIMIT);
+        wl_evaluation_control_report_t original;
+        CHECK(!wl_evaluation_control_report(exact.operation, &original)
+            && original.consumed == scan_work + 392u * 192u + 256u);
+        fixture_destroy(&exact);
+
+        fixture_t f; fixture_init(&f, 1, 1, false, true, 0);
+        col_rel_t **registry = calloc(n, sizeof(*registry)); CHECK(registry);
+        wl_session_t *raw = NULL;
+        CHECK(!wl_session_create(wl_backend_columnar(), compiled, 1, &raw));
+        for (unsigned i = 0; i < n; ++i) {
+            char name[32]; snprintf(name, sizeof(name), "scan%u", i);
+            registry[i] = source_new(name, 1, 1, false, (int)i);
+            int64_t value = i;
+            CHECK(!wl_session_insert(raw, name, &value, 1, 1));
+        }
+        CHECK(!wl_session_step(raw));
+        const col_rel_t *reference = session_find_rel((wl_col_session_t *)raw,
+                "output");
+        CHECK(reference && reference->nrows == n);
+        f.session.rels = registry; f.session.nrels = f.session.rel_cap = n;
+        uint64_t saved_id = f.id;
+        for (unsigned capture = 0; capture < 2; ++capture) {
+            begin(&f, &body); run(&f);
+            CHECK(f.id == saved_id && f.ctx->abort_supported
+                && f.ctx->phase == WL_COLUMNAR_EVAL_SERIAL_FRAMED_READY
+                && f.ctx->candidate && f.ctx->candidate->nrows == n);
+            for (unsigned row = 0; row < n; ++row)
+                CHECK(f.ctx->candidate->columns[0][row] == (int64_t)row
+                    && reference->columns[0][row] == (int64_t)row);
+            discard(&f); run(&f); CHECK(!close_frame(&f));
+            if (!capture) {
+                CHECK(
+                    !
+                    wl_columnar_eval_stack_cleanup_begin_receipted_attempt_controlled
+                        (&f.session, &f.frame, NULL, f.id, f.operation_identity,
+                    &f.receipt_key));
+                CHECK(!wl_columnar_eval_stack_framed_context(f.frame,
+                    &f.session, &f.ctx));
+            }
+        }
+        session_rel_free_hash(&f.session);
+        f.session.rels = f.inputs; f.session.nrels = f.session.rel_cap = 3;
+        for (unsigned i = 0; i < n; ++i) col_rel_destroy(registry[i]);
+        free(registry); fixture_destroy(&f); wl_session_destroy(raw);
+        wl_plan_free(compiled); wirelog_program_free(program);
+    }
+}
+
+static void
+test_abort_scan_framed_error_order(void)
+{
+    /* A malformed grammar is a negative classifier input, not a generated
+     * permission or a runtime phase. Fixed preflight and funding come first. */
+    wl_plan_op_t ops[] = {{.op = WL_PLAN_OP_FILTER},
+                          {.op = WL_PLAN_OP_CONSOLIDATE}};
+    wl_plan_relation_t body = {.name = "output", .ops = ops, .op_count = 2};
+    bool supported = true;
+    CHECK(wl_columnar_eval_plan_numeric_composed_abort_supported(&body, 0, 2,
+        &supported) == EINVAL && !supported);
+    fixture_t f; fixture_init(&f, 1, 1, false, false, 0);
+    grant_t *grant = grant_begin(&f, 383);
+    CHECK(host_begin(&f, &body, grant) == WL_EVALUATION_CONTROL_WORK_LIMIT);
+    CHECK(!f.ctx->identity && !f.ctx->pin_owned && !f.ctx->phase);
+    grant = grant_begin(&f, 384);
+    CHECK(host_begin(&f, &body, grant) == EINVAL && !grant->finish_status);
+    abort_scan_fresh_frame(&f);
+    CHECK(!wl_evaluation_control_finish(f.operation, &f.owner, 0, 0));
+    wl_evaluation_control_report_t report;
+    CHECK(!wl_evaluation_control_report(f.operation, &report)
+        && report.consumed == 33u + 64u);
+    fixture_destroy(&f);
+}
+
+static void
 test_refusal_and_identity(void)
 {
     fixture_t f; fixture_init(&f, 1, 3, false, false, 0);
@@ -689,8 +847,15 @@ test_growth_quota_and_retry(void)
 static void
 test_bootstrap_limits(void)
 {
-    const uint64_t limits[] = {191, 192, 75263, 75264, 75519, 75520};
-    const uint64_t consumed[] = {0, 192, 75072, 75264, 75264, 75520};
+    const uint64_t scan_work = 33u + 64u * 2u + 17u;
+    const uint64_t limits[] = {scan_work + 191, scan_work + 192,
+                               scan_work + 75263, scan_work + 75264,
+                               scan_work + 75519,
+                               scan_work + 75520};
+    const uint64_t consumed[] = {scan_work, scan_work + 192,
+                                 scan_work + 75072, scan_work + 75264,
+                                 scan_work + 75264,
+                                 scan_work + 75520};
     wl_plan_op_t ops[] = {
         {.op = WL_PLAN_OP_VARIABLE, .relation_name = "a",
          .delta_mode = WL_DELTA_FORCE_FULL},
@@ -2311,6 +2476,21 @@ check_two_join_path(const col_rel_t *path, uint32_t expected_rows)
             && path->columns[1][i] == expected[i][1]);
 }
 
+static uint64_t
+recursive_capture_scan_work(const wl_plan_t *plan, const char *name)
+{
+    for (uint32_t si = 0; si < plan->stratum_count; ++si)
+        for (uint32_t ri = 0; ri < plan->strata[si].relation_count; ++ri) {
+            const wl_plan_relation_t *body = &plan->strata[si].relations[ri];
+            if (!strcmp(body->name, name)) {
+                CHECK(body->op_count && body->ops[body->op_count - 1].op
+                    == WL_PLAN_OP_EXCHANGE);
+                return 33u + 64u * (body->op_count - 1u) + 17u;
+            }
+        }
+    CHECK(false); return 0;
+}
+
 static void
 test_controlled_recursive_two_join_step(void)
 {
@@ -2323,15 +2503,16 @@ test_controlled_recursive_two_join_step(void)
      * Keep all other work pinned independently of observed consumption. */
     /* Native publication replaces checked commit: (3776+128*d) minus
      * (448+128*d) =3328 for each of two JOINs in three body frames. */
-    const uint64_t expected_work = UINT64_C(1271246) + UINT64_C(6) * 3328
-        + UINT64_C(3) * 224
-        * ((wl_columnar_eval_stack_test_allocation_size() + 15) / 16)
-        + UINT64_C(18) * 224 * ((sizeof(col_rel_t) + 7) / 8);
     wl_plan_t *plan = NULL;
     wirelog_program_t *program = NULL;
     wl_evaluation_control_t *control = NULL;
     wl_session_t *session = controlled_recursive_two_join_session(edges, 4,
             &plan, &program, &control);
+    const uint64_t expected_work = UINT64_C(1271246) + UINT64_C(6) * 3328
+        + 3u * recursive_capture_scan_work(plan, "path")
+        + UINT64_C(3) * 224
+        * ((wl_columnar_eval_stack_test_allocation_size() + 15) / 16)
+        + UINT64_C(18) * 224 * ((sizeof(col_rel_t) + 7) / 8);
     CHECK(!wl_evaluation_control_configure(control, expected_work));
     CHECK(!controlled_recursive_run(session, control));
     const col_rel_t *path = session_find_rel((wl_col_session_t *)session,
@@ -2479,6 +2660,7 @@ test_controlled_recursive_step_publication_and_stops(void)
      * CONSOLIDATE, and the detached result: 20 descriptors, zeroed at 224
      * per eight-byte chunk. Both sizes include ABI-dependent thread IDs. */
     const uint64_t expected_work = UINT64_C(1391081) + UINT64_C(4) * 3328
+        + 4u * recursive_capture_scan_work(plan, "path")
         + UINT64_C(4) * 224
         * ((wl_columnar_eval_stack_test_allocation_size() + 15) / 16)
         + UINT64_C(20) * 224 * ((sizeof(col_rel_t) + 7) / 8);
@@ -2678,6 +2860,7 @@ test_controlled_recursive_step_after_public_edge_append(void)
     /* Four edges require five body rounds (including empty convergence),
      * with five operator descriptors per round, using the tariffs above. */
     const uint64_t successor_work = UINT64_C(1859706) + UINT64_C(5) * 3328
+        + 5u * recursive_capture_scan_work(plan, "path")
         + UINT64_C(5) * 224
         * ((wl_columnar_eval_stack_test_allocation_size() + 15) / 16)
         + UINT64_C(25) * 224 * ((sizeof(col_rel_t) + 7) / 8);
@@ -2716,15 +2899,16 @@ test_controlled_recursive_successor_work_boundaries(void)
     static const int64_t edges[] = { 1, 2, 2, 3, 3, 4 };
     static const int64_t later_edge[] = { 4, 5 };
     /* Same four-edge recomputation: five frames and 25 descriptors. */
-    const uint64_t successor_work = UINT64_C(1859706) + UINT64_C(5) * 3328
-        + UINT64_C(5) * 224
-        * ((wl_columnar_eval_stack_test_allocation_size() + 15) / 16)
-        + UINT64_C(25) * 224 * ((sizeof(col_rel_t) + 7) / 8);
     wl_plan_t *plan = NULL;
     wirelog_program_t *program = NULL;
     wl_evaluation_control_t *control = NULL;
     wl_session_t *session = controlled_recursive_session(edges, 3, &plan,
             &program, &control);
+    const uint64_t successor_work = UINT64_C(1859706) + UINT64_C(5) * 3328
+        + 5u * recursive_capture_scan_work(plan, "path")
+        + UINT64_C(5) * 224
+        * ((wl_columnar_eval_stack_test_allocation_size() + 15) / 16)
+        + UINT64_C(25) * 224 * ((sizeof(col_rel_t) + 7) / 8);
     wl_col_session_t *columnar = (wl_col_session_t *)session;
     CHECK(!controlled_recursive_run(session, control));
     CHECK(!wl_session_insert(session, "edge", later_edge, 1, 2));
@@ -15350,7 +15534,9 @@ main(void)
     test_entry_generated_lftj_allocation_precharge();
     test_entry_generated_filter_work_boundary();
 
-    test_shapes(); test_generated_union(); test_refusal_and_identity();
+    test_shapes(); test_generated_union();
+    test_generated_abort_scan_captures(); test_abort_scan_framed_error_order();
+    test_refusal_and_identity();
     test_failures(); test_retained_and_consume_refusal();
     test_growth_quota_and_retry(); test_bootstrap_limits();
     test_cleanup_receipt_attempt_identity();

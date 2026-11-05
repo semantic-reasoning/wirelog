@@ -1727,6 +1727,19 @@ uses the actual immutable generated relation plan, begins the original operation
 once with `base.operation_admission`, and retains session/input/native ownership
 until terminal close. The original operation remains active across progress.
 
+Each framed begin charges its abort-capability classifier to that same original
+operation: ENTRY33, OP64 before each visited operator, and FINAL17 before the
+last-opcode check. A complete scan of `N` operators adds `33 + 64*N + 17`;
+an early grammar result or refusal charges only admitted actions. Repeated
+captures rescan and use the cumulative allowance. Fixed preflight and the
+existing child384 admission precede this scan, so child383 refuses before any
+new original scan work; after child384 succeeds, an original ENTRY refusal
+precedes variable-plan errors. The raw classifier's grammar results are
+unchanged. Scan failure precedes control retention and context identity, pin
+and phase activation, although the existing receipt key may already be written.
+This qualifies the variable-length classifier only; fixed constructor/native
+and complete coordinator source obligations remain separate.
+
 The integer return is protocol status. Only `TERMINAL` makes `execution_result`
 and `committed` valid, after actual frame close. `MORE` may mean retained cleanup;
 `STATUS` is separately funded and preserves the outstanding non-status receipt.

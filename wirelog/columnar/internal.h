@@ -7984,6 +7984,14 @@ int wl_columnar_eval_plan_numeric_composed_abort_request(
     uint64_t);
 /* Pure generated-closure check used before the framed host consumes any
  * progress receipt; unsupported requests must be completely inert. */
+enum {
+    WL_COLUMNAR_EVAL_PLAN_ABORT_SCAN_ENTRY_WORK = 33,
+    WL_COLUMNAR_EVAL_PLAN_ABORT_SCAN_OP_WORK = 64,
+    WL_COLUMNAR_EVAL_PLAN_ABORT_SCAN_FINAL_WORK = 17
+};
+int wl_columnar_eval_plan_numeric_composed_abort_supported_attempt_controlled(
+    const wl_plan_relation_t *, uint32_t, uint32_t, bool *,
+    wl_evaluation_control_t *, uint64_t);
 int wl_columnar_eval_plan_numeric_composed_abort_supported(
     const wl_plan_relation_t *, uint32_t, uint32_t, bool *);
 int wl_columnar_eval_plan_numeric_composed_consume_result(
