@@ -1219,8 +1219,8 @@ test_mr1_constructor_and_workers(void)
     CHECK(!col_worker_session_destroy(&c->tdd_workers[1]));
     CHECK(!wl_session_try_destroy(&raw));
 
-    /* The second actual shallow-copy site is exercised through a real raw
-     * default K_FUSION dispatch, not by invoking the copy helper directly. */
+    /* Low-K adaptive dispatch may remain serial with a coarse clock.
+     * Preserve its actual six-cycle result independently of that choice. */
     CHECK(!wl_session_create(wl_backend_columnar(), plan, 4, &raw));
     const int64_t cycle[] = {1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 1};
     CHECK(!wl_session_insert(raw, "edge", cycle, 6, 2));
@@ -1228,8 +1228,61 @@ test_mr1_constructor_and_workers(void)
     CHECK(!wl_session_step(raw));
     wl_columnar_kfusion_test_clone = NULL;
     const col_rel_t *path = session_find_rel((wl_col_session_t *)raw, "path");
-    CHECK(path && path->nrows == 18 && mr1_clone_count > 0);
+    CHECK(path && path->nrows == 18);
     CHECK(!wl_session_try_destroy(&raw));
+
+    /* K=4 takes the production fixed parallel path, independently of elapsed
+     * samples. Keep the real shallow-copy/worker ownership witness here. */
+    const char *clone_source =
+        ".decl edge(x:int64,y:int64)\n.decl path(x:int64,y:int64)\n"
+        "path(x,y) :- edge(x,y).\n"
+        "path(x,v) :- path(x,y),path(y,z),path(z,w),path(w,v).\n";
+    wirelog_error_t clone_error;
+    wirelog_program_t *clone_program =
+        wirelog_parse_string(clone_source, &clone_error);
+    wl_plan_t *clone_plan = NULL;
+    CHECK(clone_program && !wl_plan_from_program(clone_program, &clone_plan));
+    const wl_plan_op_k_fusion_t *clone_meta = NULL;
+    for (uint32_t si = 0; si < clone_plan->stratum_count; ++si)
+        for (uint32_t ri = 0;
+            ri < clone_plan->strata[si].relation_count; ++ri) {
+            const wl_plan_relation_t *clone_relation =
+                &clone_plan->strata[si].relations[ri];
+            for (uint32_t oi = 0; oi < clone_relation->op_count; ++oi) {
+                const wl_plan_op_t *clone_op = &clone_relation->ops[oi];
+                if (clone_op->op != WL_PLAN_OP_K_FUSION) continue;
+                CHECK(!clone_meta && clone_op->opaque_data);
+                clone_meta = clone_op->opaque_data;
+            }
+        }
+    CHECK(clone_meta && clone_meta->k == 4);
+    CHECK(!wl_session_create(wl_backend_columnar(), clone_plan, 4, &raw));
+    CHECK(!wl_session_insert(raw, "edge", cycle, 6, 2));
+    mr1_clone_count = 0; wl_columnar_kfusion_test_clone = mr1_clone;
+    CHECK(!wl_session_step(raw));
+    wl_columnar_kfusion_test_clone = NULL;
+    const col_rel_t *clone_path =
+        session_find_rel((wl_col_session_t *)raw, "path");
+    CHECK(clone_path && clone_path->ncols == 2 && clone_path->nrows == 12
+        && clone_path->columns && clone_path->columns[0]
+        && clone_path->columns[1] && mr1_clone_count > 0);
+    static const int64_t clone_expected[][2] = {
+        {1, 2}, {1, 5}, {2, 3}, {2, 6}, {3, 1}, {3, 4},
+        {4, 2}, {4, 5}, {5, 3}, {5, 6}, {6, 1}, {6, 4}
+    };
+    unsigned clone_seen = 0;
+    for (uint32_t i = 0; i < clone_path->nrows; ++i) {
+        unsigned match;
+        for (match = 0; match < 12; ++match)
+            if (clone_path->columns[0][i] == clone_expected[match][0]
+                && clone_path->columns[1][i] == clone_expected[match][1])
+                break;
+        CHECK(match < 12 && !(clone_seen & (1u << match)));
+        clone_seen |= 1u << match;
+    }
+    CHECK(clone_seen == 0xfffu);
+    CHECK(!wl_session_try_destroy(&raw));
+    wl_plan_free(clone_plan); wirelog_program_free(clone_program);
     wl_plan_free(plan); wirelog_program_free(program);
 }
 
