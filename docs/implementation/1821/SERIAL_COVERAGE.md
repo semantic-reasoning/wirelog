@@ -898,12 +898,19 @@ and a live successor with zero consumption are covered alongside a genuine
 failure exercises a RESERVED token; cancellation after the last commit
 exercises all three COMMITTED tokens, without seeding native phases or flags.
 
-The selected reserve SOURCE caller160 owns current77 and one-use76 (153 total).
-The original-only known64 credit helper preserves counter/CAS semantics and
-counts the first native iteration. Full credited restoration fits64 including
-its caller; arbitrary ROUND164 retries fund themselves, and the uniform
-simultaneous bound is164+76+builder16=256. Generic capture/refund callers are
-separate source obligations; this selected correction does not certify them.
+The selected reserve SOURCE caller160 owns current81 and one-use78 (159 total),
+including the ordinary three-cell `ref_get` body. Typed OVERFLOW has a separate
+current83/terminal28 history. Private saved-ID phase/tail/verdict checkpoints
+do not exempt ordinary `charge` or its mutex/locked bodies. ADMITTED preserves
+the hook/guard/zero-check order in its owning reserve body. The original-only
+known64 credit helper preserves counter/CAS semantics and counts the first
+native iteration; complete credited restoration including its caller fits64.
+Arbitrary ROUND164 retries fund themselves. Actual unprocessed source at the
+dominant cut is235-3 evaluated fronts+3 caller error cells+18 constructor/copier
+ancestor cells=253/256. BUILD192 pays its complete120, including those18 cells.
+Commit caller128 owns80 current+11 bootstrap+36 terminal=127. All original
+prices, callback work labels and report amounts remain unchanged. Generic
+capture/refund callers retain their separate source obligations.
 
 Independently funded END drains source readers. Separate256 ZERO and BEGIN
 turns clear the scalar and managed records respectively. BEGIN establishes
