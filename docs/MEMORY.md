@@ -5940,18 +5940,35 @@ precedes token credit, and the saved reference is released last. Original END
 and a live successor do not supply cleanup work. A committed17-byte peer
 remains owned and unchanged until its own physical free and release.
 
-Only this selected constructor pairs reserve caller160 with the existing
-SOURCE protocol: complete current77 and a one-use native-front/restoration
-share76 fit153. Each arbitrary ROUND164 funds its own complete retry work;
-the76 share can cover one final native supplement, not every retry. The
-commit caller128 owns current80 and one-use48. SOURCE100 alone does not
-qualify the MSVC frontend, and these shares do not qualify other callers.
-Actual reports remain admitted work; no current margin is refunded or reused.
+The selected SOURCE protocol uses private phase/tail/verdict checkpoints and
+`charge_attempt` with the immutable original attempt ID. Ordinary `charge`,
+its locked body and mutex fronts have no controller-interior exemption.
+The ADMITTED checkpoint keeps its original hook, getter, guards and zero check
+in the owning reserve body, removing six actual forwarding/return operations.
+Prices, work labels, native order and cumulative admitted reports are unchanged.
+
+Only this selected constructor qualifies reserve caller160: complete current81
+includes all three ordinary `ref_get` body operations; one-use terminal78
+gives159. Completed typed OVERFLOW instead uses current83 and terminal28,
+giving111; it does not also execute the maximal restored-error continuation.
+Each arbitrary ROUND164 pays its own complete retry work. The terminal share
+is used once per owning invocation, including ENTRY's seven source cells;
+it is never renewed by a retry. Commit caller128 pays current80, bootstrap11
+and one-use36, giving127. SOURCE100 alone does not qualify the MSVC frontend,
+and these selected caller shares do not qualify generic capture caller80.
+No current margin is refunded or reused.
 The owning-TU original-restoration credit helper preserves the initial counter
 observation and CAS ordering, including expected-value refresh. Its typed64
 MSVC CAS removes generic width forwarding without excluding its ordinary
-fronts or first iteration. Credited restoration including its caller fits64;
-the uniform simultaneous bound is ROUND164 + one-use76 + builder16 =256.
+fronts or first iteration. Credited restoration including its caller fits64.
+At the dominant ROUND admission, actual remaining source is235 minus the
+three already evaluated call fronts, plus the compatible caller error suffix3
+and both actual constructor/copier ancestor suffixes18:253, within256.
+The live BUILD192 action separately pays its complete120 source, including
+those18 ancestor cells. Successful and typed-result histories have their own
+suffixes; no maximal error bank is added to an incompatible success suffix.
+Whole source funding and actual unprocessed source are distinct from an entire
+nominal fee or fee-minus-completed-work calculation.
 Generic release/refund helpers and unrelated capture callers need their own
 complete first-iteration source proof.
 

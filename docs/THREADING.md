@@ -2737,6 +2737,14 @@ the first native iteration are counted; only the exact existing original
 mandatory-restoration repeated-iteration scope remains. No successor is polled
 or charged. This does not qualify other generic refund/capture callers.
 
+Selected SOURCE phase/tail/verdict checkpoints use the saved immutable attempt
+ID in every positive and zero `charge_attempt`. Ordinary `charge` and its
+mutex/locked body are not aliases or qualified interiors. The inlined ADMITTED
+checkpoint retains the original callback, active-ID guard and zero-check order;
+original END followed by a live successor cannot debit that successor. All
+ordinary getter and native fronts count. This changes no atomic site or memory
+order, and the inventory remains518.
+
 | Source anchor | Object | Atomic operation | Ordering | Synchronization purpose |
 |---|---|---|---|---|
 | `memory_governor.c:wl_columnar_memory_governor_source_credit_original` | `governor->reserved_bytes` | `atomic_load_explicit` | relaxed | Observe the aggregate counter before original-only restoration; CAS validates intervening peer updates |
