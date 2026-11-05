@@ -486,14 +486,23 @@ test_generated_abort_scan_captures(void)
     const unsigned branches[] = {3, 17, 65};
     for (unsigned b = 0; b < 3; ++b) {
         unsigned n = branches[b]; char text[16384]; size_t used = 0;
-        for (unsigned i = 0; i < n; ++i)
-            used += (size_t)snprintf(text + used, sizeof(text) - used,
+        int written;
+        for (unsigned i = 0; i < n; ++i) {
+            written = snprintf(text + used, sizeof(text) - used,
                     ".decl scan%u(x:int64)\n", i);
-        used += (size_t)snprintf(text + used, sizeof(text) - used,
+            CHECK(written > 0 && (size_t)written < sizeof(text) - used);
+            used += (size_t)written;
+        }
+        written = snprintf(text + used, sizeof(text) - used,
                 ".decl output(x:int64)\n");
-        for (unsigned i = 0; i < n; ++i)
-            used += (size_t)snprintf(text + used, sizeof(text) - used,
+        CHECK(written > 0 && (size_t)written < sizeof(text) - used);
+        used += (size_t)written;
+        for (unsigned i = 0; i < n; ++i) {
+            written = snprintf(text + used, sizeof(text) - used,
                     "output(x):-scan%u(x).\n", i);
+            CHECK(written > 0 && (size_t)written < sizeof(text) - used);
+            used += (size_t)written;
+        }
         CHECK(used < sizeof(text));
         wirelog_error_t error;
         wirelog_program_t *program = wirelog_parse_string(text, &error);
