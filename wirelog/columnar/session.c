@@ -13832,24 +13832,26 @@ col_controlled_step(wl_col_session_t *sess,
         if (rc) return rc;
     }
     if (!step) {
-        sess->controlled_step = calloc(1, sizeof(*sess->controlled_step));
-        if (!sess->controlled_step) return ENOMEM;
+        wl_columnar_controlled_step_t *fresh =
+            calloc(1, sizeof(*sess->controlled_step));
+        if (!fresh) return ENOMEM;
         /* The host identity persists while control attempt IDs may change. */
-        sess->controlled_step->operation_identity =
-            (uint64_t)(uintptr_t)sess->controlled_step;
+        fresh->operation_identity =
+            (uint64_t)(uintptr_t)fresh;
         const wl_plan_t *plan = sess->plan;
-        sess->controlled_step->recursive_route = plan
+        fresh->recursive_route = plan
             && plan->stratum_count == 1 && plan->strata
             && plan->strata[0].is_recursive
             && plan->strata[0].relation_count == 1
             && plan->strata[0].relations
             && wl_columnar_eval_plan_numeric_recursive_path_supported(
             &plan->strata[0].relations[0]);
-        sess->controlled_step->observed = sess->delta_cb != NULL;
-        sess->controlled_step->general_observed = snapshot
+        fresh->observed = sess->delta_cb != NULL;
+        fresh->general_observed = snapshot
             || wl_columnar_session_observed_general_shape(sess);
-        if (sess->controlled_step->general_observed)
-            sess->controlled_step->recursive_route = false;
+        if (fresh->general_observed)
+            fresh->recursive_route = false;
+        sess->controlled_step = fresh;
     }
     if (snapshot) {
         sess->controlled_step->snapshot = snapshot;
