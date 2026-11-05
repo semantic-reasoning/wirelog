@@ -89,13 +89,13 @@ def workflow_block(text: str, heading: str) -> str:
     return match.group(0)
 
 
-def pull_request_block(text: str) -> str:
+def pull_request_block(text: str, event: str = "pull_request") -> str:
     text = strip_yaml_comments(text)
     match = re.search(
-        r"(?ms)^  pull_request:\s*(.*?)(?=^  [A-Za-z0-9_-]+:\s*$|\Z)",
+        rf"(?ms)^  {re.escape(event)}:\s*(.*?)(?=^  [A-Za-z0-9_-]+:\s*$|\Z)",
         text,
     )
-    require(match is not None, "workflow is missing a pull_request trigger")
+    require(match is not None, f"workflow is missing a {event} trigger")
     return match.group(0)
 
 
@@ -104,15 +104,15 @@ def yaml_field(block: str, field: str) -> list[str]:
     return re.findall(rf"(?m)^    {re.escape(field)}:\s*(.*?)\s*$", block)
 
 
-def branch_names(text: str) -> set[str]:
-    trigger = pull_request_block(text)
+def branch_names(text: str, event: str = "pull_request") -> set[str]:
+    trigger = pull_request_block(text, event)
     match = re.search(r"(?m)^    branches:\s*\[([^]]+)\]\s*$", trigger)
     require(match is not None, "pull_request trigger must declare branches")
     return {part.strip().strip("'\"") for part in match.group(1).split(",")}
 
 
-def assert_branches(text: str, workflow_name: str) -> None:
-    branches = branch_names(text)
+def assert_branches(text: str, workflow_name: str, event: str = "pull_request") -> None:
+    branches = branch_names(text, event)
     require(
         {"main", "1.0"}.issubset(branches),
         f"{workflow_name}: pull_request branches must include main and 1.0",
@@ -137,50 +137,39 @@ def check_codeowners(root: Path) -> None:
 
 def check_branches(root: Path) -> None:
     assert_branches(read(root, CI_PR), "ci-pr.yml")
-    assert_branches(read(root, CLA_WORKFLOW), "cla-required.yml")
+    assert_branches(read(root, CLA_WORKFLOW), "cla-required.yml", "pull_request_target")
 
 
 def check_cla_workflow(root: Path) -> None:
-    text = read(root, CLA_WORKFLOW)
+    text = strip_yaml_comments(read(root, CLA_WORKFLOW))
     job = workflow_block(text, "cla-signoff-gate")
-    require(re.search(r"(?m)^    name:\s*CLA signoff gate\s*$", job) is not None,
-            "CLA gate display name changed")
-    require(re.search(r"(?m)^      CLA_CONTEXT:\s*license/cla\s*$", job) is not None,
-            "CLA_CONTEXT must be license/cla")
-    require("statuses[]" in job, "CLA gate must inspect hosted commit statuses")
-    require(re.search(
-        r"(?m)^\s+status_url=\"https://api\.github\.com/repos/"
-        r"\$\{REPOSITORY\}/commits/\$\{HEAD_SHA\}/status\"\s*$", job
-    ) is not None,
-            "CLA gate must query the PR head SHA status endpoint")
-    require("--fail" in job and "--max-time" in job,
-            "CLA status requests must fail closed on transport errors")
-    require(re.search(r"(?m)^\s+set -euo pipefail\s*$", job) is not None,
-            "CLA gate must use strict shell failure semantics")
-    require(re.search(
-        r"(?m)^\s+if \[ \"\$\{PR_AUTHOR_ASSOCIATION\}\" = \"OWNER\" \]",
-        job,
-    ) is not None,
-            "CLA owner bypass must be explicit and narrowly scoped")
-
-    require(re.search(r"(?m)^\s+success\)\s*$", job) is not None
-            and re.search(r"success\).*?exit 0", job, re.S),
-            "CLA success must be the only successful hosted-status path")
-    require(re.search(r"(?m)^\s+pending\)\s*$", job) is not None,
-            "CLA gate must recognize pending hosted status")
-    require(re.search(r"(?m)^\s+missing\)\s*$", job) is not None,
-            "CLA gate must recognize missing hosted status")
-    require(re.search(r"(?m)^\s+failure\|error\)\s*$", job) is not None
-            and re.search(r"failure\|error\).*?exit 1", job, re.S),
-            "CLA failure and error statuses must fail")
-    require("unexpected state" in job and re.search(r"\*\).*?exit 1", job, re.S),
-            "CLA unexpected statuses must fail closed")
-    for state in ("pending", "missing"):
-        state_block = re.search(rf"{state}\)(.*?);;", job, re.S)
-        require(state_block is not None and "exit 0" not in state_block.group(1),
-                f"CLA {state} status must not pass")
-    require("Timed out after" in job and re.search(r"latest state.*?\n\s*exit 1", job, re.S),
-            "CLA timeout for missing or pending status must fail closed")
+    require(yaml_field(job, "name") == ["CLA registry evaluator"],
+            "CLA evaluator must be distinct from the published CLA signoff gate")
+    require(re.findall(r"(?m)^      - uses: (.+)$", job) and re.fullmatch(
+        r"semantic-reasoning/sr-cla@[0-9a-f]{40}",
+        re.findall(r"(?m)^      - uses: (.+)$", job)[0]),
+            "CLA checker must use a full SHA pin from semantic-reasoning/sr-cla")
+    require(len(re.findall(r"(?m)^      - uses:", job)) == 1
+            and not re.search(r"(?m)^\s+(?:- )?run:", job),
+            "CLA workflow must execute only the trusted pinned checker")
+    require("token: ${{ github.token }}" in job and "secrets." not in text,
+            "CLA checker must use its repository-scoped token")
+    permission_block = text.split("permissions:\n", 1)[-1].split("\njobs:", 1)[0]
+    require(set(permission_block.strip().splitlines()) == {
+        "contents: read", "  pull-requests: read", "  checks: write"},
+            "CLA permissions must be contents/read, pull-requests/read and checks/write")
+    trigger = pull_request_block(text, "pull_request_target")
+    require("types: [opened, reopened, synchronize, ready_for_review, edited]" in trigger,
+            "CLA must recheck base edits as well as new heads")
+    require("issue_comment:" in text and "workflow_dispatch:" in text
+            and "schedule:" in text, "CLA must support comment, manual and periodic rechecks")
+    guard = ("github.event_name != 'issue_comment' || "
+             "(github.event.issue.pull_request && github.event.comment.body == '/cla recheck')")
+    require(guard in re.sub(r"\s+", " ", job),
+            "CLA comment trigger must require an exact PR recheck request")
+    require(not any(token in text for token in (
+        "continue-on-error", "author_association", "license/cla", "actions/checkout")),
+            "CLA cannot bypass checks, poll hosted status, or check out PR code")
 
 
 CONCRETE_BUILD_JOBS = (
@@ -471,6 +460,39 @@ class BranchProtectionContractTests(unittest.TestCase):
             CLA_WORKFLOW,
             lambda text: text.replace("cla-signoff-gate", "cla-signoff-renamed", 1),
             "missing.*cla-signoff-gate",
+        )
+
+    def test_unpinned_cla_action_is_rejected(self) -> None:
+        self.assert_mutation_fails(
+            CLA_WORKFLOW,
+            lambda text: re.sub(r"sr-cla@[0-9a-f]{40}", "sr-cla@main", text),
+            "full SHA pin",
+        )
+
+    def test_cla_base_edit_trigger_is_required(self) -> None:
+        self.assert_mutation_fails(
+            CLA_WORKFLOW, lambda text: text.replace(", edited]", "]"),
+            "base edits",
+        )
+
+    def test_cla_checkout_is_rejected(self) -> None:
+        self.assert_mutation_fails(
+            CLA_WORKFLOW, lambda text: text.replace("    steps:",
+                "    steps:\n      - uses: actions/checkout@v5"),
+            "full SHA pin|only the trusted",
+        )
+
+    def test_cla_write_scope_is_rejected(self) -> None:
+        self.assert_mutation_fails(
+            CLA_WORKFLOW, lambda text: text.replace("contents: read", "contents: write"),
+            "permissions",
+        )
+
+    def test_cla_failure_bypass_is_rejected(self) -> None:
+        self.assert_mutation_fails(
+            CLA_WORKFLOW, lambda text: text.replace("    steps:",
+                "    continue-on-error: true\n    steps:"),
+            "cannot bypass",
         )
 
     def test_false_build_required_is_rejected(self) -> None:

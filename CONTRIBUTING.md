@@ -318,3 +318,34 @@ section on `1.0` is **frozen** — every hotfix landing on
 `1.0` between rc1 cut and GA tag updates the versioned
 section, not `[Unreleased]`.  This is mechanically enforced by
 the per-branch CI rule landed under #747 (B18).
+
+
+## Contributor License Agreement
+
+wirelog uses the public [sr-cla registry](https://github.com/semantic-reasoning/sr-cla)
+for explicit CLA consent. The [agreement](CLA.md) is unchanged; its versioned
+copy and exact SHA-256 are maintained centrally.
+
+Read the agreement, open a [signing issue](https://github.com/semantic-reasoning/sr-cla/issues/new?template=sign-cla.yml),
+and personally post the exact consent statement shown there as a new comment.
+Once the recording workflow completes, comment `/cla recheck` on your wirelog
+PR. The CLA Required workflow also supports manual dispatch with a PR number
+and an hourly refresh of open PRs.
+
+The central record is public and stores your GitHub account ID, login, consent
+time, agreement hash, and comment evidence. No private email is collected.
+Prior hosted-service signatures are not inferred or copied without evidence;
+existing contributors need to record consent in sr-cla once. Neither a
+maintainer nor an agent should sign on your behalf.
+
+The `CLA signoff gate` check verifies the opener and all GitHub-resolved commit
+authors/coauthors, including `Co-Authored-by`. Link commit emails to the correct
+GitHub account if an identity cannot be resolved. OWNER/MEMBER status does not
+exempt contributors. Bot accounts are not automatically exempt. PRs above 250
+commits, or multiple open PRs sharing a head commit, fail closed: split large
+PRs or use distinct heads, then recheck.
+
+The checker runs pinned trusted code and never executes PR source. API errors
+fail validation; rerun after recovery. The old hosted `license/cla` status is
+independent of the central check and is retired only after the rollout checks
+in [the release process](docs/RELEASE_PROCESS.md) are complete.
