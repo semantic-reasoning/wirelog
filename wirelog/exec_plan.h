@@ -50,6 +50,7 @@
 #include "wirelog-types.h"
 
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 
 /* ======================================================================== */
@@ -785,5 +786,67 @@ typedef struct {
     const wl_plan_idb_schema_t *idb_schemas;
     uint32_t idb_schema_count;
 } wl_plan_t;
+
+/* Immutable sequential alternatives derived from the original K_FUSION
+ * metadata. This is not a wl_plan_t or execution authority. All operator
+ * payloads and origin pointers are borrowed: the original immutable plan,
+ * program and intern must outlive the view and its session. Only the arena
+ * containing these records and copied operator descriptors is owned here. */
+typedef struct {
+    void *context;
+    int (*allocate)(void *context, size_t bytes, void **out);
+    void (*release)(void *context, void *storage, size_t bytes);
+} wl_plan_scalar_view_allocator_t;
+
+typedef enum {
+    WL_PLAN_SCALAR_MERGE_SORTED_UNION_AFTER_ALL
+} wl_plan_scalar_merge_t;
+
+typedef struct {
+    const wl_plan_relation_t *origin_relation;
+    uint32_t group_index; /* UINT32_MAX: use the untouched original relation. */
+} wl_plan_scalar_relation_t;
+
+typedef struct {
+    uint32_t stratum_index, relation_index, original_op_index;
+    uint32_t first_branch, branch_count;
+    const wl_plan_op_t *origin_fused, *terminal_exchange;
+    wl_plan_scalar_merge_t merge;
+} wl_plan_scalar_group_t;
+
+typedef struct {
+    uint32_t group_index, branch_index, first_op, op_count;
+    const wl_plan_op_t *origin_ops;
+    /* Each alternative starts with its own empty stack. The group merge
+     * follows ALL alternatives, not each individual scalar sequence. */
+    wl_plan_relation_t scalar_relation;
+} wl_plan_scalar_branch_t;
+
+typedef struct {
+    const wl_plan_t *origin;
+    wl_plan_scalar_view_allocator_t allocator;
+    size_t storage_bytes;
+    uint32_t stratum_count, relation_count, group_count, branch_count, op_count;
+    const uint32_t *stratum_offsets; /* stratum_count + 1 entries */
+    const wl_plan_scalar_relation_t *relations;
+    const wl_plan_scalar_group_t *groups;
+    const wl_plan_scalar_branch_t *branches;
+    const wl_plan_op_t *ops;
+} wl_plan_scalar_view_t;
+
+/* Synchronous immutable creation only; no evaluator consumes this view yet.
+ * The allocator/context must outlive the view. allocate is called at most
+ * once and must return aligned malloc-compatible storage (or errno and NULL).
+ * release owns the exact returned arena, including partial-build failures.
+ * out is ordinary caller-owned, writable, nonaliasing storage. No eligible
+ * group returns 0 with *out == NULL and performs no allocation. Copied op
+ * descriptors must never be passed to free_op or wl_plan_free. */
+int
+wl_plan_scalar_view_create(const wl_plan_t *origin,
+    const wl_plan_scalar_view_allocator_t *allocator,
+    wl_plan_scalar_view_t **out);
+
+void
+wl_plan_scalar_view_destroy(wl_plan_scalar_view_t *view);
 
 #endif /* WL_EXEC_PLAN_H */

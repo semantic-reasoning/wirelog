@@ -4256,8 +4256,14 @@ wl_columnar_session_ensure_tdd_worker_slots(wl_col_session_t *sess,
     if (sess->tdd_workers_cap >= active_workers)
         return 0;
 
+    uint64_t bytes;
+    if (!wl_columnar_memory_size_mul(active_workers, sizeof(wl_col_session_t),
+        &bytes) || bytes > SIZE_MAX) return EOVERFLOW;
+    /* Workers never own a scalar view. Existing empty/zero token storage may
+    * move here; copy_without_ledger initializes it at the final worker
+    * address before use. A failed worker teardown still retains its slot. */
     wl_col_session_t *new_workers = (wl_col_session_t *)realloc(
-        sess->tdd_workers, active_workers * sizeof(wl_col_session_t));
+        sess->tdd_workers, (size_t)bytes);
     if (!new_workers)
         return ENOMEM;
 
@@ -4791,6 +4797,62 @@ wl_columnar_session_inline_schema(col_rel_t *r, const wl_plan_t *plan,
     return rc;
 }
 
+/* The sole arena allocation is synchronous session creation. The token stays
+ * at its final coordinator address; compiler code sees only generic callbacks. */
+static int
+wl_columnar_session_scalar_view_allocate(void *context, size_t bytes,
+    void **out)
+{
+    wl_col_session_t *sess = context;
+    if (!out) return EINVAL;
+    *out = NULL;
+    if (!sess || !sess->memory_governor || !bytes) return EINVAL;
+    uint64_t governed_bytes = (uint64_t)bytes;
+    if ((size_t)governed_bytes != bytes) return EOVERFLOW;
+    wl_columnar_memory_reservation_t *token =
+        &sess->controlled_scalar_view_reservation;
+    if (token->identity != token || atomic_load_explicit(&token->state,
+        memory_order_acquire) != WL_COLUMNAR_MEMORY_RESERVATION_EMPTY)
+        return EINVAL;
+    int rc = session_rels_admit(sess, governed_bytes, token);
+    if (rc) return rc;
+    void *storage = malloc(bytes);
+    if (!storage) {
+        if (!wl_columnar_memory_rollback(token)) abort();
+        wl_columnar_memory_reservation_init(token);
+        return ENOMEM;
+    }
+    if (!wl_columnar_memory_commit(token, storage)) {
+        free(storage);
+        if (!wl_columnar_memory_rollback(token)) abort();
+        wl_columnar_memory_reservation_init(token);
+        return EINVAL;
+    }
+    *out = storage;
+    return 0;
+}
+
+static void
+wl_columnar_session_scalar_view_release(void *context, void *storage,
+    size_t bytes)
+{
+    wl_col_session_t *sess = context;
+    wl_columnar_memory_reservation_t *token =
+        &sess->controlled_scalar_view_reservation;
+    /* Only our successful allocator can reach this callback. The session
+     * governor reference outlives the arena and its exact own-credit return. */
+    if (!storage || !bytes || token->identity != token
+        || token->bytes != bytes || token->governor !=
+        wl_columnar_memory_governor_ref_get(sess->memory_governor)
+        || atomic_load_explicit(&token->state, memory_order_acquire)
+        != WL_COLUMNAR_MEMORY_RESERVATION_COMMITTED
+        || atomic_load_explicit(&token->owner_bits, memory_order_acquire)
+        != (uint64_t)(uintptr_t)storage) abort();
+    free(storage);
+    if (!wl_columnar_memory_release(token)) abort();
+    wl_columnar_memory_reservation_init(token);
+}
+
 static int
 col_session_create_internal(const wl_plan_t *plan, uint32_t num_workers,
     const wl_session_options_t *options, wl_session_t **out)
@@ -4864,6 +4926,8 @@ col_session_create_internal(const wl_plan_t *plan, uint32_t num_workers,
     sess->cleanup_receipt_next_id = 1;
     sess->cleanup_receipt_next_plan_epoch = 1;
     sess->memory_governor = memory_governor;
+    wl_columnar_memory_reservation_init(
+        &sess->controlled_scalar_view_reservation);
     wl_columnar_memory_reservation_init(&sess->rel_hash_reservation);
     wl_columnar_memory_reservation_init(&sess->rels_reservation);
     wl_columnar_memory_reservation_init(
@@ -5345,6 +5409,20 @@ col_session_create_internal(const wl_plan_t *plan, uint32_t num_workers,
      * pairs to prevent incorrect skip-condition evaluation across epochs. */
     /* outer_epoch = 0; */ /* Already zeroed by calloc */
 
+    /* Generic session creation has attached the normalized options control,
+     * but assigns base.evaluation_control only after this backend succeeds.
+     * Preserve sess->plan and every execution selector; this view has no
+     * evaluator consumer until the separately reviewed scalar driver exists. */
+    if (options && options->evaluation_control && sess->num_workers == 1) {
+        const wl_plan_scalar_view_allocator_t allocator = {
+            sess, wl_columnar_session_scalar_view_allocate,
+            wl_columnar_session_scalar_view_release
+        };
+        relation_create_rc = wl_plan_scalar_view_create(plan, &allocator,
+                &sess->controlled_scalar_view);
+        if (relation_create_rc) goto oom;
+    }
+
     /* Last fallible initialization: no store-owning early return follows.
      * All spill allocations use the session's existing admission governor. */
     if (options && options->spill_directory) {
@@ -5388,6 +5466,9 @@ oom:
     if (intern_attached_here)
         (void)wl_intern_detach_memory_governor(
             sess->intern, sess->memory_governor);
+    wl_plan_scalar_view_t *view = sess->controlled_scalar_view;
+    sess->controlled_scalar_view = NULL;
+    wl_plan_scalar_view_destroy(view);
     wl_columnar_memory_governor_ref_release(sess->memory_governor);
     free(sess);
     return relation_create_rc == ENOSPC ? WL_ERR_MEMORY_BUDGET
@@ -5699,6 +5780,9 @@ col_session_destroy(wl_session_t *session)
     }
     if (sess->owns_spill_store)
         wl_columnar_spill_store_retire(sess->spill_store);
+    wl_plan_scalar_view_t *view = sess->controlled_scalar_view;
+    sess->controlled_scalar_view = NULL;
+    wl_plan_scalar_view_destroy(view);
     wl_columnar_memory_governor_ref_release(sess->memory_governor);
     free(sess);
 }

@@ -27,6 +27,7 @@ bench_optimizer_src = files(
 )
 
 bench_backend_src = files(
+  subdir_wirelog / 'exec_plan_scalar_view.c',
   subdir_wirelog / 'columnar/relation.c',
   subdir_wirelog / 'columnar/cache.c',
   subdir_wirelog / 'columnar/ops.c',

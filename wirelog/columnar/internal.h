@@ -3008,6 +3008,10 @@ typedef struct wl_col_session_t {
 #ifdef WL_PROFILE
     wl_profile_stats_t profile; /* operator profiling counters */
 #endif
+    /* Coordinator-owned immutable descriptor arena. Never execution authority
+    * and never copied to worker wrappers, including its noncopyable token. */
+    wl_plan_scalar_view_t *controlled_scalar_view;
+    wl_columnar_memory_reservation_t controlled_scalar_view_reservation;
     /* Memory accounting ledger (Issue #224): thread-safe per-subsystem tracking.
      * Embedded (not a pointer) so that the session owns the ledger lifetime.
      * Initialized in col_session_create via wl_mem_ledger_init().
@@ -3251,18 +3255,22 @@ typedef struct wl_col_session_t {
     uint64_t seed_none_identity[16];
 } wl_col_session_t;
 
-/* Distinct unpublished destination, immutable non-ledger source fields.
- * Never byte-copy live accounting atomics or original writer authority.
- * Caller initializes the excluded ledger before any use or publication. */
+/* Distinct unpublished destination, immutable non-owning source fields.
+ * Never byte-copy the scalar-view token or live ledger atomics, even
+ * transiently. Caller initializes the excluded ledger before publication. */
 static inline void
 wl_columnar_session_copy_without_ledger(wl_col_session_t *destination,
     const wl_col_session_t *source)
 {
-    const size_t begin = offsetof(wl_col_session_t, mem_ledger);
-    const size_t end = begin + sizeof(source->mem_ledger);
+    const size_t begin = offsetof(wl_col_session_t, controlled_scalar_view);
+    const size_t end = offsetof(wl_col_session_t, mem_ledger)
+        + sizeof(source->mem_ledger);
     memcpy(destination, source, begin);
     memcpy((unsigned char *)destination + end,
         (const unsigned char *)source + end, sizeof(*source) - end);
+    destination->controlled_scalar_view = NULL;
+    wl_columnar_memory_reservation_init(
+        &destination->controlled_scalar_view_reservation);
 }
 
 bool

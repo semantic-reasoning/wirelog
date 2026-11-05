@@ -228,7 +228,7 @@ These exist so struct fields can be declared portably; the audit in
 
 Every `atomic_*` call site in `wirelog/` production sources. Counted
 mechanically by `scripts/ci/check-threading-doc.sh`; row count must
-match the script's count (currently **458**).
+match the script's count (currently **461**).
 
 Format: `file:function[#N]` | field | operation | order | justification.
 
@@ -665,7 +665,7 @@ concurrent alias removals cannot underflow the count.
 | `session.c:session_pool_rel_promote#3` | `src->storage_alias_borrows` | `atomic_store_explicit` | relaxed | Leave the closed pool tombstone with no child aliases |
 
 112 + 21 + 37 = **170 atomic call sites** in the summarized groups; the full
-symbol-anchored inventory below covers 458 sites.
+symbol-anchored inventory below covers 461 sites.
 
 The `#N` suffix counts all atomic sites in a symbol, regardless of operation;
 the first site remains unsuffixed. `scripts/ci/check-threading-doc.sh` uses
@@ -1752,7 +1752,7 @@ DONE. If a stop leaves the receipt holding a claim, its caller preserves that
 receipt and resumes with a fresh live maintenance attempt; it cannot abandon or
 reinitialize the receipt/token while the claim remains held.
 
-The complete current atomic-source inventory contains 458 call sites.
+The complete current atomic-source inventory contains 461 call sites.
 
 ### Caller-attempt-bound single mutation admission
 
@@ -2616,3 +2616,17 @@ The payload and memory orders match the shared reservation move operation.
 | `relation.c:wl_columnar_relation_constructor_reservation_move#5` | `destination->state` | `atomic_store_explicit` | release | Publish the complete moved reservation at its final address |
 | `relation.c:wl_columnar_relation_constructor_reservation_move#6` | `source->owner_bits` | `atomic_store_explicit` | relaxed | Clear transferred source owner payload before publishing EMPTY |
 | `relation.c:wl_columnar_relation_constructor_reservation_move#7` | `source->state` | `atomic_store_explicit` | release | Publish EMPTY after source payload and ownership have been cleared |
+
+## Scalar-view arena reservation
+
+The coordinator retains a governor reference throughout scalar-view allocation
+and serialized arena destruction. Its reservation remains at its final session
+address; worker copies exclude it. The allocation callback requires EMPTY,
+while the release callback verifies the committed storage owner before freeing
+physical storage and returning its exact credit.
+
+| Source anchor | Object | Atomic operation | Ordering | Synchronization purpose |
+| --- | --- | --- | --- | --- |
+| `session.c:wl_columnar_session_scalar_view_allocate` | `token->state` | `atomic_load_explicit` | acquire | Require the coordinator's final-address arena token to be EMPTY before real governor admission |
+| `session.c:wl_columnar_session_scalar_view_release` | `token->state` | `atomic_load_explicit` | acquire | Verify COMMITTED arena authority before physical storage is freed and its credit released |
+| `session.c:wl_columnar_session_scalar_view_release#2` | `token->owner_bits` | `atomic_load_explicit` | acquire | Verify that the actual committed reservation names this arena allocation before destruction |
