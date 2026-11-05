@@ -335,6 +335,16 @@ int wl_columnar_join_batch_prepare_sink_commit_ack(
     uint64_t generation, const wl_columnar_relation_append_batch_t *,
     const wl_columnar_relation_scalar_source_t *, uint32_t *committed_extent,
     const void *numeric_owner);
+typedef struct {
+    int protocol;
+    bool funding_refused;
+} wl_columnar_join_batch_sink_ack_result_t;
+wl_columnar_join_batch_sink_ack_result_t
+    wl_columnar_join_batch_prepare_sink_commit_ack_funded(
+    wl_columnar_join_batch_prepare_t *, col_rel_t *, uint32_t, uint64_t,
+    const wl_columnar_relation_append_batch_t *,
+    const wl_columnar_relation_scalar_source_t *, uint32_t *, const void *,
+    wl_evaluation_control_t *, uint64_t);
 /* Real DONE without a pending batch; no generation may be invented or ACKed.
  * The zero-row borrowed scratch remains protected by the prepared owner. */
 int wl_columnar_join_batch_prepare_terminal_schema(

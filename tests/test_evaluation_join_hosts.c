@@ -1648,13 +1648,169 @@ funding_public(void)
     }
 }
 
+static unsigned ack_boundary_case, ack_before, ack_after;
+static bool ack_boundary_selected, ack_boundary_finished, ack_cancelled;
+static bool ack_report_rechecked, ack_outer_consumed, ack_inner_consumed;
+static uint64_t ack_original_work;
+static const uint64_t ack_limits[] = {1650, 1651, 1877, 1878, 1992, 1993, 2496};
+static const uint64_t ack_consumed[] = {1409, 1651, 1651, 1878, 1878, 1993,
+                                        1651};
+static wl_evaluation_control_report_t ack_finished_report;
+
+static int
+ack_expected_protocol(void)
+{
+    return ack_boundary_case == 5 ? 0 : ack_boundary_case == 6
+        ? WL_EVALUATION_CONTROL_CANCELLED : WL_EVALUATION_CONTROL_WORK_LIMIT;
+}
+
+static void
+ack_boundary_checkpoint(wl_evaluation_control_t *control, unsigned event,
+    uint64_t generation, uint32_t extent, uint64_t producer_work)
+{
+    checkpoint(control, event, generation, extent, producer_work);
+    if (ack_boundary_case != 6 || !ack_boundary_selected || ack_cancelled ||
+        event != WL_COLUMNAR_JOIN_PIPELINE_TEST_BEFORE_ACK) return;
+    wl_col_session_t *session = (wl_col_session_t *)active->session;
+    wl_columnar_eval_serial_framed_attempt_t *ctx = NULL;
+    CHECK(!wl_columnar_eval_stack_framed_context(session->cleanup_active,
+        session, &ctx));
+    CHECK(ctx->pending_funding && ctx->pending_funding != control &&
+        wl_evaluation_control_active_attempt_id(ctx->pending_funding) ==
+        ctx->pending_funding_id);
+    /* Interrupt the actual live host grant through its ordinary cancellation
+     * API. No grant fields, reports, protocol state or phases are seeded. */
+    wl_evaluation_control_request_cancel(ctx->pending_funding);
+    ack_cancelled = true;
+}
+
+static uint64_t
+ack_boundary_limit(const wl_col_session_t *session,
+    wl_columnar_eval_serial_framed_host_action_t action, uint64_t proposed)
+{
+    if (action != WL_COLUMNAR_EVAL_SERIAL_FRAMED_ADVANCE ||
+        !session->cleanup_active) return proposed;
+    wl_columnar_eval_serial_framed_attempt_t *ctx = NULL;
+    CHECK(active && session == (wl_col_session_t *)active->session);
+    CHECK(!wl_columnar_eval_stack_framed_context(session->cleanup_active,
+        (wl_col_session_t *)session, &ctx));
+    if (ack_boundary_selected) {
+        if (!ack_boundary_finished) return proposed;
+        if (!ack_outer_consumed &&
+            ctx->phase == WL_COLUMNAR_EVAL_SERIAL_FRAMED_PENDING) {
+            wl_evaluation_control_report_t report;
+            CHECK(ctx->pending_funding &&
+                !wl_evaluation_control_report(ctx->pending_funding, &report) &&
+                report.attempt_id == ack_finished_report.attempt_id &&
+                report.consumed == ack_finished_report.consumed &&
+                report.result == ack_finished_report.result);
+            ack_report_rechecked = true;
+        }
+        if (!ack_outer_consumed &&
+            ctx->phase == WL_COLUMNAR_EVAL_SERIAL_FRAMED_CHILD &&
+            ctx->child.phase == WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_PENDING) {
+            CHECK(!ctx->pending_funding &&
+                ctx->inner_protocol == ack_expected_protocol() &&
+                !ctx->child.protocol_result && !ctx->child.semantic_result);
+            ack_outer_consumed = true;
+        }
+        if (ack_outer_consumed && !ack_inner_consumed &&
+            ctx->child.phase ==
+            WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_JOIN_BATCH) {
+            CHECK(ctx->child.protocol_result == ack_expected_protocol() &&
+                !ctx->child.semantic_result);
+            ack_inner_consumed = true;
+        }
+        return proposed;
+    }
+    if (ctx->phase != WL_COLUMNAR_EVAL_SERIAL_FRAMED_CHILD ||
+        ctx->child.phase != WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_JOIN_BATCH)
+        return proposed;
+    uint64_t work;
+    CHECK(!wl_columnar_join_pipeline_numeric_funding_work(&ctx->child, &work));
+    if (work != 585) return proposed;
+    CHECK(proposed == 2496 && ctx->controlled_materialized_batch_fallback);
+    CHECK(!wl_evaluation_control_test_active_consumed(active->control,
+        ctx->attempt_id, &ack_original_work));
+    ack_before = hits[WL_COLUMNAR_JOIN_PIPELINE_TEST_BEFORE_ACK];
+    ack_after = hits[WL_COLUMNAR_JOIN_PIPELINE_TEST_AFTER_ACK];
+    ack_boundary_selected = true;
+    return ack_limits[ack_boundary_case];
+}
+
+static void
+ack_boundary_report(const wl_col_session_t *session,
+    wl_columnar_eval_serial_framed_host_action_t action,
+    wl_evaluation_control_t *grant, int protocol)
+{
+    if (!ack_boundary_selected || ack_boundary_finished) return;
+    CHECK(active && session == (wl_col_session_t *)active->session &&
+        action == WL_COLUMNAR_EVAL_SERIAL_FRAMED_ADVANCE);
+    wl_evaluation_control_report_t report;
+    CHECK(!wl_evaluation_control_active_attempt_id(grant) &&
+        !wl_evaluation_control_report(grant, &report));
+    CHECK(report.limit == ack_limits[ack_boundary_case] &&
+        report.consumed == ack_consumed[ack_boundary_case] &&
+        !report.execution_status && !report.cleanup_status);
+    CHECK(protocol == ack_expected_protocol() && report.result == protocol);
+    wl_columnar_eval_serial_framed_attempt_t *ctx = NULL;
+    CHECK(!wl_columnar_eval_stack_framed_context(session->cleanup_active,
+        (wl_col_session_t *)session, &ctx));
+    CHECK(ctx->phase == WL_COLUMNAR_EVAL_SERIAL_FRAMED_PENDING &&
+        ctx->pending_action == WL_COLUMNAR_EVAL_SERIAL_FRAMED_CHILD &&
+        ctx->pending_funding == grant &&
+        ctx->pending_funding_id == report.attempt_id &&
+        ctx->child.phase == WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_PENDING &&
+        !ctx->child.protocol_result && !ctx->child.semantic_result);
+    uint64_t original;
+    CHECK(!wl_evaluation_control_test_active_consumed(active->control,
+        ctx->attempt_id, &original) && original == ack_original_work + 1);
+    CHECK(hits[WL_COLUMNAR_JOIN_PIPELINE_TEST_BEFORE_ACK] ==
+        ack_before + (ack_boundary_case != 0) &&
+        hits[WL_COLUMNAR_JOIN_PIPELINE_TEST_AFTER_ACK] ==
+        ack_after + (ack_boundary_case == 5));
+    col_rel_t *head = session_find_rel((wl_col_session_t *)session, "output");
+    CHECK(!head || !head->nrows);
+    ack_finished_report = report;
+    ack_boundary_finished = true;
+}
+
+static void
+funding_ack_boundaries(void)
+{
+    /* Each one-shot production grant reaches a real ACK stage. The next
+     * normal grant consumes the genuine outer and inner pending results;
+     * the source report remains intact until its actual outer consumption. */
+    for (ack_boundary_case = 0; ack_boundary_case < 7; ++ack_boundary_case) {
+        fixture_t f; init(&f, 0, true, 2); observe(&f);
+        target = 0; stopped = false; work_stop = false;
+        ack_boundary_selected = ack_boundary_finished = false;
+        ack_cancelled = ack_report_rechecked = false;
+        ack_outer_consumed = ack_inner_consumed = false;
+        wl_columnar_join_pipeline_test_numeric_checkpoint =
+            ack_boundary_checkpoint;
+        wl_columnar_session_test_framed_grant_limit = ack_boundary_limit;
+        wl_columnar_session_test_framed_grant_finished = ack_boundary_report;
+        int rc = finish(f.session);
+        wl_columnar_session_test_framed_grant_limit = NULL;
+        wl_columnar_session_test_framed_grant_finished = NULL;
+        CHECK(!rc && ack_boundary_selected && ack_boundary_finished &&
+            ack_report_rechecked && ack_outer_consumed && ack_inner_consumed &&
+            ack_cancelled == (ack_boundary_case == 6));
+        CHECK(hits[WL_COLUMNAR_JOIN_PIPELINE_TEST_AFTER_ACK] > 1);
+        CHECK(!finish(f.raw));
+        verify(&f, f.session); verify(&f, f.raw);
+        destroy(&f);
+    }
+}
+
 static void
 funding(void)
 {
     funding_setup(); funding_setup_turnover();
     funding_metadata(); funding_metadata_cancel(); funding_metadata_authority();
     funding_start_boundaries();
-    funding_composed(); funding_public();
+    funding_composed(); funding_public(); funding_ack_boundaries();
 }
 
 int
