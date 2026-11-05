@@ -91,6 +91,67 @@ wl_columnar_eval_plan_numeric_composed_abort_supported(
     return 0;
 }
 
+int
+wl_columnar_eval_plan_numeric_composed_abort_supported_attempt_controlled(
+    const wl_plan_relation_t *plan, uint32_t begin, uint32_t end,
+    bool *supported, wl_evaluation_control_t *control, uint64_t attempt_id)
+{
+    if (!supported) return EINVAL;
+    *supported = false;
+    int rc = wl_evaluation_control_charge_attempt(control, attempt_id,
+            WL_COLUMNAR_EVAL_PLAN_ABORT_SCAN_ENTRY_WORK);
+    if (rc) return rc;
+    if (!plan || !plan->ops || begin >= end || end > plan->op_count)
+        return EINVAL;
+    uint32_t depth = 0;
+    uint32_t i = begin;
+    while (i < end) {
+        rc = wl_evaluation_control_charge_attempt(control, attempt_id,
+                WL_COLUMNAR_EVAL_PLAN_ABORT_SCAN_OP_WORK);
+        if (rc) return rc;
+        switch (plan->ops[i].op) {
+        case WL_PLAN_OP_VARIABLE:
+            if (depth == COL_STACK_MAX) return ENOBUFS;
+            ++depth;
+            break;
+        case WL_PLAN_OP_FILTER:
+        case WL_PLAN_OP_MAP:
+            if (!depth) return EINVAL;
+            break;
+        case WL_PLAN_OP_LFTJ:
+            /* A generated LFTJ owns its k input relations in opaque_data and
+             * contributes one result to the composed runtime stack. */
+            if (depth) return EINVAL;
+            ++depth;
+            break;
+        case WL_PLAN_OP_JOIN:
+            if (!depth) return EINVAL;
+            /* The owned ordinary JOIN attempt retains cancellation state and
+             * cleanup after its synchronous run returns. Host ABORT cannot
+             * interrupt that run. Materialized JOIN has no equivalent framed
+             * owner and remains usable only through ordinary advance. */
+            if (plan->ops[i].materialized) return 0;
+            break;
+        case WL_PLAN_OP_CONCAT:
+            if (depth < 2) return EINVAL;
+            --depth;
+            break;
+        case WL_PLAN_OP_CONSOLIDATE:
+            if (!depth || i + 1 != end) return ENOTSUP;
+            break;
+        default:
+            return 0;
+        }
+        ++i;
+    }
+    rc = wl_evaluation_control_charge_attempt(control, attempt_id,
+            WL_COLUMNAR_EVAL_PLAN_ABORT_SCAN_FINAL_WORK);
+    if (rc) return rc;
+    *supported = depth == 1
+        && plan->ops[end - 1].op == WL_PLAN_OP_CONSOLIDATE;
+    return 0;
+}
+
 /*
  * wl_columnar_eval_plan_var_skip_scan:
  * Decide whether the rows of the VARIABLE at @var_idx can be left out of

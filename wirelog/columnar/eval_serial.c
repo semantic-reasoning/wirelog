@@ -168,11 +168,8 @@ wl_columnar_eval_serial_framed_attempt_begin_internal(
     bool abort_supported = false;
     uint32_t child_end = capture_only && !ordinary_capture
         ? plan->op_count - 1 : plan->op_count;
-    int rc = wl_columnar_eval_plan_numeric_composed_abort_supported(plan, 0,
-            child_end, &abort_supported);
-    if (rc) return rc;
     wl_columnar_eval_serial_framed_attempt_t *ctx = NULL;
-    rc = wl_columnar_eval_stack_framed_context(frame, session, &ctx);
+    int rc = wl_columnar_eval_stack_framed_context(frame, session, &ctx);
     if (rc) return rc;
     rc = wl_columnar_eval_stack_cleanup_receipt_key_for_frame(frame,
             &ctx->cleanup_receipt_key);
@@ -189,6 +186,11 @@ wl_columnar_eval_serial_framed_attempt_begin_internal(
     rc = wl_columnar_eval_stack_framed_fresh(frame, ctx);
     if (rc) return rc;
     rc = wl_columnar_eval_serial_framed_fund(funding, funding_id, control);
+    if (rc) return rc;
+    rc =
+        wl_columnar_eval_plan_numeric_composed_abort_supported_attempt_controlled
+        (
+        plan, 0, child_end, &abort_supported, control, id);
     if (rc) return rc;
     /* 392*192 = current50176 + future25088 = 98 named256 capacities:
      * stack/result disposal33, later inert proof33, B2drain18, workspace4,

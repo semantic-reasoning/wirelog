@@ -2115,3 +2115,38 @@ This qualifies the changed ACK action and its stated containing windows only.
 Unchanged ordinary STATUS/consume/factory/coordinator envelopes, constructor,
 writer/compiler, generic receipt and strict/cache/local/shared/general policy
 obligations remain required before the grouped PR is Ready.
+
+
+### Framed abort-capability scan
+
+The controlled classifier now charges the original saved attempt before each
+operator read. Its complete source bounds are ENTRY33, OP64 and FINAL17;
+OP64 includes all grammar branches, indexed materialized inspection and one
+following refused OP/FINAL frontier. ENTRY owns only one refused first OP.
+The existing raw classifier remains unchanged, and each genuine recapture
+repeats the scan without carrying a previous result as permission.
+
+The sole framed call follows the same existing funding384 and precedes the
+bootstrap, retention and context activation. The exact incremental framing
+seam is35/384: its own15 plus either the first ENTRY refusal/public return19
+or post-scan bootstrap first-refusal/public return20. This does not certify
+unused framing capacity for OPEN fixed preflight/native work. Existing
+bootstrap actions retain their own current/future shares; the final context
+activation remains separately charged256. No field, allocation or layout
+changes are introduced.
+
+Parsed unions with3,17 and65 unique inputs exercise growing preserved compiler
+bodies at stack depth2, literal nonempty results against raw execution, and
+two real captures on one original attempt. Exact begin budgets include the
+independently derived scan plus392*192+256. Numeric tests cover each visited
+OP one-short, FINAL16/17, repeated cumulative scans, all grammar results and
+real finished/stale/cancelled generations with zero successor consumption.
+Framed tests cover child383/384, initial and partial original refusal and the
+explicit funding-before-variable-error order. Refusal checks identity, pin and
+phase freshness rather than byte equality of a context whose receipt key may
+already be written. Existing recursive exact-work formulas add the compiled
+body's scan once per independently specified capture round.
+
+Whole fixed constructor/public return, static recursive recognizer, O0/O2,
+retirement-parent, owner predicate, cutoff and general policy source obligations
+remain separate required work.

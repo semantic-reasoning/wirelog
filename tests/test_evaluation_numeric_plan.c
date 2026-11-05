@@ -13394,9 +13394,189 @@ test_finite_scalar_retirement_leaves(void)
             }
 }
 
+/* The scanner is an observation, never a fabricated runtime permission. These
+ * unit inputs compare every grammar outcome with the untouched raw classifier;
+ * the generated and framed fixtures below supply the production positives. */
+static void
+abort_scan_case(const wl_plan_relation_t *plan, uint32_t begin, uint32_t end,
+    uint64_t limit, int expected, bool expected_supported, uint64_t work)
+{
+    int owner = 0;
+    wl_evaluation_control_t *control = control_new(limit, &owner);
+    uint64_t id = wl_evaluation_control_active_attempt_id(control);
+    bool supported = true;
+    int rc =
+        wl_columnar_eval_plan_numeric_composed_abort_supported_attempt_controlled
+            (plan, begin, end, &supported, control, id);
+    CHECK(rc == expected && supported == expected_supported);
+    int finish = wl_evaluation_control_finish(control, &owner, 0, 0);
+    CHECK(finish == (expected == WL_EVALUATION_CONTROL_WORK_LIMIT
+        ? expected : 0));
+    wl_evaluation_control_report_t report;
+    CHECK(!wl_evaluation_control_report(control, &report)
+        && report.attempt_id == id && report.consumed == work);
+    CHECK(!wl_evaluation_control_detach(control, &owner));
+    wl_evaluation_control_release(control);
+}
+
+static void
+test_abort_scan_semantics_and_boundaries(void)
+{
+    const wl_plan_op_type_t cases[][6] = {
+        {WL_PLAN_OP_VARIABLE, WL_PLAN_OP_CONSOLIDATE},
+        {WL_PLAN_OP_VARIABLE, WL_PLAN_OP_FILTER, WL_PLAN_OP_MAP,
+         WL_PLAN_OP_JOIN, WL_PLAN_OP_CONSOLIDATE},
+        {WL_PLAN_OP_LFTJ, WL_PLAN_OP_CONSOLIDATE},
+        {WL_PLAN_OP_VARIABLE, WL_PLAN_OP_VARIABLE, WL_PLAN_OP_CONCAT,
+         WL_PLAN_OP_CONSOLIDATE},
+        {WL_PLAN_OP_FILTER}, {WL_PLAN_OP_MAP}, {WL_PLAN_OP_JOIN},
+        {WL_PLAN_OP_CONCAT}, {WL_PLAN_OP_CONSOLIDATE},
+        {WL_PLAN_OP_VARIABLE, WL_PLAN_OP_LFTJ},
+        {WL_PLAN_OP_VARIABLE, WL_PLAN_OP_CONSOLIDATE, WL_PLAN_OP_FILTER},
+        {WL_PLAN_OP_EXCHANGE}, {WL_PLAN_OP_VARIABLE}
+    };
+    const uint32_t lengths[] = {2, 5, 2, 4, 1, 1, 1, 1, 1, 2, 3, 1, 1};
+    const uint32_t visited[] = {2, 5, 2, 4, 1, 1, 1, 1, 1, 2, 2, 1, 1};
+    for (unsigned c = 0; c < sizeof(lengths) / sizeof(lengths[0]); ++c) {
+        wl_plan_op_t ops[6] = {0};
+        for (uint32_t i = 0; i < lengths[c]; ++i) ops[i].op = cases[c][i];
+        wl_plan_relation_t plan = {.name = "scanner", .ops = ops,
+                                   .op_count = lengths[c]};
+        bool supported = true;
+        int raw = wl_columnar_eval_plan_numeric_composed_abort_supported(
+            &plan, 0, plan.op_count, &supported);
+        bool complete = !raw && c != 11;
+        abort_scan_case(&plan, 0, plan.op_count, 0, raw, supported,
+            33u + 64u * visited[c] + (complete ? 17u : 0u));
+        abort_scan_case(&plan, 0, plan.op_count, 32,
+            WL_EVALUATION_CONTROL_WORK_LIMIT, false, 0);
+        abort_scan_case(&plan, 0, plan.op_count, 33,
+            WL_EVALUATION_CONTROL_WORK_LIMIT, false, 33);
+    }
+    wl_plan_op_t materialized[] = {
+        {.op = WL_PLAN_OP_VARIABLE},
+        {.op = WL_PLAN_OP_JOIN, .materialized = true},
+        {.op = WL_PLAN_OP_CONSOLIDATE}
+    };
+    wl_plan_relation_t plan = {.name = "scanner", .ops = materialized,
+                               .op_count = 3};
+    abort_scan_case(&plan, 0, 3, 0, 0, false, 33u + 2u * 64u);
+    abort_scan_case(&plan, 1, 3, 0, EINVAL, false, 33u + 64u);
+    abort_scan_case(&plan, 0, 0, 0, EINVAL, false, 33);
+    abort_scan_case(&plan, 0, 4, 0, EINVAL, false, 33);
+    abort_scan_case(NULL, 0, 1, 0, EINVAL, false, 33);
+    int owner = 0;
+    wl_evaluation_control_t *control = control_new(0, &owner);
+    uint64_t id = wl_evaluation_control_active_attempt_id(control);
+    CHECK(
+        wl_columnar_eval_plan_numeric_composed_abort_supported_attempt_controlled
+            (&plan, 0, plan.op_count, NULL, control, id) == EINVAL);
+    CHECK(!wl_evaluation_control_finish(control, &owner, 0, 0));
+    wl_evaluation_control_report_t report;
+    CHECK(!wl_evaluation_control_report(control, &report) && !report.consumed);
+    CHECK(!wl_evaluation_control_detach(control, &owner));
+    wl_evaluation_control_release(control);
+    wl_plan_op_t *deep = calloc(COL_STACK_MAX + 1u, sizeof(*deep));
+    CHECK(deep);
+    for (unsigned i = 0; i <= COL_STACK_MAX; ++i)
+        deep[i].op = WL_PLAN_OP_VARIABLE;
+    plan.ops = deep; plan.op_count = COL_STACK_MAX + 1u;
+    abort_scan_case(&plan, 0, plan.op_count, 0, ENOBUFS, false,
+        33u + 64u * plan.op_count);
+    free(deep);
+}
+
+static void
+test_abort_scan_generated_and_saved_id(void)
+{
+    const unsigned branches[] = {3, 17, 65};
+    for (unsigned b = 0; b < 3; ++b) {
+        char text[16384]; size_t used = 0;
+        for (unsigned i = 0; i < branches[b]; ++i)
+            used += (size_t)snprintf(text + used, sizeof(text) - used,
+                    ".decl input%u(x:int64)\n", i);
+        used += (size_t)snprintf(text + used, sizeof(text) - used,
+                ".decl output(x:int64)\n");
+        for (unsigned i = 0; i < branches[b]; ++i)
+            used += (size_t)snprintf(text + used, sizeof(text) - used,
+                    "output(x):-input%u(x).\n", i);
+        CHECK(used < sizeof(text));
+        wirelog_error_t error;
+        wirelog_program_t *program = wirelog_parse_string(text, &error);
+        wl_plan_t *compiled = NULL;
+        CHECK(program && !wl_plan_from_program(program, &compiled));
+        wl_plan_relation_t body = probe_generated_body(compiled);
+        unsigned variables = 0, concats = 0;
+        for (uint32_t i = 0; i < body.op_count; ++i) {
+            variables += body.ops[i].op == WL_PLAN_OP_VARIABLE;
+            concats += body.ops[i].op == WL_PLAN_OP_CONCAT;
+        }
+        CHECK(variables == branches[b] && concats + 1 == variables);
+        const uint64_t ops_work = 33u + 64u * body.op_count;
+        const uint64_t complete = ops_work + 17u;
+        for (uint32_t i = 1; i <= body.op_count; ++i) {
+            abort_scan_case(&body, 0, body.op_count, 33u + 64u * i - 1u,
+                WL_EVALUATION_CONTROL_WORK_LIMIT, false,
+                33u + 64u * (i - 1u));
+            abort_scan_case(&body, 0, body.op_count, 33u + 64u * i,
+                WL_EVALUATION_CONTROL_WORK_LIMIT, false, 33u + 64u * i);
+        }
+        abort_scan_case(&body, 0, body.op_count, complete - 1u,
+            WL_EVALUATION_CONTROL_WORK_LIMIT, false, ops_work);
+        abort_scan_case(&body, 0, body.op_count, complete, 0, true, complete);
+        int owner = 0;
+        wl_evaluation_control_t *control = control_new(2u * complete, &owner);
+        uint64_t id = wl_evaluation_control_active_attempt_id(control);
+        bool supported = false;
+        for (unsigned repeat = 0; repeat < 2; ++repeat) {
+            CHECK(!
+                wl_columnar_eval_plan_numeric_composed_abort_supported_attempt_controlled
+                    (&body, 0, body.op_count, &supported, control, id)
+                && supported);
+        }
+        CHECK(
+            wl_columnar_eval_plan_numeric_composed_abort_supported_attempt_controlled
+                (&body, 0, body.op_count, &supported, control, id)
+            == WL_EVALUATION_CONTROL_WORK_LIMIT && !supported);
+        CHECK(wl_evaluation_control_finish(control, &owner, 0, 0)
+            == WL_EVALUATION_CONTROL_WORK_LIMIT);
+        wl_evaluation_control_report_t report;
+        CHECK(!wl_evaluation_control_report(control, &report)
+            && report.consumed == 2u * complete);
+        /* Finished, stale, and cancelled generations use actual lifecycle APIs;
+         * no copied grant or restored completed report authorizes a scan. */
+        CHECK(
+            wl_columnar_eval_plan_numeric_composed_abort_supported_attempt_controlled
+                (&body, 0, body.op_count, &supported, control, id) == EINVAL);
+        CHECK(!wl_evaluation_control_reset(control));
+        CHECK(!wl_evaluation_control_configure(control, 0));
+        CHECK(!wl_evaluation_control_begin(control, &owner));
+        uint64_t successor = wl_evaluation_control_active_attempt_id(control);
+        CHECK(successor != id);
+        CHECK(
+            wl_columnar_eval_plan_numeric_composed_abort_supported_attempt_controlled
+                (&body, 0, body.op_count, &supported, control, id) == EINVAL
+            && !supported);
+        wl_evaluation_control_request_cancel(control);
+        CHECK(
+            wl_columnar_eval_plan_numeric_composed_abort_supported_attempt_controlled
+                (&body, 0, body.op_count, &supported, control, successor)
+            == WL_EVALUATION_CONTROL_CANCELLED && !supported);
+        CHECK(wl_evaluation_control_finish(control, &owner, 0, 0)
+            == WL_EVALUATION_CONTROL_CANCELLED);
+        CHECK(!wl_evaluation_control_report(control, &report)
+            && report.attempt_id == successor && !report.consumed);
+        CHECK(!wl_evaluation_control_detach(control, &owner));
+        wl_evaluation_control_release(control);
+        wl_plan_free(compiled); wirelog_program_free(program);
+    }
+}
+
 int
 main(void)
 {
+    test_abort_scan_semantics_and_boundaries();
+    test_abort_scan_generated_and_saved_id();
     test_prepared_join_chained_delta();
     test_prepared_join_early_stop_turnover();
     test_prepared_join_unsupported_contexts();
