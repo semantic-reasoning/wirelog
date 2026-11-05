@@ -7766,11 +7766,16 @@ col_eval_stratum_tdd_recursive(const wl_plan_stratum_t *sp,
     }
 
     /* Sort pre-existing IDB data on workers (eval_serial.c:309-314).
-    * The serial twin of this loop propagates a refused sort for the same
-    * reason: it establishes the sorted prefix that
-    * col_op_consolidate_incremental_delta requires, and continuing on an
-    * unsorted prefix makes the two-pointer merge miss duplicates. */
-    for (uint32_t w = 0; w < W; w++) {
+     * The serial twin of this loop propagates a refused sort for the same
+     * reason: it establishes the sorted prefix that
+     * col_op_consolidate_incremental_delta requires, and continuing on an
+     * unsorted prefix makes the two-pointer merge miss duplicates.
+     * Global-read workers only read borrowed coordinator heads and emit
+     * private deltas; they never consolidate into those heads. Sorting a
+     * borrowed head would request a writer against its live reader leases.
+     * Their exchange consolidates deltas and hash-diffs the coordinator head
+     * without requiring a sorted worker prefix. */
+    for (uint32_t w = 0; !global_read_mode && w < W; w++) {
         for (uint32_t ri = 0; ri < nrels; ri++) {
             col_rel_t *r = session_find_rel(&coord->tdd_workers[w],
                     sp->relations[ri].name);
