@@ -69,7 +69,8 @@ wl_delta_event_append(wl_col_session_t *sess, const char *relation,
         sess->delta_events = grown;
         sess->delta_event_capacity = next;
     }
-    copy = (int64_t *)malloc((size_t)row_bytes);
+    /* A zero-width row still needs a distinct, non-null address. */
+    copy = (int64_t *)malloc(row_bytes ? (size_t)row_bytes : sizeof(*copy));
     if (!copy) {
         if (replacement_active)
             wl_columnar_memory_rollback(&replacement);
@@ -3351,7 +3352,8 @@ wl_columnar_eval_delta_rollback_retry(wl_col_session_t *sess)
          * the partial storage first so the captured pre-step snapshot is the
          * state that becomes visible again. */
         bool incomplete = !record->retained && record->evaluation_error != 0;
-        if (incomplete && rel->columns
+        bool holds_rows = rel->columns || (!rel->ncols && rel->nrows);
+        if (incomplete && holds_rows
             && (entry->nrows == 0 || rel->storage_owner != rel)) {
             rc = wl_columnar_relation_delta_detach(rel, entry->identity);
             if (rc != 0) {
@@ -3432,7 +3434,11 @@ wl_columnar_eval_delta_capture(const wl_plan_stratum_t *sp,
         wl_columnar_eval_delta_snapshot_t *entry = &record->entries[i];
         col_rel_t *rel = session_find_rel(sess, sp->relations[i].name);
         uint64_t cells = 0, bytes = 0;
-        if (!rel || !rel->ncols)
+        /* Only a placeholder whose schema no insert or evaluation has set
+         * yet is skipped.  A zero-column head is a real relation: emptied,
+         * it must still be detached, or a failed step could publish a
+         * partial row for it (#2231). */
+        if (!rel || (!rel->schema_ok && !rel->ncols && !rel->nrows))
             continue;
         rc = col_rel_source_reader_acquire(rel, &entry->capture_reader);
         if (rc != 0)
@@ -3472,7 +3478,7 @@ wl_columnar_eval_delta_capture(const wl_plan_stratum_t *sp,
             rc = ENOMEM;
             goto fail;
         }
-        if (!entry->nrows)
+        if (!entry->nrows || !entry->ncols)
             continue;
         entry->rows = malloc((size_t)entry->nrows * entry->ncols *
                 sizeof(int64_t));
@@ -3876,6 +3882,21 @@ col_stratum_step_with_delta(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
         if (sess->delta_observer)
             continue;
         uint32_t ncols = r->ncols;
+
+        /* A zero-width relation holds at most one distinct row, so its set
+         * difference is a change of presence. */
+        if (ncols == 0 && rollback->entries[ri].ncols == 0) {
+            static const int64_t nullary_row[1] = { 0 };
+            bool was = rollback->entries[ri].nrows != 0;
+            bool is = r->nrows != 0;
+            if (was != is) {
+                rc = wl_delta_event_append(sess, r->name, nullary_row, 0,
+                        is ? +1 : -1);
+                if (rc != 0)
+                    goto cleanup;
+            }
+            continue;
+        }
 
         /* Gather current state into flat buffer for col_row_in_sorted */
         int64_t *cur_flat = NULL;

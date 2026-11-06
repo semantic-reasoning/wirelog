@@ -248,6 +248,17 @@ All notable changes to wirelog are documented in this file.
 
 ### Fixed
 
+- **A zero-column rule head is retracted under a delta callback** (#2231):
+  with `wirelog_easy_set_delta_cb` set, a step snapshots each head before
+  re-deriving it, and the snapshot skipped zero-column relations. A
+  zero-width head whose rule binds no column, such as `ok() :- e(x).`, was
+  then never emptied: once derived it stayed held after its last support was
+  removed, no -1 was delivered for it, and rules reading it kept their
+  results. It is now retracted on the step after which nothing derives it. A
+  step that fails after re-deriving such a head, held or emptied by an
+  earlier step, no longer leaves the partial row behind. Steps without a
+  delta callback were not affected.
+
 - Plain STEP now retains recursive TDD completion after a final-normalization
   refusal. STEP or SNAPSHOT retries finish normalization and aggregate
   publication before accepting input, preventing stale paths after a later

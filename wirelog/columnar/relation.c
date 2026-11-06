@@ -7530,7 +7530,7 @@ wl_columnar_relation_delta_restore_flat_impl(col_rel_t *rel,
     uint32_t timestamp_capacity = 0;
     uint64_t bytes = 0;
     int pending_rc = 0, rc;
-    if (!rel || !rows || !nrows || !ncols)
+    if (!rel || !nrows || (ncols && !rows))
         return EINVAL;
     col_rel_payload_txn_init(&pending);
     wl_columnar_memory_reservation_init(&previous);
@@ -7546,7 +7546,41 @@ wl_columnar_relation_delta_restore_flat_impl(col_rel_t *rel,
      * incomplete-evaluation rollback path and explicitly requests replacement.
      * The overwrite path still allocates the replacement before publishing it.
      */
-    if (rel->columns && !overwrite) {
+    if ((rel->columns || (ncols == 0 && rel->nrows != 0)) && !overwrite) {
+        rc = 0;
+        goto done;
+    }
+    if (ncols == 0) {
+        /* A zero-width row has no payload: restoring it restores the count. */
+        if (rel->ncols != 0
+            || !col_rel_timestamp_shape_valid(rel)
+            || (rel->timestamps && rel->timestamp_capacity < nrows)
+            || col_rel_storage_owner_resolve(rel, &owner) != 0
+            || owner != rel) {
+            rc = EINVAL;
+            goto done;
+        }
+        rc = wl_columnar_source_access_writer_acquire(&rel->source_access,
+                &writer);
+        if (rc != 0)
+            goto done;
+        if (col_rel_storage_alias_borrow_count(rel) != 0) {
+            rc = EBUSY;
+            goto done;
+        }
+        if (rel->view_generation >= WL_COLUMNAR_REL_GENERATION_INVALID - 1u
+            || rel->storage_generation
+            >= WL_COLUMNAR_REL_GENERATION_INVALID - 1u) {
+            rc = EOVERFLOW;
+            goto done;
+        }
+        rel->nrows = nrows;
+        if (rel->capacity < nrows)
+            rel->capacity = nrows;
+        rel->sorted_nrows = nrows;
+        rel->run_count = 1;
+        rel->run_ends[0] = nrows;
+        wl_columnar_relation_touch_replacement(rel);
         rc = 0;
         goto done;
     }
