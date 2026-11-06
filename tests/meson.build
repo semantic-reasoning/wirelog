@@ -6314,6 +6314,16 @@ test_easy_recursive_seed_workers_exe = executable(
 
 test('easy_recursive_seed_workers', test_easy_recursive_seed_workers_exe)
 
+test_easy_nullary_fact_exe = executable(
+  'test_easy_nullary_fact',
+  files('test_easy_nullary_fact.c'),
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
+  link_with: [testlib_prod],
+)
+
+test('easy_nullary_fact', test_easy_nullary_fact_exe)
+
 # ============================================================================
 # I/O Context Accessor Tests (#452)
 # ============================================================================

@@ -319,10 +319,15 @@ wirelog_program_get_facts(const wirelog_program_t *prog, const char *relation,
              * this function in wirelog.h. */
             uint32_t ncols = wl_ir_relation_physical_width(rel);
             uint32_t total = rel->fact_count * ncols;
-            int64_t *copy = (int64_t *)malloc(total * sizeof(int64_t));
+            /* A zero-column relation has no slots to copy, but the caller
+             * still gets a buffer to free: malloc(0) may return NULL, which
+             * would read as an error (#2231). */
+            int64_t *copy
+                = (int64_t *)malloc((total > 0 ? total : 1) * sizeof(int64_t));
             if (!copy)
                 return -1;
-            memcpy(copy, rel->fact_data, total * sizeof(int64_t));
+            if (total > 0)
+                memcpy(copy, rel->fact_data, total * sizeof(int64_t));
 
             *data = copy;
             *num_rows = rel->fact_count;

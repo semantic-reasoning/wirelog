@@ -158,6 +158,15 @@ Snapshots returned by `wirelog_easy_snapshot()` and IDB rows derived by the
 optimizer pipeline therefore observe inline facts on the first call,
 without any host action.
 
+A fact of a zero-column relation (`flag().`, with or without
+`.decl flag()`) seeds one zero-width row, so `flag()` holds in rule bodies
+and `!flag()` does not; repeating the fact derives the same rows.
+`wirelog_program_get_facts` reports such a relation with `num_cols` 0 and
+`num_rows` equal to the number of facts written (#2231).  Removing a
+zero-width row with `wirelog_easy_remove()` is not covered by the z-set
+rules below: the columnar backend currently ignores it, so a seeded
+`flag()` keeps holding.
+
 ### Z-set semantics for host insert / remove
 
 `wirelog_easy_insert()` and `wirelog_easy_remove()` are differential operations
