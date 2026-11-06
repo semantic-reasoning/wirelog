@@ -1282,7 +1282,9 @@ wl_columnar_eval_serial_framed_abort_step(
             ctx->primary_result = WL_EVALUATION_CONTROL_CANCELLED;
         ctx->abort_requested = true;
         wl_evaluation_control_request_cancel(ctx->control);
-        (void)wl_evaluation_control_charge(ctx->control, 0);
+        (void)wl_evaluation_control_charge_attempt(ctx->control,
+            ctx->attempt_id,
+            0);
     }
     if (ctx->phase == WL_COLUMNAR_EVAL_SERIAL_FRAMED_PENDING) return EBUSY;
     if (ctx->child_bound &&

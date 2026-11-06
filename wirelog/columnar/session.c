@@ -8754,7 +8754,8 @@ col_controlled_step_advance_cursor(wl_col_session_t *sess,
         --wl_columnar_session_test_exhaust_after_relation;
         /* A finite configured test limit makes this a real sticky stop at
          * the exact publication boundary, without timing or worker races. */
-        (void)wl_evaluation_control_charge(sess->base.evaluation_control,
+        (void)wl_evaluation_control_charge_attempt(
+            sess->base.evaluation_control, step->operation_id,
             UINT64_MAX);
     }
 #endif
@@ -8782,7 +8783,9 @@ col_controlled_step_successor_publish_candidate(wl_col_session_t *sess,
     if (!step->successor_candidate_detached) {
         while (step->successor_candidate_scan_index < sess->nrels) {
             uint32_t i = step->successor_candidate_scan_index;
-            int charge_rc = wl_evaluation_control_charge(control, 1);
+            int charge_rc = wl_evaluation_control_charge_attempt(control,
+                    step->operation_id,
+                    1);
             if (charge_rc)
                 return charge_rc;
 #ifdef WL_SESSION_TEST_HOOKS
@@ -8804,12 +8807,16 @@ col_controlled_step_successor_publish_candidate(wl_col_session_t *sess,
     }
     if (!step->successor_candidate_renamed) {
         while (public_name[step->successor_rename_name_bytes_charged]) {
-            int charge_rc = wl_evaluation_control_charge(control, 1);
+            int charge_rc = wl_evaluation_control_charge_attempt(control,
+                    step->operation_id,
+                    1);
             if (charge_rc)
                 return charge_rc;
             step->successor_rename_name_bytes_charged++;
         }
-        int charge_rc = wl_evaluation_control_charge(control, 1);
+        int charge_rc = wl_evaluation_control_charge_attempt(control,
+                step->operation_id,
+                1);
         if (charge_rc)
             return charge_rc;
         int rename_rc = wl_columnar_relation_rename_checked(
@@ -8819,7 +8826,9 @@ col_controlled_step_successor_publish_candidate(wl_col_session_t *sess,
         step->successor_candidate_renamed = true;
     }
     while (step->successor_registration_scan_charged < sess->nrels) {
-        int charge_rc = wl_evaluation_control_charge(control, 1);
+        int charge_rc = wl_evaluation_control_charge_attempt(control,
+                step->operation_id,
+                1);
         if (charge_rc)
             return charge_rc;
 #ifdef WL_SESSION_TEST_HOOKS
@@ -8829,10 +8838,14 @@ col_controlled_step_successor_publish_candidate(wl_col_session_t *sess,
 #endif
         step->successor_registration_scan_charged++;
     }
-    int charge_rc = wl_evaluation_control_charge(control, 1);
+    int charge_rc = wl_evaluation_control_charge_attempt(control,
+            step->operation_id,
+            1);
     if (charge_rc)
         return charge_rc;
-    charge_rc = wl_evaluation_control_charge(control, 0);
+    charge_rc = wl_evaluation_control_charge_attempt(control,
+            step->operation_id,
+            0);
     if (charge_rc)
         return charge_rc;
 #ifdef WL_SESSION_TEST_HOOKS
@@ -9776,7 +9789,9 @@ col_controlled_step_observer_drive(wl_col_session_t *sess,
         wl_columnar_session_test_observer_precharged_events = 0;
 #endif
     while (step->delivery_precharge_index < event_count) {
-        int rc = wl_evaluation_control_charge(control, 1);
+        int rc = wl_evaluation_control_charge_attempt(control,
+                step->operation_id,
+                1);
         if (rc) return rc;
         step->delivery_precharge_index++;
 #ifdef WL_SESSION_TEST_HOOKS
@@ -9787,7 +9802,7 @@ col_controlled_step_observer_drive(wl_col_session_t *sess,
     rc = col_controlled_step_staging_prepare(sess, step);
     if (rc) return rc;
     if (!step->staging_tail_prepaid) {
-        rc = wl_evaluation_control_charge(control,
+        rc = wl_evaluation_control_charge_attempt(control, step->operation_id,
                 step->successor_attempt ? sess->nrels : 0);
         if (rc) return rc;
         step->staging_tail_prepaid = true;
@@ -9797,7 +9812,9 @@ col_controlled_step_observer_drive(wl_col_session_t *sess,
             rc = col_controlled_step_successor_publish_candidate(sess, step);
             if (rc) return rc;
         } else {
-            rc = wl_evaluation_control_charge(control, 0);
+            rc = wl_evaluation_control_charge_attempt(control,
+                    step->operation_id,
+                    0);
             if (rc) return rc;
         }
         step->published = true;
@@ -13413,7 +13430,9 @@ col_controlled_step_drive(wl_col_session_t *sess,
             return col_controlled_step_finish(sess, step, EINVAL);
         int lease_rc = wl_columnar_session_staging_maintenance(step);
         if (lease_rc) return col_controlled_step_finish(sess, step, lease_rc);
-        lease_rc = wl_evaluation_control_charge(control, 1);
+        lease_rc = wl_evaluation_control_charge_attempt(control,
+                step->operation_id,
+                1);
         if (lease_rc)
             return col_controlled_step_finish(sess, step, lease_rc);
         lease_rc = col_rel_source_reader_acquire(source,
@@ -13430,7 +13449,9 @@ col_controlled_step_drive(wl_col_session_t *sess,
             assert(release_rc == 0);
             return col_controlled_step_finish(sess, step, EINVAL);
         }
-        lease_rc = wl_evaluation_control_charge(control, 0);
+        lease_rc = wl_evaluation_control_charge_attempt(control,
+                step->operation_id,
+                0);
         if (lease_rc)
             return col_controlled_step_finish(sess, step, lease_rc);
     }
@@ -13438,13 +13459,17 @@ col_controlled_step_drive(wl_col_session_t *sess,
     if (step->observed) {
         col_rel_t *source = step->observed_input;
         if (source && source->ncols == 0 && source->nrows == 0) {
-            int schema_rc = wl_evaluation_control_charge(control, 1);
+            int schema_rc = wl_evaluation_control_charge_attempt(control,
+                    step->operation_id,
+                    1);
             if (schema_rc)
                 return col_controlled_step_finish(sess, step, schema_rc);
             schema_rc = col_rel_set_schema(source, 1, NULL);
             if (schema_rc)
                 return col_controlled_step_finish(sess, step, schema_rc);
-            schema_rc = wl_evaluation_control_charge(control, 0);
+            schema_rc = wl_evaluation_control_charge_attempt(control,
+                    step->operation_id,
+                    0);
             if (schema_rc)
                 return col_controlled_step_finish(sess, step, schema_rc);
         }
@@ -13500,7 +13525,8 @@ col_controlled_step_drive(wl_col_session_t *sess,
             step->observer_cleanup_pending = false;
         }
         int rc = step->observed ? 0
-            : wl_evaluation_control_charge(control, 0);
+            : wl_evaluation_control_charge_attempt(control, step->operation_id,
+                0);
         return col_controlled_step_finish(sess, step, rc);
     }
 
@@ -13593,7 +13619,10 @@ col_controlled_step_drive(wl_col_session_t *sess,
                     return finish_rc == WL_EVALUATION_CONTROL_CANCELLED
                         ? 0 : finish_rc;
                 }
-                int boundary_stop = wl_evaluation_control_charge(control, 0);
+                int boundary_stop =
+                    wl_evaluation_control_charge_attempt(control,
+                        step->operation_id,
+                        0);
                 if (boundary_stop) {
                     int finish_rc = col_controlled_step_finish(sess, step,
                             boundary_stop);
@@ -13649,7 +13678,9 @@ col_controlled_step_successor_target_init(wl_col_session_t *sess,
             if (step->successor_name_suffix == 1024) return EEXIST;
             /* Fixed buffer generation and header bookkeeping are admitted
              * before the bounded snprintf; no caller-sized string is read. */
-            rc = wl_evaluation_control_charge(control, 128);
+            rc = wl_evaluation_control_charge_attempt(control,
+                    step->operation_id,
+                    128);
             if (rc) return rc;
             int n = snprintf(step->successor_name_buffer,
                     sizeof(step->successor_name_buffer),
@@ -13662,7 +13693,9 @@ col_controlled_step_successor_target_init(wl_col_session_t *sess,
             step->successor_name_byte = 0;
             step->successor_name_phase = 1;
         } else if (step->successor_name_phase == 1) {
-            rc = wl_evaluation_control_charge(control, 1);
+            rc = wl_evaluation_control_charge_attempt(control,
+                    step->operation_id,
+                    1);
             if (rc) return rc;
             if (step->successor_name_slot >= sess->nrels) {
                 step->successor_name_phase = 2;
@@ -13696,7 +13729,9 @@ col_controlled_step_successor_target_init(wl_col_session_t *sess,
                 size_t remaining = offset < relation_bytes
                     ? relation_bytes - local : op_bytes - local;
                 size_t chunk = remaining < 128 ? remaining : 128;
-                rc = wl_evaluation_control_charge(control, chunk);
+                rc = wl_evaluation_control_charge_attempt(control,
+                        step->operation_id,
+                        chunk);
                 if (rc) return rc;
                 unsigned char *dst = offset < relation_bytes
                     ? (unsigned char *)&step->successor_relation
@@ -13708,7 +13743,9 @@ col_controlled_step_successor_target_init(wl_col_session_t *sess,
                 step->successor_metadata_byte += chunk;
                 continue;
             }
-            rc = wl_evaluation_control_charge(control, 32);
+            rc = wl_evaluation_control_charge_attempt(control,
+                    step->operation_id,
+                    32);
             if (rc) return rc;
             step->successor_private_name = step->successor_name_buffer;
             col_rel_t *input = step->observed_input;
@@ -13723,10 +13760,13 @@ col_controlled_step_successor_target_init(wl_col_session_t *sess,
             step->successor_relation.name = step->successor_private_name;
             step->successor_ops[0].delta_mode = WL_DELTA_FORCE_FULL;
             step->successor_relation.ops = step->successor_ops;
-            return wl_evaluation_control_charge(control, 0);
+            return wl_evaluation_control_charge_attempt(control,
+                       step->operation_id,
+                       0);
         }
     }
-    int rc = wl_evaluation_control_charge(control, 0);
+    int rc = wl_evaluation_control_charge_attempt(control, step->operation_id,
+            0);
     return rc ? rc : EAGAIN;
 }
 
