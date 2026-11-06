@@ -2718,14 +2718,30 @@ following earlier published rows. Inspect DRAINING authority even when an
 initiating positive error masks a cleanup error.
 
 The held-batch region ceilings are begin170, original validation220, each
-capture initialization/pin phase80, renewal128 and set70. Full valid begin
-read-only bootstrap86 includes the inert-single helper63; rejected inert paths
-are bounded by78. This is an explicit retrospective bootstrap exception: dirty,
-inactive and first-refused admissions may report consumed0. Renewal is funded
-before old release and includes both original-ID guards, reinitialization and
-refused-child return continuations. The maximum conservative forward envelope
-is248; the complete post-CAS publication through outer return is225, including
-both wrappers' ordinary return work. Mandatory cleanup bodies remain excluded.
+capture initialization/pin phase80, renewal128 and set70. The caller-generation
+`wl_columnar_relation_append_batch_begin_attempt_controlled` entry admits the
+writer against the supplied saved ID before publishing batch state or acquiring
+source access. A stale ID leaves the successor accounting and batch unchanged.
+Its read-only bootstrap84 includes the inert-single helper63; rejected inert
+paths are bounded by78. Count the extra saved-ID argument in the actual caller.
+The legacy `begin_controlled` entry still captures the current ID, then delegates;
+it does not authenticate an earlier caller generation. Its ordinary wrapper9
+makes the complete bootstrap93 and inert rejection87. These are the concrete
+fixed metadata initialization bounds under the existing retrospective bootstrap
+exception: dirty, inactive and first-refused admissions may report consumed0.
+No refused action receives future body credit. The NULL-control legacy branch
+adds at most10 fixed front/return operations around the unchanged raw begin;
+this does not qualify the raw algorithm as controlled work.
+
+Renewal is funded before old release and includes both original-ID guards,
+reinitialization and refused-child return continuations. The caller-generation
+route retains the conservative forward248 and complete post-CAS publication
+through outer return225. The legacy wrapper adds one final return, giving249
+and226 respectively, including controlled LFTJ/REDUCE callers that retain that
+entry. Begin170 remains sufficient because its actual generic charge expansion
+is replaced by the qualified saved-ID primitive; that reduction supplies no
+credit to the precharge rejection or final return. Mandatory cleanup bodies
+remain excluded.
 
 
 ### Caller-attempt-bound empty scalar schema clone

@@ -4097,6 +4097,43 @@ test_controlled_batch_gap_capture(void)
 }
 
 static void
+test_controlled_batch_saved_generation(void)
+{
+    col_rel_t *r = relation(1, 2, 1, false, NULL);
+    wl_evaluation_control_t *c = control(0);
+    uint64_t old_id = wl_evaluation_control_active_attempt_id(c);
+    CHECK(finish(c, EIO) == 0);
+    retry(c, 0);
+    uint64_t id = wl_evaluation_control_active_attempt_id(c), consumed;
+    CHECK(id != old_id);
+    wl_evaluation_control_report_t before, after;
+    CHECK(!wl_evaluation_control_report(c, &before));
+    wl_columnar_relation_append_batch_t batch = {0};
+    CHECK(wl_columnar_relation_append_batch_begin_attempt_controlled(&batch,
+        r, c, old_id) == EINVAL);
+    CHECK(wl_columnar_relation_append_batch_begin_attempt_controlled(&batch,
+        r, c, 0) == EINVAL);
+    CHECK(!batch.identity && !batch.control && !batch.attempt_id);
+    CHECK(!wl_evaluation_control_test_active_consumed(c, id, &consumed));
+    CHECK(consumed == 0);
+    CHECK(!wl_evaluation_control_report(c, &after));
+    CHECK(before.attempt_id == after.attempt_id && before.result == after.result
+        && before.consumed == after.consumed && before.limit == after.limit
+        && before.stop_reason == after.stop_reason
+        && before.execution_status == after.execution_status
+        && before.cleanup_status == after.cleanup_status);
+    released(r);
+    CHECK(!wl_columnar_relation_append_batch_begin_attempt_controlled(&batch,
+        r, c, id));
+    int64_t value = 55;
+    CHECK(!wl_columnar_relation_append_batch_row_controlled(&batch, &value));
+    CHECK(!wl_columnar_relation_append_batch_end_controlled(&batch, 0));
+    CHECK(r->nrows == 2 && r->columns[0][1] == value);
+    CHECK(finish(c, 0) > 0);
+    release(c); released(r); destroy(r);
+}
+
+static void
 test_controlled_batch_end_authority(void)
 {
     col_rel_t *r = relation(1, 2, 1, false, NULL);
@@ -5502,6 +5539,7 @@ main(void)
     test_row_resources();
     test_controlled_batch_twins();
     test_controlled_batch_gap_capture();
+    test_controlled_batch_saved_generation();
     test_controlled_batch_end_authority();
     test_controlled_batch_seams();
     test_controlled_batch_renew_authority();

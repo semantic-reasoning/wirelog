@@ -10558,9 +10558,9 @@ cleanup_error:
 }
 
 int
-wl_columnar_relation_append_batch_begin_controlled(
+wl_columnar_relation_append_batch_begin_attempt_controlled(
     wl_columnar_relation_append_batch_t *batch, col_rel_t *r,
-    wl_evaluation_control_t *control)
+    wl_evaluation_control_t *control, uint64_t attempt_id)
 {
     /* Zero-initialized EMPTY is the only begin state. Explicit caller reset
      * after completed end may establish a new inert original wrapper. */
@@ -10571,6 +10571,7 @@ wl_columnar_relation_append_batch_begin_controlled(
         || !wl_columnar_relation_single_inert(&batch->raw.single))
         return EINVAL;
     if (!control) {
+        if (attempt_id) return EINVAL;
         int rc = col_rel_append_batch_begin(&batch->raw, r);
         if (rc)
             return rc;
@@ -10579,10 +10580,9 @@ wl_columnar_relation_append_batch_begin_controlled(
         batch->phase = WL_COLUMNAR_RELATION_BATCH_HELD;
         return 0;
     }
-    uint64_t attempt_id = wl_evaluation_control_active_attempt_id(control);
     if (!attempt_id)
         return EINVAL;
-    int rc = wl_evaluation_control_charge(control,
+    int rc = wl_evaluation_control_charge_attempt(control, attempt_id,
             WL_COLUMNAR_RELATION_BATCH_BEGIN_WORK);
     if (rc)
         return rc;
@@ -10605,6 +10605,16 @@ wl_columnar_relation_append_batch_begin_controlled(
         batch->phase = WL_COLUMNAR_RELATION_BATCH_DRAINING;
     }
     return rc;
+}
+
+int
+wl_columnar_relation_append_batch_begin_controlled(
+    wl_columnar_relation_append_batch_t *batch, col_rel_t *r,
+    wl_evaluation_control_t *control)
+{
+    uint64_t id = wl_evaluation_control_active_attempt_id(control);
+    return wl_columnar_relation_append_batch_begin_attempt_controlled(batch,
+               r, control, id);
 }
 
 /* Persistent private-output batch retirement. Every step returns to a real
@@ -21433,12 +21443,12 @@ wl_columnar_relation_copy_rows_controlled(const char *name,
             WL_COLUMNAR_RELATION_COPY_ROWS_BEGIN_CALL_WORK);
     if (rc)
         goto done;
-    /* Adjacent guard prevents begin's capture-on-entry from charging a new ID. */
+    /* Preserve the caller guard and pass the same ID into writer admission. */
     rc = wl_columnar_relation_attempt_guard(control, attempt_id);
     if (rc)
         goto done;
-    rc = wl_columnar_relation_append_batch_begin_controlled(&ctx.batch,
-            ctx.local, control);
+    rc = wl_columnar_relation_append_batch_begin_attempt_controlled(&ctx.batch,
+            ctx.local, control, attempt_id);
     if (rc)
         goto done;
     if (ctx.batch.identity != &ctx.batch ||
