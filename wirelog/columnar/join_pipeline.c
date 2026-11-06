@@ -2645,6 +2645,14 @@ wl_columnar_join_pipeline_host_ack(wl_columnar_join_host_t *h,
         h->pending = NULL; h->phase = h->streaming
             ? WL_COLUMNAR_JOIN_HOST_TRANSFORM_RETIRE :
             WL_COLUMNAR_JOIN_HOST_PRODUCE;
+        /* The committed extent is post-consumer for streaming, and JOIN
+         * output for a direct sink. Phase advance journals this once,
+         * before the ACK hook; a later cancellation cannot mask overflow. */
+        wl_col_session_t *session = h->parent->session;
+        if (h->extent > session->join_output_peak)
+            session->join_output_peak = h->extent;
+        if (session->join_output_limit
+            && h->extent >= session->join_output_limit) rc = EOVERFLOW;
         WL_COLUMNAR_JOIN_HOST_HOOK(h,
             WL_COLUMNAR_JOIN_PIPELINE_TEST_AFTER_ACK);
     }

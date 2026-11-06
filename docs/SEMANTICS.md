@@ -2291,3 +2291,24 @@ use the actual physical allocation size including the native receipt tail.
 These local bounds do not qualify unrelated ordinary/coordinator actions or
 whole-consumer/policy completion; integrated adoption requires fresh layout,
 copy-exclusion, native and source carry.
+
+### Controlled JOIN local output policy
+
+The admitted non-strict scalar session host preserves the configured local
+`WIRELOG_JOIN_OUTPUT_LIMIT`. A consumed FILTER/MAP/probe pipeline counts its
+committed sink rows; a direct JOIN sink counts its committed JOIN rows. A later,
+separately executed FILTER does not reduce that JOIN's policy count. Zero
+turns the cap off, while reaching or exceeding a positive cap returns
+`EOVERFLOW`. The peak records committed private output even when the cap is off.
+
+The policy decision follows successful batch extent publication and producer
+ACK in the same activation. It executes once and precedes the existing
+AFTER_ACK hook, so cancellation requested by that hook cannot replace an
+already selected overflow. Cancellation before precommit still prevents the
+ACK and policy update. Failed attempts publish no session head; reset and a
+raised local limit can retry with the configured producer retained. Batch
+capacity can cause the same bounded cap overshoot as raw batching.
+
+This local policy does not enable strict batching, worker shared counters or
+additional transaction/source domains. Their admission and ownership contracts
+remain separately qualified.

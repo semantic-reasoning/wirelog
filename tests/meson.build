@@ -7083,3 +7083,14 @@ recursive_random_model_exe = executable(
   link_with: [testlib_prod],
 )
 test('recursive_random_model', recursive_random_model_exe, timeout: 180)
+
+# #2297: configured controlled JOIN sink policy and recovery.
+test_evaluation_join_host_policies_exe = executable(
+  'test_evaluation_join_host_policies', files('test_evaluation_join_host_policies.c'),
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
+  c_args: ['-DWL_SESSION_TEST_HOOKS=1'],
+  link_with: [testlib_prod],
+)
+test('evaluation_join_host_policies', test_evaluation_join_host_policies_exe,
+     suite: ['unit', 'tsan', 'evaluation_join_hosts'], timeout: 60)
