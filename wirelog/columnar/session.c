@@ -6599,6 +6599,83 @@ col_session_controlled_step_authorize_insert(const wl_session_t *session,
            && col_controlled_step_provenance_current(sess, step);
 }
 
+/* The plan's schema for a rule head that session creation did not
+ * register.  Session creation registers the relations that can hold input
+ * before any evaluation: those no rule derives, and rule heads with an
+ * inline fact.  Another rule head is registered when evaluation first runs
+ * its stratum.  Only a head with a `.decl` has a schema the plan fixes
+ * before that; an undeclared head's width and column types are set by its
+ * first evaluation.  Returns NULL when @relation is registered, is not a
+ * rule head, or has no declared schema. */
+static const wl_plan_idb_schema_t *
+session_unregistered_declared_head(const wl_col_session_t *sess,
+    const char *relation)
+{
+    if (session_find_rel((wl_col_session_t *)sess, relation)
+        || !session_plan_has_rule_head(sess->plan, relation))
+        return NULL;
+    const wl_plan_idb_schema_t *schema
+        = wl_columnar_session_idb_schema(sess, relation);
+    return schema && schema->declared ? schema : NULL;
+}
+
+/* The relation a host insert names.  A declared rule head that evaluation
+ * has not registered yet gets the placeholder its first evaluation would
+ * register, so an insert before the first step reaches it (#2231).  The
+ * placeholder stays registered if the insert is then refused; it is the
+ * empty relation the first evaluation would have registered. */
+static int
+session_insert_target(wl_col_session_t *sess, const char *relation,
+    col_rel_t **out)
+{
+    const wl_plan_idb_schema_t *schema
+        = session_unregistered_declared_head(sess, relation);
+    col_rel_t *r = NULL;
+    int rc;
+
+    *out = NULL;
+    if (!schema) {
+        r = session_find_rel(sess, relation);
+        if (!r)
+            return ENOENT;
+        *out = r;
+        return 0;
+    }
+    rc = wl_columnar_session_idb_placeholder_new(sess, relation, &r);
+    if (rc != 0)
+        return rc;
+    /* A head declared with no columns gets that schema, so an insert at
+     * another width is refused here rather than failing the step. */
+    if (schema->width == 0)
+        rc = col_rel_set_schema(r, 0, NULL);
+    if (rc == 0)
+        rc = session_add_rel(sess, r);
+    if (rc != 0) {
+        col_rel_destroy(r);
+        return rc;
+    }
+    r = session_find_rel(sess, relation);
+    if (!r)
+        return ENOENT;
+    *out = r;
+    return 0;
+}
+
+/* A removal from a declared rule head that evaluation has not registered
+ * yet: the head holds nothing, so a removal at its declared width changes
+ * nothing and one at another width is refused, as it is once registered.
+ * Returns -1 when @relation is not such a head. */
+static int
+session_remove_unregistered_head(const wl_col_session_t *sess,
+    const char *relation, uint32_t num_cols)
+{
+    const wl_plan_idb_schema_t *schema
+        = session_unregistered_declared_head(sess, relation);
+    if (!schema)
+        return -1;
+    return num_cols == schema->width ? 0 : EINVAL;
+}
+
 int
 col_session_insert(wl_session_t *session, const char *relation,
     const int64_t *data, uint32_t num_rows, uint32_t num_cols)
@@ -6636,9 +6713,10 @@ col_session_insert(wl_session_t *session, const char *relation,
     if (cleanup_rc != 0)
         return cleanup_rc;
 
-    col_rel_t *r = session_find_rel(sess, relation);
-    if (!r)
-        return ENOENT;
+    col_rel_t *r = NULL;
+    int target_rc = session_insert_target(sess, relation, &r);
+    if (target_rc != 0)
+        return target_rc;
 
     /* Lazy schema initialisation on first insert.  Issue #1038: the first
      * insert used to *define* the width; it is now checked against the
@@ -6647,7 +6725,10 @@ col_session_insert(wl_session_t *session, const char *relation,
     if (r->ncols == 0 && r->declared_ncols != 0
         && num_cols != r->declared_ncols)
         return EINVAL;
-    if (r->ncols != 0 && r->ncols != num_cols) {
+    /* An established relation fixes the width, zero columns included; the
+     * check comes before the seed shadow takes the batch, which would
+     * otherwise keep the wrong width after the refusal (#2231). */
+    if ((r->ncols != 0 || r->schema_ok) && r->ncols != num_cols) {
         return EINVAL; /* column count mismatch */
     }
 
@@ -6829,9 +6910,11 @@ col_session_insert_incremental(wl_session_t *session, const char *relation,
     if (cleanup_rc != 0)
         return cleanup_rc;
 
-    col_rel_t *r = session_find_rel(COL_SESSION(session), relation);
-    if (!r)
-        return ENOENT;
+    col_rel_t *r = NULL;
+    int target_rc = session_insert_target(COL_SESSION(session), relation,
+            &r);
+    if (target_rc != 0)
+        return target_rc;
 
     /* Lazy schema initialisation on first insert.  Issue #1038: the first
      * insert used to *define* the width; it is now checked against the
@@ -6840,7 +6923,10 @@ col_session_insert_incremental(wl_session_t *session, const char *relation,
     if (r->ncols == 0 && r->declared_ncols != 0
         && num_cols != r->declared_ncols)
         return EINVAL;
-    if (r->ncols != 0 && r->ncols != num_cols) {
+    /* An established relation fixes the width, zero columns included; the
+     * check comes before the seed shadow takes the batch, which would
+     * otherwise keep the wrong width after the refusal (#2231). */
+    if ((r->ncols != 0 || r->schema_ok) && r->ncols != num_cols) {
         return EINVAL; /* column count mismatch */
     }
 
@@ -6903,12 +6989,20 @@ col_session_remove(wl_session_t *session, const char *relation,
     if (cleanup_rc != 0)
         return cleanup_rc;
 
+    int unregistered_rc = session_remove_unregistered_head(sess, relation,
+            num_cols);
+    if (unregistered_rc >= 0)
+        return unregistered_rc;
     col_rel_t *r = session_find_rel(sess, relation);
     if (!r)
         return ENOENT;
     /* A relation whose schema nothing has set holds nothing to remove.  An
      * established zero-column relation holds zero-width rows like any
-     * other, and is removed from at width 0 only (#2231). */
+     * other, and is removed from at width 0 only (#2231).  Before its first
+     * row a declared width still binds, as it does for an insert. */
+    if (r->ncols == 0 && r->declared_ncols != 0
+        && num_cols != r->declared_ncols)
+        return EINVAL;
     if (r->ncols != num_cols)
         return r->ncols == 0 && !r->schema_ok ? 0 : EINVAL;
 
@@ -7093,12 +7187,20 @@ col_session_remove_incremental(wl_session_t *session, const char *relation,
     if (cleanup_rc != 0)
         return cleanup_rc;
 
+    int unregistered_rc = session_remove_unregistered_head(sess, relation,
+            num_cols);
+    if (unregistered_rc >= 0)
+        return unregistered_rc;
     col_rel_t *r = session_find_rel(sess, relation);
     if (!r)
         return ENOENT;
     /* A relation whose schema nothing has set holds nothing to remove.  An
      * established zero-column relation holds zero-width rows like any
-     * other, and is removed from at width 0 only (#2231). */
+     * other, and is removed from at width 0 only (#2231).  Before its first
+     * row a declared width still binds, as it does for an insert. */
+    if (r->ncols == 0 && r->declared_ncols != 0
+        && num_cols != r->declared_ncols)
+        return EINVAL;
     if (r->ncols != num_cols)
         return r->ncols == 0 && !r->schema_ok ? 0 : EINVAL;
 

@@ -248,6 +248,22 @@ All notable changes to wirelog are documented in this file.
 
 ### Fixed
 
+- **A host row can be inserted into a declared rule head before the first
+  step** (#2231): a session registers a rule head without an inline fact
+  only when evaluation first runs its stratum, so before that
+  `wirelog_easy_insert` and `wirelog_easy_remove` on it returned
+  `WIRELOG_ERR_EXEC`, for a zero-column head such as `.decl flag()` with
+  `flag() :- e(1).` and for a unary or binary one alike. A head with a
+  `.decl` and no compound or graph column now takes the insert, and a
+  removal at its declared width returns `WIRELOG_OK` and changes nothing;
+  either at another width returns `WIRELOG_ERR_EXEC`. Other heads, those
+  without a `.decl` or with a compound or graph column, are still refused
+  until their first evaluation. Two width checks were also missing. An
+  insert at a nonzero width into a zero-column rule head without an inline
+  fact was refused, but left that width on the head's input copy, so every
+  later insert into the head failed. A removal at the wrong width from a
+  declared input relation that never held a row returned `WIRELOG_OK`.
+
 - **Removing a zero-column row retracts it** (#2231):
   `wirelog_easy_remove(s, "flag", row, 0)` returned `WIRELOG_OK` and left
   the row, so a `flag()` from an inline fact or a host insert kept holding.

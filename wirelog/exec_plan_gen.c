@@ -4412,6 +4412,25 @@ plan_idb_schema_width(const struct wirelog_program *prog,
     return arity;
 }
 
+/* True when @rel of @prog is a pure IDB declared with no columns, such as
+ * `.decl flag()` with `flag() :- e(1).`: its starting width is 0, which
+ * plan_idb_schema_width() reports for "no schema" too.  A host insert
+ * into it before the first evaluation is checked against that width. */
+static bool
+plan_idb_schema_declared_nullary(const struct wirelog_program *prog,
+    const wl_ir_relation_info_t *rel)
+{
+    if (!rel->name || !rel->has_decl || rel->column_count != 0
+        || rel->has_graph_column
+        || (rel->fact_count > 0 && rel->fact_data != NULL))
+        return false;
+    for (uint32_t r = 0; r < prog->rule_count; r++)
+        if (prog->rules[r].head_relation
+            && strcmp(prog->rules[r].head_relation, rel->name) == 0)
+            return true;
+    return false;
+}
+
 /* Issue #2334: fill plan->idb_schemas from @prog.  The plan owns every
  * allocation as soon as it is made, so a failure leaves it for
  * wl_plan_free().  Returns 0 or ENOMEM. */
@@ -4420,7 +4439,8 @@ plan_build_idb_schemas(wl_plan_t *plan, const struct wirelog_program *prog)
 {
     uint32_t count = 0;
     for (uint32_t i = 0; i < prog->relation_count; i++)
-        if (plan_idb_schema_width(prog, &prog->relations[i]) > 0)
+        if (plan_idb_schema_width(prog, &prog->relations[i]) > 0
+            || plan_idb_schema_declared_nullary(prog, &prog->relations[i]))
             count++;
     if (count == 0)
         return 0;
@@ -4432,7 +4452,7 @@ plan_build_idb_schemas(wl_plan_t *plan, const struct wirelog_program *prog)
     for (uint32_t i = 0; i < prog->relation_count; i++) {
         const wl_ir_relation_info_t *rel = &prog->relations[i];
         uint32_t width = plan_idb_schema_width(prog, rel);
-        if (width == 0)
+        if (width == 0 && !plan_idb_schema_declared_nullary(prog, rel))
             continue;
         wl_plan_idb_schema_t *dst = &schemas[plan->idb_schema_count];
         dst->name = dup_str(rel->name);
@@ -4441,7 +4461,7 @@ plan_build_idb_schemas(wl_plan_t *plan, const struct wirelog_program *prog)
         plan->idb_schema_count++;
         dst->width = width;
         dst->declared = rel->has_decl;
-        if (!rel->has_decl)
+        if (!rel->has_decl || width == 0)
             continue;
         wirelog_column_type_t *types = (wirelog_column_type_t *)calloc(
             rel->column_count, sizeof(*types));

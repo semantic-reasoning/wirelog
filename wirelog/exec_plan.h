@@ -747,7 +747,12 @@ typedef struct {
  * other lane INT64, the meaning of an untyped lane.  A relation without
  * one has no declared types: @width is the arity its rule heads agree on
  * and @column_types is NULL, and the first rows published into the empty
- * relation define its lane types. */
+ * relation define its lane types.
+ *
+ * A relation declared with no columns has an entry of @width 0 with
+ * @declared set and @column_types NULL (#2231).  Its placeholder starts
+ * as any other zero-width one; the session checks a host insert or
+ * removal before the first evaluation against that width. */
 typedef struct {
     const char *name;
     uint32_t width;
@@ -778,11 +783,11 @@ typedef struct {
     const wl_plan_edb_schema_t *edb_schemas;
     struct wl_intern *intern; /* borrowed from program; lifetime >= plan */
     /* Issue #2334: starting schemas of pure IDB relations (rules, no inline
-     * facts, no compound or graph column, a width above 0, and without a
-     * `.decl`, rule heads with no aggregate that agree on one arity),
-     * owned by the plan and freed in wl_plan_free.  NULL with a count of 0
-     * in a hand-built plan, whose IDB placeholders keep starting zero-width
-     * and untyped. */
+     * facts, no compound or graph column, a width above 0 or a `.decl` with
+     * no columns, and without a `.decl`, rule heads with no aggregate that
+     * agree on one arity), owned by the plan and freed in wl_plan_free.
+     * NULL with a count of 0 in a hand-built plan, whose IDB placeholders
+     * keep starting zero-width and untyped. */
     const wl_plan_idb_schema_t *idb_schemas;
     uint32_t idb_schema_count;
 } wl_plan_t;

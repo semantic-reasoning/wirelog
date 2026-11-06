@@ -6334,6 +6334,16 @@ test_easy_nullary_remove_exe = executable(
 
 test('easy_nullary_remove', test_easy_nullary_remove_exe)
 
+test_easy_head_insert_first_exe = executable(
+  'test_easy_head_insert_first',
+  files('test_easy_head_insert_first.c'),
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
+  link_with: [testlib_prod],
+)
+
+test('easy_head_insert_first', test_easy_head_insert_first_exe)
+
 # ============================================================================
 # I/O Context Accessor Tests (#452)
 # ============================================================================

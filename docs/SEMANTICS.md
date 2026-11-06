@@ -182,6 +182,14 @@ seed, the row's multiplicity becomes `+2`. A subsequent
 `wirelog_easy_remove()` of the same row leaves multiplicity `+1`; the row
 remains observable in snapshots until both copies are retracted.
 
+A rule head with a `.decl` and no compound or graph column takes host
+rows and removals before the first step as after it, each checked
+against its declared width (#2231).  Any other rule head without an
+inline fact, one without a `.decl` or with a compound or graph column,
+gets its schema from its first evaluation, so before that an insert or
+removal on it returns `WIRELOG_ERR_EXEC`; after it the head takes host
+rows like any other.
+
 This matches differential dataflow conventions and is consistent with
 `wl_session_*` (internal) and the future `wirelog_session_*` advanced
 surface (see `stable-release-plan.md` §3).
