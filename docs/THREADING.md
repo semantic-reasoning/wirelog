@@ -228,7 +228,7 @@ These exist so struct fields can be declared portably; the audit in
 
 Every `atomic_*` call site in `wirelog/` production sources. Counted
 mechanically by `scripts/ci/check-threading-doc.sh`; row count must
-match the script's count (currently **518**).
+match the script's count (currently **520**).
 
 Format: `file:function[#N]` | field | operation | order | justification.
 
@@ -665,7 +665,7 @@ concurrent alias removals cannot underflow the count.
 | `session.c:session_pool_rel_promote#3` | `src->storage_alias_borrows` | `atomic_store_explicit` | relaxed | Leave the closed pool tombstone with no child aliases |
 
 112 + 21 + 37 = **170 atomic call sites** in the summarized groups; the full
-symbol-anchored inventory below covers 518 sites.
+symbol-anchored inventory below covers 520 sites.
 
 The `#N` suffix counts all atomic sites in a symbol, regardless of operation;
 the first site remains unsuffixed. `scripts/ci/check-threading-doc.sh` uses
@@ -1590,7 +1590,7 @@ pointer. Reset is quiescent relative to evaluation; a request racing reset is
 ordered by the atomic exchange, and hosts must coordinate reset if that request
 must not be cleared.
 
-The seventeen sites below extend the existing exact inventory. RMW reads use the
+The nineteen sites below extend the existing exact inventory. RMW reads use the
 existing MSVC Interlocked shim instead of assuming volatile loads publish state.
 Cancellation carries no payload, so relaxed ordering suffices. References use
 release decrement plus acquire RMW at last release before destruction. The
@@ -1625,6 +1625,8 @@ isolated test process.
 | `evaluation_control.c:wl_evaluation_control_active_attempt_id` | active_attempt_id | `atomic_fetch_add_explicit` | acquire | Neutral MSVC Interlocked read preserves full unsigned identity |
 | `evaluation_control.c:wl_evaluation_control_active_attempt_id#2` | active_attempt_id | `atomic_load_explicit` | acquire | C11 observation of active identity without mutex or attempt pin |
 | `evaluation_control.c:wl_evaluation_control_finish` | active_attempt_id | `atomic_exchange_explicit` | release | Clear identity after completion and before unlocking |
+| `evaluation_control.c:wl_evaluation_control_source_bank_rearm_phase` | references | `atomic_fetch_add_explicit` | acquire | Neutral MSVC read under BANK and controller mutexes; require the original private attached ref2 before sealed-class rearm |
+| `evaluation_control.c:wl_evaluation_control_source_bank_rearm_phase#2` | references | `atomic_load_explicit` | acquire | C11 counterpart of the same private ref2 check; no control or saved ID escapes the class |
 
 See the [evaluation-control contract](SEMANTICS.md#evaluation-control-foundation-1819-engine-integration-pending)
 for prospective checkpoint coverage and the publication cutoff. The future
@@ -2774,3 +2776,19 @@ order, and the inventory remains518.
 | `relation.c:wl_columnar_relation_cache_copy_end#2` | `retirement.tokens[1].state` | `atomic_store_explicit` | relaxed | Initialize EMPTY at the final token address after this activation clears the complete managed record |
 | `relation.c:wl_columnar_relation_cache_copy_end#3` | `retirement.tokens[2].state` | `atomic_store_explicit` | relaxed | Initialize EMPTY at the final token address after this activation clears the complete managed record |
 | `relation.c:wl_columnar_relation_cache_copy_end#4` | `retirement.tokens[3].state` | `atomic_store_explicit` | relaxed | Initialize EMPTY at the final token address after this activation clears the complete managed record |
+
+
+### Private financial SOURCE bank
+
+The admission owns the BANK at its final external handle slot. Each private
+lane owns its controller attachment and is serialized by the BANK mutex;
+rearm additionally holds that controller's mutex. Only this constructor seals
+the class marker. Rearm requires inactive state, ref2, the matching private
+owner and a verified prior report with no callback or ID borrower. It resets
+only the unobservable private financial sequence. Generic/original/BODY IDs
+remain monotone. A context is noncopy, thread-bound external storage; it is
+never an engine permission or a saved callback. The TLS byte is only thread
+identity. SOURCE actions return before phase closure and receive no BANK,
+context or controller ID. The original owning slot outlives the BANK and
+rejects copied/borrowed/self-alias destruction. Workers retain their existing
+NULL admission/nonowning fields.

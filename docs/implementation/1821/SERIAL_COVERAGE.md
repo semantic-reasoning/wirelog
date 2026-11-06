@@ -2429,3 +2429,22 @@ their complete source and checked drain. Complete generic drain/ROW/growth/compi
 ordinary coordinator/owner/public recovery,
 materialized-cache driver, strict/local/shared/general cap intersections and
 whole-bundle acceptance remain mandatory; no PR Ready claim follows here.
+
+
+#### Private SOURCE financial lifetime prerequisite
+
+The admission-owned sealed BANK now has genuine fixed pre-session birth,
+partial-lane failure rollback, owning-slot destruction and private phase/report
+lifetime. Destruction uses actual256/24/160 admissions, source intervals
+235/20/20/141 and correlated slack<=251 with corrected processed lower189.
+Generic original/BODY IDs remain monotone and no native controller/ID escapes.
+The class alone supplies no engine permission or blanket callback qualification.
+The focused test covers a real parsed public session, real second-lane identity
+exhaustion, original attachment/report preservation, live successor0, noncopy
+and thread/reentry/owning-slot guards. Synthetic kernel policies test financial
+mechanics and are not production source tariffs.
+
+Complete public query/HOST/return/Snapshot/ordinary owning recovery, all native
+consumer source contours, compiler materialized execution and strict/local/shared
+cap intersections remain open. This prerequisite does not close2297/2298 or
+establish their complete acceptance scope.

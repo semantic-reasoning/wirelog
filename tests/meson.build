@@ -6614,6 +6614,21 @@ test_evaluation_control_exe = executable(
 test('evaluation_control', test_evaluation_control_exe,
      suite: ['unit', 'tsan'], timeout: 60)
 
+
+# The private financial class has no exported native control/ID. Actual public
+# construction/rollback and a live unrelated successor exercise its lifetime.
+test_evaluation_source_bank_exe = executable(
+  'test_evaluation_source_bank',
+  files('test_evaluation_source_bank.c'),
+  c_args: ['-DWL_SESSION_TEST_HOOKS=1'],
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
+  link_with: [testlib_prod],
+  install: false,
+)
+test('evaluation_source_bank', test_evaluation_source_bank_exe,
+     suite: ['unit', 'tsan'], timeout: 60)
+
 # #1984: recognize explicit multiway input occurrences without changing TDD
 # admission. The actual benchmark source prevents a toy-plan-only proof.
 tdd_driver_wrap = host_machine.system() == 'linux'

@@ -37,6 +37,7 @@ struct wl_session_admission {
     bool controlled_step_complete;
     bool closing;
     wl_session_exclusive_attempt_t *exclusive_attempt;
+    wl_evaluation_control_source_bank_t *source_bank;
 };
 
 #if defined(_MSC_VER)
@@ -120,6 +121,8 @@ wl_session_admission_destroy(wl_session_admission_t *admission)
 {
     if (!admission)
         return;
+    if (wl_evaluation_control_source_bank_destroy(&admission->source_bank))
+        wl_session_gate_fatal();
     wl_cond_destroy(&admission->idle);
     wl_mutex_destroy(&admission->mutex);
     free(admission);
@@ -653,6 +656,15 @@ wl_session_create_with_snapshot_options(const wl_compute_backend_t *backend,
     if (control) {
         rc = wl_evaluation_control_attach(control, admission);
         if (rc != 0) {
+            wl_session_admission_destroy(admission);
+            return rc;
+        }
+        /* Financial BANK birth precedes backend construction, publication
+        * and the first evaluation BEGIN. No engine/native debt exists. */
+        rc = wl_evaluation_control_source_bank_create(&admission->source_bank);
+        if (rc) {
+            if (wl_evaluation_control_detach(control, admission))
+                wl_session_gate_fatal();
             wl_session_admission_destroy(admission);
             return rc;
         }

@@ -26,6 +26,7 @@ struct wl_evaluation_control {
     int accounting_error;
     bool active;
     wl_evaluation_control_report_t completed;
+    const wl_evaluation_control_source_bank_t *source_bank_class;
 };
 
 static wl_atomic_u64 wl_next_evaluation_control_identity = 1;
@@ -381,4 +382,358 @@ wl_evaluation_control_report(wl_evaluation_control_t *control,
         *out = control->completed;
     wl_mutex_unlock(&control->mutex);
     return rc;
+}
+
+/* Sealed financial class: no controller or saved-ID accessor/loan exists.
+ * The original/BODY controller APIs retain their monotone ID contract. */
+enum { WL_EVALUATION_CONTROL_SOURCE_LANES = 2 };
+#define WL_EVALUATION_CONTROL_SOURCE_PHASE_CAPACITY \
+        (UINT64_C(3) * WL_EVALUATION_CONTROL_QUANTUM)
+
+#if defined(_MSC_VER)
+#define WL_EVALUATION_CONTROL_SOURCE_THREAD_LOCAL __declspec(thread)
+#else
+#define WL_EVALUATION_CONTROL_SOURCE_THREAD_LOCAL _Thread_local
+#endif
+/* Identity cookie only, never a TLS BANK/context/control issuer. */
+static WL_EVALUATION_CONTROL_SOURCE_THREAD_LOCAL unsigned char
+wl_evaluation_control_source_thread_cookie;
+#undef WL_EVALUATION_CONTROL_SOURCE_THREAD_LOCAL
+
+typedef struct {
+    wl_evaluation_control_t *control;
+    wl_evaluation_control_source_context_t *context;
+    uint64_t id;
+    uint64_t charged_total;
+    bool running;
+    bool callback_active;
+    bool report_verified;
+} wl_evaluation_control_source_lane_state_t;
+
+struct wl_evaluation_control_source_bank {
+    struct wl_evaluation_control_source_bank *identity;
+    struct wl_evaluation_control_source_bank **owner_slot;
+    wl_mutex_t mutex;
+    bool closing;
+    wl_evaluation_control_source_lane_state_t
+        lanes[WL_EVALUATION_CONTROL_SOURCE_LANES];
+};
+
+static int
+wl_evaluation_control_source_bank_lock(
+    wl_evaluation_control_source_bank_t *bank)
+{
+    return wl_mutex_lock(&bank->mutex) == 0 ? 0 : EIO;
+}
+
+static void
+wl_evaluation_control_source_bank_unlock(
+    wl_evaluation_control_source_bank_t *bank)
+{
+    if (wl_mutex_unlock(&bank->mutex)) abort();
+}
+
+/* BANK mutex is held. This private entry accepts a genuine BANK and lane,
+ * never a native-control/owner pair supplied by an original/BODY caller.
+ * Class marker, lane membership, real owner/ref2 and quiescence all agree.
+ * New native/mutex/atomic fronts here are ordinary source, not exact-nine. */
+static int
+wl_evaluation_control_source_bank_rearm_phase(
+    wl_evaluation_control_source_bank_t *bank, unsigned index)
+{
+    if (!bank || bank->identity != bank
+        || index >= WL_EVALUATION_CONTROL_SOURCE_LANES) return EINVAL;
+    wl_evaluation_control_source_lane_state_t *lane = &bank->lanes[index];
+    wl_evaluation_control_t *control = lane->control;
+    if (!control || !lane->context || lane->running || lane->callback_active
+        || (lane->id && !lane->report_verified)) return EBUSY;
+    if (wl_mutex_lock(&control->mutex)) return EIO;
+#ifdef _MSC_VER
+    uint64_t references = (uint64_t)atomic_fetch_add_explicit(
+        &control->references, UINT64_C(0), memory_order_acquire);
+#else
+    uint64_t references = atomic_load_explicit(&control->references,
+            memory_order_acquire);
+#endif
+    int rc = control->source_bank_class != bank || control->owner != lane
+        || control->active || references != UINT64_C(2)
+        || wl_evaluation_control_active_attempt_id(control) != 0
+        ? EBUSY : 0;
+    if (!rc) {
+        /* No raw control/ID has ever left this sealed class. The preceding
+         * phase's actual report was checked and every callback returned.
+         * Generic/original/BODY instances have markerNULL and cannot enter. */
+        control->attempt_id = 0;
+        lane->id = 0;
+        lane->charged_total = 0;
+        lane->report_verified = false;
+    }
+    if (wl_mutex_unlock(&control->mutex)) abort();
+    return rc;
+}
+
+/* BANK mutex held. Each successful actual charge is recorded exactly once. */
+static int
+wl_evaluation_control_source_bank_charge(
+    wl_evaluation_control_source_lane_state_t *lane, uint64_t work)
+{
+    int rc = wl_evaluation_control_charge_attempt(lane->control, lane->id,
+            work);
+    if (!rc) lane->charged_total += work;
+    return rc;
+}
+
+static int
+wl_evaluation_control_source_bank_finish_phase(
+    wl_evaluation_control_source_lane_state_t *lane)
+{
+    int finished = wl_evaluation_control_finish(lane->control, lane, 0, 0);
+    wl_evaluation_control_report_t report;
+    if (wl_evaluation_control_report(lane->control, &report)
+        || wl_evaluation_control_active_attempt_id(lane->control)
+        || report.attempt_id != lane->id
+        || report.limit != WL_EVALUATION_CONTROL_SOURCE_PHASE_CAPACITY
+        || report.consumed != lane->charged_total
+        || report.execution_status || report.cleanup_status
+        || report.stop_reason != finished || report.result != finished)
+        abort();
+    lane->report_verified = true;
+    lane->running = false;
+    return finished;
+}
+
+/* Used only while BANK birth is unpublished and no BEGIN has occurred. */
+static void
+wl_evaluation_control_source_bank_unwind_birth(
+    wl_evaluation_control_source_bank_t *bank, unsigned created)
+{
+    for (unsigned i = 0; i < created; ++i) {
+        wl_evaluation_control_source_lane_state_t *lane = &bank->lanes[i];
+        if (wl_evaluation_control_detach(lane->control, lane)) abort();
+        wl_evaluation_control_release(lane->control);
+    }
+    wl_mutex_destroy(&bank->mutex);
+    free(bank);
+}
+
+int
+wl_evaluation_control_source_bank_create(
+    wl_evaluation_control_source_bank_t **out)
+{
+    if (!out || *out) return EINVAL;
+    wl_evaluation_control_source_bank_t *bank = calloc(1, sizeof(*bank));
+    if (!bank) return ENOMEM;
+    if (wl_mutex_init(&bank->mutex)) {
+        free(bank);
+        return ENOMEM;
+    }
+    bank->identity = bank;
+    bank->owner_slot = out;
+    for (unsigned i = 0; i < WL_EVALUATION_CONTROL_SOURCE_LANES; ++i) {
+        wl_evaluation_control_source_lane_state_t *lane = &bank->lanes[i];
+        int rc = wl_evaluation_control_create(
+            WL_EVALUATION_CONTROL_SOURCE_PHASE_CAPACITY, &lane->control);
+        if (rc) {
+            wl_evaluation_control_source_bank_unwind_birth(bank, i);
+            return rc;
+        }
+        rc = wl_evaluation_control_attach(lane->control, lane);
+        if (rc) {
+            wl_evaluation_control_release(lane->control);
+            wl_evaluation_control_source_bank_unwind_birth(bank, i);
+            return rc;
+        }
+        /* The only marker writer: fresh controller, stable private owner,
+         * no BEGIN, raw controller/ID still unpublished and never exported. */
+        lane->control->source_bank_class = bank;
+    }
+    *out = bank;
+    return 0;
+}
+
+int
+wl_evaluation_control_source_context_begin(
+    wl_evaluation_control_source_bank_t *bank,
+    wl_evaluation_control_source_lane_t index,
+    wl_evaluation_control_source_context_t *context)
+{
+    if (!bank || bank->identity != bank || !context
+        || context->identity || context->bank || context->lane
+        || context->thread_cookie
+        || (unsigned)index >= WL_EVALUATION_CONTROL_SOURCE_LANES)
+        return EINVAL;
+    int rc = wl_evaluation_control_source_bank_lock(bank);
+    if (rc) return rc;
+    wl_evaluation_control_source_lane_state_t *lane = &bank->lanes[index];
+    if (bank->closing || lane->context || lane->running
+        || lane->callback_active) rc = EBUSY;
+    if (!rc) {
+        context->identity = context;
+        context->bank = bank;
+        context->lane = (unsigned)index;
+        context->thread_cookie = &wl_evaluation_control_source_thread_cookie;
+        lane->context = context;
+    }
+    wl_evaluation_control_source_bank_unlock(bank);
+    return rc;
+}
+
+int
+wl_evaluation_control_source_context_end(
+    wl_evaluation_control_source_context_t *context)
+{
+    if (!context || context->identity != context || !context->bank
+        || context->lane >= WL_EVALUATION_CONTROL_SOURCE_LANES
+        || context->thread_cookie !=
+        &wl_evaluation_control_source_thread_cookie)
+        return EINVAL;
+    wl_evaluation_control_source_bank_t *bank = context->bank;
+    if (bank->identity != bank) return EINVAL;
+    int rc = wl_evaluation_control_source_bank_lock(bank);
+    if (rc) return rc;
+    wl_evaluation_control_source_lane_state_t *lane =
+        &bank->lanes[context->lane];
+    if (lane->context != context) rc = EINVAL;
+    else if (lane->running || lane->callback_active
+        || wl_evaluation_control_active_attempt_id(lane->control)
+        || (lane->id && !lane->report_verified)) rc = EBUSY;
+    if (!rc) {
+        lane->context = NULL;
+        context->identity = NULL;
+        context->bank = NULL;
+        context->lane = 0;
+        context->thread_cookie = NULL;
+    }
+    wl_evaluation_control_source_bank_unlock(bank);
+    return rc;
+}
+
+wl_evaluation_control_source_phase_result_t
+wl_evaluation_control_source_bank_run(
+    wl_evaluation_control_source_context_t *context,
+    const wl_evaluation_control_source_phase_policy_t *policy,
+    wl_evaluation_control_source_action_fn action, void *payload)
+{
+    wl_evaluation_control_source_phase_result_t result = {EINVAL, 0, false};
+    if (!context || context->identity != context || !context->bank
+        || context->lane >= WL_EVALUATION_CONTROL_SOURCE_LANES
+        || context->thread_cookie != &wl_evaluation_control_source_thread_cookie
+        || !policy || !action || !policy->bootstrap_work
+        || !policy->current_work || !policy->close_work
+        || policy->bootstrap_work > WL_EVALUATION_CONTROL_QUANTUM
+        || policy->current_work > WL_EVALUATION_CONTROL_QUANTUM
+        || policy->close_work > WL_EVALUATION_CONTROL_QUANTUM)
+        return result;
+    wl_evaluation_control_source_bank_t *bank = context->bank;
+    if (bank->identity != bank || payload == bank || payload == context)
+        return result;
+    int rc = wl_evaluation_control_source_bank_lock(bank);
+    if (rc) {
+        result.financial_result = rc; return result;
+    }
+    wl_evaluation_control_source_lane_state_t *lane =
+        &bank->lanes[context->lane];
+    if (bank->closing || lane->context != context || lane->running
+        || lane->callback_active) {
+        wl_evaluation_control_source_bank_unlock(bank);
+        result.financial_result = EBUSY;
+        return result;
+    }
+    rc = wl_evaluation_control_source_bank_rearm_phase(bank, context->lane);
+    if (!rc) rc = wl_evaluation_control_begin(lane->control, lane);
+    if (rc) {
+        wl_evaluation_control_source_bank_unlock(bank);
+        result.financial_result = rc;
+        return result;
+    }
+    lane->id = wl_evaluation_control_active_attempt_id(lane->control);
+    if (!lane->id) abort();
+    lane->running = true;
+    rc = wl_evaluation_control_source_bank_charge(lane, policy->bootstrap_work);
+    if (!rc) rc = wl_evaluation_control_source_bank_charge(lane,
+                policy->current_work);
+    if (!rc) {
+        lane->callback_active = true;
+        wl_evaluation_control_source_bank_unlock(bank);
+        /* SOURCE-only action: no bank/context/native-ID is an argument or
+         * stored callback. A constructor executes immediately after CURRENT.
+         * No BODY/user hook may be called by the admitted action. */
+        result.action_result = action(payload);
+        result.action_called = true;
+        if (wl_evaluation_control_source_bank_lock(bank)) abort();
+        lane->callback_active = false;
+        rc = wl_evaluation_control_source_bank_charge(lane, policy->close_work);
+    }
+    int finished = wl_evaluation_control_source_bank_finish_phase(lane);
+    result.financial_result = rc ? rc : finished;
+    wl_evaluation_control_source_bank_unlock(bank);
+    return result;
+}
+
+int
+wl_evaluation_control_source_bank_destroy(
+    wl_evaluation_control_source_bank_t **slot)
+{
+    if (!slot) return EINVAL;
+    wl_evaluation_control_source_bank_t *bank = *slot;
+    if (!bank) return 0;
+    if (bank->identity != bank || bank->owner_slot != slot) return EINVAL;
+    int rc = wl_evaluation_control_source_bank_lock(bank);
+    if (rc) return rc;
+    for (unsigned i = 0; i < WL_EVALUATION_CONTROL_SOURCE_LANES; ++i) {
+        wl_evaluation_control_source_lane_state_t *lane = &bank->lanes[i];
+        if (lane->context || lane->running || lane->callback_active
+            || wl_evaluation_control_active_attempt_id(lane->control)
+            || (lane->id && !lane->report_verified)) {
+            wl_evaluation_control_source_bank_unlock(bank);
+            return EBUSY;
+        }
+    }
+    /* Candidate source ownership: BOOT256 covers actual incoming/rearm;
+     * CURRENT24 covers its separate monetary transition; CLOSE160 covers
+     * report/retirement and the fixed admission tail. All source intervals
+     * and simultaneous slack are re-audited against this complete literal.
+     * Capacity3Q is configuration, not payment. No Session is read here. */
+    wl_evaluation_control_source_context_t final_context = {0};
+    unsigned index = WL_EVALUATION_CONTROL_SOURCE_CLOSE;
+    wl_evaluation_control_source_lane_state_t *lane = &bank->lanes[index];
+    final_context.identity = &final_context;
+    final_context.bank = bank;
+    final_context.lane = index;
+    final_context.thread_cookie = &wl_evaluation_control_source_thread_cookie;
+    lane->context = &final_context;
+    rc = wl_evaluation_control_source_bank_rearm_phase(bank, index);
+    if (!rc) rc = wl_evaluation_control_begin(lane->control, lane);
+    if (rc) {
+        lane->context = NULL;
+        wl_evaluation_control_source_bank_unlock(bank);
+        return rc;
+    }
+    lane->id = wl_evaluation_control_active_attempt_id(lane->control);
+    if (!lane->id) abort();
+    lane->running = true;
+    rc = wl_evaluation_control_source_bank_charge(lane,
+            WL_EVALUATION_CONTROL_QUANTUM);
+    if (!rc) rc = wl_evaluation_control_source_bank_charge(lane,
+                UINT64_C(24));
+    if (!rc) rc = wl_evaluation_control_source_bank_charge(lane,
+                UINT64_C(160));
+    int finished = wl_evaluation_control_source_bank_finish_phase(lane);
+    lane->context = NULL;
+    if (rc || finished) {
+        wl_evaluation_control_source_bank_unlock(bank);
+        return rc ? rc : finished;
+    }
+    bank->closing = true;
+    wl_evaluation_control_source_bank_unlock(bank);
+    for (unsigned i = 0; i < WL_EVALUATION_CONTROL_SOURCE_LANES; ++i) {
+        lane = &bank->lanes[i];
+        if (wl_evaluation_control_detach(lane->control, lane)) abort();
+        wl_evaluation_control_release(lane->control);
+    }
+    bank->identity = NULL;
+    wl_mutex_destroy(&bank->mutex);
+    free(bank);
+    *slot = NULL;
+    return 0;
 }

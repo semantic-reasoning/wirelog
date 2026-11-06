@@ -9,6 +9,7 @@
 #define WL_EVALUATION_CONTROL_H
 
 #include <stdint.h>
+#include <stdbool.h>
 
 typedef struct wl_evaluation_control wl_evaluation_control_t;
 
@@ -116,5 +117,63 @@ int wl_evaluation_control_finish(wl_evaluation_control_t *control,
 /* ENOENT before first finish; returns the prior completed report if active. */
 int wl_evaluation_control_report(wl_evaluation_control_t *control,
     wl_evaluation_control_report_t *out);
+
+/* Internal financial source class; never an engine/native permission. */
+typedef struct wl_evaluation_control_source_bank
+    wl_evaluation_control_source_bank_t;
+
+typedef enum {
+    WL_EVALUATION_CONTROL_SOURCE_OPERATION = 0,
+    WL_EVALUATION_CONTROL_SOURCE_CLOSE = 1
+} wl_evaluation_control_source_lane_t;
+
+/* Initialize with {0}, pass by address, never copy or retain across public activations.
+ * No underlying controller or saved native attempt ID is exported. */
+typedef struct wl_evaluation_control_source_context {
+    struct wl_evaluation_control_source_context *identity;
+    wl_evaluation_control_source_bank_t *bank;
+    unsigned lane;
+    const void *thread_cookie;
+} wl_evaluation_control_source_context_t;
+
+typedef struct {
+    uint64_t bootstrap_work;
+    uint64_t current_work;
+    uint64_t close_work;
+} wl_evaluation_control_source_phase_policy_t;
+
+typedef struct {
+    int financial_result;
+    int action_result;
+    bool action_called;
+} wl_evaluation_control_source_phase_result_t;
+
+typedef int (*wl_evaluation_control_source_action_fn)(void *payload);
+
+/* out is NULL-initialized exclusive external owning storage and must
+ * outlive BANK. Its address is the immutable owner_slot; never move/copy
+ * ownership to another slot. Borrowed opaque handles cannot destroy BANK. */
+int wl_evaluation_control_source_bank_create(
+    wl_evaluation_control_source_bank_t **out);
+int wl_evaluation_control_source_bank_destroy(
+    wl_evaluation_control_source_bank_t **bank);
+/* context is a complete zeroed external object, disjoint from BANK and
+ * its private controllers; genuine public callers use lexical stack storage.
+ * Arbitrary cast/overlapping output storage is outside this internal contract. */
+int wl_evaluation_control_source_context_begin(
+    wl_evaluation_control_source_bank_t *bank,
+    wl_evaluation_control_source_lane_t lane,
+    wl_evaluation_control_source_context_t *context);
+int wl_evaluation_control_source_context_end(
+    wl_evaluation_control_source_context_t *context);
+/* The complete bounded SOURCE-only action receives no BANK/context/ID.
+ * All three positive fees must be <=QUANTUM; policy is private immutable.
+ * Constructor action executes immediately after CURRENT and returns before
+ * CLOSE/report/rearm. No arbitrary BODY/user callback is an action. */
+wl_evaluation_control_source_phase_result_t
+wl_evaluation_control_source_bank_run(
+    wl_evaluation_control_source_context_t *context,
+    const wl_evaluation_control_source_phase_policy_t *policy,
+    wl_evaluation_control_source_action_fn action, void *payload);
 
 #endif /* WL_EVALUATION_CONTROL_H */
