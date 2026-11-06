@@ -1232,7 +1232,7 @@ call.
 | `snapshot_stable_valid` | `col_controlled_step_recursive_drive`, `col_session_remove`, `col_session_remove_incremental`, `col_session_snapshot_impl`, `col_session_step_impl`, `session_note_inserted_input`, `wl_columnar_session_observed_action`, `wl_columnar_session_note_iteration_cap` | `col_session_snapshot_impl` | PRESERVE |
 | `delta_seeded` | `insert_clone_prepare`, `tdd_worker_subpass_fn` | `col_op_variable`, `has_empty_forced_delta`, `tdd_worker_subpass_fn`, `wl_columnar_eval_nonrec_relation_parallel`, `wl_columnar_join_select_right`, `wl_columnar_join_op_attempt_start_owned_initialize`, `wl_columnar_join_host_forward`, `wl_columnar_eval_plan_numeric_source_select`, `wl_columnar_eval_plan_composed_source_select`, `wl_columnar_eval_tdd_plan_prepare_inputs`, `wl_columnar_eval_tdd_plan_prepare_insert`, `wl_columnar_join_spill_eligible`, `wl_columnar_session_cold_mode` | PRESERVE |
 | `last_removed_relation` | `col_session_remove_incremental`, `col_worker_session_create`, `session_retraction_cleanup`, `col_controlled_step_staging_finish`, `wl_columnar_session_observed_action` | `col_session_remove_incremental`, `col_session_snapshot_impl`, `col_session_step_impl`, `col_controlled_step_staging_prepare`, `wl_columnar_session_cold_busy`, `wl_columnar_session_observed_action` | PRESERVE |
-| `retraction_seeded` | `col_session_step_impl`, `col_stratum_step_retraction_nonrecursive`, `col_stratum_step_with_delta`, `insert_clone_prepare`, `session_retraction_cleanup`, `col_controlled_step_staging_finish`, `wl_columnar_session_observed_action` | `col_controlled_step_static_preflight`, `wl_columnar_filter_consolidate_attempt_start_owned`, `col_op_variable`, `col_session_snapshot_impl`, `col_stratum_step_with_delta`, `has_empty_forced_delta`, `wl_columnar_eval_nonrec_relation_parallel`, `wl_columnar_join_select_right`, `wl_columnar_join_op_attempt_start_owned_initialize`, `wl_columnar_join_probe_op_attempt_start_owned_initialize`, `wl_columnar_eval_plan_numeric_source_attempt_begin`, `wl_columnar_eval_tdd_plan_prepare_inputs`, `wl_columnar_eval_tdd_plan_prepare_insert`, `wl_columnar_ops_reduce_attempt_start_owned`, `wl_columnar_merge_concat_attempt_start_owned`, `wl_columnar_eval_plan_numeric_composed_attempt_begin_internal`, `wl_columnar_eval_serial_framed_relation_internal`, `wl_columnar_join_spill_eligible`, `wl_columnar_session_cold_mode` | PRESERVE |
+| `retraction_seeded` | `col_session_step_impl`, `col_stratum_step_retraction_nonrecursive`, `col_stratum_step_with_delta`, `insert_clone_prepare`, `session_retraction_cleanup`, `col_controlled_step_staging_finish`, `wl_columnar_session_observed_action` | `wl_columnar_session_preflight_foreign_first`, `wl_columnar_filter_consolidate_attempt_start_owned`, `col_op_variable`, `col_session_snapshot_impl`, `col_stratum_step_with_delta`, `has_empty_forced_delta`, `wl_columnar_eval_nonrec_relation_parallel`, `wl_columnar_join_select_right`, `wl_columnar_join_op_attempt_start_owned_initialize`, `wl_columnar_join_probe_op_attempt_start_owned_initialize`, `wl_columnar_eval_plan_numeric_source_attempt_begin`, `wl_columnar_eval_tdd_plan_prepare_inputs`, `wl_columnar_eval_tdd_plan_prepare_insert`, `wl_columnar_ops_reduce_attempt_start_owned`, `wl_columnar_merge_concat_attempt_start_owned`, `wl_columnar_eval_plan_numeric_composed_attempt_begin_internal`, `wl_columnar_eval_serial_framed_relation_internal`, `wl_columnar_join_spill_eligible`, `wl_columnar_session_cold_mode` | PRESERVE |
 | `plain_step_completion_pending` | `col_eval_stratum_tdd_nonrecursive`, `col_eval_stratum_tdd_recursive`, `col_session_step_impl`, `col_worker_session_create`, `wl_columnar_session_note_iteration_cap` | `col_session_insert`, `col_session_insert_incremental`, `col_session_make_compound`, `col_session_remove`, `col_session_remove_incremental`, `col_session_snapshot_impl`, `col_session_step_impl`, `wl_columnar_eval_resume_stratum_completion`, `wl_columnar_session_cold_busy` | PRESERVE -- with `plain_step_completion_phase` this is the resume token |
 | `plain_step_completion_phase` | `col_eval_stratum_tdd_nonrecursive`, `col_eval_stratum_tdd_recursive`, `col_session_step_impl`, `col_worker_session_create`, `wl_columnar_eval_resume_stratum_completion`, `wl_columnar_session_note_iteration_cap` | `col_session_step_impl`, `wl_columnar_eval_resume_stratum_completion` | PRESERVE |
 | `plain_step_completion_step_context` | `col_session_snapshot_impl`, `col_session_step_impl`, `col_worker_session_create`, `wl_columnar_session_note_iteration_cap` | `col_eval_stratum_tdd_nonrecursive`, `col_eval_stratum_tdd_recursive`, `col_session_step_impl` | PRESERVE |
@@ -2294,7 +2294,7 @@ copy-exclusion, native and source carry.
 
 ### Controlled JOIN local output policy
 
-The admitted non-strict scalar session host preserves the configured local
+The admitted scalar session host preserves the configured local
 `WIRELOG_JOIN_OUTPUT_LIMIT`. A consumed FILTER/MAP/probe pipeline counts its
 committed sink rows; a direct JOIN sink counts its committed JOIN rows. A later,
 separately executed FILTER does not reduce that JOIN's policy count. Zero
@@ -2309,13 +2309,12 @@ ACK and policy update. Failed attempts publish no session head; reset and a
 raised local limit can retry with the configured producer retained. Batch
 capacity can cause the same bounded cap overshoot as raw batching.
 
-This local policy does not enable strict batching, worker shared counters or
-additional transaction/source domains. Their admission and ownership contracts
-remain separately qualified.
+The local cap composes with the strict and private transaction contracts below.
+Worker shared counters retain their separate ownership and policy contract.
 
 ### Controlled JOIN transaction bindings
 
-Configured non-strict JOIN batches and their FILTER/MAP/FULL-probe consumers
+Configured eligible JOIN batches and their FILTER/MAP/FULL-probe consumers
 can run inside the existing ordinary nonrecursive private transaction. The
 child reads the current transaction's exact head images, including a preceding
 private head and a derived FULL anti-probe source. It uses the same semantic
@@ -2380,3 +2379,28 @@ mutating the borrowed registry. Pointer/count/cap checks are defensive checks,
 not a detector for arbitrary in-place mutation. A future public primary-cache
 producer or independently interleaved internal cache mutation requires renewed
 ownership and boundedness qualification.
+
+### Controlled JOIN public admission and completion
+
+The single-worker, configured acyclic JOIN domain uses the admission-owned
+SOURCE BANK for public STEP/Snapshot metadata, actual state reads and static
+preflight. Each bounded read returns its own status before any output predicate
+is consumed. A failed SOURCE read never falls back to direct execution.
+Mutation preflight and routes outside that domain retain their explicit direct
+mode. Lexical SOURCE scope is installed after admission and restored before
+end-step arbitration, including invalid callback/backend/input returns.
+
+The saved Original generation owns semantic charges and completion throughout
+producer/consumer suspension, Native recovery and observed transactions. Private
+financial controllers carry no Native permission. Snapshot completion uses its
+preborn financial owner even when a user callback ends Original, starts a
+successor or exhausts process-wide controller identities. It preserves the
+frozen Original report and leaves the successor uncharged. Cleanup validates
+the actual owner, creator thread, source binding and receipt before Native
+action, ACK or cursor retirement. An active successor prevents destruction.
+
+Synchronous destruction drains the existing finite observed-disposal cursors
+until their genuine terminal status; it is not limited to sixteen calls.
+Busy, identity and cleanup errors remain authoritative. The complete ordinary
+JOIN coverage and reproducible regression commands are recorded in
+[JOIN host acceptance](implementation/2297/JOIN_HOST_ACCEPTANCE.md).

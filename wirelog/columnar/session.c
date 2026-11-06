@@ -650,6 +650,13 @@ void (*wl_columnar_session_test_metadata_finished)(
     wl_columnar_session_metadata_event_t, int, wl_evaluation_control_report_t);
 int wl_columnar_session_test_exhaust_after_relation;
 unsigned wl_columnar_session_test_preflight_quantum = 64;
+void (*wl_columnar_session_test_before_fresh_shape)(wl_col_session_t *);
+#if defined(_MSC_VER)
+__declspec(thread) unsigned wl_columnar_session_test_step_reset_chunks;
+#else
+_Thread_local unsigned wl_columnar_session_test_step_reset_chunks;
+#endif
+
 void (*wl_columnar_session_test_recursive_step_checkpoint)(
     wl_evaluation_control_t *, unsigned, uint32_t);
 size_t wl_columnar_session_test_observer_precharged_events;
@@ -7965,70 +7972,321 @@ col_controlled_step_controlled_op(const wl_plan_op_t *op)
 /* Reject whole-session and recursive routes before opening an operation
  * attempt.  This checks only immutable plan shape and session admission state;
  * relation/operator validation and all evaluation work remain charged below. */
-static bool wl_columnar_session_observed_general_shape(
-    const wl_col_session_t *);
+/* Shared predicate bodies: DIRECT is explicitly chosen before execution;
+ * SOURCE has no fallback when its actual financial/read action fails. */
+typedef enum {
+    WL_COLUMNAR_SESSION_PREFLIGHT_DIRECT,
+    WL_COLUMNAR_SESSION_PREFLIGHT_SOURCE
+} wl_columnar_session_preflight_mode_t;
 
-static bool
-wl_columnar_session_recursive_transaction_shape(const wl_col_session_t *sess)
+typedef struct {
+    wl_col_session_t *session;
+    const wl_plan_t *plan;
+    const wl_columnar_controlled_step_t *step;
+    const wl_plan_relation_t *relation;
+    uint32_t index;
+    bool retained;
+    bool timestamped;
+    bool done;
+    bool shape;
+    bool successor;
+} wl_columnar_session_preflight_read_t;
+
+static int
+wl_columnar_session_preflight_read(wl_columnar_session_preflight_mode_t mode,
+    wl_col_session_t *sess, wl_evaluation_control_source_action_fn action,
+    void *payload)
 {
-    const wl_plan_t *plan = sess->plan;
-    if (!plan || !plan->strata ||
-        plan->stratum_count > MAX_STRATA) return false;
-    /* Timestamped sources use preserved-body set reconstruction. Keep the
-     * independently qualified value-only binary fast path for other inputs. */
-    bool timestamp_source = sess->rels && sess->nrels && sess->rels[0]
-        && sess->rels[0]->timestamps;
-    if (!sess->delta_cb && plan->stratum_count == 1
-        && plan->strata[0].relation_count == 1 && plan->strata[0].relations
-        && wl_columnar_eval_plan_numeric_recursive_path_supported(
-            &plan->strata[0].relations[0]) && !timestamp_source) return false;
-    for (uint32_t i = 0; i < plan->stratum_count; ++i) {
-        const wl_plan_stratum_t *stratum = &plan->strata[i];
-        if (!stratum->is_recursive) continue;
-        /* Preserve the existing before-attempt refusal of the single-head
-         * typed route; general metadata is validated by charged admission. */
-        if (plan->stratum_count == 1 && stratum->relation_count == 1
-            && (!stratum->bodies || !stratum->bodies[0].declared_int64))
-            return false;
-        return true;
-    }
-    return false;
+    return mode == WL_COLUMNAR_SESSION_PREFLIGHT_SOURCE
+        ? wl_session_source_admission_read(&sess->base, action, payload)
+        : action(payload);
+}
+
+static wl_columnar_session_preflight_mode_t
+wl_columnar_session_preflight_mode(const wl_col_session_t *sess)
+{
+    return sess->base.source_c1_admission
+        ? WL_COLUMNAR_SESSION_PREFLIGHT_SOURCE
+        : WL_COLUMNAR_SESSION_PREFLIGHT_DIRECT;
 }
 
 static int
-col_controlled_step_static_preflight(wl_col_session_t *sess, bool successor)
+wl_columnar_session_preflight_initial(void *payload)
 {
-    const wl_plan_t *plan = sess->plan;
-    const wl_plan_relation_t *only_relation = NULL;
-    const wl_columnar_controlled_step_t *step = sess->controlled_step;
-    if (sess->delta_cb && plan && plan->stratum_count > MAX_STRATA)
-        return ENOTSUP;
-    if (step && step->general_observed) return 0;
-    /* A stopped rule retains its own baseline for the next control attempt.
-     * Do not mistake that owned, unevaluated baseline for a foreign observer. */
-    bool retained_baseline = step && step->observed && step->baseline_ready
+    wl_columnar_session_preflight_read_t *p = payload;
+    if (p->session->delta_cb && p->plan
+        && p->plan->stratum_count > MAX_STRATA) return ENOTSUP;
+    if (p->step && p->step->general_observed) p->done = true;
+    return 0;
+}
+
+static int
+wl_columnar_session_preflight_baseline(void *payload)
+{
+    wl_columnar_session_preflight_read_t *p = payload;
+    const wl_columnar_controlled_step_t *step = p->step;
+    p->retained = step && step->observed && step->baseline_ready
         && !step->operation_active && !step->complete && !step->published
         && !step->observer_evaluated && !step->observer_preparing
         && !step->observer_prepare_discard && !step->observer_prepared
         && !step->observer_cleanup_pending
-        && !wl_columnar_eval_delta_observer_evaluated(sess);
-    if (sess->cleanup_active || sess->cleanup_pending)
-        return EBUSY;
-    if (!plan || !plan->strata || !sess->base.evaluation_control
-        || (sess->delta_observer && !retained_baseline)
-        || sess->current_iteration
+        && !wl_columnar_eval_delta_observer_evaluated(p->session);
+    return 0;
+}
+
+static int
+wl_columnar_session_preflight_foreign_first(void *payload)
+{
+    wl_columnar_session_preflight_read_t *p = payload;
+    wl_col_session_t *sess = p->session;
+    if (sess->cleanup_active || sess->cleanup_pending) return EBUSY;
+    if (!p->plan || !p->plan->strata || !sess->base.evaluation_control
+        || (sess->delta_observer && !p->retained) || sess->current_iteration
         || sess->retraction_seeded || sess->retraction_right_pass
-        || sess->tdd_input_run || sess->tdd_subpass_active
-        || sess->tdd_outbound_only_active || sess->diff_operators_active
-        || sess->join_output_shared_count
-        || sess->coordinator || sess->num_workers > 1
-        || sess->cleanup_active || sess->cleanup_pending
+        || sess->tdd_input_run || sess->tdd_subpass_active) return ENOTSUP;
+    return 0;
+}
+
+static int
+wl_columnar_session_preflight_foreign_last(void *payload)
+{
+    wl_columnar_session_preflight_read_t *p = payload;
+    wl_col_session_t *sess = p->session;
+    if (sess->tdd_outbound_only_active || sess->diff_operators_active
+        || sess->join_output_shared_count || sess->coordinator
+        || sess->num_workers > 1 || sess->cleanup_active
+        || sess->cleanup_pending
         || wl_columnar_eval_delta_rollback_active(sess)
-        || (wl_columnar_eval_delta_observer_active(sess) && !retained_baseline))
+        || (wl_columnar_eval_delta_observer_active(sess) && !p->retained))
         return ENOTSUP;
+    return 0;
+}
 
-    if (wl_columnar_session_recursive_transaction_shape(sess)) return 0;
+static int
+wl_columnar_session_preflight_recursive_initial(void *payload)
+{
+    wl_columnar_session_preflight_read_t *p = payload;
+    const wl_plan_t *plan = p->plan;
+    if (!plan || !plan->strata || plan->stratum_count > MAX_STRATA) {
+        p->done = true;
+        return 0;
+    }
+    p->timestamped = p->session->rels && p->session->nrels
+        && p->session->rels[0] && p->session->rels[0]->timestamps;
+    return 0;
+}
 
+static int
+wl_columnar_session_preflight_recursive_special(void *payload)
+{
+    wl_columnar_session_preflight_read_t *p = payload;
+    const wl_plan_t *plan = p->plan;
+    /* For a sole nonrecursive stratum both old matcher outcomes were false.
+     * Avoid its irrelevant seven/eight-op scan on that actual metadata arm. */
+    if (!p->session->delta_cb && plan->stratum_count == 1
+        && plan->strata[0].is_recursive
+        && plan->strata[0].relation_count == 1 && plan->strata[0].relations
+        && wl_columnar_eval_plan_numeric_recursive_path_supported(
+            &plan->strata[0].relations[0]) && !p->timestamped)
+        p->done = true;
+    return 0;
+}
+
+static int
+wl_columnar_session_preflight_recursive_one(void *payload)
+{
+    wl_columnar_session_preflight_read_t *p = payload;
+    const wl_plan_stratum_t *stratum = &p->plan->strata[p->index];
+    if (!stratum->is_recursive) return 0;
+    p->done = true;
+    if (p->plan->stratum_count == 1 && stratum->relation_count == 1
+        && (!stratum->bodies || !stratum->bodies[0].declared_int64)) return 0;
+    p->shape = true;
+    return 0;
+}
+
+static int
+wl_columnar_session_recursive_shape_read(wl_col_session_t *sess,
+    wl_columnar_session_preflight_mode_t mode, bool *shape)
+{
+    *shape = false;
+    wl_columnar_session_preflight_read_t p = {0};
+    p.session = sess; p.plan = sess->plan;
+    int rc = wl_columnar_session_preflight_read(mode, sess,
+            wl_columnar_session_preflight_recursive_initial, &p);
+    if (rc || p.done) return rc;
+    rc = wl_columnar_session_preflight_read(mode, sess,
+            wl_columnar_session_preflight_recursive_special, &p);
+    if (rc || p.done) return rc;
+    for (; p.index < p.plan->stratum_count && !p.done; ++p.index) {
+        rc = wl_columnar_session_preflight_read(mode, sess,
+                wl_columnar_session_preflight_recursive_one, &p);
+        if (rc) return rc;
+    }
+    *shape = p.shape;
+    return 0;
+}
+
+static int
+wl_columnar_session_preflight_general_first(void *payload)
+{
+    wl_columnar_session_preflight_read_t *p = payload;
+    const wl_plan_t *plan = p->plan;
+    if (!p->session->delta_cb) {
+        p->done = true; return 0;
+    }
+    if (!plan || !plan->strata) {
+        p->done = p->shape = true; return 0;
+    }
+    if (plan->edb_count == 1 && plan->edb_column_type_counts
+        && plan->edb_column_type_counts[0] == 1 && plan->edb_column_types
+        && plan->edb_column_types[0]
+        && plan->edb_column_types[0][0] != WIRELOG_TYPE_INT64) {
+        p->done = p->shape = true; return 0;
+    }
+    if (plan->stratum_count != 1 || plan->strata[0].relation_count != 1)
+        p->done = p->shape = true;
+    return 0;
+}
+
+static int
+wl_columnar_session_preflight_general_relation(void *payload)
+{
+    wl_columnar_session_preflight_read_t *p = payload;
+    if (!p->plan->strata[0].relations) {
+        p->done = p->shape = true; return 0;
+    }
+    const wl_plan_relation_t *r = &p->plan->strata[0].relations[0];
+    p->relation = r;
+    if (!r->ops || (r->op_count != 3 && r->op_count != 4)) {
+        p->done = p->shape = true; return 0;
+    }
+    if (r->ops[0].op != WL_PLAN_OP_VARIABLE
+        || (r->op_count == 4 && r->ops[1].op != WL_PLAN_OP_FILTER)
+        || r->ops[r->op_count - 2].op != WL_PLAN_OP_MAP
+        || r->ops[r->op_count - 1].op != WL_PLAN_OP_CONSOLIDATE)
+        p->done = p->shape = true;
+    return 0;
+}
+
+static int
+wl_columnar_session_preflight_general_map(void *payload)
+{
+    wl_columnar_session_preflight_read_t *p = payload;
+    const wl_plan_op_t *map = &p->relation->ops[p->relation->op_count - 2];
+    p->shape = map->project_count != 1 || !map->project_indices
+        || map->project_indices[0] != 0;
+    return 0;
+}
+
+static int
+wl_columnar_session_general_shape_read(wl_col_session_t *sess,
+    wl_columnar_session_preflight_mode_t mode, bool *shape)
+{
+    *shape = false;
+    int rc = wl_columnar_session_recursive_shape_read(sess, mode, shape);
+    if (rc || *shape) return rc;
+    wl_columnar_session_preflight_read_t p = {0};
+    p.session = sess; p.plan = sess->plan;
+    rc = wl_columnar_session_preflight_read(mode, sess,
+            wl_columnar_session_preflight_general_first, &p);
+    if (rc) return rc;
+    if (!p.done) {
+        rc = wl_columnar_session_preflight_read(mode, sess,
+                wl_columnar_session_preflight_general_relation, &p);
+        if (rc) return rc;
+    }
+    if (!p.done) {
+        rc = wl_columnar_session_preflight_read(mode, sess,
+                wl_columnar_session_preflight_general_map, &p);
+        if (rc) return rc;
+    }
+    *shape = p.shape;
+    return 0;
+}
+
+static int
+wl_columnar_session_preflight_observer_relation(void *payload)
+{
+    wl_columnar_session_preflight_read_t *p = payload;
+    const wl_plan_t *plan = p->plan;
+    if (plan->stratum_count != 1 || plan->strata[0].is_recursive
+        || plan->strata[0].relation_count != 1 || !plan->strata[0].relations)
+        return ENOTSUP;
+    p->relation = &plan->strata[0].relations[0];
+    if (p->successor && p->session->nrels > 3) return ENOTSUP;
+    return 0;
+}
+
+static int
+wl_columnar_session_preflight_observer_ops(void *payload)
+{
+    wl_columnar_session_preflight_read_t *p = payload;
+    const wl_plan_relation_t *r = p->relation;
+    if (!r->name || (r->op_count != 3 && r->op_count != 4) || !r->ops
+        || r->ops[0].op != WL_PLAN_OP_VARIABLE
+        || (r->op_count == 4 && r->ops[1].op != WL_PLAN_OP_FILTER)
+        || r->ops[r->op_count - 2].op != WL_PLAN_OP_MAP
+        || r->ops[r->op_count - 1].op != WL_PLAN_OP_CONSOLIDATE
+        || !r->ops[0].relation_name) return ENOTSUP;
+    return 0;
+}
+
+static int
+wl_columnar_session_preflight_observer_map(void *payload)
+{
+    wl_columnar_session_preflight_read_t *p = payload;
+    const wl_plan_op_t *map = &p->relation->ops[p->relation->op_count - 2];
+    if (map->project_count != 1 || !map->project_indices
+        || map->project_indices[0] != 0
+        || (map->map_expr_count &&
+        (!map->map_exprs || map->map_expr_count != 1)))
+        return ENOTSUP;
+    return 0;
+}
+
+static int
+wl_columnar_session_preflight_observer_expression(void *payload)
+{
+    wl_columnar_session_preflight_read_t *p = payload;
+    const wl_plan_op_t *map = &p->relation->ops[p->relation->op_count - 2];
+    if (!map->map_expr_count) return 0;
+    const wl_plan_expr_buffer_t *expr = &map->map_exprs[0];
+    if (!expr->data && expr->size) return ENOTSUP;
+    if (expr->data && expr->size) {
+        uint16_t len = 0;
+        if (expr->size != 7 ||
+            expr->data[0] != WL_PLAN_EXPR_VAR) return ENOTSUP;
+        memcpy(&len, expr->data + 1, sizeof(len));
+        if (len != 4 || memcmp(expr->data + 3, "col0", 4) != 0) return ENOTSUP;
+    }
+    return 0;
+}
+
+static int
+col_controlled_step_static_preflight_mode(wl_col_session_t *sess,
+    bool successor, wl_columnar_session_preflight_mode_t mode)
+{
+    const wl_plan_t *plan = sess->plan;
+    const wl_columnar_controlled_step_t *step = sess->controlled_step;
+    wl_columnar_session_preflight_read_t p = {0};
+    p.session = sess; p.plan = plan; p.step = step; p.successor = successor;
+    int rc = wl_columnar_session_preflight_read(mode, sess,
+            wl_columnar_session_preflight_initial, &p);
+    if (rc || p.done) return rc;
+    rc = wl_columnar_session_preflight_read(mode, sess,
+            wl_columnar_session_preflight_baseline, &p);
+    if (rc) return rc;
+    rc = wl_columnar_session_preflight_read(mode, sess,
+            wl_columnar_session_preflight_foreign_first, &p);
+    if (rc) return rc;
+    rc = wl_columnar_session_preflight_read(mode, sess,
+            wl_columnar_session_preflight_foreign_last, &p);
+    if (rc) return rc;
+    bool shape;
+    rc = wl_columnar_session_recursive_shape_read(sess, mode, &shape);
+    if (rc) return rc;
+    if (shape) return 0;
     /* The first controlled recursive route is intentionally exact: one
      * recursive path relation, the parser's terminal zero-worker EXCHANGE,
      * and one registered EDB source. All other recursive plans remain
@@ -8060,53 +8318,36 @@ col_controlled_step_static_preflight(wl_col_session_t *sess, bool successor)
 
     if (step && step->general_observed) return 0;
     if (!sess->delta_cb) return 0;
-    if (wl_columnar_session_observed_general_shape(sess) ||
-        (successor && sess->nrels > 3)) return 0;
+    rc = wl_columnar_session_general_shape_read(sess, mode, &shape);
+    if (rc) return rc;
+    if (shape || (successor && sess->nrels > 3)) return 0;
+    rc = wl_columnar_session_preflight_read(mode, sess,
+            wl_columnar_session_preflight_observer_relation, &p);
+    if (rc) return rc;
+    rc = wl_columnar_session_preflight_read(mode, sess,
+            wl_columnar_session_preflight_observer_ops, &p);
+    if (rc) return rc;
+    rc = wl_columnar_session_preflight_read(mode, sess,
+            wl_columnar_session_preflight_observer_map, &p);
+    if (rc) return rc;
+    return wl_columnar_session_preflight_read(mode, sess,
+               wl_columnar_session_preflight_observer_expression, &p);
+}
 
-    /* This route has exactly one stratum/rule. Reject other counts before
-     * traversing metadata; variable-size validation belongs to the attempt. */
-    if (plan->stratum_count != 1 || plan->strata[0].is_recursive
-        || plan->strata[0].relation_count != 1 || !plan->strata[0].relations)
-        return ENOTSUP;
-    only_relation = &plan->strata[0].relations[0];
-    if (successor && sess->nrels > 3)
-        return ENOTSUP;
-    {
-        if (!only_relation->name
-            || (only_relation->op_count != 3 && only_relation->op_count != 4)
-            || !only_relation->ops
-            || only_relation->ops[0].op != WL_PLAN_OP_VARIABLE
-            || (only_relation->op_count == 4
-            && only_relation->ops[1].op != WL_PLAN_OP_FILTER)
-            || only_relation->ops[only_relation->op_count - 2].op
-            != WL_PLAN_OP_MAP
-            || only_relation->ops[only_relation->op_count - 1].op
-            != WL_PLAN_OP_CONSOLIDATE
-            || !only_relation->ops[0].relation_name)
-            return ENOTSUP;
-        const wl_plan_op_t *map =
-            &only_relation->ops[only_relation->op_count - 2];
-        if (map->project_count != 1 || !map->project_indices
-            || map->project_indices[0] != 0
-            || (map->map_expr_count && (!map->map_exprs
-            || map->map_expr_count != 1)))
-            return ENOTSUP;
-        if (map->map_expr_count) {
-            const wl_plan_expr_buffer_t *expr = &map->map_exprs[0];
-            if (!expr->data && expr->size)
-                return ENOTSUP;
-            if (expr->data && expr->size) {
-                uint16_t len = 0;
-                if (expr->size != 7 || expr->data[0] != WL_PLAN_EXPR_VAR)
-                    return ENOTSUP;
-                memcpy(&len, expr->data + 1, sizeof(len));
-                if (len != 4 || memcmp(expr->data + 3, "col0", 4) != 0)
-                    return ENOTSUP;
-            }
-        }
-    }
+/* Mutation admission has no STEP/Snapshot SOURCE scope. Its explicit mode
+ * shares every predicate and must never be selected after a finance error. */
+static int
+col_controlled_step_static_preflight(wl_col_session_t *sess, bool successor)
+{
+    return col_controlled_step_static_preflight_mode(sess, successor,
+               WL_COLUMNAR_SESSION_PREFLIGHT_DIRECT);
+}
 
-    return 0;
+static int
+col_controlled_step_static_preflight_c1(wl_col_session_t *sess, bool successor)
+{
+    return col_controlled_step_static_preflight_mode(sess, successor,
+               wl_columnar_session_preflight_mode(sess));
 }
 
 /* Observed admission precedes baseline construction and operator execution.
@@ -9997,6 +10238,36 @@ wl_columnar_session_retirement_entry_guard(wl_col_session_t *sess,
         wl_columnar_session_retirement_work_proof(sess, step))
         return WL_EVALUATION_CONTROL_WORK_LIMIT;
     return EINVAL; /* No invented stop, allowance, reset or child authority. */
+}
+
+typedef struct {
+    wl_col_session_t *session;
+    wl_columnar_controlled_step_t *step;
+} wl_columnar_session_retirement_guard_read_t;
+
+static int
+wl_columnar_session_retirement_guard_read(void *payload)
+{
+    wl_columnar_session_retirement_guard_read_t *p = payload;
+    return wl_columnar_session_retirement_entry_guard(p->session, p->step);
+}
+
+/* Financial SOURCE pays the actual read-only owner/thread/report proof.
+ * The unchanged proof supplies status, never permission to skip Native gates. */
+static int
+wl_columnar_session_retirement_entry_guard_c1(wl_col_session_t *sess,
+    wl_columnar_controlled_step_t *step)
+{
+    if (!sess->base.source_c1_admission)
+        return wl_columnar_session_retirement_entry_guard(sess, step);
+    wl_columnar_session_retirement_guard_read_t payload = {sess, step};
+    wl_evaluation_control_source_phase_result_t phase =
+        wl_session_source_snapshot_metadata(&sess->base,
+            wl_columnar_session_retirement_guard_read, &payload);
+    if (phase.financial_result || !phase.action_called) abort();
+    int rc = phase.action_result;
+    if (wl_session_source_footer(&sess->base)) abort();
+    return rc;
 }
 
 static int
@@ -13178,6 +13449,8 @@ static int
 wl_columnar_session_observed_dispose(wl_col_session_t *sess,
     wl_columnar_controlled_step_t *step)
 {
+    bool source_successor = sess->base.source_c1_admission
+        && step->complete && step->successor_mutation_seen;
     if (!wl_columnar_session_retirement_native_equal(step)) return EBUSY;
     wl_columnar_session_observed_transaction_t *tx = step->transaction;
     if (!tx) return 0;
@@ -13188,9 +13461,20 @@ wl_columnar_session_observed_dispose(wl_col_session_t *sess,
     if (tx->child_active || sess->cleanup_active) return EBUSY;
     int rc = wl_columnar_session_observed_maintenance(tx);
     if (rc) return rc;
+    if (source_successor) {
+        /* CUTOFF already created this genuine unlimited maintenance owner.
+         * This real zero pays the connector and never polls Original. */
+        rc = wl_evaluation_control_charge_attempt(tx->maintenance,
+                tx->maintenance_id, 0);
+        if (rc) {
+            if (wl_session_source_footer(&sess->base)) abort();
+            return rc;
+        }
+    }
     rc = wl_columnar_arrangement_diff_attempt_drain(&tx->differential,
             sess, tx->maintenance, tx->maintenance_id);
     if (rc) return rc;
+    if (source_successor && wl_session_source_footer(&sess->base)) abort();
     uint32_t originals = tx->phase <
         WL_SESSION_OBSERVED_LEASES ? 0 : tx->old_count;
     if (originals > tx->old_count) originals = tx->old_count;
@@ -13296,6 +13580,7 @@ wl_columnar_session_observed_dispose(wl_col_session_t *sess,
         tx->dispose_index++;
         return EAGAIN;
     }
+    if (source_successor && wl_session_source_footer(&sess->base)) abort();
     if (tx->committed) {
         rc = wl_columnar_session_observed_old_storage_finish(tx);
         if (rc) return rc;
@@ -13321,6 +13606,7 @@ wl_columnar_session_observed_dispose(wl_col_session_t *sess,
         if (rc) return rc;
         if (!done) return EAGAIN;
     }
+    if (source_successor && wl_session_source_footer(&sess->base)) abort();
     (void)wl_evaluation_control_finish(tx->maintenance, tx, 0, 0);
     (void)wl_evaluation_control_detach(tx->maintenance, tx);
     wl_evaluation_control_release(tx->maintenance);
@@ -14180,7 +14466,9 @@ col_controlled_step_drive(wl_col_session_t *sess,
 {
     if (step->native_error_busy || step->retirement_begin_busy
         || step->retirement_busy) return EBUSY;
-    int owner_guard = wl_columnar_session_retirement_entry_guard(sess, step);
+    if (sess->base.source_c1_admission
+        && wl_session_source_footer(&sess->base)) abort();
+    int owner_guard = wl_columnar_session_retirement_entry_guard_c1(sess, step);
     if (owner_guard) return owner_guard;
     if (step->retirement_begin_failure_pending)
         return wl_columnar_session_retirement_begin_failure_drive(sess, step);
@@ -14643,29 +14931,17 @@ col_controlled_step_successor_target_init(wl_col_session_t *sess,
     return rc ? rc : EAGAIN;
 }
 
-static bool
-wl_columnar_session_observed_general_shape(const wl_col_session_t *sess)
+typedef struct {
+    unsigned char *bytes;
+    size_t count;
+} wl_columnar_session_step_reset_bytes_t;
+
+static int
+wl_columnar_session_step_reset_bytes(void *payload)
 {
-    const wl_plan_t *plan = sess->plan;
-    if (wl_columnar_session_recursive_transaction_shape(sess)) return true;
-    if (!sess->delta_cb) return false;
-    if (!plan || !plan->strata) return true;
-    if (plan->edb_count == 1 && plan->edb_column_type_counts
-        && plan->edb_column_type_counts[0] == 1 && plan->edb_column_types
-        && plan->edb_column_types[0]
-        && plan->edb_column_types[0][0] != WIRELOG_TYPE_INT64) return true;
-    if (plan->stratum_count != 1 || plan->strata[0].relation_count != 1)
-        return true;
-    if (!plan->strata[0].relations) return true;
-    const wl_plan_relation_t *r = &plan->strata[0].relations[0];
-    if (!r->ops || (r->op_count != 3 && r->op_count != 4)) return true;
-    if (r->ops[0].op != WL_PLAN_OP_VARIABLE
-        || (r->op_count == 4 && r->ops[1].op != WL_PLAN_OP_FILTER)
-        || r->ops[r->op_count - 2].op != WL_PLAN_OP_MAP
-        || r->ops[r->op_count - 1].op != WL_PLAN_OP_CONSOLIDATE) return true;
-    const wl_plan_op_t *map = &r->ops[r->op_count - 2];
-    return map->project_count != 1 || !map->project_indices
-           || map->project_indices[0] != 0;
+    wl_columnar_session_step_reset_bytes_t *p = payload;
+    memset(p->bytes, 0, p->count);
+    return 0;
 }
 
 static int
@@ -14677,12 +14953,14 @@ col_controlled_step(wl_col_session_t *sess,
         || sess->controlled_step->join_cleanup.busy
         || sess->controlled_step->retirement_begin_busy
         || sess->controlled_step->retirement_busy)) return EBUSY;
+    if (sess->base.source_c1_admission
+        && wl_session_source_footer(&sess->base)) abort();
     wl_columnar_controlled_step_t *step = sess->controlled_step;
     wl_columnar_session_native_error_dispatch_result_t typed =
         wl_columnar_session_join_cleanup_dispatch(sess, step);
     if (typed.selected) return typed.protocol;
     if (step) {
-        int owner_guard = wl_columnar_session_retirement_entry_guard(sess,
+        int owner_guard = wl_columnar_session_retirement_entry_guard_c1(sess,
                 step);
         if (owner_guard) return owner_guard;
     }
@@ -14710,7 +14988,7 @@ col_controlled_step(wl_col_session_t *sess,
             step->retryable = false;
             return EINVAL;
         }
-        int preflight_rc = col_controlled_step_static_preflight(sess, false);
+        int preflight_rc = col_controlled_step_static_preflight_c1(sess, false);
         if (preflight_rc) return preflight_rc;
         step->default_preflight_phase = COL_CONTROLLED_DEFAULT_PREFLIGHT_IDLE;
         step->default_preflight_plan = NULL;
@@ -14727,8 +15005,10 @@ col_controlled_step(wl_col_session_t *sess,
         successor_step = true;
     }
     if (step && step->complete && step->successor_mutation_seen) {
-        int rc = col_controlled_step_static_preflight(sess, true);
+        int rc = col_controlled_step_static_preflight_c1(sess, true);
         if (rc) return rc;
+        if (sess->base.source_c1_admission
+            && wl_session_source_footer(&sess->base)) abort();
         uint64_t identity = step->operation_identity;
         bool general = snapshot || step->general_observed ||
             step->callback_changed
@@ -14739,7 +15019,11 @@ col_controlled_step(wl_col_session_t *sess,
                     wl_evaluation_control_begin_attempt(
                     sess->base.evaluation_control,
                     sess->base.operation_admission);
-                if (begin.protocol) return begin.protocol;
+                if (begin.protocol) {
+                    if (sess->base.source_c1_admission
+                        && wl_session_source_footer(&sess->base)) abort();
+                    return begin.protocol;
+                }
                 step->operation_active = true;
                 step->operation_id = begin.attempt_id;
             }
@@ -14753,7 +15037,27 @@ col_controlled_step(wl_col_session_t *sess,
         bool observed = sess->delta_cb != NULL;
         uint64_t operation_id = step->operation_id;
         bool operation_active = step->operation_active;
-        memset(step, 0, sizeof(*step));
+        if (sess->base.source_c1_admission) {
+            if (wl_session_source_footer(&sess->base)) abort();
+            /* Completion and actual disposal already retired Native debt.
+             * No partially reset descriptor escapes this exclusive scope. */
+            for (size_t byte = 0; byte < sizeof(*step); ) {
+                size_t count = sizeof(*step) - byte;
+                if (count > 64) count = 64;
+                wl_columnar_session_step_reset_bytes_t payload = {
+                    (unsigned char *)step + byte, count
+                };
+                wl_evaluation_control_source_phase_result_t phase =
+                    wl_session_source_snapshot_metadata(&sess->base,
+                        wl_columnar_session_step_reset_bytes, &payload);
+                if (phase.financial_result || !phase.action_called
+                    || phase.action_result) abort();
+#ifdef WL_SESSION_TEST_HOOKS
+                wl_columnar_session_test_step_reset_chunks++;
+#endif
+                byte += count;
+            }
+        } else memset(step, 0, sizeof(*step));
         step->operation_id = operation_id;
         step->operation_active = operation_active;
         step->operation_identity = identity;
@@ -14764,12 +15068,16 @@ col_controlled_step(wl_col_session_t *sess,
         step->append_source = append_source;
         step->append_identity = append_identity;
         step->append_begin = append_begin;
+        if (sess->base.source_c1_admission
+            && wl_session_source_footer(&sess->base)) abort();
     }
     if (!successor_step
         && (!step || (!step->operation_active && !step->complete))) {
-        int rc = col_controlled_step_static_preflight(sess,
+        int rc = col_controlled_step_static_preflight_c1(sess,
                 step && step->successor_attempt);
         if (rc) return rc;
+        if (sess->base.source_c1_admission
+            && wl_session_source_footer(&sess->base)) abort();
     }
     if (!step) {
         wl_columnar_controlled_step_t *fresh =
@@ -14787,8 +15095,23 @@ col_controlled_step(wl_col_session_t *sess,
             && wl_columnar_eval_plan_numeric_recursive_path_supported(
             &plan->strata[0].relations[0]);
         fresh->observed = sess->delta_cb != NULL;
-        fresh->general_observed = snapshot
-            || wl_columnar_session_observed_general_shape(sess);
+        bool general = snapshot != NULL;
+        if (!general) {
+            if (sess->base.source_c1_admission
+                && wl_session_source_footer(&sess->base)) abort();
+#ifdef WL_SESSION_TEST_HOOKS
+            if (wl_columnar_session_test_before_fresh_shape)
+                wl_columnar_session_test_before_fresh_shape(sess);
+#endif
+            int shape_rc = wl_columnar_session_general_shape_read(sess,
+                    wl_columnar_session_preflight_mode(sess), &general);
+            if (shape_rc) {
+                free(fresh); return shape_rc;
+            }
+        }
+        if (sess->base.source_c1_admission
+            && wl_session_source_footer(&sess->base)) abort();
+        fresh->general_observed = general;
         if (fresh->general_observed)
             fresh->recursive_route = false;
         sess->controlled_step = fresh;
@@ -14878,8 +15201,10 @@ col_session_step(wl_session_t *session)
             wl_columnar_session_native_error_dispatch(sess,
                 sess->controlled_step);
     if (cleanup.selected) return cleanup.protocol;
+    if (session->source_c1_admission
+        && wl_session_source_footer(session)) abort();
     if (sess->controlled_step) {
-        int owner_guard = wl_columnar_session_retirement_entry_guard(sess,
+        int owner_guard = wl_columnar_session_retirement_entry_guard_c1(sess,
                 sess->controlled_step);
         if (owner_guard) return owner_guard;
     }
@@ -16171,8 +16496,12 @@ col_session_snapshot_controlled(wl_session_t *session,
     wl_evaluation_control_t *control = session->evaluation_control;
     const void *owner = session->operation_admission;
     if (!control || !owner) return EINVAL;
-    wl_controlled_step_state_t state =
-        col_session_controlled_step_state(session);
+    wl_controlled_step_state_t state;
+    if (session->source_c1_admission) {
+        int state_rc = wl_session_source_admission_state_read(session, &state);
+        if (state_rc) return state_rc;
+        if (wl_session_source_footer(session)) abort();
+    } else state = col_session_controlled_step_state(session);
     if (state == WL_CONTROLLED_STEP_PENDING
         || state == WL_CONTROLLED_STEP_NATIVE_ERROR_CLEANUP_PENDING
         || state == WL_CONTROLLED_STEP_RETRYABLE
@@ -16182,12 +16511,14 @@ col_session_snapshot_controlled(wl_session_t *session,
         return ENOTSUP; /* An unrelated refused/stopped STEP owns its route. */
     bool evaluating = state != WL_CONTROLLED_STEP_COMPLETE;
     if (evaluating) {
-        int admission = col_controlled_step_static_preflight(sess,
+        int admission = col_controlled_step_static_preflight_c1(sess,
                 state == WL_CONTROLLED_STEP_DIRTY);
         if (admission) return admission;
     }
     /* Never reinterpret another owner's already active attempt. */
     if (wl_evaluation_control_active_attempt_id(control)) return EBUSY;
+    if (session->source_c1_admission && wl_session_source_footer(session))
+        abort();
     /* Only financial state is constructed here. Its positive setup phases
      * end before native evaluation; the local record is never lent to it. */
     bool source_enabled = sess->join_batch_bytes

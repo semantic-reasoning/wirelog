@@ -125,6 +125,9 @@ int wl_session_source_footer(wl_session_t *);
  * actions and never perform Native work; errors have no direct-read fallback. */
 int wl_session_source_admission_read(wl_session_t *,
     wl_evaluation_control_source_action_fn, void *);
+/* Actual admitted C1 state observation; separate from the 40-action class. */
+int wl_session_source_admission_state_read(wl_session_t *,
+    wl_controlled_step_state_t *);
 /* Synchronous SOURCE bookkeeping only; no native or user callback work. */
 wl_evaluation_control_source_phase_result_t
     wl_session_source_snapshot_metadata(wl_session_t *,
@@ -170,6 +173,8 @@ wl_session_create_with_snapshot_options(const wl_compute_backend_t *backend,
     const wl_session_options_t *options, wl_session_t **out);
 
 #ifdef WL_SESSION_TEST_HOOKS
+/* One-shot actual read-action rejection; zero clears the test fault. */
+void wl_session_testhook_refuse_source_read(unsigned after);
 void wl_session_testhook_fail_next_admission_lock(void);
 void wl_session_testhook_fail_next_admission_unlock(void);
 /* Test-only, per-thread default options substituted when a creator passes

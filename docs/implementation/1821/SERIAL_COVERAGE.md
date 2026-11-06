@@ -5,6 +5,12 @@ for package 1 of the [closure plan](CLOSURE_PLAN.md). It records implementation
 obligations, not a declaration that #1821 is implemented. A refusal proves
 admission behavior only; a private operator test does not prove session reachability.
 
+The original matrix is updated below for the completed ordinary JOIN host
+contract in #2297. Later prerequisite sections retain their historical scope;
+the current acceptance record is [JOIN host acceptance](../2297/JOIN_HOST_ACCEPTANCE.md).
+LFTJ (#2298), worker coordination (#1822) and the remaining serial umbrella
+(#2293) retain their own acceptance obligations.
+
 ## Reading the matrix
 
 **R** means required serial work; **P** means parallel ownership in #1822;
@@ -50,8 +56,8 @@ Source: [session.c](../../../wirelog/columnar/session.c),
 | E05 / S07 | Exact binary INT64 path manifest with one/two JOINs and terminal zero-worker EXCHANGE → `col_controlled_step_recursive_drive` | R, implemented restricted recursion; charged progress/private merge; S/F; general SCC bound U | `test_controlled_recursive_two_join_step`, `test_controlled_recursive_two_join_successor_stop`, `test_controlled_recursive_successor_work_boundaries`; G3 |
 | E06 / S07 | Ordinary positive recursive multihead/SCC bodies | R, declared positive-arity INT64 route implemented with private synchronous rounds; charged comparison and retirement; S/F/O | `test_controlled_recursive_step_general_join_chain`, `test_controlled_recursive_transaction`, `test_controlled_recursive_transaction_successors`; observed/unobserved and insert/remove recomputation. `test_controlled_recursive_transaction_stops` and `test_controlled_recursive_transaction_shapes` qualify phase stops, multiple strata and empirical budget boundaries; differential and optimized routes remain G3b/G4 |
 | E07 / S08 | Foreign active raw iteration/retraction/differential state at admission versus legal completed-host removal | Foreign states retain their refusal. Qualified scalar mutations and binary recursive removal use private bounded reconstruction; see the #2296 qualification below | `test_controlled_session_admission_matrix` remains refusal evidence. `evaluation_differential` independently qualifies natural scheduler selection, scalar selectors, legal mutation, stop/retry and signed events; physical scalar intersections are qualified in PHYSICAL_METADATA_AUDIT.md |
-| E08 / S09 | Nonzero `join_batch_bytes`, non-strict unobserved supported scalar plans → prepared producer, controlled per-batch FILTER/MAP/FULL-probe consumers and private relation sink | R, restricted; Q64 preflight, A producer/consumer/sink, same F; intrinsic declines use bounded ordinary JOIN; S/F/B | `evaluation_join_hosts` domains/recovery/failures/funding and existing selector tests; broader policies remain G4 |
-| E09 / S09 | Remaining strict/cap/shared/observed batch policies and unsupported operator/source dispositions | R, guarded per destination; general non-strict scalar shapes use E08's actual producer/consumer owners | `test_controlled_session_admission_matrix` retains foreign/strict exclusions and positively qualifies scalar batch admission; broader policy/source intersections still required, G4 |
+| E08 / S09 | Nonzero JOIN batch bytes, eligible acyclic scalar JOIN and FILTER/MAP/FULL-probe tails | Session; A/Q256, same saved attempt across producer, consumer, sink, suspension and retry; S/F/B/O | `evaluation_join_hosts`, `evaluation_join_probes`, `evaluation_join_host_lifecycle`; ordinary JOIN host qualified, worker transport remains #1822 |
+| E09 / S09 | Strict/local-cap/observed policies and intrinsic pipeline declines | Session; strict eligible keyed producers execute; genuine policy refusals and bounded ordinary alternatives preserve selector semantics | `evaluation_join_host_strict`, `evaluation_join_host_policies`, lifecycle private-cap/successors/snapshots; shared worker counters remain #1822 |
 | E10 / S12 | Fresh/dirty controlled SNAPSHOT versus completed STEP | R; qualifying fresh/dirty → private transaction and staging on one attempt; unrelated pending STEP EBUSY; completed → `col_session_snapshot_controlled` → charged private staging → finite prepaid dispatch; S | `evaluation_lifecycle` covers generated fresh/dirty acyclic and numeric recursive evaluation, shared attempt identity, stop/retry and live-state refusal; `test_controlled_session_snapshot_publication` covers cutoff/reference. `test_controlled_snapshot_preparation` covers charged preparation, no-output stops and retry; finite prepaid dispatch preserves the cutoff |
 | E11 / S11 | Frame bootstrap, funding transfer, retained continuation, ABORT/ACK and destruction | R, implemented receipt protocol; per-transition charging, nested allocation/cleanup U; F | `test_cleanup_receipt_transfer_retry`, `test_entry_abort_and_unsupported_abort`, `test_controlled_session_step_destroy_refusal`; G6 must audit all ownership regions |
 | E12 / S13 | Coordinator, >1 worker, TDD input/subpass/outbound state, shared output counter | P for worker scheduling/global allowance; serial payload still R | Static/composed refusal; #1822 owns worker integration. Serial payload obligations stay in operator rows, not excluded wholesale |
@@ -90,9 +96,9 @@ controlled fallback.
 
 | ID / family | Branch and destination | Disposition / bound / owner | Evidence and exit obligation |
 |---|---|---|---|
-| F01 / S03,S09 | Raw JOIN: non-differential + batch bytes → `wl_columnar_join_pipeline_try_eval`; successful consumer pipeline advances operator index | R, general controlled host unavailable; U; raw pipeline ownership is not a controlled owner | `join_pipeline` is raw correctness evidence. Need actual controlled sink/filter/MAP suspension/replay and shared allowance, G4 |
-| F02 / S09 | Pipeline ORDINARY or non-strict DELTA_RIGHT decline, or relation-sink successor → ordinary JOIN; other decline/error records pipeline fallback; strict refuses | R, raw decision branches; controlled session uses E08 instead; U | `eval_plan.c` raw JOIN switch; `join_pipeline`/`join_batch_resume` references do not prove controlled fallback. Qualify every decline destination without budget reset, G4 |
-| F03 / S09 | `join_batch.c` prepared producer bound to control/attempt → controlled producer/runner; capacity pause, cancellation, stale provenance | R, primitive implemented; `controlled_charge` polls each billed action and enforces caller turn allowance; B; end-to-end host U | `join_batch_resume`: `test_controlled_producer_work_limit`, `test_controlled_producer_cancel_and_stale_input`, `test_controlled_join_runner_cancel`; G4 |
+| F01 / S03,S09 | Controlled prepared JOIN with FILTER/MAP/FULL-probe consumer and relation sink | Session/frame; producer/consumer/sink retain S/F/B, actual capacity/ACK/cleanup boundaries | Host domains/recovery/funding, probes, lifecycle; raw references and literal content |
+| F02 / S09 | Intrinsic pipeline decline and relation-sink fallback | Session/frame; actual controlled ordinary JOIN destination retains saved attempt and selector processing; strict refusal remains policy-driven | Host domain/recovery, strict refusal and append lifecycle fixtures |
+| F03 / S09 | Prepared producer/runner, capacity exchange, cancellation and source provenance | Session/frame/primitive; billed producer actions, same allowance through pause/replay and terminal native receipt | `join_batch_resume`, host failures/funding, lifecycle native-owner and private-cap tests |
 | F04 / S08 | `diff_operators_active` selects `wl_columnar_join_diff_op` and `col_op_consolidate_diff`; trace/arrangement updates and `diff_join_batch.c` | R, refused at controlled host/numeric/composed entry; U; no integrated stop owner | `diff_join` is raw reference only. `arrangement.c:diff_registry_grow` also refuses an active evaluation attempt; G3 must integrate trace/registry/retraction ownership with #1820 |
 | F05 / S03 | Materialized JOIN versus named ordinary right source | R, owned ordinary child explicitly excludes `op->materialized`; unsupported private variants must not fall through raw execution; U for required materialized path | Composed abort-support validation distinguishes materialized JOIN; `test_entry_abort_and_unsupported_abort`; execution/refusal coverage by representation still G5 |
 | F06 / S06 | Raw `col_op_lftj` cache/sorted inputs versus private controlled per-attempt source copy/sort/seek | R; primitive has its own charged path, cache reuse/fallback host behavior unqualified; L / U for raw alternatives | `test_entry_generated_lftj_stops_inside_child`, `test_entry_generated_lftj_allocation_precharge`, reader/abort fixtures; G4 |
@@ -104,16 +110,16 @@ controlled fallback.
 ### Concrete fallback predicates within F01–F07
 
 The following subdivisions keep the fallback ledger tied to source decisions,
-not only algorithm names. All are R with a U whole-region bound until G3/G4/G5
+not only algorithm names. Unqualified destinations remain R with a U whole-region bound until G3/G4/G5
 qualification; worker execution itself is P. The existing raw suites are
 references, not interruption evidence.
 
 | Subedge | Source decision / destination | Current controlled disposition and owner |
 |---|---|---|
-| F02a | Pipeline decline NONE/success, NOT_ELIGIBLE, ORDINARY, DELTA_RIGHT in `join_pipeline.h` and raw `eval_plan.c` switch | Success consumes the pipeline; ORDINARY and non-strict DELTA_RIGHT go to ordinary JOIN; relation-sink decline also uses ordinary JOIN; other declines record PIPELINE, strict refuses. No general controlled pipeline owner; G4 |
-| F02b | `join_batch.h` eligibility OFF, CROSS, DELTA_RIGHT, FILTERED_RIGHT, WORKER | Raw non-strict exclusion chooses one-shot JOIN, strict refuses when batching requested. Controlled host has E08 only; product/right-filter ordinary controlled children remain O04, not proof of batch fallback; G4 |
-| F02c | Eligible keyed JOIN lacks persistent arrangement, or producer creation cannot fit one row | Raw NO_ARRANGEMENT selects ephemeral hash; ROW_TOO_LARGE selects one-shot output, strict refuses. Controlled producer B exists only for admitted prepared inputs; host fallback ownership missing, G4 |
-| F02d | MATERIALIZED, LFTJ, INSERT_ROUTE exclusions in batch eligibility/reporting | Differential/materialized selection belongs to F04/F05; raw LFTJ strict refusal/non-strict one-shot is F06; insertion route does not activate the batch knob. These are not controlled escape hatches; G3/G4/G5 |
+| F02a | Pipeline success, ORDINARY, DELTA_RIGHT and other ineligible tails | Consumed success advances the actual tail; ordinary alternatives stay controlled; strict refuses ineligible destinations after required qualification. Host/probe/strict/lifecycle tests qualify ordinary JOIN scope |
+| F02b | Batch OFF, CROSS, DELTA_RIGHT, FILTERED_RIGHT, WORKER | Serial OFF/product/right-filter/delta declines use bounded ordinary destination with required key/filter processing; strict refusals remain. WORKER belongs to #1822 |
+| F02c | Missing arrangement or row cannot fit batch | Controlled private index handles missing arrangement; non-strict oversized rows use bounded ordinary JOIN, strict preserves row-fit refusal. Strict fixtures include empty/schema/protected-cache intersections |
+| F02d | Transaction INPUT versus materialized algorithm/LFTJ/INSERT_ROUTE | Real private transaction INPUT is generation-bound through ACK, including prior heads and append sources. This is distinct from op->materialized/CSE (#2296/#2300), LFTJ (#2298), and insertion-route policy |
 | F04a | Differential arrangement/trace persistent transaction versus ephemeral hash fallback | Raw fallback must leave no transaction state; controlled entry refuses active differential mode and active-attempt registry growth. Integrated stop owner absent; G3, #1820 |
 | F05a | Ordinary keyed persistent arrangement/probe bundle versus ephemeral hash; cached right filter versus operation-owned filtered relation | General serial STEP owns a private native index registry for full-right public EDB INT64 JOIN, with bounded creation/reuse/probes and a common head/index cutoff. Existing pins/pending/deferred entries refuse replacement. Filtered/private-head/batch representations retain their previous controlled disposition; this does not qualify raw cache alternatives, G5/G6 |
 | F06a | `ops.c:col_op_lftj` sorted-arrangement probe/cache versus owned per-source materialization; raw binary output callback | Controlled private LFTJ uses its per-attempt copy/sort/traversal L owner. Raw whole-output append and cache alternatives have no session control proof; G4 |
@@ -131,7 +137,7 @@ until the product contract justifies exclusion.
 | C01 / S02,S13 | Numeric expression decoder accepts column numeric variables, INT/FLOAT/BOOL literals, integer/float arithmetic/comparison, CRC/hash and numeric aggregate tags; default returns ENOTSUP | R. `expr.c:wl_columnar_expr_attempt_decode` polls bytes/digits and evaluation instructions. String/symbol/extension/library expressions require explicit metered admission or refusal, G5; no unlimited expression fallback |
 | C02 / S13 | `crc32_variant` ethernet/castagnoli; `mbedTLS` disabled/enabled/auto | R. Both integer CRC fixtures exist; library crypto is not certified by numeric tests. Enabled-library paths need finite admission/error semantics or refusal before invocation, G5/G6 |
 | C03 / S13 | Native C11/POSIX/Windows threading, forced `threads=posix`; serial worker count versus coordinator/multiworker | R serial ABI/thread-affinity checks; P global worker allowance. Run the same serial contracts on supported backends; existing ABI-aware work formulas must not assume LP64, G6 |
-| C04 / S09,S13 | Runtime batch bytes/strict, delta selectors AUTO/FORCE_FULL/FORCE_DELTA, right-delta availability, output limit/shared counter | R. E08/E09 and F01–F04 distinguish current routes; producer versus whole pipeline qualification G4, policy precedence G6 |
+| C04 / S09,S13 | Batch bytes/strict, delta selectors/right-delta and output policy | Ordinary serial JOIN host qualifies actual chosen destination, strict refusal, local cap after committed sink ACK, private rollback and retry. Shared counters remain #1822; other operator policy intersections retain G6 |
 | C05 / S01,S13 | `embedded`, `ipc`, IO/plugin loader, Arrow/import/export and extension callbacks | IO/transport outside serial evaluation; R for resulting representations and expressions when consumed by an operator, H only for callback bodies. Qualification G5/G6; enabled options cannot bypass source/child admission |
 | C06 / S13 | Android/iOS cross builds, MSVC/Clang/GCC, debug/release/sanitizers; logging ceiling, fuzz/docs switches | R serial behavior/ABI qualification; build-only tooling is not a new evaluator route. Local tests below do not certify all targets; G6 and final #1824 qualification |
 | C07 / S07,S13 | Optimizer selects LFTJ, SIP, K_FUSION, EXCHANGE or materialized JOIN | R serial work follows O05/O09–O12/F05/F06; P redistribution. Refusal today is not permission to omit a default/supported optimizer result from final coverage, G3–G5 |
@@ -149,7 +155,7 @@ amends a row before implementation, rather than silently enlarging the scope.
 | G1 — bounded session admission and snapshot engine work | E02/E03/E10/F10; S11/S12 | Long names, many strata/EDBs/registry slots and large snapshot sources stop at deterministic checkpoints before callbacks; exact/one-short admission boundaries, unchanged output on stop, retry. Preserve #1820 publication cutoff. Merged in PR #2272 for the restricted admitted session domain; fresh/dirty evaluation stays with #1820/G3 |
 | G2 — reusable signed observer composition | E03/E04/F10; S10 plus already controlled ordinary scalar composition | Implemented and qualified in this bundle: repeated signed cycles, typed/wide/nullary/dependent heads, stops/retry, no replay and resource baselines. New child domains/configurations retain G5/G6 ownership; #1820 cutoff and recovery preserved |
 | G3 — general serial recursive/differential execution | E05–E07/O10/O12/F04/F08 | Actual SCC/frontier, trace, retraction and serial fallback interruption; signed reference parity and reset/retry. Integrate #1820 safe state ownership, leave parallel scheduler to #1822 |
-| G4 — host LFTJ and batch/pipeline/fallback integration | E08/E09/O11/F01–F03/F06/C04 | Actual chosen pipeline/LFTJ/decline destination must run and stop; one allowance across suspension/replay, no-output candidates, error distinctions, reference parity; reuse existing producers |
+| G4 — host LFTJ and batch/pipeline/fallback integration | E08/E09/O11/F01–F03/F06/C04 | Ordinary serial JOIN host portion qualified by #2297 acceptance record; LFTJ hosting/cache/fallback and remaining operator-specific intersections stay under #2298 |
 | G5 — scalar/expression/representation closure | O01–O09/F05/F07/C01/C02/C05/C07 | Each required type/expression/materialized/retained/segmented/weighted representation has actual-path limits, cancellation, canonical reference and ownership tests; unsupported external bodies get explicit finite admission/cooperative disposition |
 | G6 — resource/policy/configuration qualification | E11/E13/F09 and C02–C06 | Audit nested setup/cleanup bounds, allocation slack, governor/overflow/output-policy precedence; named native/sanitizer/MSVC/POSIX/configuration evidence and no leaked ownership after stop |
 | G7 — final serial acceptance | All R rows | Close all U and missing required execution evidence; complete quantum/boundary/reference table on final SHA, then close #1821. #1822–#1824 remain separately owned |
@@ -539,7 +545,14 @@ results. These remaining predicates retain their existing issue owners;
 completion of this bundle alone does not close every #2296/#1953 obligation.
 
 
-## Controlled per-batch session consumers (#2297, restricted domain)
+## Historical JOIN host implementation stages
+
+The following sections describe the scope at each prerequisite landing. Their
+then-open #2297 obligations are superseded for ordinary serial JOIN by the
+[current acceptance record](../2297/JOIN_HOST_ACCEPTANCE.md). They do not
+supersede the separately tracked LFTJ, worker or materialized algorithms.
+
+### Controlled per-batch session consumers (#2297, initial restricted domain)
 
 `evaluation_join_hosts` witnesses actual prepared producer generations,
 per-batch FILTER/MAP, transformed sink rows and serialized extent/ACK in the

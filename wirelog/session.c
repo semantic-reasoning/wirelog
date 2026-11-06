@@ -49,6 +49,13 @@ static WL_SESSION_THREAD_LOCAL unsigned char wl_session_thread_cookie;
 #ifdef WL_SESSION_TEST_HOOKS
 static WL_SESSION_THREAD_LOCAL bool wl_session_fail_next_admission_lock;
 static WL_SESSION_THREAD_LOCAL bool wl_session_fail_next_admission_unlock;
+static WL_SESSION_THREAD_LOCAL unsigned wl_session_refuse_source_read_after;
+
+void
+wl_session_testhook_refuse_source_read(unsigned after)
+{
+    wl_session_refuse_source_read_after = after;
+}
 #endif
 /* The public wrapper produces this scope only after actual admission. It
  * contains provenance, never a BANK/context/controller/attempt-ID loan. */
@@ -128,10 +135,24 @@ wl_session_source_admission_read(wl_session_t *session,
     static const wl_evaluation_control_source_phase_policy_t policy = {
         208, 96, 80
     };
+#ifdef WL_SESSION_TEST_HOOKS
+    /* Exercise the actual kernel's invalid-action rejection, not a mock
+     * financial result or Native permission. Consume the fault once. */
+    if (wl_session_refuse_source_read_after
+        && !--wl_session_refuse_source_read_after) action = NULL;
+#endif
     wl_evaluation_control_source_phase_result_t phase =
         wl_session_source_run(session, &policy, action, payload);
-    if (phase.financial_result) return phase.financial_result;
-    return phase.action_called ? phase.action_result : EINVAL;
+    int rc = phase.financial_result ? phase.financial_result
+        : phase.action_called ? phase.action_result : EINVAL;
+    /* Admitted read rejection still owns the public return path. A real
+     * scope error remains a scope error; it never falls back to direct reads. */
+    wl_session_source_scope_t *scope = wl_session_source_scope;
+    if (rc && scope && scope->session == session
+        && scope->admission == session->operation_admission
+        && session->owns_operation_admission)
+        (void)wl_session_source_footer(session);
+    return rc;
 }
 
 wl_evaluation_control_source_phase_result_t
@@ -395,6 +416,24 @@ wl_session_source_gate_state(void *payload)
 {
     wl_session_source_gate_state_t *p = payload;
     p->state = p->session->backend->session_controlled_step_state(p->session);
+    return 0;
+}
+
+int
+wl_session_source_admission_state_read(wl_session_t *session,
+    wl_controlled_step_state_t *state)
+{
+    static const wl_evaluation_control_source_phase_policy_t policy = {
+        208, 160, 80
+    };
+    wl_session_source_gate_state_t read = {session, WL_CONTROLLED_STEP_IDLE};
+    wl_evaluation_control_source_phase_result_t phase =
+        wl_session_source_run(session, &policy, wl_session_source_gate_state,
+            &read);
+    if (phase.financial_result) return phase.financial_result;
+    if (!phase.action_called) return EINVAL;
+    if (phase.action_result) return phase.action_result;
+    *state = read.state;
     return 0;
 }
 
