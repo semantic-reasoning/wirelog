@@ -2312,3 +2312,28 @@ capacity can cause the same bounded cap overshoot as raw batching.
 This local policy does not enable strict batching, worker shared counters or
 additional transaction/source domains. Their admission and ownership contracts
 remain separately qualified.
+
+### Controlled JOIN transaction bindings
+
+Configured non-strict JOIN batches and their FILTER/MAP/FULL-probe consumers
+can run inside the existing ordinary nonrecursive private transaction. The
+child reads the current transaction's exact head images, including a preceding
+private head and a derived FULL anti-probe source. It uses the same semantic
+attempt through producer capacity pauses, internal funding retries and sinks.
+The binding table, generation and head plan remain owned by the transaction
+until the child's terminal cleanup receipt is acknowledged; only then may the
+transaction replace that binding or advance to another head.
+
+This also applies to evaluating SNAPSHOT and configured insert/remove
+successors. The existing final cutoff and completed-Snapshot callback-batch
+contract remain unchanged. Cancellation publishes no partial head or delta
+batch. A work-limit retry can reuse a completed private head while its source
+leases still refuse input mutation; caller reset starts a new semantic attempt
+without reinterpreting internal suspension as a budget reset.
+
+Ordinary append optimization retains its selector/effect semantics. A changed
+right operand uses the controlled ordinary JOIN destination; a changed left
+operand can use the prepared producer with a FULL right source. The existing
+controlled CONCAT combines the increment with the previous head under the
+same authenticated batch context. Strict batching and worker shared counters
+still require their separate admission and policy qualification.

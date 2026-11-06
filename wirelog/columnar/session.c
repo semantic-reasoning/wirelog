@@ -579,14 +579,21 @@ wl_columnar_session_controlled_batch_authorized(
 {
     const wl_columnar_controlled_step_t *step = sess
         ? sess->controlled_step : NULL;
-    return step && (uint64_t)(uintptr_t)step == identity
-           && step->operation_active && step->operation_id == id
-           && step->default_preflight_phase
+    if (!step || (uint64_t)(uintptr_t)step != identity
+        || !step->operation_active || step->operation_id != id
+        || !sess->join_batch_bytes
+        || control != sess->base.evaluation_control
+        || wl_evaluation_control_active_attempt_id(control) != id) return false;
+    const wl_columnar_session_observed_transaction_t *tx = step->transaction;
+    if (step->general_observed && step->transaction_initialized && tx
+        && tx->phase == WL_SESSION_OBSERVED_EVALUATE && tx->child_active
+        && tx->head < tx->head_count && !tx->heads[tx->head].recursive)
+        return wl_columnar_session_observed_bindings_authorized(sess,
+                   &tx->bindings);
+    return step->default_preflight_phase
            == COL_CONTROLLED_DEFAULT_PREFLIGHT_READY
            && step->default_preflight_plan == sess->plan
-           && step->controlled_materialized_batch_fallback
-           && control == sess->base.evaluation_control
-           && wl_evaluation_control_active_attempt_id(control) == id;
+           && step->controlled_materialized_batch_fallback;
 }
 
 #ifdef WL_SESSION_TEST_HOOKS
@@ -8653,7 +8660,9 @@ col_controlled_step_host_action(wl_col_session_t *sess,
         .operation_id = step->operation_id,
         .operation_identity = step->operation_identity,
         .controlled_materialized_batch_fallback =
-            step->controlled_materialized_batch_fallback,
+            step->controlled_materialized_batch_fallback
+            || (ordinary_capture && sess->join_batch_bytes
+            && !step->transaction->heads[step->transaction->head].recursive),
         .private_bindings = ordinary_capture ? &step->transaction->bindings
             : capture_only ? &recursive->body_bindings : NULL,
         .capture_only = capture_only,

@@ -4938,7 +4938,10 @@ wl_columnar_merge_concat_attempt_start_owned(const wl_plan_op_t *op,
         && !session->current_iteration && !session->diff_operators_active
         && !session->retraction_seeded && !session->retraction_right_pass
         && !session->tdd_input_run && !session->tdd_subpass_active
-        && !session->tdd_outbound_only_active && !session->join_batch_bytes
+        && !session->tdd_outbound_only_active
+        && (!session->join_batch_bytes
+        || wl_columnar_eval_plan_numeric_batch_fallback_authorized(owner,
+        frame, session, control, id))
         && !session->join_output_shared_count && !session->coordinator
         && session->num_workers <= 1;
     rc = wl_columnar_merge_concat_tail(control, id, 3, 0);
