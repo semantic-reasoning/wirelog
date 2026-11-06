@@ -2249,7 +2249,8 @@ session_retire_committed_rows(wl_col_session_t *sess, const col_rel_t *r,
         || !wl_columnar_memory_size_mul(cells, sizeof(int64_t), &bytes)
         || bytes > SIZE_MAX)
         return EOVERFLOW;
-    rows = (int64_t *)malloc((size_t)bytes);
+    /* A zero-column relation needs no row storage; never malloc(0). */
+    rows = (int64_t *)malloc(bytes ? (size_t)bytes : sizeof(*rows));
     if (!rows)
         return ENOMEM;
     *prior_out = retired->nrows;
@@ -2302,7 +2303,8 @@ wl_columnar_session_restore_seed(wl_col_session_t *sess, col_rel_t *r)
         || !wl_columnar_memory_size_mul(cells, sizeof(int64_t), &bytes)
         || bytes > SIZE_MAX)
         return EOVERFLOW;
-    rows = (int64_t *)malloc((size_t)bytes);
+    /* A zero-column relation needs no row storage; never malloc(0). */
+    rows = (int64_t *)malloc(bytes ? (size_t)bytes : sizeof(*rows));
     if (!rows)
         return ENOMEM;
     for (uint32_t i = 0; i < seed->nrows; i++)
@@ -6904,10 +6906,11 @@ col_session_remove(wl_session_t *session, const char *relation,
     col_rel_t *r = session_find_rel(sess, relation);
     if (!r)
         return ENOENT;
-    if (r->ncols == 0)
-        return 0; /* uninitialized schema = nothing to remove */
+    /* A relation whose schema nothing has set holds nothing to remove.  An
+     * established zero-column relation holds zero-width rows like any
+     * other, and is removed from at width 0 only (#2231). */
     if (r->ncols != num_cols)
-        return EINVAL;
+        return r->ncols == 0 && !r->schema_ok ? 0 : EINVAL;
 
     wl_columnar_source_access_writer_t writer = { 0 };
     col_rel_t *owner = NULL;
@@ -7093,10 +7096,11 @@ col_session_remove_incremental(wl_session_t *session, const char *relation,
     col_rel_t *r = session_find_rel(sess, relation);
     if (!r)
         return ENOENT;
-    if (r->ncols == 0)
-        return 0; /* uninitialized schema = nothing to remove */
+    /* A relation whose schema nothing has set holds nothing to remove.  An
+     * established zero-column relation holds zero-width rows like any
+     * other, and is removed from at width 0 only (#2231). */
     if (r->ncols != num_cols)
-        return EINVAL;
+        return r->ncols == 0 && !r->schema_ok ? 0 : EINVAL;
 
     wl_columnar_source_access_writer_t writer = { 0 };
     col_rel_t *owner = NULL;
