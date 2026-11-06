@@ -6279,7 +6279,10 @@ tdd_save_coord_idb(const wl_plan_stratum_t *sp, wl_col_session_t *coord,
         return ENOMEM;
     for (uint32_t ri = 0; ri < sp->relation_count; ri++) {
         col_rel_t *r = session_find_rel(coord, sp->relations[ri].name);
-        if (!r || r->ncols == 0)
+        /* An empty zero-width placeholder restores as an empty candidate,
+         * but a zero-column relation that holds rows, such as `flag()`
+         * seeded by a fact or a host insert, must keep them (#2231). */
+        if (!r || (r->ncols == 0 && r->nrows == 0))
             continue;
         rc = tdd_snapshot_relation(r, &saved[ri]);
         if (rc != 0)
