@@ -50,6 +50,160 @@ static WL_SESSION_THREAD_LOCAL unsigned char wl_session_thread_cookie;
 static WL_SESSION_THREAD_LOCAL bool wl_session_fail_next_admission_lock;
 static WL_SESSION_THREAD_LOCAL bool wl_session_fail_next_admission_unlock;
 #endif
+/* The public wrapper produces this scope only after actual admission. It
+ * contains provenance, never a BANK/context/controller/attempt-ID loan. */
+typedef struct wl_session_source_scope {
+    wl_session_t *session;
+    wl_session_admission_t *admission;
+    wl_evaluation_control_source_lane_t lane;
+    struct wl_session_source_scope *previous;
+} wl_session_source_scope_t;
+
+static WL_SESSION_THREAD_LOCAL wl_session_source_scope_t *
+    wl_session_source_scope;
+
+static int
+wl_session_source_finance_birth(void *payload)
+{
+    wl_session_source_finance_t *record = payload;
+    int rc = wl_evaluation_control_create(record->limit, &record->control);
+    if (rc) return rc;
+    rc = wl_evaluation_control_attach(record->control, record);
+    if (rc) {
+        wl_evaluation_control_release(record->control); record->control = NULL;
+        return rc;
+    }
+    record->attached = true;
+    rc = wl_evaluation_control_begin(record->control, record);
+    if (rc) {
+        if (wl_evaluation_control_detach(record->control, record)) abort();
+        wl_evaluation_control_release(record->control);
+        record->control = NULL; record->attached = false;
+        return rc;
+    }
+    record->active = true;
+    record->id = wl_evaluation_control_active_attempt_id(record->control);
+    return record->id ? 0 : EINVAL;
+}
+
+static wl_evaluation_control_source_phase_result_t
+wl_session_source_run(wl_session_t *session,
+    const wl_evaluation_control_source_phase_policy_t *policy,
+    wl_evaluation_control_source_action_fn action, void *payload)
+{
+    wl_session_source_scope_t *scope = wl_session_source_scope;
+    if (!scope || scope->session != session || !session
+        || !session->owns_operation_admission || !session->evaluation_control
+        || scope->admission != session->operation_admission
+        || !scope->admission
+        || (scope->lane != WL_EVALUATION_CONTROL_SOURCE_OPERATION
+        && scope->lane != WL_EVALUATION_CONTROL_SOURCE_CLOSE))
+        return (wl_evaluation_control_source_phase_result_t){EINVAL, 0, false};
+    return wl_evaluation_control_source_bank_run_lexical(
+        scope->admission->source_bank,
+        scope->lane, policy, action, payload);
+}
+
+static int
+wl_session_source_footer_noop(void *payload)
+{
+    (void)payload;
+    return 0;
+}
+
+int
+wl_session_source_footer(wl_session_t *session)
+{
+    static const wl_evaluation_control_source_phase_policy_t policy = {
+        190, 54, 208
+    };
+    return wl_session_source_run(session, &policy,
+               wl_session_source_footer_noop, NULL).financial_result;
+}
+
+wl_evaluation_control_source_phase_result_t
+wl_session_source_snapshot_metadata(wl_session_t *session,
+    wl_evaluation_control_source_action_fn action, void *payload)
+{
+    static const wl_evaluation_control_source_phase_policy_t policy = {
+        208, 144, 80
+    };
+    return wl_session_source_run(session, &policy, action, payload);
+}
+
+int
+wl_session_source_finance_start(wl_session_t *session,
+    wl_session_source_finance_t *record,
+    const wl_evaluation_control_source_phase_policy_t *policy, uint64_t limit)
+{
+    if (!record || record->control || record->id || record->active
+        || record->attached || !limit) return EINVAL;
+    record->limit = limit;
+    wl_evaluation_control_source_phase_result_t result =
+        wl_session_source_run(session, policy, wl_session_source_finance_birth,
+            record);
+    int rc = result.financial_result ? result.financial_result
+        : !result.action_called ? EINVAL : result.action_result;
+    if (rc) {
+        (void)wl_session_source_finance_dispose(record);
+        return rc;
+    }
+    return 0;
+}
+
+int
+wl_session_source_finance_charge(wl_session_source_finance_t *record,
+    uint64_t work)
+{
+    if (!record || !record->active || !record->control || !record->id
+        || !work || work > WL_EVALUATION_CONTROL_QUANTUM) return EINVAL;
+    int rc = wl_evaluation_control_charge_attempt(record->control, record->id,
+            work);
+    if (!rc) record->charged += work;
+    return rc;
+}
+
+int
+wl_session_source_finance_finish(wl_session_source_finance_t *record)
+{
+    if (!record || !record->control || !record->active ||
+        !record->id) return EINVAL;
+    int rc = wl_evaluation_control_finish(record->control, record, 0, 0);
+    wl_evaluation_control_report_t report;
+    if (wl_evaluation_control_active_attempt_id(record->control)
+        || wl_evaluation_control_report(record->control, &report)
+        || report.attempt_id != record->id || report.result != rc
+        || report.consumed != record->charged || report.execution_status
+        || report.cleanup_status) abort();
+    record->active = false; record->id = 0;
+    return rc;
+}
+
+int
+wl_session_source_finance_rebegin(wl_session_source_finance_t *record)
+{
+    if (!record || !record->control || !record->attached || record->active ||
+        record->id)
+        return EINVAL;
+    int rc = wl_evaluation_control_begin(record->control, record);
+    if (rc) return rc;
+    record->id = wl_evaluation_control_active_attempt_id(record->control);
+    record->charged = 0; record->active = true;
+    return record->id ? 0 : EINVAL;
+}
+
+int
+wl_session_source_finance_dispose(wl_session_source_finance_t *record)
+{
+    if (!record || !record->control) return 0;
+    int rc = record->active ? wl_session_source_finance_finish(record) : 0;
+    if (record->attached && wl_evaluation_control_detach(record->control,
+        record)) abort();
+    wl_evaluation_control_release(record->control);
+    record->control = NULL; record->attached = false;
+    return rc;
+}
+
 #undef WL_SESSION_THREAD_LOCAL
 
 static void
@@ -714,8 +868,14 @@ wl_session_destroy_owned(wl_session_t *session,
         ? session->extension_snapshot : NULL;
     control = session->owns_evaluation_control
         ? session->evaluation_control : NULL;
-    if (backend && backend->session_destroy)
+    if (backend && backend->session_destroy) {
+        wl_session_source_scope_t scope = {session, admission,
+                                           WL_EVALUATION_CONTROL_SOURCE_CLOSE,
+                                           wl_session_source_scope};
+        if (control && admission) wl_session_source_scope = &scope;
         backend->session_destroy(session);
+        if (control && admission) wl_session_source_scope = scope.previous;
+    }
     wirelog_extension_snapshot_release(snapshot);
     if (control)
         (void)wl_evaluation_control_detach(control, admission);
@@ -739,7 +899,10 @@ wl_session_try_destroy(wl_session_t **session_slot)
     if (wl_session_admission_lock(admission) != 0)
         return EIO;
     if (admission->closing || admission->active_operations != 0
-        || admission->exclusive_attempt || admission->controlled_step_pending) {
+        || admission->exclusive_attempt || admission->controlled_step_pending
+        || (session->evaluation_control
+        && wl_evaluation_control_active_attempt_id(
+            session->evaluation_control))) {
         wl_session_checked_unlock(admission);
         return EBUSY;
     }
@@ -762,7 +925,10 @@ wl_session_destroy(wl_session_t *session)
         if (wl_session_admission_lock(admission) != 0)
             wl_session_gate_fatal();
         bool parked = admission->exclusive_attempt != NULL
-            || admission->controlled_step_pending;
+            || admission->controlled_step_pending
+            || (session->evaluation_control
+            && wl_evaluation_control_active_attempt_id(
+                session->evaluation_control));
         wl_session_checked_unlock(admission);
         if (parked) {
             fputs("wl_session_destroy: live attempt; use "
@@ -883,8 +1049,15 @@ wl_session_step(wl_session_t *session)
     if (!session->backend || !session->backend->session_step
         || session->input_load_failed)
         rc = -1;
-    else
+    else {
+        wl_session_source_scope_t scope = {session,
+                                           session->operation_admission,
+                                           WL_EVALUATION_CONTROL_SOURCE_OPERATION,
+                                           wl_session_source_scope};
+        if (controlled) wl_session_source_scope = &scope;
         rc = session->backend->session_step(session);
+        if (controlled) wl_session_source_scope = scope.previous;
+    }
     if (controlled) {
         wl_controlled_step_state_t state =
             session->backend
@@ -970,8 +1143,15 @@ wl_session_snapshot(wl_session_t *session, wirelog_on_tuple_fn callback,
         rc = -1;
     else if (controlled && !callback)
         rc = EINVAL;
-    else
+    else {
+        wl_session_source_scope_t scope = {session,
+                                           session->operation_admission,
+                                           WL_EVALUATION_CONTROL_SOURCE_OPERATION,
+                                           wl_session_source_scope};
+        if (controlled) wl_session_source_scope = &scope;
         rc = session->backend->session_snapshot(session, callback, user_data);
+        if (controlled) wl_session_source_scope = scope.previous;
+    }
     if (controlled)
         wl_session_operation_end_step(session,
             session->backend && session->backend->session_controlled_step_state

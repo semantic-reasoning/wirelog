@@ -1664,6 +1664,51 @@ wl_columnar_join_host_consumer(wl_columnar_join_host_t *h, unsigned action)
     return 0;
 }
 
+/* A native-error consumer uses the actual stream dispatch and closes it on
+ * every path. Financial proof cuts neither select nor authorize a native op. */
+static int
+wl_columnar_join_host_consumer_cleanup(wl_columnar_join_host_t *h,
+    wl_evaluation_control_t *funding, uint64_t id)
+{
+    wl_columnar_eval_plan_numeric_attempt_t *r = h->parent;
+    wl_columnar_eval_serial_framed_attempt_t *parent = NULL;
+    int rc = wl_columnar_eval_stack_framed_context(r->frame, r->session,
+            &parent);
+    if (rc) return rc;
+    rc = wl_evaluation_control_charge_attempt(funding, id, 0);
+    if (rc) return rc;
+    unsigned action = h->consumer_status.progress ==
+        WL_COLUMNAR_FILTER_PROGRESS_DONE
+        ? WL_COLUMNAR_JOIN_STREAM_ACK : WL_COLUMNAR_JOIN_STREAM_STEP;
+    if (!parent->native_cleanup) return wl_columnar_join_host_consumer(h,
+                   action);
+    const wl_plan_op_t *op = &r->plan->ops[h->consumer_cursor];
+    rc = wl_columnar_eval_stack_stream_dispatch_owned(r->frame, r, h, op,
+            action, true);
+    if (rc) return rc;
+    WL_COLUMNAR_JOIN_HOST_HOOK(h, WL_COLUMNAR_JOIN_PIPELINE_TEST_CONSUMER);
+    rc = wl_columnar_filter_op_native_cleanup_latch_owned(r->frame, r, funding,
+            id, NULL);
+    if (!rc) rc = wl_evaluation_control_charge_attempt(funding, id, 0);
+    if (!rc) rc = action == WL_COLUMNAR_JOIN_STREAM_STEP
+        ? wl_columnar_filter_op_attempt_step_owned(r->frame,
+                &h->consumer_status, r)
+        : wl_columnar_filter_op_attempt_ack_owned(r->frame, r);
+    int paid = wl_evaluation_control_charge_attempt(funding, id, 0);
+    if (!rc) rc = paid;
+    bool done = false;
+    int state = wl_columnar_eval_stack_stream_consumer_state_owned(r->frame,
+            r, h, &h->consumer_live, &done);
+    int closed = wl_columnar_eval_stack_stream_dispatch_owned(r->frame, r, h,
+            op, action, false);
+    if (state || closed) return state ? state : closed;
+    h->consumer_protocol = rc; h->consumer_pending = true;
+    if (!rc && action == WL_COLUMNAR_JOIN_STREAM_ACK &&
+        h->consumer_live) return EBUSY;
+    /* h->phase remains ABORT; no next consumer/producer or sink commit. */
+    return rc;
+}
+
 static int
 wl_columnar_join_host_strict_successor(wl_columnar_join_host_t *h)
 {
@@ -2613,12 +2658,8 @@ wl_columnar_join_host_cleanup(wl_columnar_join_host_t *h,
         return rc;
     }
     if (h->exchange_active) {
-        if (h->consumer_live) {
-            unsigned action = h->consumer_status.progress
-                == WL_COLUMNAR_FILTER_PROGRESS_DONE
-                ? WL_COLUMNAR_JOIN_STREAM_ACK : WL_COLUMNAR_JOIN_STREAM_STEP;
-            return wl_columnar_join_host_consumer(h, action);
-        }
+        if (h->consumer_live)
+            return wl_columnar_join_host_consumer_cleanup(h, funding, id);
         rc = wl_evaluation_control_charge_attempt(funding, id, 128);
         if (rc) return rc;
         rc = wl_columnar_eval_stack_stream_restore_owned(r->frame, r, h,

@@ -33,6 +33,14 @@ extern "C" {
 
 typedef struct wl_session_admission wl_session_admission_t;
 
+/* Lexical SOURCE financial record. Zero-init at its final address, never copy,
+* retain in a session/frame/receipt, or use as a BODY funding/native permit. */
+typedef struct {
+    wl_evaluation_control_t *control;
+    uint64_t id, limit, charged;
+    bool attached, active;
+} wl_session_source_finance_t;
+
 /* Internal persistent exclusion lease used by controlled attempts. Zero-init
  * before first acquire and retain at the same address through release. */
 typedef struct wl_session_exclusive_attempt {
@@ -102,6 +110,19 @@ int wl_session_exclusive_attempt_release(
  * back the wirelog_easy_* facade and are exercised by in-tree tests; they
  * are not promised to external consumers and may change without notice.
  */
+
+int wl_session_source_finance_start(wl_session_t *,
+    wl_session_source_finance_t *,
+    const wl_evaluation_control_source_phase_policy_t *, uint64_t);
+int wl_session_source_finance_charge(wl_session_source_finance_t *, uint64_t);
+int wl_session_source_finance_finish(wl_session_source_finance_t *);
+int wl_session_source_finance_rebegin(wl_session_source_finance_t *);
+int wl_session_source_finance_dispose(wl_session_source_finance_t *);
+int wl_session_source_footer(wl_session_t *);
+/* Synchronous SOURCE bookkeeping only; no native or user callback work. */
+wl_evaluation_control_source_phase_result_t
+    wl_session_source_snapshot_metadata(wl_session_t *,
+    wl_evaluation_control_source_action_fn, void *);
 
 /**
  * wl_session_create:

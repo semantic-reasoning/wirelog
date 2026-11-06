@@ -41,21 +41,6 @@
  */
 #include "../wirelog/columnar/internal.h"
 
-#ifdef WL_SESSION_TEST_HOOKS
-/* This standalone backend target has no generic session implementation. */
-void
-wl_session_testhook_before_workqueue_drain(wl_session_t *session)
-{
-    (void)session;
-}
-
-void
-wl_session_testhook_after_worker_lease_release(wl_session_t *session)
-{
-    (void)session;
-}
-#endif
-
 /*
  * Forward declaration of the function under test.
  * RED phase: does not exist -> link error (expected).

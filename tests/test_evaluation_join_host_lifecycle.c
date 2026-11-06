@@ -7,6 +7,7 @@
 #include "../wirelog/exec_plan_gen.h"
 #include "../wirelog/session.h"
 #include "../wirelog/session_options.h"
+#include "../wirelog/thread.h"
 #include "../wirelog/wirelog.h"
 #include <errno.h>
 #include <stdio.h>
@@ -33,6 +34,7 @@ static bool stopped, work_stop, strict_mode;
 static wl_evaluation_control_t *snapshot_control;
 static bool snapshot_cancelled, inject_funding, funding_pending, funding_used;
 static unsigned funding_refusals;
+static int snapshot_identity_exhaustion = -1;
 static unsigned append_reads, append_joins, append_variables;
 extern void (*wl_columnar_session_test_observed_transaction_checkpoint)(
     wl_evaluation_control_t *, unsigned, uint32_t,
@@ -569,6 +571,549 @@ appends(void)
     destroy(&f);
 }
 
+static fixture_t *native_fixture;
+static unsigned native_event, native_forward_after, native_produced,
+    native_acked;
+static bool native_pending, native_ended, native_successor, native_at_limit;
+static bool native_late, native_refuse, native_refused;
+static bool native_metadata_denial, native_metadata_refused,
+    native_foreign_call;
+static unsigned native_metadata_reports;
+static uint64_t native_successor_id;
+static wl_evaluation_control_report_t native_report;
+extern int wl_columnar_eval_stack_test_fail_allocation;
+
+typedef struct {
+    wl_session_t *session;
+    int result;
+} native_foreign_call_t;
+
+static void *
+native_foreign_step(void *data)
+{
+    native_foreign_call_t *call = data;
+    call->result = wl_session_step(call->session);
+    return NULL;
+}
+
+static void
+native_report_same(const wl_evaluation_control_report_t *a,
+    const wl_evaluation_control_report_t *b)
+{
+    CHECK(a->attempt_id == b->attempt_id && a->limit == b->limit
+        && a->consumed == b->consumed && a->stop_reason == b->stop_reason
+        && a->execution_status == b->execution_status
+        && a->cleanup_status == b->cleanup_status && a->result == b->result);
+}
+
+static void
+native_end_original(void)
+{
+    if (!native_pending || native_ended) return;
+    wl_session_t *session = native_fixture->sessions[0];
+    wl_evaluation_control_t *control = native_fixture->control;
+    uint64_t id = wl_evaluation_control_active_attempt_id(control);
+    CHECK(id && id == attempt);
+    wl_evaluation_control_attempt_finish_result_t ended =
+        wl_evaluation_control_finish_attempt(control,
+            session->operation_admission, id, 0, 0);
+    CHECK(!ended.protocol && ended.report_valid
+        && ended.kind == WL_EVALUATION_CONTROL_ATTEMPT_FINISH_OWN_FINISHED
+        && !ended.report.result && ended.report.consumed);
+    native_report = ended.report;
+    native_ended = true; native_produced = produced; native_acked = acked;
+    if (native_successor) {
+        CHECK(!wl_evaluation_control_reset(control));
+        wl_evaluation_control_attempt_begin_result_t next =
+            wl_evaluation_control_begin_attempt(control,
+                session->operation_admission);
+        CHECK(!next.protocol && next.attempt_id != id);
+        native_successor_id = next.attempt_id;
+    }
+}
+
+static void
+native_end_checkpoint(wl_evaluation_control_t *control, unsigned event,
+    uint64_t gen, uint32_t extent, uint64_t work)
+{
+    if (native_ended) {
+        if (event == WL_COLUMNAR_JOIN_PIPELINE_TEST_PRODUCE
+            || event == WL_COLUMNAR_JOIN_PIPELINE_TEST_AFTER_ACK
+            || event == WL_COLUMNAR_JOIN_PIPELINE_TEST_PREPARED)
+            ++native_forward_after;
+        return;
+    }
+    checkpoint(control, event, gen, extent, work);
+    if (event == native_event) native_pending = true;
+}
+
+static void
+native_grant_finished(const wl_col_session_t *session,
+    wl_columnar_eval_serial_framed_host_action_t action,
+    wl_evaluation_control_t *grant, int protocol)
+{
+    (void)session; (void)action; (void)grant; (void)protocol;
+    if (!native_at_limit && (!native_late || !session->cleanup_active))
+        native_end_original();
+}
+
+static uint64_t
+native_grant_limit(const wl_col_session_t *session,
+    wl_columnar_eval_serial_framed_host_action_t action, uint64_t proposed)
+{
+    (void)session; (void)action;
+    if (native_at_limit) native_end_original();
+    if (native_refuse && native_ended && !native_refused
+        && action == WL_COLUMNAR_EVAL_SERIAL_FRAMED_NATIVE_CLEANUP) {
+        native_refused = true;
+        return WL_COLUMNAR_EVAL_SERIAL_FRAMED_HOST_WORK - 1;
+    }
+    return proposed;
+}
+
+static uint64_t
+native_metadata_limit(const wl_col_session_t *session,
+    wl_columnar_session_metadata_purpose_t purpose, uint64_t proposed)
+{
+    (void)session;
+    if (purpose == WL_COLUMNAR_SESSION_METADATA_JOIN_CLEANUP
+        && native_ended && !native_foreign_call && !native_metadata_refused) {
+        native_metadata_refused = true;
+        return 315; /* ENTRY140+GUARD80 succeeds; ROOT96 is one short. */
+    }
+    return proposed;
+}
+
+static void
+native_metadata_report(const wl_col_session_t *session,
+    wl_columnar_session_metadata_purpose_t purpose,
+    wl_columnar_session_metadata_event_t event, int protocol,
+    wl_evaluation_control_report_t report)
+{
+    (void)session;
+    if (purpose != WL_COLUMNAR_SESSION_METADATA_JOIN_CLEANUP) return;
+    CHECK(report.attempt_id && !report.execution_status &&
+        !report.cleanup_status);
+    if (report.limit == 315) {
+        if (event != WL_COLUMNAR_SESSION_METADATA_JOIN_UNUSED_CLOSED
+            || protocol != WL_EVALUATION_CONTROL_WORK_LIMIT
+            || report.result != WL_EVALUATION_CONTROL_WORK_LIMIT
+            || report.consumed != 220)
+            fprintf(stderr,
+                "metadata refusal event=%u protocol=%d result=%d stop=%d consumed=%llu id=%llu\n",
+                event, protocol, report.result, report.stop_reason,
+                (unsigned long long)report.consumed,
+                (unsigned long long)report.attempt_id);
+        CHECK(event == WL_COLUMNAR_SESSION_METADATA_JOIN_UNUSED_CLOSED
+            && protocol == WL_EVALUATION_CONTROL_WORK_LIMIT
+            && report.result == WL_EVALUATION_CONTROL_WORK_LIMIT
+            && report.stop_reason == WL_EVALUATION_CONTROL_WORK_LIMIT
+            && report.consumed == 220);
+        ++native_metadata_reports;
+        wl_evaluation_control_report_t frozen;
+        CHECK(!wl_evaluation_control_report(native_fixture->control, &frozen));
+        native_report_same(&native_report, &frozen);
+    } else CHECK(!report.result && !report.stop_reason && report.consumed);
+}
+
+static void
+native_end_history(bool observed, bool evaluating_snapshot, unsigned event,
+    bool successor, bool at_limit, bool late, bool refuse)
+{
+    fixture_t f; init(&f, observed);
+    native_fixture = &f; native_event = event;
+    native_pending = native_ended = false; native_forward_after = 0;
+    native_successor = successor; native_successor_id = 0;
+    native_at_limit = at_limit;
+    native_late = late; native_refuse = refuse; native_refused = false;
+    native_metadata_refused = false; native_metadata_reports = 0;
+    stop_event = 0;
+    trace();
+    wl_columnar_join_pipeline_test_numeric_checkpoint = native_end_checkpoint;
+    wl_columnar_session_test_framed_grant_finished = native_grant_finished;
+    wl_columnar_session_test_framed_grant_limit = native_grant_limit;
+    if (native_metadata_denial) {
+        wl_columnar_session_test_metadata_limit = native_metadata_limit;
+        wl_columnar_session_test_metadata_finished = native_metadata_report;
+    }
+    capture_t rows = {0};
+    int rc;
+    if (evaluating_snapshot) rc = wl_session_snapshot(f.sessions[0], snapshot,
+                &rows);
+    else {
+        for (unsigned i = 0;; ++i) {
+            CHECK(i < 1000000);
+            rc = wl_session_step(f.sessions[0]);
+            if (native_ended || rc != EAGAIN) break;
+        }
+        CHECK(native_ended && rc == EAGAIN);
+        wl_col_session_t *col = (wl_col_session_t *)f.sessions[0];
+        wl_columnar_eval_stack_cleanup_frame_t *frame = col->cleanup_active;
+        unsigned phase = wl_columnar_session_test_native_error_phase(col);
+        unsigned produced_before = produced, acked_before = acked;
+        native_foreign_call_t foreign = {f.sessions[0], 0};
+        wl_thread_t thread;
+        native_foreign_call = true;
+        CHECK(!wl_thread_create(&thread, native_foreign_step, &foreign));
+        CHECK(!wl_thread_join(&thread));
+        native_foreign_call = false;
+        CHECK(foreign.result == EBUSY && col->cleanup_active == frame
+            && wl_columnar_session_test_native_error_phase(col) == phase
+            && produced == produced_before && acked == acked_before);
+        wl_evaluation_control_report_t frozen;
+        CHECK(!wl_evaluation_control_report(f.control, &frozen));
+        native_report_same(&native_report, &frozen);
+        rc = finish(f.sessions[0]);
+    }
+    if (rc != EINVAL) fprintf(stderr,
+            "native-end observed=%u snapshot=%u event=%u successor=%u limit=%u rc=%d phase=%u\n",
+            observed, evaluating_snapshot, event, successor, at_limit, rc,
+            wl_columnar_session_test_native_error_phase(
+                (wl_col_session_t *)f.sessions[0]));
+    CHECK(native_ended && rc == EINVAL);
+    CHECK(!refuse || native_refused);
+    CHECK(!native_metadata_denial || (native_metadata_refused
+        && native_metadata_reports == 1));
+    if (wl_columnar_session_test_native_error_phase(
+            (wl_col_session_t *)f.sessions[0])
+        != WL_COLUMNAR_SESSION_NATIVE_ERROR_DONE)
+        fprintf(stderr,
+            "native cleanup returned before DONE observed=%u snapshot=%u event=%u phase=%u\n",
+            observed, evaluating_snapshot, event,
+            wl_columnar_session_test_native_error_phase(
+                (wl_col_session_t *)f.sessions[0]));
+    CHECK(wl_columnar_session_test_native_error_phase(
+            (wl_col_session_t *)f.sessions[0])
+        == WL_COLUMNAR_SESSION_NATIVE_ERROR_DONE);
+    CHECK(!native_forward_after && produced == native_produced &&
+        acked == native_acked);
+    wl_columnar_session_test_framed_grant_finished = NULL;
+    wl_columnar_session_test_framed_grant_limit = NULL;
+    wl_columnar_session_test_metadata_limit = NULL;
+    wl_columnar_session_test_metadata_finished = NULL;
+    wl_columnar_join_pipeline_test_numeric_checkpoint = NULL;
+    wl_evaluation_control_report_t report;
+    CHECK(!wl_evaluation_control_report(f.control, &report));
+    native_report_same(&native_report, &report);
+    if (successor) {
+        uint64_t used = UINT64_MAX;
+        wl_session_t *saved = f.sessions[0];
+        CHECK(wl_session_try_destroy(&f.sessions[0]) == EBUSY
+            && f.sessions[0] == saved);
+        CHECK(wl_evaluation_control_active_attempt_id(f.control) ==
+            native_successor_id);
+        CHECK(!wl_evaluation_control_test_active_consumed(f.control,
+            native_successor_id, &used)
+            && !used);
+        CHECK(!wl_evaluation_control_report(f.control, &report));
+        native_report_same(&native_report, &report);
+        wl_evaluation_control_attempt_finish_result_t ended =
+            wl_evaluation_control_finish_attempt(f.control,
+                f.sessions[0]->operation_admission,
+                native_successor_id, 0, 0);
+        CHECK(!ended.protocol && ended.report_valid && !ended.report.result
+            && !ended.report.consumed && !ended.report.stop_reason);
+    }
+    wl_col_session_t *col = (wl_col_session_t *)f.sessions[0];
+    CHECK(!col->cleanup_active && !col->cleanup_pending &&
+        !col->cleanup_reserved_bytes);
+    const col_rel_t *mid = session_find_rel(col, "mid");
+    const col_rel_t *output = session_find_rel(col, "output");
+    if (late && !observed && !evaluating_snapshot) {
+        CHECK(mid && mid->ncols == 2 && mid->nrows == 28);
+        capture_t prefix = {0};
+        for (uint32_t r = 0; r < mid->nrows; ++r) {
+            int64_t row[] = {col_rel_get(mid, r, 0), col_rel_get(mid, r, 1)};
+            capture("mid", row, 2, 1, &prefix);
+        }
+        for (unsigned x = 0; x < 9; ++x)
+            for (unsigned y = 0; y < 9; ++y)
+                CHECK(prefix.rows[0][x][y] == (int)member(&f.state, 0, x, y));
+        CHECK(!output || !output->nrows);
+    } else CHECK((!mid || !mid->nrows) && (!output || !output->nrows));
+    state_t empty = {0};
+    expect_events(&f.events[0], &empty, &empty);
+    expect_events(&rows, &empty, &empty);
+    CHECK(!wl_evaluation_control_reset(f.control));
+    trace();
+    capture_t retry_rows = {0};
+    int retry_rc = evaluating_snapshot
+        ? wl_session_snapshot(f.sessions[0], snapshot, &retry_rows)
+        : finish(f.sessions[0]);
+    if (retry_rc) fprintf(stderr,
+            "native retry observed=%u snapshot=%u event=%u rc=%d phase=%u prepared=%u\n",
+            observed, evaluating_snapshot, event, retry_rc,
+            wl_columnar_session_test_native_error_phase(col), prepared);
+    CHECK(!retry_rc);
+    if (evaluating_snapshot) expect_events(&retry_rows, &empty, &f.state);
+    unsigned expected_prepared = late && !observed &&
+        !evaluating_snapshot ? 1 : 2;
+    CHECK(prepared == expected_prepared && produced > 2 && acked > 2 &&
+        exchanges > 1 && probes);
+    verify(f.sessions[0], &f.state);
+    CHECK(!finish(f.sessions[1])); verify(f.sessions[1], &f.state);
+    if (observed) expect_events(&f.events[0], &empty, &f.state);
+    destroy(&f); native_fixture = NULL;
+}
+
+static void
+native_end(void)
+{
+    const unsigned events[] = {WL_COLUMNAR_JOIN_PIPELINE_TEST_PREPARED,
+                               WL_COLUMNAR_JOIN_PIPELINE_TEST_PRODUCE,
+                               WL_COLUMNAR_JOIN_PIPELINE_TEST_EXCHANGED,
+                               WL_COLUMNAR_JOIN_PIPELINE_TEST_CONSUMER,
+                               WL_COLUMNAR_JOIN_PIPELINE_TEST_AFTER_ACK};
+    for (unsigned observed = 0; observed < 2; ++observed)
+        for (size_t e = 0; e < sizeof(events)/sizeof(events[0]); ++e)
+            native_end_history(observed, false, events[e], e % 2, e % 2, false,
+                false);
+    native_end_history(false, true, WL_COLUMNAR_JOIN_PIPELINE_TEST_CONSUMER,
+        false, false, false, false);
+    native_end_history(false, true, WL_COLUMNAR_JOIN_PIPELINE_TEST_AFTER_ACK,
+        true, true, false, false);
+    for (unsigned successor = 0; successor < 2; ++successor) {
+        native_end_history(false, false,
+            WL_COLUMNAR_JOIN_PIPELINE_TEST_PREPARED,
+            successor, false, true, false);
+        native_end_history(true, false, WL_COLUMNAR_JOIN_PIPELINE_TEST_PREPARED,
+            successor, false, true, false);
+        native_end_history(false, true, WL_COLUMNAR_JOIN_PIPELINE_TEST_PREPARED,
+            successor, false, true, false);
+    }
+    native_end_history(true, false, WL_COLUMNAR_JOIN_PIPELINE_TEST_CONSUMER,
+        true, false, false, true);
+    strict_mode = true;
+    native_end_history(false, false, WL_COLUMNAR_JOIN_PIPELINE_TEST_CONSUMER,
+        true, false, false, false);
+    native_end_history(true, false, WL_COLUMNAR_JOIN_PIPELINE_TEST_AFTER_ACK,
+        false, false, false, true);
+    native_end_history(false, true, WL_COLUMNAR_JOIN_PIPELINE_TEST_PREPARED,
+        true, false, true, false);
+    strict_mode = false;
+    native_metadata_denial = true;
+    native_end_history(false, false, WL_COLUMNAR_JOIN_PIPELINE_TEST_CONSUMER,
+        false, false, false, false);
+    native_end_history(true, false, WL_COLUMNAR_JOIN_PIPELINE_TEST_CONSUMER,
+        true, false, false, false);
+    native_metadata_denial = false;
+    configure("WIRELOG_JOIN_BATCH_STRICT", NULL);
+}
+
+static void
+native_bootstrap_finished(const wl_col_session_t *session,
+    wl_columnar_eval_serial_framed_host_action_t action,
+    wl_evaluation_control_t *grant, int protocol)
+{
+    if (native_ended || action != WL_COLUMNAR_EVAL_SERIAL_FRAMED_ADVANCE
+        || protocol != ENOMEM) return;
+    CHECK(!session->cleanup_active && !session->cleanup_pending);
+    wl_evaluation_control_report_t report;
+    CHECK(!wl_evaluation_control_report(grant, &report)
+        && report.consumed && !report.result);
+    attempt = wl_evaluation_control_active_attempt_id(native_fixture->control);
+    native_pending = true;
+    native_end_original();
+}
+
+static void
+native_bootstrap_end(void)
+{
+    for (unsigned mode = 0; mode < 3; ++mode)
+        for (unsigned successor = 0; successor < 2; ++successor) {
+            fixture_t f; init(&f, mode == 1); trace();
+            native_fixture = &f; native_pending = native_ended = false;
+            native_successor = successor; native_successor_id = 0;
+            wl_columnar_eval_stack_test_fail_allocation = 0;
+            wl_columnar_session_test_framed_grant_finished =
+                native_bootstrap_finished;
+            capture_t rows = {0};
+            int rc = mode == 2 ? wl_session_snapshot(f.sessions[0], snapshot,
+                    &rows)
+            : finish(f.sessions[0]);
+            wl_columnar_eval_stack_test_fail_allocation = -1;
+            wl_columnar_session_test_framed_grant_finished = NULL;
+            if (!native_ended || rc != ENOMEM) fprintf(stderr,
+                    "bootstrap-end mode=%u successor=%u ended=%u rc=%d\n",
+                    mode, successor, native_ended, rc);
+            CHECK(native_ended && rc == ENOMEM);
+            wl_evaluation_control_report_t report;
+            CHECK(!wl_evaluation_control_report(f.control, &report));
+            native_report_same(&native_report, &report);
+            wl_col_session_t *col = (wl_col_session_t *)f.sessions[0];
+            CHECK(!col->cleanup_active && !col->cleanup_pending
+                && !col->cleanup_reserved_bytes);
+            if (successor) {
+                uint64_t used = UINT64_MAX;
+                CHECK(!wl_evaluation_control_test_active_consumed(f.control,
+                    native_successor_id, &used) && !used);
+                wl_evaluation_control_attempt_finish_result_t end =
+                    wl_evaluation_control_finish_attempt(f.control,
+                        f.sessions[0]->operation_admission, native_successor_id,
+                        0, 0);
+                CHECK(!end.protocol && end.report_valid && !end.report.result
+                    && !end.report.consumed);
+            }
+            CHECK(!wl_evaluation_control_reset(f.control));
+            trace();
+            int retry = mode == 2
+            ? wl_session_snapshot(f.sessions[0], snapshot, &rows)
+            : finish(f.sessions[0]);
+            CHECK(!retry); verify(f.sessions[0], &f.state);
+            if (mode == 2) {
+                state_t empty = {0};
+                expect_events(&rows, &empty, &f.state);
+            }
+            destroy(&f); native_fixture = NULL;
+        }
+}
+
+typedef struct {
+    wl_session_t *session;
+    wl_evaluation_control_t *control;
+    bool successor;
+    unsigned calls, seen[17][17];
+    uint64_t next_id;
+    wl_evaluation_control_report_t report;
+} native_snapshot_capture_t;
+
+static void
+native_snapshot_end_callback(const char *name, const int64_t *row,
+    uint32_t width,
+    void *userdata)
+{
+    native_snapshot_capture_t *out = userdata;
+    CHECK(!strcmp(name, "output") && width == 2);
+    CHECK(row[0] >= 0 && row[0] < 17 && row[1] >= 0 && row[1] < 17);
+    CHECK(!out->seen[row[0]][row[1]]++);
+    if (++out->calls != 1) return;
+    uint64_t id = wl_evaluation_control_active_attempt_id(out->control);
+    wl_evaluation_control_attempt_finish_result_t ended =
+        wl_evaluation_control_finish_attempt(out->control,
+            out->session->operation_admission, id, 0, 0);
+    CHECK(!ended.protocol && ended.report_valid && !ended.report.result
+        && ended.report.consumed);
+    out->report = ended.report;
+    if (out->successor) {
+        CHECK(!wl_evaluation_control_reset(out->control));
+        wl_evaluation_control_attempt_begin_result_t begin =
+            wl_evaluation_control_begin_attempt(out->control,
+                out->session->operation_admission);
+        CHECK(!begin.protocol && begin.attempt_id != id);
+        out->next_id = begin.attempt_id;
+    }
+    if (snapshot_identity_exhaustion >= 0) {
+        /* Accelerate only the process counter, then really create/release
+         * the final controller after the outer Snapshot financier exists. */
+        CHECK(!wl_evaluation_control_test_seed_next_identity(UINT64_MAX - 1));
+        wl_evaluation_control_t *last = NULL;
+        CHECK(!wl_evaluation_control_create(0, &last) && last);
+        wl_evaluation_control_release(last);
+    }
+}
+
+static void
+native_snapshot_end(void)
+{
+    for (unsigned completed = 0; completed < 2; ++completed)
+        for (unsigned successor = 0; successor < 2; ++successor) {
+            if (snapshot_identity_exhaustion >= 0
+                && (unsigned)snapshot_identity_exhaustion !=
+                completed * 2 + successor) continue;
+            const char *source =
+                ".decl a(k:int64,x:int64)\n.decl b(k:int64,y:int64)\n"
+                ".decl output(x:int64,y:int64)\noutput(x,y):-a(k,x),b(k,y).\n";
+            wirelog_error_t error;
+            wirelog_program_t *program = wirelog_parse_string(source, &error);
+            wl_plan_t *plan = NULL;
+            CHECK(program && !wl_plan_from_program(program, &plan));
+            native_snapshot_capture_t out = {0};
+            out.successor = successor;
+            CHECK(!wl_evaluation_control_create(0, &out.control));
+            wl_session_options_t options;
+            wl_session_options_init(&options);
+            options.evaluation_control = out.control;
+            configure("WIRELOG_JOIN_BATCH_BYTES", "64");
+            configure("WIRELOG_JOIN_BATCH_STRICT", NULL);
+            configure("WIRELOG_JOIN_OUTPUT_LIMIT", "0");
+            CHECK(!wl_session_create_with_options(wl_backend_columnar(), plan,
+                1,
+                &options, &out.session));
+            configure("WIRELOG_JOIN_BATCH_BYTES", NULL);
+            configure("WIRELOG_JOIN_OUTPUT_LIMIT", NULL);
+            int64_t input[34];
+            for (unsigned i = 0; i < 17; ++i) {
+                input[2*i] = 1; input[2*i+1] = i;
+            }
+            CHECK(!wl_session_insert(out.session, "a", input, 17, 2));
+            CHECK(!wl_session_insert(out.session, "b", input, 17, 2));
+            stop_event = 0; trace();
+            if (completed) CHECK(!finish(out.session));
+            int snapshot_rc = wl_session_snapshot(out.session,
+                    native_snapshot_end_callback, &out);
+            if (snapshot_rc) fprintf(stderr,
+                    "postcutoff snapshot completed=%u successor=%u rc=%d calls=%u phase=%u\n",
+                    completed, successor, snapshot_rc, out.calls,
+                    wl_columnar_session_test_native_error_phase(
+                        (wl_col_session_t *)out.session));
+            CHECK(!snapshot_rc);
+            wl_columnar_join_pipeline_test_numeric_checkpoint = NULL;
+            CHECK(prepared == 1 && produced > 2 && acked > 2 &&
+                out.calls == 289);
+            for (unsigned x = 0; x < 17; ++x)
+                for (unsigned y = 0; y < 17; ++y) CHECK(out.seen[x][y] == 1);
+            wl_evaluation_control_report_t report;
+            CHECK(!wl_evaluation_control_report(out.control, &report));
+            native_report_same(&out.report, &report);
+            if (successor) {
+                uint64_t used = UINT64_MAX;
+                CHECK(wl_evaluation_control_active_attempt_id(out.control) ==
+                    out.next_id);
+                CHECK(!wl_evaluation_control_test_active_consumed(out.control,
+                    out.next_id, &used)
+                    && !used);
+                wl_evaluation_control_attempt_finish_result_t ended =
+                    wl_evaluation_control_finish_attempt(out.control,
+                        out.session->operation_admission, out.next_id, 0, 0);
+                CHECK(!ended.protocol && ended.report_valid &&
+                    !ended.report.result
+                    && !ended.report.consumed && !ended.report.stop_reason);
+            }
+            CHECK(!((wl_col_session_t *)out.session)->cleanup_active
+                && !((wl_col_session_t *)out.session)->cleanup_pending);
+            CHECK(!wl_session_try_destroy(&out.session));
+            wl_evaluation_control_release(out.control);
+            wl_plan_free(plan); wirelog_program_free(program);
+        }
+}
+
+/* Isolated process: exhausts global identities permanently after real fixture birth. */
+static void
+snapshot_finance_birth(void)
+{
+    fixture_t f; init(&f, true);
+    state_t empty = {0};
+    wl_evaluation_control_report_t report;
+    CHECK(wl_evaluation_control_report(f.control, &report) == ENOENT);
+    CHECK(!wl_evaluation_control_test_seed_next_identity(UINT64_MAX));
+    trace();
+    capture_t rows = {0};
+    CHECK(wl_session_snapshot(f.sessions[0], snapshot, &rows) == EOVERFLOW);
+    CHECK(!prepared && !produced && !acked && !attempt);
+    CHECK(!wl_evaluation_control_active_attempt_id(f.control));
+    CHECK(wl_evaluation_control_report(f.control, &report) == ENOENT);
+    expect_events(&rows, &empty, &empty);
+    expect_events(&f.events[0], &empty, &empty);
+    for (unsigned h = 0; h < 2; ++h) {
+        const col_rel_t *rel = session_find_rel(
+            (wl_col_session_t *)f.sessions[0], h ? "output" : "mid");
+        CHECK(!rel || !rel->nrows);
+    }
+    CHECK(!((wl_col_session_t *)f.sessions[0])->cleanup_active
+        && !((wl_col_session_t *)f.sessions[0])->cleanup_pending);
+    destroy(&f);
+}
+
 int
 main(int argc, char **argv)
 {
@@ -610,6 +1155,19 @@ main(int argc, char **argv)
     else if (!strcmp(argv[1], "funding")) funding();
     else if (!strcmp(argv[1], "snapshot-recovery")) snapshot_recovery();
     else if (!strcmp(argv[1], "appends")) appends();
-    else CHECK(false);
+    else if (!strcmp(argv[1], "native-end")) native_end();
+    else if (!strcmp(argv[1], "bootstrap-end")) native_bootstrap_end();
+    else if (!strcmp(argv[1], "snapshot-end")) native_snapshot_end();
+    else if (!strcmp(argv[1],
+        "snapshot-finance-birth")) snapshot_finance_birth();
+    else if (!strcmp(argv[1], "snapshot-exhaust-evaluating-end")) {
+        snapshot_identity_exhaustion = 0; native_snapshot_end();
+    } else if (!strcmp(argv[1], "snapshot-exhaust-evaluating-successor")) {
+        snapshot_identity_exhaustion = 1; native_snapshot_end();
+    } else if (!strcmp(argv[1], "snapshot-exhaust-completed-end")) {
+        snapshot_identity_exhaustion = 2; native_snapshot_end();
+    } else if (!strcmp(argv[1], "snapshot-exhaust-completed-successor")) {
+        snapshot_identity_exhaustion = 3; native_snapshot_end();
+    }else CHECK(false);
     return 0;
 }

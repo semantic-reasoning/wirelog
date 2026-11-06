@@ -2883,7 +2883,8 @@ test('sub_ms_graph_correctness', test_sub_ms_graph_perf_gate_exe,
 
 test_consolidate_incremental_delta_exe = executable(
   'test_consolidate_incremental_delta',
-  files('test_consolidate_incremental_delta.c', '../wirelog/evaluation_control.c'),
+  files('test_consolidate_incremental_delta.c', '../wirelog/evaluation_control.c',
+        '../wirelog/session.c'),
   backend_src,
   intern_src,
   arena_src,
@@ -2952,7 +2953,8 @@ endforeach
 
 test_consolidate_kway_merge_exe = executable(
   'test_consolidate_kway_merge',
-  files('test_consolidate_kway_merge.c', '../wirelog/evaluation_control.c'),
+  files('test_consolidate_kway_merge.c', '../wirelog/evaluation_control.c',
+        '../wirelog/session.c'),
   backend_src,
   intern_src,
   arena_src,
@@ -4712,7 +4714,8 @@ test('col_rel_deep_copy', test_col_rel_deep_copy_exe, timeout: 120)
 # Relation identity/generation contract and mutation instrumentation (Issue #1441)
 relation_mutation_set_exe = executable(
   'test_relation_mutation_set',
-  files('test_relation_mutation_set.c', '../wirelog/evaluation_control.c'),
+  files('test_relation_mutation_set.c', '../wirelog/evaluation_control.c',
+        '../wirelog/session.c'),
   backend_src, intern_src, arena_src, thread_src, workqueue_src,
   include_directories: [wirelog_inc, wirelog_src_inc],
   dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
@@ -4723,7 +4726,8 @@ test('relation_mutation_set', relation_mutation_set_exe,
 
 test_relation_generations_exe = executable(
   'test_relation_generations',
-  files('test_relation_generations.c', '../wirelog/evaluation_control.c'),
+  files('test_relation_generations.c', '../wirelog/evaluation_control.c',
+        '../wirelog/session.c'),
   backend_src,
   intern_src,
   arena_src,
@@ -4741,7 +4745,8 @@ test('relation_generations', test_relation_generations_exe)
 if host_machine.system() == 'linux'
   test_relation_generations_oom_exe = executable(
     'test_relation_generations_oom',
-    files('test_relation_generations.c', '../wirelog/evaluation_control.c'),
+    files('test_relation_generations.c', '../wirelog/evaluation_control.c',
+        '../wirelog/session.c'),
     backend_src,
     intern_src,
     arena_src,
@@ -7113,7 +7118,7 @@ test_evaluation_join_host_lifecycle_exe = executable(
   c_args: ['-DWL_SESSION_TEST_HOOKS=1'],
   link_with: [testlib_prod],
 )
-foreach join_lifecycle_case : ['successors', 'snapshots', 'recovery', 'funding', 'snapshot-recovery', 'appends', 'strict']
+foreach join_lifecycle_case : ['successors', 'snapshots', 'recovery', 'funding', 'snapshot-recovery', 'appends', 'strict', 'native-end', 'snapshot-end', 'bootstrap-end', 'snapshot-finance-birth', 'snapshot-exhaust-evaluating-end', 'snapshot-exhaust-evaluating-successor', 'snapshot-exhaust-completed-end', 'snapshot-exhaust-completed-successor']
   test('evaluation_join_host_lifecycle_' + join_lifecycle_case,
        test_evaluation_join_host_lifecycle_exe, args: [join_lifecycle_case],
        suite: ['unit', 'tsan', 'evaluation_join_hosts'], timeout: 60)
