@@ -79,16 +79,18 @@ metadata-based discovery always takes priority.
 Digest and HMAC built-ins take their input bytes from the operand's
 declared type (#963): the string's own bytes for a `symbol`/`string`
 column, `strlen()` many with no NUL terminator, and the 8-byte `int64`
-representation for a numeric one. `.decl` types are not enforced, so a
-`symbol` column holding values that were never interned falls back to
-the `int64` form — the guarantee is only as strong as the declaration.
-They compute mbedTLS digest/HMAC bytes and fold those bytes with
-`XXH3_64bits()` into the single `int64` value stored by wirelog;
-they do not return hex strings or byte arrays. **The fold means these
-are 64-bit fingerprints, not full-width digests**, and must not be
-relied on for collision resistance at scale. `uuid4()` and
-`uuid5(namespace, name)` return the first 8 UUID bytes as an `int64`;
-`uuid5()` is not RFC 4122 (see `docs/SYNTAX.md`).
+representation for a numeric one. A `symbol`/`string` column is not
+checked to hold interned values: integer inline facts and host inserts
+into it are stored unchanged. Such an integer digests its `int64` form,
+unless it equals the id of an interned string, in which case it digests
+that string's bytes and collides with that string's digest — the
+guarantee is only as strong as the declaration. They compute mbedTLS
+digest/HMAC bytes and fold those bytes with `XXH3_64bits()` into the
+single `int64` value stored by wirelog; they do not return hex strings
+or byte arrays. **The fold means these are 64-bit fingerprints, not
+full-width digests**, and must not be relied on for collision resistance
+at scale. `uuid4()` and `uuid5(namespace, name)` return the first 8 UUID
+bytes as an `int64`; `uuid5()` is not RFC 4122 (see `docs/SYNTAX.md`).
 
 **The digest built-ins do not separate operand domains.** A `symbol`
 operand contributes its own bytes and an `int64` operand contributes its

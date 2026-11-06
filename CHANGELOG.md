@@ -248,6 +248,27 @@ All notable changes to wirelog are documented in this file.
 
 ### Fixed
 
+- **Rules that mix symbol and numeric values are rejected** (#2231): symbols
+  are stored as intern ids, so `p(x) :- g(x), s(x).` with `g` declared
+  `int64` and `s` `symbol` joined the two by id, `x = "a"` on an `int64`
+  column kept the row equal to the id of `"a"`, `g(x) :- n(x).` wrote
+  integers into a `symbol` column, and `p(x) :- g(x).` with `g` declared
+  `float` and `p` `int64` stored the float's bits as an integer. Loading now
+  fails with `WIRELOG_ERR_PARSE` when, within one rule, a variable is bound
+  to both a `symbol`/`string` column and a column of another type, a
+  comparison has a symbol operand and a numeric one, a body or head constant
+  has the other kind from its column (in a body atom an integer constant in
+  a `float` column, or a float constant in another column, counts as the
+  other kind), or a head column receives a value of the other kind or a
+  `float` value it is not declared to hold. Relation columns are checked
+  only for relations typed by a `.decl`, with no compound column and used at
+  their declared width; a comparison is checked when both operand types are
+  known from a column, a literal, a string function, arithmetic or an `=`
+  binding. Inline facts, host inserts, aggregate heads, the operands of
+  string and arithmetic functions, the results of scalar extension calls, an
+  integer in a `float` head column, and a `float` against a number in a body
+  comparison or join are not.
+
 - **`wirelog_easy_print_delta` no longer aborts on a symbol id it cannot
   resolve** (#2231): a row whose `symbol` or `string` column held an id
   missing from the intern table, such as a value the host inserted without

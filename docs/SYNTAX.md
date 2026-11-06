@@ -282,7 +282,9 @@ by the same physical comparison (see [Inline facts must match their declared
 arity](#inline-facts-must-match-their-declared-arity) above). It was accepted
 until #985, which is where the `outr(1, 99, 0)` above was observed.
 
-Rule **bodies** are still not validated against their `.decl`.
+Rule **bodies** are not validated against their `.decl` for arity. Their
+symbol and numeric values are checked; see [Rules must not mix symbol and
+numeric values](#rules-must-not-mix-symbol-and-numeric-values) below.
 
 The count is not the only constraint on aggregates in a head — the aggregate
 must also be written **last**. `t(min(v), g) :- val(g, v).` lowers with a
@@ -298,6 +300,43 @@ and `AVG` are recognized by the lexer and require a float operand at lowering.
 The keywords are
 kept reserved so that `avg`/`AVERAGE` do not have to be taken away from user
 identifiers later.)
+
+### Rules must not mix symbol and numeric values
+
+Symbols are stored as intern ids, so a rule that joins a `symbol` column
+with an `int64` one matches by id, `x = "a"` on an `int64` column keeps the
+row whose value equals the id of `"a"`, and `g(x) :- n(x).` writes integers
+into a `symbol` column. Such rules evaluated on ids rather than values
+and gave no diagnostic, so loading now rejects them with
+`WIRELOG_ERR_PARSE` (#2231). Within one rule:
+
+- a variable must not be bound to a `string`/`symbol` column and to a
+  column of another type: `p(x) :- g(x), s(x).` with `g` declared `int64`
+  and `s` `symbol`;
+- a comparison must not have a `string`/`symbol` operand and a numeric
+  one: `p(x) :- g(x), x = "a".`;
+- a constant must have the kind of its column, in a body atom or in the
+  head: `p(5) :- g(0).` with `p` declared `symbol`. In a body atom an
+  integer constant in a `float` column, or a float constant in another
+  column, is rejected too: in `p(x) :- g(x), g(2).` with `g` declared
+  `float`, or `g(2.5)` with `g` declared `int64`, the constant was not
+  applied as a filter and the atom held whenever `g` had a row; `g(2, k)`
+  and a single-atom body failed at plan time;
+- a head column must not receive a value of the other kind, nor a
+  `float` value when it is not declared `float`: `g(x) :- n(x).` with `g`
+  `symbol` and `n` `int64`.
+
+A variable bound only by an `=` takes the type of the expression it is
+equal to, so `p(c) :- s(x), c = to_upper(x).` puts a string into `p`.
+
+Relation columns are checked only for relations typed by a `.decl` and
+with no compound column, at their declared width; a comparison is checked
+when both of its operand types are known from a column, a literal, a
+string function, arithmetic or an `=` binding. Not checked: inline facts
+and host inserts (#963), the columns of relations without a `.decl`,
+aggregate heads, the operands of string and arithmetic functions, the
+results of scalar extension calls, an integer in a `float` head column,
+and a `float` against a number in a body comparison or join.
 
 ---
 
@@ -607,11 +646,13 @@ what would stop `printf '%s' abcdefgh | xxhsum -H3` from reproducing
 exception; see below. `docs/SECURITY_MODEL.md` states the caveat in
 full.
 
-**The guarantee is only as good as the `.decl`.** Column types are not
-enforced: a column declared `symbol` that actually holds integers which
-were never interned digests their `int64` representation instead — the
-same answer the numeric form would have given, and the query still runs
-rather than failing. A column with no declared type at all digests the
+**The guarantee is only as good as the `.decl`.** A `symbol`/`string`
+column is not checked to hold interned values: integer inline facts and
+host inserts into it are stored unchanged. Such an integer digests its
+`int64` representation instead — the same answer the numeric form would
+have given, and the query still runs rather than failing — unless it
+equals the id of an interned string, in which case it digests that
+string's bytes. A column with no declared type at all digests the
 interned id, which is *not* stable across runs; `WL_LOG=EVAL:2` reports
 each digest that falls back this way, and `WL_LOG=EVAL:4` reports each
 value whose reverse lookup failed. Declare the relation.
@@ -712,8 +753,11 @@ Before(a, b) :- Event(a), Event(b), a < b.
 sorts event names alphabetically when `Event` is declared
 `.decl Event(name: string)`.
 
-`=` and `!=` are type-independent: symbols are interned canonically — one
-id per distinct string — so id equality already is string equality.
+`=` and `!=` need no ordering: symbols are interned canonically — one id
+per distinct string — so id equality already is string equality between
+two symbols. A string compared with a number is rejected at load when both
+types are known in the rule (see [Rules must not mix symbol and numeric
+values](#rules-must-not-mix-symbol-and-numeric-values)).
 
 The ordering **aggregates** `min()` and `max()` follow the same rule from
 the same declared types, so `min(Name)` over a `symbol` column is the
@@ -739,8 +783,11 @@ stable: adding an unrelated earlier fact changes it. Declare the relation
 to get lexicographic ordering. `WL_LOG=EVAL:2` reports each ordering
 comparison that falls back this way.
 
-Mixing a string operand with a numeric one in an ordering comparison also
-falls back to id order, and is likewise reported at `EVAL:2`.
+A comparison of a string with a number is rejected at load when both
+operand types are known in the rule (see [Rules must not mix symbol and
+numeric values](#rules-must-not-mix-symbol-and-numeric-values)). When one
+side's type is not known to that check it falls back to id order, and is
+reported at `EVAL:2`.
 
 **The digest built-ins deliberately do not follow that last rule.** An
 ordering comparison needs *both* operands reversed to the strings they

@@ -220,8 +220,9 @@ Two patterns are supported:
   Operators". Id order still leaks through in two places. A column with no
   declared type: the engine has nothing to compare but the ids, so the
   result is as unstable as they are -- declare the relation. And a
-  comparison with one string and one numeric operand: it stays an integer
-  comparison, described in `docs/SYNTAX.md`.
+  comparison with one string and one numeric operand whose types are not
+  both known at load: it stays an integer comparison, described in
+  `docs/SYNTAX.md`; when both are known the rule is rejected (#2231).
 
   A column declared `symbol` whose values were never interned is the
   aggregate's version of the same caveat as the digests below: `min()` and
@@ -234,15 +235,18 @@ Two patterns are supported:
   `hash()` and the digest family — `crc32_*`, `md5`, `sha*`,
   `hmac_sha256`, `uuid5` — take the **string's bytes** for a column
   declared `symbol`/`string`, `strlen()` many with no NUL terminator, and
-  the 8-byte `int64` representation for a numeric one. So a fingerprint
-  is a property of the data and reproduces outside wirelog. Two caveats,
-  both consequences of `.decl` types not being enforced. A column with no
-  declared type digests the id, and is therefore as unstable as the id
-  assignment. A column declared `symbol` whose values were never interned
-  digests their `int64` representation — the numeric answer for numeric
-  data — rather than failing the query; in head position a failure would
-  abort the whole projection, not drop a row. Both are reported under
-  `WL_LOG=EVAL`. The guarantee is only as good as the declaration.
+  the 8-byte `int64` representation for a numeric one. So a fingerprint is
+  a property of the data and reproduces outside wirelog. Two caveats
+  remain where the declared type cannot vouch for the bytes. A column with
+  no declared type digests the id, and is therefore as unstable as the id
+  assignment. A column declared `symbol` that holds integers digests their
+  `int64` representation — the numeric answer for numeric data — rather
+  than failing the query, unless an integer equals the id of an interned
+  string, which then digests that string's bytes; in head position a
+  failure would abort the whole projection, not drop a row. Both fallbacks
+  are reported under `WL_LOG=EVAL`; an integer that aliases an interned
+  string is not, since its lookup succeeds. The guarantee is only as good
+  as the declaration.
 - Multiplicities other than the basic z-set arithmetic above (e.g.
   weighted aggregates) are subject to the engine's
   multiplicity-tracking rules, not promised by this document.
@@ -465,6 +469,9 @@ from producing semantically correct output at workers in {1, 4, 8, 16}.
 - Issue #977 — `.decl`-versus-program arity validation: inline facts and
   rule heads are validated; rule *bodies* and facts on undeclared relations
   are not.
+- Issue #2231 — rules that mix symbol and numeric values are rejected at
+  load; see `docs/SYNTAX.md`, "Rules must not mix symbol and numeric
+  values".
 - `wirelog/columnar/ops.c` — `col_op_reduce`.
 - `wirelog/columnar/eval_serial.c` — recursive aggregate canonicalization.
 - `wirelog/ir/program.c` — `convert_rule` multi-aggregate head rejection.

@@ -1146,6 +1146,419 @@ validate_head_arities(struct wirelog_program *program,
     return 0;
 }
 
+/* #2231: reject a rule that mixes symbol and numeric values.
+ *
+ * Symbols are stored as intern ids, so a variable bound to a `symbol`
+ * column and to an `int64` one joins by id, a comparison of a symbol with
+ * a number compares the id, and a number written into a `symbol` column
+ * reads back as the string holding that id, if any.  These ran without a
+ * diagnostic, on ids rather than values.  So a rule is rejected when,
+ * within it:
+ *
+ *   E1  a variable is bound to a string/symbol column and to a column of
+ *       another type (body atoms, positive or negated);
+ *   E2  a comparison has a string/symbol operand and a number one;
+ *   E3  a constant has the other kind from its column, in a body atom or
+ *       in the head; in a body atom an integer constant in a `float`
+ *       column and a float constant in another column count as the other
+ *       kind too: in `p(x) :- g(x), g(2).` with g `float`, or
+ *       `g(2.5)` with g `int64`, such a constant was not applied as a
+ *       filter; `g(2, k)` and a single-atom body failed at plan time;
+ *   E4  a head column receives a value of the other kind, or a float
+ *       value lands in a column that is not `float`, whose bits it would
+ *       be stored as.
+ *
+ * Relation columns are checked only for relations typed by a `.decl`,
+ * with no compound column and used at their declared width; a comparison
+ * is checked when both of its operand types are known from a column, a
+ * literal, a string function, arithmetic or an `=` binding.  A variable
+ * whose only binding is an `=` with a typed expression takes that
+ * expression's type, which is the binding U4 gives it.  Not checked:
+ * inline facts and host inserts (#963), aggregate heads, the operands of
+ * string and arithmetic functions, the results of scalar extension calls,
+ * which a plan may route into a string column (test_plan_gen's
+ * `text.keep`), an integer value in a `float` head column, and a float
+ * against a number in a body comparison or join. */
+
+typedef struct {
+    const char *name;
+    wl_ir_coltype_t domain;
+    const char *rel;
+    uint32_t col;
+    wirelog_column_type_t type;
+} domain_binding_t;
+
+typedef struct {
+    domain_binding_t *vars;
+    uint32_t count;
+    uint32_t capacity;
+} domain_env_t;
+
+static const char *
+column_type_word(wirelog_column_type_t type)
+{
+    switch (type) {
+    case WIRELOG_TYPE_INT32:
+        return "int32";
+    case WIRELOG_TYPE_INT64:
+        return "int64";
+    case WIRELOG_TYPE_UINT32:
+        return "uint32";
+    case WIRELOG_TYPE_UINT64:
+        return "uint64";
+    case WIRELOG_TYPE_FLOAT:
+        return "float";
+    case WIRELOG_TYPE_STRING:
+        return "string/symbol";
+    case WIRELOG_TYPE_BOOL:
+        return "bool";
+    }
+    return "unknown";
+}
+
+static const char *
+domain_word(wl_ir_coltype_t domain)
+{
+    switch (domain) {
+    case WL_IR_COLTYPE_STRING:
+        return "string/symbol";
+    case WL_IR_COLTYPE_FLOAT:
+        return "float";
+    case WL_IR_COLTYPE_SCALAR:
+        return "numeric";
+    case WL_IR_COLTYPE_UNKNOWN:
+        break;
+    }
+    return "untyped";
+}
+
+static const char *
+cmp_op_word(wirelog_cmp_op_t op)
+{
+    switch (op) {
+    case WIRELOG_CMP_EQ:
+        return "=";
+    case WIRELOG_CMP_NEQ:
+        return "!=";
+    case WIRELOG_CMP_LT:
+        return "<";
+    case WIRELOG_CMP_GT:
+        return ">";
+    case WIRELOG_CMP_LTE:
+        return "<=";
+    case WIRELOG_CMP_GTE:
+        return ">=";
+    }
+    return "?";
+}
+
+/* True when exactly one of two known domains is string/symbol. */
+static bool
+domains_mix_symbol(wl_ir_coltype_t a, wl_ir_coltype_t b)
+{
+    if (a == WL_IR_COLTYPE_UNKNOWN || b == WL_IR_COLTYPE_UNKNOWN)
+        return false;
+    return (a == WL_IR_COLTYPE_STRING) != (b == WL_IR_COLTYPE_STRING);
+}
+
+/* True when @value cannot be stored in a column of @column's domain. */
+static bool
+domain_head_conflict(wl_ir_coltype_t value, wl_ir_coltype_t column)
+{
+    if (domains_mix_symbol(value, column))
+        return true;
+    return value == WL_IR_COLTYPE_FLOAT && column != WL_IR_COLTYPE_FLOAT
+           && column != WL_IR_COLTYPE_UNKNOWN;
+}
+
+/* True when a body-atom constant of @value cannot equal a value of a
+ * @column column: the other kind, or a number against a float lane. */
+static bool
+body_constant_conflict(wl_ir_coltype_t value, wl_ir_coltype_t column)
+{
+    if (domains_mix_symbol(value, column))
+        return true;
+    if (value == WL_IR_COLTYPE_UNKNOWN || column == WL_IR_COLTYPE_UNKNOWN)
+        return false;
+    return (value == WL_IR_COLTYPE_FLOAT) != (column == WL_IR_COLTYPE_FLOAT);
+}
+
+/* The relation @atom names when its columns can be checked: typed by a
+ * `.decl`, no compound column, used at its declared width. */
+static const wl_ir_relation_info_t *
+domain_checked_relation(const struct wirelog_program *program,
+    const wl_parser_ast_node_t *atom)
+{
+    if (!atom || !atom->name)
+        return NULL;
+    const wl_ir_relation_info_t *rel = find_relation_info(program,
+            atom->name);
+    if (!rel || !rel->has_decl || !rel->columns
+        || atom->child_count != rel->column_count)
+        return NULL;
+    for (uint32_t c = 0; c < rel->column_count; c++)
+        if (rel->columns[c].compound_kind != WIRELOG_COMPOUND_KIND_NONE)
+            return NULL;
+    return rel;
+}
+
+static uint32_t
+count_variable_nodes(const wl_parser_ast_node_t *node)
+{
+    if (!node)
+        return 0;
+    uint32_t n = node->type == WL_PARSER_AST_NODE_VARIABLE ? 1u : 0u;
+    for (uint32_t i = 0; i < node->child_count; i++)
+        n += count_variable_nodes(node->children[i]);
+    return n;
+}
+
+static domain_binding_t *
+domain_env_find(domain_env_t *env, const char *name)
+{
+    for (uint32_t i = 0; name && i < env->count; i++)
+        if (strcmp(env->vars[i].name, name) == 0)
+            return &env->vars[i];
+    return NULL;
+}
+
+static wl_ir_coltype_t
+domain_of_value(const wl_parser_ast_node_t *node, domain_env_t *env)
+{
+    if (!node)
+        return WL_IR_COLTYPE_UNKNOWN;
+    switch (node->type) {
+    case WL_PARSER_AST_NODE_VARIABLE: {
+        domain_binding_t *b = domain_env_find(env, node->name);
+        return b ? b->domain : WL_IR_COLTYPE_UNKNOWN;
+    }
+    case WL_PARSER_AST_NODE_INTEGER:
+        return WL_IR_COLTYPE_SCALAR;
+    case WL_PARSER_AST_NODE_FLOAT:
+        return WL_IR_COLTYPE_FLOAT;
+    case WL_PARSER_AST_NODE_STRING:
+        return WL_IR_COLTYPE_STRING;
+    case WL_PARSER_AST_NODE_BINARY_EXPR: {
+        /* As the plan generator types it: float only when every operand
+         * is; no arithmetic yields a symbol. */
+        bool all_float = node->child_count > 0;
+        for (uint32_t i = 0; i < node->child_count; i++)
+            if (domain_of_value(node->children[i], env)
+                != WL_IR_COLTYPE_FLOAT)
+                all_float = false;
+        return all_float ? WL_IR_COLTYPE_FLOAT : WL_IR_COLTYPE_SCALAR;
+    }
+    case WL_PARSER_AST_NODE_STR_FUNCTION:
+        switch (node->str_fn) {
+        case WIRELOG_STR_FN_CAT:
+        case WIRELOG_STR_FN_SUBSTR:
+        case WIRELOG_STR_FN_TO_UPPER:
+        case WIRELOG_STR_FN_TO_LOWER:
+        case WIRELOG_STR_FN_STR_REPLACE:
+        case WIRELOG_STR_FN_TRIM:
+        case WIRELOG_STR_FN_TO_STRING:
+        case WIRELOG_STR_FN_UUID5_RFC:
+            return WL_IR_COLTYPE_STRING;
+        case WIRELOG_STR_FN_STRLEN:
+        case WIRELOG_STR_FN_CONTAINS:
+        case WIRELOG_STR_FN_STR_PREFIX:
+        case WIRELOG_STR_FN_STR_SUFFIX:
+        case WIRELOG_STR_FN_STR_ORD:
+        case WIRELOG_STR_FN_TO_NUMBER:
+            return WL_IR_COLTYPE_SCALAR;
+        }
+        return WL_IR_COLTYPE_UNKNOWN;
+    default:
+        return WL_IR_COLTYPE_UNKNOWN;
+    }
+}
+
+static bool
+node_is_constant(const wl_parser_ast_node_t *node)
+{
+    return node && (node->type == WL_PARSER_AST_NODE_INTEGER
+           || node->type == WL_PARSER_AST_NODE_FLOAT
+           || node->type == WL_PARSER_AST_NODE_STRING);
+}
+
+/* Pass A over one body atom.  Returns -1 after setting the error. */
+static int
+domain_check_body_atom(struct wirelog_program *program,
+    const wl_parser_ast_node_t *atom, const char *head_name,
+    domain_env_t *env)
+{
+    const wl_ir_relation_info_t *rel = domain_checked_relation(program,
+            atom);
+    if (!rel)
+        return 0;
+    for (uint32_t c = 0; c < atom->child_count; c++) {
+        const wl_parser_ast_node_t *arg = atom->children[c];
+        wirelog_column_type_t type = rel->columns[c].type;
+        wl_ir_coltype_t col = wl_ir_coltype_from_column_type(type);
+        if (arg->type == WL_PARSER_AST_NODE_VARIABLE && arg->name) {
+            domain_binding_t *b = domain_env_find(env, arg->name);
+            if (!b) {
+                if (env->count >= env->capacity)
+                    continue;
+                b = &env->vars[env->count++];
+                b->name = arg->name;
+                b->domain = col;
+                b->rel = rel->name;
+                b->col = c;
+                b->type = type;
+                continue;
+            }
+            if (b->domain == WL_IR_COLTYPE_UNKNOWN) {
+                b->domain = col;
+                b->rel = rel->name;
+                b->col = c;
+                b->type = type;
+                continue;
+            }
+            if (domains_mix_symbol(b->domain, col)) {
+                wl_ir_program_set_error(program,
+                    "variable '%s' in a rule for '%s' is bound to %s column"
+                    " %u of '%s' and to %s column %u of '%s'; symbols are"
+                    " stored as intern ids, so the two would match by id"
+                    " (line %u)", arg->name, head_name,
+                    column_type_word(b->type), b->col, b->rel,
+                    column_type_word(type), c, rel->name, atom->line);
+                return -1;
+            }
+        } else if (node_is_constant(arg)
+            && body_constant_conflict(domain_of_value(arg, env), col)) {
+            wl_ir_program_set_error(program,
+                "%s constant in column %u of '%s', which is declared %s,"
+                " in a rule for '%s' (line %u)",
+                domain_word(domain_of_value(arg, env)), c, rel->name,
+                column_type_word(type), head_name, atom->line);
+            return -1;
+        }
+    }
+    return 0;
+}
+
+static int
+domain_check_rule(struct wirelog_program *program,
+    const wl_parser_ast_node_t *rule)
+{
+    const wl_parser_ast_node_t *head = rule->children[0];
+    const char *head_name = head && head->name ? head->name : "?";
+    domain_env_t env = { NULL, 0, 0 };
+    int rc = 0;
+
+    env.capacity = count_variable_nodes(rule);
+    if (env.capacity > 0) {
+        env.vars = (domain_binding_t *)calloc(env.capacity,
+                sizeof(*env.vars));
+        if (!env.vars) {
+            wl_ir_program_set_error(program,
+                "out of memory checking a rule for '%s'", head_name);
+            return -1;
+        }
+    }
+
+    /* Pass A: body atoms bind their variables to column types. */
+    for (uint32_t i = 1; rc == 0 && i < rule->child_count; i++) {
+        const wl_parser_ast_node_t *b = rule->children[i];
+        if (b->type == WL_PARSER_AST_NODE_ATOM)
+            rc = domain_check_body_atom(program, b, head_name, &env);
+        else if (b->type == WL_PARSER_AST_NODE_NEGATION
+            && b->child_count > 0)
+            rc = domain_check_body_atom(program, b->children[0],
+                    head_name, &env);
+    }
+
+    /* Pass B: a variable bound by nothing else takes the type of the
+     * expression an `=` gives it.  Two rounds cover one chained `=`. */
+    for (int round = 0; rc == 0 && round < 2; round++) {
+        for (uint32_t i = 1; i < rule->child_count; i++) {
+            const wl_parser_ast_node_t *b = rule->children[i];
+            if (b->type != WL_PARSER_AST_NODE_COMPARISON
+                || b->cmp_op != WIRELOG_CMP_EQ || b->child_count != 2)
+                continue;
+            for (int side = 0; side < 2; side++) {
+                const wl_parser_ast_node_t *var = b->children[side];
+                const wl_parser_ast_node_t *val = b->children[1 - side];
+                if (var->type != WL_PARSER_AST_NODE_VARIABLE || !var->name)
+                    continue;
+                wl_ir_coltype_t d = domain_of_value(val, &env);
+                if (d == WL_IR_COLTYPE_UNKNOWN)
+                    continue;
+                domain_binding_t *bind = domain_env_find(&env, var->name);
+                if (!bind && env.count < env.capacity) {
+                    bind = &env.vars[env.count++];
+                    bind->name = var->name;
+                    bind->domain = WL_IR_COLTYPE_UNKNOWN;
+                }
+                if (bind && bind->domain == WL_IR_COLTYPE_UNKNOWN) {
+                    bind->domain = d;
+                    bind->rel = NULL;
+                }
+            }
+        }
+    }
+
+    /* Pass C: comparisons. */
+    for (uint32_t i = 1; rc == 0 && i < rule->child_count; i++) {
+        const wl_parser_ast_node_t *b = rule->children[i];
+        if (b->type != WL_PARSER_AST_NODE_COMPARISON || b->child_count != 2)
+            continue;
+        if (domains_mix_symbol(domain_of_value(b->children[0], &env),
+            domain_of_value(b->children[1], &env))) {
+            wl_ir_program_set_error(program,
+                "'%s' comparison in a rule for '%s' compares a"
+                " string/symbol with a number (line %u)",
+                cmp_op_word(b->cmp_op), head_name, b->line);
+            rc = -1;
+        }
+    }
+
+    /* Pass D: the head.  An aggregate head reorders its columns (#980),
+     * so it is skipped. */
+    const wl_ir_relation_info_t *rel = rc == 0
+        ? domain_checked_relation(program, head) : NULL;
+    for (uint32_t c = 0; rel && c < head->child_count; c++)
+        if (head->children[c]->type == WL_PARSER_AST_NODE_AGGREGATE)
+            rel = NULL;
+    for (uint32_t c = 0; rel && rc == 0 && c < head->child_count; c++) {
+        const wl_parser_ast_node_t *arg = head->children[c];
+        wirelog_column_type_t type = rel->columns[c].type;
+        wl_ir_coltype_t value = domain_of_value(arg, &env);
+        if (!domain_head_conflict(value,
+            wl_ir_coltype_from_column_type(type)))
+            continue;
+        if (node_is_constant(arg))
+            wl_ir_program_set_error(program,
+                "%s constant in column %u of '%s', which is declared %s,"
+                " in a rule for '%s' (line %u)", domain_word(value), c,
+                rel->name, column_type_word(type), head_name, head->line);
+        else
+            wl_ir_program_set_error(program,
+                "rule head for '%s' puts a %s value into column %u, which"
+                " is declared %s (line %u)", rel->name, domain_word(value),
+                c, column_type_word(type), head->line);
+        rc = -1;
+    }
+
+    free(env.vars);
+    return rc;
+}
+
+static int
+validate_rule_value_domains(struct wirelog_program *program,
+    const wl_parser_ast_node_t *ast)
+{
+    for (uint32_t i = 0; i < ast->child_count; i++) {
+        const wl_parser_ast_node_t *node = ast->children[i];
+        if (node->type != WL_PARSER_AST_NODE_RULE || node->child_count < 1)
+            continue;
+        if (domain_check_rule(program, node) != 0)
+            return -1;
+    }
+    return 0;
+}
+
 int
 wl_ir_program_collect_metadata(struct wirelog_program *program,
     const wl_parser_ast_node_t *ast)
@@ -1195,7 +1608,9 @@ wl_ir_program_collect_metadata(struct wirelog_program *program,
      * first. */
     if (validate_fact_arities(program, ast) != 0)
         return -1;
-    return validate_head_arities(program, ast);
+    if (validate_head_arities(program, ast) != 0)
+        return -1;
+    return validate_rule_value_domains(program, ast);
 }
 
 /* ======================================================================== */
