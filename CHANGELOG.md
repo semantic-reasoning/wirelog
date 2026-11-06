@@ -248,6 +248,16 @@ All notable changes to wirelog are documented in this file.
 
 ### Fixed
 
+- **Removing a zero-column row retracts it** (#2231):
+  `wirelog_easy_remove(s, "flag", row, 0)` returned `WIRELOG_OK` and left
+  the row, so a `flag()` from an inline fact or a host insert kept holding.
+  It now lowers the row's multiplicity by one: once every inserted copy is
+  removed and no rule derives `flag()`, `p(100) :- flag().` stops holding
+  at the next step or snapshot, and a delta callback receives `p(100)` with
+  diff -1. A removal with nonzero `ncols` from a relation that holds or
+  held zero-width rows returns `WIRELOG_ERR_EXEC`, as an insert at that
+  width already did.
+
 - **Inline facts of zero-column relations are seeded** (#2231): `flag().`
   against `.decl flag()`, or with no `.decl` for `flag`, was accepted but
   never loaded, so `p(100) :- flag().` derived nothing and `!flag()` held.

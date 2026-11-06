@@ -6324,6 +6324,16 @@ test_easy_nullary_fact_exe = executable(
 
 test('easy_nullary_fact', test_easy_nullary_fact_exe)
 
+test_easy_nullary_remove_exe = executable(
+  'test_easy_nullary_remove',
+  files('test_easy_nullary_remove.c'),
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
+  link_with: [testlib_prod],
+)
+
+test('easy_nullary_remove', test_easy_nullary_remove_exe)
+
 # ============================================================================
 # I/O Context Accessor Tests (#452)
 # ============================================================================
