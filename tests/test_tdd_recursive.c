@@ -5619,6 +5619,77 @@ test_wide_dedup_hash_parity(uint32_t width)
     return ok ? 0 : -1;
 }
 
+#ifdef WL_TEST_TDD_RESET_RESTORE
+/* #2231: the owner fallback saves the coordinator's relations before a
+ * worker run and restores them when it falls back.  The save skipped every
+ * zero-column relation, so one that held a row, such as `flag()` seeded by
+ * a fact, came back as an empty candidate.  An empty zero-width
+ * placeholder still has nothing to save. */
+static void
+test_tdd_save_restore_nullary(void)
+{
+    TEST("TDD coordinator save/restore keeps zero-width rows");
+
+    const int64_t unused[1] = { 0 };
+    wl_col_session_t coord = { 0 };
+    wl_plan_relation_t plan_rels[2] = { { 0 }, { 0 } };
+    wl_plan_stratum_t stratum = { 0 };
+    col_rel_t *flag = col_rel_new_auto("flag", 0);
+    col_rel_t *ph = col_rel_new_auto("ph", 0);
+    col_rel_t **saved = NULL;
+    bool denied = false;
+    const char *why = NULL;
+
+    if (!flag || !ph || col_rel_set_schema(flag, 0, NULL) != 0
+        || col_rel_append_rows_atomic(flag, unused, 1, 0, &denied) != 0
+        || flag->nrows != 1 || session_add_rel(&coord, flag) != 0) {
+        col_rel_destroy(flag);
+        col_rel_destroy(ph);
+        free(coord.rels);
+        FAIL("zero-width save setup");
+        return;
+    }
+    if (session_add_rel(&coord, ph) != 0) {
+        col_rel_destroy(ph);
+        why = "placeholder setup";
+        goto done;
+    }
+    plan_rels[0].name = "flag";
+    plan_rels[1].name = "ph";
+    stratum.relations = plan_rels;
+    stratum.relation_count = 2;
+    if (wl_columnar_eval_test_tdd_save(&stratum, &coord, &saved) != 0) {
+        why = "save failed";
+        goto done;
+    }
+    if (!saved[0] || saved[0]->nrows != 1 || saved[1]) {
+        why = "save skipped the held row or saved the placeholder";
+        goto done;
+    }
+    session_find_rel(&coord, "flag")->nrows = 0;
+    if (wl_columnar_eval_test_tdd_restore(&stratum, &coord, saved) != 0) {
+        why = "restore failed";
+        goto done;
+    }
+    if (!session_find_rel(&coord, "flag")
+        || session_find_rel(&coord, "flag")->nrows != 1
+        || !session_find_rel(&coord, "ph")
+        || session_find_rel(&coord, "ph")->nrows != 0)
+        why = "restore lost the zero-width row";
+done:
+    if (saved)
+        wl_columnar_eval_test_tdd_free_saved(&stratum, saved);
+    session_remove_rel(&coord, "flag");
+    session_remove_rel(&coord, "ph");
+    session_rel_free_hash(&coord);
+    free(coord.rels);
+    if (why)
+        FAIL(why);
+    else
+        PASS();
+}
+#endif
+
 int
 main(void)
 {
@@ -5733,6 +5804,7 @@ main(void)
         FAIL("owner lifetime mixed backing retention/accounting");
 #ifdef WL_TEST_TDD_RESET_RESTORE
     test_tdd_reset_restore_transaction();
+    test_tdd_save_restore_nullary();
 #endif
 #ifdef WL_TEST_TDD_MERGE
     test_tdd_merge_growth_admission();
