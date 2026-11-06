@@ -248,6 +248,17 @@ All notable changes to wirelog are documented in this file.
 
 ### Fixed
 
+- **Workers get a writable copy of a zero-column rule head that holds a
+  row** (#2231): when a relation such as `flag()` both heads a rule of a
+  recursive stratum (`flag() :- t(1, 4).`) and is read by it
+  (`t(x, y) :- e(x, y), flag().`), and holds a row from an inline fact or
+  `wirelog_easy_insert`, each worker received a copy of it that it could not
+  write to. A step without a delta callback that set up two or more workers
+  this way, for example under the aligned strategy, then returned
+  `WIRELOG_ERR_EXEC` once a worker derived `flag()` again. Each worker now
+  gets a copy it can write to, so a worker deriving `flag()` again no longer
+  fails the step there.
+
 - **The owner strategy no longer refuses a zero-column relation that holds a
   row while setting up its workers** (#2231): when such a relation, for
   example `flag()` seeded by `flag().` or `wirelog_easy_insert`, belongs to

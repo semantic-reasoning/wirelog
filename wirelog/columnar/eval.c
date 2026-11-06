@@ -5434,9 +5434,13 @@ tdd_init_workers_hybrid(const wl_plan_stratum_t *sp, wl_col_session_t *coord,
             break;
         }
 
-        if (is_idb && rel->nrows == 0) {
+        if (is_idb && (rel->nrows == 0 || rel->ncols == 0)) {
             /* Empty IDBs are writable worker state, not shared EDB views.
-             * Their leases would otherwise prevent coordinator publication. */
+             * Their leases would otherwise prevent coordinator publication.
+             * A zero-column IDB has no key to partition its rows by, so a
+             * worker that reads it needs all of them: each worker gets its
+             * own governed copy.  A shared view of it was refused the first
+             * time a worker derived the head again (#2231). */
             wl_columnar_source_access_reader_t reader = { 0 };
             rc = col_rel_source_reader_acquire(rel, &reader);
             if (rc != 0)
@@ -5454,6 +5458,11 @@ tdd_init_workers_hybrid(const wl_plan_stratum_t *sp, wl_col_session_t *coord,
                 }
                 empty->declared_ncols = rel->declared_ncols;
                 worker_rels[w][rels_built] = empty;
+                if (rel->nrows > 0) {
+                    rc = col_rel_append_all(empty, rel, NULL);
+                    if (rc != 0)
+                        break;
+                }
 #ifdef WL_TEST_BDX_SEED
                 if (wl_columnar_eval_test_hybrid_boundary)
                     wl_columnar_eval_test_hybrid_boundary(2, w);
