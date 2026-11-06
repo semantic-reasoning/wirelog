@@ -5987,3 +5987,42 @@ legitimate issuer reaching it needs576 plus new containing source evidence;
 current512-driver tests establish no such positive. This qualification does
 not enable the pending registered cache owner, default materialized driver,
 strict/shared caps or general transaction intersections.
+
+
+### Admission-owned private SOURCE bank
+
+A controlled public session creates a sealed financial BANK after attaching
+its original controller and before backend construction or evaluation BEGIN.
+This is a narrow pre-session construction boundary on both success and failure:
+only the fixed holder/two private lanes and their rollback are included. It
+covers no backend traversal or later engine work and does not reuse the
+read-only13 exception. A failed birth leaves the output NULL, unwinds only its
+real lanes and detaches the original. Raw sessions create no BANK.
+
+The opaque class exports neither its controllers nor their saved IDs. Actual
+phase BEGIN/charge/FINISH/report operations remain real. Each successful charge
+updates an exact private sum checked against all seven report fields. Only a
+closed, fully reported, callback-free private lane can rearm; original and BODY
+controllers retain their monotone ID contract. The external owning handle slot
+must stay at its constructor address through destruction. Context storage is
+zeroed, exclusive, disjoint external storage and is never copied or retained
+across public activations.
+
+The production destruction lifecycle admits256,24,160 (440 total), independently
+of its configured capacity768. Its disjoint source ceilings are255,20,141;
+actual between-check ceilings are235,20,20,141. Before its third positive at
+least189 source cells have executed across the five supported atomic/thread
+profiles, so admitted but unprocessed slack is at most251. FINISH/report and
+physical free are not checks. Controllers detach/release before BANK free;
+its owning admission slot is cleared before the admission itself is freed.
+Existing qualified mandatory backend/extension retirement keeps its scoped
+contract. These prices do not qualify other callbacks or public queries.
+
+The reusable internal runner requires a separately source-qualified private
+immutable policy and bounded SOURCE-only action. Positive fees no larger than
+256 and finite capacity alone prove no source fit. Complete caller/context,
+rearm, action, FINISH/report and return source, rejected branches, promise
+lifetimes and slack must be established for each real integration. No arbitrary
+BODY/user callback, PENDING loan or native mutation authority comes from BANK
+finance. This foundation does not enable the unfinished ordinary recovery,
+materialized compiler driver or policy/cap acceptance paths.
