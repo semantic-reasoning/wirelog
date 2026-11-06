@@ -6171,3 +6171,33 @@ before each probe; the selected-false fallback keeps its separate checkpoint.
 The expanded metadata actor upper92 gives CURRENT142/144, total432 and unused
 admission236; its return-to-loop upper76 fits CLOSE80. These are local
 post-admission SOURCE bounds, not a qualification of static public preflight.
+
+### Public C1 admission SOURCE boundary
+
+An owning controlled single-worker session with configured JOIN batches and an
+acyclic plan of at most32 strata selects financial admission reads. The cached
+bit selects payment only; actual program, callback, source and Native eligibility
+remain live predicates. Worker copies explicitly clear it. The locked quiescent
+STEP gate uses208/96/96; Snapshot uses212/160/96 and reads its actual backend
+state once. The actual typed-frame birth-before-child invariant also covers
+FILTER, ANTIJOIN and LFTJ-containing numeric frames; this does not complete LFTJ
+algorithm recovery or alter its qualified row-local MAP context.
+
+The C1 getter bound76 plus its actor5 and financial surroundings50 gives131
+under CURRENT160. Snapshot FIRST210 fits212. The compatible shortest profile
+processes116+41+13+68=238 before CLOSE: the updated total468 leaves230, so the old
+conservative lower206 must not be reused for this policy. Complete locked-gate
+return77 and the admitted scope/fronts fit CLOSE96. On every successfully
+admitted STEP/Snapshot, actual SOURCE TLS is installed before body validation;
+the existing allocation-free BANK footer then bounds entry work. The resulting
+gate-to-next-check interval is at most254. TLS is restored before end-step
+arbitration on invalid backend/input/callback paths as well as successful ones.
+These local gate/entry statements do not replace the separate static-read
+callback qualification.
+
+Controlled destruction drains the same finite owned observed transaction until
+its existing disposal returns a genuine terminal status. The old16-turn cap
+could abort successful32-head Snapshots. Each disposal still uses its actual
+maintenance owner and existing bounded reader/retirement/refund actions; real
+busy/identity/error returns propagate. No evaluation, Original reset or invented
+receipt completion is introduced by draining the remaining cleanup cursors.

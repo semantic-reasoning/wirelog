@@ -7118,7 +7118,7 @@ test_evaluation_join_host_lifecycle_exe = executable(
   c_args: ['-DWL_SESSION_TEST_HOOKS=1'],
   link_with: [testlib_prod],
 )
-foreach join_lifecycle_case : ['successors', 'snapshots', 'recovery', 'funding', 'snapshot-recovery', 'appends', 'strict', 'native-end', 'snapshot-end', 'bootstrap-end', 'snapshot-finance-birth', 'snapshot-exhaust-evaluating-end', 'snapshot-exhaust-evaluating-successor', 'snapshot-exhaust-completed-end', 'snapshot-exhaust-completed-successor']
+foreach join_lifecycle_case : ['successors', 'snapshots', 'recovery', 'funding', 'snapshot-recovery', 'appends', 'strict', 'native-end', 'snapshot-end', 'bootstrap-end', 'snapshot-finance-birth', 'snapshot-exhaust-evaluating-end', 'snapshot-exhaust-evaluating-successor', 'snapshot-exhaust-completed-end', 'snapshot-exhaust-completed-successor', 'admission-strata-step', 'admission-strata-snapshot', 'admission-strata-refusal']
   test('evaluation_join_host_lifecycle_' + join_lifecycle_case,
        test_evaluation_join_host_lifecycle_exe, args: [join_lifecycle_case],
        suite: ['unit', 'tsan', 'evaluation_join_hosts'], timeout: 60)
