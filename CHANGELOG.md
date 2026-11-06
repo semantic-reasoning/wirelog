@@ -248,6 +248,16 @@ All notable changes to wirelog are documented in this file.
 
 ### Fixed
 
+- **`wirelog_easy_print_delta` no longer aborts on a symbol id it cannot
+  resolve** (#2231): a row whose `symbol` or `string` column held an id
+  missing from the intern table, such as a value the host inserted without
+  interning it or a number a rule passed into a `symbol` column, called
+  `abort()`. With `wirelog_easy_print_delta` as the delta callback,
+  `.decl g(x: symbol) .decl n(x: int64) n(7). u(x) :- n(x). g(x) :- u(x).`
+  ended the process with SIGABRT. The value is now printed as a bare,
+  unquoted integer, as `wirelog_cli` already prints it, and after the row a
+  line naming the relation, column and id is written to stderr.
+
 - **Workers get a writable copy of a zero-column rule head that holds a
   row** (#2231): when a relation such as `flag()` both heads a rule of a
   recursive stratum (`flag() :- t(1, 4).`) and is read by it

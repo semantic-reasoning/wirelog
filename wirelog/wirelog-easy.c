@@ -501,13 +501,15 @@ wirelog_easy_print_delta(const char *relation, const int64_t *row,
 
     char sign = (diff > 0) ? '+' : '-';
 
-    /* Schema lookup may fail (unknown relation or arity mismatch).  The
-     * abort-on-missed-reverse-intern policy applies ONLY when the schema
-     * explicitly declares a column as STRING — otherwise we have no
-     * warrant to treat an integer id as a pointer into the intern table.
-     * In the schema-unavailable branch, default to integer rendering so a
-     * synthetic delta call (or a schema-less relation) does not trip the
-     * abort.
+    /* Schema lookup may fail (unknown relation or arity mismatch).  An id
+     * is reverse-interned ONLY when the schema explicitly declares its
+     * column as STRING -- otherwise we have no warrant to treat an integer
+     * id as a pointer into the intern table, and the value is rendered as
+     * an integer.  A STRING column whose id the intern table cannot
+     * reverse (a value the host inserted without interning it, or a number
+     * a rule wrote into a `symbol` column) is printed as a bare integer
+     * too, as wirelog_cli prints it, and named on stderr once the row is
+     * complete (#2231).
      *
      * The ncols equality is a *logical* schema against a *physical* row
      * width.  The two agree for every relation that declares no `inline`
@@ -536,14 +538,10 @@ wirelog_easy_print_delta(const char *relation, const int64_t *row,
 
         if (have_schema && column_is_string(schema->columns[i].type)) {
             const char *str = wl_intern_reverse(s->intern_mut, row[i]);
-            if (!str) {
-                fprintf(stderr,
-                    "wirelog_easy_print_delta: missed reverse-intern for "
-                    "relation '%s' column %u id %" PRId64 "\n",
-                    relation, i, row[i]);
-                abort();
-            }
-            printf("\"%s\"", str);
+            if (str)
+                printf("\"%s\"", str);
+            else
+                printf("%" PRId64, row[i]);
         } else {
             /* Either the schema declares this column as a non-string
              * (int/bool) type, or no schema was available at all.  In
@@ -552,6 +550,15 @@ wirelog_easy_print_delta(const char *relation, const int64_t *row,
         }
     }
     printf(")\n");
+    for (uint32_t i = 0; have_schema && i < ncols; i++) {
+        if (column_is_string(schema->columns[i].type)
+            && !wl_intern_reverse(s->intern_mut, row[i]))
+            fprintf(stderr,
+                "wirelog_easy_print_delta: missed reverse-intern for "
+                "relation '%s' column %u id %" PRId64
+                "; printed as an integer\n",
+                relation, i, row[i]);
+    }
 }
 
 /* ======================================================================== */
