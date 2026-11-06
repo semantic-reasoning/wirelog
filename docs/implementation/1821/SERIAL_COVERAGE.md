@@ -2464,3 +2464,30 @@ exact-nine interiors or production caller tariffs. They do not migrate public
 STEP/Snapshot or consumers. Together with the private BANK lifetime, these are
 prerequisites for the still-open ownership/source/materialized/policy/cap
 integration;2297/2298 acceptance remains incomplete.
+
+#### JOIN host local cap boundary
+
+The non-strict owning scalar batch host now admits the configured local output
+cap. A successful sink commit/producer ACK advances the existing host phase,
+updates the local peak and tests committed extent against the local limit
+before the existing AFTER_ACK hook. That synchronous phase advance is the
+once-only journal; no additional poll, fee, persistent state or shared counter
+claim is introduced. A consumed pipeline counts post-consumer rows; a direct
+sink counts JOIN rows even when a later separate FILTER rejects them all.
+
+The exact inline policy adds eight source slots on successful commit115 only:
+one local session store, comparison/dispatch/peak store3, and two cap predicates,
+dispatch/error store4. The compatible commit bound becomes95/115; unchanged
+initial proof and precommit refusals never execute these slots. Whole success
+and cap-error windows through actual grant finish are115 and123, within256.
+The old quote585, admitted total1993 and independent ACK one-short oracles stay
+unchanged. This is scoped to the existing ACK convention and owning-local path.
+
+`evaluation_join_host_policies` uses parser-generated session routes and
+creation-time environment configuration. It compares raw status/peak, literal
+64/28/zero-row content, real producer/ACK generations, streaming exchanges and
+private nonpublication. It covers disabled/below/exact/above caps, consumed
+reject-all versus separately materialized reject-all, reset/raised-limit retry,
+and cancellation on either side of ACK. Existing host funding exact boundaries
+remain independent regression oracles. Strict, shared-worker, general
+transaction/source and remaining whole-bundle acceptance are still required.
