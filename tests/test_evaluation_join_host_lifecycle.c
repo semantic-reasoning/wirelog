@@ -36,6 +36,14 @@ static bool snapshot_cancelled, inject_funding, funding_pending, funding_used;
 static unsigned funding_refusals;
 static int snapshot_identity_exhaustion = -1;
 static unsigned append_reads, append_joins, append_variables;
+extern void (*wl_columnar_session_test_before_fresh_shape)(wl_col_session_t *);
+static unsigned fresh_shape_reached;
+#if defined(_MSC_VER)
+extern __declspec(thread) unsigned wl_columnar_session_test_step_reset_chunks;
+#else
+extern _Thread_local unsigned wl_columnar_session_test_step_reset_chunks;
+#endif
+
 extern void (*wl_columnar_session_test_observed_transaction_checkpoint)(
     wl_evaluation_control_t *, unsigned, uint32_t,
     const wl_columnar_eval_private_bindings_t *);
@@ -275,6 +283,7 @@ step_pair(fixture_t *f, const state_t *old, bool observed,
 static void
 successors(bool observed)
 {
+    wl_columnar_session_test_step_reset_chunks = 0;
     fixture_t f; init(&f, observed);
     state_t old = {0};
     step_pair(&f, &old, observed, 2);
@@ -307,6 +316,8 @@ successors(bool observed)
         CHECK(!wl_session_snapshot(f.sessions[i], snapshot, &rows));
         expect_events(&rows, &empty, &f.state);
     }
+    CHECK(wl_columnar_session_test_step_reset_chunks >= 2);
+    wl_columnar_session_test_step_reset_chunks = 0;
     destroy(&f);
 }
 
@@ -1231,6 +1242,95 @@ admission_strata(bool evaluating_snapshot, bool refuse_only)
     wl_plan_free(plan); wirelog_program_free(program);
 }
 
+static int
+admission_count_read(void *payload)
+{
+    ++*(unsigned *)payload;
+    return 0;
+}
+
+static void
+admission_refuse_fresh_read(wl_col_session_t *session)
+{
+    CHECK(!session->controlled_step);
+    ++fresh_shape_reached;
+    wl_session_testhook_refuse_source_read(1);
+}
+
+static void
+admission_read_failure(void)
+{
+    fixture_t f; init(&f, true);
+    unsigned called = 0;
+    /* No fake SOURCE scope: the real wrapper rejects this provenance. */
+    CHECK(wl_session_source_admission_read(f.sessions[0],
+        admission_count_read, &called) == EINVAL && !called);
+    trace();
+    fresh_shape_reached = 0;
+    wl_columnar_session_test_before_fresh_shape = admission_refuse_fresh_read;
+    CHECK(finish(f.sessions[0]) == EINVAL);
+    wl_columnar_session_test_before_fresh_shape = NULL;
+    wl_session_testhook_refuse_source_read(0);
+    CHECK(fresh_shape_reached == 1 && !prepared && !produced && !acked);
+    wl_col_session_t *session = (wl_col_session_t *)f.sessions[0];
+    CHECK(!session->controlled_step && !session->cleanup_active
+        && !session->cleanup_pending);
+    CHECK(!wl_evaluation_control_active_attempt_id(f.control));
+    wl_evaluation_control_report_t report;
+    CHECK(wl_evaluation_control_report(f.control, &report) == ENOENT);
+    state_t empty = {0};
+    expect_events(&f.events[0], &empty, &empty);
+    for (unsigned h = 0; h < 2; ++h) {
+        const col_rel_t *rel = session_find_rel(session, h ? "output" : "mid");
+        CHECK(!rel || !rel->nrows);
+    }
+    step_pair(&f, &empty, true, 2);
+    destroy(&f);
+}
+
+static void
+private_output_cap(void)
+{
+    fixture_t f; init(&f, true);
+    for (unsigned i = 0; i < 2; ++i)
+        CHECK(!wl_session_insert(f.sessions[i], "c",
+            (int64_t[]){7, 207}, 1, 2));
+    f.state.extra = true;
+    ((wl_col_session_t *)f.sessions[0])->join_output_limit = 32;
+    trace();
+    CHECK(finish(f.sessions[0]) == EOVERFLOW);
+    CHECK(prepared == 2 && produced && acked && exchanges);
+    state_t empty = {0};
+    for (unsigned h = 0; h < 2; ++h) {
+        const col_rel_t *rel = session_find_rel(
+            (wl_col_session_t *)f.sessions[0], h ? "output" : "mid");
+        CHECK(!rel || !rel->nrows);
+    }
+    expect_events(&f.events[0], &empty, &empty);
+    wl_evaluation_control_report_t report;
+    CHECK(!wl_evaluation_control_report(f.control, &report));
+    CHECK(report.result == EOVERFLOW && report.execution_status == EOVERFLOW
+        && !report.cleanup_status);
+    CHECK(!wl_evaluation_control_active_attempt_id(f.control));
+    ((wl_col_session_t *)f.sessions[0])->join_output_limit = 100;
+    CHECK(!wl_evaluation_control_reset(f.control));
+    trace();
+    CHECK(!finish(f.sessions[0]));
+    CHECK(prepared == 2 && produced && acked && exchanges);
+    wl_columnar_join_pipeline_test_numeric_checkpoint = NULL;
+    CHECK(!finish(f.sessions[1]));
+    for (unsigned i = 0; i < 2; ++i) {
+        verify(f.sessions[i], &f.state);
+        expect_events(&f.events[i], &empty, &f.state);
+        const col_rel_t *mid = session_find_rel(
+            (wl_col_session_t *)f.sessions[i], "mid");
+        const col_rel_t *output = session_find_rel(
+            (wl_col_session_t *)f.sessions[i], "output");
+        CHECK(mid && mid->nrows == 28 && output && output->nrows == 35);
+    }
+    destroy(&f);
+}
+
 int
 main(int argc, char **argv)
 {
@@ -1291,6 +1391,9 @@ main(int argc, char **argv)
         admission_strata(true, false);
     else if (!strcmp(argv[1], "admission-strata-refusal"))
         admission_strata(false, true);
+    else if (!strcmp(argv[1],
+        "admission-read-failure")) admission_read_failure();
+    else if (!strcmp(argv[1], "private-cap")) private_output_cap();
     else CHECK(false);
     return 0;
 }

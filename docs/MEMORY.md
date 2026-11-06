@@ -6201,3 +6201,94 @@ could abort successful32-head Snapshots. Each disposal still uses its actual
 maintenance owner and existing bounded reader/retirement/refund actions; real
 busy/identity/error returns propagate. No evaluation, Original reset or invented
 receipt completion is introduced by draining the remaining cleanup cursors.
+
+### JOIN static metadata and owner-read SOURCE seams
+
+The C1 public host uses explicit SOURCE mode for STEP/Snapshot static metadata;
+mutation and nonC1 routes select DIRECT before execution. A SOURCE error never
+selects DIRECT. The scalar read class is208/96/80. Its callbacks inspect bounded
+metadata rather than scanning a whole plan, operator list or expression: strata
+advance one callback at a time, and separate callbacks inspect relation shape,
+MAP geometry and the fixed supported expression. The acyclic single-stratum
+arm skips the irrelevant recursive seven/eight-operator matcher using the real
+is_recursive flag; this does not cache or widen Native eligibility. Payload
+initialization, caller return/status branches and test-only fault fronts are
+ordinary source, not part of an opaque callback fee.
+
+Snapshot's actual post-admission state read uses208/160/80, followed immediately
+by the existing190/54/208 no-op BANK footer. A separate no-op after the active
+Original guard pays the outer financier constructor seam. Actual read errors
+retain their semantic status; the error-return footer pays the admitted public
+unwind without executing a direct read or a callback. The fresh-shape read runs
+before canonical publication; its error frees the unpublished allocation.
+
+All three retirement-entry guard callers use the unchanged read-only proof
+through the existing208/144/80 metadata executor on C1. The full guard ceiling79
+includes native thread equality, foreign staging readers and the actual saved
+WORK report proof. Callback fronts5 make84; existing surroundings72 minus old
+constructor23 plus84 and result reserve1 give134/144. This is not the40-action
+read class. Its conservative short-called lower181 is kernel116 plus distinct
+wrapper/payload/call7, BOOT13 and minimum CURRENT45, leaving432−181=251 unused.
+Financial status and action_called are checked separately; the saved action
+status survives the genuine no-op return footer. No Source result replaces
+Native authority, Original status or cleanup ownership.
+
+There are three real no-op entry seams: outer STEP after typed and old-AUTO
+selected-false, controlled STEP after its busy check, and drive after its busy
+check. Every guard lease also ends at its own real no-op before returning.
+The tight ongoing Snapshot route counts both payload associations and the
+actual attempt setter: postguard return3, begin-failure2, staging2, retry3,
+first association5, successor initialization1, recursive selector3,
+successor-mutation selector3, skipped preflight4, absent-step1, final association
+and setter10, drive call4 and busy3 total44. Previous no-op tail48 plus44,
+C1 flag1 and next no-op FIRST162 is255/256; the preceding positive208 owns93
+performed units. The new drive cut to guard FIRST is48+178=226. The metadata
+return-to-own-footer interval is below225 and its return fronts fit CLOSE80.
+These active-route numbers do not price fresh allocation or successor reset as
+an opaque44 action; those branches retain their actual reader, allocator and
+existing transaction/retirement payers.
+
+Fresh admission has three additional actual no-op seams: after successful static
+preflight, before the optional general-shape read and its test hook, and at the
+common successful point before canonical publication. Their complete selected
+windows are238/228/251/227/233, including ten-field read payload initialization,
+actual status/return fronts and test hooks. Snapshot preserves its short-circuit;
+a read failure frees the unpublished descriptor and returns its exact status.
+The fixed expression callback explicitly compares memcmp against zero; its
+expanded ceiling33 remains within the40-action class.
+
+A genuine completed successor transaction already has active unlimited
+maintenance: CUTOFF constructs it before publication, then RETIRE/FINISH drain
+ownership before complete/DONE. Its disposal connector uses a real saved-ID
+maintenance zero after the existing maintenance lookup succeeds. Original BEGIN
+stays outside SOURCE callbacks, and no new Original poll changes pending-denial
+metadata. The successful BEGIN-to-maintenance-zero window is170, paid by the
+preceding208; the failed-BEGIN return uses a real no-op and its shorter branch
+window255. A maintenance-zero error retains the actual transaction/status and
+executes the real return footer.
+
+Only the genuine C1 complete/successor-mutation conjunction selects the three
+additional disposal no-ops: after differential drain0, before committed terminal
+release, and before maintenance FINISH. These flags select payment, never Native
+authority. Existing owner/thread/reader/retirement and reservation checks and
+actions remain outside callbacks. The selected connector windows are190,239,254
+and242 through the final reset-entry no-op. The254 packet spends all eight
+reserved source cells on actual metadata-credit done initialization, arguments,
+call, result store and predicates. FINISH and REPORT are not work checkpoints.
+An empty-head EAGAIN exit has a compatible194-cell DIRTY/public-end packet;
+reserve8 gives202 within208, without combining incompatible getter/closing arms.
+The no-transaction successor instead uses its own235-cell saved-local path.
+
+After successful actual disposal (or the genuine no-transaction completion),
+the old descriptor is inert. Its reset uses SOURCE metadata chunks of at most64
+byte writes under existing208/144/80, with no Native action, Original transition,
+resource destructor or user hook in the callback. The conservative actor84 fits
+CURRENT134/144; actual short-called lower181 leaves at most251 unused. Loop
+return/advance/next-FIRST is248 and final restoration/return-footer is239; the
+single test-only TLS increment gives249/240. The preloop connector is245.
+All saved semantic identity/active/id, observer/general and append fields remain
+outside the cleared storage and restore before further Native use. Unexpected
+financial/noncalled/action errors integrity-abort; no ordinary return exposes a
+partially reset canonical descriptor. NonC1 keeps its original reset. Real
+successor histories assert multiple completed chunks while retaining literal,
+signed/raw, report and callback oracles; the counter is not a cost oracle.
