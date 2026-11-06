@@ -4408,6 +4408,10 @@ typedef struct wl_columnar_relation_append_batch {
     int saved_result;
 } wl_columnar_relation_append_batch_t;
 
+/* Caller-owned generation; a stale ID cannot acquire a writer or debit its successor. */
+int wl_columnar_relation_append_batch_begin_attempt_controlled(
+    wl_columnar_relation_append_batch_t *batch, col_rel_t *r,
+    wl_evaluation_control_t *control, uint64_t attempt_id);
 int wl_columnar_relation_append_batch_begin_controlled(
     wl_columnar_relation_append_batch_t *batch, col_rel_t *r,
     wl_evaluation_control_t *control);

@@ -2306,8 +2306,8 @@ wl_columnar_filter_op_attempt_start_owned(const wl_plan_op_t *op,
     rc = wl_columnar_filter_attempt_tail(control, attempt_id, 11, 0);
     if (rc)
         goto done;
-    rc = wl_columnar_relation_append_batch_begin_controlled(&ctx->batch,
-            *out_slot, control);
+    rc = wl_columnar_relation_append_batch_begin_attempt_controlled(&ctx->batch,
+            *out_slot, control, attempt_id);
     rc = wl_columnar_filter_attempt_return(control, attempt_id, rc);
     if (rc)
         goto done;
@@ -2802,8 +2802,8 @@ wl_columnar_filter_consolidate_attempt_start_owned(const wl_plan_op_t *op,
     rc = wl_columnar_filter_attempt_tail(control, attempt_id, 11, 0);
     if (rc)
         goto done;
-    rc = wl_columnar_relation_append_batch_begin_controlled(&ctx->batch,
-            *out_slot, control);
+    rc = wl_columnar_relation_append_batch_begin_attempt_controlled(&ctx->batch,
+            *out_slot, control, attempt_id);
     rc = wl_columnar_filter_attempt_return(control, attempt_id, rc);
     if (rc)
         goto done;
@@ -3462,8 +3462,8 @@ wl_columnar_filter_map_attempt_start_owned(const wl_plan_op_t *op,
     rc = wl_columnar_filter_attempt_tail(control, attempt_id, 11, 0);
     if (rc)
         goto done;
-    rc = wl_columnar_relation_append_batch_begin_controlled(&ctx->batch,
-            *out_slot, control);
+    rc = wl_columnar_relation_append_batch_begin_attempt_controlled(&ctx->batch,
+            *out_slot, control, attempt_id);
     rc = wl_columnar_filter_attempt_return(control, attempt_id, rc);
     if (rc)
         goto done;

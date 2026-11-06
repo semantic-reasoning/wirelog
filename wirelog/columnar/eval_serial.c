@@ -520,8 +520,9 @@ wl_columnar_eval_serial_framed_attempt_step(
     case WL_COLUMNAR_EVAL_SERIAL_FRAMED_BATCH_BEGIN:
         wl_columnar_eval_serial_framed_pending(ctx, ctx->phase, funding,
             funding_id);
-        return wl_columnar_relation_append_batch_begin_controlled(&ctx->batch,
-                   ctx->candidate, ctx->control);
+        return wl_columnar_relation_append_batch_begin_attempt_controlled(
+            &ctx->batch,
+            ctx->candidate, ctx->control, ctx->attempt_id);
     case WL_COLUMNAR_EVAL_SERIAL_FRAMED_GATHER:
         if (ctx->row == ctx->source.nrows) {
             ctx->phase = WL_COLUMNAR_EVAL_SERIAL_FRAMED_SORTED;

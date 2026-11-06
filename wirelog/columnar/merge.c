@@ -5068,8 +5068,8 @@ wl_columnar_merge_concat_attempt_start_owned(const wl_plan_op_t *op,
     rc = wl_columnar_merge_concat_charge(control, id,
             WL_COLUMNAR_MERGE_CONCAT_WORK);
     if (rc) goto done;
-    rc = wl_columnar_relation_append_batch_begin_controlled(&ctx->batch,
-            *out_slot, control);
+    rc = wl_columnar_relation_append_batch_begin_attempt_controlled(&ctx->batch,
+            *out_slot, control, id);
     rc = wl_columnar_merge_concat_return(control, id, rc);
     if (rc) goto done;
     for (unsigned side = 0; side < 2; ++side) {

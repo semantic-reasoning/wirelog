@@ -2387,8 +2387,10 @@ wl_columnar_join_host_forward(wl_columnar_join_host_t *h)
         wl_columnar_filter_attempt_batch_init(&h->writer);
         wl_columnar_relation_private_batch_drain_init(&h->writer_drain);
         h->writer_initialized = true;
-        rc = wl_columnar_relation_append_batch_begin_controlled(&h->writer,
-                h->output, r->control);
+        rc =
+            wl_columnar_relation_append_batch_begin_attempt_controlled(
+            &h->writer,
+            h->output, r->control, r->attempt_id);
         if (!rc) h->phase = WL_COLUMNAR_JOIN_HOST_GATHER;
         return rc;
     case WL_COLUMNAR_JOIN_HOST_GATHER:

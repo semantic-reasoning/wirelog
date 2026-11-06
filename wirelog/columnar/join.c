@@ -6502,8 +6502,8 @@ wl_columnar_join_op_attempt_start_owned_initialize(const wl_plan_op_t *op,
     rc = wl_columnar_join_attempt_charge(control, id,
             WL_COLUMNAR_JOIN_ATTEMPT_WORK);
     if (rc) goto done;
-    rc = wl_columnar_relation_append_batch_begin_controlled(&ctx->batch,
-            ctx->output, control);
+    rc = wl_columnar_relation_append_batch_begin_attempt_controlled(&ctx->batch,
+            ctx->output, control, id);
     rc = wl_columnar_join_attempt_return(control, id, rc);
     if (rc) goto done;
     uint32_t buckets = 1;
@@ -7127,8 +7127,8 @@ wl_columnar_join_probe_op_attempt_start_owned_initialize(const wl_plan_op_t *op,
     rc = wl_columnar_join_attempt_charge(control, id,
             WL_COLUMNAR_JOIN_ATTEMPT_WORK);
     if (rc) goto done;
-    rc = wl_columnar_relation_append_batch_begin_controlled(&ctx->batch,
-            ctx->output, control);
+    rc = wl_columnar_relation_append_batch_begin_attempt_controlled(&ctx->batch,
+            ctx->output, control, id);
     rc = wl_columnar_join_attempt_return(control, id, rc);
     if (rc) goto done;
     uint32_t buckets = 1;
