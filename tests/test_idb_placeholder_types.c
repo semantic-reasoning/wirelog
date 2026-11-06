@@ -1145,10 +1145,12 @@ test_incremental(void)
 }
 
 /* The plan records a starting schema for pure IDBs only: not for an EDB,
- * an IDB with inline facts, a nullary IDB, or an undeclared IDB whose rule
- * heads disagree on the arity or aggregate.  An undeclared IDB gets its
- * width and no lane types, also when the fusion pass has turned a rule's
- * root into a FLATMAP. */
+ * an IDB with inline facts, or an undeclared IDB whose rule heads disagree
+ * on the arity or aggregate.  An undeclared IDB gets its width and no lane
+ * types, also when the fusion pass has turned a rule's root into a
+ * FLATMAP.  A nullary IDB with a `.decl` gets width 0 and no lane types,
+ * the width a host insert before its first evaluation must match
+ * (#2231). */
 static void
 test_plan_idb_schemas(void)
 {
@@ -1188,6 +1190,7 @@ test_plan_idb_schemas(void)
     const wl_plan_idb_schema_t *b = NULL;
     const wl_plan_idb_schema_t *f = NULL;
     const wl_plan_idb_schema_t *u = NULL;
+    const wl_plan_idb_schema_t *p = NULL;
     bool unexpected = false;
     for (uint32_t i = 0; i < plan->idb_schema_count; i++) {
         const wl_plan_idb_schema_t *e = &plan->idb_schemas[i];
@@ -1197,10 +1200,13 @@ test_plan_idb_schemas(void)
             f = e;
         else if (strcmp(e->name, "u") == 0)
             u = e;
+        else if (strcmp(e->name, "p") == 0)
+            p = e;
         else
             unexpected = true;
     }
-    bool ok = !unexpected && plan->idb_schema_count == 3 && b && f && u
+    bool ok = !unexpected && plan->idb_schema_count == 4 && b && f && u
+        && p && p->declared && p->width == 0 && !p->column_types
         && b->declared && f->declared && !u->declared
         && u->width == 2 && !u->column_types
         && b->width == 2 && b->column_types
