@@ -737,3 +737,95 @@ wl_evaluation_control_source_bank_destroy(
     *slot = NULL;
     return 0;
 }
+
+/* Generation-bound siblings; existing generic transitions remain unchanged. */
+/* Separate fully counted entry. Generic finish ABI/semantics are unchanged. */
+wl_evaluation_control_attempt_finish_result_t
+wl_evaluation_control_finish_attempt(wl_evaluation_control_t *control,
+    const void *owner, uint64_t expected_id, int execution_status,
+    int cleanup_status)
+{
+    wl_evaluation_control_attempt_finish_result_t out = {0};
+    if (!control || !owner || !expected_id) {
+        out.protocol = EINVAL;
+        return out;
+    }
+    wl_mutex_lock(&control->mutex);
+    if (control->owner != owner) {
+        out.protocol = EINVAL;
+        wl_mutex_unlock(&control->mutex);
+        return out;
+    }
+    if (control->attempt_id != expected_id) {
+        out.kind = WL_EVALUATION_CONTROL_ATTEMPT_FINISH_SUCCESSOR_MISMATCH;
+        wl_mutex_unlock(&control->mutex);
+        return out;
+    }
+    if (!control->active) {
+        if (control->completed.attempt_id != expected_id) {
+            out.protocol = EINVAL;
+        } else {
+            out.kind = WL_EVALUATION_CONTROL_ATTEMPT_FINISH_ALREADY_ENDED;
+            out.report = control->completed;
+            out.report_valid = true;
+        }
+        wl_mutex_unlock(&control->mutex);
+        return out;
+    }
+    if (wl_evaluation_control_is_stop(execution_status)) {
+        if (control->stop == WL_EVALUATION_CONTROL_NONE)
+            control->stop = (wl_evaluation_control_stop_t)execution_status;
+        execution_status = 0;
+    }
+    if (execution_status == 0)
+        execution_status = control->accounting_error;
+    int result = execution_status != 0 ? execution_status
+        : cleanup_status != 0 ? cleanup_status : (int)control->stop;
+    control->completed = (wl_evaluation_control_report_t){
+        .attempt_id = control->attempt_id,
+        .limit = control->attempt_limit,
+        .consumed = control->consumed,
+        .stop_reason = control->stop,
+        .execution_status = execution_status,
+        .cleanup_status = cleanup_status,
+        .result = result,
+    };
+    control->active = false;
+    (void)atomic_exchange_explicit(&control->active_attempt_id, 0,
+        memory_order_release);
+    out.kind = WL_EVALUATION_CONTROL_ATTEMPT_FINISH_OWN_FINISHED;
+    out.report = control->completed;
+    out.report_valid = true;
+    wl_mutex_unlock(&control->mutex);
+    return out;
+}
+
+/* Fully counted sibling. The produced ID is copied before mutex release. */
+wl_evaluation_control_attempt_begin_result_t
+wl_evaluation_control_begin_attempt(wl_evaluation_control_t *control,
+    const void *owner)
+{
+    wl_evaluation_control_attempt_begin_result_t out = {0};
+    if (!control || !owner) {
+        out.protocol = EINVAL;
+        return out;
+    }
+    wl_mutex_lock(&control->mutex);
+    int rc = control->owner != owner ? EINVAL : control->active ? EBUSY : 0;
+    if (rc == 0 && control->attempt_id == UINT64_MAX)
+        rc = EOVERFLOW;
+    if (rc == 0) {
+        control->active = true;
+        control->attempt_id++;
+        control->attempt_limit = control->configured_limit;
+        control->consumed = 0;
+        control->stop = WL_EVALUATION_CONTROL_NONE;
+        control->accounting_error = 0;
+        (void)atomic_exchange_explicit(&control->active_attempt_id,
+            control->attempt_id, memory_order_release);
+        out.attempt_id = control->attempt_id;
+    }
+    out.protocol = rc;
+    wl_mutex_unlock(&control->mutex);
+    return out;
+}

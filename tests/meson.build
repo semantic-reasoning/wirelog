@@ -6629,6 +6629,19 @@ test_evaluation_source_bank_exe = executable(
 test('evaluation_source_bank', test_evaluation_source_bank_exe,
      suite: ['unit', 'tsan'], timeout: 60)
 
+# Genuine generations and condition-variable ordered stale-footer histories.
+test_evaluation_attempt_identity_exe = executable(
+  'test_evaluation_attempt_identity',
+  files('test_evaluation_attempt_identity.c'),
+  c_args: ['-DWL_SESSION_TEST_HOOKS=1'],
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
+  link_with: [testlib_prod],
+  install: false,
+)
+test('evaluation_attempt_identity', test_evaluation_attempt_identity_exe,
+     suite: ['unit', 'tsan'], timeout: 60)
+
 # #1984: recognize explicit multiway input occurrences without changing TDD
 # admission. The actual benchmark source prevents a toy-plan-only proof.
 tdd_driver_wrap = host_machine.system() == 'linux'
