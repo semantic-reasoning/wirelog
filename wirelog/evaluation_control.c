@@ -487,6 +487,9 @@ static int
 wl_evaluation_control_source_bank_finish_phase(
     wl_evaluation_control_source_lane_state_t *lane)
 {
+    /* The lane remains active even after a refused payment. This real
+     * financial checkpoint preserves that diagnostic and adds no payment. */
+    (void)wl_evaluation_control_charge_attempt(lane->control, lane->id, 0);
     int finished = wl_evaluation_control_finish(lane->control, lane, 0, 0);
     wl_evaluation_control_report_t report;
     if (wl_evaluation_control_report(lane->control, &report)

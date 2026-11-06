@@ -6044,6 +6044,18 @@ its owning admission slot is cleared before the admission itself is freed.
 Existing qualified mandatory backend/extension retirement keeps its scoped
 contract. These prices do not qualify other callbacks or public queries.
 
+The common BANK phase finisher checkpoints its still-active saved generation
+immediately before FINISH. A refused positive payment leaves that same phase
+active with a sticky financial stop; the zero payment preserves its diagnostic
+and leaves both consumed work and the private charge journal unchanged. The
+four ordinary call fronts fit the existing finisher ceiling31: its prior
+literal body23 becomes27. FINISH and REPORT remain ordinary settlement work,
+not checkpoints. This narrows the settlement-to-caller interval without
+exporting a controller, changing a positive fee, or granting native authority.
+The lexical runner's remaining settlement, unbind, unlock and caller return
+fronts are bounded by48 after this check. A containing caller still needs its
+own bound; the cut alone does not qualify a Snapshot loop or a native action.
+
 The reusable internal runner requires a separately source-qualified private
 immutable policy and bounded SOURCE-only action. Positive fees no larger than
 256 and finite capacity alone prove no source fit. Complete caller/context,
