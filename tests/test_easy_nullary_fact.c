@@ -421,6 +421,148 @@ done:
     }
 }
 
+/* One step of a cycle script: CY_EDGE inserts e(@a, @b), CY_FLAG inserts
+ * and CY_UNFLAG removes the zero-width row of `flag`, and CY_STEP steps
+ * and expects @t rows of t and @fp of fp.  Without a callback at two or
+ * more workers a step with @strategy must have run it on at least two
+ * workers. */
+enum { CY_END, CY_EDGE, CY_FLAG, CY_UNFLAG, CY_STEP };
+
+typedef struct {
+    int op;
+    int64_t a;
+    int64_t b;
+    int t;
+    int fp;
+    const char *strategy;
+} cycle_op_t;
+
+#define CY_E(a, b)         { CY_EDGE, a, b, 0, 0, NULL }
+#define CY_F               { CY_FLAG, 0, 0, 0, 0, NULL }
+#define CY_U               { CY_UNFLAG, 0, 0, 0, 0, NULL }
+#define CY_S(t, fp, strat) { CY_STEP, 0, 0, t, fp, strat }
+#define CY_X               { CY_END, 0, 0, 0, 0, NULL }
+
+/* `flag()` both heads a rule of a recursive stratum and is read by it.
+ * Holding a row, it matched neither worker branch for the stratum's
+ * relations and was handed to every worker as a read-only view; the
+ * first time a worker derived `flag()` again, the view refused the write
+ * and the step returned WIRELOG_ERR_EXEC. */
+static void
+check_cycle(const char *name, const char *src, const cycle_op_t *ops,
+    uint32_t workers, bool callback)
+{
+    wirelog_easy_open_opts_t opts = WIRELOG_EASY_OPEN_OPTS_INIT;
+    wirelog_easy_session_t *s = NULL;
+    wl_col_session_t *inner = NULL;
+    char why[160] = "";
+    int64_t unused = 0;
+
+    tests_run++;
+    printf("  [%d] %s (%u worker%s%s)", tests_run, name, workers,
+        workers == 1 ? "" : "s", callback ? ", callback" : "");
+    opts.num_workers = workers;
+    opts.eager_build = true;
+    if (wirelog_easy_open_opts(src, &opts, &s) != WIRELOG_OK) {
+        snprintf(why, sizeof(why), "open");
+        goto done;
+    }
+    if (callback && wirelog_easy_set_delta_cb(s, ignore_delta, NULL)
+        != WIRELOG_OK) {
+        snprintf(why, sizeof(why), "set_delta_cb");
+        goto done;
+    }
+    inner = COL_SESSION(wirelog_easy_testhook_inner(s));
+    for (uint32_t i = 0; ops[i].op != CY_END && !why[0]; i++) {
+        const cycle_op_t *o = &ops[i];
+        int64_t edge[2] = { o->a, o->b };
+        int rc = WIRELOG_OK;
+        int t;
+        int fp;
+
+        switch (o->op) {
+        case CY_EDGE:
+            rc = wirelog_easy_insert(s, "e", edge, 2);
+            break;
+        case CY_FLAG:
+            rc = wirelog_easy_insert(s, "flag", &unused, 0);
+            break;
+        case CY_UNFLAG:
+            rc = wirelog_easy_remove(s, "flag", &unused, 0);
+            break;
+        default:
+            inner->tdd_audit.enabled = true;
+            inner->tdd_audit.strategy = NULL;
+            inner->tdd_audit.selected_workers = 0;
+            rc = wirelog_easy_step(s);
+            if (rc != WIRELOG_OK)
+                break;
+            if (o->strategy && workers > 1 && !callback
+                && (!inner->tdd_audit.strategy
+                || strcmp(inner->tdd_audit.strategy, o->strategy) != 0
+                || inner->tdd_audit.selected_workers < 2)) {
+                snprintf(why, sizeof(why), "op %u: ran %s on %u, want %s",
+                    i, inner->tdd_audit.strategy
+                    ? inner->tdd_audit.strategy : "none",
+                    inner->tdd_audit.selected_workers, o->strategy);
+                break;
+            }
+            t = owner_count(s, "t");
+            fp = owner_count(s, "fp");
+            if (t != o->t || fp != o->fp)
+                snprintf(why, sizeof(why),
+                    "op %u: t has %d rows and fp %d, want %d and %d", i, t,
+                    fp, o->t, o->fp);
+            break;
+        }
+        if (rc != WIRELOG_OK && !why[0])
+            snprintf(why, sizeof(why), "op %u: rc %d", i, rc);
+    }
+done:
+    if (s)
+        wirelog_easy_close(s);
+    if (why[0]) {
+        tests_failed++;
+        printf(" ... FAIL: %s\n", why);
+    } else {
+        tests_passed++;
+        printf(" ... PASS\n");
+    }
+}
+
+#define CYCLE_HEAD ".decl flag()\n.decl fp(x: int64)\n" EDGES \
+        "fp(100) :- flag().\n"
+
+static const cycle_op_t cycle_once[] = { CY_S(6, 1, "aligned"), CY_X };
+
+static const cycle_op_t cycle_grows[] = {
+    CY_S(6, 1, "aligned"), CY_E(4, 5), CY_S(10, 1, "aligned"), CY_E(5, 6),
+    CY_S(15, 1, "aligned"), CY_X
+};
+
+static const cycle_op_t cycle_host[] = {
+    CY_S(0, 0, NULL), CY_F, CY_S(6, 1, "aligned"), CY_X
+};
+
+/* Removing the input row retracts the cycle: nothing else supports
+ * t(1, 2), so t(1, 4) and with it the derived `flag()` go too. */
+static const cycle_op_t cycle_retract[] = {
+    CY_S(6, 1, "aligned"), CY_U, CY_S(0, 0, "replicate"), CY_F,
+    CY_S(6, 1, "aligned"), CY_X
+};
+
+static const cycle_op_t cycle_bdx[] = { CY_S(6, 1, "bdx"), CY_X };
+
+static const cycle_op_t cycle_replicate[] = {
+    CY_S(6, 1, "replicate"), CY_X
+};
+
+/* `!flag()` in a second recursive stratum; its strategy is not asserted,
+ * only the rows. */
+static const cycle_op_t cycle_negated[] = {
+    CY_S(3, 1, NULL), CY_E(4, 5), CY_S(4, 1, NULL), CY_X
+};
+
 int
 main(void)
 {
@@ -525,6 +667,67 @@ main(void)
                 40, n, c, "owner_tiny_frontier");
             check_owner("owner cycle through host flag(), long chain", true,
                 40, n, c, "owner_tiny_frontier");
+        }
+    }
+    for (uint32_t w = 0; w < sizeof(workers) / sizeof(workers[0]); w++) {
+        for (int cb = 0; cb < 2; cb++) {
+            uint32_t n = workers[w];
+            bool c = cb != 0;
+
+            check_cycle("cycle through flag()", CYCLE_HEAD "flag().\n"
+                "t(x, y) :- e(x, y), flag().\n"
+                "t(x, z) :- e(x, y), t(y, z).\n"
+                "flag() :- t(1, 4).\n", cycle_once, n, c);
+            check_cycle("cycle through flag(), other body order",
+                CYCLE_HEAD "flag().\n"
+                "t(x, y) :- flag(), e(x, y).\n"
+                "t(x, z) :- t(x, y), e(y, z).\n"
+                "flag() :- t(1, 4).\n", cycle_once, n, c);
+            check_cycle("cycle through flag(), wildcard rule",
+                CYCLE_HEAD "flag().\n"
+                "t(x, y) :- e(x, y), flag().\n"
+                "t(x, z) :- e(x, y), t(y, z).\n"
+                "flag() :- t(_, 4).\n", cycle_once, n, c);
+            check_cycle("two-sided cycle through flag()",
+                CYCLE_HEAD "flag().\n"
+                "t(x, y) :- e(x, y), flag().\n"
+                "t(x, z) :- t(x, y), e(y, z).\n"
+                "t(x, z) :- e(x, y), t(y, z).\n"
+                "flag() :- t(1, 4).\n", cycle_once, n, c);
+            check_cycle("cycle through flag(), growing chain",
+                CYCLE_HEAD "flag().\n"
+                "t(x, y) :- e(x, y), flag().\n"
+                "t(x, z) :- e(x, y), t(y, z).\n"
+                "flag() :- t(1, 4).\n", cycle_grows, n, c);
+            check_cycle("cycle through host flag()", CYCLE_HEAD
+                "t(x, y) :- e(x, y), flag().\n"
+                "t(x, z) :- e(x, y), t(y, z).\n"
+                "flag() :- t(1, 4).\n", cycle_host, n, c);
+            check_cycle("cycle through flag(), removed and reinserted",
+                CYCLE_HEAD "flag().\n"
+                "t(x, y) :- e(x, y), flag().\n"
+                "t(x, z) :- e(x, y), t(y, z).\n"
+                "flag() :- t(1, 4).\n", cycle_retract, n, c);
+            check_cycle("self-join cycle through flag()",
+                CYCLE_HEAD "flag().\n"
+                "t(x, y) :- e(x, y), flag().\n"
+                "t(x, z) :- t(x, y), t(y, z).\n"
+                "flag() :- t(1, 4).\n", cycle_bdx, n, c);
+            check_cycle("cycle through flag() in the recursive rule",
+                CYCLE_HEAD "flag().\n"
+                "t(x, y) :- e(x, y), flag().\n"
+                "t(x, z) :- t(x, y), e(y, z), flag().\n"
+                "flag() :- t(1, 4).\n", cycle_replicate, n, c);
+            check_cycle("!flag() beside a cycle through flag()",
+                ".decl flag()\n.decl fp(x: int64)\n"
+                ".decl u(x: int64, y: int64)\n" EDGES
+                "fp(100) :- flag().\nflag().\n"
+                "u(x, y) :- e(x, y), flag().\n"
+                "u(x, z) :- u(x, y), e(y, z).\n"
+                "flag() :- u(1, 4).\n"
+                "t(x, y) :- e(x, y).\n"
+                "t(x, z) :- t(x, y), e(y, z), !flag().\n",
+                cycle_negated, n, c);
         }
     }
     printf("%d run, %d passed, %d failed\n", tests_run, tests_passed,
