@@ -992,7 +992,7 @@ wl_columnar_eval_plan_numeric_fund(wl_evaluation_control_t *funding,
     if (!funding || funding == operation || !id
         || wl_evaluation_control_active_attempt_id(funding) != id)
         return EINVAL;
-    int rc = wl_evaluation_control_charge(funding,
+    int rc = wl_evaluation_control_charge_attempt(funding, id,
             WL_COLUMNAR_EVAL_PLAN_NUMERIC_HOST_WORK);
     if (rc) return rc;
     return wl_evaluation_control_active_attempt_id(funding) == id ? 0 : EINVAL;
@@ -2250,7 +2250,7 @@ wl_columnar_eval_plan_composed_charge(wl_evaluation_control_t *control,
     if (!control || !id ||
         wl_evaluation_control_active_attempt_id(control) != id)
         return EINVAL;
-    int rc = wl_evaluation_control_charge(control, work);
+    int rc = wl_evaluation_control_charge_attempt(control, id, work);
     if (rc) return rc;
     return wl_evaluation_control_active_attempt_id(control) == id ? 0 : EINVAL;
 }
@@ -2265,7 +2265,7 @@ wl_columnar_eval_plan_composed_fund(wl_evaluation_control_t *funding,
     if (!funding || funding == operation || !id
         || wl_evaluation_control_active_attempt_id(funding) != id)
         return EINVAL;
-    return wl_evaluation_control_charge(funding,
+    return wl_evaluation_control_charge_attempt(funding, id,
                WL_COLUMNAR_EVAL_PLAN_NUMERIC_HOST_WORK);
 }
 
