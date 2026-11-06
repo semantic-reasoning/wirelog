@@ -7095,6 +7095,16 @@ test_evaluation_join_host_policies_exe = executable(
 test('evaluation_join_host_policies', test_evaluation_join_host_policies_exe,
      suite: ['unit', 'tsan', 'evaluation_join_hosts'], timeout: 60)
 
+test_evaluation_join_host_strict_exe = executable(
+  'test_evaluation_join_host_strict', files('test_evaluation_join_host_strict.c'),
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
+  c_args: ['-DWL_SESSION_TEST_HOOKS=1'],
+  link_with: [testlib_prod],
+)
+test('evaluation_join_host_strict', test_evaluation_join_host_strict_exe,
+     suite: ['unit', 'tsan', 'evaluation_join_hosts'], timeout: 60)
+
 # #2297: transaction-owned JOIN sources across real public operations.
 test_evaluation_join_host_lifecycle_exe = executable(
   'test_evaluation_join_host_lifecycle', files('test_evaluation_join_host_lifecycle.c'),
@@ -7103,7 +7113,7 @@ test_evaluation_join_host_lifecycle_exe = executable(
   c_args: ['-DWL_SESSION_TEST_HOOKS=1'],
   link_with: [testlib_prod],
 )
-foreach join_lifecycle_case : ['successors', 'snapshots', 'recovery', 'funding', 'snapshot-recovery', 'appends']
+foreach join_lifecycle_case : ['successors', 'snapshots', 'recovery', 'funding', 'snapshot-recovery', 'appends', 'strict']
   test('evaluation_join_host_lifecycle_' + join_lifecycle_case,
        test_evaluation_join_host_lifecycle_exe, args: [join_lifecycle_case],
        suite: ['unit', 'tsan', 'evaluation_join_hosts'], timeout: 60)

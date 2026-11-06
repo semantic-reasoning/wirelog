@@ -85,7 +85,7 @@ check_rows(wl_session_t *session, bool filtered, bool reject)
 typedef enum { DIRECT, FILTERED, FILTERED_EMPTY, MATERIALIZED_EMPTY } shape_t;
 
 static void
-run_cap(shape_t shape, unsigned limit, unsigned stop)
+run_cap(shape_t shape, unsigned limit, unsigned stop, bool strict)
 {
     bool filtered = shape != DIRECT, reject = shape >= FILTERED_EMPTY;
     bool materialized = shape == MATERIALIZED_EMPTY;
@@ -96,7 +96,7 @@ run_cap(shape_t shape, unsigned limit, unsigned stop)
         materialized ? ",x>y+100" : filtered ? ",x<y" : "");
     snprintf(cap, sizeof(cap), "%u", limit);
     configure("WIRELOG_JOIN_BATCH_BYTES", "64");
-    configure("WIRELOG_JOIN_BATCH_STRICT", NULL);
+    configure("WIRELOG_JOIN_BATCH_STRICT", strict ? "1" : NULL);
     configure("WIRELOG_JOIN_OUTPUT_LIMIT", cap);
     wirelog_error_t error;
     wirelog_program_t *program = wirelog_parse_string(source, &error);
@@ -185,18 +185,21 @@ run_cap(shape_t shape, unsigned limit, unsigned stop)
 int
 main(void)
 {
-    for (unsigned filtered = 0; filtered < 2; ++filtered) {
-        unsigned count = filtered ? 28 : 64;
-        shape_t shape = filtered ? FILTERED : DIRECT;
-        run_cap(shape, 0, 0);
-        run_cap(shape, 1, 0);
-        run_cap(shape, count - 1, 0);
-        run_cap(shape, count, 0);
-        run_cap(shape, count + 1, 0);
+    for (unsigned strict = 0; strict < 2; ++strict) {
+        for (unsigned filtered = 0; filtered < 2; ++filtered) {
+            unsigned count = filtered ? 28 : 64;
+            shape_t shape = filtered ? FILTERED : DIRECT;
+            run_cap(shape, 0, 0, strict);
+            run_cap(shape, 1, 0, strict);
+            run_cap(shape, count - 1, 0, strict);
+            run_cap(shape, count, 0, strict);
+            run_cap(shape, count + 1, 0, strict);
+        }
+        run_cap(FILTERED_EMPTY, 1, 0, strict);
+        run_cap(DIRECT, 1, WL_COLUMNAR_JOIN_PIPELINE_TEST_BEFORE_ACK, strict);
+        run_cap(DIRECT, 1, WL_COLUMNAR_JOIN_PIPELINE_TEST_AFTER_ACK, strict);
     }
-    run_cap(FILTERED_EMPTY, 1, 0);
-    run_cap(MATERIALIZED_EMPTY, 1, 0);
-    run_cap(DIRECT, 1, WL_COLUMNAR_JOIN_PIPELINE_TEST_BEFORE_ACK);
-    run_cap(DIRECT, 1, WL_COLUMNAR_JOIN_PIPELINE_TEST_AFTER_ACK);
+    run_cap(MATERIALIZED_EMPTY, 1, 0, false);
+    configure("WIRELOG_JOIN_BATCH_STRICT", NULL);
     return 0;
 }
