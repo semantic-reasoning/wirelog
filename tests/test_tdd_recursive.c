@@ -5690,6 +5690,38 @@ done:
 }
 #endif
 
+/* #2231: the owner strategy builds a dedup set for every relation of the
+ * stratum before its workers run.  The builder refused a zero-column
+ * relation holding rows, which has no column storage, so a stratum
+ * reading `flag()` seeded by a fact failed before any worker ran. */
+static void
+test_dedup_set_init_nullary(void)
+{
+    TEST("dedup set builds over a zero-width relation with a row");
+
+    const int64_t unused[1] = { 0 };
+    col_rel_t *flag = col_rel_new_auto("flag", 0);
+    bool denied = false;
+    int rc;
+
+    if (!flag || col_rel_set_schema(flag, 0, NULL) != 0
+        || col_rel_append_rows_atomic(flag, unused, 1, 0, &denied) != 0
+        || flag->nrows != 1) {
+        col_rel_destroy(flag);
+        FAIL("zero-width dedup setup");
+        return;
+    }
+    rc = wl_columnar_eval_dedup_set_init_from_rel(flag);
+    if (rc != 0 || flag->dedup_count != 1) {
+        printf(" [rc %d, %u entries]", rc, flag->dedup_count);
+        col_rel_destroy(flag);
+        FAIL("dedup set refused or miscounted the zero-width row");
+        return;
+    }
+    col_rel_destroy(flag);
+    PASS();
+}
+
 int
 main(void)
 {
@@ -5806,6 +5838,7 @@ main(void)
     test_tdd_reset_restore_transaction();
     test_tdd_save_restore_nullary();
 #endif
+    test_dedup_set_init_nullary();
 #ifdef WL_TEST_TDD_MERGE
     test_tdd_merge_growth_admission();
     test_tdd_merge_transactional_publication();

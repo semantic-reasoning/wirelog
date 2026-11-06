@@ -451,7 +451,9 @@ wl_columnar_eval_dedup_set_init_from_rel(col_rel_t *r)
         return EBUSY;
     if (r->nrows > UINT32_MAX / 2u)
         return EOVERFLOW;
-    if (r->nrows > r->capacity || (r->nrows && !r->columns))
+    /* A zero-column relation's rows have no columns to read; each hashes
+     * as the empty row (#2231). */
+    if (r->nrows > r->capacity || (r->nrows && r->ncols && !r->columns))
         return EINVAL;
     if (r->nrows)
         for (uint32_t c = 0; c < r->ncols; c++)

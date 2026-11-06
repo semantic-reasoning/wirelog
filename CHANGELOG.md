@@ -248,6 +248,18 @@ All notable changes to wirelog are documented in this file.
 
 ### Fixed
 
+- **The owner strategy no longer refuses a zero-column relation that holds a
+  row while setting up its workers** (#2231): when such a relation, for
+  example `flag()` seeded by `flag().` or `wirelog_easy_insert`, belongs to
+  a recursive stratum, as in `t(1, 2) :- flag().`,
+  `t(x, z) :- t(x, y), e(y, z).` and `flag() :- t(1, 4).`, a step without a
+  delta callback that chose the owner strategy on two or more workers
+  returned `WIRELOG_ERR_EXEC` while setting up: the owner strategy's dedup
+  set refused a zero-column relation holding rows. It no longer refuses it,
+  so that program derives the same rows as on one worker, and when such a
+  step falls back through the owner_tiny_frontier replay the relation keeps
+  its rows.
+
 - **A host row can be inserted into a declared rule head before the first
   step** (#2231): a session registers a rule head without an inline fact
   only when evaluation first runs its stratum, so before that
