@@ -3117,16 +3117,20 @@ test_fact_arity_zero_param_decl_rejected(void)
     }
 
     /* A zero-arity fact against a zero-column .decl matches and is
-     * accepted.  Note what "accepted" means here: collect_fact computes
-     * needed = fact_count * 0 == 0 and never allocates, so fact_data stays
-     * NULL and wl_session_load_facts skips the relation entirely.  The fact
-     * is silently *dropped*, and p() evaluates to false -- pre-existing
-     * behaviour this check neither causes nor fixes.  Do not read this test
-     * as evidence that zero-arity facts work. */
+     * accepted, and it is kept: fact loading skips a relation whose
+     * fact_data is NULL, so a zero-width fact must still leave a buffer
+     * behind (#2231).  test_easy_nullary_fact.c checks that the fact is
+     * seeded and derives. */
     struct wirelog_program *ok = make_program(".decl p()\n"
             "p().\n");
     if (!ok) {
         FAIL("p(). against .decl p() should be accepted");
+        return;
+    }
+    if (ok->relation_count != 1 || ok->relations[0].fact_count != 1
+        || !ok->relations[0].fact_data) {
+        wl_ir_program_free(ok);
+        FAIL("p(). should leave one fact with a non-NULL buffer");
         return;
     }
     wl_ir_program_free(ok);
@@ -3677,6 +3681,52 @@ test_api_get_facts(void)
     PASS();
 }
 
+static void
+test_api_get_facts_nullary(void)
+{
+    TEST("wirelog_program_get_facts on a zero-column relation (#2231)");
+
+    wirelog_program_t *prog
+        = wirelog_parse_string(".decl flag()\n"
+            ".decl none()\n"
+            "flag().\n"
+            "flag().\n",
+            NULL);
+    if (!prog) {
+        FAIL("program is NULL");
+        return;
+    }
+
+    int64_t *data = NULL;
+    uint32_t num_rows = 0, num_cols = 0;
+    int rc
+        = wirelog_program_get_facts(prog, "flag", &data, &num_rows, &num_cols);
+    if (rc != 0 || !data || num_rows != 2 || num_cols != 0) {
+        char buf[96];
+        snprintf(buf, sizeof(buf),
+            "expected rc 0, data, 2x0; got rc %d, data %s, %ux%u", rc,
+            data ? "set" : "NULL", num_rows, num_cols);
+        free(data);
+        wirelog_program_free(prog);
+        FAIL(buf);
+        return;
+    }
+    free(data);
+
+    /* A zero-column relation with no fact still reports "no facts". */
+    data = NULL;
+    rc = wirelog_program_get_facts(prog, "none", &data, &num_rows, &num_cols);
+    if (rc != 1 || data) {
+        free(data);
+        wirelog_program_free(prog);
+        FAIL("relation without facts should return 1");
+        return;
+    }
+
+    wirelog_program_free(prog);
+    PASS();
+}
+
 /*
  * The same public reader against a relation with an `inline` compound
  * column -- the case the other three get_facts tests cannot reach, because
@@ -4165,6 +4215,7 @@ main(void)
 
     /* Fact extraction API */
     test_api_get_facts();
+    test_api_get_facts_nullary();
     test_api_get_facts_inline_compound_physical_width();
     test_api_get_facts_no_facts();
     test_api_get_facts_unknown_relation();

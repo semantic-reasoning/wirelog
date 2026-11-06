@@ -208,6 +208,10 @@ wirelog_program_get_intern(const wirelog_program_t *prog);
  * no ABI break is involved, but this is a semantic change for an embedder
  * that had treated the two as interchangeable: index by @p num_cols (#985).
  *
+ * For a zero-column relation (`.decl flag()` with `flag().`) a successful
+ * call reports @p num_cols 0 and @p num_rows equal to the number of facts
+ * written, repeats included, and still returns a buffer the caller frees.
+ *
  * @param prog       Compiled program
  * @param relation   Relation name (e.g., "edge")
  * @param data       Output: allocated array of int64_t values (caller frees)

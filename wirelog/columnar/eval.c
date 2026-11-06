@@ -4100,7 +4100,10 @@ tdd_merge_relation_results(wl_col_session_t *coord, col_rel_t **target_io,
         return 0;
     }
 
-    if (target && target->ncols != 0
+    /* A zero-column target that already holds rows is a real nullary
+     * relation, such as one seeded by `flag().` with a rule for `flag()`
+     * as well, not an empty placeholder: keep its rows (#2231). */
+    if (target && (target->ncols != 0 || target->nrows != 0)
         && !tdd_idb_adopts_first_rows(coord, rel_name, target)) {
         rc = wl_columnar_relation_deep_copy_governed(target, &candidate,
                 coord ? coord->memory_governor : target->memory_governor);
@@ -4189,6 +4192,11 @@ tdd_merge_relation_results(wl_col_session_t *coord, col_rel_t **target_io,
         }
         candidate->nrows = out;
         candidate->sorted_nrows = out;
+        wl_columnar_relation_touch_view(candidate);
+    } else if (candidate->nrows > 1 && candidate->ncols == 0) {
+        /* Zero-width rows are all equal, so the set holds one of them. */
+        candidate->nrows = 1;
+        candidate->sorted_nrows = 1;
         wl_columnar_relation_touch_view(candidate);
     }
 
@@ -5545,6 +5553,16 @@ tdd_init_workers_hybrid(const wl_plan_stratum_t *sp, wl_col_session_t *coord,
                 }
                 if (rel->ncols > 0) {
                     rc = col_rel_install_shared_view(view, rel);
+                } else if (rel->nrows > 0) {
+                    /* A zero-column relation has no key to partition by
+                     * and no columns to share; a keyless join needs its
+                     * rows on every worker, or `flag()` reads as empty
+                     * there (#2231). */
+                    rc = col_rel_append_all(view, rel, NULL);
+                    if (rc != 0) {
+                        col_rel_destroy(view);
+                        break;
+                    }
                 } else {
                     rc = 0;
                 }

@@ -23,9 +23,10 @@
  * WIRELOG_NONREC_TDD_MIN_ROWS_PER_WORKER=1 lower the rows a worker needs, so
  * a step whose driver holds enough rows may use workers on these small
  * inputs; whether a given step does depends on its row count, and no case
- * asserts it.  The filtered head `ok() :- e(1).` passed before this change
- * too, because the head was then stored at width one; it guards the
- * zero-width form a later change gives it.
+ * asserts it.  The filtered head `ok() :- e(1).` was stored at width one
+ * until the FLATMAP lowering emitted a zero-column projection for it
+ * (#2231).  Its negation case fails without that lowering; the case where
+ * it feeds a unary relation passes at either width.
  *
  * The plan-level cases drive col_stratum_step_with_delta directly: once
  * without a delta observer, which takes the direct emission path, and once
@@ -503,6 +504,8 @@ main(void)
                 filtered_src, w, nc != 0);
             test_negation_flip("unfiltered nullary head, !ok() flips",
                 unfiltered_src, w, nc != 0);
+            test_negation_flip("filtered nullary head, !ok() flips",
+                filtered_src, w, nc != 0);
         }
     }
     test_direct_emission();

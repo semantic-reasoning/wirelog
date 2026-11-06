@@ -2118,8 +2118,18 @@ translate_ir_node(const wirelog_ir_node_t *node, op_list_t *ops,
                 return -1;
         }
 
-        /* MAP op (from project_indices/project_count) */
-        if (node->project_count > 0) {
+        /* MAP op (from project_indices/project_count).  A zero-column
+         * head still gets its MAP, as the PROJECT case emits one: without
+         * it the filtered rows reached the head at the body's width, and a
+         * nullary relation with both a fact and such a rule failed when
+         * the two widths met (#2231). */
+        if (node->project_count == 0) {
+            wl_plan_op_t *map = op_list_push(ops);
+            if (!map)
+                return -1;
+            map->op = WL_PLAN_OP_MAP;
+            map->project_count = 0;
+        } else {
             wl_plan_op_t *map = op_list_push(ops);
             if (!map)
                 return -1;

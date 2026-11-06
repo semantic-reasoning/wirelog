@@ -842,8 +842,14 @@ collect_fact(struct wirelog_program *prog,
 
     uint32_t ncols = fact_node->child_count;
 
-    /* Grow fact_data buffer if needed */
+    /* Grow fact_data buffer if needed.  A zero-column fact needs no slots,
+     * but it still gets a buffer of one: readers take fact_data != NULL to
+     * mean the relation has facts, and wl_session_load_facts skips a
+     * relation whose buffer is NULL, so an unallocated buffer dropped
+     * `flag().` (#2231).  The extra slot is never read. */
     uint32_t needed = (rel->fact_count + 1) * ncols;
+    if (needed == 0)
+        needed = 1;
     if (needed > rel->fact_capacity) {
         uint32_t new_cap
             = rel->fact_capacity == 0 ? ncols * 8 : rel->fact_capacity * 2;
@@ -853,6 +859,8 @@ collect_fact(struct wirelog_program *prog,
             = (int64_t *)realloc(rel->fact_data, new_cap * sizeof(int64_t));
         if (!new_data)
             return -1;
+        if (ncols == 0)
+            new_data[0] = 0;
         rel->fact_data = new_data;
         rel->fact_capacity = new_cap;
     }

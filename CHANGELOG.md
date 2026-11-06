@@ -248,6 +248,22 @@ All notable changes to wirelog are documented in this file.
 
 ### Fixed
 
+- **Inline facts of zero-column relations are seeded** (#2231): `flag().`
+  against `.decl flag()`, or with no `.decl` for `flag`, was accepted but
+  never loaded, so `p(100) :- flag().` derived nothing and `!flag()` held.
+  The fact now seeds one zero-width row, and repeating it derives the same
+  rows. A recursive stratum that ran its aligned, owner or bdx strategy on
+  two or more workers also gave every worker an empty copy of a zero-column
+  relation, so a closure guarded by `flag()` lost rows and one guarded by
+  `!flag()` gained them, whether the row came from an inline fact or from
+  `wirelog_easy_insert`; each worker now gets the rows. A rule for a
+  zero-column head whose body filters, such as `ok() :- e(1).`, derived its
+  body's row (`ok(1)`) instead of a zero-width one. A zero-column relation
+  with both a fact and such a rule now evaluates on one or more workers.
+  `wirelog_program_get_facts` on a zero-column relation no longer passes a
+  NULL source to `memcpy`; it returns 0 with `num_cols` 0, `num_rows` equal
+  to the number of facts written and a buffer the caller frees.
+
 - **A zero-column rule head is retracted under a delta callback** (#2231):
   with `wirelog_easy_set_delta_cb` set, a step snapshots each head before
   re-deriving it, and the snapshot skipped zero-column relations. A
