@@ -1996,7 +1996,8 @@ wl_columnar_expr_attempt_charge(wl_evaluation_control_t *control,
     uint64_t attempt_id, uint64_t work)
 {
     int rc = wl_columnar_expr_attempt_guard(control, attempt_id);
-    return rc ? rc : wl_evaluation_control_charge(control, work);
+    return rc ? rc : wl_evaluation_control_charge_attempt(control, attempt_id,
+               work);
 }
 
 static int

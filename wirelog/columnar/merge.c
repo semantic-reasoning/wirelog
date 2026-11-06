@@ -4680,7 +4680,8 @@ wl_columnar_merge_concat_charge(wl_evaluation_control_t *control, uint64_t id,
     if (!control || !id
         || wl_evaluation_control_active_attempt_id(control) != id)
         return EINVAL;
-    return wl_evaluation_control_charge(control, work);
+    return wl_evaluation_control_charge_attempt(control, id,
+               work);
 }
 
 static int

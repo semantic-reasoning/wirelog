@@ -1782,7 +1782,8 @@ wl_columnar_filter_attempt_charge(wl_evaluation_control_t *control,
     uint64_t id, uint64_t work)
 {
     int rc = wl_columnar_filter_attempt_guard(control, id);
-    return rc ? rc : wl_evaluation_control_charge(control, work);
+    return rc ? rc : wl_evaluation_control_charge_attempt(control, id,
+               work);
 }
 
 static int

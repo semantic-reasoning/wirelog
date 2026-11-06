@@ -1318,7 +1318,8 @@ wl_columnar_eval_plan_numeric_forward(
 {
     if (!record->control || wl_evaluation_control_active_attempt_id(
             record->control) != record->attempt_id) return EINVAL;
-    int rc = wl_evaluation_control_charge(record->control,
+    int rc = wl_evaluation_control_charge_attempt(record->control,
+            record->attempt_id,
             WL_COLUMNAR_EVAL_PLAN_NUMERIC_FORWARD_WORK);
     if (rc) return rc;
     return wl_evaluation_control_active_attempt_id(record->control)
