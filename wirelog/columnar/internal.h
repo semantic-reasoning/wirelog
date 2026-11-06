@@ -3571,6 +3571,8 @@ int wl_columnar_eval_stack_cleanup_begin_receipted_attempt_controlled(
 int wl_columnar_eval_stack_cleanup_receipt_cancel_begin(
     wl_columnar_eval_stack_cleanup_frame_t *,
     const wl_columnar_eval_cleanup_receipt_key_t *);
+bool wl_columnar_eval_stack_cleanup_receipt_key_protected(
+    wl_columnar_eval_stack_cleanup_frame_t *);
 int wl_columnar_eval_stack_cleanup_receipt_key_for_frame(
     wl_columnar_eval_stack_cleanup_frame_t *,
     wl_columnar_eval_cleanup_receipt_key_t *);
@@ -6303,6 +6305,11 @@ typedef struct wl_columnar_eval_serial_framed_host_request
 /* Raw synchronous calls pass NULL request. Controlled calls require the aware
  * one-action host contract defined after the framed parent below. */
 int
+wl_columnar_eval_serial_framed_relation_source(const wl_plan_relation_t *,
+    wl_col_session_t *, bool,
+    const wl_columnar_eval_serial_framed_host_request_t *,
+    wl_session_source_finance_t *);
+int
 wl_columnar_eval_serial_framed_relation(const wl_plan_relation_t *rp,
     wl_col_session_t *sess, bool recursive,
     const wl_columnar_eval_serial_framed_host_request_t *request);
@@ -8256,6 +8263,7 @@ typedef struct wl_columnar_eval_serial_framed_attempt {
     bool source_initialized, batch_initialized, batch_done;
     bool candidate_owned, materialized, committed, pending_inner_consume;
     bool close_proven, abort_supported, abort_requested;
+    bool native_cleanup;
     bool controlled_materialized_batch_fallback;
     const wl_columnar_eval_private_bindings_t *private_bindings;
     col_rel_t **capture_out;
@@ -8482,7 +8490,8 @@ typedef enum {
     WL_COLUMNAR_EVAL_SERIAL_FRAMED_STATUS,
     WL_COLUMNAR_EVAL_SERIAL_FRAMED_ABORT,
     WL_COLUMNAR_EVAL_SERIAL_FRAMED_RECEIPT_RETRY,
-    WL_COLUMNAR_EVAL_SERIAL_FRAMED_RECEIPT_ACK
+    WL_COLUMNAR_EVAL_SERIAL_FRAMED_RECEIPT_ACK,
+    WL_COLUMNAR_EVAL_SERIAL_FRAMED_NATIVE_CLEANUP
 } wl_columnar_eval_serial_framed_host_action_t;
 
 typedef enum {
@@ -8550,6 +8559,11 @@ struct wl_columnar_eval_serial_framed_host_request {
     wl_columnar_eval_serial_framed_host_reply_t *reply;
 };
 
+int wl_columnar_eval_stack_cleanup_receipt_host_source(
+    const wl_plan_relation_t *,
+    wl_col_session_t *, bool,
+    const wl_columnar_eval_serial_framed_host_request_t *,
+    wl_session_source_finance_t *);
 int wl_columnar_eval_stack_cleanup_receipt_host(const wl_plan_relation_t *,
     wl_col_session_t *, bool,
     const wl_columnar_eval_serial_framed_host_request_t *);
@@ -8587,11 +8601,15 @@ int wl_columnar_eval_stack_auto_cleanup_shape(const wl_col_session_t *,
 int wl_columnar_eval_stack_auto_cleanup_ready(const wl_col_session_t *);
 
 typedef enum {
-    WL_COLUMNAR_SESSION_METADATA_NATIVE_ERROR
+    WL_COLUMNAR_SESSION_METADATA_NATIVE_ERROR,
+    WL_COLUMNAR_SESSION_METADATA_JOIN_CLEANUP
 } wl_columnar_session_metadata_purpose_t;
 typedef enum {
     WL_COLUMNAR_SESSION_METADATA_SETUP_REFUSED,
-    WL_COLUMNAR_SESSION_METADATA_BODY_RETURNED
+    WL_COLUMNAR_SESSION_METADATA_BODY_RETURNED,
+    WL_COLUMNAR_SESSION_METADATA_JOIN_PROOF_CLOSED,
+    WL_COLUMNAR_SESSION_METADATA_JOIN_RETURN_CLOSED,
+    WL_COLUMNAR_SESSION_METADATA_JOIN_UNUSED_CLOSED
 } wl_columnar_session_metadata_event_t;
 
 typedef enum {
@@ -8620,6 +8638,29 @@ int wl_columnar_eval_plan_numeric_native_cleanup_consume(
 int wl_columnar_eval_plan_numeric_native_cleanup_ack(
     wl_columnar_eval_serial_framed_attempt_t *, wl_evaluation_control_t *,
     uint64_t);
+/* Distinct registered owning-session cleanup. No original generation poll,
+ * forward evaluation, synthetic AUTO receipt or caller-supplied permit. */
+int wl_columnar_session_join_cleanup_prove(
+    const wl_columnar_eval_serial_framed_attempt_t *, wl_evaluation_control_t *,
+    uint64_t, wl_session_source_finance_t *, int *);
+int wl_columnar_session_join_cleanup_frame_prove(const wl_col_session_t *,
+    const wl_columnar_eval_stack_cleanup_frame_t *, wl_evaluation_control_t *,
+    uint64_t, wl_session_source_finance_t *, int *);
+int wl_columnar_eval_plan_numeric_join_cleanup_step(
+    wl_columnar_eval_serial_framed_attempt_t *, wl_evaluation_control_t *,
+    uint64_t);
+int wl_columnar_eval_plan_numeric_join_cleanup_consume(
+    wl_columnar_eval_serial_framed_attempt_t *, int, wl_evaluation_control_t *,
+    uint64_t);
+int wl_columnar_eval_plan_numeric_join_cleanup_ack(
+    wl_columnar_eval_serial_framed_attempt_t *, wl_evaluation_control_t *,
+    uint64_t);
+int wl_columnar_filter_op_native_cleanup_latch_owned(
+    wl_columnar_eval_stack_cleanup_frame_t *, const void *,
+    wl_evaluation_control_t *, uint64_t, bool *);
+int wl_columnar_merge_concat_native_cleanup_latch_owned(
+    wl_columnar_eval_stack_cleanup_frame_t *, const void *,
+    wl_evaluation_control_t *, uint64_t);
 bool wl_columnar_eval_stack_host_geometry(const wl_col_session_t *,
     const wl_columnar_eval_serial_framed_host_request_t *);
 

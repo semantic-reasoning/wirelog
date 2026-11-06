@@ -6109,3 +6109,65 @@ remain valid. No future CURRENT payment finances already executed BOOT work.
 This additive protocol has no new production consumer. Public STEP/Snapshot
 adoption, complete caller pricing and all remaining ownership/materialized/cap
 acceptance require their own integration and validation.
+
+### JOIN host SOURCE ownership and native error retirement (#2297)
+
+Configured ordinary serial JOIN hosts construct a local SOURCE financier through
+an admission-owned BANK. Its constructor performs only financial creation,
+attachment and BEGIN. The record stays at its original stack address; neither
+its control nor its saved ID is stored in a native frame, transaction, pending
+receipt or TLS. TLS carries only the admitted session, admission and lane.
+Financial permission never replaces native frame/context/thread/source/key
+validation. All metered shared JOIN work uses the actual saved attempt ID.
+
+SOURCE construction uses BANK phases 248/88/104 and a private phase capacity672.
+Host construction pays HEADER105, CLASSIFY100 and REQUEST140, then checks and
+settles the actual financial report before BODY. A still-active unused gateway
+phase pays81 before settlement; the fresh post-BODY phase pays LATE148 (frame)
+or48 (no frame), first-birth170 (private binding) or126 (default), TUPLE72 and
+CLOSE176. These are SOURCE fees, not extra semantic JOIN output or native grants.
+The typed native cleanup dispatcher instead uses its own 2304 capacity and
+separate checked phase reports. Its ENTRY140/GUARD80 and actual saved-ID zero
+precede checked close. Original AUTO native-error ownership is unchanged.
+
+Semantic completion has a separate private capacity240. ENTRY64, conditional
+bootstrap report retirement96 and WINDUP80 settle before expected Original
+FINISH. A fresh224 owns that actual saved-ID FINISH and its returned result;
+checked private settlement/rebegin precedes fresh RETURN208. Refused financial
+birth retains semantic completion debt without dropping native ownership. The
+BANK-only public footer190/54/208 constructs no new controller and works after
+process-wide controller identity exhaustion.
+
+Controlled Snapshot constructs its final-address financier before any prior
+retry disposal, Original BEGIN or callback. SETUP224 pays local payload and
+reservation initialization, then real checked settlement/rebegin leaves zero
+admitted work across native execution. Optional160 pays prior-disposal metadata
+and/or Original BEGIN and also settles before native execution. The same dormant
+private generation provides the real zero checkpoint on a false typed-cleanup
+probe before the original wrapper. Outer saved-ID FINISH224 settles before a
+fresh RETURN208; all post-birth exits retire only this private controller. At
+most four financial attempts use one controller. Existing static admission and
+preflight validation precede this constructor; local constructor costs do not
+claim to measure the entire public admission path.
+
+Actual native error recovery retains the producer/frame/receipt and its creator
+thread until genuine ACK and cursor retirement. A foreign-thread retry cannot
+mutate them. Snapshot callback END/rebind preserves the frozen Original report
+and does not charge or finish its successor. An active successor prevents
+try-destroy and preserves the owning slot. Financial-only bootstrap failures
+retire only their authentic saved grant; they do not invent a native frame.
+The existing fully prepaid Snapshot callback-batch cutoff and mandatory scalar
+source retirement qualifications remain unchanged.
+
+
+Snapshot-owned inner completion uses the preborn BANK directly with208/144/80
+for SOURCE bookkeeping: pending-debt checks, authentic completed financial BOOT
+grant retirement, and scalar metadata reset. It performs no Native action or
+Original FINISH. Its real action result remains separate from financial status.
+This branch creates no generic controller after callback delivery, so exhaustion
+of controller identities cannot turn completion into an endless EAGAIN loop.
+The synchronous evaluating loop checks its existing dormant private generation
+before each probe; the selected-false fallback keeps its separate checkpoint.
+The expanded metadata actor upper92 gives CURRENT142/144, total432 and unused
+admission236; its return-to-loop upper76 fits CLOSE80. These are local
+post-admission SOURCE bounds, not a qualification of static public preflight.

@@ -271,7 +271,13 @@ run(const char *body, unsigned bytes, unsigned mask, int expected,
     session->arr_cache_limit_bytes = cache_limit;
     if (event || cache_mode == STALE_PIN || cache_mode == GROW_PIN) {
         CHECK(!wl_evaluation_control_reset(control));
-        CHECK(!finish(owned)); verify(owned, rows);
+        int retry_rc = finish(owned);
+        if (retry_rc) fprintf(stderr,
+                "strict retry body=%s variant=%u cache=%u bytes=%u event=%u hit=%u empty=%u rc=%d phase=%u\n",
+                body, variant, cache_mode, bytes, event, hit, empty_mask,
+                retry_rc,
+                wl_columnar_session_test_native_error_phase(session));
+        CHECK(!retry_rc); verify(owned, rows);
     }
     CHECK(!wl_session_try_destroy(&owned) && !wl_session_try_destroy(&raw));
     wl_evaluation_control_release(control);
