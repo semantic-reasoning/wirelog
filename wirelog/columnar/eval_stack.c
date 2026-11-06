@@ -3300,7 +3300,7 @@ wl_columnar_eval_stack_binary_fund(
     if (!funding || funding == ctx->control || !id
         || wl_evaluation_control_active_attempt_id(funding) != id)
         return EINVAL;
-    return wl_evaluation_control_charge(funding,
+    return wl_evaluation_control_charge_attempt(funding, id,
                WL_COLUMNAR_EVAL_STACK_BINARY_HOST_WORK);
 }
 
@@ -3837,7 +3837,7 @@ wl_columnar_eval_stack_composed_source_abort(
     if (!funding || funding == owner->control || !funding_id
         || wl_evaluation_control_active_attempt_id(funding) != funding_id)
         return EINVAL;
-    rc = wl_evaluation_control_charge(funding, 384);
+    rc = wl_evaluation_control_charge_attempt(funding, funding_id, 384);
     if (rc) return rc;
     return wl_columnar_eval_stack_composed_source_abort_funded(frame, sess,
                owner);
