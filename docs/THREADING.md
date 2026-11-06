@@ -228,7 +228,7 @@ These exist so struct fields can be declared portably; the audit in
 
 Every `atomic_*` call site in `wirelog/` production sources. Counted
 mechanically by `scripts/ci/check-threading-doc.sh`; row count must
-match the script's count (currently **520**).
+match the script's count (currently **522**).
 
 Format: `file:function[#N]` | field | operation | order | justification.
 
@@ -665,7 +665,7 @@ concurrent alias removals cannot underflow the count.
 | `session.c:session_pool_rel_promote#3` | `src->storage_alias_borrows` | `atomic_store_explicit` | relaxed | Leave the closed pool tombstone with no child aliases |
 
 112 + 21 + 37 = **170 atomic call sites** in the summarized groups; the full
-symbol-anchored inventory below covers 520 sites.
+symbol-anchored inventory below covers 522 sites.
 
 The `#N` suffix counts all atomic sites in a symbol, regardless of operation;
 the first site remains unsuffixed. `scripts/ci/check-threading-doc.sh` uses
@@ -1590,7 +1590,7 @@ pointer. Reset is quiescent relative to evaluation; a request racing reset is
 ordered by the atomic exchange, and hosts must coordinate reset if that request
 must not be cleared.
 
-The nineteen sites below extend the existing exact inventory. RMW reads use the
+The twenty-one sites below extend the existing exact inventory. RMW reads use the
 existing MSVC Interlocked shim instead of assuming volatile loads publish state.
 Cancellation carries no payload, so relaxed ordering suffices. References use
 release decrement plus acquire RMW at last release before destruction. The
@@ -1627,6 +1627,8 @@ isolated test process.
 | `evaluation_control.c:wl_evaluation_control_finish` | active_attempt_id | `atomic_exchange_explicit` | release | Clear identity after completion and before unlocking |
 | `evaluation_control.c:wl_evaluation_control_source_bank_rearm_phase` | references | `atomic_fetch_add_explicit` | acquire | Neutral MSVC read under BANK and controller mutexes; require the original private attached ref2 before sealed-class rearm |
 | `evaluation_control.c:wl_evaluation_control_source_bank_rearm_phase#2` | references | `atomic_load_explicit` | acquire | C11 counterpart of the same private ref2 check; no control or saved ID escapes the class |
+| `evaluation_control.c:wl_evaluation_control_begin_attempt` | active_attempt_id | `atomic_exchange_explicit` | release | Publish the actual new generation after initialization; copy its ID into the result before releasing the same controller mutex |
+| `evaluation_control.c:wl_evaluation_control_finish_attempt` | active_attempt_id | `atomic_exchange_explicit` | release | Clear only the matching active generation after publishing all seven completed fields under the controller mutex; stale expectations never exchange it |
 
 See the [evaluation-control contract](SEMANTICS.md#evaluation-control-foundation-1819-engine-integration-pending)
 for prospective checkpoint coverage and the publication cutoff. The future
@@ -1754,7 +1756,7 @@ DONE. If a stop leaves the receipt holding a claim, its caller preserves that
 receipt and resumes with a fresh live maintenance attempt; it cannot abandon or
 reinitialize the receipt/token while the claim remains held.
 
-The complete current atomic-source inventory contains 518 call sites.
+The complete current atomic-source inventory contains 522 call sites.
 
 ### Caller-attempt-bound single mutation admission
 
@@ -2730,7 +2732,8 @@ INSTALL keeps all native state/identity checks after the original final zero
 check. The21 sites below move the same descriptor, metadata and retained
 reservations, seven operations each. The last four sites establish EMPTY
 retirement tokens after a complete same-activation managed-record clear.
-The exact inventory is518; no atomic-site exception is added.
+This INSTALL repair added no atomic-site exception; the complete current
+inventory is listed above.
 
 Original credited restoration uses a known64 counter helper in the owning
 governor TU. Its initial observation, expected refresh, release/relaxed CAS
@@ -2745,7 +2748,7 @@ mutex/locked body are not aliases or qualified interiors. The inlined ADMITTED
 checkpoint retains the original callback, active-ID guard and zero-check order;
 original END followed by a live successor cannot debit that successor. All
 ordinary getter and native fronts count. This changes no atomic site or memory
-order, and the inventory remains518.
+order. At the time of that repair, the inventory remained518.
 
 | Source anchor | Object | Atomic operation | Ordering | Synchronization purpose |
 |---|---|---|---|---|
@@ -2792,3 +2795,16 @@ identity. SOURCE actions return before phase closure and receive no BANK,
 context or controller ID. The original owning slot outlives the BANK and
 rejects copied/borrowed/self-alias destruction. Workers retain their existing
 NULL admission/nonowning fields.
+
+### Generation-bound BEGIN and FINISH results
+
+The two additional release exchanges above belong to separate internal
+generation-bound siblings. BEGIN copies its actual newly published ID before
+unlocking. FINISH validates owner and expected ID under one mutex, copies all
+seven report fields before unlocking and clears only its matching active ID.
+An already-ended generation returns the original report; a different generation
+neither polls cancellation nor exchanges an ID or exposes a report. Callers
+retain controller/owner storage and drain workers. These transitions grant no
+session/native mutation authority and do not expand exact-nine qualification.
+The genuine thread tests use condition-variable handshakes to order all three
+outcomes; elapsed time is only the existing test watchdog.

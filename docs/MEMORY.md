@@ -6026,3 +6026,37 @@ lifetimes and slack must be established for each real integration. No arbitrary
 BODY/user callback, PENDING loan or native mutation authority comes from BANK
 finance. This foundation does not enable the unfinished ordinary recovery,
 materialized compiler driver or policy/cap acceptance paths.
+
+### Generation-bound controller completion
+
+The internal `wl_evaluation_control_begin_attempt()` sibling returns the exact
+new generation copied before releasing its BEGIN mutex. Structural failure
+returns ID0. `wl_evaluation_control_finish_attempt()` checks the attached owner
+and expected generation under that same controller mutex. It distinguishes
+finishing its own active generation, observing that generation already ended,
+and a different generation. A different generation exposes no report and
+changes no state; it does not prove that a successor is alive. A matching
+ended generation returns its original seven report fields, ignoring later
+execution/cleanup arguments. Protocol status is separate from `report.result`,
+which is readable only when `report_valid` is true.
+
+FINISH does not poll cancellation. Cancellation after a final zero check stays
+for the next BEGIN/charge; an old footer cannot poll, debit or finish a live
+successor. Existing generic methods, error/stop precedence and monotone IDs
+remain unchanged. The host retains the live controller and stable attached
+owner, drains workers before FINISH and serializes session/native mutation.
+The new methods serialize controller transitions, not native execution.
+
+Both new method bodies are ordinary source, outside the exact-nine qualified
+interiors. Conservative complete-body ceilings are65 for BEGIN and114 for
+expected-ID FINISH, including result construction/copies/returns, portable
+mutex bodies9, Windows bodies6 and full reached MSVC exchange fronts. These
+are local bounds, not tariffs or composed caller/check intervals. The same
+corrected native convention gives the BANK lifecycle above actual payer
+ceilings224/15/132 and intervals209/15/15/132, within its documented larger
+ceilings and unchanged256/24/160 admissions; processed lower189/slack251
+remain valid. No future CURRENT payment finances already executed BOOT work.
+
+This additive protocol has no new production consumer. Public STEP/Snapshot
+adoption, complete caller pricing and all remaining ownership/materialized/cap
+acceptance require their own integration and validation.

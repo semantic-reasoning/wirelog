@@ -2448,3 +2448,19 @@ Complete public query/HOST/return/Snapshot/ordinary owning recovery, all native
 consumer source contours, compiler materialized execution and strict/local/shared
 cap intersections remain open. This prerequisite does not close2297/2298 or
 establish their complete acceptance scope.
+
+#### Generation-bound financial completion prerequisite
+
+Internal atomic BEGIN now returns its actual new ID under the same mutex.
+Expected-ID FINISH distinguishes own completion, matching already-ended report
+and different generation without touching or exposing the latter. Genuine
+three-outcome thread histories, live-successor consumed/report preservation,
+late cancellation, complete seven-field generic parity, execution/cleanup/stop
+precedence and actual full-width exhaustion have a separate regression target.
+The two added release exchanges extend the strict inventory to522.
+
+The new bodies are fully ordinary source (local ceilings65/114), not new
+exact-nine interiors or production caller tariffs. They do not migrate public
+STEP/Snapshot or consumers. Together with the private BANK lifetime, these are
+prerequisites for the still-open ownership/source/materialized/policy/cap
+integration;2297/2298 acceptance remains incomplete.

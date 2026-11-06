@@ -176,4 +176,47 @@ wl_evaluation_control_source_bank_run(
     const wl_evaluation_control_source_phase_policy_t *policy,
     wl_evaluation_control_source_action_fn action, void *payload);
 
+/* Atomic identity siblings for hosts holding a live controller reference and
+ * its stable attached owner. Workers must be drained before FINISH. These
+ * mutex-serialized transitions do not authorize concurrent session/native
+ * mutation or supply native permission. Their complete bodies are ordinary
+ * work, outside the exact-nine qualified interiors. */
+typedef enum {
+    WL_EVALUATION_CONTROL_ATTEMPT_FINISH_REJECTED = 0,
+    WL_EVALUATION_CONTROL_ATTEMPT_FINISH_OWN_FINISHED,
+    WL_EVALUATION_CONTROL_ATTEMPT_FINISH_ALREADY_ENDED,
+    WL_EVALUATION_CONTROL_ATTEMPT_FINISH_SUCCESSOR_MISMATCH
+} wl_evaluation_control_attempt_finish_kind_t;
+
+typedef struct {
+    wl_evaluation_control_attempt_finish_kind_t kind;
+    int protocol;
+    bool report_valid;
+    wl_evaluation_control_report_t report;
+} wl_evaluation_control_attempt_finish_result_t;
+
+/* protocol is structural status, separate from report.result. Read report
+ * only when report_valid. A matching active generation finishes once; a
+ * matching ended generation returns its original report despite new error
+ * arguments. A different generation returns SUCCESSOR_MISMATCH without
+ * polling, modifying state or exposing a report. This kind also covers an
+ * invalid future expectation: it does not prove a successor is alive.
+ * FINISH never polls cancellation, matching the generic finish contract. */
+wl_evaluation_control_attempt_finish_result_t
+wl_evaluation_control_finish_attempt(wl_evaluation_control_t *control,
+    const void *owner, uint64_t expected_attempt_id, int execution_status,
+    int cleanup_status);
+
+typedef struct {
+    int protocol;
+    uint64_t attempt_id;
+} wl_evaluation_control_attempt_begin_result_t;
+
+/* Success copies the genuine new ID before releasing the same BEGIN mutex.
+ * Every failure returns ID0. Cancellation persistence, limit capture and
+ * monotone exhaustion have the same semantics as generic BEGIN. */
+wl_evaluation_control_attempt_begin_result_t
+wl_evaluation_control_begin_attempt(wl_evaluation_control_t *control,
+    const void *owner);
+
 #endif /* WL_EVALUATION_CONTROL_H */
