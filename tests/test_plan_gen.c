@@ -1557,6 +1557,8 @@ test_float_plan_lowering(void)
         ".decl value(x: box(float) inline)\n",
         ".decl src(x: int64)\nsrc(1).\n"
         ".decl out(x: int64)\nout(1.5) :- src(x).\n",
+        ".decl src(x: int64)\nsrc(1).\n"
+        ".decl out(x: float)\nout(1.5) :- src(x).\n",
     };
     for (size_t i = 0; i < sizeof(sources) / sizeof(sources[0]); i++) {
         wirelog_program_t *prog = wirelog_parse_string(sources[i], &err);
@@ -1565,8 +1567,15 @@ test_float_plan_lowering(void)
                 "decimal float fact must not enter integer column");
             continue;
         }
-        ASSERT(prog != NULL, "float fixture failed to parse");
         if (i == 5) {
+            /* #2231: a float constant in an int64 head is rejected at load,
+             * as a float fact in an int64 column is. */
+            ASSERT(prog == NULL,
+                "float rule constant must not enter integer column");
+            continue;
+        }
+        ASSERT(prog != NULL, "float fixture failed to parse");
+        if (i == 6) {
             ASSERT(prog->rule_count == 1 && prog->rules[0].ir_root != NULL,
                 "float rule was not converted to IR");
             ASSERT(node_contains_float_constant(prog->rules[0].ir_root),

@@ -3628,6 +3628,159 @@ test_head_arity_mismatch_maps_to_parse_error(void)
 }
 
 /* ======================================================================== */
+/* Symbol / number domain check (#2231)                                     */
+/* ======================================================================== */
+
+#define DOMAIN_BASE \
+        ".decl g(x: int64)\n.decl s(x: symbol)\n" \
+        "g(0).\ng(1).\ns(\"a\").\ns(\"b\").\n"
+
+/* @src must fail to load with WIRELOG_ERR_PARSE and a message containing
+ * @needle. */
+static void
+expect_domain_rejected(const char *name, const char *src, const char *needle)
+{
+    char errbuf[512];
+    wirelog_error_t err = WIRELOG_OK;
+
+    TEST(name);
+    struct wirelog_program *prog = wl_ir_parse_string_err(src, &err, errbuf,
+            sizeof(errbuf));
+    if (prog) {
+        wirelog_program_free(prog);
+        FAIL("program was accepted");
+        return;
+    }
+    if (err != WIRELOG_ERR_PARSE) {
+        FAIL("error should be WIRELOG_ERR_PARSE");
+        return;
+    }
+    if (!strstr(errbuf, needle)) {
+        printf(" [%s]", errbuf);
+        FAIL("message does not name the conflict");
+        return;
+    }
+    PASS();
+}
+
+static void
+expect_domain_accepted(const char *name, const char *src)
+{
+    char errbuf[512];
+    wirelog_error_t err = WIRELOG_OK;
+
+    TEST(name);
+    struct wirelog_program *prog = wl_ir_parse_string_err(src, &err, errbuf,
+            sizeof(errbuf));
+    if (!prog) {
+        printf(" [%s]", errbuf);
+        FAIL("program was rejected");
+        return;
+    }
+    wirelog_program_free(prog);
+    PASS();
+}
+
+static void
+test_rule_value_domains(void)
+{
+    /* E1: one variable bound to a symbol and to a number column. */
+    expect_domain_rejected("Domains: variable joins int64 and symbol",
+        DOMAIN_BASE ".decl p(x: int64)\np(x) :- g(x), s(x).\n",
+        "variable 'x' in a rule for 'p' is bound to int64 column 0 of 'g'"
+        " and to string/symbol column 0 of 's'");
+    expect_domain_rejected("Domains: negated atom of the other kind",
+        DOMAIN_BASE ".decl p(x: int64)\np(x) :- g(x), !s(x).\n",
+        "variable 'x' in a rule for 'p'");
+    /* E2: comparisons, whatever the operator. */
+    expect_domain_rejected("Domains: int64 variable = string constant",
+        DOMAIN_BASE ".decl p(x: int64)\np(x) :- g(x), x = \"a\".\n",
+        "'=' comparison in a rule for 'p' compares a string/symbol");
+    expect_domain_rejected("Domains: int64 variable != string constant",
+        DOMAIN_BASE ".decl p(x: int64)\np(x) :- g(x), x != \"a\".\n",
+        "'!=' comparison");
+    expect_domain_rejected("Domains: symbol variable = integer constant",
+        DOMAIN_BASE ".decl p(x: symbol)\np(x) :- s(x), x = 0.\n",
+        "'=' comparison");
+    expect_domain_rejected("Domains: int64 variable < string constant",
+        DOMAIN_BASE ".decl p(x: int64)\np(x) :- g(x), x < \"b\".\n",
+        "'<' comparison");
+    /* E3: constants of the other kind, in a body atom or the head. */
+    expect_domain_rejected("Domains: string constant in an int64 body atom",
+        DOMAIN_BASE ".decl p(x: int64)\np(1) :- g(\"a\").\n",
+        "string/symbol constant in column 0 of 'g', which is declared int64");
+    /* An integer constant in a float body column was not applied as a
+     * filter: `g(2)` held because g had a row, and p(1.5) was derived. */
+    expect_domain_rejected("Domains: integer constant in a float body atom",
+        ".decl g(x: float)\ng(1.5).\n.decl p(x: float)\n"
+        "p(x) :- g(x), g(2).\n",
+        "numeric constant in column 0 of 'g', which is declared float");
+    expect_domain_rejected("Domains: float constant in an int64 body atom",
+        DOMAIN_BASE ".decl p(x: int64)\np(1) :- g(2.5).\n",
+        "float constant in column 0 of 'g', which is declared int64");
+    expect_domain_rejected("Domains: integer constant in a symbol head",
+        DOMAIN_BASE ".decl p(x: symbol)\np(5) :- g(0).\n",
+        "numeric constant in column 0 of 'p', which is declared"
+        " string/symbol");
+    expect_domain_rejected("Domains: string constant in an int64 head",
+        DOMAIN_BASE ".decl p(x: int64)\np(\"z\") :- g(1).\n",
+        "string/symbol constant in column 0 of 'p'");
+    expect_domain_rejected("Domains: float constant in an int64 head",
+        DOMAIN_BASE ".decl p(x: int64)\np(2.5) :- g(1).\n",
+        "float constant in column 0 of 'p', which is declared int64");
+    /* E4: head values of the other kind. */
+    expect_domain_rejected("Domains: int64 variable into a symbol head",
+        ".decl g(x: symbol)\ng(\"a\").\n.decl n(x: int64)\nn(7).\n"
+        "g(x) :- n(x).\n",
+        "rule head for 'g' puts a numeric value into column 0, which is"
+        " declared string/symbol");
+    expect_domain_rejected("Domains: string function into an int64 head",
+        DOMAIN_BASE ".decl p(x: int64)\np(c) :- s(x), c = to_upper(x).\n",
+        "rule head for 'p' puts a string/symbol value");
+    expect_domain_rejected("Domains: arithmetic into a symbol head",
+        DOMAIN_BASE ".decl p(x: symbol)\np(x + 1) :- g(x).\n",
+        "rule head for 'p' puts a numeric value");
+    expect_domain_rejected("Domains: float variable into an int64 head",
+        ".decl g(x: float)\ng(1.5).\n.decl p(x: int64)\np(x) :- g(x).\n",
+        "rule head for 'p' puts a float value into column 0, which is"
+        " declared int64");
+    expect_domain_rejected("Domains: float arithmetic into an int64 head",
+        ".decl g(x: float)\ng(1.5).\n.decl p(x: int64)\n"
+        "p(x * 2.0) :- g(x).\n",
+        "rule head for 'p' puts a float value into column 0");
+
+    /* Accepted: kinds that agree, and what the check leaves alone. */
+    expect_domain_accepted("Domains: int32 joined with int64",
+        ".decl a(x: int32)\na(1).\n.decl b(x: int64)\nb(1).\n"
+        ".decl p(x: int64)\np(x) :- a(x), b(x).\n");
+    expect_domain_accepted("Domains: symbol joined with string",
+        ".decl a(x: symbol)\na(\"a\").\n.decl b(x: string)\nb(\"a\").\n"
+        ".decl p(x: symbol)\np(x) :- a(x), b(x).\n");
+    expect_domain_accepted("Domains: symbol variable = string constant",
+        DOMAIN_BASE ".decl p(x: symbol)\np(x) :- s(x), x = \"a\".\n");
+    expect_domain_accepted("Domains: integer fact in a symbol column (#963)",
+        ".decl S(x: symbol, n: int64)\nS(\"g\", 9999).\nS(7, 1).\n");
+    expect_domain_accepted("Domains: string length into an int64 head",
+        DOMAIN_BASE ".decl p(x: int64)\np(n) :- s(x), n = strlen(x).\n");
+    expect_domain_accepted("Domains: undeclared relation mixes its column",
+        ".decl edge(x: symbol, y: int64)\nedge(\"a\", 1).\n"
+        "u(x, y) :- edge(x, y).\nu(y, x) :- u(x, y).\n");
+    expect_domain_accepted("Domains: float constant in a float body atom",
+        ".decl g(x: float)\ng(1.5).\n.decl p(x: float)\n"
+        "p(x) :- g(x), g(1.5).\n");
+    expect_domain_accepted("Domains: integer constant in a float head",
+        ".decl n(x: int64)\nn(1).\n.decl p(x: float)\np(2) :- n(1).\n");
+    expect_domain_accepted("Domains: float arithmetic into a float head",
+        ".decl g(x: float)\ng(1.5).\n.decl p(x: float)\n"
+        "p(x * 2.0) :- g(x).\n");
+    /* An aggregate head reorders its columns (#980), so even a symbol
+     * key in an int64 column is left alone. */
+    expect_domain_accepted("Domains: aggregate head is not checked",
+        DOMAIN_BASE ".decl c(x: int64, n: int64)\n"
+        "c(x, count(y)) :- s(x), g(y).\n");
+}
+
+/* ======================================================================== */
 /* Fact Extraction API Tests                                                */
 /* ======================================================================== */
 
@@ -4212,6 +4365,9 @@ main(void)
     test_head_arity_undeclared_head_accepted();
     test_head_arity_matching_accepted();
     test_head_arity_mismatch_maps_to_parse_error();
+
+    /* #2231: rules that mix symbol and numeric values */
+    test_rule_value_domains();
 
     /* Fact extraction API */
     test_api_get_facts();
