@@ -2443,6 +2443,21 @@ wl_columnar_eval_plan_numeric_composed_attempt_begin_bound(
 }
 
 int
+wl_columnar_eval_plan_numeric_composed_attempt_begin_bound_batch(
+    wl_columnar_eval_plan_numeric_attempt_t *record,
+    const wl_plan_relation_t *plan, uint32_t begin, uint32_t end,
+    wl_columnar_eval_stack_cleanup_frame_t *frame, wl_col_session_t *session,
+    uint32_t initial_depth, wl_evaluation_control_t *control, uint64_t id,
+    wl_evaluation_control_t *funding, uint64_t funding_id,
+    const wl_columnar_eval_private_bindings_t *private_bindings)
+{
+    if (!private_bindings || !private_bindings->dynamic_entries) return EINVAL;
+    return wl_columnar_eval_plan_numeric_composed_attempt_begin_internal(
+        record, plan, begin, end, frame, session, initial_depth, control, id,
+        funding, funding_id, true, private_bindings);
+}
+
+int
 wl_columnar_eval_plan_numeric_composed_attempt_begin_batch_fallback(
     wl_columnar_eval_plan_numeric_attempt_t *record,
     const wl_plan_relation_t *plan, uint32_t begin, uint32_t end,

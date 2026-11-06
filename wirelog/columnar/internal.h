@@ -7876,6 +7876,12 @@ int wl_columnar_eval_plan_numeric_composed_attempt_begin_bound(
     wl_col_session_t *, uint32_t, wl_evaluation_control_t *, uint64_t,
     wl_evaluation_control_t *, uint64_t,
     const wl_columnar_eval_private_bindings_t *);
+int wl_columnar_eval_plan_numeric_composed_attempt_begin_bound_batch(
+    wl_columnar_eval_plan_numeric_attempt_t *, const wl_plan_relation_t *,
+    uint32_t, uint32_t, wl_columnar_eval_stack_cleanup_frame_t *,
+    wl_col_session_t *, uint32_t, wl_evaluation_control_t *, uint64_t,
+    wl_evaluation_control_t *, uint64_t,
+    const wl_columnar_eval_private_bindings_t *);
 /* Synchronous setup results carry no owning receipt or pointer authority. */
 typedef enum {
     WL_COLUMNAR_JOIN_SETUP_FUNDING_REFUSED,

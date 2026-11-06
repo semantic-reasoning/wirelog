@@ -2491,3 +2491,51 @@ reject-all versus separately materialized reject-all, reset/raised-limit retry,
 and cancellation on either side of ACK. Existing host funding exact boundaries
 remain independent regression oracles. Strict, shared-worker, general
 transaction/source and remaining whole-bundle acceptance are still required.
+
+#### JOIN transaction-owned source adapter
+
+The dynamic bound-batch constructor authenticates the real ordinary
+nonrecursive transaction child, rather than inventing default-preflight READY
+state. The request mode, framed child constructor and composed JOIN dispatch
+agree from birth. The funded binding getter supplies the canonical native
+binding to the host; FULL JOIN/probe lookups retain it through terminal child
+receipt ACK. Private head rebinding still follows that ACK. Original-ended
+cleanup keeps its existing registered tuple authority.
+
+The existing dynamic getter uses HEADER123/128, DYNAMIC53/64 and FINISH core56/64.
+BIND's additional canonical-pointer store belongs to its actual parent action;
+PUBLISH separately removes its old NULL store (161/192). The complete dynamic
+parent local envelope is258/384, not a claim that a whole public source interval
+fits256. Complete public HOST/source/return ownership remains a separate U1
+obligation. Owning session construction always retains or creates a nonNULL
+governor, including off/zero policy; no supported operation clears it. Thus
+this new dynamic route does not execute the optional no-governor bootstrap
+lookup/SELECT contour. Future constructor changes must re-audit that premise.
+
+Dynamic append source selection has a separate APPEND_SELECT action with
+actual financial192 and saved-original192 admissions. It covers the complete
+current binding, operation geometry, three-field snapshot/equality and hook
+fronts: helper144, complete action185/192 and containing window209/256. A
+successful action advances to the existing finite classification before any
+producer or ordinary destination is selected. Two extra nonconsumer quote
+slots make the existing ACK module error bound255/256; consumer384 selection
+is unchanged. The corresponding parent observation is382/384. NONE still uses
+its existing financial1 path and exact ACK585/1993 and setup1728/2496 oracles.
+General3072 capacity accommodates the actual dynamic getter and selected action;
+capacity is never a debit or native permission. The append CONCAT successor
+uses the existing full numeric owner/thread/control proof in its already
+admitted support action; its complete worst refusal/next-admission suffix is
+146/192. Other representation and worker exclusions remain unchanged.
+
+`evaluation_join_host_lifecycle_*` covers configured callback-free/observed
+STEP, evaluating/completed SNAPSHOT, signed insert/remove successors, a private
+intermediate and derived FULL anti-probe canary, callback uniqueness and literal
+relation-qualified content. Stops target producer/consumer/ACK work in both
+first and second JOIN heads, with cancellation/work exhaustion, private
+nonpublication, retained-head input EBUSY and reset/retry. A genuine383 funding
+refusal preserves the live transaction and attempt. Snapshot checks distinguish
+precutoff refusal, full postcutoff delivery after callback cancellation and
+sticky cancellation on the next call. Authentic right/left append histories
+exercise the bounded ordinary and prepared destinations without disabling the
+batch knob. These local predicates do not close the remaining strict, complete
+SOURCE/owning caller and whole-bundle acceptance obligations.

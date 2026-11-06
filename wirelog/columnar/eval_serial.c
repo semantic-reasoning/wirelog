@@ -380,6 +380,14 @@ wl_columnar_eval_serial_framed_attempt_step(
     case WL_COLUMNAR_EVAL_SERIAL_FRAMED_CHILD_BEGIN:
         wl_columnar_eval_serial_framed_pending(ctx, ctx->phase, funding,
             funding_id);
+        if (ctx->private_bindings
+            && ctx->controlled_materialized_batch_fallback)
+            return
+                wl_columnar_eval_plan_numeric_composed_attempt_begin_bound_batch
+                (
+                &ctx->child, ctx->plan, 0, ctx->plan->op_count, ctx->frame,
+                ctx->session, 0, ctx->control, ctx->attempt_id, funding,
+                funding_id, ctx->private_bindings);
         if (ctx->private_bindings)
             return wl_columnar_eval_plan_numeric_composed_attempt_begin_bound(
                 &ctx->child, ctx->plan, 0, ctx->plan->op_count
