@@ -6037,6 +6037,17 @@ BODY/user callback, PENDING loan or native mutation authority comes from BANK
 finance. This foundation does not enable the unfinished ordinary recovery,
 materialized compiler driver or policy/cap acceptance paths.
 
+The synchronous lexical runner keeps its canonical context on its own stack,
+binds the lane under the bank mutex, and clears that association after actual
+phase settlement before returning. Existing external contexts still exclude a
+lexical activation on the same lane; reentry cannot replace an active context.
+It preserves separate financial/action results, including a constructor that
+was called and failed, and exports no private controller or ID. This removes
+the separate context-begin/run/end prefixes for future synchronous issuers.
+It does not supply a production policy: the actual caller, first/unused,
+action, late/close and repeat source/slack still require qualification. Kernel
+test prices exercise lifetime and failure handling only.
+
 ### Generation-bound controller completion
 
 The internal `wl_evaluation_control_begin_attempt()` sibling returns the exact

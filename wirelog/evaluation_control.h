@@ -176,6 +176,17 @@ wl_evaluation_control_source_bank_run(
     const wl_evaluation_control_source_phase_policy_t *policy,
     wl_evaluation_control_source_action_fn action, void *payload);
 
+/* Same SOURCE-only callback contract, with a context owned exclusively by
+ * this synchronous activation. No stack-context borrow survives its return.
+ * This avoids separate context-begin/run/end source prefixes; actual callers
+ * still require their own immutable policy and complete containing proof. */
+wl_evaluation_control_source_phase_result_t
+wl_evaluation_control_source_bank_run_lexical(
+    wl_evaluation_control_source_bank_t *bank,
+    wl_evaluation_control_source_lane_t lane,
+    const wl_evaluation_control_source_phase_policy_t *policy,
+    wl_evaluation_control_source_action_fn action, void *payload);
+
 /* Atomic identity siblings for hosts holding a live controller reference and
  * its stable attached owner. Workers must be drained before FINISH. These
  * mutex-serialized transitions do not authorize concurrent session/native
