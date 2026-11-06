@@ -6410,6 +6410,25 @@ wl_columnar_join_op_attempt_start_owned_initialize(const wl_plan_op_t *op,
             }
         }
     }
+    if (controlled_batch_fallback && session->join_batch_bytes
+        && session->join_batch_strict && right && !forced_empty) {
+        rc = wl_evaluation_control_charge_attempt(control, id,
+                WL_COLUMNAR_JOIN_ATTEMPT_WORK);
+        if (rc) goto done;
+        bool intrinsic = !op->key_count || used_delta
+            || op->right_filter_expr.size;
+        rc = wl_columnar_join_attempt_guard(control, id);
+        if (rc) goto done;
+#ifdef WL_SESSION_TEST_HOOKS
+        if (wl_columnar_join_test_attempt_checkpoint)
+            wl_columnar_join_test_attempt_checkpoint(control, 50, intrinsic);
+#endif
+        rc = wl_evaluation_control_charge_attempt(control, id, 0);
+        if (rc) goto done;
+        if (intrinsic) {
+            rc = ENOTSUP; goto done;
+        }
+    }
     rc = wl_columnar_join_attempt_charge(control, id,
             WL_COLUMNAR_JOIN_ATTEMPT_WORK);
     if (rc) goto done;

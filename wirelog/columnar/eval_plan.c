@@ -2322,7 +2322,7 @@ wl_columnar_eval_plan_numeric_composed_attempt_begin_internal(
         }
     }
     if (controlled_materialized_batch_fallback) {
-        if (!session->join_batch_bytes || session->join_batch_strict
+        if (!session->join_batch_bytes
             || begin != 0 || end != plan->op_count || initial_depth != 0
             )
             return ENOTSUP;

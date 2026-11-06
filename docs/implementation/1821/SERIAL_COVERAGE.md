@@ -2539,3 +2539,52 @@ sticky cancellation on the next call. Authentic right/left append histories
 exercise the bounded ordinary and prepared destinations without disabling the
 batch knob. These local predicates do not close the remaining strict, complete
 SOURCE/owning caller and whole-bundle acceptance obligations.
+
+#### JOIN strict producer and decline policy
+
+The strict admission fences now yield to the real host classification. Eligible
+keyed FULL producers and consumed relation-sink tails execute through the same
+parent attempt and cleanup owner, including transaction-private right inputs.
+The bounded successor cursor uses the final tail after runtime probe truncation;
+static JOIN exclusions run their ordered successor decision before delegation.
+Delta-right validates key/type compatibility before strict refusal. Ordinary
+intrinsic strict classification follows actual right selection/filter/key/type
+work and precedes output construction. Row-fit refusal follows availability.
+Missing/forced-empty/bare and eligible-empty ordinary dispositions remain intact.
+Initialized zero-row inputs with valid keys retain final successor qualification.
+After that decision only the direct ordinary empty destination skips cache and
+row-fit; a consumed tail retains producer/cache/row-fit policy even at zero rows.
+
+A read-only primary-cache census preserves applicable protected errors while
+using the private prepared index as the bounded algorithm alternative. It
+compares actual selected source identity to a separately resolved public source;
+name equality or nonNULL bindings alone never select cache policy. One action
+examines one operator, cache entry, name byte or key. Cold/private routes do not
+manufacture unavailable-cache or skipped-allocation errors. The genuine owning
+controlled graph has no primary first producer; warm/pinned/error fixtures are
+internal component evidence and hold registry/pin metadata quiescent until
+terminal cleanup. Captured pointer/count/cap is not an in-place mutation detector.
+
+The contiguous consumer predicate and APPEND_SELECT/strict action range retain
+existing ACK module255/256 and parent382/384 source envelopes without changing
+CLASSIFY financial1, consumer384, ACK585/1993 or default setup1728/2496 tariffs.
+All new storage participates in actual sizeof(host) admission and incremental
+zeroing. The new ordinary strict action uses saved-ID192 and zero-check calls,
+retaining the phase50 hook and its prehook generation guard; old generic JOIN
+helpers are unchanged. These local bounds do not close U1 public SOURCE/caller
+and original-ended native-debt integration obligations.
+
+`evaluation_join_host_strict` covers creation-time strict cold positives, exact
+and sub-row budget, bare/missing sides, product/materializing refusal, selected
+delta/type precedence, right-filter row rejection before intrinsic refusal,
+cache match/pin/stale/growth/spare-capacity/pressure/tombstone component states,
+initialized left/right/both-empty direct versus consumed/materializing tails,
+a long-name scan interruption and reset/retry. `evaluation_join_host_policies`
+runs its direct/consumed cap and pre/post-ACK cancellation matrix in both modes.
+`evaluation_join_host_lifecycle_strict` uses a real compiler-generated private
+right JOIN and derived probe, callback-free/observed STEP, evaluating/completed
+SNAPSHOT, funding refusal, producer/consumer/ACK stops and literal/signed effects.
+A stale pinned old public image does not reject the distinct private right
+image; its pin is released only after terminal execution. Existing independent
+primitive/funding tests remain regression oracles. Whole-bundle issue closure
+still requires the remaining U1 and final acceptance record.

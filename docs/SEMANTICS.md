@@ -2335,5 +2335,48 @@ Ordinary append optimization retains its selector/effect semantics. A changed
 right operand uses the controlled ordinary JOIN destination; a changed left
 operand can use the prepared producer with a FULL right source. The existing
 controlled CONCAT combines the increment with the previous head under the
-same authenticated batch context. Strict batching and worker shared counters
-still require their separate admission and policy qualification.
+same authenticated batch context. Worker shared counters remain a separate
+admission and policy domain.
+
+### Controlled strict JOIN policy
+
+The owning serial host admits configured strict keyed FULL-input producers,
+including eligible FILTER/MAP/probe tails and private transaction inputs.
+Strictness is not a blanket session refusal. The host follows the actual final
+tail to its destination before constructing a producer: a materializing
+successor refuses with `ENOTSUP`, while a relation sink can run bounded batches.
+One metered action examines one successor operator, registry entry, relation
+name byte or key; it does not invoke the raw whole-plan/cache builder.
+
+Selected delta-right input validates keys and compatible types before its
+strict refusal. Ordinary product/right-filter destinations preserve their
+filter/key/type processing before intrinsic strict refusal, even if filtering
+rejects every row. Missing, forced-empty and bare inputs retain their ordinary
+empty/schema disposition. A nonempty producer row exceeding the batch budget
+refuses; non-strict execution retains its controlled ordinary alternative.
+An initialized zero-row input with valid physical keys still undergoes strict
+successor qualification. Only a direct ordinary empty destination bypasses
+cache/row-fit afterward; a consumed tail keeps its producer and row-fit policy
+even with no rows.
+The local output cap and ACK ordering described above also apply in strict
+mode.
+
+The bounded private index replaces optional primary-cache construction. Cold
+cache absence does not mean the input is unsupported, and unattempted cache
+allocations do not manufacture `ENOMEM`. An exact public-source cache census
+preserves protected stale/deferred-pinned and relocation failures. An
+authenticated private image with the same name does not inherit an unrelated
+public cache's error. Actual source-reader, generation and memory admission
+failures remain authoritative.
+
+The primary registry stays empty in the current owning controlled public
+graph: construction starts empty, controlled operators build private indexes,
+and mutations do not create a first primary entry. Prewarmed/pinned cache tests
+are explicitly internal component fixtures. Their registry metadata and pins
+remain quiescent for the entire logical census, including internal yields;
+fixtures release pins after terminal cleanup. No user callback runs inside the
+census, and financial/test hooks may observe or stop the controller without
+mutating the borrowed registry. Pointer/count/cap checks are defensive checks,
+not a detector for arbitrary in-place mutation. A future public primary-cache
+producer or independently interleaved internal cache mutation requires renewed
+ownership and boundedness qualification.

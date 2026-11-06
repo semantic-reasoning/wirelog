@@ -178,7 +178,7 @@ wl_columnar_eval_serial_framed_attempt_begin_internal(
         || ctx->cleanup_receipt_key.operation_id != operation_identity)
         return EINVAL;
     if (controlled_materialized_batch_fallback
-        && (!session->join_batch_bytes || session->join_batch_strict
+        && (!session->join_batch_bytes
         || !wl_columnar_session_controlled_batch_authorized(session, control,
         id, operation_identity)
         )) return ENOTSUP;
@@ -1571,7 +1571,7 @@ wl_columnar_eval_serial_framed_relation(const wl_plan_relation_t *rp,
             : rp->ops[rp->op_count - 1].op != WL_PLAN_OP_CONSOLIDATE)
             return ENOTSUP;
         if (request->controlled_materialized_batch_fallback
-            && (!sess->join_batch_bytes || sess->join_batch_strict
+            && (!sess->join_batch_bytes
             || !wl_columnar_session_controlled_batch_authorized(sess,
             request->operation, request->operation_id,
             request->operation_identity)

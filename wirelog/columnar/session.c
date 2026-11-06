@@ -7978,7 +7978,6 @@ col_controlled_step_static_preflight(wl_col_session_t *sess, bool successor)
         || sess->retraction_seeded || sess->retraction_right_pass
         || sess->tdd_input_run || sess->tdd_subpass_active
         || sess->tdd_outbound_only_active || sess->diff_operators_active
-        || (sess->join_batch_bytes && sess->join_batch_strict)
         || sess->join_output_shared_count
         || sess->coordinator || sess->num_workers > 1
         || sess->cleanup_active || sess->cleanup_pending

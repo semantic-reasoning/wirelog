@@ -29,7 +29,7 @@ typedef struct {
 static unsigned prepared, produced, acked, exchanges, probes, stop_event,
     stop_prepared;
 static uint64_t generation, attempt, consumed;
-static bool stopped, work_stop;
+static bool stopped, work_stop, strict_mode;
 static wl_evaluation_control_t *snapshot_control;
 static bool snapshot_cancelled, inject_funding, funding_pending, funding_used;
 static unsigned funding_refusals;
@@ -168,14 +168,17 @@ static void
 init(fixture_t *f, bool observed)
 {
     memset(f, 0, sizeof(*f));
-    static const char source[] =
+    static const char source_format[] =
         ".decl a(k:int64,x:int64)\n.decl b(k:int64,y:int64)\n"
         ".decl c(y:int64,z:int64)\n.decl mid(x:int64,y:int64)\n"
         ".decl deny(y:int64)\n.decl blocked(y:int64)\n"
         ".decl output(x:int64,z:int64)\n"
         "blocked(y):-deny(y).\n"
         "mid(x,y):-a(k,x),b(k,y),x<y.\n"
-        "output(x,z):-mid(x,y),c(y,z),!blocked(y).\n";
+        "output(x,z):-%s,!blocked(y).\n";
+    char source[512];
+    snprintf(source, sizeof(source), source_format,
+        strict_mode ? "c(y,z),mid(x,y)" : "mid(x,y),c(y,z)");
     wirelog_error_t error;
     f->program = wirelog_parse_string(source, &error);
     CHECK(f->program && !wl_plan_from_program(f->program, &f->plan));
@@ -189,8 +192,21 @@ init(fixture_t *f, bool observed)
             }
         }
     CHECK(joins == 2);
+    if (strict_mode) {
+        bool private_right = false;
+        for (uint32_t s = 0; s < f->plan->stratum_count; ++s)
+            for (uint32_t r = 0; r < f->plan->strata[s].relation_count; ++r) {
+                const wl_plan_relation_t *head =
+                    &f->plan->strata[s].relations[r];
+                for (uint32_t i = 0; i < head->op_count; ++i)
+                    if (head->ops[i].op == WL_PLAN_OP_JOIN
+                        && !strcmp(head->ops[i].right_relation,
+                        "mid")) private_right = true;
+            }
+        CHECK(private_right);
+    }
     configure("WIRELOG_JOIN_BATCH_BYTES", "64");
-    configure("WIRELOG_JOIN_BATCH_STRICT", NULL);
+    configure("WIRELOG_JOIN_BATCH_STRICT", strict_mode ? "1" : NULL);
     configure("WIRELOG_JOIN_OUTPUT_LIMIT", "100");
     CHECK(!wl_evaluation_control_create(0, &f->control));
     wl_session_options_t options;
@@ -489,7 +505,7 @@ appends(void)
     CHECK(f.plan->stratum_count == 1 && f.plan->strata[0].relation_count == 1
         && f.plan->strata[0].relations[0].ops[1].op == WL_PLAN_OP_JOIN);
     configure("WIRELOG_JOIN_BATCH_BYTES", "64");
-    configure("WIRELOG_JOIN_BATCH_STRICT", NULL);
+    configure("WIRELOG_JOIN_BATCH_STRICT", strict_mode ? "1" : NULL);
     configure("WIRELOG_JOIN_OUTPUT_LIMIT", "100");
     CHECK(!wl_evaluation_control_create(0, &f.control));
     wl_session_options_t options;
@@ -557,7 +573,37 @@ int
 main(int argc, char **argv)
 {
     CHECK(argc == 2);
-    if (!strcmp(argv[1], "successors")) {
+    if (!strcmp(argv[1], "strict")) {
+        strict_mode = true;
+        for (unsigned observed = 0; observed < 2; ++observed) {
+            fixture_t f; init(&f, observed);
+            state_t empty = {0};
+            step_pair(&f, &empty, observed, 2);
+            CHECK(!((wl_col_session_t *)f.sessions[0])->arr_count);
+            /* Internal prewarmed cache fixture on the prior public image.
+             * A same-name private right input must not inherit this EBUSY. */
+            uint32_t key = 1;
+            col_arrangement_pin_t pin = {0};
+            CHECK(!col_session_pin_arrangement(f.sessions[0], "mid", &key, 1,
+                &pin));
+            col_session_invalidate_arrangements(f.sessions[0], "mid");
+            CHECK(pin.entry->rebuild_deferred);
+            state_t old = f.state;
+            for (unsigned i = 0; i < 2; ++i)
+                CHECK(!wl_session_insert(f.sessions[i], "c",
+                    (int64_t[]){7, 207}, 1, 2));
+            f.state.extra = true;
+            step_pair(&f, &old, observed, 2);
+            CHECK(pin.active && pin.entry->rebuild_deferred);
+            col_arrangement_pin_release(&pin);
+            destroy(&f);
+        }
+        snapshots();
+        recovery();
+        funding();
+        snapshot_recovery();
+        configure("WIRELOG_JOIN_BATCH_STRICT", NULL);
+    } else if (!strcmp(argv[1], "successors")) {
         successors(false); successors(true);
     } else if (!strcmp(argv[1], "snapshots")) snapshots();
     else if (!strcmp(argv[1], "recovery")) recovery();
