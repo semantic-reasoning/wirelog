@@ -1114,6 +1114,123 @@ snapshot_finance_birth(void)
     destroy(&f);
 }
 
+typedef struct {
+    bool seen[MAX_STRATA][2];
+    unsigned calls;
+} admission_rows_t;
+
+static void
+admission_snapshot_row(const char *name, const int64_t *row, uint32_t width,
+    void *userdata)
+{
+    if (!strcmp(name, "a")) return;
+    CHECK(name[0] == 'r');
+    char *end = NULL;
+    unsigned long index = strtoul(name + 1, &end, 10);
+    CHECK(end && !*end && index < MAX_STRATA && width == 1);
+    CHECK(row[0] >= 0 && row[0] < 2);
+    admission_rows_t *rows = userdata;
+    CHECK(!rows->seen[index][row[0]]);
+    rows->seen[index][row[0]] = true;
+    ++rows->calls;
+}
+
+/* Negative dependencies force the compiler to retain all 32 real strata. */
+static void
+admission_strata(bool evaluating_snapshot, bool refuse_only)
+{
+    char source[8192];
+    size_t used = 0;
+    int written = snprintf(source, sizeof(source), ".decl a(x:int64)\n");
+    CHECK(written > 0); used = (size_t)written;
+    for (unsigned i = 0; i < MAX_STRATA; ++i) {
+        written = snprintf(source + used, sizeof(source) - used,
+                ".decl r%u(x:int64)\n", i);
+        CHECK(written > 0 && (size_t)written < sizeof(source) - used);
+        used += (size_t)written;
+    }
+    for (unsigned i = 0; i < MAX_STRATA; ++i) {
+        written = i ? snprintf(source + used, sizeof(source) - used,
+                "r%u(x):-a(x),!r%u(x).\n", i, i - 1)
+            : snprintf(source + used, sizeof(source) - used, "r0(x):-a(x).\n");
+        CHECK(written > 0 && (size_t)written < sizeof(source) - used);
+        used += (size_t)written;
+    }
+    wirelog_error_t error;
+    wirelog_program_t *program = wirelog_parse_string(source, &error);
+    wl_plan_t *plan = NULL;
+    CHECK(program && !wl_plan_from_program(program, &plan));
+    CHECK(plan->stratum_count == MAX_STRATA);
+    wl_evaluation_control_t *control = NULL;
+    CHECK(!wl_evaluation_control_create(0, &control));
+    wl_session_options_t options;
+    wl_session_options_init(&options); options.evaluation_control = control;
+    configure("WIRELOG_JOIN_BATCH_BYTES", "64");
+    configure("WIRELOG_JOIN_BATCH_STRICT", NULL);
+    wl_session_t *sessions[2] = {NULL, NULL};
+    CHECK(!wl_session_create_with_options(wl_backend_columnar(), plan, 1,
+        &options, &sessions[0]));
+    CHECK(!wl_session_create(wl_backend_columnar(), plan, 1, &sessions[1]));
+    configure("WIRELOG_JOIN_BATCH_BYTES", NULL);
+    CHECK(sessions[0]->source_c1_admission &&
+        !sessions[1]->source_c1_admission);
+    for (unsigned i = 0; i < 2; ++i)
+        CHECK(!wl_session_insert(sessions[i], "a", (int64_t[]){0, 1}, 2, 1));
+    if (refuse_only) {
+        /* Invalid admission must not need another global controller identity.
+         * No transaction or Native borrower exists on this fresh fixture. */
+        CHECK(!wl_evaluation_control_test_seed_next_identity(UINT64_MAX));
+        CHECK(wl_session_snapshot(sessions[0], NULL, NULL) == EINVAL);
+        wl_evaluation_control_report_t report;
+        CHECK(!wl_evaluation_control_active_attempt_id(control));
+        CHECK(wl_evaluation_control_report(control, &report) == ENOENT);
+        CHECK(!((wl_col_session_t *)sessions[0])->controlled_step);
+        for (unsigned i = 0; i < 2; ++i)
+            CHECK(!wl_session_try_destroy(&sessions[i]));
+        wl_evaluation_control_release(control);
+        wl_plan_free(plan); wirelog_program_free(program);
+        return;
+    }
+    admission_rows_t captured = {0};
+    if (evaluating_snapshot)
+        CHECK(!wl_session_snapshot(sessions[0], admission_snapshot_row,
+            &captured));
+    else CHECK(!finish(sessions[0]));
+    CHECK(!finish(sessions[1]));
+    for (unsigned i = 0; i < 2; ++i)
+        for (unsigned j = 0; j < MAX_STRATA; ++j) {
+            char name[16]; snprintf(name, sizeof(name), "r%u", j);
+            const col_rel_t *rel =
+                session_find_rel((wl_col_session_t *)sessions[i],
+                    name);
+            CHECK(rel && rel->ncols == 1 && rel->nrows == (j % 2 ? 0 : 2));
+            bool seen[2] = {false, false};
+            for (uint32_t k = 0; k < rel->nrows; ++k) {
+                int64_t value = col_rel_get(rel, k, 0);
+                CHECK(value >= 0 && value < 2 && !seen[value]);
+                seen[value] = true;
+            }
+            CHECK(seen[0] == (j % 2 == 0) && seen[1] == (j % 2 == 0));
+            if (evaluating_snapshot)
+                CHECK(captured.seen[j][0] == seen[0]
+                    && captured.seen[j][1] == seen[1]);
+        }
+    if (evaluating_snapshot) CHECK(captured.calls == MAX_STRATA);
+    wl_evaluation_control_report_t before, after;
+    CHECK(!wl_evaluation_control_report(control, &before)
+        && before.consumed && !before.result && !before.cleanup_status);
+    CHECK(wl_session_snapshot(sessions[0], NULL, NULL) == EINVAL);
+    CHECK(!wl_evaluation_control_active_attempt_id(control));
+    CHECK(!wl_evaluation_control_report(control, &after));
+    native_report_same(&before, &after);
+    for (unsigned i = 0; i < 2;
+        ++i) CHECK(!wl_session_try_destroy(&sessions[i]));
+    CHECK(!wl_evaluation_control_report(control, &after));
+    native_report_same(&before, &after);
+    wl_evaluation_control_release(control);
+    wl_plan_free(plan); wirelog_program_free(program);
+}
+
 int
 main(int argc, char **argv)
 {
@@ -1168,6 +1285,12 @@ main(int argc, char **argv)
         snapshot_identity_exhaustion = 2; native_snapshot_end();
     } else if (!strcmp(argv[1], "snapshot-exhaust-completed-successor")) {
         snapshot_identity_exhaustion = 3; native_snapshot_end();
-    }else CHECK(false);
+    } else if (!strcmp(argv[1], "admission-strata-step"))
+        admission_strata(false, false);
+    else if (!strcmp(argv[1], "admission-strata-snapshot"))
+        admission_strata(true, false);
+    else if (!strcmp(argv[1], "admission-strata-refusal"))
+        admission_strata(false, true);
+    else CHECK(false);
     return 0;
 }

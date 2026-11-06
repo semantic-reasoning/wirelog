@@ -5441,8 +5441,13 @@ col_session_create_internal(const wl_plan_t *plan, uint32_t num_workers,
      * Copy monotone property from each stratum in the plan.
      * Conservative default (all false from calloc) is already set,
      * so only copy if strata exist. */
+    sess->base.source_c1_admission = options && options->evaluation_control
+        && sess->num_workers == 1 && sess->join_batch_bytes
+        && plan->stratum_count <= MAX_STRATA;
     for (uint32_t si = 0; si < plan->stratum_count && si < MAX_STRATA; si++) {
         sess->stratum_is_monotone[si] = plan->strata[si].is_monotone;
+        if (plan->strata[si].is_recursive)
+            sess->base.source_c1_admission = false;
     }
 
     /* Issue #103: Initialize 2D frontier epoch tracking.
@@ -5972,6 +5977,7 @@ col_worker_session_create(wl_col_session_t *coordinator,
     out_worker->base.owns_extension_snapshot = false;
     out_worker->base.operation_admission = NULL;
     out_worker->base.owns_operation_admission = false;
+    out_worker->base.source_c1_admission = false;
     out_worker->base.owns_evaluation_control = false;
 
     /* Step 3: NULL all owned pointers (safe for cleanup on early abort) */
@@ -14819,10 +14825,11 @@ wl_columnar_session_controlled_step_drain_for_destroy(wl_col_session_t *sess)
         rc = col_controlled_step_drive(sess, step, true);
     if (rc == EAGAIN || step->operation_active) return EBUSY;
     if (step->transaction) {
-        int dispose_rc = EAGAIN;
-        for (unsigned action = 0; action < 16 && dispose_rc == EAGAIN; ++action)
+        int dispose_rc;
+        do {
             dispose_rc = wl_columnar_session_observed_dispose(sess, step);
-        if (dispose_rc) return dispose_rc == EAGAIN ? EBUSY : dispose_rc;
+        } while (dispose_rc == EAGAIN);
+        if (dispose_rc) return dispose_rc;
     }
     if (step->retirement_native_count || step->staging_cancel_pending ||
         step->staging_progress.identity

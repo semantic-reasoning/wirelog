@@ -83,6 +83,8 @@ struct wl_session {
     /* Owner key is operation_admission; copied workers borrow the control. */
     wl_evaluation_control_t *evaluation_control;
     bool owns_evaluation_control;
+    /* Selects SOURCE finance only; actual eligibility is always rechecked. */
+    bool source_c1_admission;
 };
 
 /* Internal: lease protects the session between controlled attempt calls.
@@ -119,6 +121,10 @@ int wl_session_source_finance_finish(wl_session_source_finance_t *);
 int wl_session_source_finance_rebegin(wl_session_source_finance_t *);
 int wl_session_source_finance_dispose(wl_session_source_finance_t *);
 int wl_session_source_footer(wl_session_t *);
+/* Actual admitted SOURCE scope only. Read callbacks do at most 40 scalar
+ * actions and never perform Native work; errors have no direct-read fallback. */
+int wl_session_source_admission_read(wl_session_t *,
+    wl_evaluation_control_source_action_fn, void *);
 /* Synchronous SOURCE bookkeeping only; no native or user callback work. */
 wl_evaluation_control_source_phase_result_t
     wl_session_source_snapshot_metadata(wl_session_t *,
