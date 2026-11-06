@@ -281,6 +281,146 @@ done:
     }
 }
 
+static unsigned owner_rows;
+
+static void
+count_owner_row(const char *relation, const int64_t *row, uint32_t ncols,
+    void *user_data)
+{
+    (void)relation;
+    (void)row;
+    (void)ncols;
+    (void)user_data;
+    owner_rows++;
+}
+
+static void
+ignore_delta(const char *relation, const int64_t *row, uint32_t ncols,
+    int32_t diff, void *user_data)
+{
+    (void)relation;
+    (void)row;
+    (void)ncols;
+    (void)diff;
+    (void)user_data;
+}
+
+/* Rows of @rel in a snapshot, or -1 when the snapshot fails. */
+static int
+owner_count(wirelog_easy_session_t *s, const char *rel)
+{
+    owner_rows = 0;
+    return wirelog_easy_snapshot(s, rel, count_owner_row, NULL) != WIRELOG_OK
+           ? -1 : (int)owner_rows;
+}
+
+/* `flag()` enters a recursive cycle through a rule with no join, which
+ * the owner strategy accepts: t(1, 2) holds while flag() does, t closes
+ * over the chain e(2, 3) .. e(@len, @len + 1) into @len rows, and flag()
+ * is derived back once t(1, 4) holds.  Owner mode builds a dedup set for
+ * every relation of the stratum, and the builder refused `flag` while it
+ * held a row, so the step failed before any worker evaluated the stratum.
+ * A chain longer than the owner strategy's iteration floor falls back
+ * through the owner_tiny_frontier replay, which restores the
+ * coordinator's saved relations; @replay names it when the step must take
+ * it.  A second step after one more edge must extend t by a row and still
+ * find one `flag()`.  With @host the row comes from wirelog_easy_insert
+ * rather than an inline fact. */
+static void
+check_owner(const char *name, bool host, uint32_t len, uint32_t workers,
+    bool callback, const char *replay)
+{
+    wirelog_easy_open_opts_t opts = WIRELOG_EASY_OPEN_OPTS_INIT;
+    wirelog_easy_session_t *s = NULL;
+    const char *why = NULL;
+    char src[4096];
+    char ran[96] = "";
+    int n;
+    int t = 0;
+
+    tests_run++;
+    printf("  [%d] %s (%u worker%s%s)", tests_run, name, workers,
+        workers == 1 ? "" : "s", callback ? ", callback" : "");
+    n = snprintf(src, sizeof(src),
+            ".decl e(x: int64, y: int64)\n.decl t(x: int64, y: int64)\n"
+            ".decl fp(x: int64)\n.decl flag()\n%s"
+            "fp(100) :- flag().\nt(1, 2) :- flag().\n"
+            "t(x, z) :- t(x, y), e(y, z).\nflag() :- t(1, 4).\n",
+            host ? "" : "flag().\n");
+    for (uint32_t i = 2; i <= len && n > 0 && (size_t)n < sizeof(src); i++)
+        n += snprintf(src + n, sizeof(src) - (size_t)n, "e(%u, %u).\n", i,
+                i + 1);
+    if (n <= 0 || (size_t)n >= sizeof(src)) {
+        why = "source too long";
+        goto done;
+    }
+    opts.num_workers = workers;
+    opts.eager_build = true;
+    if (wirelog_easy_open_opts(src, &opts, &s) != WIRELOG_OK) {
+        why = "open";
+        goto done;
+    }
+    if (callback && wirelog_easy_set_delta_cb(s, ignore_delta, NULL)
+        != WIRELOG_OK) {
+        why = "set_delta_cb";
+        goto done;
+    }
+    if (host) {
+        int64_t unused = 0;
+        if (wirelog_easy_insert(s, "flag", &unused, 0) != WIRELOG_OK) {
+            why = "insert";
+            goto done;
+        }
+    }
+    wl_col_session_t *inner = COL_SESSION(wirelog_easy_testhook_inner(s));
+    inner->tdd_audit.enabled = true;
+    if (wirelog_easy_step(s) != WIRELOG_OK) {
+        why = "step";
+        goto done;
+    }
+    snprintf(ran, sizeof(ran), " [ran %s on %u, replay %s]",
+        inner->tdd_audit.strategy ? inner->tdd_audit.strategy : "none",
+        inner->tdd_audit.selected_workers,
+        inner->tdd_audit.replay ? inner->tdd_audit.replay : "none");
+    if (workers > 1 && !callback
+        && (!inner->tdd_audit.strategy
+        || strcmp(inner->tdd_audit.strategy, "owner") != 0
+        || inner->tdd_audit.selected_workers < 2
+        || (replay && (!inner->tdd_audit.replay
+        || strcmp(inner->tdd_audit.replay, replay) != 0)))) {
+        why = "strategy, worker count or replay";
+        goto done;
+    }
+    t = owner_count(s, "t");
+    if (t != (int)len || owner_count(s, "flag") != 1
+        || owner_count(s, "fp") != 1) {
+        why = "wrong rows";
+        goto done;
+    }
+    /* The stratum evaluates again over one more edge after the first
+     * step, and after its fallback and restore when the step took one. */
+    int64_t edge[2] = { (int64_t)len + 1, (int64_t)len + 2 };
+    if (wirelog_easy_insert(s, "e", edge, 2) != WIRELOG_OK
+        || wirelog_easy_step(s) != WIRELOG_OK) {
+        why = "second step";
+        goto done;
+    }
+    t = owner_count(s, "t");
+    if (t != (int)len + 1 || owner_count(s, "flag") != 1
+        || owner_count(s, "fp") != 1)
+        why = "wrong rows after a second step";
+done:
+    if (s)
+        wirelog_easy_close(s);
+    if (why) {
+        tests_failed++;
+        printf("%s ... FAIL: %s (t has %d rows)\n", ran, why, t);
+    } else {
+        tests_passed++;
+        printf(" ... PASS\n");
+    }
+}
+
 int
 main(void)
 {
@@ -371,6 +511,21 @@ main(void)
             "t(x, y) :- e(x, y), flag().\n"
             "t(x, z) :- t(x, y), e(y, z), flag().\n",
             true, n, "aligned", 6);
+    }
+    for (uint32_t w = 0; w < sizeof(workers) / sizeof(workers[0]); w++) {
+        for (int cb = 0; cb < 2; cb++) {
+            uint32_t n = workers[w];
+            bool c = cb != 0;
+
+            check_owner("owner cycle through flag(), short chain", false, 3,
+                n, c, NULL);
+            check_owner("owner cycle through host flag(), short chain",
+                true, 3, n, c, NULL);
+            check_owner("owner cycle through flag(), long chain", false,
+                40, n, c, "owner_tiny_frontier");
+            check_owner("owner cycle through host flag(), long chain", true,
+                40, n, c, "owner_tiny_frontier");
+        }
     }
     printf("%d run, %d passed, %d failed\n", tests_run, tests_passed,
         tests_failed);
