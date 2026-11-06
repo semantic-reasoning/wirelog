@@ -5915,6 +5915,9 @@ col_worker_session_create(wl_col_session_t *coordinator,
         WL_COLUMNAR_PLAIN_STEP_COMPLETION_NONE;
     out_worker->plain_step_completion_relation = 0;
     out_worker->plain_step_completion_workers_retired = false;
+    out_worker->plain_step_completion_final_iteration = 0;
+    out_worker->plain_step_completion_rule_base = 0;
+    out_worker->plain_step_completion_iteration_capped = false;
     out_worker->callback_session_key = coordinator->callback_session_key;
     out_worker->delta_events = NULL;
     out_worker->delta_event_count = 0;
@@ -7490,16 +7493,27 @@ col_session_step_impl(wl_session_t *session)
         if (sess->plain_step_completion_phase
             != WL_COLUMNAR_PLAIN_STEP_COMPLETION_FINALIZE_NONREC
             && sess->plain_step_completion_phase
+            != WL_COLUMNAR_PLAIN_STEP_COMPLETION_FINALIZE_RECURSIVE
+            && sess->plain_step_completion_phase
+            != WL_COLUMNAR_PLAIN_STEP_COMPLETION_CANONICALIZE_RECURSIVE
+            && sess->plain_step_completion_phase
             != WL_COLUMNAR_PLAIN_STEP_COMPLETION_EVALUATE_REMAINING)
             return EBUSY;
         completion_start = sess->plain_step_completion_stratum + 1;
         completion_mask = sess->plain_step_completion_mask;
         if (sess->plain_step_completion_phase
-            == WL_COLUMNAR_PLAIN_STEP_COMPLETION_FINALIZE_NONREC) {
+            != WL_COLUMNAR_PLAIN_STEP_COMPLETION_EVALUATE_REMAINING) {
             int resume_rc =
-                wl_columnar_eval_resume_nonrecursive_completion(sess);
+                wl_columnar_eval_resume_stratum_completion(sess);
             if (resume_rc != 0)
                 return resume_rc;
+            if (sess->eval_stratum_iteration_capped) {
+                wl_columnar_session_note_iteration_cap(sess,
+                    sess->plain_step_completion_stratum);
+                return 0;
+            }
+            col_session_note_stratum_done(sess,
+                sess->plain_step_completion_stratum);
         }
     }
     sess->extension_expr_status = 0;

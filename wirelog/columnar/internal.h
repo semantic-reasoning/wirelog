@@ -2631,6 +2631,8 @@ enum wl_columnar_plain_step_completion_phase {
     WL_COLUMNAR_PLAIN_STEP_COMPLETION_FINALIZE_NONREC = 1,
     WL_COLUMNAR_PLAIN_STEP_COMPLETION_EVALUATE_REMAINING = 2,
     WL_COLUMNAR_PLAIN_STEP_COMPLETION_COMPACT = 3,
+    WL_COLUMNAR_PLAIN_STEP_COMPLETION_FINALIZE_RECURSIVE = 4,
+    WL_COLUMNAR_PLAIN_STEP_COMPLETION_CANONICALIZE_RECURSIVE = 5,
 };
 
 typedef struct wl_columnar_eval_stack_cleanup_frame
@@ -2759,6 +2761,9 @@ typedef struct wl_col_session_t {
     uint32_t plain_step_completion_phase;
     uint32_t plain_step_completion_relation;
     bool plain_step_completion_workers_retired;
+    uint32_t plain_step_completion_final_iteration;
+    uint32_t plain_step_completion_rule_base;
+    bool plain_step_completion_iteration_capped;
     /* Framed controlled initial STEP continuation; opaque to the session
      * layout so its host protocol types remain declared below. */
     wl_columnar_controlled_step_t *controlled_step;
@@ -6313,7 +6318,7 @@ wl_columnar_eval_tdd_owner_lifetime_retry(wl_col_session_t *coord);
 int
 wl_columnar_eval_tdd_owner_lifetime_quiesce(wl_col_session_t *coord);
 int
-wl_columnar_eval_resume_nonrecursive_completion(wl_col_session_t *coord);
+wl_columnar_eval_resume_stratum_completion(wl_col_session_t *coord);
 int
 wl_columnar_session_ensure_workqueue(wl_col_session_t *sess,
     uint32_t active_workers);

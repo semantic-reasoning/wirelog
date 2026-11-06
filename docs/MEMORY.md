@@ -2127,16 +2127,18 @@ rows, since a smaller result makes the bulk reserve a no-op.
 cache-clear case proves that clearing releases exactly the output's token.
 A full report-level reconciliation for join outputs is not covered.
 
-## 10c. Plain STEP completion recovery (#1713, #2329)
+## 10c. Plain STEP completion recovery (#1713, #2329, #2336)
 
 A public `STEP` that starts with no delta callback and no delta observer can
 retain a bounded scalar completion cursor (`plain_step_completion_pending`).
 It is armed at these points:
 
-- At W>=2, in `col_eval_stratum_tdd_nonrecursive` only: after workers evaluated
-  a partitioned nonrecursive stratum and their results merged, before the
-  workers retire (phase `FINALIZE_NONREC`). A recursive stratum does not arm
-  it. Neither does a nonrecursive stratum evaluated through `col_eval_stratum`,
+- At W>=2, after successful TDD evaluation and merge, before workers retire:
+  `col_eval_stratum_tdd_nonrecursive` uses phase `FINALIZE_NONREC`;
+  `col_eval_stratum_tdd_recursive` uses `FINALIZE_RECURSIVE`, followed by
+  `CANONICALIZE_RECURSIVE` for aggregate publication. The cursor saves the
+  final iteration, rule base and iteration-cap outcome. A nonrecursive
+  stratum evaluated through `col_eval_stratum` does not arm it,
   including its per-relation parallel path
   (`wl_columnar_eval_nonrec_relation_parallel`).
 - At W=1, after each stratum commits (phase `EVALUATE_REMAINING`).
@@ -2169,7 +2171,12 @@ exists, because a session with evaluation control never arms one.
 A later public `STEP` or `SNAPSHOT` first runs its entry checks, which can
 return their own error with the cursor unchanged. It then resumes the cursor
 before evaluating anything else or emitting anything. Completed worker
-publication and relations already finalized are not repeated. A `SNAPSHOT`
+publication and relations already finalized are not repeated. Recursive
+aggregate retry does not repeat relation normalization. Recursive convergence
+frontiers and iteration accounting publish once, after finalization succeeds;
+an iteration-capped stratum clears the cursor without publishing convergence
+or evaluating downstream strata, preserving the partial-snapshot contract.
+A `SNAPSHOT`
 whose resume fails calls no tuple callback.
 
 A finalization refused before it publishes leaves its target's rows,
@@ -2189,8 +2196,11 @@ or `SNAPSHOT`.
 Input stays refused because the session holds an uncommitted evaluation. After
 a merge, the relation holds rows that are neither normalized nor counted as
 completed, and a first evaluation that started over would keep them. This
-protection exists only where a cursor is armed: #2336 tracks a recursive
-stratum at W>=2, whose refused final normalization arms nothing.
+protection exists only where a cursor is armed. Recursive W>=2 completion
+now has the same input exclusion after successful merge (#2336). The regression
+lowers an enforcing governor's limit at the final-normalization test hook and
+observes a real `ENOSPC`; reachability with a fixed public budget and no hook
+has not been established by this test.
 
 The cursor clears in two places only: the commit block of a `STEP`, or of the
 drain inside a `SNAPSHOT`, that succeeds, and a stratum that reaches its

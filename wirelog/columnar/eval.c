@@ -8602,6 +8602,26 @@ done:
      * owned modes already accumulated their results during exchange. */
     if (rc == 0 && !bdx_mode && !owner_exchange_mode && !global_read_mode)
         rc = tdd_merge_worker_results(sp, coord);
+    if (rc == 0 && coord->plain_step_completion_step_context) {
+        /* The fixpoint is already in the coordinator.  A refused cleanup
+         * or normalization must not let a new input operation turn these
+         * uncommitted rows into the next evaluation's seed (#2336). */
+        coord->plain_step_completion_pending = true;
+        coord->plain_step_completion_active = true;
+        coord->plain_step_completion_stratum = stratum_idx;
+        coord->plain_step_completion_phase =
+            WL_COLUMNAR_PLAIN_STEP_COMPLETION_FINALIZE_RECURSIVE;
+        coord->plain_step_completion_relation = 0;
+        coord->plain_step_completion_workers_retired = false;
+        coord->plain_step_completion_final_iteration = final_eff_iter;
+        coord->plain_step_completion_rule_base = rule_id_base;
+        coord->plain_step_completion_iteration_capped =
+            coord->eval_stratum_iteration_capped;
+        rc = wl_columnar_eval_resume_stratum_completion(coord);
+        coord->tdd_final_merge_ns += now_ns() - merge_t0;
+        coord->tdd_total_ns += now_ns() - tdd_total_t0;
+        return rc;
+    }
     int cleanup_rc = tdd_cleanup_workers(coord);
     if (cleanup_rc != 0)
         rc = cleanup_rc;
@@ -8757,6 +8777,9 @@ col_eval_stratum_tdd_nonrecursive(const wl_plan_stratum_t *sp,
             WL_COLUMNAR_PLAIN_STEP_COMPLETION_FINALIZE_NONREC;
         coord->plain_step_completion_relation = 0;
         coord->plain_step_completion_workers_retired = false;
+        coord->plain_step_completion_final_iteration = 0;
+        coord->plain_step_completion_rule_base = 0;
+        coord->plain_step_completion_iteration_capped = false;
     }
 
     /* Worker results have been merged; retire their dependencies before
@@ -8785,21 +8808,25 @@ col_eval_stratum_tdd_nonrecursive(const wl_plan_stratum_t *sp,
     /* Worker merge is complete.  Keep the finalization cursor outside the
      * worker contexts so a checked reader refusal can be retried through a
      * later public STEP or SNAPSHOT without dispatching the stratum again. */
-    return wl_columnar_eval_resume_nonrecursive_completion(coord);
+    return wl_columnar_eval_resume_stratum_completion(coord);
 }
 
 int
-wl_columnar_eval_resume_nonrecursive_completion(wl_col_session_t *coord)
+wl_columnar_eval_resume_stratum_completion(wl_col_session_t *coord)
 {
     if (!coord || !coord->plain_step_completion_pending)
         return EINVAL;
-    if (coord->plain_step_completion_phase
-        != WL_COLUMNAR_PLAIN_STEP_COMPLETION_FINALIZE_NONREC)
+    const uint32_t phase = coord->plain_step_completion_phase;
+    if ((phase != WL_COLUMNAR_PLAIN_STEP_COMPLETION_FINALIZE_NONREC
+        && phase != WL_COLUMNAR_PLAIN_STEP_COMPLETION_FINALIZE_RECURSIVE
+        && phase != WL_COLUMNAR_PLAIN_STEP_COMPLETION_CANONICALIZE_RECURSIVE)
+        || !coord->plan
+        || coord->plain_step_completion_stratum >= coord->plan->stratum_count) {
+        coord->plain_step_completion_active = false;
         return EINVAL;
-    if (!coord->plan
-        || coord->plain_step_completion_stratum >= coord->plan->stratum_count)
-        return EINVAL;
-
+    }
+    const bool recursive = phase !=
+        WL_COLUMNAR_PLAIN_STEP_COMPLETION_FINALIZE_NONREC;
     const wl_plan_stratum_t *sp =
         &coord->plan->strata[coord->plain_step_completion_stratum];
     if (!coord->plain_step_completion_workers_retired) {
@@ -8820,8 +8847,30 @@ wl_columnar_eval_resume_nonrecursive_completion(wl_col_session_t *coord)
         }
         coord->plain_step_completion_relation++;
     }
-    tdd_record_nonrecursive_convergence(coord, sp,
-        coord->plain_step_completion_stratum);
+    coord->eval_stratum_iteration_capped =
+        coord->plain_step_completion_iteration_capped;
+    if (recursive) {
+        /* Keep the relation cursor at the end if aggregate publication is
+         * refused: already normalized relations must not be replayed. */
+        coord->plain_step_completion_phase =
+            WL_COLUMNAR_PLAIN_STEP_COMPLETION_CANONICALIZE_RECURSIVE;
+        int rc = wl_columnar_eval_serial_canonicalize_aggregates(sp, coord);
+        if (rc != 0) {
+            coord->plain_step_completion_active = false;
+            return rc;
+        }
+        if (!coord->eval_stratum_iteration_capped) {
+            tdd_record_recursive_convergence(coord, sp,
+                coord->plain_step_completion_stratum,
+                coord->plain_step_completion_rule_base,
+                coord->plain_step_completion_final_iteration);
+            coord->total_iterations +=
+                coord->plain_step_completion_final_iteration;
+        }
+    } else {
+        tdd_record_nonrecursive_convergence(coord, sp,
+            coord->plain_step_completion_stratum);
+    }
     coord->plain_step_completion_phase =
         WL_COLUMNAR_PLAIN_STEP_COMPLETION_EVALUATE_REMAINING;
     coord->plain_step_completion_relation = 0;
