@@ -6399,7 +6399,8 @@ hold_aggregate_publication(wl_col_session_t *sess, col_rel_t *rel)
 }
 
 static void
-test_aggregate_public_retry(uint32_t workers, bool alias_reader)
+test_aggregate_public_retry(uint32_t workers, bool alias_reader,
+    bool plain_step)
 {
     TEST("public aggregate: final publication refusal and exact retry");
     uint8_t predicate[] = { WL_PLAN_EXPR_BOOL, 1 };
@@ -6448,17 +6449,23 @@ test_aggregate_public_retry(uint32_t workers, bool alias_reader)
     atomic_store_explicit(&aggregate_public_workers, 0, memory_order_relaxed);
     wl_columnar_eval_test_outbound_after_plan = observe_aggregate_worker;
     wl_columnar_eval_serial_test_before_aggregate = hold_aggregate_publication;
-    int rc = wl_session_snapshot(session, collect_tuple, &tuples);
+    int rc = plain_step ? wl_session_step(session)
+        : wl_session_snapshot(session, collect_tuple, &tuples);
     wl_columnar_eval_serial_test_before_aggregate = NULL;
     wl_columnar_eval_test_outbound_after_plan = NULL;
     PUBLIC_AGG_CHECK(rc == EBUSY && aggregate_public_hook_rc == 0
         && aggregate_public_target && aggregate_public_target->nrows == 2
         && tuples.count == 0, "public final aggregate refusal");
     if (workers > 1)
-        PUBLIC_AGG_CHECK(sess->tdd_executed_strata == 1
+        PUBLIC_AGG_CHECK((plain_step || sess->tdd_executed_strata == 1)
             && atomic_load_explicit(&aggregate_public_workers,
             memory_order_relaxed) == (1u << workers) - 1u,
             "actual aggregate workers");
+    if (plain_step)
+        PUBLIC_AGG_CHECK(sess->plain_step_completion_pending
+            && sess->plain_step_completion_phase ==
+            WL_COLUMNAR_PLAIN_STEP_COMPLETION_CANONICALIZE_RECURSIVE,
+            "recursive aggregate completion cursor");
     PUBLIC_AGG_CHECK(col_session_get_arrangement(session, "output", &key, 1),
         "held target arrangement");
     uint32_t arrangement_index = 0;
@@ -6504,6 +6511,9 @@ test_aggregate_public_retry(uint32_t workers, bool alias_reader)
         && tuples.rows[0][1] == 10
         && strcmp(tuples.relations[0], "output") == 0,
         "public exact aggregate retry");
+    if (plain_step)
+        PUBLIC_AGG_CHECK(!sess->plain_step_completion_pending,
+            "aggregate completion cursor drained");
 cleanup:
     wl_columnar_eval_serial_test_before_aggregate = NULL;
     wl_columnar_eval_test_outbound_after_plan = NULL;
@@ -17967,6 +17977,254 @@ recovery_cleanup:
         PASS();
 #undef RECOVERY_CHECK
 }
+/* #2336: a failed final normalization owns a completed recursive result.
+ * Keep it resumable, and do not let a retraction turn it into a new seed. */
+static wl_col_session_t *recursive_finish_coord;
+static unsigned recursive_finish_hits;
+static uint32_t recursive_finish_iterations;
+static col_frontier_2d_t recursive_finish_frontier;
+static wl_atomic_u64 recursive_finish_dispatches;
+
+static void
+recursive_finish_refuse(wl_col_session_t *coord, col_rel_t *target)
+{
+    if (coord != recursive_finish_coord || !target
+        || strcmp(target->name, "p") != 0)
+        return;
+    if (recursive_finish_hits++ == 0) {
+        recursive_finish_iterations = coord->total_iterations;
+        recursive_finish_frontier = coord->frontiers[0];
+    }
+    if (!idb_budget_changed)
+        idb_set_budget(coord);
+}
+
+static int
+recursive_finish_count_dispatch(wl_col_session_t *sess, col_rel_t *r,
+    col_rel_t *image, col_rel_t *delta)
+{
+    (void)r;
+    (void)image;
+    (void)delta;
+    if (sess->coordinator == recursive_finish_coord)
+        atomic_fetch_add_explicit(&recursive_finish_dispatches, 1,
+            memory_order_relaxed);
+    return 0;
+}
+
+/* Exact independent oracle: these rules derive positive odd-length paths.
+ * Removing (10,11) divides the chain; both p and its downstream copy z must
+ * contain each surviving path exactly once, and no other tuple. */
+static bool
+recursive_finish_model(const tuple_collector_t *tuples, bool removed)
+{
+    bool seen[2][22][22] = { false };
+    unsigned expected = 0;
+    for (int i = 0; i < tuples->count; i++) {
+        int rel = strcmp(tuples->relations[i], "p") == 0 ? 0
+            : strcmp(tuples->relations[i], "z") == 0 ? 1 : -1;
+        int64_t x = tuples->rows[i][0], y = tuples->rows[i][1];
+        if (rel < 0 || tuples->ncols[i] != 2 || x < 1 || y > 21
+            || x >= y || ((y - x) % 2) != 1
+            || (removed && x <= 10 && y >= 11) || seen[rel][x][y])
+            return false;
+        seen[rel][x][y] = true;
+    }
+    for (unsigned rel = 0; rel < 2; rel++)
+        for (unsigned x = 1; x <= 20; x++)
+            for (unsigned y = x + 1; y <= 21; y++) {
+                bool wanted = ((y - x) % 2) == 1
+                    && !(removed && x <= 10 && y >= 11);
+                if (wanted)
+                    expected++;
+                if (seen[rel][x][y] != wanted)
+                    return false;
+            }
+    return expected == (removed ? 110u : 220u)
+           && tuples->count == (int)expected;
+}
+
+static void
+test_recursive_finalization_recovery(uint32_t workers, bool snapshot_retry,
+    bool capped)
+{
+    TEST(
+        "recursive finalization refusal blocks input and resumes before removal");
+    const char *old = getenv("WIRELOG_TDD_MIN_ROWS_PER_WORKER");
+    char saved[64] = "";
+    if (old)
+        snprintf(saved, sizeof(saved), "%s", old);
+    wl_session_t *session = NULL, *reference = NULL;
+    wl_plan_t *plan = NULL;
+    wirelog_program_t *program = NULL;
+    wirelog_error_t parse_error;
+    wl_columnar_memory_governor_ref_t *governor = NULL;
+    static tuple_collector_t actual, expected;
+    const char *failure = NULL;
+    const int64_t removed[] = { 10, 11 }, extra[] = { 21, 22 };
+    wl_columnar_eval_serial_test_iteration_limit = capped ? 1 : 0;
+    recursive_finish_hits = 0;
+    recursive_finish_coord = NULL;
+    atomic_store_explicit(&recursive_finish_dispatches, 0,
+        memory_order_relaxed);
+    idb_budget_changed = false;
+#define RECURSIVE_FINISH_CHECK(c, m) do { if (!(c)) { failure = (m); \
+                                                      goto \
+                                                      recursive_finish_cleanup; \
+                                          } } while (0)
+#ifdef _WIN32
+    (void)_putenv_s("WIRELOG_TDD_MIN_ROWS_PER_WORKER", "1");
+#else
+    (void)setenv("WIRELOG_TDD_MIN_ROWS_PER_WORKER", "1", 1);
+#endif
+    program = wirelog_parse_string(capped
+        ? ".decl e(x: int64, y: int64)\n"
+            ".decl p(x: int64, y: int64)\n"
+            ".decl z(x: int64, y: int64)\n"
+            "p(x,y) :- e(x,y).\n"
+            "p(x,z) :- p(x,y), e(y,z).\n"
+            "z(x,y) :- p(x,y).\n"
+        : ".decl e(x: int64, y: int64)\n"
+            ".decl p(x: int64, y: int64)\n"
+            ".decl z(x: int64, y: int64)\n"
+            "p(x,y) :- e(x,y).\n"
+            "p(x,w) :- p(x,y), p(y,z), p(z,w).\n"
+            "z(x,y) :- p(x,y).\n", &parse_error);
+    RECURSIVE_FINISH_CHECK(program, "parse recursive program");
+    wl_fusion_apply(program, NULL);
+    wl_jpp_apply(program, NULL);
+    wl_sip_apply(program, NULL);
+    RECURSIVE_FINISH_CHECK(wl_plan_from_program(program, &plan) == 0,
+        "build recursive plan");
+    RECURSIVE_FINISH_CHECK(plan && plan->stratum_count == 2,
+        "recursive and downstream strata");
+    RECURSIVE_FINISH_CHECK(wl_session_create(wl_backend_columnar(), plan,
+        workers, &session) == 0 && wl_session_create(wl_backend_columnar(),
+        plan, workers, &reference) == 0, "recovery sessions");
+    recursive_finish_coord = COL_SESSION(session);
+    governor = recursive_finish_coord->memory_governor;
+    wl_columnar_memory_governor_ref_retain(governor);
+    for (int64_t i = 1; i <= 20; i++) {
+        const int64_t row[] = { i, i + 1 };
+        RECURSIVE_FINISH_CHECK(wl_session_insert(session, "e", row, 1, 2)
+            == 0 && wl_session_insert(reference, "e", row, 1, 2) == 0,
+            "chain input");
+    }
+    wl_columnar_eval_test_before_final_normalize = recursive_finish_refuse;
+    int rc = wl_session_step(session);
+    RECURSIVE_FINISH_CHECK(rc == ENOSPC && wl_session_budget_denied(session)
+        && recursive_finish_hits == 1, "real governor refusal at finalization");
+    RECURSIVE_FINISH_CHECK(recursive_finish_coord->plain_step_completion_pending
+        && !recursive_finish_coord->plain_step_completion_active,
+        "refused recursive finalization retains an idle cursor");
+    col_rel_t *head = session_find_rel(recursive_finish_coord, "p");
+    RECURSIVE_FINISH_CHECK(head &&
+        (capped ? head->nrows > 1 : head->nrows == 110),
+        "merged recursive result");
+    const uint64_t view = head->view_generation,
+        storage = head->storage_generation;
+    wl_columnar_eval_test_before_worker_dedup = recursive_finish_count_dispatch;
+    memset(&actual, 0, sizeof(actual));
+    RECURSIVE_FINISH_CHECK(wl_session_snapshot(session, collect_tuple, &actual)
+        == ENOSPC && actual.count == 0 && wl_session_step(session) == ENOSPC,
+        "repeated STEP/SNAPSHOT refusal emits nothing");
+    RECURSIVE_FINISH_CHECK(head->view_generation == view
+        && head->storage_generation == storage
+        && recursive_finish_coord->total_iterations ==
+        recursive_finish_iterations
+        && memcmp(&recursive_finish_coord->frontiers[0],
+        &recursive_finish_frontier, sizeof(recursive_finish_frontier)) == 0,
+        "refusal does not publish storage or convergence");
+    idb_restore_budget(recursive_finish_coord);
+    RECURSIVE_FINISH_CHECK(wl_session_remove(session, "e", removed, 1, 2)
+        == EBUSY && wl_session_insert(session, "e", extra, 1, 2) == EBUSY,
+        "restored budget does not reopen pending input");
+    wl_columnar_eval_test_before_final_normalize = NULL;
+    memset(&actual, 0, sizeof(actual));
+    rc = snapshot_retry ? wl_session_snapshot(session, collect_tuple, &actual)
+        : wl_session_step(session);
+    RECURSIVE_FINISH_CHECK(rc == 0
+        && !recursive_finish_coord->plain_step_completion_pending
+        && !recursive_finish_coord->plain_step_completion_active
+        && atomic_load_explicit(&recursive_finish_dispatches,
+        memory_order_relaxed) == 0,
+        "completion drains without recursive redispatch");
+    wl_columnar_eval_test_before_worker_dedup = NULL;
+    RECURSIVE_FINISH_CHECK(wl_session_step(reference) == 0,
+        "never-failed reference");
+    RECURSIVE_FINISH_CHECK(recursive_finish_coord->total_iterations
+        == COL_SESSION(reference)->total_iterations,
+        "convergence iterations counted exactly once");
+    if (capped) {
+        col_rel_t *downstream = session_find_rel(recursive_finish_coord, "z");
+        RECURSIVE_FINISH_CHECK(
+            recursive_finish_coord->eval_stratum_iteration_capped
+            && recursive_finish_coord->total_iterations == 0
+            && (!downstream || downstream->nrows == 0),
+            "capped completion skips convergence and downstream evaluation");
+        if (snapshot_retry) {
+            RECURSIVE_FINISH_CHECK(actual.count == (int)head->nrows,
+                "capped snapshot emits the partial recursive result");
+            for (int i = 0; i < actual.count; i++)
+                RECURSIVE_FINISH_CHECK(strcmp(actual.relations[i], "p") == 0,
+                    "capped snapshot excludes downstream relation");
+        }
+        goto recursive_finish_cleanup;
+    }
+    if (!snapshot_retry)
+        RECURSIVE_FINISH_CHECK(wl_session_snapshot(session, collect_tuple,
+            &actual) == 0, "completed snapshot");
+    memset(&expected, 0, sizeof(expected));
+    RECURSIVE_FINISH_CHECK(wl_session_snapshot(reference, collect_tuple,
+        &expected) == 0 && recursive_finish_model(&actual, false)
+        && recursive_finish_model(&expected, false),
+        "both complete models match every expected tuple");
+    RECURSIVE_FINISH_CHECK(wl_session_remove(session, "e", removed, 1, 2)
+        == 0 && wl_session_remove(reference, "e", removed, 1, 2) == 0
+        && wl_session_step(session) == 0 && wl_session_step(reference) == 0,
+        "remove and step after completion");
+    memset(&actual, 0, sizeof(actual));
+    memset(&expected, 0, sizeof(expected));
+    RECURSIVE_FINISH_CHECK(wl_session_snapshot(session, collect_tuple, &actual)
+        == 0 && wl_session_snapshot(reference, collect_tuple, &expected) == 0
+        && recursive_finish_model(&actual, true)
+        && recursive_finish_model(&expected, true),
+        "removed edge and all paths crossing it disappear from both relations");
+recursive_finish_cleanup:
+    wl_columnar_eval_serial_test_iteration_limit = 0;
+    wl_columnar_eval_test_before_final_normalize = NULL;
+    wl_columnar_eval_test_before_worker_dedup = NULL;
+    if (session) {
+        idb_restore_budget(COL_SESSION(session));
+        wl_session_destroy(session);
+    }
+    if (reference)
+        wl_session_destroy(reference);
+    wl_plan_free(plan);
+    wirelog_program_free(program);
+    if (governor) {
+        if (wl_columnar_memory_reserved(wl_columnar_memory_governor_ref_get(
+                governor)) != 0)
+            failure = "recursive completion leaked a reservation";
+        wl_columnar_memory_governor_ref_release(governor);
+    }
+    recursive_finish_coord = NULL;
+#ifdef _WIN32
+    (void)_putenv_s("WIRELOG_TDD_MIN_ROWS_PER_WORKER", old ? saved : "");
+#else
+    if (old)
+        (void)setenv("WIRELOG_TDD_MIN_ROWS_PER_WORKER", saved, 1);
+    else
+        (void)unsetenv("WIRELOG_TDD_MIN_ROWS_PER_WORKER");
+#endif
+    if (failure) {
+        printf(" (W=%u snapshot=%d)", workers, snapshot_retry);
+        FAIL(failure);
+    } else {
+        PASS();
+    }
+#undef RECURSIVE_FINISH_CHECK
+}
 #endif
 
 int
@@ -17984,6 +18242,12 @@ main(void)
     test_worker_image_run_guard();
     test_worker_failure_recovery(2);
     test_worker_failure_recovery(8);
+    test_recursive_finalization_recovery(2, false, false);
+    test_recursive_finalization_recovery(2, true, false);
+    test_recursive_finalization_recovery(8, false, false);
+    test_recursive_finalization_recovery(8, true, false);
+    test_recursive_finalization_recovery(2, false, true);
+    test_recursive_finalization_recovery(8, true, true);
     /* Stale state from an earlier run must not satisfy the guard test. */
     run_guard.other = 1;
     run_guard.count = RUN_GUARD_SLOTS;
@@ -18156,11 +18420,13 @@ main(void)
         test_aggregate_publication_guard(mode, false);
         test_aggregate_publication_guard(mode, true);
     }
-    test_aggregate_public_retry(1, false);
-    test_aggregate_public_retry(2, false);
-    test_aggregate_public_retry(2, true);
-    test_aggregate_public_retry(8, false);
-    test_aggregate_public_retry(8, true);
+    test_aggregate_public_retry(1, false, false);
+    test_aggregate_public_retry(2, false, false);
+    test_aggregate_public_retry(2, true, false);
+    test_aggregate_public_retry(8, false, false);
+    test_aggregate_public_retry(8, true, false);
+    test_aggregate_public_retry(2, false, true);
+    test_aggregate_public_retry(8, true, true);
     test_coordinator_specialized_parallel();
     test_filter_worker_provenance(2);
     test_filter_worker_provenance(8);

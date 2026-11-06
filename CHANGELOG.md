@@ -243,6 +243,11 @@ All notable changes to wirelog are documented in this file.
 
 ### Fixed
 
+- Plain STEP now retains recursive TDD completion after a final-normalization
+  refusal. STEP or SNAPSHOT retries finish normalization and aggregate
+  publication before accepting input, preventing stale paths after a later
+  removal (#2336).
+
 - **String and float recursive relations evaluate on several workers**
   (#2334): a recursive relation with no rows yet started an evaluation as
   an empty, zero-width and untyped placeholder.  When a recursive rule read
