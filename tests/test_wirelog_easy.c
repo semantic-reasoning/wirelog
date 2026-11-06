@@ -1946,43 +1946,85 @@ test_print_delta_unknown_relation_integer_fallback(void)
 
 /* PARITY: facade-only -- wirelog_easy_print_delta is a stdout helper; no advanced equivalent (#785). */
 static void
-test_print_delta_abort_on_missed_symbol(void)
+test_print_delta_missed_symbol_prints_integer(void)
 {
-    TEST("print_delta aborts on missed reverse-intern");
+    TEST("print_delta prints a missed reverse-intern as an integer");
 
 #ifdef _WIN32
     SKIP("fork not available on Windows");
     return;
 #else
+    int fds[2];
+    if (pipe(fds) != 0) {
+        FAIL("pipe failed");
+        return;
+    }
+    /* The child must not inherit this process's unflushed test log. */
+    fflush(stdout);
+    fflush(stderr);
     pid_t pid = fork();
     if (pid < 0) {
+        close(fds[0]);
+        close(fds[1]);
         FAIL("fork failed");
         return;
     }
     if (pid == 0) {
-        /* Child: silence stdio so the abort message does not pollute
-         * the parent's test log. */
-        fclose(stdout);
-        fclose(stderr);
+        /* Child: stdout and stderr share the pipe, unbuffered, so the
+         * parent sees them in the order they were written. */
+        close(fds[0]);
+        if (dup2(fds[1], 1) < 0 || dup2(fds[1], 2) < 0)
+            _exit(3);
+        close(fds[1]);
+        setvbuf(stdout, NULL, _IONBF, 0);
 
         wirelog_easy_session_t *s = NULL;
         if (wirelog_easy_open(ACCESS_CONTROL_SRC, &s) != WIRELOG_OK || !s)
             _exit(2);
         wirelog_easy_set_delta_cb(s, wirelog_easy_print_delta, s);
-        /* Bogus, never-interned ids — printer must abort. */
+        /* Ids the intern table never handed out. */
         int64_t row[2] = { 999999, 888888 };
         wirelog_easy_insert(s, "can", row, 2);
         wirelog_easy_step(s);
         wirelog_easy_close(s);
+        fflush(stdout);
         _exit(0);
     }
+    close(fds[1]);
+    char out[4096];
+    size_t len = 0;
+    for (;;) {
+        ssize_t n = read(fds[0], out + len, sizeof(out) - 1 - len);
+        if (n <= 0)
+            break;
+        len += (size_t)n;
+        if (len == sizeof(out) - 1)
+            break;
+    }
+    out[len] = '\0';
+    close(fds[0]);
     int status = 0;
     if (waitpid(pid, &status, 0) < 0) {
         FAIL("waitpid failed");
         return;
     }
-    if (!WIFSIGNALED(status) || WTERMSIG(status) != SIGABRT) {
-        FAIL("child did not abort as expected");
+    if (WIFSIGNALED(status)) {
+        FAIL("child died on a signal");
+        return;
+    }
+    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+        FAIL("child did not exit 0");
+        return;
+    }
+    const char *printed = strstr(out, "+ granted(999999, 888888)\n");
+    const char *note = strstr(out, "missed reverse-intern for relation "
+            "'granted' column 0 id 999999");
+    if (!printed || !note || !strstr(out, "column 1 id 888888")) {
+        FAIL("missing the integer row or the stderr note");
+        return;
+    }
+    if (note < printed) {
+        FAIL("stderr note written before the row was complete");
         return;
     }
     PASS();
@@ -3332,7 +3374,7 @@ main(void)
     test_snapshot_filter();
     test_print_delta_integer_column();
     test_print_delta_unknown_relation_integer_fallback();
-    test_print_delta_abort_on_missed_symbol();
+    test_print_delta_missed_symbol_prints_integer();
     test_cleanup_order_no_use_after_free();
     test_intern_after_step_succeeds();
     test_delta_cb_multi_round_recursive_insert();

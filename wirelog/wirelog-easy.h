@@ -343,9 +343,12 @@ wirelog_easy_set_delta_cb(wirelog_easy_session_t *s, wirelog_on_delta_fn cb,
  *
  * Convenience delta callback that prints "+" / "-" followed by the relation
  * and the columns formatted according to the parsed schema.  STRING columns
- * are reverse-interned; integer/bool columns are printed as %PRId64.  If a
- * STRING column cannot be reverse-interned, the function calls abort() to
- * prevent silent corruption (NDEBUG-safe — assert() would compile out).
+ * are reverse-interned; integer/bool columns are printed as %PRId64.  A
+ * STRING column whose id the intern table cannot reverse (for example a
+ * value inserted by the host that was never interned) is printed as a
+ * bare, unquoted integer, and a line naming the relation, column and id is
+ * written to stderr after the row.  A resolved string is always printed
+ * quoted.
  */
 WIRELOG_API void
 wirelog_easy_print_delta(const char *relation, const int64_t *row,
