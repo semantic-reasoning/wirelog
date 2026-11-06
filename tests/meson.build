@@ -7074,3 +7074,12 @@ test_relation_empty_source_exe = executable(
 )
 test('relation_empty_source', test_relation_empty_source_exe,
      suite: ['unit', 'tsan'], timeout: 60)
+
+# Independent generated-program oracle (#2242).
+recursive_random_model_exe = executable(
+  'test_recursive_random_model', files('test_recursive_random_model.c'),
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
+  link_with: [testlib_prod],
+)
+test('recursive_random_model', recursive_random_model_exe, timeout: 180)

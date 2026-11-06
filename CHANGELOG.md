@@ -6,6 +6,11 @@ All notable changes to wirelog are documented in this file.
 
 ### Added
 
+- A deterministic 150-program recursive evaluation campaign compares exact
+  models with an independent finite-domain interpreter, covering body constants,
+  repeated variables, differently keyed cached joins and filtered recursive
+  joins (#2242).
+
 - Recursive TDD strata carry worker deltas to the coordinator through a
   byte-bounded batch channel that the coordinator pumps while workers run.
   A batch larger than the capacity is still admitted into an empty
