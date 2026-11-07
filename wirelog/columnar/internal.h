@@ -5922,6 +5922,18 @@ int wl_columnar_expr_hash_bytes_attempt_controlled(const uint8_t *, size_t,
 int wl_columnar_expr_crc_bytes_attempt_controlled(const uint8_t *, size_t,
     bool, uint32_t *, wl_evaluation_control_t *, uint64_t);
 
+/* Private disjoint case-copy destination, immutable source span. Like byte
+ * copy, copied reports completed stores after accepted entry, even on stop;
+ * rejected entry leaves it unchanged. Tariff224*(3*length+2): LOAD, ASCII-only
+ * transform, STORE separately funded. NUL/high bytes are ordinary span bytes. */
+int wl_columnar_expr_ascii_case_attempt_controlled(uint8_t *, const uint8_t *,
+    size_t, bool, size_t *, wl_evaluation_control_t *, uint64_t);
+/* Caller supplies private24-byte buffer. Fixed snprintf boundary; buffer may
+ * be modified before a later stop, length unchanged on nonzero. Two224 caller
+ * regions, independent of fixed-width int64 magnitude. No heap admission. */
+int wl_columnar_expr_format_i64_attempt_controlled(int64_t, char *, size_t *,
+    wl_evaluation_control_t *, uint64_t);
+
 /* Context-bearing scalar owner (#2299). Immutable bytecode copy, no intern
  * mutation during compile. Numeric-only hosts keep the numeric owner path.
  * Evaluation borrows the actual session/plan context (or caller-held pin),

@@ -1707,7 +1707,653 @@ static void session_string_digests(void) {
     wl_columnar_memory_governor_ref_release(g2);
 }
 
+static const uint8_t builder_tags[] = {WL_PLAN_EXPR_STR_FN_CAT,
+                                       WL_PLAN_EXPR_STR_FN_TO_UPPER,
+                                       WL_PLAN_EXPR_STR_FN_TO_LOWER,
+                                       WL_PLAN_EXPR_STR_FN_TO_STRING};
+static void builder_primitives(void) {
+    uint8_t source[256], out[256];
+    for (unsigned i = 0; i < 256; ++i)source[i] = (uint8_t)i;
+    for (unsigned upper = 0; upper < 2; ++upper)for (unsigned empty = 0;
+            empty < 2;
+            ++empty)
+            for (unsigned below = 0; below < 2; ++below) {
+                size_t n = empty?0:256, copied = 999;
+                memset(out, 0xFF, sizeof(out));
+                wl_evaluation_control_t *c = begin(224*(3*n+2)-below);
+                int rc = wl_columnar_expr_ascii_case_attempt_controlled(out,
+                        source, n, upper != 0, &copied,
+                        c, wl_evaluation_control_active_attempt_id(c));
+                CHECK(rc == (below?WL_EVALUATION_CONTROL_WORK_LIMIT:0) &&
+                    copied == n);
+                for (size_t i = 0; i < n; ++i) {
+                    unsigned char x = source[i];
+                    if (upper && x >= 'a' && x <= 'z') x -= 32u;
+                    else if (!upper && x >= 'A' && x <= 'Z') x += 32u;
+                    CHECK(out[i] == x);
+                }
+                finish(c, rc);
+            }
+    for (unsigned phase = 144; phase <= 148; ++phase) {
+        wl_evaluation_control_t *c = begin(0); size_t copied = 999;
+        stop_phase = phase; stop_progress = phase == 144?0:phase == 148?0:1;
+        wl_columnar_expr_test_checkpoint = witness;
+        int rc = wl_columnar_expr_ascii_case_attempt_controlled(out, source,
+                256, true, &copied,
+                c, wl_evaluation_control_active_attempt_id(c));
+        wl_columnar_expr_test_checkpoint = NULL; stop_phase = 0;
+        CHECK(rc == WL_EVALUATION_CONTROL_CANCELLED);
+        CHECK(copied == (phase == 144?999:phase == 148?256:1)); finish(c, rc);
+    }
+    const int64_t numbers[] = {0, 1, -1, INT64_MIN, INT64_MAX};
+    const char *strings[] = {"0", "1", "-1", "-9223372036854775808",
+                             "9223372036854775807"};
+    for (unsigned i = 0; i < 5;
+        ++i) for (unsigned below = 0; below < 2; ++below){
+            wl_evaluation_control_t *c = begin(448-below); char text[24];
+            size_t length = 999;
+            int rc = wl_columnar_expr_format_i64_attempt_controlled(numbers[i],
+                    text, &length, c,
+                    wl_evaluation_control_active_attempt_id(c));
+            CHECK(rc == (below?WL_EVALUATION_CONTROL_WORK_LIMIT:0));
+            if (below) CHECK(length == 999);
+            else CHECK(length == strlen(strings[i]) && !strcmp(text,
+                    strings[i]));
+            finish(c, rc);
+        }
+    for (unsigned phase = 139; phase <= 148; ++phase) {
+        if (phase == 140 || phase == 143)continue;
+        wl_evaluation_control_t *c = begin(0);
+        uint64_t old = wl_evaluation_control_active_attempt_id(c);
+        rebound = false; utf8_rebind_phase = phase;
+        wl_columnar_expr_test_checkpoint = utf8_rebind;
+        size_t copied = 999, length = 999; char text[24];
+        int rc = phase <
+            144?wl_columnar_expr_format_i64_attempt_controlled(INT64_MIN, text,
+                &length, c, old):
+            wl_columnar_expr_ascii_case_attempt_controlled(out, source, 256,
+                true, &copied, c, old);
+        wl_columnar_expr_test_checkpoint = NULL;
+        CHECK(rebound && rc == EINVAL && length == 999);
+        uint64_t consumed = 999;
+        CHECK(!wl_evaluation_control_test_active_consumed(c,
+            wl_evaluation_control_active_attempt_id(c),
+            &consumed) && !consumed);
+        finish(c, 0);
+    }
+}
+static void direct_builders(void) {
+    wl_intern_t *intern = wl_intern_create(); CHECK(intern);
+    const char *words[] = {"", "aB", " A z ", "\xE2\x82\xAC" "z", "\xF1\x80"};
+    int64_t ids[5];
+    for (unsigned i = 0; i < 5; ++i) {
+        ids[i] = wl_intern_put(intern, words[i]); CHECK(ids[i] >= 0);
+    }
+    int64_t operands[] = {ids[0], ids[1], ids[2], ids[3], ids[4], -1, INT64_MIN,
+                          INT64_MAX};
+    for (unsigned op = 0; op < 4; ++op)for (unsigned context_case =
+            0; context_case < 2;
+            ++context_case)
+            for (unsigned a = 0; a < sizeof(operands)/sizeof(*operands)+1; ++a)
+                for (unsigned b = 0;
+                    b < (op?1:sizeof(operands)/sizeof(*operands)); ++b){
+                    uint8_t bytes[32]; uint32_t n = 0;
+                    if (a < sizeof(operands)/sizeof(*operands)) {
+                        bytes[n++] = WL_PLAN_EXPR_CONST_INT;
+                        memcpy(bytes+n, &operands[a], 8); n += 8;
+                        if (!op) {
+                            bytes[n++] = WL_PLAN_EXPR_CONST_INT;
+                            memcpy(bytes+n, &operands[b], 8); n += 8;
+                        }
+                    }
+                    bytes[n++] = builder_tags[op];
+                    wl_evaluation_control_t *c = begin(0);
+                    bool supported = false;
+                    wl_columnar_expr_attempt_scalar_t *program = NULL;
+                    CHECK(!wl_columnar_expr_compile_scalar_attempt_controlled(
+                            bytes, n, NULL, &program, &supported, c,
+                            wl_evaluation_control_active_attempt_id(c)) &&
+                        supported);
+                    wl_columnar_expr_context_t context =
+                    {.intern = context_case?NULL:intern};
+                    int64_t value = 999, raw = 999; bool failed = true;
+                    wl_columnar_expr_status_t status, raw_status;
+                    CHECK(!wl_columnar_expr_eval_run_ctx(bytes, n, NULL, 0,
+                        &raw, &context, &raw_status));
+                    CHECK(!wl_columnar_expr_eval_scalar_attempt_controlled(
+                            program, NULL, 0, &context, &value, &failed,
+                            &status, c,
+                            wl_evaluation_control_active_attempt_id(c)) &&
+                        !failed && value == raw && status == raw_status);
+                    wirelog_column_type_t type = WIRELOG_TYPE_FLOAT;
+                    CHECK(
+                        !wl_columnar_expr_scalar_result_type_attempt_controlled(
+                            program, NULL, 0, &type, &supported, c,
+                            wl_evaluation_control_active_attempt_id(c)) &&
+                        supported && type == WIRELOG_TYPE_STRING);
+                    wl_columnar_expr_attempt_scalar_free(program); finish(c, 0);
+                }
+    wl_intern_free(intern);
+}
+static wl_columnar_memory_governor_ref_t *builder_governor(void) {
+    wl_columnar_memory_resolution_t r =
+    {.budget_bytes = WL_COLUMNAR_MEMORY_MIN_BUDGET, .usable_bytes = 1000000,
+     .mode =
+         WL_COLUMNAR_MEMORY_MODE_ENFORCING};
+    wl_columnar_memory_governor_ref_t *g =
+        wl_columnar_memory_governor_ref_create(&r); CHECK(g); return g;
+}
+static void builder_memory(void) {
+    for (unsigned shared = 0; shared < 2; ++shared)for (unsigned denied =
+            0; denied < 2;
+            ++denied){
+            wl_intern_t *intern = wl_intern_create(); CHECK(intern);
+            int64_t x = wl_intern_put(intern, "x"); CHECK(x >= 0);
+            wl_columnar_memory_governor_ref_t *gi = builder_governor(),
+                *go = shared?gi:builder_governor();
+            CHECK(!wl_intern_attach_memory_governor(intern, gi));
+            wl_columnar_memory_governor_t *bi =
+                wl_columnar_memory_governor_ref_get(gi),
+                *bo = wl_columnar_memory_governor_ref_get(go);
+            uint64_t base = wl_columnar_memory_reserved(bi);
+            uint8_t bytes[10] = {WL_PLAN_EXPR_CONST_INT};
+            memcpy(bytes+1, &x, 8); bytes[9] = WL_PLAN_EXPR_STR_FN_TO_UPPER;
+            wl_evaluation_control_t *c = begin(0); bool supported = false;
+            wl_columnar_expr_attempt_scalar_t *program = NULL;
+            CHECK(!wl_columnar_expr_compile_scalar_attempt_controlled(bytes,
+                sizeof(bytes), go, &program, &supported, c,
+                wl_evaluation_control_active_attempt_id(c)) && supported);
+            uint64_t owner = wl_columnar_expr_test_scalar_owner_size()+
+                sizeof(bytes), scratch = 2;
+            uint64_t peak = 2*base+2+(shared?owner+scratch:0);
+            if (!shared) atomic_store_explicit(&bo->usable_bytes, owner+scratch,
+                    memory_order_relaxed);
+            atomic_store_explicit(&bi->usable_bytes, peak-denied,
+                memory_order_relaxed);
+            wl_columnar_expr_context_t context = {.intern = intern};
+            int64_t value = 999; bool failed = true;
+            wl_columnar_expr_status_t status = WL_COLUMNAR_EXPR_INVALID_RESULT;
+            int rc = wl_columnar_expr_eval_scalar_attempt_controlled(program,
+                    NULL, 0, &context, &value, &failed, &status, c,
+                    wl_evaluation_control_active_attempt_id(c));
+            CHECK(rc == (denied?ENOMEM:0));
+            if (denied) {
+                CHECK(value == 999 && failed &&
+                    status == WL_COLUMNAR_EXPR_INVALID_RESULT &&
+                    wl_intern_count(intern) == 1);
+                CHECK(wl_columnar_memory_reserved(bi) == base+(shared?owner:0));
+                CHECK(wl_evaluation_control_finish(c, &direct_owner, ENOMEM,
+                    0) == ENOMEM);
+                CHECK(!wl_evaluation_control_reset(c));
+                CHECK(!wl_evaluation_control_begin(c, &direct_owner));
+                atomic_store_explicit(&bi->usable_bytes, peak,
+                    memory_order_relaxed);
+                CHECK(!wl_columnar_expr_eval_scalar_attempt_controlled(program,
+                    NULL, 0, &context, &value, &failed, &status, c,
+                    wl_evaluation_control_active_attempt_id(c)) && !failed);
+            }
+            CHECK(!strcmp(wl_intern_reverse(intern, value),
+                "X") && wl_intern_count(intern) == 2);
+            CHECK(wl_columnar_memory_reserved(bi) == base+2+(shared?owner:0));
+            if (!shared) CHECK(wl_columnar_memory_reserved(bo) == owner);
+            wl_columnar_expr_attempt_scalar_free(program); finish(c, 0);
+            wl_intern_free(intern);
+            CHECK(!wl_columnar_memory_reserved(bi)); if (!shared) {
+                CHECK(!wl_columnar_memory_reserved(bo));
+                wl_columnar_memory_governor_ref_release(go);
+            }
+            wl_columnar_memory_governor_ref_release(gi);
+        }
+    /* A distinct owner governor can admit the owner but deny its real scratch. */
+    wl_intern_t *intern = wl_intern_create(); CHECK(intern);
+    int64_t x = wl_intern_put(intern, "x"); CHECK(x >= 0);
+    wl_columnar_memory_governor_ref_t *g = builder_governor();
+    wl_columnar_memory_governor_t *budget =
+        wl_columnar_memory_governor_ref_get(g);
+    uint8_t bytes[10] = {WL_PLAN_EXPR_CONST_INT}; memcpy(bytes+1, &x, 8);
+    bytes[9] = WL_PLAN_EXPR_STR_FN_TO_UPPER;
+    wl_evaluation_control_t *c = begin(0); bool supported = false;
+    wl_columnar_expr_attempt_scalar_t *program = NULL;
+    CHECK(!wl_columnar_expr_compile_scalar_attempt_controlled(bytes,
+        sizeof(bytes), g, &program, &supported, c,
+        wl_evaluation_control_active_attempt_id(c)) && supported);
+    uint64_t owner = wl_columnar_expr_test_scalar_owner_size()+sizeof(bytes);
+    atomic_store_explicit(&budget->usable_bytes, owner+1, memory_order_relaxed);
+    int64_t value = 999; bool failed = true;
+    wl_columnar_expr_status_t status = WL_COLUMNAR_EXPR_INVALID_RESULT;
+    wl_columnar_expr_context_t context = {.intern = intern};
+    CHECK(wl_columnar_expr_eval_scalar_attempt_controlled(program, NULL, 0,
+        &context, &value, &failed, &status, c,
+        wl_evaluation_control_active_attempt_id(c)) == ENOSPC && value == 999 &&
+        failed && status == WL_COLUMNAR_EXPR_INVALID_RESULT);
+    CHECK(wl_intern_count(intern) == 1 &&
+        wl_columnar_memory_reserved(budget) == owner);
+    wl_columnar_expr_attempt_scalar_free(program); finish(c, ENOSPC);
+    wl_intern_free(intern);
+    CHECK(!wl_columnar_memory_reserved(budget));
+    wl_columnar_memory_governor_ref_release(g);
+}
+static void builder_stack_format(void) {
+    wl_intern_t *intern = wl_intern_create(); CHECK(intern);
+    CHECK(wl_intern_put(intern, "42") >= 0);
+    wl_columnar_memory_governor_ref_t *g = builder_governor();
+    uint8_t bytes[10] = {WL_PLAN_EXPR_CONST_INT}; int64_t input = 42;
+    memcpy(bytes+1, &input, 8); bytes[9] = WL_PLAN_EXPR_STR_FN_TO_STRING;
+    wl_evaluation_control_t *c = begin(0); bool supported = false;
+    wl_columnar_expr_attempt_scalar_t *program = NULL;
+    CHECK(!wl_columnar_expr_compile_scalar_attempt_controlled(bytes,
+        sizeof(bytes), g, &program, &supported, c,
+        wl_evaluation_control_active_attempt_id(c)) && supported);
+    uint64_t owner = wl_columnar_expr_test_scalar_owner_size()+sizeof(bytes);
+    atomic_store_explicit(&wl_columnar_memory_governor_ref_get(g)->usable_bytes,
+        owner, memory_order_relaxed);
+    wl_columnar_expr_test_fail_allocation = 0;
+    int64_t value = 999; bool failed = true;
+    wl_columnar_expr_context_t context = {.intern = intern};
+    wl_columnar_expr_status_t status;
+    CHECK(!wl_columnar_expr_eval_scalar_attempt_controlled(program, NULL, 0,
+        &context, &value, &failed, &status, c,
+        wl_evaluation_control_active_attempt_id(c)) && !failed &&
+        !strcmp(wl_intern_reverse(intern, value), "42"));
+    CHECK(wl_columnar_expr_test_fail_allocation == 0);
+    wl_columnar_expr_test_fail_allocation = -1;
+    wl_columnar_expr_attempt_scalar_free(program); finish(c, 0);
+    wl_intern_free(intern);
+    CHECK(!wl_columnar_memory_reserved(wl_columnar_memory_governor_ref_get(g)));
+    wl_columnar_memory_governor_ref_release(g);
+}
+static uint64_t intern_overflow_before;
+static void intern_accounting_overflow(wl_evaluation_control_t *c,
+    unsigned phase, uint64_t progress) {
+    (void)progress;
+    if (phase == 2) {
+        CHECK(!wl_evaluation_control_test_active_consumed(c,
+            wl_evaluation_control_active_attempt_id(c),
+            &intern_overflow_before));
+        CHECK(wl_evaluation_control_charge(c, UINT64_MAX) == EOVERFLOW);
+    }
+}
+static void allocation_late_cancel(wl_evaluation_control_t *c, unsigned phase,
+    uint64_t progress, bool failed) {
+    (void)failed;
+    if (c && phase == 150 &&
+        progress == ENOMEM) wl_evaluation_control_request_cancel(c);
+}
+static void builder_errors_and_stops(void) {
+    for (unsigned mode = 0; mode < 5; ++mode) {
+        wl_intern_t *intern = wl_intern_create(); CHECK(intern);
+        int64_t id = wl_intern_put(intern, "x"); CHECK(id >= 0);
+        wl_columnar_memory_governor_ref_t *g = builder_governor();
+        uint8_t bytes[32]; uint32_t n;
+        if (mode == 0)n = (uint32_t)literal(bytes, "overflow", 8);
+        else {
+            bytes[0] = WL_PLAN_EXPR_CONST_INT; memcpy(bytes+1, &id, 8);
+            bytes[9] = WL_PLAN_EXPR_STR_FN_TO_UPPER; n = 10;
+        }
+        wl_evaluation_control_t *c = begin(0); bool supported = false;
+        wl_columnar_expr_attempt_scalar_t *program = NULL;
+        CHECK(!wl_columnar_expr_compile_scalar_attempt_controlled(bytes, n, g,
+            &program, &supported, c,
+            wl_evaluation_control_active_attempt_id(c)) && supported);
+        uint64_t owner =
+            wl_columnar_memory_reserved(wl_columnar_memory_governor_ref_get(g));
+        if (mode <
+            2) wl_intern_control_test_checkpoint = intern_accounting_overflow;
+        else if (mode == 2)wl_columnar_expr_test_fail_allocation = 0;
+        else {
+            wl_intern_control_test_fail_allocation = 0;
+            if (mode ==
+                4) wl_columnar_expr_test_checkpoint = allocation_late_cancel;
+        }
+        int64_t value = 999; bool failed = true;
+        wl_columnar_expr_status_t status = WL_COLUMNAR_EXPR_INVALID_RESULT;
+        wl_columnar_expr_context_t context = {.intern = intern};
+        uint64_t old = wl_evaluation_control_active_attempt_id(c);
+        int rc = wl_columnar_expr_eval_scalar_attempt_controlled(program, NULL,
+                0, &context, &value, &failed, &status, c, old);
+        wl_intern_control_test_checkpoint = NULL;
+        wl_columnar_expr_test_checkpoint = NULL;
+        wl_columnar_expr_test_fail_allocation = -1;
+        wl_intern_control_test_fail_allocation = -1;
+        CHECK(rc == (mode < 2?EOVERFLOW:ENOMEM) && value == 999 && failed &&
+            status == WL_COLUMNAR_EXPR_INVALID_RESULT);
+        CHECK(wl_intern_count(intern) == 1 &&
+            wl_columnar_memory_reserved(wl_columnar_memory_governor_ref_get(
+                g)) == owner);
+        uint64_t consumed = 0;
+        CHECK(!wl_evaluation_control_test_active_consumed(c, old,
+            &consumed) && consumed > 0 && consumed < UINT64_MAX);
+        if (mode < 2) CHECK(consumed == intern_overflow_before);
+        CHECK(wl_evaluation_control_finish(c, &direct_owner, rc, 0) == rc);
+        wl_evaluation_control_report_t report;
+        CHECK(!wl_evaluation_control_report(c,
+            &report) && report.result == rc && report.execution_status == rc &&
+            report.consumed == consumed && !report.cleanup_status);
+        if (mode ==
+            4) CHECK(report.stop_reason == WL_EVALUATION_CONTROL_CANCELLED);
+        CHECK(!wl_evaluation_control_reset(c));
+        CHECK(!wl_evaluation_control_begin(c, &direct_owner));
+        CHECK(!wl_columnar_expr_eval_scalar_attempt_controlled(program, NULL, 0,
+            &context, &value, &failed, &status, c,
+            wl_evaluation_control_active_attempt_id(c)) && !failed);
+        CHECK(!strcmp(wl_intern_reverse(intern, value),
+            mode == 0?"overflow":"X"));
+        wl_columnar_expr_attempt_scalar_free(program); finish(c, 0);
+        wl_intern_free(intern);
+        CHECK(!wl_columnar_memory_reserved(wl_columnar_memory_governor_ref_get(
+                g))); wl_columnar_memory_governor_ref_release(g);
+    }
+    for (unsigned rebind = 0; rebind < 2; ++rebind)for (unsigned phase = 130;
+            phase <= 138; ++phase) {
+            if (phase == 132 || phase == 133 || phase == 134) continue;
+            wl_intern_t *intern = wl_intern_create(); CHECK(intern);
+            int64_t id = wl_intern_put(intern, "x"); CHECK(id >= 0);
+            wl_columnar_memory_governor_ref_t *g = builder_governor();
+            uint8_t bytes[10] = {WL_PLAN_EXPR_CONST_INT};
+            memcpy(bytes+1, &id, 8); bytes[9] = WL_PLAN_EXPR_STR_FN_TO_UPPER;
+            wl_evaluation_control_t *c = begin(0); bool supported = false;
+            wl_columnar_expr_attempt_scalar_t *program = NULL;
+            CHECK(!wl_columnar_expr_compile_scalar_attempt_controlled(bytes,
+                sizeof(bytes), g, &program, &supported, c,
+                wl_evaluation_control_active_attempt_id(c)) && supported);
+            uint64_t owner =
+                wl_columnar_memory_reserved(wl_columnar_memory_governor_ref_get(
+                        g)), old = wl_evaluation_control_active_attempt_id(c);
+            if (rebind) {
+                rebound = false; utf8_rebind_phase = phase;
+                wl_columnar_expr_test_checkpoint = utf8_rebind;
+            }else {
+                stop_phase = phase; stop_progress = 0;
+                wl_columnar_expr_test_checkpoint = witness;
+            }
+            int64_t value = 999; bool failed = true;
+            wl_columnar_expr_status_t status = WL_COLUMNAR_EXPR_INVALID_RESULT;
+            wl_columnar_expr_context_t context = {.intern = intern};
+            int rc = wl_columnar_expr_eval_scalar_attempt_controlled(program,
+                    NULL, 0, &context, &value, &failed, &status, c, old);
+            wl_columnar_expr_test_checkpoint = NULL; stop_phase = 0;
+            CHECK(rc == (rebind?EINVAL:WL_EVALUATION_CONTROL_CANCELLED) &&
+                value == 999 && failed &&
+                status == WL_COLUMNAR_EXPR_INVALID_RESULT);
+            CHECK(wl_columnar_memory_reserved(
+                    wl_columnar_memory_governor_ref_get(g)) == owner);
+            CHECK(wl_intern_count(intern) == (phase >= 137?2:1));
+            if (rebind) {
+                uint64_t consumed = 999;
+                CHECK(rebound && !wl_evaluation_control_test_active_consumed(c,
+                    wl_evaluation_control_active_attempt_id(c),
+                    &consumed) && !consumed);
+            }else {
+                CHECK(wl_evaluation_control_finish(c, &direct_owner, 0,
+                    0) == rc); CHECK(!wl_evaluation_control_reset(c));
+                CHECK(!wl_evaluation_control_begin(c, &direct_owner));
+            }
+            CHECK(!wl_columnar_expr_eval_scalar_attempt_controlled(program,
+                NULL, 0, &context, &value, &failed, &status, c,
+                wl_evaluation_control_active_attempt_id(c)) && !failed &&
+                !strcmp(wl_intern_reverse(intern, value), "X"));
+            wl_columnar_expr_attempt_scalar_free(program); finish(c, 0);
+            wl_intern_free(intern);
+            CHECK(!wl_columnar_memory_reserved(
+                    wl_columnar_memory_governor_ref_get(g)));
+            wl_columnar_memory_governor_ref_release(g);
+        }
+}
+
+static const char *builder_words[] = {"", "aB", " Z ", "\xE2\x82\xAC" "z"};
+static const int64_t builder_numbers[] = {10, -42, INT64_MIN, INT64_MAX-1};
+static const char *builder_results[4][4] = {
+    {"!", "aB!", " Z !", "\xE2\x82\xAC" "z!"},
+    {"", "AB", " Z ", "\xE2\x82\xAC" "Z"},
+    {"", "ab", " z ", "\xE2\x82\xAC" "z"},
+    {"10", "-42", "-9223372036854775808", "9223372036854775806"}
+};
+static const char builder_source[] = ".decl input(x:string,n:int64)\n"
+    ".decl out(x:string,c:string,u:string,l:string,s:string,n:int64)\n"
+    "out(x,cat(x,\"!\"),to_upper(x),to_lower(x),to_string(n),n+1) :- input(x,n).\n";
+static void builder_input(fixture_t *f, unsigned i) {
+    int64_t row[] = {wl_intern_put(f->plan->intern, builder_words[i]),
+                     builder_numbers[i]}; CHECK(row[0] >= 0);
+    CHECK(!wl_session_insert(f->session, "input", row, 1, 2));
+}
+static unsigned builder_word_index(wl_intern_t *intern, int64_t value) {
+    const char *word = wl_intern_reverse(intern, value); CHECK(word);
+    unsigned i = 0;
+    while (i < 4 && strcmp(word, builder_words[i]))++i;
+    CHECK(i < 4); return i;
+}
+static void check_builder_map(fixture_t *f, unsigned count) {
+    col_rel_t *out = session_find_rel(COL_SESSION(f->session), "out");
+    CHECK(out && out->ncols == 6 && out->nrows == count);
+    for (unsigned c = 0; c < 5;
+        ++c) CHECK(out->column_types[c] == WIRELOG_TYPE_STRING);
+    CHECK(out->column_types[5] == WIRELOG_TYPE_INT64); bool seen[4] = {0};
+    for (uint32_t r = 0; r < count; ++r) {
+        unsigned k = builder_word_index(f->plan->intern, out->columns[0][r]);
+        CHECK(!seen[k]); seen[k] = true;
+        for (unsigned op = 0; op < 4; ++op) {
+            const char *result = wl_intern_reverse(f->plan->intern,
+                    out->columns[op+1][r]);
+            CHECK(result && !strcmp(result, builder_results[op][k]));
+        }
+        CHECK(out->columns[5][r] == builder_numbers[k]+1);
+    }
+    if (count == 4)for (unsigned i = 0; i < 4; ++i) CHECK(seen[i]);
+    if (count == 3)for (unsigned i = 0; i < 4; ++i) CHECK(seen[i] == (i != 1));
+    if (count == 1)CHECK(seen[1]);
+}
+static void builder_delta(const char *relation, const int64_t *row,
+    uint32_t cols, int32_t diff, void *arg) {
+    fixture_t *f = arg;
+    CHECK(!strcmp(relation, "out") && cols == 6 && (diff == 1 || diff == -1));
+    unsigned k = builder_word_index(f->plan->intern, row[0]);
+    for (unsigned op = 0; op < 4; ++op) {
+        const char *result = wl_intern_reverse(f->plan->intern, row[op+1]);
+        CHECK(result && !strcmp(result, builder_results[op][k]));
+    }
+    CHECK(row[5] == builder_numbers[k]+1); ++events; positives += diff == 1;
+    negatives += diff == -1;
+}
+static unsigned builders_seen[4];
+static bool builder_exhaust;
+static void builder_session_stop(wl_evaluation_control_t *c, unsigned phase,
+    uint64_t progress, bool failed) {
+    (void)failed;
+    if (phase == 129)for (unsigned i = 0; i < 4;
+            ++i) if (progress == builder_tags[i]) ++builders_seen[i];
+    if (c && phase == 147 && progress == 1) {
+        if (builder_exhaust)CHECK(wl_evaluation_control_charge(c,
+                UINT64_MAX) == WL_EVALUATION_CONTROL_WORK_LIMIT);
+        else wl_evaluation_control_request_cancel(c);
+    }
+}
+static void builder_filter_delta(const char *relation, const int64_t *row,
+    uint32_t cols, int32_t diff, void *arg) {
+    fixture_t *f = arg;
+    CHECK(!strcmp(relation, "out") && cols == 1 && (diff == 1 || diff == -1));
+    CHECK(builder_word_index(f->plan->intern, row[0]) == 1); ++events;
+    positives += diff == 1; negatives += diff == -1;
+}
+static void session_builders(void) {
+    for (unsigned mode = 0; mode < 2; ++mode) {
+        fixture_t f = create(builder_source, mode != 0);
+        events = positives = negatives = 0;
+        wl_session_set_delta_cb(f.session, builder_delta, &f);
+        memset(builders_seen, 0, sizeof(builders_seen));
+        uint32_t strings = wl_intern_count(f.plan->intern);
+        wl_columnar_expr_test_checkpoint = builder_session_stop;
+        CHECK(!step_complete(f.session));
+        wl_columnar_expr_test_checkpoint = NULL; check_builder_map(&f, 0);
+        CHECK(wl_intern_count(f.plan->intern) == strings); for (unsigned i = 0;
+            i < 4; ++i) CHECK(!builders_seen[i]);
+        for (unsigned i = 0; i < 4; ++i)builder_input(&f, i);
+        builder_exhaust = mode != 0;
+        if (builder_exhaust) CHECK(!wl_evaluation_control_configure(f.control,
+                UINT64_MAX-1));
+        wl_columnar_expr_test_checkpoint = builder_session_stop;
+        CHECK(step_complete(f.session) ==
+            (builder_exhaust?WL_EVALUATION_CONTROL_WORK_LIMIT:
+            WL_EVALUATION_CONTROL_CANCELLED));
+        wl_columnar_expr_test_checkpoint = NULL; CHECK(!events);
+        check_builder_map(&f, 0);
+        for (unsigned i = 0; i < 4; ++i)CHECK(builders_seen[i]);
+        CHECK(!wl_evaluation_control_reset(f.control));
+        CHECK(!step_complete(f.session)); check_builder_map(&f, 4);
+        CHECK(events == 4 && positives == 4 && !negatives);
+        int64_t removed[] = {wl_intern_get(f.plan->intern, "aB"), -42};
+        CHECK(!wl_session_remove(f.session, "input", removed, 1, 2));
+        CHECK(!step_complete(f.session)); check_builder_map(&f, 3);
+        CHECK(events == 5 && negatives == 1);
+        CHECK(!step_complete(f.session) && events == 5);
+        wl_columnar_memory_governor_ref_t *g =
+            COL_SESSION(f.session)->memory_governor;
+        wl_columnar_memory_governor_ref_retain(g); destroy(&f);
+        CHECK(!wl_columnar_memory_reserved(wl_columnar_memory_governor_ref_get(
+                g))); wl_columnar_memory_governor_ref_release(g);
+    }
+    const char *expressions[] = {"cat(x,\"!\")", "to_upper(x)", "to_lower(x)",
+                                 "to_string(n)"};
+    for (unsigned op = 0; op < 4; ++op) {
+        char source[512];
+        snprintf(source, sizeof(source),
+            ".decl input(x:string,n:int64)\n.decl out(x:string)\nout(x) :- input(x,n), %s = \"%s\".\n",
+            expressions[op], builder_results[op][1]);
+        fixture_t f = create(source, false); events = positives = negatives = 0;
+        wl_session_set_delta_cb(f.session, builder_filter_delta, &f);
+        CHECK(!step_complete(f.session));
+        col_rel_t *out = session_find_rel(COL_SESSION(f.session), "out");
+        CHECK(out && !out->nrows);
+        for (unsigned i = 0; i < 4; ++i)builder_input(&f, i);
+        stop_phase = 136; stop_progress = 0;
+        wl_columnar_expr_test_checkpoint = witness;
+        CHECK(step_complete(f.session) == WL_EVALUATION_CONTROL_CANCELLED);
+        wl_columnar_expr_test_checkpoint = NULL; stop_phase = 0;
+        out = session_find_rel(COL_SESSION(f.session), "out");
+        CHECK(out && !out->nrows && !events);
+        CHECK(!wl_evaluation_control_reset(f.control));
+        CHECK(!step_complete(f.session));
+        out = session_find_rel(COL_SESSION(f.session), "out");
+        CHECK(out && out->nrows == 1 && events == 1 && positives == 1 &&
+            !negatives);
+        CHECK(builder_word_index(f.plan->intern, out->columns[0][0]) == 1);
+        int64_t removed[] = {wl_intern_get(f.plan->intern, "aB"), -42};
+        CHECK(!wl_session_remove(f.session, "input", removed, 1, 2));
+        CHECK(!step_complete(f.session));
+        out = session_find_rel(COL_SESSION(f.session), "out");
+        CHECK(out && !out->nrows && events == 2 && negatives == 1);
+        CHECK(!step_complete(f.session) && events == 2); destroy(&f);
+    }
+    fixture_t f = create(builder_source, false);
+    CHECK(!step_complete(f.session));
+    wl_evaluation_control_t *control = NULL;
+    CHECK(!wl_evaluation_control_create(0, &control));
+    wl_session_options_t options;
+    wl_session_options_init(&options); options.evaluation_control = control;
+    wl_session_t *second = NULL;
+    CHECK(!wl_session_create_with_options(wl_backend_columnar(), f.plan, 1,
+        &options, &second));
+    wl_columnar_memory_governor_ref_t *g1 =
+        COL_SESSION(f.session)->memory_governor,
+        *g2 = COL_SESSION(second)->memory_governor;
+    CHECK(g1 != g2); wl_columnar_memory_governor_ref_retain(g1);
+    wl_columnar_memory_governor_ref_retain(g2);
+    fixture_t borrowed = f; borrowed.session = second;
+    builder_input(&borrowed, 1); CHECK(!step_complete(second));
+    check_builder_map(&borrowed, 1);
+    wl_session_destroy(second); wl_evaluation_control_release(control);
+    CHECK(!wl_columnar_memory_reserved(wl_columnar_memory_governor_ref_get(
+            g2)));
+    destroy(&f);
+    CHECK(!wl_columnar_memory_reserved(wl_columnar_memory_governor_ref_get(
+            g1)));
+    wl_columnar_memory_governor_ref_release(g1);
+    wl_columnar_memory_governor_ref_release(g2);
+}
+static void builders_preserve_allocations(void) {
+    for (unsigned kind = 0; kind < 5; ++kind) {
+        wl_intern_t *intern = wl_intern_create(); CHECK(intern);
+        int64_t empty = wl_intern_put(intern, ""),
+            upper = wl_intern_put(intern, "A"),
+            lower = wl_intern_put(intern, "a");
+        CHECK(empty >= 0 && upper >= 0 && lower >= 0);
+        int64_t input = kind < 3?empty:kind == 3?upper:lower;
+        uint8_t bytes[24] = {WL_PLAN_EXPR_CONST_INT};
+        memcpy(bytes+1, &input, 8); uint32_t n = 9;
+        if (!kind) {
+            bytes[n++] = WL_PLAN_EXPR_CONST_INT; memcpy(bytes+n, &empty, 8);
+            n += 8;
+        }
+        bytes[n++] = kind == 0?WL_PLAN_EXPR_STR_FN_CAT:kind == 1 ||
+            kind == 3?WL_PLAN_EXPR_STR_FN_TO_UPPER:WL_PLAN_EXPR_STR_FN_TO_LOWER;
+        wl_evaluation_control_t *c = begin(0); bool supported = false;
+        wl_columnar_expr_attempt_scalar_t *program = NULL;
+        CHECK(!wl_columnar_expr_compile_scalar_attempt_controlled(bytes, n,
+            NULL, &program, &supported, c,
+            wl_evaluation_control_active_attempt_id(c)) && supported);
+        wl_columnar_expr_test_fail_allocation = 0;
+        int64_t value = 999; bool failed = true;
+        wl_columnar_expr_status_t status = WL_COLUMNAR_EXPR_INVALID_RESULT;
+        wl_columnar_expr_context_t context = {.intern = intern};
+        CHECK(wl_columnar_expr_eval_scalar_attempt_controlled(program, NULL, 0,
+            &context, &value, &failed, &status, c,
+            wl_evaluation_control_active_attempt_id(c)) == ENOMEM &&
+            value == 999 && failed &&
+            status == WL_COLUMNAR_EXPR_INVALID_RESULT);
+        wl_columnar_expr_test_fail_allocation = -1;
+        CHECK(wl_intern_count(intern) == 3);
+        wl_columnar_expr_attempt_scalar_free(program); finish(c, ENOMEM);
+        wl_intern_free(intern);
+    }
+    for (unsigned phase = 2; phase <= 4; phase += 2) {
+        wl_intern_t *intern = wl_intern_create(); CHECK(intern);
+        int64_t input = wl_intern_put(intern, "x"); CHECK(input >= 0);
+        wl_columnar_memory_governor_ref_t *g = builder_governor();
+        uint8_t bytes[10] = {WL_PLAN_EXPR_CONST_INT};
+        memcpy(bytes+1, &input, 8); bytes[9] = WL_PLAN_EXPR_STR_FN_TO_UPPER;
+        wl_evaluation_control_t *c = begin(0); bool supported = false;
+        wl_columnar_expr_attempt_scalar_t *program = NULL;
+        CHECK(!wl_columnar_expr_compile_scalar_attempt_controlled(bytes,
+            sizeof(bytes), g, &program, &supported, c,
+            wl_evaluation_control_active_attempt_id(c)) && supported);
+        uint64_t owner =
+            wl_columnar_memory_reserved(wl_columnar_memory_governor_ref_get(g)),
+            old = wl_evaluation_control_active_attempt_id(c);
+        rebound = false; intern_rebind_phase = phase;
+        wl_intern_control_test_checkpoint = rebind_intern;
+        int64_t value = 999; bool failed = true;
+        wl_columnar_expr_status_t status = WL_COLUMNAR_EXPR_INVALID_RESULT;
+        wl_columnar_expr_context_t context = {.intern = intern};
+        CHECK(wl_columnar_expr_eval_scalar_attempt_controlled(program, NULL, 0,
+            &context, &value, &failed, &status, c, old) == EINVAL);
+        wl_intern_control_test_checkpoint = NULL;
+        CHECK(rebound && value == 999 && failed &&
+            status == WL_COLUMNAR_EXPR_INVALID_RESULT &&
+            wl_intern_count(intern) == 1);
+        uint64_t consumed = 999;
+        CHECK(!wl_evaluation_control_test_active_consumed(c,
+            wl_evaluation_control_active_attempt_id(c),
+            &consumed) && !consumed);
+        CHECK(wl_columnar_memory_reserved(wl_columnar_memory_governor_ref_get(
+                g)) == owner);
+        CHECK(!wl_columnar_expr_eval_scalar_attempt_controlled(program, NULL, 0,
+            &context, &value, &failed, &status, c,
+            wl_evaluation_control_active_attempt_id(c)) && !failed &&
+            !strcmp(wl_intern_reverse(intern, value), "X"));
+        wl_columnar_expr_attempt_scalar_free(program); finish(c, 0);
+        wl_intern_free(intern);
+        CHECK(!wl_columnar_memory_reserved(wl_columnar_memory_governor_ref_get(
+                g))); wl_columnar_memory_governor_ref_release(g);
+    }
+}
+
 int main(void) {
+    session_builders();
+    builders_preserve_allocations();
+    builder_primitives();
+    direct_builders();
+    builder_memory();
+    builder_stack_format();
+    builder_errors_and_stops();
     hash_crc_primitives();
     direct_string_digests();
     session_string_digests();
