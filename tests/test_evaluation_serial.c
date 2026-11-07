@@ -9235,16 +9235,14 @@ test_entry_generated_integer_crc(void)
     CHECK(symbol_map);
     entry_assert_generated_crc(symbol_map, true,
         WL_PLAN_EXPR_ARITH_CRC32_ETH_S);
-    col_rel_t **symbol_rels = symbol.session->rels;
-    uint32_t symbol_nrels = symbol.session->nrels;
     col_rel_t *symbol_input = session_find_rel(symbol.session, "input");
     entry_complete(&symbol);
-    CHECK(symbol.reply.execution_result == ENOTSUP
-        && !symbol.reply.committed
-        && !session_rel_hash_lookup(symbol.session, "output")
-        && symbol.session->rels == symbol_rels
-        && symbol.session->nrels == symbol_nrels
+    CHECK(!symbol.reply.execution_result && symbol.reply.committed
         && session_find_rel(symbol.session, "input") == symbol_input);
+    /* #2299 now admits symbol CRC, including raw-compatible native-byte
+     * fallback for IDs absent from the actual intern context. */
+    entry_compare_crc_values(&symbol, symbol_crc, rows,
+        sizeof(rows) / sizeof(rows[0]));
     entry_destroy(&symbol);
 
     /* Find the repeatable allowance that admits the fourth byte checkpoint.
@@ -9484,15 +9482,14 @@ test_entry_generated_integer_hash(void)
             symbol_map = &symbol.relation->ops[i];
     CHECK(symbol_map);
     entry_assert_generated_crc(symbol_map, true, WL_PLAN_EXPR_ARITH_HASH_S);
-    col_rel_t **old_rels = symbol.session->rels;
-    uint32_t old_nrels = symbol.session->nrels;
     col_rel_t *old_input = session_find_rel(symbol.session, "input");
     entry_complete(&symbol);
-    CHECK(symbol.reply.execution_result == ENOTSUP
-        && !symbol.reply.committed && !session_rel_hash_lookup(symbol.session,
-        "output") && symbol.session->rels == old_rels
-        && symbol.session->nrels == old_nrels
+    CHECK(!symbol.reply.execution_result && symbol.reply.committed
         && session_find_rel(symbol.session, "input") == old_input);
+    /* The formerly refused symbol domain now publishes exact raw-compatible
+     * values through the same retained serial bridge as numeric HASH. */
+    entry_compare_crc_values(&symbol, entry_hash_symbol_map, rows,
+        sizeof(rows) / sizeof(rows[0]));
     entry_destroy(&symbol);
 
     uint64_t low = 1, high = UINT64_C(1) << 20;

@@ -71,7 +71,7 @@ def check(root: Path) -> tuple[list[str], int]:
         valid_qualification = (qualification == 'open' or
                                qualification == 'baseline-numeric' and
                                expected == 'existing-numeric' or
-                               qualification in {'unit4-sessions', 'unit5-sessions', 'unit5-decimal'} and
+                               qualification in {'unit4-sessions', 'unit5-sessions', 'unit5-decimal', 'unit5-digests'} and
                                tag in scalar_tags and scalar_expected == 'admitted' or
                                qualification == 'legacy-rejected' and tag not in raw_tags)
         if not valid_qualification:
