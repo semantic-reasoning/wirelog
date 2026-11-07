@@ -897,6 +897,9 @@ find_relation_info(const struct wirelog_program *prog, const char *name);
 static uint32_t
 atom_physical_column_count(const wl_parser_ast_node_t *atom,
     const wl_ir_relation_info_t *rel_info, const struct wirelog_program *prog);
+/* Defined next to wl_ir_program_rename_positional_vars(). */
+static const char *
+user_var_name(const char *name);
 
 /* #2231: the declared type of physical lane @lane of @rel.  A scalar column
  * has its own type; a slot of an `inline` compound has its declared slot
@@ -4091,7 +4094,8 @@ convert_rule(const wl_parser_ast_node_t *rule_node,
                     "bind it in a positive body atom (e.g. project the negated "
                     "relation first: key(...) :- %s(...); "
                     "head :- ..., !key(...))",
-                    neg_vars[j], neg_atom->name ? neg_atom->name : "?",
+                    user_var_name(neg_vars[j]),
+                    neg_atom->name ? neg_atom->name : "?",
                     neg_atom->name ? neg_atom->name : "rel");
                 free_var_names(neg_vars, neg_vcount);
                 wl_ir_node_free(neg_scan);
@@ -4385,6 +4389,74 @@ conversion_cleanup:
     free_side_binding_arrays(scan_side, scan_side_counts, scan_cap);
 
     return root;
+}
+
+/* #2231: lowering refers to a column by position with a synthesised
+ * variable named `col` and the column's index -- the operand of an
+ * aggregate (rewrite_expr_vars_to_columns()), the filter for a constant in
+ * a body atom or for an equality with a constant pushed into one
+ * (wrap_column_cmp_filter()) and the filter for a repeated variable
+ * (wrap_duplicate_var_filters()) -- and plan generation
+ * resolves a variable by name before it reads such a name as a position.
+ * A rule variable spelled the same way therefore captured the reference:
+ * with n(9, 1, 1) and n(3, 7, 3), `m(a) :- n(col1, a, a).` derived m(7)
+ * where `m(a) :- n(z, a, a).` derives m(1).  Such a variable is renamed
+ * here with a `$` prefix, which no identifier the lexer produces starts
+ * with; user_var_name() strips it again for messages. */
+static bool
+is_positional_name(const char *name)
+{
+    if (strncmp(name, "col", 3) != 0 || name[3] == '\0')
+        return false;
+    for (const char *p = name + 3; *p; p++)
+        if (*p < '0' || *p > '9')
+            return false;
+    return true;
+}
+
+static const char *
+user_var_name(const char *name)
+{
+    return name[0] == '$' && is_positional_name(name + 1) ? name + 1 : name;
+}
+
+static int
+rename_positional_vars(wl_parser_ast_node_t *node)
+{
+    if (node->type == WL_PARSER_AST_NODE_VARIABLE && node->name
+        && is_positional_name(node->name)) {
+        size_t len = strlen(node->name);
+        char *renamed = (char *)malloc(len + 2);
+        if (!renamed)
+            return -1;
+        renamed[0] = '$';
+        memcpy(renamed + 1, node->name, len + 1);
+        free(node->name);
+        node->name = renamed;
+    }
+    for (uint32_t i = 0; i < node->child_count; i++)
+        if (node->children[i]
+            && rename_positional_vars(node->children[i]) != 0)
+            return -1;
+    return 0;
+}
+
+int
+wl_ir_program_rename_positional_vars(struct wirelog_program *program,
+    wl_parser_ast_node_t *ast)
+{
+    if (!program || !ast)
+        return -1;
+    for (uint32_t i = 0; i < ast->child_count; i++) {
+        wl_parser_ast_node_t *child = ast->children[i];
+        if (child->type == WL_PARSER_AST_NODE_RULE
+            && rename_positional_vars(child) != 0) {
+            wl_ir_program_set_error(program,
+                "out of memory renaming rule variables");
+            return -1;
+        }
+    }
+    return 0;
 }
 
 /* ---- Public Entry Point for Pass 2 ---- */
