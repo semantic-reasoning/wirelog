@@ -852,6 +852,7 @@ wl_columnar_lftj_attempt_resolve(wl_columnar_lftj_attempt_t *a)
             bool private_entry = in->lookup_slot < private_count;
             col_rel_t *candidate = NULL;
             const char *wanted = a->metadata->rel_names[i];
+            if (!wanted) return wl_columnar_lftj_attempt_fail(a, ENOENT);
             const char *registered = NULL;
             if (private_entry) {
                 rc = wl_columnar_eval_private_binding_get(a->private_bindings,

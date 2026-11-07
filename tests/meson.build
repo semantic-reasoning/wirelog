@@ -7028,7 +7028,7 @@ test_evaluation_lftj_hosts_exe = executable(
   c_args: ['-DWL_SESSION_TEST_HOOKS=1'],
   link_with: [testlib_prod],
 )
-foreach lftj_host_case : ['domains', 'recovery', 'failures', 'admission', 'native', 'metadata-native', 'microsteps']
+foreach lftj_host_case : ['domains', 'recovery', 'failures', 'admission', 'native', 'metadata-native', 'microsteps', 'policy']
   test('evaluation_lftj_hosts_' + lftj_host_case,
        test_evaluation_lftj_hosts_exe, args: [lftj_host_case],
        suite: ['unit', 'tsan', 'evaluation_lftj_hosts'], timeout: 60)

@@ -1,9 +1,10 @@
 # Serial LFTJ source ownership
 
-This records the default serial LFTJ financial admission prerequisite for
-#2298. It extends the existing framed execution destination to its public
-batch-off financial host. Complete child traversal and policy qualification
-are separate parts of the issue; this document does not declare them complete.
+This records default serial LFTJ admission, bounded child preparation/output,
+retirement and per-operator runtime policy for #2298. It extends the framed
+destination to the public batch-off host. The coverage ledger and final issue
+qualification are tracked separately; this source map alone does not declare
+whole-issue completion.
 Registered ended-Original cleanup is specified in
 [LFTJ_NATIVE_CLEANUP.md](LFTJ_NATIVE_CLEANUP.md).
 
@@ -363,3 +364,137 @@ STATUS includes stack owner54, composed guards16, full output-range helpers48,
 saved-funding fronts24, caller24 and26 reserve. No HOST384 payment finances
 those preceding proofs. All eight wrappers and inner cleanup validation pass
 the actual separate funding and saved ID. Legacy numeric scans are unchanged.
+
+## Runtime metadata and policy for each actual LFTJ
+
+Whole-body preflight and both abort-support classifiers treat LFTJ as a checked
+push-one operation, retaining any previous stack entry. They read no opaque
+metadata, names or source cells. The controlled classifier retains ENTRY33,
+one OP64 for each actually visited operator and FINAL17. Its source packets
+are entry96, one LFTJ96 and final/caller128. The pure classifier is finite by
+plan length; it does not claim an arbitrary entire plan scan fits256.
+Independent boundary tests cover the actual two-LFTJ/CONCAT grammar, full
+stack overflow and exact/minus-one OP/FINAL admissions.
+
+Actual READY authenticates any prior child as genuine resource-free DONE,
+then resets all17 meaningful metadata proof fields for the current cursor.
+It retains parent, depth, prior stack entries, completed count and receipt.
+The historical private PREFLIGHT_LFTJ enum now denotes runtime admission only;
+whole-body PREFLIGHT never selects it. This keeps existing constructor and
+native cleanup dispatch separate from the tight PREFIX return packet.
+VALIDATED enters BIND_HEADER instead of advancing preflight depth/cursor.
+
+HEADER pays its real128 before the raw minimum metadata shape: nonnull opaque
+metadata, k>=2 and nonnull name/key arrays. Batch-off ignores strict. Batch-on
+strict returns ENOTSUP without diagnostics. Nonstrict records EXCLUDED_LFTJ
+once for this actual operator, including a later failing operator. A genuine
+saved-Original zero separates policy/logging from controlled-local mode/cap
+qualification and capture. Every error enters RELEASE; successful capture
+persists NAMES, so neither EAGAIN nor cleanup replays the counter. A fresh
+actual evaluation after reset records again; a clean no-op does not.
+
+The reusable metadata header/direct preflight remains pure with its earlier
+validation contract. Runtime name values resolve in source order. NAMES keeps
+bounded position/cursor actions; it does not reject a late NULL before earlier
+source errors. After its real lookup1, RESOLVE rejects NULL with ENOENT before
+any private getter or indexed character read. Prior source KEY/size checks
+complete before cursor advances. The earlier invalid-key/later-NULL oracle
+therefore returns raw EINVAL; isolated NULL/missing names return raw ENOENT.
+Legacy direct preflight still rejects NULL with EINVAL.
+
+Controlled geometry retains k<=64 after policy and before fixed-array indexing.
+Raw minimum header has no maximum-k check, and its kernel cap is later. The
+policy/error matrix uses valid sources at k65 to verify policy-before-cap.
+No equivalence is claimed for every combination of invalid oversized geometry
+and a different earlier raw source error. Outer whole-body shape/unsupported
+route guards and worker/shared/differential/TDD admission remain unchanged.
+
+| Complete changed source interval | Upper |
+| --- | ---: |
+| Shape-only PREFLIGHT push/advance or full error return | 160 |
+| READY historic-DONE proof, meaningful reset and full return | 224 |
+| Metadata parent/check or first refusal, including cursor predicate | 177 |
+| HEADER minimum and enabled first-warning policy to real zero/refusal | 224 |
+| HEADER strict/off/already-warned shorter alternatives | 160 |
+| Postpolicy zero through local header/capture and full return | 128 |
+| NAMES/VALIDATED bounded position or transition and return | 128 |
+| Binding/context parent through its actual first admission/refusal | 177 |
+| Successful source lookup after added NULL guard | 225 |
+| NULL failure through complete child/host return | 96 |
+
+The prior-DONE helper74, explicit17 proof stores, READY dispatch/front45 and
+complete caller68 fit224 with reserve20. The parent adds exactly one cursor
+predicate before constructor admissions. Thus PREFIX249, INSTALL192 and
+portable retirement BIND254 remain unchanged at their exact endpoints.
+A failed NULL lookup returns before any private snapshot getter or character
+access; its96 includes fail-intent stores and the containing return68.
+
+Enabled logging is included: full fallback128 contains production logger80.
+Logger rows are header/helper/snprintf fronts24, offset/error/clamp6, varargs
+and vsnprintf setup12, total/truncation/newline20, sink/fwrite/return10 and
+reserve8. Its fixed512-byte stack buffer is not zeroed. There is no project
+loop, mutex or allocation in this body. Only standard formatted-I/O interiors,
+FILE-internal I/O/locking, ABI varargs and the four-byte literal copy retain
+existing narrow library boundaries; their call and scalar fronts are counted.
+Already-warned still increments count/reason but skips the warning. The real
+host policy suite enables the JOIN warning threshold after session creation
+and exercises production first-warning and warned-mask alternatives.
+
+## Uncaptured empty READY cleanup
+
+Moving metadata to actual reach leaves the first empty READY with canonical
+INERT proof. The specialized completed-stop API accepts only this constructor
+history: actual owner/thread/frame, no source/child/output/join debt, zero depth,
+cursor==begin, completed0, current LFTJ and all17 meaningful proof fields zero.
+A real distinct saved-funding zero precedes direct plan/zero-proof validation.
+It never reads opaque/name storage; poisoned opaque metadata is tested.
+Genuine frozen CANCEL/WORK report, no active Original/successor, busy/reentry,
+posthook funding/report rechecks, actual empty frame and output nonoverlap
+requirements all remain. The terminal ACK contract is unchanged.
+
+| Complete specialized stop/ACK interval | Upper |
+| --- | ---: |
+| Entry/full canonical empty owner through READY funding zero/refusal | 160 |
+| READY zero through zero-proof/report/rechecks to192 first refusal | 240 |
+| Other metadata stop entry with added branch/arguments | 200 |
+| Successful192 through fixed metadata clear/result and return | 96 |
+| Terminal ACK full validation/range/funding to384 first refusal | 226 |
+| Successful384 through release/clear/reference drop and return | 224 |
+
+Entry160 expands result geometry20, outer fronts20, empty guards26, full stack
+owner54, funding/check16 and reserve24. The next240 reuses the independently
+expanded old stopped-metadata source192 and counts48 additional plan/zero-proof,
+argument and branch fronts. This192 is a source certificate, distinct from the
+logical192 debit; the earlier packet is split by its real zero. Terminal ACK
+adds two argument fronts to its existing224 precheck envelope. No new loan,
+refund or future processed lower is minted by zero checks.
+
+The genuine READY test reaches the state through constructor and shape steps,
+then finishes CANCEL/WORK. It exercises canonical-zero/current-state negatives,
+wrong thread/copy/result alias/stale funding,191/192 cleanup and383/384 ACK,
+frozen report and reference/destruction ownership. The registered public route
+continues to support nonempty second admission under its separate native proof;
+this narrow empty-component branch grants no such authority.
+
+## Runtime policy and repeated-operator evidence
+
+`evaluation_lftj_hosts_policy` checks natural compiler two-LFTJ/CONCAT output
+and first/second stack depths across all batch/strict/plain/observed STEP and
+Snapshot combinations. Literal rows and schema, raw parity, once-only count,
+strict exclusion, local JOIN cap independence and no-op stability are explicit.
+The error matrix covers minimum malformed headers, late NULL/missing names,
+bad keys, mixed earlier bad key/later NULL and valid-source k65, then restores
+metadata and retries against literal output and counters.
+
+Sixty real second-metadata native histories preserve the first stack result,
+end Original between activations, refuse one cleanup grant and retry, retain
+all seven report fields and a genuine active successor, preserve five source
+images and peer4096 credit, publish nothing on failure, and reset/retry to four
+literal rows and exact events. Counter checks distinguish a second HEADER not
+yet executed from later paid policy and a new complete two-operator retry.
+
+A natural LFTJ followed by ordinary JOIN proves the separate output policy:
+LFTJ can exceed the ordinary JOIN cap, while the actual suffix JOIN returns
+EOVERFLOW at its own cap. Strict and fallback counts/reasons match the raw
+route; raised-cap retry returns literal rows without failed-attempt delivery.
+These tests qualify this actual route and do not widen unsupported outer modes.
