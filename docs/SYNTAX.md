@@ -598,6 +598,15 @@ rejected in a `float` column or slot. An integer or string literal in a
 `symbol`, `string` or `int64` column is stored as written; a string in an
 `int64` column holds its intern id, which is not stable across runs.
 
+A literal written directly as an argument of a rule head, for a relation
+typed by a `.decl` or by its inline facts, follows the same rules (#2231): an
+integer in a `float` column or slot is stored as its binary64 value, so
+`o(1) :- s(_).` against `.decl o(x: float)` derives `o(1)`, and an inexact
+integer, a float in a column, slot or `side` handle column not declared
+`float`, a string in a `float` column or slot, and an `int32` value outside
+32 bits are rejected with `WIRELOG_ERR_PARSE`. Constants in the head of a
+rule with an aggregate are not checked or converted.
+
 ---
 
 ## Expressions

@@ -48,6 +48,25 @@ CASES = [
      ".decl g(id: int64, v: f/2 inline)\ng(1, 2.5, 3).\n", None),
     ("float in a side handle column",
      ".decl g(id: int64, v: f/2)\ng(1, 2.5).\n", None),
+    # Rule-head constants follow the same rules.
+    ("integer head constant in a float column",
+     ".decl s(x: int64)\ns(1).\n.decl o(x: float)\n.output o\n"
+     "o(1) :- s(_).\n", ["o(1)"]),
+    ("negative integer head constant in a float column",
+     ".decl s(x: int64)\ns(1).\n.decl o(x: float)\n.output o\n"
+     "o(-3) :- s(_).\n", ["o(-3)"]),
+    ("integer head constant read by a comparison",
+     ".decl s(x: int64)\ns(1).\n.decl o(x: float)\n.decl p(x: int64)\n"
+     ".output p\no(1) :- s(_).\np(9) :- o(x), x > 0.5.\n", ["p(9)"]),
+    ("integer head constant in an inline float slot",
+     ".decl s(x: int64)\ns(1).\n"
+     ".decl o(id: int64, v: f(float, int64) inline)\n"
+     ".decl p(a: int64, b: float, c: int64)\n.output p\n"
+     "o(1, 2, 3) :- s(_).\np(a, b, c) :- o(a, f(b, c)).\n",
+     ["p(1, 2, 3)"]),
+    ("int32 head constant outside 32 bits",
+     ".decl s(x: int64)\ns(1).\n.decl o(x: int32)\n.output o\n"
+     "o(5000000000) :- s(_).\n", None),
 ]
 
 # (name, program with %s for the input file, file contents, expected stdout

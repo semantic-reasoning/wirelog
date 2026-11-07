@@ -1757,6 +1757,69 @@ validate_rule_value_domains(struct wirelog_program *program,
     return 0;
 }
 
+/* #2231: a literal written as a rule-head argument follows the rules an
+ * inline fact follows (validate_fact_arities()).  A head has no compound
+ * term grammar, so head position k is physical lane k, typed by
+ * fact_lane_type().  An integer in a float lane is converted when the rule
+ * is lowered; this pass rejects what cannot be stored: an integer binary64
+ * cannot represent exactly, a float in a lane that is not float, a string
+ * in a float lane, and an integer outside 32 bits in an int32 lane.  A head
+ * with an aggregate is skipped, because #980 reorders its columns. */
+static int
+validate_head_constants(struct wirelog_program *program,
+    const wl_parser_ast_node_t *ast)
+{
+    for (uint32_t i = 0; i < ast->child_count; i++) {
+        const wl_parser_ast_node_t *node = ast->children[i];
+        if (node->type != WL_PARSER_AST_NODE_RULE || node->child_count < 1)
+            continue;
+        const wl_parser_ast_node_t *head = node->children[0];
+        if (!head || head->type != WL_PARSER_AST_NODE_HEAD || !head->name)
+            continue;
+        const wl_ir_relation_info_t *rel
+            = find_relation_info(program, head->name);
+        if (!rel || (!rel->has_decl && !rel->schema_from_facts))
+            continue;
+        bool has_aggregate = false;
+        for (uint32_t c = 0; c < head->child_count; c++)
+            if (head->children[c]->type == WL_PARSER_AST_NODE_AGGREGATE)
+                has_aggregate = true;
+        if (has_aggregate)
+            continue;
+        for (uint32_t c = 0; c < head->child_count; c++) {
+            const wl_parser_ast_node_t *arg = head->children[c];
+            wirelog_column_type_t lane_type;
+            const char *why = NULL;
+            if (!fact_lane_type(rel, c, &lane_type))
+                continue;
+            if (arg->type == WL_PARSER_AST_NODE_FLOAT
+                && lane_type != WIRELOG_TYPE_FLOAT)
+                why = "a float constant in a column that is not float";
+            else if (arg->type == WL_PARSER_AST_NODE_STRING
+                && lane_type == WIRELOG_TYPE_FLOAT)
+                why = "a string constant in a float column";
+            else if (arg->type == WL_PARSER_AST_NODE_INTEGER
+                && lane_type == WIRELOG_TYPE_FLOAT
+                && !int64_exact_as_binary64(arg->int_value))
+                why = "an integer constant that a float column cannot"
+                    " represent exactly";
+            else if (arg->type == WL_PARSER_AST_NODE_INTEGER
+                && lane_type == WIRELOG_TYPE_INT32
+                && (arg->int_value < INT32_MIN
+                || arg->int_value > INT32_MAX))
+                why = "an integer constant outside 32 bits in an int32"
+                    " column";
+            if (why) {
+                wl_ir_program_set_error(program,
+                    "rule head for relation '%s' puts %s, column %u (line"
+                    " %u)", rel->name, why, c, head->line);
+                return -1;
+            }
+        }
+    }
+    return 0;
+}
+
 int
 wl_ir_program_collect_metadata(struct wirelog_program *program,
     const wl_parser_ast_node_t *ast)
@@ -1809,6 +1872,8 @@ wl_ir_program_collect_metadata(struct wirelog_program *program,
     if (infer_fact_schemas(program, ast) != 0)
         return -1;
     if (validate_head_arities(program, ast) != 0)
+        return -1;
+    if (validate_head_constants(program, ast) != 0)
         return -1;
     return validate_rule_value_domains(program, ast);
 }
@@ -4024,8 +4089,30 @@ convert_rule(const wl_parser_ast_node_t *rule_node,
                     root = NULL;
                     goto conversion_failed;
                 }
+                const wl_ir_relation_info_t *head_rel = head->name
+                    ? find_relation_info(prog, head->name) : NULL;
+                if (head_rel && !head_rel->has_decl
+                    && !head_rel->schema_from_facts)
+                    head_rel = NULL;
                 for (uint32_t i = 0; i < head->child_count; i++) {
                     root->project_exprs[i] = convert_expr(head->children[i]);
+                    wirelog_column_type_t lane_type;
+                    /* #2231: an integer constant in a float lane is the
+                     * binary64 value of that integer, as in an inline fact;
+                     * validate_head_constants() has checked it is exact. */
+                    if (root->project_exprs[i] && head_rel
+                        && head->children[i]->type
+                        == WL_PARSER_AST_NODE_INTEGER
+                        && fact_lane_type(head_rel, i, &lane_type)
+                        && lane_type == WIRELOG_TYPE_FLOAT) {
+                        wl_ir_expr_t *f = wl_ir_expr_create(
+                            WL_IR_EXPR_CONST_FLOAT);
+                        if (f)
+                            f->float_value
+                                = (double)head->children[i]->int_value;
+                        wl_ir_expr_free(root->project_exprs[i]);
+                        root->project_exprs[i] = f;
+                    }
                     if (!root->project_exprs[i]) {
                         wl_ir_program_set_error(prog,
                             "allocation failed while converting a project "
