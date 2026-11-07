@@ -2011,6 +2011,191 @@ wl_columnar_expr_attempt_tail(wl_evaluation_control_t *control,
     return wl_columnar_expr_attempt_charge(control, attempt_id, 0);
 }
 
+/* #2299 immutable byte operations. Each admitted region is prepaid by224.
+ * Reuse the attempt guard (G9), guarded charge prefix (C13) and guarded
+ * tail (T26/T29). At most128 further source actions cover validation,
+ * local loads/arithmetic, loop/caller transitions, refusal and publication:
+ * 9+13+29+128=179 <=224 <=quantum256. A LOAD and STORE/hash-update have
+ * separate regions; nested search charges each candidate and pair.
+ * Hooks are test instrumentation, never part of the production interval.
+ * Invalid bootstrap touches no source/output and has a fixed bound. */
+#define WL_COLUMNAR_EXPR_BYTE_WORK UINT64_C(224)
+typedef char wl_columnar_expr_byte_tariff_fits_t[
+        WL_COLUMNAR_EXPR_BYTE_WORK <= WL_EVALUATION_CONTROL_QUANTUM ? 1 : -1];
+
+static int
+wl_columnar_expr_byte_region(wl_evaluation_control_t *control,
+    uint64_t attempt_id)
+{
+    return wl_columnar_expr_attempt_charge(control, attempt_id,
+               WL_COLUMNAR_EXPR_BYTE_WORK);
+}
+
+static int
+wl_columnar_expr_byte_cutoff(wl_evaluation_control_t *control,
+    uint64_t attempt_id)
+{
+    int rc = wl_columnar_expr_byte_region(control, attempt_id);
+    return rc ? rc : wl_columnar_expr_attempt_tail(control, attempt_id, 48, 0);
+}
+
+int
+wl_columnar_expr_cstr_length_attempt_controlled(const char *source,
+    size_t *length, wl_evaluation_control_t *control, uint64_t attempt_id)
+{
+    if (!source || !length)
+        return EINVAL;
+    int rc = wl_columnar_expr_byte_region(control, attempt_id);
+    if (rc) return rc;
+    rc = wl_columnar_expr_attempt_tail(control, attempt_id, 40, 0);
+    if (rc) return rc;
+    size_t n = 0;
+    for (;;) {
+        rc = wl_columnar_expr_byte_region(control, attempt_id);
+        if (rc) return rc;
+        unsigned char byte = (unsigned char)source[n];
+        rc = wl_columnar_expr_attempt_tail(control, attempt_id, 41, n);
+        if (rc) return rc;
+        if (!byte) break;
+        if (n == SIZE_MAX) return EOVERFLOW;
+        ++n;
+    }
+    rc = wl_columnar_expr_byte_cutoff(control, attempt_id);
+    if (rc) return rc;
+    *length = n;
+    return 0;
+}
+
+int
+wl_columnar_expr_bytes_compare_attempt_controlled(const uint8_t *left,
+    const uint8_t *right, size_t length, int *ordering,
+    wl_evaluation_control_t *control, uint64_t attempt_id)
+{
+    if ((!left && length) || (!right && length) || !ordering)
+        return EINVAL;
+    int rc = wl_columnar_expr_byte_region(control, attempt_id);
+    if (rc) return rc;
+    rc = wl_columnar_expr_attempt_tail(control, attempt_id, 40, 0);
+    if (rc) return rc;
+    int result = 0;
+    for (size_t i = 0; i < length; ++i) {
+        rc = wl_columnar_expr_byte_region(control, attempt_id);
+        if (rc) return rc;
+        unsigned a = left[i], b = right[i];
+        result = (a > b) - (a < b);
+        rc = wl_columnar_expr_attempt_tail(control, attempt_id, 42, i);
+        if (rc) return rc;
+        if (result) break;
+    }
+    rc = wl_columnar_expr_byte_cutoff(control, attempt_id);
+    if (rc) return rc;
+    *ordering = result;
+    return 0;
+}
+
+int
+wl_columnar_expr_bytes_copy_attempt_controlled(uint8_t *destination,
+    const uint8_t *source, size_t length, size_t *copied,
+    wl_evaluation_control_t *control, uint64_t attempt_id)
+{
+    if ((!destination && length) || (!source && length) || !copied)
+        return EINVAL;
+    int rc = wl_columnar_expr_byte_region(control, attempt_id);
+    if (rc) return rc;
+    rc = wl_columnar_expr_attempt_tail(control, attempt_id, 40, 0);
+    if (rc) return rc;
+    *copied = 0;
+    for (size_t i = 0; i < length; ++i) {
+        rc = wl_columnar_expr_byte_region(control, attempt_id);
+        if (rc) return rc;
+        uint8_t byte = source[i];
+        rc = wl_columnar_expr_attempt_tail(control, attempt_id, 43, i);
+        if (rc) return rc;
+        rc = wl_columnar_expr_byte_region(control, attempt_id);
+        if (rc) return rc;
+        destination[i] = byte;
+        *copied = i + 1;
+        rc = wl_columnar_expr_attempt_tail(control, attempt_id, 44, i);
+        if (rc) return rc;
+    }
+    return wl_columnar_expr_byte_cutoff(control, attempt_id);
+}
+
+int
+wl_columnar_expr_bytes_hash_attempt_controlled(const uint8_t *source,
+    size_t length, uint32_t initial, uint32_t *hash,
+    wl_evaluation_control_t *control, uint64_t attempt_id)
+{
+    if ((!source && length) || !hash)
+        return EINVAL;
+    int rc = wl_columnar_expr_byte_region(control, attempt_id);
+    if (rc) return rc;
+    rc = wl_columnar_expr_attempt_tail(control, attempt_id, 40, 0);
+    if (rc) return rc;
+    uint32_t result = initial;
+    for (size_t i = 0; i < length; ++i) {
+        rc = wl_columnar_expr_byte_region(control, attempt_id);
+        if (rc) return rc;
+        uint8_t byte = source[i];
+        rc = wl_columnar_expr_attempt_tail(control, attempt_id, 43, i);
+        if (rc) return rc;
+        rc = wl_columnar_expr_byte_region(control, attempt_id);
+        if (rc) return rc;
+        result = (result ^ byte) * UINT32_C(16777619);
+        rc = wl_columnar_expr_attempt_tail(control, attempt_id, 45, i);
+        if (rc) return rc;
+    }
+    rc = wl_columnar_expr_byte_cutoff(control, attempt_id);
+    if (rc) return rc;
+    *hash = result;
+    return 0;
+}
+
+int
+wl_columnar_expr_bytes_find_attempt_controlled(const uint8_t *haystack,
+    size_t haystack_length, const uint8_t *needle, size_t needle_length,
+    size_t *position, bool *found, wl_evaluation_control_t *control,
+    uint64_t attempt_id)
+{
+    if ((!haystack && haystack_length) || (!needle && needle_length)
+        || !position || !found)
+        return EINVAL;
+    int rc = wl_columnar_expr_byte_region(control, attempt_id);
+    if (rc) return rc;
+    rc = wl_columnar_expr_attempt_tail(control, attempt_id, 40, 0);
+    if (rc) return rc;
+    size_t result = 0;
+    bool matched = needle_length == 0;
+    if (needle_length && needle_length <= haystack_length) {
+        size_t last = haystack_length - needle_length;
+        for (size_t i = 0; i <= last; ++i) {
+            rc = wl_columnar_expr_byte_region(control, attempt_id);
+            if (rc) return rc;
+            rc = wl_columnar_expr_attempt_tail(control, attempt_id, 46, i);
+            if (rc) return rc;
+            bool candidate = true;
+            for (size_t j = 0; j < needle_length; ++j) {
+                rc = wl_columnar_expr_byte_region(control, attempt_id);
+                if (rc) return rc;
+                bool equal = haystack[i + j] == needle[j];
+                rc = wl_columnar_expr_attempt_tail(control, attempt_id, 47, j);
+                if (rc) return rc;
+                if (!equal) {
+                    candidate = false; break;
+                }
+            }
+            if (candidate) {
+                result = i; matched = true; break;
+            }
+        }
+    }
+    rc = wl_columnar_expr_byte_cutoff(control, attempt_id);
+    if (rc) return rc;
+    *position = result;
+    *found = matched;
+    return 0;
+}
+
 static int
 wl_columnar_expr_attempt_bytes(const uint8_t *buf, uint32_t size,
     uint32_t *pos, uint8_t *out, uint32_t count, unsigned pass,
