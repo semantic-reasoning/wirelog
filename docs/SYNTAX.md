@@ -586,6 +586,17 @@ results. A unary minus may be separated from a float literal by whitespace;
 columnar executor, joins, ordering, consolidation, CSV input/output, and
 aggregates.
 
+In an inline fact of a relation with a `.decl`, an integer literal in a
+`float` column, or in a `float` slot of an `inline` compound, is stored as
+the binary64 value of that integer, so `g(1).` against `.decl g(x: float)`
+holds `1.0`, as a `1` read from an `.input` file does (#2231). An integer
+that binary64 cannot represent exactly, such as `9007199254740993`, is
+rejected. A float literal is rejected in a column or slot not declared
+`float`, including a `side` compound handle column, and a string literal is
+rejected in a `float` column or slot. An integer or string literal in a
+`symbol`, `string` or `int64` column is stored as written; a string in an
+`int64` column holds its intern id, which is not stable across runs.
+
 ---
 
 ## Expressions

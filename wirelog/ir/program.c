@@ -870,6 +870,9 @@ collect_fact(struct wirelog_program *prog,
     for (uint32_t i = 0; i < ncols; i++) {
         const wl_parser_ast_node_t *arg = fact_node->children[i];
         if (arg->type == WL_PARSER_AST_NODE_INTEGER) {
+            /* An integer in a float lane is stored raw here and rewritten
+             * by validate_fact_arities() once every `.decl` is known
+             * (#2231). */
             rel->fact_data[offset + i] = arg->int_value;
         } else if (arg->type == WL_PARSER_AST_NODE_FLOAT) {
             rel->fact_data[offset + i] = float_lane_bits(arg->float_value);
@@ -893,6 +896,42 @@ find_relation_info(const struct wirelog_program *prog, const char *name);
 static uint32_t
 atom_physical_column_count(const wl_parser_ast_node_t *atom,
     const wl_ir_relation_info_t *rel_info, const struct wirelog_program *prog);
+
+/* #2231: the declared type of physical lane @lane of @rel.  A scalar column
+ * has its own type; a slot of an `inline` compound has its declared slot
+ * type, or int64 when the compound gives none (`f/2 inline`, #1037); a
+ * `side` compound column holds an integer handle.  Returns false when
+ * @lane is past the relation's physical width. */
+static bool
+fact_lane_type(const wl_ir_relation_info_t *rel, uint32_t lane,
+    wirelog_column_type_t *out)
+{
+    uint32_t phys = 0;
+
+    for (uint32_t c = 0; rel->columns && c < rel->column_count; c++) {
+        const wirelog_column_t *col = &rel->columns[c];
+        if (col->compound_kind != WIRELOG_COMPOUND_KIND_INLINE) {
+            if (phys == lane) {
+                *out = col->compound_kind == WIRELOG_COMPOUND_KIND_NONE
+                    ? col->type : WIRELOG_TYPE_INT64;
+                return true;
+            }
+            phys++;
+            continue;
+        }
+        for (uint32_t s = 0; s < col->compound_arity; s++, phys++) {
+            if (phys != lane)
+                continue;
+            uint32_t idx = c * 4u + s;
+            *out = WIRELOG_TYPE_INT64;
+            if (s < 4 && rel->slot_types && rel->slot_type_declared
+                && idx < rel->slot_type_count && rel->slot_type_declared[idx])
+                *out = rel->slot_types[idx];
+            return true;
+        }
+    }
+    return false;
+}
 
 /* Issue #977: validate every inline fact against its relation's declared
  * arity.
@@ -954,16 +993,28 @@ static int
 validate_fact_arities(struct wirelog_program *program,
     const wl_parser_ast_node_t *ast)
 {
-    for (uint32_t i = 0; i < ast->child_count; i++) {
+    uint32_t *rows_seen = (uint32_t *)calloc(
+        program->relation_count ? program->relation_count : 1u,
+        sizeof(*rows_seen));
+    int rc = 0;
+
+    if (!rows_seen) {
+        wl_ir_program_set_error(program,
+            "out of memory checking inline facts");
+        return -1;
+    }
+    for (uint32_t i = 0; rc == 0 && i < ast->child_count; i++) {
         const wl_parser_ast_node_t *node = ast->children[i];
         if (node->type != WL_PARSER_AST_NODE_FACT || !node->name)
             continue;
 
-        const wl_ir_relation_info_t *rel = NULL;
+        wl_ir_relation_info_t *rel = NULL;
+        uint32_t rel_index = 0;
         for (uint32_t r = 0; r < program->relation_count; r++) {
             if (program->relations[r].name
                 && strcmp(program->relations[r].name, node->name) == 0) {
                 rel = &program->relations[r];
+                rel_index = r;
                 break;
             }
         }
@@ -985,51 +1036,58 @@ validate_fact_arities(struct wirelog_program *program,
                     " declared with %u column(s) (line %u)",
                     rel->name, node->child_count, rel->name, declared,
                     node->line);
-            return -1;
+            rc = -1;
+            break;
         }
-        /* Scalar float/integer facts must agree with the declared lane.  An
-         * integer literal may enter a float lane only when binary64 can
-         * represent it exactly; decimal literals must never be truncated
-         * into an integer lane.  Compound slot typing is validated by its
-         * dedicated metadata path below and is intentionally not inferred
-         * from the logical column count here. */
-        bool all_scalar = rel->column_count == node->child_count
-            && rel->columns;
-        if (all_scalar) {
-            for (uint32_t c = 0; c < rel->column_count; c++) {
-                if (rel->columns[c].compound_kind
-                    != WIRELOG_COMPOUND_KIND_NONE) {
-                    all_scalar = false;
-                    break;
-                }
-            }
-        }
-        if (all_scalar) {
-            for (uint32_t c = 0; c < node->child_count; c++) {
-                const wl_parser_ast_node_t *arg = node->children[c];
-                wirelog_column_type_t declared_type = rel->columns[c].type;
-                if (arg->type == WL_PARSER_AST_NODE_FLOAT
-                    && declared_type != WIRELOG_TYPE_FLOAT) {
-                    wl_ir_program_set_error(program,
-                        "float fact for integer column %u of relation '%s' "
-                        "is not allowed (line %u)", c, rel->name,
-                        node->line);
-                    return -1;
-                }
-                if (arg->type == WL_PARSER_AST_NODE_INTEGER
-                    && declared_type == WIRELOG_TYPE_FLOAT
-                    && !int64_exact_as_binary64(arg->int_value)) {
+        /* Every earlier fact of this relation passed the width check above
+         * and collect_fact() appended the facts in AST order, so this fact
+         * is row @row of fact_data at stride @declared. */
+        uint32_t row = rows_seen[rel_index]++;
+
+        /* Each literal must fit its lane's declared type (#2231).  An
+         * integer literal in a float lane is converted here, to the
+         * binary64 value of the integer: collect_fact() cannot do it,
+         * because the `.decl` may follow the fact.  An integer that
+         * binary64 cannot represent exactly is rejected, and so is a
+         * float literal in a lane that is not float, and a string literal
+         * in a float lane.  An integer or string in a symbol or integer
+         * lane is stored as written (#963). */
+        for (uint32_t c = 0; rc == 0 && c < node->child_count; c++) {
+            const wl_parser_ast_node_t *arg = node->children[c];
+            wirelog_column_type_t lane_type;
+            if (!fact_lane_type(rel, c, &lane_type))
+                continue;
+            if (arg->type == WL_PARSER_AST_NODE_FLOAT
+                && lane_type != WIRELOG_TYPE_FLOAT) {
+                wl_ir_program_set_error(program,
+                    "float fact for non-float column %u of relation '%s'"
+                    " is not allowed (line %u)", c, rel->name, node->line);
+                rc = -1;
+            } else if (arg->type == WL_PARSER_AST_NODE_STRING
+                && lane_type == WIRELOG_TYPE_FLOAT) {
+                wl_ir_program_set_error(program,
+                    "string fact for float column %u of relation '%s'"
+                    " is not allowed (line %u)", c, rel->name, node->line);
+                rc = -1;
+            } else if (arg->type == WL_PARSER_AST_NODE_INTEGER
+                && lane_type == WIRELOG_TYPE_FLOAT) {
+                if (!int64_exact_as_binary64(arg->int_value)) {
                     wl_ir_program_set_error(program,
                         "integer fact for float column %u of relation '%s' "
                         "is not exactly representable (line %u)", c,
                         rel->name, node->line);
-                    return -1;
+                    rc = -1;
+                } else if (rel->fact_data && row < rel->fact_count) {
+                    rel->fact_data[(size_t)row * declared + c]
+                        = float_lane_bits((double)arg->int_value);
+                    rel->has_float_facts = true;
                 }
             }
         }
     }
 
-    return 0;
+    free(rows_seen);
+    return rc;
 }
 
 /* #2231: the schema of a relation that has inline facts and no `.decl`.

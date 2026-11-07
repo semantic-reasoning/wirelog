@@ -3774,6 +3774,137 @@ test_api_get_facts_undeclared(void)
 }
 
 /* ======================================================================== */
+/* Inline fact literals against their lanes (#2231)                        */
+/* ======================================================================== */
+
+static int64_t
+double_bits(double value)
+{
+    int64_t bits;
+    memcpy(&bits, &value, sizeof(bits));
+    return bits;
+}
+
+static void
+test_fact_int_in_float_column_converted(void)
+{
+    static const char *srcs[] = {
+        ".decl g(x: float)\ng(1).\ng(-3).\ng(2.5).\n",
+        "g(1).\ng(-3).\ng(2.5).\n.decl g(x: float)\n",
+    };
+
+    TEST("Fact lanes: integer in a float column is converted");
+    for (size_t i = 0; i < sizeof(srcs) / sizeof(srcs[0]); i++) {
+        struct wirelog_program *prog = make_program(srcs[i]);
+        const wl_ir_relation_info_t *g = relation_named(prog, "g");
+        bool ok = g && g->fact_count == 3 && g->fact_data
+            && g->has_float_facts
+            && g->fact_data[0] == double_bits(1.0)
+            && g->fact_data[1] == double_bits(-3.0)
+            && g->fact_data[2] == double_bits(2.5);
+        if (prog)
+            wl_ir_program_free(prog);
+        if (!ok) {
+            FAIL(i == 0 ? "integers not stored as binary64"
+                : "integers not converted when the .decl follows");
+            return;
+        }
+    }
+    PASS();
+}
+
+static void
+test_fact_int_in_inline_float_slot_converted(void)
+{
+    TEST("Fact lanes: integer in an inline float slot is converted");
+    struct wirelog_program *prog = make_program(
+        ".decl g(id: int64, v: f(float, int64) inline)\ng(1, 2, 3).\n");
+    const wl_ir_relation_info_t *g = relation_named(prog, "g");
+    bool ok = g && g->fact_count == 1 && g->fact_data
+        && g->fact_data[0] == 1 && g->fact_data[1] == double_bits(2.0)
+        && g->fact_data[2] == 3;
+    if (prog)
+        wl_ir_program_free(prog);
+    if (!ok) {
+        FAIL("expected {1, bits(2.0), 3}");
+        return;
+    }
+    PASS();
+}
+
+static void
+test_fact_lane_mismatches_rejected(void)
+{
+    static const struct {
+        const char *src;
+        const char *needle;
+    } cases[] = {
+        { ".decl g(id: int64, v: f(int64, int64) inline)\ng(1, 2.5, 3).\n",
+          "float fact for non-float column 1" },
+        { ".decl g(id: int64, v: f/2 inline)\ng(1, 2.5, 3).\n",
+          "float fact for non-float column 1" },
+        { ".decl g(x: float)\ng(\"a\").\n",
+          "string fact for float column 0" },
+        { ".decl g(id: int64, v: f(float, int64) inline)\ng(1, \"a\", 3).\n",
+          "string fact for float column 1" },
+        { ".decl g(id: int64, v: f/2)\ng(1, 2.5).\n",
+          "float fact for non-float column 1" },
+        { ".decl g(x: string)\ng(1.5).\n",
+          "float fact for non-float column 0" },
+        { ".decl g(x: int64)\ng(1.5).\n",
+          "float fact for non-float column 0" },
+        { ".decl g(x: float)\ng(9007199254740993).\n",
+          "is not exactly representable" },
+    };
+
+    TEST("Fact lanes: literals that do not fit their lane are rejected");
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        char errbuf[512];
+        wirelog_error_t err = WIRELOG_OK;
+        struct wirelog_program *prog = wl_ir_parse_string_err(cases[i].src,
+                &err, errbuf, sizeof(errbuf));
+        if (prog) {
+            wirelog_program_free(prog);
+            FAIL(cases[i].src);
+            return;
+        }
+        if (err != WIRELOG_ERR_PARSE || !strstr(errbuf, cases[i].needle)) {
+            printf(" [%s]", errbuf);
+            FAIL("wrong error for a lane mismatch");
+            return;
+        }
+    }
+    PASS();
+}
+
+static void
+test_fact_lane_controls(void)
+{
+    TEST("Fact lanes: integers in symbol and handle lanes are kept");
+    struct wirelog_program *sym = make_program(".decl g(x: symbol)\ng(7).\n");
+    const wl_ir_relation_info_t *g = relation_named(sym, "g");
+    bool ok = g && g->fact_data && g->fact_data[0] == 7;
+    if (sym)
+        wl_ir_program_free(sym);
+    struct wirelog_program *str = make_program(".decl g(x: int64)\n"
+            "g(\"a\").\n");
+    ok = ok && str != NULL;
+    if (str)
+        wl_ir_program_free(str);
+    struct wirelog_program *handle = make_program(".decl g(id: int64,"
+            " v: f/2)\ng(1, 2).\n");
+    const wl_ir_relation_info_t *h = relation_named(handle, "g");
+    ok = ok && h && h->fact_data && h->fact_data[1] == 2;
+    if (handle)
+        wl_ir_program_free(handle);
+    if (!ok) {
+        FAIL("a symbol, int64 or handle lane control changed");
+        return;
+    }
+    PASS();
+}
+
+/* ======================================================================== */
 /* Symbol / number domain check (#2231)                                     */
 /* ======================================================================== */
 
@@ -4522,6 +4653,12 @@ main(void)
     test_head_arity_undeclared_head_accepted();
     test_head_arity_matching_accepted();
     test_head_arity_mismatch_maps_to_parse_error();
+
+    /* #2231: inline fact literals against their lanes */
+    test_fact_int_in_float_column_converted();
+    test_fact_int_in_inline_float_slot_converted();
+    test_fact_lane_mismatches_rejected();
+    test_fact_lane_controls();
 
     /* #2231: undeclared fact relations take their schema from their facts */
     test_fact_schema_inferred_from_facts();
