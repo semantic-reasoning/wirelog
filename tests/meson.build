@@ -7164,3 +7164,12 @@ test_evaluation_reduce_batch_owner_exe = executable(
 )
 test('evaluation_reduce_batch_owner', test_evaluation_reduce_batch_owner_exe,
      suite: ['unit', 'tsan'], timeout: 120)
+# Every supported/rejected scalar tag must remain visible in the #2299 ledger.
+test('expression_inventory', py3,
+  args: [files('../scripts/ci/check-expression-inventory.py')],
+  suite: 'abi',
+)
+test('expression_inventory_selftest', py3,
+  args: [files('../scripts/ci/test-check-expression-inventory.py')],
+  suite: 'abi',
+)
