@@ -187,3 +187,50 @@ and resource/pin/lease balance. Run native plus ASan/UBSan, optional-library
 on/off, and relevant numeric/serial/recursive/pipeline regressions. Wall time is
 only a watchdog. Update the ledger with concrete assertions and commands before
 marking a domain qualified. Missing evidence stays outstanding.
+
+## Immutable byte prerequisite (unit 2)
+
+The `wl_columnar_expr_*_attempt_controlled` byte helpers are prerequisites;
+none of the `open` expression rows is activated by these helpers alone.
+They require a live saved attempt and borrowed immutable source storage.
+They neither allocate nor acquire intern ownership; callers retain an intern
+pin when reading an interned string. Copy destinations are private disjoint
+scratch. Scalars remain unchanged on failure; after accepted copy entry the
+`copied` count instead reports stores already completed, even when a later poll
+fails. A rejected entry leaves that count unchanged.
+
+The fixed tariff is T=224. Entry and final publication each pay T. C-string
+inspection pays T per byte including its terminating NUL. Comparison pays T
+per unsigned byte pair up to and including the first mismatch. Copy and FNV1a
+hash each pay separate T for a LOAD and a STORE/update. Search pays T for each
+candidate plus T for every compared pair (including partial failures). Search
+uses subtraction-based bounds, returns `0,false` when absent and `0,true` for
+an empty needle; an oversized needle has no candidate or pair cost.
+
+Successful-path independent budget formulas:
+
+| Operation | Exact work |
+| --- | --- |
+| C-string of n non-NUL bytes | 224 × (n + 3) |
+| Compare inspecting k pairs | 224 × (k + 2) |
+| Copy/hash of n bytes | 224 × (2n + 2) |
+| Search with c candidates and p inspected pairs | 224 × (c + p + 2) |
+
+The source regions reuse the existing saved-ID guard (G9), guarded debit
+prefix (C13) and tail (T26/T29). The helper source audit allows at most 128
+additional actions for validation, scalar loads/arithmetic, loop/child/caller
+transitions, refused-debit return and output publication; 9+13+29+128=179 is
+below T224 and quantum256. This is a conservative source-action allowance,
+not an instruction count or a wall-time claim. Hook bodies are test-only;
+revalidation after them remains production control logic. A LOAD never funds
+its later STORE/update. Final guarded polling occurs before scalar publication.
+Invalid bootstrap is fixed-size and reads neither source nor output.
+
+`test_evaluation_expression_bytes.c` independently specifies literal exact and
+one-short budgets, known FNV vectors, early mismatch and nested partial search,
+unsigned/UTF-8/embedded-NUL byte values, empty inputs, invalid admission,
+LOAD-before-STORE denial, cancellation at every checkpoint and final cutoff,
+controller replacement without successor debit/hook invocation, and a real
+pin-held retired intern owner. The large length case stops after byte1024,
+then retries the same immutable input successfully. Empty spans still pay
+entry and final charges. No UTF-8 decoding is claimed by these byte helpers.
