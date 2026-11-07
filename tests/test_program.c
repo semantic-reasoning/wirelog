@@ -1559,7 +1559,7 @@ test_compound_inline_annotation(void)
     TEST("INLINE compound: scan->type becomes COMPOUND_INLINE with metadata");
 
     struct wirelog_program *prog
-        = make_program(".decl pred(a: int32, b: int32)\n"
+        = make_program(".decl pred(a: f/1 inline, b: int32)\n"
             ".decl r(b: int32)\n"
             "r(b) :- pred(f(x), b).\n");
     if (!prog) {
@@ -1649,7 +1649,7 @@ test_compound_side_annotation(void)
     TEST("SIDE compound: scan->type becomes COMPOUND_SIDE with metadata");
 
     struct wirelog_program *prog
-        = make_program(".decl pred(a: int32)\n"
+        = make_program(".decl pred(a: g/1 side)\n"
             ".decl r(x: int32)\n"
             "r(x) :- pred(g(x)).\n");
     if (!prog) {
@@ -1691,7 +1691,7 @@ test_compound_annotation_not_wrapped(void)
     TEST("Compound annotation: no extra COMPOUND wrapper above the SCAN");
 
     struct wirelog_program *prog
-        = make_program(".decl pred(a: int32)\n"
+        = make_program(".decl pred(a: f/1 inline)\n"
             ".decl r(x: int32)\n"
             "r(x) :- pred(f(x)).\n");
     if (!prog) {
@@ -1741,7 +1741,7 @@ test_compound_mixed_columns(void)
     TEST("Mixed columns: first compound column drives annotation");
 
     struct wirelog_program *prog
-        = make_program(".decl pred(a: int32, b: int32, c: int32)\n"
+        = make_program(".decl pred(a: f/1 inline, b: int32, c: g/1 side)\n"
             ".decl r(y: int32)\n"
             "r(y) :- pred(f(x), y, g(z)).\n");
     if (!prog) {
@@ -1820,7 +1820,7 @@ test_compound_participates_in_join(void)
     TEST("Compound annotation participates in JOIN chain (well-formed IR)");
 
     struct wirelog_program *prog
-        = make_program(".decl pred(a: int32, b: int32)\n"
+        = make_program(".decl pred(a: f/1 inline, b: int32)\n"
             ".decl other(b: int32, c: int32)\n"
             ".decl r(x: int32, c: int32)\n"
             "r(x, c) :- pred(f(x), y), other(y, c).\n");
@@ -1909,7 +1909,7 @@ test_compound_observability_logging(void)
     wl_log_init();
 
     struct wirelog_program *prog
-        = make_program(".decl pred(a: int32)\n"
+        = make_program(".decl pred(a: f/1 inline)\n"
             ".decl r(x: int32)\n"
             "r(x) :- pred(f(x)).\n");
     if (!prog) {
@@ -2028,7 +2028,7 @@ test_compound_invalid_kind_skipped(void)
     TEST("Invalid compound_kind value leaves leaf as SCAN");
 
     struct wirelog_program *prog
-        = make_program(".decl pred(a: int32)\n"
+        = make_program(".decl pred(a: f/1 inline)\n"
             ".decl r(x: int32)\n"
             "r(x) :- pred(f(x)).\n");
     if (!prog) {
@@ -2075,7 +2075,7 @@ test_compound_inline_zero_arity_skipped(void)
     TEST("INLINE compound with arity=0 leaves leaf as SCAN");
 
     struct wirelog_program *prog
-        = make_program(".decl pred(a: int32)\n"
+        = make_program(".decl pred(a: f/1 inline)\n"
             ".decl r(x: int32)\n"
             "r(x) :- pred(f(x)).\n");
     if (!prog) {
@@ -3758,6 +3758,112 @@ test_body_arity_accepted_forms(void)
     PASS();
 }
 
+#define PAIR_BOX_DECL \
+        ".decl a(i: int64, p: pair/2 inline, m: int64, q: box/1 inline)\n" \
+        "a(1, 2, 3, 4, 5).\n"
+
+static void
+test_body_compound_placement_rejected(void)
+{
+    static const struct {
+        const char *src;
+        const char *needle;
+    } cases[] = {
+        /* a compound term at a scalar column, positive and negated */
+        { ".decl e(i: int64, x: int64)\ne(1, 9).\n.decl o(i: int64, z: int64)\n"
+          "o(i, z) :- e(i, box(z)).\n",
+          "body atom for relation 'e' has a compound term at argument 2,"
+          " but column 'x' of 'e' is not a compound column" },
+        { ".decl e(i: int64, x: int64)\ne(1, 9).\n.decl o(i: int64)\n"
+          "o(i) :- e(i, x), !e(i, box(x)).\n",
+          "negated body atom for relation 'e' has a compound term at"
+          " argument 2" },
+        /* a scalar column of a relation in logical form */
+        { ".decl q(x: g/2 inline, y: int64)\nq(1, 2, 3).\n.decl o(a: int64)\n"
+          "o(a) :- q(g(a, _), h(1)).\n",
+          "has a compound term at argument 2, but column 'y' of 'q' is not" },
+        /* an undeclared relation typed by its facts */
+        { "e(1, 9).\n.decl o(i: int64)\no(i) :- e(i, box(_)).\n",
+          "has a compound term at argument 2, but column 2 of 'e' is not" },
+        /* a scalar column before a flat-written inline column */
+        { ".decl a(i: int64, p: pair/2 inline)\na(1, 2, 3).\n"
+          ".decl o(i: int64)\no(i) :- a(box(i), s, n).\n",
+          "but column 'i' of 'a' is not a compound column" },
+        /* a compound term after a flat-written inline column */
+        { PAIR_BOX_DECL ".decl o(i: int64, s: int64, z: int64)\n"
+          "o(i, s, z) :- a(i, s, n, m, box(z)).\n",
+          "has a compound term at argument 5, after inline column 'p'"
+          " written one argument per slot" },
+        { ".decl q(x: g/2 inline, y: f/2 inline)\nq(1, 2, 3, 4).\n"
+          ".decl o(a: int64, b: int64, c: int64, d: int64)\n"
+          "o(a, b, c, d) :- q(a, b, c, f(d)).\n",
+          "has a compound term at argument 4, after inline column 'x'" },
+        /* a side column after a flat-written inline column */
+        { ".decl r(p: f/2 inline, q: s/1 side)\n.decl o(a: int64)\n"
+          "o(a) :- r(a, b, s(x)).\n",
+          "has a compound term at argument 3, after inline column 'p'" },
+    };
+
+    TEST("Body compounds: a compound term off a compound column is rejected");
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        char errbuf[512];
+        wirelog_error_t err = WIRELOG_OK;
+        struct wirelog_program *prog = wl_ir_parse_string_err(cases[i].src,
+                &err, errbuf, sizeof(errbuf));
+        if (prog) {
+            wirelog_program_free(prog);
+            FAIL(cases[i].src);
+            return;
+        }
+        if (err != WIRELOG_ERR_PARSE || !strstr(errbuf, cases[i].needle)) {
+            printf(" [%s]", errbuf);
+            FAIL("wrong error for a misplaced compound term");
+            return;
+        }
+    }
+    PASS();
+}
+
+static void
+test_body_compound_placement_accepted(void)
+{
+    static const char *cases[] = {
+        /* side compound columns, alone and next to an inline column */
+        ".decl event(id: int64, payload: metadata/4 side)\n"
+        ".decl gate(id: int64)\n.decl hot(id: int64, r: int64)\n"
+        "hot(ID, R) :- gate(ID), event(ID, metadata(_, _, _, R)).\n",
+        ".decl r(p: f/2 inline, q: s/1 side)\n.decl o(a: int64)\n"
+        "o(a) :- r(f(a, b), s(x)).\n",
+        /* a side column before a flat-written inline column, and next to
+         * a one-slot inline column written flat */
+        ".decl ev(h: metadata/4 side, p: pair/2 inline, k: int64)\n"
+        ".decl o(r: int64, a: int64, b: int64, k: int64)\n"
+        "o(R, A, B, K) :- ev(metadata(_, _, _, R), A, B, K).\n",
+        ".decl ev(p: f/1 inline, h: metadata/4 side)\n"
+        ".decl o(a: int64, r: int64)\n"
+        "o(A, R) :- ev(A, metadata(_, _, _, R)).\n",
+        /* inline columns in logical form, with a nested compound */
+        PAIR_BOX_DECL ".decl o(i: int64, z: int64)\n"
+        "o(i, z) :- a(i, pair(_, _), _, box(z)).\n",
+        ".decl a(i: int64, p: pair(symbol, int64) inline)\n.decl o(i: int64)\n"
+        "o(i) :- a(i, pair(nested(s), n)).\n",
+        /* undeclared head-only relations are not checked */
+        ".decl e(x: int64)\ne(1).\nt(x, x) :- e(x).\n"
+        ".decl o(x: int64)\no(x) :- t(x, f(y)).\n",
+    };
+
+    TEST("Body compounds: compound terms at compound columns still load");
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        struct wirelog_program *prog = make_program(cases[i]);
+        if (!prog) {
+            FAIL(cases[i]);
+            return;
+        }
+        wl_ir_program_free(prog);
+    }
+    PASS();
+}
+
 /* ======================================================================== */
 /* Rule-head constants against their lanes (#2231)                          */
 /* ======================================================================== */
@@ -4923,6 +5029,8 @@ main(void)
     /* #2231: body atom width */
     test_body_arity_mismatches_rejected();
     test_body_arity_accepted_forms();
+    test_body_compound_placement_rejected();
+    test_body_compound_placement_accepted();
 
     /* #2231: rule-head constants against their lanes */
     test_head_int_const_in_float_lane_converted();
