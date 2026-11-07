@@ -3140,6 +3140,41 @@ wl_columnar_expr_eval_attempt_controlled(
     return 0;
 }
 
+/* Immutable tables above are shared with the existing numeric evaluator.
+ * LOAD and CRC update are separately admitted; no table initialization. */
+int
+wl_columnar_expr_crc_bytes_attempt_controlled(const uint8_t *bytes,
+    size_t length, bool castagnoli, uint32_t *result,
+    wl_evaluation_control_t *control, uint64_t id)
+{
+    if ((!bytes && length) || !result) return EINVAL;
+    int rc = wl_columnar_expr_byte_region(control, id);
+    if (rc) return rc;
+    rc = wl_columnar_expr_attempt_tail(control, id, 114, length);
+    if (rc) return rc;
+    const uint32_t *table = castagnoli ? wl_columnar_expr_crc_cast_bytes :
+        wl_columnar_expr_crc_eth_bytes;
+    uint32_t crc = UINT32_MAX;
+    for (size_t i = 0; i < length; ++i) {
+        rc = wl_columnar_expr_byte_region(control, id);
+        if (rc) return rc;
+        rc = wl_columnar_expr_attempt_tail(control, id, 115, i);
+        if (rc) return rc;
+        uint8_t byte = bytes[i];
+        rc = wl_columnar_expr_byte_region(control, id);
+        if (rc) return rc;
+        rc = wl_columnar_expr_attempt_tail(control, id, 116, i);
+        if (rc) return rc;
+        crc = (crc >> 8) ^ table[(crc ^ byte) & 255u];
+    }
+    rc = wl_columnar_expr_byte_region(control, id);
+    if (rc) return rc;
+    rc = wl_columnar_expr_attempt_tail(control, id, 117, length);
+    if (rc) return rc;
+    *result = ~crc;
+    return 0;
+}
+
 /* Context-bearing scalar expressions (#2299). Numeric-only owners and their
  * source/debit oracles remain independent. Bytecode is copied, context is
  * borrowed only for synchronous evaluation under its plan/session owner. */
@@ -3371,6 +3406,8 @@ wl_columnar_expr_scalar_decode(const uint8_t *bytes, uint32_t size,
         *pos += length;
         break;
     }
+    case WL_PLAN_EXPR_ARITH_HASH_S:
+    case WL_PLAN_EXPR_ARITH_CRC32_ETH_S: case WL_PLAN_EXPR_ARITH_CRC32_CAST_S:
     case WL_PLAN_EXPR_STR_FN_TO_NUMBER:
     case WL_PLAN_EXPR_STR_FN_STRLEN: case WL_PLAN_EXPR_STR_FN_STR_ORD:
     case WL_PLAN_EXPR_STR_FN_CONTAINS: case WL_PLAN_EXPR_STR_FN_STR_PREFIX:
@@ -3454,6 +3491,9 @@ wl_columnar_expr_compile_scalar_attempt_controlled(const uint8_t *bytes,
         case WL_PLAN_EXPR_CONST_FLOAT: case WL_PLAN_EXPR_CONST_STR:
         case WL_PLAN_EXPR_BOOL:
             break;
+        case WL_PLAN_EXPR_ARITH_HASH_S:
+        case WL_PLAN_EXPR_ARITH_CRC32_ETH_S: case
+            WL_PLAN_EXPR_ARITH_CRC32_CAST_S:
         case WL_PLAN_EXPR_STR_FN_TO_NUMBER:
         case WL_PLAN_EXPR_STR_FN_STRLEN: case WL_PLAN_EXPR_STR_FN_STR_ORD:
         case WL_PLAN_EXPR_ARITH_BNOT: case WL_PLAN_EXPR_ARITH_HASH:
@@ -3540,7 +3580,10 @@ wl_columnar_expr_scalar_result_type_attempt_controlled(
     if (owner->producer.op == WL_PLAN_EXPR_VAR_STRING
         || owner->producer.op ==
         WL_PLAN_EXPR_CONST_STR) result = WIRELOG_TYPE_STRING;
-    else if (owner->producer.op == WL_PLAN_EXPR_STR_FN_TO_NUMBER ||
+    else if (owner->producer.op == WL_PLAN_EXPR_ARITH_HASH_S ||
+        owner->producer.op == WL_PLAN_EXPR_ARITH_CRC32_ETH_S ||
+        owner->producer.op == WL_PLAN_EXPR_ARITH_CRC32_CAST_S ||
+        owner->producer.op == WL_PLAN_EXPR_STR_FN_TO_NUMBER ||
         owner->producer.op == WL_PLAN_EXPR_STR_FN_STRLEN ||
         owner->producer.op ==
         WL_PLAN_EXPR_STR_FN_STR_ORD) result = WIRELOG_TYPE_INT64;
@@ -3647,6 +3690,47 @@ wl_columnar_expr_eval_scalar_attempt_controlled(
             if (rc) return rc;
             expr_push_string(&stack, v, owner->bytes + in.iarg,
                 (uint32_t)in.larg);
+        } else if (in.op == WL_PLAN_EXPR_ARITH_HASH_S ||
+            in.op == WL_PLAN_EXPR_ARITH_CRC32_ETH_S ||
+            in.op == WL_PLAN_EXPR_ARITH_CRC32_CAST_S) {
+            rc = wl_columnar_expr_scalar_region(control, id, 102, pos);
+            if (rc) return rc;
+            int64_t operand = expr_pop(&stack), result = 0;
+            const char *text = intern ? wl_intern_reverse(intern,
+                    operand) : NULL;
+            uint8_t native[sizeof(operand)];
+            const uint8_t *data;
+            size_t length;
+            if (text) {
+                data = (const uint8_t *)text;
+                rc = wl_columnar_expr_cstr_length_attempt_controlled(text,
+                        &length, control, id);
+                if (rc) return rc;
+            } else {
+                WL_LOG(WL_LOG_SEC_EVAL, WL_LOG_DEBUG,
+                    "digest operand %" PRId64
+                    " is declared symbol but names no "
+                    "interned string: digesting its int64 representation",
+                    operand);
+                memcpy(native, &operand, sizeof(operand));
+                data = native; length = sizeof(operand);
+            }
+            rc = wl_columnar_expr_scalar_region(control, id, 103, length);
+            if (rc) return rc;
+            if (in.op == WL_PLAN_EXPR_ARITH_HASH_S)
+                rc = wl_columnar_expr_hash_bytes_attempt_controlled(data,
+                        length, &result, control, id);
+            else {
+                uint32_t crc = 0;
+                rc = wl_columnar_expr_crc_bytes_attempt_controlled(data,
+                        length, in.op == WL_PLAN_EXPR_ARITH_CRC32_CAST_S, &crc,
+                        control, id);
+                result = crc;
+            }
+            if (rc) return rc;
+            rc = wl_columnar_expr_scalar_region(control, id, 104, pos);
+            if (rc) return rc;
+            expr_push(&stack, result);
         } else if (in.op == WL_PLAN_EXPR_STR_FN_TO_NUMBER) {
             rc = wl_columnar_expr_scalar_region(control, id, 100, pos);
             if (rc) return rc;

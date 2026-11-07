@@ -93,7 +93,7 @@ wirelog_lockfree_queue_src = files('util/lockfree_queue.c', )
 #== == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == ==
 
 wirelog_backend_src = files('exec_plan_scalar_view.c', 'columnar/relation.c', 'columnar/cache.c',
-                           'columnar/ops.c', 'columnar/arithmetic.c', 'columnar/expr.c', 'intern_control.c', 'columnar/filter.c', 'columnar/join.c', 'columnar/merge.c', 'columnar/kfusion.c', 'columnar/kfusion_adaptive.c', 'columnar/diff.c', 'columnar/inline.c', 'columnar/eval_dedup.c', 'columnar/eval_delta.c', 'columnar/tdd_channel.c', 'columnar/eval_tdd_channel.c', 'columnar/eval_tdd_plan.c', 'columnar/eval_tdd_insert.c', 'columnar/eval_plan.c', 'columnar/eval_stack.c', 'columnar/eval_serial.c', 'columnar/eval.c',
+                           'columnar/ops.c', 'columnar/arithmetic.c', 'columnar/expr.c', 'columnar/expr_hash.c', 'intern_control.c', 'columnar/filter.c', 'columnar/join.c', 'columnar/merge.c', 'columnar/kfusion.c', 'columnar/kfusion_adaptive.c', 'columnar/diff.c', 'columnar/inline.c', 'columnar/eval_dedup.c', 'columnar/eval_delta.c', 'columnar/tdd_channel.c', 'columnar/eval_tdd_channel.c', 'columnar/eval_tdd_plan.c', 'columnar/eval_tdd_insert.c', 'columnar/eval_plan.c', 'columnar/eval_stack.c', 'columnar/eval_serial.c', 'columnar/eval.c',
                            'columnar/arrangement.c', 'columnar/frontier.c', 'columnar/frontier_epoch.c',
                            'columnar/mobius.c', 'columnar/session.c', 'columnar/session_hash.c',
                            'columnar/delta_pool.c',

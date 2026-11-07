@@ -5912,6 +5912,16 @@ int wl_columnar_expr_utf8_next_attempt_controlled(const char *, size_t *,
 int wl_columnar_expr_decimal_attempt_controlled(const char *, int64_t *,
     wl_evaluation_control_t *, uint64_t);
 
+/* Borrowed spans, NULL only for length0; saved active attempt required.
+ * No allocations/intern changes. Nonzero leaves output unchanged.
+ * XXH3: 224*(4+ceil(length/64)) engine work, narrow vendor reset/update/digest
+ * cooperation boundaries, each update<=64. CRC: 224*(2*length+2), distinct
+ * byte LOAD and immutable-table update, zero-extended complemented CRC. */
+int wl_columnar_expr_hash_bytes_attempt_controlled(const uint8_t *, size_t,
+    int64_t *, wl_evaluation_control_t *, uint64_t);
+int wl_columnar_expr_crc_bytes_attempt_controlled(const uint8_t *, size_t,
+    bool, uint32_t *, wl_evaluation_control_t *, uint64_t);
+
 /* Context-bearing scalar owner (#2299). Immutable bytecode copy, no intern
  * mutation during compile. Numeric-only hosts keep the numeric owner path.
  * Evaluation borrows the actual session/plan context (or caller-held pin),
