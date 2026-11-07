@@ -375,7 +375,7 @@ test_registry_growth_moves_reservations(void)
         "e:int32,f:int32,g:int32,h:int32,i:int32,j:int32)\n"
         "edge(1,2,3,4,5,6,7,8,9,10).\n"
         ".decl path(a:int32,b:int32)\n"
-        "path(a,b) :- edge(a,b).\n";
+        "path(a,b) :- edge(a,b,_,_,_,_,_,_,_,_).\n";
     wl_session_t *sess = NULL;
     wl_plan_t *plan = NULL;
     wirelog_program_t *prog = NULL;

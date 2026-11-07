@@ -480,9 +480,10 @@ from producing semantically correct output at workers in {1, 4, 8, 16}.
 
 - Issue #692 — Blocker B5: Recursive aggregation residue = 0.
 - Issue #973 — at most one aggregate per rule head.
-- Issue #977 — `.decl`-versus-program arity validation: inline facts and
-  rule heads are validated against the `.decl`, or, for a relation with
-  facts and no `.decl`, against its facts (#2231); rule *bodies* are not.
+- Issue #977 — `.decl`-versus-program arity validation: inline facts,
+  rule heads and rule body atoms (positive and negated) are validated
+  against the `.decl`, or, for a relation with facts and no `.decl`,
+  against its facts (#2231).
 - Issue #2231 — rules that mix symbol and numeric values are rejected at
   load; see `docs/SYNTAX.md`, "Rules must not mix symbol and numeric
   values".

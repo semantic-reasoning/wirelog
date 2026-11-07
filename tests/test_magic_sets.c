@@ -1242,10 +1242,11 @@ test_magic_rebuild_and_stratify(void)
  * so this test uses several deliberately -- a single-rule version would
  * pass on the unfixed code in an ordinary build.
  *
- * All three shapes below crash on the unfixed code, and none is caught by
- * the #977 arity checks: the first has a correct head and a wrong body, the
- * second is undeclared so has_decl skips it, and in the third every atom
- * already measures at the correct physical width. */
+ * Both shapes below crashed on the unfixed code.  The first has a correct
+ * head and a body atom wider than its .decl; the body-arity check (#2231)
+ * now rejects it at load, before magic sets runs, and the test pins that.
+ * The second uses an undeclared head relation, which no arity check sees,
+ * so it still reaches re-stratification. */
 static void
 test_stratify_no_oob_on_graph_absent_head(void)
 {
@@ -1271,8 +1272,18 @@ test_stratify_no_oob_on_graph_absent_head(void)
     for (size_t i = 0; i < sizeof(srcs) / sizeof(srcs[0]); i++) {
         wirelog_error_t err;
         wirelog_program_t *prog = wirelog_parse_string(srcs[i], &err);
-        if (!prog)
-            continue; /* rejected earlier by an arity check: also fine */
+        if (i == 0) {
+            if (prog) {
+                wirelog_program_free(prog);
+                FAIL("a body atom wider than its .decl was accepted");
+                return;
+            }
+            continue;
+        }
+        if (!prog) {
+            FAIL("the undeclared shape failed to parse");
+            return;
+        }
 
         wl_magic_demand_t demands[1];
         demands[0].relation_name = "path";

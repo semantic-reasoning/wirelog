@@ -1297,7 +1297,8 @@ infer_fact_schemas(struct wirelog_program *program,
  * `column_count > 0` so that `.decl p()` is checked instead of skipped.
  * Undeclared heads are skipped: they are widespread and legitimate
  * (bench/workloads/doop.dl has ~90), unless the relation's width was fixed
- * by its facts (schema_from_facts, #2231). */
+ * by its facts (schema_from_facts, #2231).  Body atoms are checked by
+ * validate_body_arities(). */
 static int
 validate_head_arities(struct wirelog_program *program,
     const wl_parser_ast_node_t *ast)
@@ -1820,6 +1821,119 @@ validate_head_constants(struct wirelog_program *program,
     return 0;
 }
 
+/* #2231: a body atom, positive or negated, must have its relation's width.
+ * An atom wider than its relation read the missing columns as 0, so
+ * `p(x, y) :- g(x, y).` against a one-column `g` holding g(5) derived
+ * p(5, 0).  A narrower one read a prefix of the row, so `g(x, _)` for the
+ * whole inline column of `g(id, p: f/2 inline)` bound nothing to the
+ * column's second slot and any later column shifted by one.
+ *
+ * An atom is written in one of two forms.  If any argument at an `inline`
+ * compound column is a compound term, the atom is in logical form: it has
+ * one argument per declared column, and every `inline` column of arity
+ * greater than 1 takes a compound term (`pred(a, f(b, c))`); a one-slot
+ * `inline` column may also take a variable or `_`, which reads that slot.
+ * Otherwise it is in flat form, one argument per physical slot
+ * (`pred(a, b, c)`), as facts and heads are written.  A compound term
+ * whose functor or arity differs from the declaration is accepted in
+ * logical form and matches no row, as before.
+ * Relations typed neither by a `.decl` nor by inline facts are skipped:
+ * an undeclared relation defined only by rule heads has no width to check
+ * against, and its atoms still read a missing column as 0. */
+static int
+check_body_atom_width(struct wirelog_program *program,
+    const wl_parser_ast_node_t *atom, bool negated)
+{
+    if (!atom || atom->type != WL_PARSER_AST_NODE_ATOM || !atom->name)
+        return 0;
+    const wl_ir_relation_info_t *rel = find_relation_info(program,
+            atom->name);
+    if (!rel || (!rel->has_decl && !rel->schema_from_facts))
+        return 0;
+
+    bool logical = false;
+    for (uint32_t c = 0; rel->columns && c < rel->column_count
+        && c < atom->child_count; c++)
+        if (rel->columns[c].compound_kind == WIRELOG_COMPOUND_KIND_INLINE
+            && atom->children[c]->type == WL_PARSER_AST_NODE_COMPOUND_TERM)
+            logical = true;
+
+    uint32_t physical = wl_ir_relation_physical_width(rel);
+    bool ok;
+    uint32_t bare = UINT32_MAX;
+    if (logical) {
+        ok = atom->child_count == rel->column_count;
+        for (uint32_t c = 0; ok && c < rel->column_count; c++)
+            if (rel->columns[c].compound_kind == WIRELOG_COMPOUND_KIND_INLINE
+                && rel->columns[c].compound_arity > 1
+                && atom->children[c]->type
+                != WL_PARSER_AST_NODE_COMPOUND_TERM) {
+                ok = false;
+                bare = c;
+            }
+    } else {
+        ok = atom->child_count == physical;
+    }
+    if (ok)
+        return 0;
+
+    const char *kind = negated ? "negated body atom" : "body atom";
+    if (!rel->has_decl)
+        wl_ir_program_set_error(program,
+            "%s for relation '%s' has %u argument(s) but its facts have %u"
+            " ('%s' has no .decl) (line %u)", kind, rel->name,
+            atom->child_count, physical, rel->name, atom->line);
+    else if (bare != UINT32_MAX)
+        wl_ir_program_set_error(program,
+            "%s for relation '%s' writes an inline column as a compound term,"
+            " so argument %u, for inline column '%s' of arity %u, must be"
+            " one too (line %u)", kind, rel->name, bare + 1,
+            rel->columns[bare].name ? rel->columns[bare].name : "",
+            rel->columns[bare].compound_arity, atom->line);
+    else if (logical)
+        wl_ir_program_set_error(program,
+            "%s for relation '%s' has %u argument(s) with a compound term"
+            " but '%s' is declared with %u column(s), each inline compound"
+            " written as a compound term, or occupies %u without one"
+            " (line %u)", kind, rel->name, atom->child_count, rel->name,
+            rel->column_count, physical, atom->line);
+    else if (physical != rel->column_count)
+        wl_ir_program_set_error(program,
+            "%s for relation '%s' has %u argument(s) but '%s' occupies %u"
+            " column(s) (%u declared, inline compound column(s) expanded to"
+            " their slots) (line %u)", kind, rel->name, atom->child_count,
+            rel->name, physical, rel->column_count, atom->line);
+    else
+        wl_ir_program_set_error(program,
+            "%s for relation '%s' has %u argument(s) but '%s' is declared"
+            " with %u column(s) (line %u)", kind, rel->name,
+            atom->child_count, rel->name, physical, atom->line);
+    return -1;
+}
+
+static int
+validate_body_arities(struct wirelog_program *program,
+    const wl_parser_ast_node_t *ast)
+{
+    for (uint32_t i = 0; i < ast->child_count; i++) {
+        const wl_parser_ast_node_t *node = ast->children[i];
+        if (node->type != WL_PARSER_AST_NODE_RULE)
+            continue;
+        for (uint32_t b = 1; b < node->child_count; b++) {
+            const wl_parser_ast_node_t *lit = node->children[b];
+            int rc = 0;
+            if (lit->type == WL_PARSER_AST_NODE_ATOM)
+                rc = check_body_atom_width(program, lit, false);
+            else if (lit->type == WL_PARSER_AST_NODE_NEGATION
+                && lit->child_count > 0)
+                rc = check_body_atom_width(program, lit->children[0], true);
+            if (rc != 0)
+                return -1;
+        }
+    }
+    return 0;
+}
+
 int
 wl_ir_program_collect_metadata(struct wirelog_program *program,
     const wl_parser_ast_node_t *ast)
@@ -1874,6 +1988,8 @@ wl_ir_program_collect_metadata(struct wirelog_program *program,
     if (validate_head_arities(program, ast) != 0)
         return -1;
     if (validate_head_constants(program, ast) != 0)
+        return -1;
+    if (validate_body_arities(program, ast) != 0)
         return -1;
     return validate_rule_value_domains(program, ast);
 }

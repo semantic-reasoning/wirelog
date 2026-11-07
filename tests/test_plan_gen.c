@@ -1658,6 +1658,13 @@ test_inline_declaration_provenance(void)
             "safe(i) :- a(i,pair(s,n),m,box(z)).\n", patterns[shape]);
         wirelog_error_t err;
         wirelog_program_t *prog = wirelog_parse_string(text, &err);
+        /* A variable or `_` for a whole inline column is a body atom of the
+         * wrong width and is rejected at load (#2231). */
+        if (shape == 2 || shape == 3) {
+            ASSERT(!prog && err == WIRELOG_ERR_PARSE,
+                "a whole-column variable at an INLINE column must be rejected");
+            continue;
+        }
         ASSERT(prog, "INLINE provenance fixture must parse");
         const wirelog_schema_t *decl = wirelog_program_get_schema(prog, "a");
         ASSERT(decl && decl->column_count == 4, "logical declaration width");
