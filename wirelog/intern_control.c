@@ -53,6 +53,8 @@ wl_intern_control_empty_slot(wl_intern_slot_t *slots, uint32_t capacity,
     uint32_t hash, uint32_t *slot, wl_evaluation_control_t *control,
     uint64_t attempt_id)
 {
+    if (!slots || capacity < INTERN_INITIAL_CAP
+        || (capacity & (capacity - 1u))) return EINVAL;
     uint32_t h = hash & (capacity - 1u);
     for (;;) {
         int rc = wl_intern_control_region(control, attempt_id, 9, h);
@@ -110,7 +112,16 @@ wl_intern_control_put_attempt(wl_intern_t *intern, const char *source,
     locked = true;
     rc = wl_intern_control_region(control, attempt_id, 3, 0);
     if (rc) goto fail;
-    uint32_t h = hash & (intern->slot_capacity - 1u);
+    uint32_t old_capacity = intern->slot_capacity;
+    /* Constructors start at64 and writers only double. Capture that fixed
+     * geometry while holding the writer lock; probes never accept a smaller
+     * or non-power-of-two private table. The added fixed checks remain within
+     * the already funded224 region and do not add a work admission. */
+    if (!intern->slots || old_capacity < INTERN_INITIAL_CAP
+        || (old_capacity & (old_capacity - 1u))) {
+        rc = EINVAL; goto fail;
+    }
+    uint32_t h = hash & (old_capacity - 1u);
     for (;;) {
         rc = wl_intern_control_region(control, attempt_id, 4, h);
         if (rc) goto fail;
@@ -136,7 +147,7 @@ wl_intern_control_put_attempt(wl_intern_t *intern, const char *source,
                 return 0;
             }
         }
-        h = (h + 1u) & (intern->slot_capacity - 1u);
+        h = (h + 1u) & (old_capacity - 1u);
     }
     rc = wl_intern_control_region(control, attempt_id, 15, 0);
     if (rc) goto fail;
@@ -147,12 +158,12 @@ wl_intern_control_put_attempt(wl_intern_t *intern, const char *source,
     uint32_t seg = intern_seg_of(count);
     bool new_segment = intern->segments[seg] == NULL;
     bool resize = (uint64_t)(count + 1u) * INTERN_LOAD_FACTOR_DEN
-        > (uint64_t)intern->slot_capacity * INTERN_LOAD_FACTOR_NUM;
-    if (resize && intern->slot_capacity > UINT32_MAX / 2u) {
+        > (uint64_t)old_capacity * INTERN_LOAD_FACTOR_NUM;
+    if (resize && old_capacity > UINT32_MAX / 2u) {
         rc = EOVERFLOW; goto fail;
     }
-    uint32_t capacity = resize ? intern->slot_capacity * 2u
-                              : intern->slot_capacity;
+    uint32_t capacity = resize ? old_capacity * 2u
+                              : old_capacity;
     uint64_t segment_bytes = 0, slot_bytes = 0, retired_bytes = 0;
     rc = wl_intern_control_region(control, attempt_id, 15, 1);
     if (rc) goto fail;
@@ -160,7 +171,7 @@ wl_intern_control_put_attempt(wl_intern_t *intern, const char *source,
         sizeof(char *), &segment_bytes))
         || (resize && (!wl_columnar_memory_size_mul(capacity,
         sizeof(wl_intern_slot_t), &slot_bytes)
-        || !wl_columnar_memory_size_mul(intern->slot_capacity,
+        || !wl_columnar_memory_size_mul(old_capacity,
         sizeof(wl_intern_slot_t), &retired_bytes)))
         || segment_bytes > SIZE_MAX || slot_bytes > SIZE_MAX) {
         rc = EOVERFLOW; goto fail;
@@ -211,7 +222,7 @@ wl_intern_control_put_attempt(wl_intern_t *intern, const char *source,
         if (rc) goto fail;
         rc = wl_intern_control_region(control, attempt_id, 14, 3);
         if (rc) goto fail;
-        segment = wl_intern_control_allocate((size_t)segment_bytes);
+        segment = (char **)wl_intern_control_allocate((size_t)segment_bytes);
         if (!segment) {
             rc = ENOMEM; goto fail;
         }
@@ -284,7 +295,6 @@ wl_intern_control_put_attempt(wl_intern_t *intern, const char *source,
             &intern->reservation)
             || !wl_columnar_memory_reservation_move(&intern->reservation,
             &pending)) abort();
-        pending_valid = false;
         intern->reserved_bytes = retained;
     }
     /* Ungoverned tables use the same preceding final guarded cutoff. */
@@ -309,7 +319,7 @@ wl_intern_control_put_attempt(wl_intern_t *intern, const char *source,
 fail:
     /* Cleanup never polls or invokes hooks; it cannot debit a successor. */
     free(copy);
-    free(segment);
+    free((void *)segment);
     free(slots);
     if (pending_valid && !wl_columnar_memory_rollback(&pending)) abort();
     if (locked) wl_mutex_unlock(&intern->lock);
