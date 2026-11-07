@@ -709,6 +709,7 @@ jobs:
             -Db_sanitize=thread \
             -Db_lundef=false \
             -Dthreads=posix \
+            -Doptimization=1 \
             -Dtests=true \
             -Dexamples=false \
             --buildtype=debug

@@ -1298,6 +1298,7 @@ To run wirelog under TSan the host must build with
 
 ```
 meson setup build-tsan \
+    --buildtype=debug \
     -Db_sanitize=thread \
     -Dthreads=posix \
     -Doptimization=1 \
@@ -1307,6 +1308,15 @@ meson test -C build-tsan --timeout-multiplier 4 --suite tsan
 
 CI's gating legs run the **whole** suite, not `--suite tsan`, and
 always with the `--timeout-multiplier 4` described below.
+
+The three full-runtime CI setups explicitly select `-Doptimization=1` while
+retaining debug symbols, assertions and complete thread-sanitizer compile/link
+instrumentation. This follows the [Clang TSan usage guidance](https://clang.llvm.org/docs/ThreadSanitizer.html)
+for practical instrumentation throughput; the watchdog and complete test
+histories remain unchanged. Optimization can change the instrumented access
+schedule, so O0 and O1 results are recorded separately. The native C11 advisory
+compile/smoke setup retains its existing O0 configuration and is not runtime
+race coverage.
 
 The `-Dthreads=posix` requirement is non-negotiable for race gating.
 Issue #826 showed that the Linux glibc C11 `<threads.h>` backend is

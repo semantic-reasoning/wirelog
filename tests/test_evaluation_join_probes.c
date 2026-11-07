@@ -1058,48 +1058,128 @@ test_key_generated_wide(unsigned stop_mode)
     free(saved_bytes); free(saved_strict);
 }
 
-int
-main(void)
+enum probe_family {
+    PROBE_KEYS, PROBE_WIDE, PROBE_BINDINGS, PROBE_DOMAINS, PROBE_SCHEMA,
+    PROBE_EVENTS, PROBE_ALLOCATIONS, PROBE_FINAL_DENIAL, PROBE_FIRST,
+    PROBE_FUNDING
+};
+
+typedef struct {
+    const char *name;
+    enum probe_family family;
+    unsigned group;
+} probe_case_t;
+
+static void
+first_probe_history(unsigned probe_op)
 {
-    test_key_literal_boundaries();
-    test_key_name_semantics();
-    test_key_saved_attempt();
-    for (unsigned mode = 0; mode < 3; ++mode) test_key_generated_wide(mode);
-    bound_probe_compatibility();
-    for (unsigned kind = 0; kind < 18; ++kind) run(kind, 0, 0, false);
-    for (unsigned point = 1; point <= 7; ++point)
-        for (unsigned work = 0; work < 2; ++work) run(0, point, 0, work);
-    for (unsigned event = 1; event <= 20; ++event)
-        for (unsigned work = 0; work < 2; ++work) run(0, 0, event, work);
-    for (int fault = 0; fault < 13; ++fault) {
-        allocation_failure = fault; run(0, 0, 0, false);
-    }
-    allocation_failure = -1;
-    for (unsigned work = 0; work < 2; ++work)
-        run(3, 0, WL_COLUMNAR_JOIN_PIPELINE_TEST_SCHEMA_FINAL, work);
-    wl_columnar_memory_reservation_init(&peer);
-    deny_schema = true; run(0, 0, 0, false);
-    const unsigned first_ops[] = {WL_PLAN_OP_SEMIJOIN, WL_PLAN_OP_ANTIJOIN};
-    for (unsigned i = 0; i < 2; ++i) {
-        first_probe_op = first_ops[i];
-        first_probe_mode = 1;
-        run(0, 0, 0, false);
-        CHECK(first_probe_found && first_probe_prefix);
-        uint64_t prefix = first_probe_prefix;
-        for (unsigned exact = 0; exact < 2; ++exact) {
-            first_probe_mode = 2;
-            first_probe_limit = prefix + (exact ? 192 : 191);
-            first_probe_paid = exact ? 192 : 0;
-            run(0, 0, 0, false);
-            CHECK(first_probe_prefix == prefix);
-        }
-        first_probe_mode = 3;
-        first_probe_paid = 0;
+    first_probe_op = probe_op;
+    first_probe_mode = 1;
+    run(0, 0, 0, false);
+    CHECK(first_probe_found && first_probe_prefix);
+    uint64_t prefix = first_probe_prefix;
+    for (unsigned exact = 0; exact < 2; ++exact) {
+        first_probe_mode = 2;
+        first_probe_limit = prefix + (exact ? 192 : 191);
+        first_probe_paid = exact ? 192 : 0;
         run(0, 0, 0, false);
         CHECK(first_probe_prefix == prefix);
     }
-    uint64_t measured = run(0, 0, 0, false);
-    funding_test = true;
-    CHECK(run(0, 0, 0, false) == measured);
-    return 0;
+    first_probe_mode = 3;
+    first_probe_paid = 0;
+    run(0, 0, 0, false);
+    CHECK(first_probe_prefix == prefix);
+    first_probe_op = first_probe_mode = 0;
+    first_probe_limit = first_probe_prefix = first_probe_paid = 0;
+}
+
+static void
+run_case(const probe_case_t *test)
+{
+    switch (test->family) {
+    case PROBE_KEYS:
+        test_key_literal_boundaries();
+        test_key_name_semantics();
+        test_key_saved_attempt();
+        break;
+    case PROBE_WIDE:
+        test_key_generated_wide(test->group);
+        break;
+    case PROBE_BINDINGS:
+        bound_probe_compatibility();
+        break;
+    case PROBE_DOMAINS:
+        for (unsigned kind = test->group * 3; kind < (test->group + 1) * 3;
+            ++kind) run(kind, 0, 0, false);
+        break;
+    case PROBE_SCHEMA: {
+        unsigned first = test->group ? 5 : 1;
+        unsigned end = test->group ? 8 : 5;
+        for (unsigned point = first; point < end; ++point)
+            for (unsigned work = 0; work < 2; ++work) run(0, point, 0, work);
+        break;
+    }
+    case PROBE_EVENTS:
+        for (unsigned event = 1 + test->group * 4;
+            event < 5 + test->group * 4; ++event)
+            for (unsigned work = 0; work < 2; ++work) run(0, 0, event, work);
+        break;
+    case PROBE_ALLOCATIONS: {
+        unsigned end = test->group == 2 ? 13 : (test->group + 1) * 4;
+        for (unsigned fault = test->group * 4; fault < end; ++fault) {
+            allocation_failure = (int)fault; run(0, 0, 0, false);
+        }
+        allocation_failure = -1;
+        break;
+    }
+    case PROBE_FINAL_DENIAL:
+        for (unsigned work = 0; work < 2; ++work)
+            run(3, 0, WL_COLUMNAR_JOIN_PIPELINE_TEST_SCHEMA_FINAL, work);
+        wl_columnar_memory_reservation_init(&peer);
+        deny_schema = true; run(0, 0, 0, false);
+        CHECK(!deny_schema);
+        break;
+    case PROBE_FIRST:
+        first_probe_history(test->group ? WL_PLAN_OP_ANTIJOIN
+            : WL_PLAN_OP_SEMIJOIN);
+        break;
+    case PROBE_FUNDING: {
+        uint64_t measured = run(0, 0, 0, false);
+        funding_test = true;
+        CHECK(run(0, 0, 0, false) == measured);
+        funding_test = false;
+        break;
+    }
+    }
+}
+
+int
+main(int argc, char **argv)
+{
+    static const probe_case_t cases[] = {
+        {"keys", PROBE_KEYS, 0},
+        {"keys-wide0", PROBE_WIDE, 0}, {"keys-wide1", PROBE_WIDE, 1},
+        {"keys-wide2", PROBE_WIDE, 2}, {"bindings", PROBE_BINDINGS, 0},
+        {"domains0", PROBE_DOMAINS, 0}, {"domains1", PROBE_DOMAINS, 1},
+        {"domains2", PROBE_DOMAINS, 2}, {"domains3", PROBE_DOMAINS, 3},
+        {"domains4", PROBE_DOMAINS, 4}, {"domains5", PROBE_DOMAINS, 5},
+        {"schema0", PROBE_SCHEMA, 0}, {"schema1", PROBE_SCHEMA, 1},
+        {"events0", PROBE_EVENTS, 0}, {"events1", PROBE_EVENTS, 1},
+        {"events2", PROBE_EVENTS, 2}, {"events3", PROBE_EVENTS, 3},
+        {"events4", PROBE_EVENTS, 4},
+        {"allocations0", PROBE_ALLOCATIONS, 0},
+        {"allocations1", PROBE_ALLOCATIONS, 1},
+        {"allocations2", PROBE_ALLOCATIONS, 2},
+        {"schema-final-denial", PROBE_FINAL_DENIAL, 0},
+        {"first-semi", PROBE_FIRST, 0}, {"first-anti", PROBE_FIRST, 1},
+        {"funding", PROBE_FUNDING, 0}
+    };
+    if (argc > 2) return 2;
+    for (unsigned i = 0; i < sizeof(cases) / sizeof(cases[0]); ++i) {
+        if (argc == 1) run_case(&cases[i]);
+        else if (!strcmp(argv[1], cases[i].name)) {
+            run_case(&cases[i]); return 0;
+        }
+    }
+    return argc == 1 ? 0 : 2;
 }
