@@ -13,9 +13,16 @@
  */
 
 #include "wirelog/wirelog-easy.h"
+#include "wirelog/backend.h"
+#include "wirelog/exec_plan_gen.h"
+#include "wirelog/session.h"
+#include "wirelog/session_facts.h"
+#include "wirelog/wirelog.h"
 
+#include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <string.h>
 
 static const char *PROG_SRC =
     ".decl role_permission(role:symbol,perm:symbol)\n"
@@ -483,6 +490,237 @@ test_inline_fact_relation_refused_by_source_inspection(void)
     return rc;
 }
 
+/* #2231: a relation with inline facts and no `.decl` was loaded as
+ * zero-width rows, so `p(x) :- g(x).` derived p(0).  It now takes its width
+ * and column types from its facts. */
+#define UNDECL_MAX 8
+
+typedef struct {
+    uint32_t count;
+    int64_t v[UNDECL_MAX][2];
+} undecl_rows_t;
+
+static void
+collect_undecl(const char *relation, const int64_t *row, uint32_t ncols,
+    void *user_data)
+{
+    undecl_rows_t *r = (undecl_rows_t *)user_data;
+
+    (void)relation;
+    if (r->count < UNDECL_MAX) {
+        r->v[r->count][0] = ncols > 0 ? row[0] : -1;
+        r->v[r->count][1] = ncols > 1 ? row[1] : -1;
+    }
+    r->count++;
+}
+
+static int
+undecl_case(const char *name, const char *src, const char *rel,
+    uint32_t want_rows, int64_t first0, int64_t first1)
+{
+    wirelog_easy_session_t *s = NULL;
+    undecl_rows_t got = { 0 };
+    int rc = wirelog_easy_open(src, &s);
+    if (rc != WIRELOG_OK || !s) {
+        printf("FAIL %s: open rc %d\n", name, rc);
+        return 1;
+    }
+    rc = wirelog_easy_snapshot(s, rel, collect_undecl, &got);
+    wirelog_easy_close(s);
+    if (rc != WIRELOG_OK || got.count != want_rows
+        || (want_rows > 0 && (got.v[0][0] != first0
+        || (first1 >= 0 && got.v[0][1] != first1)))) {
+        printf("FAIL %s: rc %d, %u rows, first (%lld, %lld)\n", name, rc,
+            got.count, (long long)got.v[0][0], (long long)got.v[0][1]);
+        return 1;
+    }
+    return 0;
+}
+
+static int
+test_undeclared_fact_relations(void)
+{
+    int failures = 0;
+
+    failures += undecl_case("undeclared unary fact",
+            "g(5).\n.decl p(x: int64)\np(x) :- g(x).\n", "p", 1, 5, -1);
+    failures += undecl_case("undeclared binary fact",
+            "g(5, 7).\n.decl p(x: int64, y: int64)\np(x, y) :- g(x, y).\n",
+            "p", 1, 5, 7);
+    failures += undecl_case("undeclared fact relation with a rule",
+            "g(5).\n.decl h(x: int64)\nh(9).\ng(x) :- h(x).\n"
+            ".decl p(x: int64)\np(x) :- g(x).\n", "p", 2, 5, -1);
+    {
+        /* `first` interns "a" ahead of g's "b", so a fabricated 0 cannot
+         * pass for the id of "b". */
+        wirelog_easy_session_t *s = NULL;
+        undecl_rows_t got = { 0 };
+        int rc = wirelog_easy_open(".decl first(x: symbol)\nfirst(\"a\").\n"
+                "g(\"b\").\n.decl want(x: symbol)\nwant(\"b\").\n"
+                ".decl p(x: symbol)\np(x) :- g(x), want(x).\n", &s);
+        int64_t b = s ? wirelog_easy_intern(s, "b") : -1;
+        if (rc == WIRELOG_OK && s)
+            rc = wirelog_easy_snapshot(s, "p", collect_undecl, &got);
+        if (s)
+            wirelog_easy_close(s);
+        if (rc != WIRELOG_OK || got.count != 1 || got.v[0][0] != b) {
+            printf("FAIL undeclared string fact: rc %d, %u rows\n", rc,
+                got.count);
+            failures++;
+        }
+    }
+
+    {
+        /* Disagreeing facts are a parse error, as a `.decl` mismatch is. */
+        wirelog_easy_session_t *s = NULL;
+        int rc = wirelog_easy_open("q().\nq(1).\n.decl p(x: int64)\n"
+                "p(x) :- q(x).\n", &s);
+        if (rc != WIRELOG_ERR_PARSE || s) {
+            printf("FAIL mixed-width facts: rc %d\n", rc);
+            failures++;
+            if (s)
+                wirelog_easy_close(s);
+        }
+    }
+
+    {
+        /* A host row into the inferred string column is taken, and a
+         * printed delta of an id nothing interned does not abort. */
+        wirelog_easy_session_t *s = NULL;
+        int64_t row[1] = { 999999 };
+        int rc = wirelog_easy_open("g(\"a\").\n.decl p(x: symbol)\n"
+                "p(x) :- g(x).\n", &s);
+        int ins = -1;
+        int step = -1;
+        if (rc == WIRELOG_OK && s) {
+            wirelog_easy_set_delta_cb(s, wirelog_easy_print_delta, s);
+            ins = wirelog_easy_insert(s, "g", row, 1);
+            step = wirelog_easy_step(s);
+        }
+        if (s)
+            wirelog_easy_close(s);
+        if (rc != WIRELOG_OK || ins != WIRELOG_OK || step != WIRELOG_OK) {
+            printf("FAIL host row into inferred string column: open %d,"
+                " insert %d, step %d\n", rc, ins, step);
+            failures++;
+        }
+    }
+
+    {
+        /* hash() of an inferred string column digests the string's bytes,
+         * as it does for a declared one. */
+        undecl_rows_t undecl = { 0 };
+        undecl_rows_t decl = { 0 };
+        wirelog_easy_session_t *s = NULL;
+        int rc1 = wirelog_easy_open("s(\"abc\").\n.decl p(h: int64)\n"
+                "p(hash(x)) :- s(x).\n", &s);
+        if (rc1 == WIRELOG_OK && s)
+            rc1 = wirelog_easy_snapshot(s, "p", collect_undecl, &undecl);
+        if (s)
+            wirelog_easy_close(s);
+        s = NULL;
+        int rc2 = wirelog_easy_open(".decl s(x: symbol)\ns(\"abc\").\n"
+                ".decl p(h: int64)\np(hash(x)) :- s(x).\n", &s);
+        if (rc2 == WIRELOG_OK && s)
+            rc2 = wirelog_easy_snapshot(s, "p", collect_undecl, &decl);
+        if (s)
+            wirelog_easy_close(s);
+        if (rc1 != WIRELOG_OK || rc2 != WIRELOG_OK || undecl.count != 1
+            || decl.count != 1 || undecl.v[0][0] != decl.v[0][0]) {
+            printf("FAIL hash of inferred string column: rc %d/%d,"
+                " %lld vs %lld\n", rc1, rc2, (long long)undecl.v[0][0],
+                (long long)decl.v[0][0]);
+            failures++;
+        }
+    }
+    return failures;
+}
+
+/* The easy facade refuses float relations, so the float cases run through
+ * the session API.  Rows of @out are compared as binary64 values. */
+typedef struct {
+    const char *rel;
+    uint32_t count;
+    double v[UNDECL_MAX];
+} float_rows_t;
+
+static void
+collect_float(const char *relation, const int64_t *row, uint32_t ncols,
+    void *user_data)
+{
+    float_rows_t *r = (float_rows_t *)user_data;
+
+    if (strcmp(relation, r->rel) != 0 || ncols != 1)
+        return;
+    if (r->count < UNDECL_MAX)
+        memcpy(&r->v[r->count], &row[0], sizeof(double));
+    r->count++;
+}
+
+static int
+undecl_float_case(const char *name, const char *src, const char *out,
+    const double *want, uint32_t nwant)
+{
+    wirelog_error_t err = WIRELOG_OK;
+    wirelog_program_t *prog = wirelog_parse_string(src, &err);
+    wl_plan_t *plan = NULL;
+    wl_session_t *sess = NULL;
+    float_rows_t got = { out, 0, { 0 } };
+    const char *why = NULL;
+
+    if (!prog)
+        why = "parse";
+    else if (!wirelog_optimize(prog, &err))
+        why = "optimize";
+    else if (wl_plan_from_program(prog, &plan) != 0)
+        why = "plan";
+    else if (wl_session_create(wl_backend_columnar(), plan, 1, &sess) != 0)
+        why = "session";
+    else if (wl_session_load_facts(sess, prog) != 0)
+        why = "load";
+    else if (wl_session_step(sess) != 0)
+        why = "step";
+    else if (wl_session_snapshot(sess, collect_float, &got) != 0)
+        why = "snapshot";
+    else if (got.count != nwant)
+        why = "row count";
+    for (uint32_t i = 0; !why && i < nwant; i++) {
+        bool found = false;
+        for (uint32_t k = 0; k < got.count && k < UNDECL_MAX; k++)
+            if (got.v[k] == want[i])
+                found = true;
+        if (!found)
+            why = "missing value";
+    }
+    if (sess)
+        wl_session_destroy(sess);
+    if (plan)
+        wl_plan_free(plan);
+    if (prog)
+        wirelog_program_free(prog);
+    if (why) {
+        printf("FAIL %s: %s (%u rows)\n", name, why, got.count);
+        return 1;
+    }
+    return 0;
+}
+
+static int
+test_undeclared_float_fact_relations(void)
+{
+    static const double above_two[] = { 2.5 };
+    static const double both[] = { 5.5, 9.5 };
+    int failures = 0;
+
+    failures += undecl_float_case("undeclared float facts filtered",
+            "g(1.5).\ng(2.5).\n.decl p(x: float)\np(x) :- g(x), x > 2.0.\n",
+            "p", above_two, 1);
+    failures += undecl_float_case("undeclared float facts with a rule",
+            "g(5.5).\n.decl h(x: float)\nh(9.5).\ng(x) :- h(x).\n"
+            ".decl p(x: float)\np(x) :- g(x).\n", "p", both, 2);
+    return failures;
+}
+
 int
 main(void)
 {
@@ -496,6 +734,8 @@ main(void)
     failures += test_inline_compound_flat_fact_destructures_exactly();
     failures += test_single_rule_idb_is_set_valued();
     failures += test_inline_fact_relation_refused_by_source_inspection();
+    failures += test_undeclared_fact_relations();
+    failures += test_undeclared_float_fact_relations();
     if (failures == 0)
         printf("test_wl_easy_inline_facts: OK\n");
     else

@@ -47,7 +47,8 @@ Features:
 - **Arithmetic**: `x + 1`, `x * y`, `x % 2` in head or comparisons
 - **Aggregation**: `min(x)`, `max(x)`, `sum(x)`, `count(x)`, and
   `average(x)` in head (at most one per head — see below). `average` requires
-  a declared `float` operand and returns a binary64 value.
+  a `float` operand, declared or inferred from facts, and returns a binary64
+  value.
 - **Wildcards**: `_` for anonymous variables
 - **Plan marker**: `.plan` before a rule for optimization hints
 
@@ -121,11 +122,11 @@ Two scope notes:
 
 ### `average()`
 
-`average(x)` and `AVG(x)` require `x` to be a declared `float` column and
-return the arithmetic mean as a 64-bit IEEE-754 value. Integer and symbol
-operands are rejected during lowering; use `sum` and `count` when an integer
-result is intended. Float inputs must be finite, and `-0.0` is canonicalized
-to `0.0`.
+`average(x)` and `AVG(x)` require `x` to be a `float` column, declared or
+inferred from the float facts of an undeclared relation, and return the
+arithmetic mean as a 64-bit IEEE-754 value. Integer and symbol operands are
+rejected during lowering; use `sum` and `count` when an integer result is
+intended. Float inputs must be finite, and `-0.0` is canonicalized to `0.0`.
 
 For example:
 
@@ -214,8 +215,11 @@ The physical width is also the row stride reported by
 compound column, and can exceed it where one is declared. See the note on
 that function in `wirelog/wirelog.h`.
 
-Facts on a relation with **no** `.decl` at all are unaffected by this check
-and continue to fail later, during loading, with a less specific message.
+Facts on a relation with **no** `.decl` are not checked against one; the
+relation takes its width from its first fact and each column's type from that
+fact's literals (an integer gives `int64`, a float `float`, a string
+`string`), and a later fact with another number of arguments or another kind
+of literal in a column is rejected at load (#2231).
 
 ### Rule heads must match their declared arity
 
@@ -231,9 +235,11 @@ t(g, v)       :- val(g, v).    /* accepted */
 t(g, min(v))  :- val(g, v).    /* accepted: an aggregate is one column */
 ```
 
-As with facts, the `.decl` may appear before or after its rules, and heads on
-a relation with **no** `.decl` are not checked at all — undeclared derived
-heads are ordinary Datalog and are used throughout the benchmark workloads.
+As with facts, the `.decl` may appear before or after its rules. A head on a
+relation with **no** `.decl` is checked only when the relation has inline
+facts, against the width they fix (#2231); an undeclared relation with no
+facts is not checked — undeclared derived heads are ordinary Datalog and are
+used throughout the benchmark workloads.
 
 This is a memory-safety guard. A head narrower than its `.decl` is an
 out-of-bounds read whenever some *other* producer has already established the
@@ -329,14 +335,15 @@ and gave no diagnostic, so loading now rejects them with
 A variable bound only by an `=` takes the type of the expression it is
 equal to, so `p(c) :- s(x), c = to_upper(x).` puts a string into `p`.
 
-Relation columns are checked only for relations typed by a `.decl` and
-with no compound column, at their declared width; a comparison is checked
-when both of its operand types are known from a column, a literal, a
-string function, arithmetic or an `=` binding. Not checked: inline facts
-and host inserts (#963), the columns of relations without a `.decl`,
-aggregate heads, the operands of string and arithmetic functions, the
-results of scalar extension calls, an integer in a `float` head column,
-and a `float` against a number in a body comparison or join.
+Relation columns are checked only for relations typed by a `.decl`, or
+by the inline facts of an undeclared relation, with no compound column
+and at their declared width; a comparison is checked when both of its
+operand types are known from a column, a literal, a string function,
+arithmetic or an `=` binding. Not checked: inline facts and host inserts
+(#963), the columns of relations with neither a `.decl` nor inline
+facts, aggregate heads, the operands of string and arithmetic functions,
+the results of scalar extension calls, an integer in a `float` head
+column, and a `float` against a number in a body comparison or join.
 
 ---
 
@@ -652,10 +659,11 @@ host inserts into it are stored unchanged. Such an integer digests its
 `int64` representation instead — the same answer the numeric form would
 have given, and the query still runs rather than failing — unless it
 equals the id of an interned string, in which case it digests that
-string's bytes. A column with no declared type at all digests the
-interned id, which is *not* stable across runs; `WL_LOG=EVAL:2` reports
-each digest that falls back this way, and `WL_LOG=EVAL:4` reports each
-value whose reverse lookup failed. Declare the relation.
+string's bytes. A column with no declared type at all — no `.decl` and
+no inline facts — digests the interned id, which is *not* stable across
+runs; `WL_LOG=EVAL:2` reports each digest that falls back this way, and
+`WL_LOG=EVAL:4` reports each value whose reverse lookup failed. Declare
+the relation.
 
 ### Checksum Functions
 
@@ -772,16 +780,16 @@ comparisons, which fall back to comparing ids. And the undeclared-column
 report is emitted once per aggregate at plan generation rather than per
 comparison, so `WL_LOG=EVAL:2` names the aggregate, not each row.
 
-**Undeclared columns compare by intern id.** Symbols are stored as
-interned integer ids, and ids are assigned in the order strings are first
+**Untyped columns compare by intern id.** Symbols are stored as interned
+integer ids, and ids are assigned in the order strings are first
 encountered. When a column has no declared type — the relation has no
-`.decl`, or the ordering operates on a value the declaration does not
-describe, such as an argument of an inline compound — the ordering
-operators fall back to comparing those ids, which orders symbols by when
-they were first seen rather than alphabetically. That result is *not*
-stable: adding an unrelated earlier fact changes it. Declare the relation
-to get lexicographic ordering. `WL_LOG=EVAL:2` reports each ordering
-comparison that falls back this way.
+`.decl` and no inline facts, or the ordering operates on a value the
+declaration does not describe, such as an argument of an inline compound
+— the ordering operators fall back to comparing those ids, which orders
+symbols by when they were first seen rather than alphabetically. That
+result is *not* stable: adding an unrelated earlier fact changes it.
+Declare the relation to get lexicographic ordering. `WL_LOG=EVAL:2`
+reports each ordering comparison that falls back this way.
 
 A comparison of a string with a number is rejected at load when both
 operand types are known in the rule (see [Rules must not mix symbol and

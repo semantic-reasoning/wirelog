@@ -3202,18 +3202,24 @@ test_fact_arity_undeclared_relations_unaffected(void)
     }
     wl_ir_program_free(derived);
 
-    /* An undeclared relation *with facts* keeps working through metadata
-     * collection: column_count is 0 because no .decl was seen, and the
-     * guard keys off has_decl, so the pass stays out of the way.  Such a
-     * program still fails later at session load ("failed to load facts for
-     * 'q'", exit 1) -- facts on undeclared relations are still unvalidated
-     * under #977, and remain so after the rule-head pass (unit 3) landed.
-     * This case is what pins the has_decl condition: drop it and this
-     * program is rejected at parse time instead. */
+    /* An undeclared relation *with facts* is not checked against a `.decl`
+     * by this pass, which keys off has_decl; its width comes from its own
+     * facts instead (#2231, infer_fact_schemas).  This case pins both: the
+     * facts agree, so the program collects, and q gets two columns. */
     struct wirelog_program *undecl = make_program("q(1, 2).\n"
             "q(3, 4).\n");
     if (!undecl) {
         FAIL("undeclared relation with facts must still collect");
+        return;
+    }
+    const wl_ir_relation_info_t *q = NULL;
+    for (uint32_t i = 0; i < undecl->relation_count; i++)
+        if (undecl->relations[i].name
+            && strcmp(undecl->relations[i].name, "q") == 0)
+            q = &undecl->relations[i];
+    if (!q || q->has_decl || !q->schema_from_facts || q->column_count != 2) {
+        wl_ir_program_free(undecl);
+        FAIL("q should take two columns from its facts");
         return;
     }
     wl_ir_program_free(undecl);
@@ -3628,6 +3634,146 @@ test_head_arity_mismatch_maps_to_parse_error(void)
 }
 
 /* ======================================================================== */
+/* Schema of undeclared fact relations (#2231)                              */
+/* ======================================================================== */
+
+static const wl_ir_relation_info_t *
+relation_named(const struct wirelog_program *prog, const char *name)
+{
+    for (uint32_t i = 0; prog && i < prog->relation_count; i++)
+        if (prog->relations[i].name
+            && strcmp(prog->relations[i].name, name) == 0)
+            return &prog->relations[i];
+    return NULL;
+}
+
+static void
+test_fact_schema_inferred_from_facts(void)
+{
+    TEST("Fact schema: width and types come from the facts");
+
+    struct wirelog_program *prog = make_program("g(5, \"a\", 1.5).\n"
+            "g(6, \"b\", 2.5).\n");
+    const wl_ir_relation_info_t *g = relation_named(prog, "g");
+    bool ok = g && !g->has_decl && g->schema_from_facts
+        && g->column_count == 3 && g->columns
+        && g->columns[0].type == WIRELOG_TYPE_INT64
+        && g->columns[1].type == WIRELOG_TYPE_STRING
+        && g->columns[2].type == WIRELOG_TYPE_FLOAT;
+    if (prog)
+        wl_ir_program_free(prog);
+    if (!ok) {
+        FAIL("g should have int64, string and float columns");
+        return;
+    }
+    PASS();
+}
+
+static void
+test_fact_schema_disagreeing_facts_rejected(void)
+{
+    static const struct {
+        const char *src;
+        const char *needle;
+    } cases[] = {
+        { "q().\nq(1).\n", "has 1 argument(s) but an earlier fact" },
+        { "q(1).\nq().\n", "has 0 argument(s) but an earlier fact" },
+        { "q(1).\nq(2, 3).\n", "has 2 argument(s) but an earlier fact" },
+        { "g(1).\ng(2.5).\n", "has a float in column 0 where an earlier"
+          " fact has an integer" },
+        { "g(1).\ng(\"a\").\n", "has a string in column 0" },
+    };
+
+    TEST("Fact schema: facts that disagree are rejected");
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        char errbuf[512];
+        wirelog_error_t err = WIRELOG_OK;
+        struct wirelog_program *prog = wl_ir_parse_string_err(cases[i].src,
+                &err, errbuf, sizeof(errbuf));
+        if (prog) {
+            wirelog_program_free(prog);
+            FAIL(cases[i].src);
+            return;
+        }
+        if (err != WIRELOG_ERR_PARSE || !strstr(errbuf, cases[i].needle)) {
+            printf(" [%s]", errbuf);
+            FAIL("wrong error for disagreeing facts");
+            return;
+        }
+    }
+    PASS();
+}
+
+static void
+test_head_arity_against_fact_schema(void)
+{
+    TEST("Fact schema: a rule head must match the facts' width");
+
+    static const char *bad[] = {
+        ".decl h(x: int64, y: int64)\ng(5).\ng(x, y) :- h(x, y).\n",
+        ".decl h(x: int64, y: int64)\ng(x, y) :- h(x, y).\ng(5).\n",
+    };
+    for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
+        char errbuf[512];
+        wirelog_error_t err = WIRELOG_OK;
+        struct wirelog_program *prog = wl_ir_parse_string_err(bad[i], &err,
+                errbuf, sizeof(errbuf));
+        if (prog) {
+            wirelog_program_free(prog);
+            FAIL("a two-column head over one-column facts was accepted");
+            return;
+        }
+        if (err != WIRELOG_ERR_PARSE
+            || !strstr(errbuf, "but its facts have 1 argument(s)")) {
+            printf(" [%s]", errbuf);
+            FAIL("wrong error for the head");
+            return;
+        }
+    }
+    /* Accepted: repeated zero-width facts, a head of the facts' width, and
+     * an undeclared head with no facts, which keeps no schema. */
+    struct wirelog_program *ok = make_program(".decl h(x: int64)\n"
+            "q().\nq().\ng(5).\ng(x) :- h(x).\nt(x, y) :- h(x), h(y).\n");
+    const wl_ir_relation_info_t *t = relation_named(ok, "t");
+    bool good = ok && t && !t->schema_from_facts && t->column_count == 0;
+    if (ok)
+        wl_ir_program_free(ok);
+    if (!good) {
+        FAIL("agreeing program rejected, or a head-only relation got a"
+            " schema");
+        return;
+    }
+    PASS();
+}
+
+static void
+test_api_get_facts_undeclared(void)
+{
+    TEST("API: get_facts and get_schema on an undeclared fact relation");
+
+    wirelog_error_t err = WIRELOG_OK;
+    wirelog_program_t *prog = wirelog_parse_string("g(5).\ng(6).\n", &err);
+    if (!prog) {
+        FAIL("program failed to parse");
+        return;
+    }
+    int64_t *data = NULL;
+    uint32_t nrows = 0;
+    uint32_t ncols = 0;
+    int rc = wirelog_program_get_facts(prog, "g", &data, &nrows, &ncols);
+    const wirelog_schema_t *schema = wirelog_program_get_schema(prog, "g");
+    bool ok = rc == 0 && nrows == 2 && ncols == 1 && data && data[0] == 5
+        && data[1] == 6 && schema && schema->column_count == 1;
+    free(data);
+    wirelog_program_free(prog);
+    if (!ok) {
+        FAIL("expected two one-column rows {5, 6}");
+        return;
+    }
+    PASS();
+}
+
+/* ======================================================================== */
 /* Symbol / number domain check (#2231)                                     */
 /* ======================================================================== */
 
@@ -3748,6 +3894,17 @@ test_rule_value_domains(void)
         ".decl g(x: float)\ng(1.5).\n.decl p(x: int64)\n"
         "p(x * 2.0) :- g(x).\n",
         "rule head for 'p' puts a float value into column 0");
+
+    /* An undeclared fact relation takes part through its inferred types. */
+    expect_domain_rejected("Domains: inferred int64 joined with inferred"
+        " symbol", "g(0).\ns(\"a\").\n.decl p(x: int64)\n"
+        "p(x) :- g(x), s(x).\n", "variable 'x' in a rule for 'p'");
+    expect_domain_rejected("Domains: int64 variable into an inferred string"
+        " head", "g(\"a\").\n.decl n(x: int64)\nn(7).\ng(x) :- n(x).\n",
+        "rule head for 'g' puts a numeric value");
+    expect_domain_rejected("Domains: symbol variable into an inferred int64"
+        " head", "g(5).\n.decl s(x: symbol)\ns(\"a\").\ng(x) :- s(x).\n",
+        "rule head for 'g' puts a string/symbol value");
 
     /* Accepted: kinds that agree, and what the check leaves alone. */
     expect_domain_accepted("Domains: int32 joined with int64",
@@ -4365,6 +4522,12 @@ main(void)
     test_head_arity_undeclared_head_accepted();
     test_head_arity_matching_accepted();
     test_head_arity_mismatch_maps_to_parse_error();
+
+    /* #2231: undeclared fact relations take their schema from their facts */
+    test_fact_schema_inferred_from_facts();
+    test_fact_schema_disagreeing_facts_rejected();
+    test_head_arity_against_fact_schema();
+    test_api_get_facts_undeclared();
 
     /* #2231: rules that mix symbol and numeric values */
     test_rule_value_domains();

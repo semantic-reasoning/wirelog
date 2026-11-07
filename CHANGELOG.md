@@ -248,6 +248,22 @@ All notable changes to wirelog are documented in this file.
 
 ### Fixed
 
+- **Facts of a relation with no `.decl` keep their values** (#2231): `g(5).`
+  with no `.decl g` was loaded as a zero-width row, so `p(x) :- g(x).`
+  derived `p(0)`, and `q(). q(1).` dropped the 1. Such a relation now takes
+  its width from its first fact and `int64`, `float` or `string` column
+  types from that fact's literals, so its int64, float and string facts
+  reach rules as written, including through a rule that also derives the
+  relation. Facts that disagree on argument count or literal kind, and rule
+  heads of another width, are rejected at load. `wirelog_program_get_facts`
+  and `wirelog_program_get_schema` report the inferred width instead of 0,
+  and the inferred columns take part in the check on rules that mix symbol
+  and numeric values. A program whose undeclared relation has `float` facts
+  is now refused by the easy facade's `float` checks, as a declared one is:
+  `wirelog_easy_snapshot` of that relation and `wirelog_easy_set_delta_cb`
+  return `WIRELOG_ERR_EXEC` where they used to accept it and see zero-width
+  rows.
+
 - **Rules that mix symbol and numeric values are rejected** (#2231): symbols
   are stored as intern ids, so `p(x) :- g(x), s(x).` with `g` declared
   `int64` and `s` `symbol` joined the two by id, `x = "a"` on an `int64`
