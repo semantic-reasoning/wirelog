@@ -19,6 +19,7 @@
 #include <psa/crypto.h>
 #endif
 
+#include <ctype.h>
 #include <errno.h>
 #include <inttypes.h>
 #include <math.h>
@@ -3211,6 +3212,55 @@ publish:
     return 0;
 }
 
+/* Checked base10 prefix, matching the raw strtoimax grammar. Locale ctype
+ * classification is a fixed-size library boundary; input traversal is ours. */
+int
+wl_columnar_expr_decimal_attempt_controlled(const char *text, int64_t *value,
+    wl_evaluation_control_t *control, uint64_t id)
+{
+    if (!text || !value) return EINVAL;
+    int rc = wl_columnar_expr_scalar_region(control, id, 96, 0);
+    if (rc) return rc;
+    size_t position = 0;
+    unsigned char c;
+    for (;;) {
+        rc = wl_columnar_expr_scalar_region(control, id, 97, position);
+        if (rc) return rc;
+        c = (unsigned char)text[position];
+        if (!isspace(c)) break;
+        ++position;
+    }
+    bool negative = c == '-';
+    if (c == '+' || c == '-') {
+        ++position;
+        rc = wl_columnar_expr_scalar_region(control, id, 97, position);
+        if (rc) return rc;
+        c = (unsigned char)text[position];
+    }
+    const uint64_t limit = (uint64_t)INT64_MAX + (negative ? 1u : 0u);
+    uint64_t magnitude = 0;
+    bool overflow = false;
+    while (c >= '0' && c <= '9') {
+        rc = wl_columnar_expr_scalar_region(control, id, 98, position);
+        if (rc) return rc;
+        uint64_t digit = c - '0';
+        if (!overflow) {
+            if (magnitude > (limit - digit) / 10u) overflow = true;
+            else magnitude = magnitude * 10u + digit;
+        }
+        ++position;
+        rc = wl_columnar_expr_scalar_region(control, id, 97, position);
+        if (rc) return rc;
+        c = (unsigned char)text[position];
+    }
+    rc = wl_columnar_expr_scalar_region(control, id, 99, position);
+    if (rc) return rc;
+    if (overflow) return ERANGE;
+    *value = negative ? (magnitude == (UINT64_C(1) << 63) ? INT64_MIN :
+        -(int64_t)magnitude) : (int64_t)magnitude;
+    return 0;
+}
+
 static int
 wl_columnar_expr_scalar_reader(uint8_t tag, int64_t a, int64_t b,
     wl_intern_t *intern, int64_t *value, wl_evaluation_control_t *control,
@@ -3322,6 +3372,7 @@ wl_columnar_expr_scalar_decode(const uint8_t *bytes, uint32_t size,
         *pos += length;
         break;
     }
+    case WL_PLAN_EXPR_STR_FN_TO_NUMBER:
     case WL_PLAN_EXPR_STR_FN_STRLEN: case WL_PLAN_EXPR_STR_FN_STR_ORD:
     case WL_PLAN_EXPR_STR_FN_CONTAINS: case WL_PLAN_EXPR_STR_FN_STR_PREFIX:
     case WL_PLAN_EXPR_STR_FN_STR_SUFFIX:
@@ -3404,6 +3455,7 @@ wl_columnar_expr_compile_scalar_attempt_controlled(const uint8_t *bytes,
         case WL_PLAN_EXPR_CONST_FLOAT: case WL_PLAN_EXPR_CONST_STR:
         case WL_PLAN_EXPR_BOOL:
             break;
+        case WL_PLAN_EXPR_STR_FN_TO_NUMBER:
         case WL_PLAN_EXPR_STR_FN_STRLEN: case WL_PLAN_EXPR_STR_FN_STR_ORD:
         case WL_PLAN_EXPR_ARITH_BNOT: case WL_PLAN_EXPR_ARITH_HASH:
         case WL_PLAN_EXPR_ARITH_CRC32_ETH: case WL_PLAN_EXPR_ARITH_CRC32_CAST:
@@ -3489,7 +3541,8 @@ wl_columnar_expr_scalar_result_type_attempt_controlled(
     if (owner->producer.op == WL_PLAN_EXPR_VAR_STRING
         || owner->producer.op ==
         WL_PLAN_EXPR_CONST_STR) result = WIRELOG_TYPE_STRING;
-    else if (owner->producer.op == WL_PLAN_EXPR_STR_FN_STRLEN ||
+    else if (owner->producer.op == WL_PLAN_EXPR_STR_FN_TO_NUMBER ||
+        owner->producer.op == WL_PLAN_EXPR_STR_FN_STRLEN ||
         owner->producer.op ==
         WL_PLAN_EXPR_STR_FN_STR_ORD) result = WIRELOG_TYPE_INT64;
     else if (owner->producer.op == WL_PLAN_EXPR_STR_FN_CONTAINS ||
@@ -3595,6 +3648,25 @@ wl_columnar_expr_eval_scalar_attempt_controlled(
             if (rc) return rc;
             expr_push_string(&stack, v, owner->bytes + in.iarg,
                 (uint32_t)in.larg);
+        } else if (in.op == WL_PLAN_EXPR_STR_FN_TO_NUMBER) {
+            rc = wl_columnar_expr_scalar_region(control, id, 100, pos);
+            if (rc) return rc;
+            int64_t operand = expr_pop(&stack), result = 0;
+            if (!intern) {
+                semantic = true; break;
+            }
+            const char *text = wl_intern_reverse(intern, operand);
+            if (text) {
+                rc = wl_columnar_expr_decimal_attempt_controlled(text, &result,
+                        control, id);
+                if (rc == ERANGE) {
+                    semantic = true; break;
+                }
+                if (rc) return rc;
+            }
+            rc = wl_columnar_expr_scalar_region(control, id, 101, pos);
+            if (rc) return rc;
+            expr_push(&stack, result);
         } else if (in.op == WL_PLAN_EXPR_STR_FN_STRLEN ||
             in.op == WL_PLAN_EXPR_STR_FN_STR_ORD ||
             in.op == WL_PLAN_EXPR_STR_FN_CONTAINS ||

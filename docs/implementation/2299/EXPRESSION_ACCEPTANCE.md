@@ -89,7 +89,7 @@ ledger explicitly.
 | `WL_PLAN_EXPR_STR_FN_STR_REPLACE` | open | open | open |
 | `WL_PLAN_EXPR_STR_FN_TRIM` | open | open | open |
 | `WL_PLAN_EXPR_STR_FN_TO_STRING` | open | open | open |
-| `WL_PLAN_EXPR_STR_FN_TO_NUMBER` | open | open | open |
+| `WL_PLAN_EXPR_STR_FN_TO_NUMBER` | open | admitted | unit5-decimal |
 | `WL_PLAN_EXPR_STR_FN_UUID5_RFC` | open | open | open |
 | `WL_PLAN_EXPR_CMP_STR_EQ` | empty-only | admitted | unit4-sessions |
 | `WL_PLAN_EXPR_CMP_STR_NEQ` | empty-only | admitted | unit4-sessions |
@@ -434,3 +434,42 @@ no-op call. MAP additionally forces deterministic mid-traversal budget denial.
 Observers are installed before the initial empty step. Owner/intern resource
 retirement is checked. `unit5-sessions` is this evidence; recursive/pipeline
 string-domain qualification and all other open tags remain outstanding.
+
+
+## Checked decimal prefix (unit 5b)
+
+TO_NUMBER preserves the checked raw conversion: absent intern is a semantic
+failure, absent/empty ID produces0, a missing numeric prefix produces0, trailing
+suffix is ignored, and an out-of-int64 prefix is a semantic failure. FILTER
+rejects such a row; MAP returns ERANGE without publishing the partial result.
+The scalar cache records unary INT64 output. Integer-carried IDs remain valid.
+
+The decimal primitive owns input traversal rather than calling strtoimax on an
+unbounded string. It uses locale isspace on each unsigned byte, optional sign,
+ASCII decimal digits and unsigned magnitude limits INT64_MAX/INT64_MAX+1. The
+ctype classification is a fixed-size library boundary. Overflow is latched
+while the complete remaining digit prefix is still traversed and charged;
+no suffix beyond its first byte is inspected. The final saved-attempt poll
+precedes either output publication or ERANGE. Nonzero returns leave output
+unchanged; negative control stops and identity loss remain distinct.
+
+Entry96 and final99 each pay224, every inspected byte97 pays224 and every
+digit accumulation98 pays224, including digits visited after overflow.
+Independent exact work is224*(2+I+D) for I byte inspections and D digits.
+TO_NUMBER host lookup/dispatch pays separate100/101 regions. Each region uses
+the prior179-action conservative source ceiling (<224<=256); one ctype lookup
+or unsigned update plus branch/child/loop transitions stays within128 added
+source actions. No variable raw conversion or new allocation occurs.
+
+Tests specify literal exact/one-short fees for empty/no-prefix/sign, decimal
+suffix, six C whitespace classes, INT64 limits and40-digit overflow. They stop
+after overflow and at final cutoff, replace attempts during digit/final regions,
+and assert no output or successor debit. Raw-expression parity covers every
+single-byte prefix and checked limit/error cases under available C, C.UTF-8
+and en_US UTF-8 locales, restoring LC_CTYPE afterward. Generated MAP checks
+mixed projection/arithmetic values, empty output, deterministic cancellation
+and budget denial, nonpublication/retry, exact signed deletion, subsequent calls
+and governor balance. A real overflowing MAP fails ERANGE then recovers after
+the bad input is removed; generated FILTER rejects overflow while retaining
+valid/zero-prefix rows. `unit5-decimal` records this session evidence; additional
+host qualification and other open domains remain outstanding.
