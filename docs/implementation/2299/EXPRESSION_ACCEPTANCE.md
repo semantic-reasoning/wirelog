@@ -9,7 +9,12 @@ qualification remains in `docs/implementation/1821/SERIAL_COVERAGE.md` and
 
 ## Finite tag inventory
 
-Every enumerated expression tag has exactly one row below. `existing-numeric`
+Every enumerated expression tag has exactly one row below. Admission columns
+are independent: adding a scalar route never hides numeric/empty-only support.
+`admitted` means the separate scalar decoder recognizes a tag; it does not
+certify all contexts. `baseline-numeric` retains existing numeric evidence;
+`unit4-sessions` names the first string-domain session qualification below,
+not all recursive/pipeline/library contexts. `existing-numeric`
 means the current attempt decoder admits it; it does not certify every host
 context. `empty-only` means the decoder admits it only for raw-compatible empty
 setup, not ordinary evaluation. `open` identifies raw-supported work still
@@ -18,92 +23,92 @@ gap to cure by adding language semantics. The inventory guard compares these
 rows with source, so adding or broadening a decoder tag requires revisiting the
 ledger explicitly.
 
-| Tag | Baseline disposition |
-| --- | --- |
-| `WL_PLAN_EXPR_VAR` | existing-numeric |
-| `WL_PLAN_EXPR_CONST_INT` | existing-numeric |
-| `WL_PLAN_EXPR_CONST_STR` | open |
-| `WL_PLAN_EXPR_BOOL` | existing-numeric |
-| `WL_PLAN_EXPR_VAR_FLOAT` | existing-numeric |
-| `WL_PLAN_EXPR_CONST_FLOAT` | existing-numeric |
-| `WL_PLAN_EXPR_VAR_STRING` | open |
-| `WL_PLAN_EXPR_EXTENSION_CALL` | open |
-| `WL_PLAN_EXPR_EXTENSION_CALL_ABI` | open |
-| `WL_PLAN_EXPR_ARITH_ADD` | existing-numeric |
-| `WL_PLAN_EXPR_ARITH_SUB` | existing-numeric |
-| `WL_PLAN_EXPR_ARITH_MUL` | existing-numeric |
-| `WL_PLAN_EXPR_ARITH_DIV` | existing-numeric |
-| `WL_PLAN_EXPR_ARITH_MOD` | existing-numeric |
-| `WL_PLAN_EXPR_ARITH_BAND` | existing-numeric |
-| `WL_PLAN_EXPR_ARITH_BOR` | existing-numeric |
-| `WL_PLAN_EXPR_ARITH_BXOR` | existing-numeric |
-| `WL_PLAN_EXPR_ARITH_SHL` | existing-numeric |
-| `WL_PLAN_EXPR_ARITH_SHR` | existing-numeric |
-| `WL_PLAN_EXPR_ARITH_FLOAT_ADD` | existing-numeric |
-| `WL_PLAN_EXPR_ARITH_FLOAT_SUB` | existing-numeric |
-| `WL_PLAN_EXPR_ARITH_FLOAT_MUL` | existing-numeric |
-| `WL_PLAN_EXPR_ARITH_FLOAT_DIV` | existing-numeric |
-| `WL_PLAN_EXPR_ARITH_BNOT` | existing-numeric |
-| `WL_PLAN_EXPR_ARITH_HASH` | existing-numeric |
-| `WL_PLAN_EXPR_ARITH_CRC32_ETH` | existing-numeric |
-| `WL_PLAN_EXPR_ARITH_CRC32_CAST` | existing-numeric |
-| `WL_PLAN_EXPR_ARITH_MD5` | open |
-| `WL_PLAN_EXPR_ARITH_SHA1` | open |
-| `WL_PLAN_EXPR_ARITH_SHA256` | open |
-| `WL_PLAN_EXPR_ARITH_SHA512` | open |
-| `WL_PLAN_EXPR_ARITH_HMAC_SHA256` | open |
-| `WL_PLAN_EXPR_ARITH_UUID4` | open |
-| `WL_PLAN_EXPR_ARITH_UUID5` | open |
-| `WL_PLAN_EXPR_CMP_EQ` | existing-numeric |
-| `WL_PLAN_EXPR_CMP_NEQ` | existing-numeric |
-| `WL_PLAN_EXPR_CMP_LT` | existing-numeric |
-| `WL_PLAN_EXPR_CMP_GT` | existing-numeric |
-| `WL_PLAN_EXPR_CMP_LTE` | existing-numeric |
-| `WL_PLAN_EXPR_CMP_GTE` | existing-numeric |
-| `WL_PLAN_EXPR_CMP_FLOAT_EQ` | existing-numeric |
-| `WL_PLAN_EXPR_CMP_FLOAT_NEQ` | existing-numeric |
-| `WL_PLAN_EXPR_CMP_FLOAT_LT` | existing-numeric |
-| `WL_PLAN_EXPR_CMP_FLOAT_GT` | existing-numeric |
-| `WL_PLAN_EXPR_CMP_FLOAT_LTE` | existing-numeric |
-| `WL_PLAN_EXPR_CMP_FLOAT_GTE` | existing-numeric |
-| `WL_PLAN_EXPR_AGG_COUNT` | existing-numeric |
-| `WL_PLAN_EXPR_AGG_SUM` | existing-numeric |
-| `WL_PLAN_EXPR_AGG_MIN` | existing-numeric |
-| `WL_PLAN_EXPR_AGG_MAX` | existing-numeric |
-| `WL_PLAN_EXPR_AGG_AVG` | legacy-rejected |
-| `WL_PLAN_EXPR_STR_FN_STRLEN` | open |
-| `WL_PLAN_EXPR_STR_FN_CAT` | open |
-| `WL_PLAN_EXPR_STR_FN_SUBSTR` | open |
-| `WL_PLAN_EXPR_STR_FN_CONTAINS` | open |
-| `WL_PLAN_EXPR_STR_FN_STR_PREFIX` | open |
-| `WL_PLAN_EXPR_STR_FN_STR_SUFFIX` | open |
-| `WL_PLAN_EXPR_STR_FN_STR_ORD` | open |
-| `WL_PLAN_EXPR_STR_FN_TO_UPPER` | open |
-| `WL_PLAN_EXPR_STR_FN_TO_LOWER` | open |
-| `WL_PLAN_EXPR_STR_FN_STR_REPLACE` | open |
-| `WL_PLAN_EXPR_STR_FN_TRIM` | open |
-| `WL_PLAN_EXPR_STR_FN_TO_STRING` | open |
-| `WL_PLAN_EXPR_STR_FN_TO_NUMBER` | open |
-| `WL_PLAN_EXPR_STR_FN_UUID5_RFC` | open |
-| `WL_PLAN_EXPR_CMP_STR_EQ` | empty-only |
-| `WL_PLAN_EXPR_CMP_STR_NEQ` | empty-only |
-| `WL_PLAN_EXPR_CMP_STR_LT` | empty-only |
-| `WL_PLAN_EXPR_CMP_STR_GT` | empty-only |
-| `WL_PLAN_EXPR_CMP_STR_LTE` | empty-only |
-| `WL_PLAN_EXPR_CMP_STR_GTE` | empty-only |
-| `WL_PLAN_EXPR_ARITH_HASH_S` | open |
-| `WL_PLAN_EXPR_ARITH_CRC32_ETH_S` | open |
-| `WL_PLAN_EXPR_ARITH_CRC32_CAST_S` | open |
-| `WL_PLAN_EXPR_ARITH_MD5_S` | open |
-| `WL_PLAN_EXPR_ARITH_SHA1_S` | open |
-| `WL_PLAN_EXPR_ARITH_SHA256_S` | open |
-| `WL_PLAN_EXPR_ARITH_SHA512_S` | open |
-| `WL_PLAN_EXPR_ARITH_HMAC_SHA256_SS` | open |
-| `WL_PLAN_EXPR_ARITH_HMAC_SHA256_SI` | open |
-| `WL_PLAN_EXPR_ARITH_HMAC_SHA256_IS` | open |
-| `WL_PLAN_EXPR_ARITH_UUID5_SS` | open |
-| `WL_PLAN_EXPR_ARITH_UUID5_SI` | open |
-| `WL_PLAN_EXPR_ARITH_UUID5_IS` | open |
+| Tag | Numeric decoder | Scalar decoder | Host evidence |
+| --- | --- | --- | --- |
+| `WL_PLAN_EXPR_VAR` | existing-numeric | admitted | baseline-numeric |
+| `WL_PLAN_EXPR_CONST_INT` | existing-numeric | admitted | baseline-numeric |
+| `WL_PLAN_EXPR_CONST_STR` | open | admitted | unit4-sessions |
+| `WL_PLAN_EXPR_BOOL` | existing-numeric | admitted | baseline-numeric |
+| `WL_PLAN_EXPR_VAR_FLOAT` | existing-numeric | admitted | baseline-numeric |
+| `WL_PLAN_EXPR_CONST_FLOAT` | existing-numeric | admitted | baseline-numeric |
+| `WL_PLAN_EXPR_VAR_STRING` | open | admitted | unit4-sessions |
+| `WL_PLAN_EXPR_EXTENSION_CALL` | open | open | open |
+| `WL_PLAN_EXPR_EXTENSION_CALL_ABI` | open | open | open |
+| `WL_PLAN_EXPR_ARITH_ADD` | existing-numeric | admitted | baseline-numeric |
+| `WL_PLAN_EXPR_ARITH_SUB` | existing-numeric | admitted | baseline-numeric |
+| `WL_PLAN_EXPR_ARITH_MUL` | existing-numeric | admitted | baseline-numeric |
+| `WL_PLAN_EXPR_ARITH_DIV` | existing-numeric | admitted | baseline-numeric |
+| `WL_PLAN_EXPR_ARITH_MOD` | existing-numeric | admitted | baseline-numeric |
+| `WL_PLAN_EXPR_ARITH_BAND` | existing-numeric | admitted | baseline-numeric |
+| `WL_PLAN_EXPR_ARITH_BOR` | existing-numeric | admitted | baseline-numeric |
+| `WL_PLAN_EXPR_ARITH_BXOR` | existing-numeric | admitted | baseline-numeric |
+| `WL_PLAN_EXPR_ARITH_SHL` | existing-numeric | admitted | baseline-numeric |
+| `WL_PLAN_EXPR_ARITH_SHR` | existing-numeric | admitted | baseline-numeric |
+| `WL_PLAN_EXPR_ARITH_FLOAT_ADD` | existing-numeric | admitted | baseline-numeric |
+| `WL_PLAN_EXPR_ARITH_FLOAT_SUB` | existing-numeric | admitted | baseline-numeric |
+| `WL_PLAN_EXPR_ARITH_FLOAT_MUL` | existing-numeric | admitted | baseline-numeric |
+| `WL_PLAN_EXPR_ARITH_FLOAT_DIV` | existing-numeric | admitted | baseline-numeric |
+| `WL_PLAN_EXPR_ARITH_BNOT` | existing-numeric | admitted | baseline-numeric |
+| `WL_PLAN_EXPR_ARITH_HASH` | existing-numeric | admitted | baseline-numeric |
+| `WL_PLAN_EXPR_ARITH_CRC32_ETH` | existing-numeric | admitted | baseline-numeric |
+| `WL_PLAN_EXPR_ARITH_CRC32_CAST` | existing-numeric | admitted | baseline-numeric |
+| `WL_PLAN_EXPR_ARITH_MD5` | open | open | open |
+| `WL_PLAN_EXPR_ARITH_SHA1` | open | open | open |
+| `WL_PLAN_EXPR_ARITH_SHA256` | open | open | open |
+| `WL_PLAN_EXPR_ARITH_SHA512` | open | open | open |
+| `WL_PLAN_EXPR_ARITH_HMAC_SHA256` | open | open | open |
+| `WL_PLAN_EXPR_ARITH_UUID4` | open | open | open |
+| `WL_PLAN_EXPR_ARITH_UUID5` | open | open | open |
+| `WL_PLAN_EXPR_CMP_EQ` | existing-numeric | admitted | baseline-numeric |
+| `WL_PLAN_EXPR_CMP_NEQ` | existing-numeric | admitted | baseline-numeric |
+| `WL_PLAN_EXPR_CMP_LT` | existing-numeric | admitted | baseline-numeric |
+| `WL_PLAN_EXPR_CMP_GT` | existing-numeric | admitted | baseline-numeric |
+| `WL_PLAN_EXPR_CMP_LTE` | existing-numeric | admitted | baseline-numeric |
+| `WL_PLAN_EXPR_CMP_GTE` | existing-numeric | admitted | baseline-numeric |
+| `WL_PLAN_EXPR_CMP_FLOAT_EQ` | existing-numeric | admitted | baseline-numeric |
+| `WL_PLAN_EXPR_CMP_FLOAT_NEQ` | existing-numeric | admitted | baseline-numeric |
+| `WL_PLAN_EXPR_CMP_FLOAT_LT` | existing-numeric | admitted | baseline-numeric |
+| `WL_PLAN_EXPR_CMP_FLOAT_GT` | existing-numeric | admitted | baseline-numeric |
+| `WL_PLAN_EXPR_CMP_FLOAT_LTE` | existing-numeric | admitted | baseline-numeric |
+| `WL_PLAN_EXPR_CMP_FLOAT_GTE` | existing-numeric | admitted | baseline-numeric |
+| `WL_PLAN_EXPR_AGG_COUNT` | existing-numeric | admitted | baseline-numeric |
+| `WL_PLAN_EXPR_AGG_SUM` | existing-numeric | admitted | baseline-numeric |
+| `WL_PLAN_EXPR_AGG_MIN` | existing-numeric | admitted | baseline-numeric |
+| `WL_PLAN_EXPR_AGG_MAX` | existing-numeric | admitted | baseline-numeric |
+| `WL_PLAN_EXPR_AGG_AVG` | legacy-rejected | legacy-rejected | legacy-rejected |
+| `WL_PLAN_EXPR_STR_FN_STRLEN` | open | open | open |
+| `WL_PLAN_EXPR_STR_FN_CAT` | open | open | open |
+| `WL_PLAN_EXPR_STR_FN_SUBSTR` | open | open | open |
+| `WL_PLAN_EXPR_STR_FN_CONTAINS` | open | open | open |
+| `WL_PLAN_EXPR_STR_FN_STR_PREFIX` | open | open | open |
+| `WL_PLAN_EXPR_STR_FN_STR_SUFFIX` | open | open | open |
+| `WL_PLAN_EXPR_STR_FN_STR_ORD` | open | open | open |
+| `WL_PLAN_EXPR_STR_FN_TO_UPPER` | open | open | open |
+| `WL_PLAN_EXPR_STR_FN_TO_LOWER` | open | open | open |
+| `WL_PLAN_EXPR_STR_FN_STR_REPLACE` | open | open | open |
+| `WL_PLAN_EXPR_STR_FN_TRIM` | open | open | open |
+| `WL_PLAN_EXPR_STR_FN_TO_STRING` | open | open | open |
+| `WL_PLAN_EXPR_STR_FN_TO_NUMBER` | open | open | open |
+| `WL_PLAN_EXPR_STR_FN_UUID5_RFC` | open | open | open |
+| `WL_PLAN_EXPR_CMP_STR_EQ` | empty-only | admitted | unit4-sessions |
+| `WL_PLAN_EXPR_CMP_STR_NEQ` | empty-only | admitted | unit4-sessions |
+| `WL_PLAN_EXPR_CMP_STR_LT` | empty-only | admitted | unit4-sessions |
+| `WL_PLAN_EXPR_CMP_STR_GT` | empty-only | admitted | unit4-sessions |
+| `WL_PLAN_EXPR_CMP_STR_LTE` | empty-only | admitted | unit4-sessions |
+| `WL_PLAN_EXPR_CMP_STR_GTE` | empty-only | admitted | unit4-sessions |
+| `WL_PLAN_EXPR_ARITH_HASH_S` | open | open | open |
+| `WL_PLAN_EXPR_ARITH_CRC32_ETH_S` | open | open | open |
+| `WL_PLAN_EXPR_ARITH_CRC32_CAST_S` | open | open | open |
+| `WL_PLAN_EXPR_ARITH_MD5_S` | open | open | open |
+| `WL_PLAN_EXPR_ARITH_SHA1_S` | open | open | open |
+| `WL_PLAN_EXPR_ARITH_SHA256_S` | open | open | open |
+| `WL_PLAN_EXPR_ARITH_SHA512_S` | open | open | open |
+| `WL_PLAN_EXPR_ARITH_HMAC_SHA256_SS` | open | open | open |
+| `WL_PLAN_EXPR_ARITH_HMAC_SHA256_SI` | open | open | open |
+| `WL_PLAN_EXPR_ARITH_HMAC_SHA256_IS` | open | open | open |
+| `WL_PLAN_EXPR_ARITH_UUID5_SS` | open | open | open |
+| `WL_PLAN_EXPR_ARITH_UUID5_SI` | open | open | open |
+| `WL_PLAN_EXPR_ARITH_UUID5_IS` | open | open | open |
 
 ## Value, error and context contract
 
@@ -322,3 +327,61 @@ at the unlocked prepared-copy boundary, proving duplicate serialization
 without racing hook state. Late cancellation is tested at the first subsequent
 observable boundary, not by adding a hook inside irreversible publication.
 This unit does not admit any additional expression tag.
+
+
+## First scalar domain: strings and comparisons (unit 4)
+
+A separate owned scalar bytecode snapshot admits VAR_STRING, CONST_STR and the
+six string comparisons, delegating ordinary numeric instructions to the existing
+numeric decoder/step. The numeric owner and its tariffs remain unchanged.
+FILTER and MAP try numeric compilation first and only try scalar compilation
+when it reports unsupported without an error. No raw evaluator fallback runs.
+The scalar owner caches the actual capped-stack producer for type inference;
+aggregate no-ops, zero underflow and ignored excess pushes retain raw behavior.
+Compilation does not intern literals. Runtime literals preserve their complete
+payload span independently of the NUL-terminated intern value.
+
+The synchronous host borrows the program's intern and full extension/worker/
+session context from its live session/plan. It never changes that intern's
+attached governor to match a later session. Scalar bytecode and temporary copy
+reservations belong to the host governor; retained symbols belong to the
+intern's governor. An interned literal may survive a later cancelled host;
+that published symbol is distinct from temporary credit, which must retire.
+Raw CONST_STR put failures map to ENOMEM; scratch admission retains ENOSPC,
+overflow and control dispositions. Semantic malformed evaluation rejects a row;
+control/allocation errors leave scalar output arguments unpublished.
+
+Each scalar region pays T224 and revalidates its saved attempt after the test
+checkpoint. Phases70–72 cover tag/length/name decoding; each decimal digit and
+encoded byte is separately metered. Opaque literal payload skipping is constant
+work; its complete owned copy uses the byte primitive's per-load/store tariff.
+Phases73–79 cover compile traversal, allocation/first cleanup, final ownership
+publication and cached type lookup. Phases80–88 cover literal preparation,
+per-instruction dispatch, string lookup/push, comparison publication and final
+output. Variable C-string lengths, literal copies and pair comparison execute
+only through the bounded primitives. Their regions pay their own costs, not
+an input-sized debit followed by a raw traversal.
+
+The fixed scalar regions reuse G9+C13+T29 and allow128 additional source actions
+for branch/stack/metadata/child-call transitions (179 total <224). The finite
+post-commit owner publication includes one40-action reservation move and fewer
+than64 scalar assignments/branches, below256. Allocator/free bodies and mandatory
+reservation cleanup/refcount contention are narrow host boundaries; no
+cancellable variable engine loop is hidden there. MAP's lazily allocated scalar
+pointer array preserves the numeric-only table layout/debits. Four separately
+charged256 grants prepay its physical and credit retirement turns; each slot
+initialization separately pays192. Cleanup visits only the published initialized
+prefix and retires numeric/scalar owners and the two arrays independently.
+
+`evaluation_expression_strings` compares all six operators against raw bytecode,
+checks embedded NUL, unsigned bytes, capped stacks, invalid IDs, null context,
+owned snapshots, exact/one-short work and memory bounds, allocation failures,
+decode/copy/evaluation stops, saved-ID replacement and credit balance. Generated
+session FILTER checks every comparator with exact relation values and positive/
+empty results. Generated MAP mixes projected strings, arithmetic and a literal;
+the parser does not admit a comparison as a head argument. Session tests stop
+after earlier rows/columns and during lazy initialization, assert no premature
+relation/events, retry, verify exact insertion/deletion events and a subsequent
+no-op call. Empty MAP and shared-plan sessions with different governors exercise
+context ownership. These constitute `unit4-sessions`; recursive/pipeline host
+qualification and all other open function/library/extension rows remain pending.

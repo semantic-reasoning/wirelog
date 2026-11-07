@@ -1931,6 +1931,22 @@ wl_columnar_filter_attempt_status(const wl_columnar_filter_context_t *ctx,
     status->committed = ctx->committed;
 }
 
+static wl_columnar_expr_context_t
+wl_columnar_filter_scalar_context(wl_col_session_t *sess, bool map)
+{
+    return (wl_columnar_expr_context_t){
+               .intern = sess ? sess->intern : NULL,
+               .extensions = sess ? sess->base.extension_snapshot : NULL,
+               .allow_extension_scalar_result = map,
+               .configured_worker_count =
+                   sess ? sess->callback_configured_workers : 1,
+               .active_worker_count = sess ? sess->callback_active_workers : 1,
+               .parallel_execution =
+                   sess ? sess->callback_parallel_execution : false,
+               .session_key = sess ? sess->callback_session_key : NULL
+    };
+}
+
 int
 wl_columnar_filter_op_attempt_start(const wl_plan_op_t *op,
     wl_columnar_eval_stack_cleanup_frame_t *frame, wl_col_session_t *sess,
@@ -1963,7 +1979,8 @@ wl_columnar_filter_op_attempt_start_owned(const wl_plan_op_t *op,
     wl_columnar_filter_context_t *ctx = NULL;
     rc = wl_columnar_eval_stack_filter_context_owned(frame, &ctx, owner);
     if (rc) return rc;
-    ctx->program = NULL; ctx->output = NULL; ctx->private_output = NULL;
+    ctx->program = NULL; ctx->scalar_program = NULL; ctx->output = NULL;
+    ctx->private_output = NULL;
     ctx->governor = NULL;
     ctx->values = ctx->inline_values;
     ctx->source_initialized = false; ctx->batch_initialized = false;
@@ -2269,8 +2286,17 @@ wl_columnar_filter_op_attempt_start_owned(const wl_plan_op_t *op,
         if (rc)
             goto done;
         if (!supported) {
-            rc = ENOTSUP;
-            goto done;
+            rc = wl_columnar_filter_attempt_charge(control, attempt_id,
+                    WL_COLUMNAR_FILTER_ATTEMPT_PROGRAM_COMPILE_WORK);
+            if (rc) goto done;
+            rc = wl_columnar_expr_compile_scalar_attempt_controlled(
+                op->filter_expr.data, op->filter_expr.size, ctx->governor,
+                &ctx->scalar_program, &supported, control, attempt_id);
+            rc = wl_columnar_filter_attempt_return(control, attempt_id, rc);
+            if (rc) goto done;
+            if (!supported) {
+                rc = ENOTSUP; goto done;
+            }
         }
     }
     /* Eighteen future steps get two128 halves each from36 payments. Each
@@ -2330,15 +2356,26 @@ wl_columnar_filter_op_attempt_start_owned(const wl_plan_op_t *op,
         if (rc)
             goto done;
         bool selected = true;
-        if (ctx->program) {
+        if (ctx->program || ctx->scalar_program) {
             int64_t value = 0;
             bool failed = false;
             rc = wl_columnar_filter_attempt_charge(control, attempt_id,
                     WL_COLUMNAR_FILTER_ATTEMPT_NUMERIC_EVAL_WORK);
             if (rc)
                 goto done;
-            rc = wl_columnar_expr_eval_attempt_controlled(ctx->program,
-                    ctx->values, width, &value, &failed, control, attempt_id);
+            if (ctx->program)
+                rc = wl_columnar_expr_eval_attempt_controlled(ctx->program,
+                        ctx->values, width, &value, &failed, control,
+                        attempt_id);
+            else {
+                wl_columnar_expr_context_t context =
+                    wl_columnar_filter_scalar_context(sess, false);
+                wl_columnar_expr_status_t expression_status =
+                    WL_COLUMNAR_EXPR_OK;
+                rc = wl_columnar_expr_eval_scalar_attempt_controlled(
+                    ctx->scalar_program, ctx->values, width, &context, &value,
+                    &failed, &expression_status, control, attempt_id);
+            }
             rc = wl_columnar_filter_attempt_return(control, attempt_id, rc);
             if (rc)
                 goto done;
@@ -2455,7 +2492,8 @@ wl_columnar_filter_consolidate_attempt_start_owned(const wl_plan_op_t *op,
         status->execution_result = rc; status->semantic_result = rc;
         return 0;
     }
-    ctx->program = NULL; ctx->output = NULL; ctx->private_output = NULL;
+    ctx->program = NULL; ctx->scalar_program = NULL; ctx->output = NULL;
+    ctx->private_output = NULL;
     ctx->governor = NULL;
     ctx->values = ctx->inline_values;
     ctx->source_initialized = false; ctx->batch_initialized = false;
@@ -2966,6 +3004,67 @@ enum {
 * first-retirement grants precede all table resources; each slot has its own
 * future grant. Forward work does not borrow another slot's retirement. */
 static int
+wl_columnar_filter_map_prepare_scalars(wl_columnar_filter_context_t *ctx,
+    uint32_t count, wl_evaluation_control_t *control, uint64_t id)
+{
+    wl_columnar_filter_program_table_t *table = &ctx->table;
+    if (table->scalars) return 0;
+    /* Two additional retirement turns, separately funded before acquisition.
+     * Each receives two128 halves for physical and credit caller/status work. */
+    for (unsigned i = 0; i < 4; ++i) {
+        int rc = wl_columnar_filter_attempt_charge(control, id,
+                WL_COLUMNAR_FILTER_MAP_TABLE_RETIRE_WORK);
+        if (rc) return rc;
+        rc = wl_columnar_filter_attempt_tail(control, id, 140, i);
+        if (rc) return rc;
+    }
+    int rc = wl_columnar_filter_attempt_charge(control, id,
+            WL_COLUMNAR_FILTER_MAP_FORWARD_WORK);
+    if (rc) return rc;
+    uint64_t bytes;
+    if (!wl_columnar_memory_size_mul(count, sizeof(*table->scalars), &bytes)
+        || bytes > SIZE_MAX) return EOVERFLOW;
+    if (table->governor) {
+        wl_columnar_memory_admission_status_t status;
+        rc = wl_columnar_memory_governor_reserve_checked_attempt_controlled(
+            wl_columnar_memory_governor_ref_get(table->governor), bytes,
+            &table->scalar_credit, &status, control, id);
+        if (rc) return rc;
+        table->scalar_admitted = status == WL_COLUMNAR_MEMORY_ADMISSION_OK
+            || status == WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY;
+        if (!table->scalar_admitted)
+            return status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED ? ENOSPC
+                : status ==
+                   WL_COLUMNAR_MEMORY_ADMISSION_OVERFLOW ? EOVERFLOW : EINVAL;
+    }
+    rc = wl_columnar_filter_attempt_charge(control, id,
+            WL_COLUMNAR_FILTER_MAP_FORWARD_WORK);
+    if (rc) return rc;
+    table->scalars = wl_columnar_filter_attempt_allocate((size_t)bytes);
+    table->scalar_allocated = table->scalars != NULL;
+    if (!table->scalar_allocated) return ENOMEM;
+    rc = wl_columnar_filter_attempt_tail(control, id, 141, count);
+    if (rc) return rc;
+    if (table->scalar_admitted) {
+        rc = wl_columnar_memory_governor_commit_attempt_controlled(
+            &table->scalar_credit, table->scalars, &table->scalar_committed,
+            control, id);
+        if (rc) return rc;
+        if (!table->scalar_committed) return ENOMEM;
+    }
+    for (uint32_t i = 0; i < count; ++i) {
+        rc = wl_columnar_filter_attempt_charge(control, id,
+                WL_COLUMNAR_FILTER_MAP_FORWARD_WORK);
+        if (rc) return rc;
+        table->scalars[i] = NULL;
+        table->scalar_initialized_slots++;
+        rc = wl_columnar_filter_attempt_tail(control, id, 142, i);
+        if (rc) return rc;
+    }
+    return 0;
+}
+
+static int
 wl_columnar_filter_map_prepare_table(wl_columnar_filter_context_t *ctx,
     const wl_plan_op_t *op, uint32_t count, wl_evaluation_control_t *control,
     uint64_t attempt_id)
@@ -2983,7 +3082,11 @@ wl_columnar_filter_map_prepare_table(wl_columnar_filter_context_t *ctx,
     if (rc) return rc;
     wl_columnar_filter_program_table_t *table = &ctx->table;
     wl_columnar_memory_reservation_init(&table->credit);
-    table->programs = NULL;
+    table->programs = NULL; table->scalars = NULL;
+    table->scalar_initialized_slots = 0;
+    table->scalar_allocated = false; table->scalar_admitted = false;
+    table->scalar_committed = false;
+    wl_columnar_memory_reservation_init(&table->scalar_credit);
     table->initialized_slots = 0; table->retirement_cursor = 0;
     table->allocated = false; table->admitted = false;
     table->committed = false; table->ref_held = false;
@@ -3073,7 +3176,17 @@ wl_columnar_filter_map_prepare_table(wl_columnar_filter_context_t *ctx,
                 control, attempt_id);
             rc = wl_columnar_filter_attempt_return(control, attempt_id, rc);
             if (rc) return rc;
-            if (!supported) return ENOTSUP;
+            if (!supported) {
+                rc = wl_columnar_filter_map_prepare_scalars(ctx, count,
+                        control, attempt_id);
+                if (rc) return rc;
+                rc = wl_columnar_expr_compile_scalar_attempt_controlled(
+                    op->map_exprs[column].data, op->map_exprs[column].size,
+                    ctx->governor, &table->scalars[column], &supported,
+                    control, attempt_id);
+                if (rc) return rc;
+                if (!supported) return ENOTSUP;
+            }
         }
         rc = wl_columnar_filter_attempt_tail(control, attempt_id, 106, column);
         if (rc) return rc;
@@ -3113,7 +3226,8 @@ wl_columnar_filter_map_attempt_start_owned(const wl_plan_op_t *op,
     wl_columnar_filter_context_t *ctx = NULL;
     rc = wl_columnar_eval_stack_filter_context_owned(frame, &ctx, owner);
     if (rc) return rc;
-    ctx->program = NULL; ctx->output = NULL; ctx->private_output = NULL;
+    ctx->program = NULL; ctx->scalar_program = NULL; ctx->output = NULL;
+    ctx->private_output = NULL;
     ctx->governor = NULL;
     ctx->values = ctx->inline_values;
     ctx->source_initialized = false; ctx->batch_initialized = false;
@@ -3398,11 +3512,18 @@ wl_columnar_filter_map_attempt_start_owned(const wl_plan_op_t *op,
         wirelog_column_type_t type = WIRELOG_TYPE_INT64;
         wl_columnar_expr_attempt_numeric_t *program =
             ctx->table.programs[column];
-        if (program) {
+        wl_columnar_expr_attempt_scalar_t *scalar = ctx->table.scalars
+            ? ctx->table.scalars[column] : NULL;
+        if (program || scalar) {
             bool supported = false;
-            rc = wl_columnar_expr_result_type_attempt_controlled(program,
-                    ctx->source.types, width, &type, &supported, control,
-                    attempt_id);
+            if (program)
+                rc = wl_columnar_expr_result_type_attempt_controlled(program,
+                        ctx->source.types, width, &type, &supported, control,
+                        attempt_id);
+            else
+                rc = wl_columnar_expr_scalar_result_type_attempt_controlled(
+                    scalar, ctx->source.types, width, &type, &supported,
+                    control, attempt_id);
             rc = wl_columnar_filter_attempt_return(control, attempt_id, rc);
             if (rc) goto done;
             if (!supported) {
@@ -3495,14 +3616,26 @@ wl_columnar_filter_map_attempt_start_owned(const wl_plan_op_t *op,
             int64_t value = 0;
             wl_columnar_expr_attempt_numeric_t *program =
                 ctx->table.programs[column];
-            if (program) {
+            wl_columnar_expr_attempt_scalar_t *scalar = ctx->table.scalars
+                ? ctx->table.scalars[column] : NULL;
+            if (program || scalar) {
                 bool failed = false;
                 rc = wl_columnar_filter_attempt_charge(control, attempt_id,
                         WL_COLUMNAR_FILTER_ATTEMPT_NUMERIC_EVAL_WORK);
                 if (rc) goto done;
-                rc = wl_columnar_expr_eval_attempt_controlled(program,
-                        ctx->values, width, &value, &failed, control,
-                        attempt_id);
+                if (program)
+                    rc = wl_columnar_expr_eval_attempt_controlled(program,
+                            ctx->values, width, &value, &failed, control,
+                            attempt_id);
+                else {
+                    wl_columnar_expr_context_t context =
+                        wl_columnar_filter_scalar_context(sess, true);
+                    wl_columnar_expr_status_t expression_status =
+                        WL_COLUMNAR_EXPR_OK;
+                    rc = wl_columnar_expr_eval_scalar_attempt_controlled(
+                        scalar, ctx->values, width, &context, &value, &failed,
+                        &expression_status, control, attempt_id);
+                }
                 rc = wl_columnar_filter_attempt_return(control, attempt_id, rc);
                 if (rc) goto done;
                 if (failed) {
@@ -3734,9 +3867,42 @@ wl_columnar_filter_op_attempt_step_owned(
                 ctx->table.programs[slot];
             ctx->table.programs[slot] = NULL;
             ++ctx->table.retirement_cursor;
+            if (ctx->table.scalars &&
+                slot < ctx->table.scalar_initialized_slots) {
+                wl_columnar_expr_attempt_scalar_t *scalar =
+                    ctx->table.scalars[slot];
+                ctx->table.scalars[slot] = NULL;
+                wl_columnar_expr_attempt_scalar_free(scalar);
+            }
             wl_columnar_expr_attempt_numeric_free(program);
             break;
         }
+        ctx->stage = ctx->table.scalar_allocated || ctx->table.scalar_admitted
+            ? WL_COLUMNAR_FILTER_STAGE_SCALAR_TABLE_PHYSICAL
+            : WL_COLUMNAR_FILTER_STAGE_TABLE_PHYSICAL;
+        break;
+    case WL_COLUMNAR_FILTER_STAGE_SCALAR_TABLE_PHYSICAL:
+        if (ctx->table.scalar_allocated) {
+            void *physical = ctx->table.scalars;
+            ctx->table.scalars = NULL;
+            ctx->table.scalar_allocated = false;
+            free(physical);
+        }
+        ctx->table.scalar_initialized_slots = 0;
+        ctx->stage = WL_COLUMNAR_FILTER_STAGE_SCALAR_TABLE_CREDIT;
+        break;
+    case WL_COLUMNAR_FILTER_STAGE_SCALAR_TABLE_CREDIT:
+        if (ctx->table.scalar_admitted) {
+            bool released = ctx->table.scalar_committed
+                ? wl_columnar_memory_release(&ctx->table.scalar_credit)
+                : wl_columnar_memory_rollback(&ctx->table.scalar_credit);
+            if (!released) {
+                ctx->cleanup_result = EINVAL; goto retained;
+            }
+            ctx->table.scalar_admitted = false;
+        }
+        ctx->table.scalar_committed = false;
+        ctx->cleanup_result = 0;
         ctx->stage = WL_COLUMNAR_FILTER_STAGE_TABLE_PHYSICAL;
         break;
     case WL_COLUMNAR_FILTER_STAGE_TABLE_PHYSICAL:
@@ -3905,6 +4071,9 @@ wl_columnar_filter_op_attempt_step_owned(
     case WL_COLUMNAR_FILTER_STAGE_PROGRAM: {
         wl_columnar_expr_attempt_numeric_t *program = ctx->program;
         ctx->program = NULL;
+        wl_columnar_expr_attempt_scalar_t *scalar = ctx->scalar_program;
+        ctx->scalar_program = NULL;
+        wl_columnar_expr_attempt_scalar_free(scalar);
         wl_columnar_expr_attempt_numeric_free(program);
         ctx->stage = WL_COLUMNAR_FILTER_STAGE_PHYSICAL;
         break;
@@ -4086,11 +4255,14 @@ wl_columnar_filter_op_attempt_ack_owned(
         || ctx->join_input_snapshot.view_generation ||
         ctx->join_input_snapshot.storage_generation
         || ctx->heap || ctx->admitted || ctx->ref_held || ctx->program ||
+        ctx->scalar_program ||
         ctx->output || ctx->private_output || ctx->table.programs
         || ctx->table.initialized_slots || ctx->table.retirement_cursor
         || ctx->table.allocated || ctx->table.admitted || ctx->table.ref_held
         || ctx->table.governor || ctx->table.committed ||
-        ctx->table.initialized)
+        ctx->table.initialized || ctx->table.scalars
+        || ctx->table.scalar_initialized_slots || ctx->table.scalar_allocated
+        || ctx->table.scalar_admitted || ctx->table.scalar_committed)
         return EBUSY;
     ctx->thread_valid = false; ctx->frame = NULL; ctx->session = NULL;
     ctx->values = ctx->inline_values; ctx->governor = NULL;
