@@ -5905,6 +5905,13 @@ int wl_columnar_expr_bytes_find_attempt_controlled(const uint8_t *, size_t,
 int wl_columnar_expr_utf8_next_attempt_controlled(const char *, size_t *,
     int64_t *, wl_evaluation_control_t *, uint64_t);
 
+/* Base10 prefix with locale isspace, optional sign and checked int64 range.
+ * Tariff224 per entry/final, inspected byte and digit accumulation. Traverses
+ * the entire digit prefix even after overflow; suffix is ignored. ERANGE and
+ * control/identity errors leave output unchanged. Input borrowed/immutable. */
+int wl_columnar_expr_decimal_attempt_controlled(const char *, int64_t *,
+    wl_evaluation_control_t *, uint64_t);
+
 /* Context-bearing scalar owner (#2299). Immutable bytecode copy, no intern
  * mutation during compile. Numeric-only hosts keep the numeric owner path.
  * Evaluation borrows the actual session/plan context (or caller-held pin),
