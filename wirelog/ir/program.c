@@ -1896,19 +1896,39 @@ check_body_atom_compounds(struct wirelog_program *program,
  * (`pred(a, b, c)`), as facts and heads are written.  A compound term
  * whose functor or arity differs from the declaration is accepted in
  * logical form and matches no row, as before.
- * Relations typed neither by a `.decl` nor by inline facts are skipped:
- * an undeclared relation defined only by rule heads has no width to check
- * against, and its atoms still read a missing column as 0. */
+ *
+ * A relation typed neither by a `.decl` nor by inline facts takes its width
+ * from its rule heads when they all agree, @heads holding that width plus 1
+ * per relation (see validate_body_arities()).  Its atoms read a missing
+ * column as 0 too: `o(x, y) :- q(x, y).` with `q(x) :- e(x).` holding e(1)
+ * derived o(1, 0).  A rule head cannot contain a compound term, so such a
+ * relation has no compound column and a compound term in its atoms is
+ * rejected as well.  Relations whose heads disagree, or with no head, are
+ * skipped. */
 static int
 check_body_atom_width(struct wirelog_program *program,
-    const wl_parser_ast_node_t *atom, bool negated)
+    const wl_parser_ast_node_t *atom, bool negated, const uint32_t *heads)
 {
     if (!atom || atom->type != WL_PARSER_AST_NODE_ATOM || !atom->name)
         return 0;
     const wl_ir_relation_info_t *rel = find_relation_info(program,
             atom->name);
-    if (!rel || (!rel->has_decl && !rel->schema_from_facts))
+    if (!rel)
         return 0;
+    const char *kind = negated ? "negated body atom" : "body atom";
+    if (!rel->has_decl && !rel->schema_from_facts) {
+        uint32_t width = heads[rel - program->relations];
+        if (width == 0 || width == UINT32_MAX)
+            return 0;
+        width--;
+        if (atom->child_count == width)
+            return check_body_atom_compounds(program, rel, atom, false, kind);
+        wl_ir_program_set_error(program,
+            "%s for relation '%s' has %u argument(s) but its rule heads have"
+            " %u ('%s' has no .decl) (line %u)", kind, rel->name,
+            atom->child_count, width, rel->name, atom->line);
+        return -1;
+    }
 
     bool logical = false;
     for (uint32_t c = 0; rel->columns && c < rel->column_count
@@ -1933,7 +1953,6 @@ check_body_atom_width(struct wirelog_program *program,
     } else {
         ok = atom->child_count == physical;
     }
-    const char *kind = negated ? "negated body atom" : "body atom";
     if (ok)
         return check_body_atom_compounds(program, rel, atom, logical, kind);
 
@@ -1970,27 +1989,56 @@ check_body_atom_width(struct wirelog_program *program,
     return -1;
 }
 
+/* The head width of each relation typed neither by a `.decl` nor by inline
+ * facts is recorded as width + 1, so that 0 means "no head" and UINT32_MAX
+ * "heads of different widths".  An aggregate is one head argument and one
+ * column (see validate_head_arities()). */
 static int
 validate_body_arities(struct wirelog_program *program,
     const wl_parser_ast_node_t *ast)
 {
+    uint32_t *heads = (uint32_t *)calloc(
+        program->relation_count ? program->relation_count : 1u,
+        sizeof(*heads));
+    int rc = 0;
+
+    if (!heads) {
+        wl_ir_program_set_error(program, "out of memory checking body atoms");
+        return -1;
+    }
     for (uint32_t i = 0; i < ast->child_count; i++) {
+        const wl_parser_ast_node_t *node = ast->children[i];
+        if (node->type != WL_PARSER_AST_NODE_RULE || node->child_count < 1)
+            continue;
+        const wl_parser_ast_node_t *head = node->children[0];
+        if (!head || head->type != WL_PARSER_AST_NODE_HEAD || !head->name)
+            continue;
+        const wl_ir_relation_info_t *rel
+            = find_relation_info(program, head->name);
+        if (!rel || rel->has_decl || rel->schema_from_facts)
+            continue;
+        uint32_t *slot = &heads[rel - program->relations];
+        if (*slot == 0)
+            *slot = head->child_count + 1;
+        else if (*slot != head->child_count + 1)
+            *slot = UINT32_MAX;
+    }
+    for (uint32_t i = 0; rc == 0 && i < ast->child_count; i++) {
         const wl_parser_ast_node_t *node = ast->children[i];
         if (node->type != WL_PARSER_AST_NODE_RULE)
             continue;
-        for (uint32_t b = 1; b < node->child_count; b++) {
+        for (uint32_t b = 1; rc == 0 && b < node->child_count; b++) {
             const wl_parser_ast_node_t *lit = node->children[b];
-            int rc = 0;
             if (lit->type == WL_PARSER_AST_NODE_ATOM)
-                rc = check_body_atom_width(program, lit, false);
+                rc = check_body_atom_width(program, lit, false, heads);
             else if (lit->type == WL_PARSER_AST_NODE_NEGATION
                 && lit->child_count > 0)
-                rc = check_body_atom_width(program, lit->children[0], true);
-            if (rc != 0)
-                return -1;
+                rc = check_body_atom_width(program, lit->children[0], true,
+                        heads);
         }
     }
-    return 0;
+    free(heads);
+    return rc;
 }
 
 int

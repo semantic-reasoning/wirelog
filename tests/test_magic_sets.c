@@ -1242,57 +1242,73 @@ test_magic_rebuild_and_stratify(void)
  * so this test uses several deliberately -- a single-rule version would
  * pass on the unfixed code in an ordinary build.
  *
- * Both shapes below crashed on the unfixed code.  The first has a correct
- * head and a body atom wider than its .decl; the body-arity check (#2231)
- * now rejects it at load, before magic sets runs, and the test pins that.
- * The second uses an undeclared head relation, which no arity check sees,
- * so it still reaches re-stratification. */
+ * The three shapes below crashed on the unfixed code.  The first has a
+ * correct head and a body atom wider than its .decl, and the second a body
+ * atom wider than the heads of its undeclared relation; the body-arity
+ * check (#2231) now rejects both at load, before magic sets runs, and the
+ * test pins that.  In the third every atom has its relation's width, the
+ * body atom writing the inline column as a compound term, so it still
+ * reaches re-stratification and the test requires that it does. */
 static void
 test_stratify_no_oob_on_graph_absent_head(void)
 {
     TEST("Magic sets: re-stratification stays in bounds (#987)");
 
-    static const char *const srcs[] = {
+    static const struct {
+        const char *src;
+        const char *relation;
+        bool rejected;
+    } shapes[] = {
         /* declared, body atom wider than the .decl, several rules */
-        ".decl edge(a: int64, b: int64)\n"
-        ".decl path(a: int64, b: int64)\n"
-        "path(x,z) :- path(x,y,q1), edge(y,z).\n"
-        "path(x,z) :- path(x,y,q2), edge(y,z).\n"
-        "path(x,z) :- path(x,y,q3), edge(y,z).\n"
-        "path(x,z) :- path(x,y,q4), edge(y,z).\n",
-        /* undeclared head relation -- has_decl gates the #977 checks off */
-        ".decl edge(a: int64, b: int64)\n"
-        "edge(1,2).\n"
-        "path(x,y) :- edge(x,y).\n"
-        "path(x,z) :- path(x,y,q1), edge(y,z).\n"
-        "path(x,z) :- path(x,y,q2), edge(y,z).\n"
-        "path(x,z) :- path(x,y,q3), edge(y,z).\n",
+        { ".decl edge(a: int64, b: int64)\n"
+          ".decl path(a: int64, b: int64)\n"
+          "path(x,z) :- path(x,y,q1), edge(y,z).\n"
+          "path(x,z) :- path(x,y,q2), edge(y,z).\n"
+          "path(x,z) :- path(x,y,q3), edge(y,z).\n"
+          "path(x,z) :- path(x,y,q4), edge(y,z).\n", "path", true },
+        /* undeclared, body atom wider than its heads */
+        { ".decl edge(a: int64, b: int64)\n"
+          "edge(1,2).\n"
+          "path(x,y) :- edge(x,y).\n"
+          "path(x,z) :- path(x,y,q1), edge(y,z).\n"
+          "path(x,z) :- path(x,y,q2), edge(y,z).\n"
+          "path(x,z) :- path(x,y,q3), edge(y,z).\n", "path", true },
+        /* inline compound column, every atom of its relation's width */
+        { ".decl edge(a: int64, b: int64)\n"
+          ".decl p(id: int64, payload: f/2 inline)\n"
+          "p(x,y,z) :- edge(x,y), z=9.\n"
+          "p(x,z,w1) :- p(x, f(y,w1)), edge(y,z).\n"
+          "p(x,z,w2) :- p(x, f(y,w2)), edge(y,z).\n"
+          "p(x,z,w3) :- p(x, f(y,w3)), edge(y,z).\n"
+          "p(x,z,w4) :- p(x, f(y,w4)), edge(y,z).\n", "p", false },
     };
+    uint32_t restratified = 0;
 
-    for (size_t i = 0; i < sizeof(srcs) / sizeof(srcs[0]); i++) {
+    for (size_t i = 0; i < sizeof(shapes) / sizeof(shapes[0]); i++) {
         wirelog_error_t err;
-        wirelog_program_t *prog = wirelog_parse_string(srcs[i], &err);
-        if (i == 0) {
+        wirelog_program_t *prog = wirelog_parse_string(shapes[i].src, &err);
+        if (shapes[i].rejected) {
             if (prog) {
                 wirelog_program_free(prog);
-                FAIL("a body atom wider than its .decl was accepted");
+                FAIL("a body atom wider than its relation was accepted");
                 return;
             }
             continue;
         }
         if (!prog) {
-            FAIL("the undeclared shape failed to parse");
+            FAIL("the inline compound shape failed to parse");
             return;
         }
 
         wl_magic_demand_t demands[1];
-        demands[0].relation_name = "path";
+        demands[0].relation_name = shapes[i].relation;
         demands[0].bound_mask = 0x1;
         demands[0].arity = 2;
 
         if (wl_magic_sets_apply_with_demands(prog, demands, 1, NULL) != 0) {
             wirelog_program_free(prog);
-            continue;
+            FAIL("magic sets did not apply to the inline compound shape");
+            return;
         }
         if (wl_ir_program_rebuild_relation_irs(prog) != 0) {
             wirelog_program_free(prog);
@@ -1323,8 +1339,13 @@ test_stratify_no_oob_on_graph_absent_head(void)
         }
 
         wirelog_program_free(prog);
+        restratified++;
     }
 
+    if (restratified != 1) {
+        FAIL("the inline compound shape did not reach re-stratification");
+        return;
+    }
     PASS();
 }
 
