@@ -5265,6 +5265,45 @@ reduce_entry_limits(void)
     }
 }
 
+/* Batch policy only admits a genuine composed host, never a standalone
+ * primitive or a noncomposed numeric owner. The new zero preserves the old
+ * pre-entry stop status without taking source or context ownership. */
+static void
+reduce_batch_and_entry_stops(void)
+{
+    for (unsigned owned = 0; owned < 2; ++owned) {
+        for (unsigned stop = 0; stop < 3; ++stop) {
+            reduce_fixture_t f;
+            reduce_fixture_init(&f, reduce_literal_input(false, false), false,
+                UINT64_C(1000000000), owned != 0);
+            f.op.agg_fn = WIRELOG_AGG_COUNT; f.op.group_by_count = 1;
+            if (owned) reduce_fixture_claim(&f);
+            uint64_t before = 0, after = 0;
+            CHECK(!wl_evaluation_control_test_active_consumed(f.operation,
+                f.operation_id, &before));
+            if (!stop) f.session->join_batch_bytes = 64;
+            if (stop == 1) wl_evaluation_control_request_cancel(f.operation);
+            if (stop == 2) CHECK(wl_evaluation_control_charge_attempt(
+                        f.operation, f.operation_id, UINT64_MAX)
+                    == WL_EVALUATION_CONTROL_WORK_LIMIT);
+            reduce_run(&f);
+            int expected = !stop ? ENOTSUP : stop == 1
+                ? WL_EVALUATION_CONTROL_CANCELLED
+                : WL_EVALUATION_CONTROL_WORK_LIMIT;
+            CHECK(!f.status.committed && f.status.semantic_result == expected
+                && f.status.progress == WL_COLUMNAR_FILTER_PROGRESS_DONE
+                && !f.status.cleanup_result);
+            CHECK(wl_columnar_eval_stack_cleanup_stack(f.frame)->items[0].rel
+                == f.input && !f.record.completed);
+            CHECK(!wl_evaluation_control_test_active_consumed(f.operation,
+                f.operation_id, &after));
+            if (stop) CHECK(after == before);
+            f.session->join_batch_bytes = 0;
+            reduce_fixture_close(&f, false);
+        }
+    }
+}
+
 static void
 reduce_quota_retry(void)
 {
@@ -6693,7 +6732,8 @@ main(void)
     reduce_collisions(); reduce_owned_authority();
     reduce_allocation_and_domains(); reduce_retained_resources();
     reduce_shape_and_expression(); reduce_wide_and_float_overflow();
-    reduce_group_native_types(); reduce_entry_limits(); reduce_quota_retry();
+    reduce_group_native_types(); reduce_entry_limits();
+    reduce_batch_and_entry_stops(); reduce_quota_retry();
     reduce_all_reached_allocations();
     reduce_expression_stops_and_ignored_count(); reduce_engine_host_refusal();
     raw_count_result_domains(); raw_count_generated_bodies();

@@ -4021,8 +4021,18 @@ Scratch physical disposal precedes credit release, saved reference release and
 record clearing. Program retirement follows all three scratch records, then
 source End and the original unary decision. A refusal retains the original
 record and requires a fresh separately funded host retry; no successor control
-pays for old cleanup. Public/default evaluation still uses raw REDUCE, and both
-private numeric-plan preflights admit REDUCE through its original owned child.
+pays for old cleanup. Admitted controlled serial composition dispatches REDUCE
+through its original owned child, including a genuine composed aggregate after
+LFTJ when JOIN batch mode is configured. This exception requires the canonical
+frame/current thread, session/control/saved ID, admitted composed fallback bit,
+busy PENDING-from-READY state, exact current REDUCE pointer and child status;
+it is rechecked after the real phase1 Original check. Standalone and
+noncomposed controlled primitives retain their batch-mode ENOTSUP. Raw
+uncontrolled REDUCE is unchanged. The initial real Original zero separates
+stack/owner validation from repeated context validation without changing the
+first192 refusal status or any positive tariff. Complete changed source
+intervals are recorded in
+[the LFTJ source map](implementation/2298/LFTJ_SOURCE_ACCOUNTING.md).
 
 REDUCE pays128 per scalar cell and192 for the existing-group numeric update,
 whose FLOAT comparison/arithmetic dispatch is larger than an ordinary key

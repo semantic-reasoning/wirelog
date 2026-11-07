@@ -2712,6 +2712,56 @@ wl_columnar_ops_reduce_attempt_start(const wl_plan_op_t *op,
                control, id, status, NULL);
 }
 
+/* Batch JOIN policy does not change ordinary scalar aggregation. Only an
+* actual admitted composed child may use that exception; standalone entry
+* retains its historical batch refusal. Recheck after the phase1 hook. */
+static int
+wl_columnar_ops_reduce_batch_authorized(const wl_plan_op_t *op,
+    wl_columnar_eval_stack_cleanup_frame_t *frame, wl_col_session_t *session,
+    wl_evaluation_control_t *control, uint64_t id,
+    wl_columnar_filter_status_t *status, const void *owner)
+{
+    if (!owner) return ENOTSUP;
+    const wl_columnar_eval_plan_numeric_attempt_t *record = owner;
+    int rc = wl_columnar_eval_stack_numeric_owner(frame, record);
+    if (rc) return rc;
+    if (!record->composed_mode
+        || !record->controlled_materialized_batch_fallback) return ENOTSUP;
+    wl_columnar_eval_serial_framed_attempt_t *host = NULL;
+    rc = wl_columnar_eval_stack_framed_context(frame, session, &host);
+    if (rc) return rc;
+    if (record->session != session || record->control != control
+        || record->attempt_id != id || session->cleanup_active != frame
+        || !record->composed_busy
+        || record->phase != WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_PENDING
+        || record->pending_action != WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_READY
+        || !record->plan || !record->plan->ops || record->cursor < record->begin
+        || record->cursor >= record->end || record->end > record->plan->op_count
+        || op != &record->plan->ops[record->cursor]
+        || op->op != WL_PLAN_OP_REDUCE || status != &record->child_status)
+        return EINVAL;
+    if (!session->join_batch_bytes || session->current_iteration
+        || session->diff_operators_active || session->retraction_seeded
+        || session->retraction_right_pass || session->tdd_input_run
+        || session->tdd_subpass_active || session->tdd_outbound_only_active
+        || session->join_output_shared_count || session->coordinator
+        || session->num_workers > 1) return ENOTSUP;
+    return 0;
+}
+
+#ifdef WL_SESSION_TEST_HOOKS
+/* Read-only component probe; this never acquires an execution capability. */
+int
+wl_columnar_ops_test_reduce_batch_authorized(const wl_plan_op_t *op,
+    wl_columnar_eval_stack_cleanup_frame_t *frame, wl_col_session_t *session,
+    wl_evaluation_control_t *control, uint64_t id,
+    wl_columnar_filter_status_t *status, const void *owner)
+{
+    return wl_columnar_ops_reduce_batch_authorized(op, frame, session, control,
+               id, status, owner);
+}
+#endif
+
 int
 wl_columnar_ops_reduce_attempt_start_owned(const wl_plan_op_t *op,
     wl_columnar_eval_stack_cleanup_frame_t *frame, wl_col_session_t *session,
@@ -2728,6 +2778,9 @@ wl_columnar_ops_reduce_attempt_start_owned(const wl_plan_op_t *op,
         const wl_columnar_eval_plan_numeric_attempt_t *record = owner;
         if (record->control != control || record->attempt_id != id)
             return EINVAL;
+        if (session->join_batch_bytes && record->composed_mode
+            && record->controlled_materialized_batch_fallback
+            && status != &record->child_status) return EINVAL;
     }
     if (!control) {
         int result = op->op == WL_PLAN_OP_REDUCE
@@ -2739,6 +2792,16 @@ wl_columnar_ops_reduce_attempt_start_owned(const wl_plan_op_t *op,
     }
     rc = wl_columnar_ops_reduce_attempt_guard(control, id);
     if (rc) return rc;
+    /* Split the complete stack/owner prefix from repeated context proof.
+     * A valid stopped attempt keeps the old first-admission DONE semantics. */
+    rc = wl_evaluation_control_charge_attempt(control, id, 0);
+    if (rc == EINVAL) return rc;
+    if (rc) {
+        status->progress = WL_COLUMNAR_FILTER_PROGRESS_DONE;
+        status->execution_result = rc; status->semantic_result = rc;
+        status->cleanup_result = 0; status->committed = false;
+        return 0;
+    }
     wl_columnar_filter_context_t *ctx = NULL;
     rc = wl_columnar_eval_stack_filter_context_owned(frame, &ctx, owner);
     if (rc) return rc;
@@ -2803,7 +2866,8 @@ wl_columnar_ops_reduce_attempt_start_owned(const wl_plan_op_t *op,
         && !session->current_iteration && !session->diff_operators_active
         && !session->retraction_seeded && !session->retraction_right_pass
         && !session->tdd_input_run && !session->tdd_subpass_active
-        && !session->tdd_outbound_only_active && !session->join_batch_bytes
+        && !session->tdd_outbound_only_active
+        && (!session->join_batch_bytes || owner)
         && !session->join_output_shared_count && !session->coordinator
         && session->num_workers <= 1;
     rc = wl_columnar_ops_reduce_attempt_tail(control, id, 1, 0);
@@ -2811,6 +2875,15 @@ wl_columnar_ops_reduce_attempt_start_owned(const wl_plan_op_t *op,
         if (rc) goto done;
     } else {
         rc = ENOTSUP; goto done;
+    }
+    if (session->join_batch_bytes) {
+        rc = wl_columnar_ops_reduce_batch_authorized(op, frame, session,
+                control, id, status, owner);
+        if (rc) goto done;
+        /* Full posthook permission is source work of its own, before any
+         * future retirement share. This real cut mints no logical credit. */
+        rc = wl_columnar_ops_reduce_attempt_charge(control, id, 0);
+        if (rc) goto done;
     }
     for (unsigned payment = 0;
         payment < WL_COLUMNAR_OPS_REDUCE_ATTEMPT_RETIRE_PAYMENTS; ++payment){
