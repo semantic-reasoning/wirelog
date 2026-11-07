@@ -192,9 +192,9 @@ On non-MSVC builds the same macros expand to
 `atomic_load_explicit(p, memory_order_relaxed)` and friends
 (`lockfree_queue.c:47-57`).
 
-### 4.4 MSVC shim in `intern.c`
+### 4.4 MSVC shim in `intern_private.h`
 
-`wirelog/intern.c:67-92` provides the same shape of shim for the
+`wirelog/intern_private.h:10-37` provides the same shape of shim for the
 `uint32_t` published-entry counter of the shared symbol table
 (Issue #958):
 
@@ -217,7 +217,7 @@ orders named above.
   `atomic_bool`, `atomic_uint_fast64_t` as MSVC-compatible aliases.
 - `wirelog/util/lockfree_queue.c:31,48` defines `wl_atomic_u32` per
   branch.
-- `wirelog/intern.c:78,84` defines `wl_intern_atomic_u32` per branch.
+- `wirelog/intern_private.h:24,30` defines `wl_intern_atomic_u32` per branch.
 
 These exist so struct fields can be declared portably; the audit in
 §5 below covers only call sites, not type-declaration sites.
@@ -228,7 +228,7 @@ These exist so struct fields can be declared portably; the audit in
 
 Every `atomic_*` call site in `wirelog/` production sources. Counted
 mechanically by `scripts/ci/check-threading-doc.sh`; row count must
-match the script's count (currently **522**).
+match the script's count (currently **524**).
 
 Format: `file:function[#N]` | field | operation | order | justification.
 
@@ -522,7 +522,7 @@ hold, freeze, or gate refusal; legacy GC retains its unchanged-epoch skip result
 On MSVC the helper load/store use interlocked intrinsics because the shared
 `wl_atomic_u64` compatibility type cannot use C11 atomic operations directly.
 
-### 5.11 `wirelog/intern.c` — shared symbol table (3 rows)
+### 5.11 Intern module — shared symbol table (5 rows)
 
 The intern table is shared, unsynchronized, by every parallel worker
 (Issue #958). Writers (`wl_intern_put`, `wl_intern_get`) serialize on
@@ -537,9 +537,11 @@ measured by `bench/bench_intern.c`; baselines are in `docs/INTERN_PERF.md`
 
 | Anchor (`file:function[#N]`) | Field | Op | Order | Justification |
 |---|---|---|---|---|
-| `intern.c:WL_INTERN_LOAD_ACQUIRE` | `intern->count` | `atomic_load_explicit` | `acquire` | `WL_INTERN_LOAD_ACQUIRE`, used by `wl_intern_reverse`/`wl_intern_count`. Pairs with the release store below: an id below the observed count names a fully written entry, and the segment holding it is allocated and never moves |
-| `intern.c:WL_INTERN_LOAD_RELAXED` | `intern->count` | `atomic_load_explicit` | `relaxed` | `WL_INTERN_LOAD_RELAXED`, used by `wl_intern_put`, `intern_resize_prepare`, `intern_retained_bytes_locked` and `wl_intern_free`. Every caller holds `intern->lock` (`wl_intern_free` takes it to release the governor reservation, Issue #1431), so no edge is needed |
-| `intern.c:WL_INTERN_STORE_RELEASE` | `intern->count` | `atomic_store_explicit` | `release` | `WL_INTERN_STORE_RELEASE`, used by `wl_intern_put` after the string and its segment pointer are written. Publishing the count first would let a lock-free reader dereference an unwritten slot |
+| `intern_private.h:WL_INTERN_LOAD_ACQUIRE` | `intern->count` | `atomic_load_explicit` | `acquire` | `WL_INTERN_LOAD_ACQUIRE`, used by `wl_intern_reverse`/`wl_intern_count`. Pairs with the release store below: an id below the observed count names a fully written entry, and the segment holding it is allocated and never moves |
+| `intern_private.h:WL_INTERN_LOAD_RELAXED` | `intern->count` | `atomic_load_explicit` | `relaxed` | `WL_INTERN_LOAD_RELAXED`, used by `wl_intern_put`, `intern_resize_prepare`, `intern_retained_bytes_locked` and `wl_intern_free`. Every caller holds `intern->lock` (`wl_intern_free` takes it to release the governor reservation, Issue #1431), so no edge is needed |
+| `intern_private.h:WL_INTERN_STORE_RELEASE` | `intern->count` | `atomic_store_explicit` | `release` | `WL_INTERN_STORE_RELEASE`, used by raw and controlled insertion after the string and its segment pointer are written. Publishing the count first would let a lock-free reader dereference an unwritten slot |
+| `intern_control.c:wl_intern_control_put_attempt` | `old->state` | `atomic_load_explicit` | `acquire` | Controlled insertion validates the old committed reservation under the writer mutex before admission and the irreversible publication cutoff. The acquire load validates COMMITTED state. Exclusive token ownership under the writer mutex protects all payload coherence checks, including those evaluated before this state load. |
+| `intern_control.c:wl_intern_control_put_attempt#2` | `old->owner_bits` | `atomic_load_explicit` | `relaxed` | Owner identity check of the same exclusive committed token. The writer mutex and stable-governor borrowing contract serialize owner changes; this identity load publishes no new payload. |
 
 ### 5.12 Existing inventory total
 
@@ -665,7 +667,7 @@ concurrent alias removals cannot underflow the count.
 | `session.c:session_pool_rel_promote#3` | `src->storage_alias_borrows` | `atomic_store_explicit` | relaxed | Leave the closed pool tombstone with no child aliases |
 
 112 + 21 + 37 = **170 atomic call sites** in the summarized groups; the full
-symbol-anchored inventory below covers 522 sites.
+symbol-anchored inventory below covers 524 sites.
 
 The `#N` suffix counts all atomic sites in a symbol, regardless of operation;
 the first site remains unsuffixed. `scripts/ci/check-threading-doc.sh` uses
@@ -1756,7 +1758,7 @@ DONE. If a stop leaves the receipt holding a claim, its caller preserves that
 receipt and resumes with a fresh live maintenance attempt; it cannot abandon or
 reinitialize the receipt/token while the claim remains held.
 
-The complete current atomic-source inventory contains 522 call sites.
+The complete current atomic-source inventory contains 524 call sites.
 
 ### Caller-attempt-bound single mutation admission
 
