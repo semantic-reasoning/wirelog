@@ -128,6 +128,7 @@ testlib_prod_src = files(
     '../wirelog/columnar/tdd_channel.c',
     '../wirelog/columnar/eval_tdd_channel.c',
     '../wirelog/columnar/expr.c',
+    '../wirelog/intern_control.c',
     '../wirelog/columnar/filter.c',
     '../wirelog/columnar/frontier.c',
     '../wirelog/columnar/frontier_epoch.c',
@@ -2161,6 +2162,7 @@ backend_src = files(
   '../wirelog/columnar/ops.c',
   '../wirelog/columnar/arithmetic.c',
   '../wirelog/columnar/expr.c',
+    '../wirelog/intern_control.c',
   '../wirelog/columnar/filter.c',
   '../wirelog/columnar/join.c',
   '../wirelog/columnar/merge.c',
@@ -7103,5 +7105,16 @@ expression_bytes_exe = executable('test_evaluation_expression_bytes',
   link_with: [testlib_prod],
 )
 test('evaluation_expression_bytes', expression_bytes_exe,
+  suite: ['unit', 'tsan'], timeout: 60,
+)
+
+expression_intern_exe = executable('test_evaluation_expression_intern',
+  files('test_evaluation_expression_intern.c'),
+  c_args: ['-DWL_SESSION_TEST_HOOKS=1'],
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
+  link_with: [testlib_prod],
+)
+test('evaluation_expression_intern', expression_intern_exe,
   suite: ['unit', 'tsan'], timeout: 60,
 )

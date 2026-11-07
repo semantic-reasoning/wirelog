@@ -234,3 +234,91 @@ controller replacement without successor debit/hook invocation, and a real
 pin-held retired intern owner. The large length case stops after byte1024,
 then retries the same immutable input successfully. Empty spans still pay
 entry and final charges. No UTF-8 decoding is claimed by these byte helpers.
+
+## Transactional intern prerequisite (unit 3)
+
+`wl_intern_control_put_attempt` adds a separate attempt-bound transaction;
+raw `wl_intern_put_checked` is unchanged. Both governed and ungoverned tables
+are supported. An ungoverned table uses the explicit final guarded cutoff;
+a governed table also uses the existing attempt-bound reservation commit.
+Caller ownership (or a matching pin), immutable preparation input, stable
+governor attachment and exclusive output are required for the whole call.
+A nonzero return leaves the output untouched.
+
+Preparation scans, copies the NUL, then hashes the owned snapshot before taking
+the writer lock. All locked comparisons and publication use that snapshot.
+Each slot inspection, segment pointer initialization, slot initialization,
+migration record/store and destination probe has its own 224-unit region.
+Three separately admitted metadata regions cover count/segment/resize policy,
+checked byte dimensions and governor/token coherence. Fixed regions also admit
+entry, prepared-copy and locked checkpoints, resource caller scaffolding and
+first mandatory cleanup before acquisition. No callback can invoke another
+locking table operation from a locked test checkpoint. The prepared-copy
+checkpoint is explicitly unlocked.
+
+The byte helpers fund their own loops. Intern caller regions separately cover
+validation, helper arguments/returns, loop transitions, guarded admission,
+allocation returns and error dispatch. Each fixed/probe/initialization region
+has a 224-unit source allowance; allocator/mutex bodies are narrow boundaries.
+Migration never performs an input-sized raw strlen/hash/memset. Slot placement
+for the new string is completed in private storage before committing.
+
+Governed admission reserves the complete replacement footprint while the old
+one remains live, exactly as raw `reserve_growth` does:
+
+```
+replacement = old_retained - retired_slot_array
+              + string_bytes_including_NUL + new_segment + new_slot_array
+high_water  = old_retained + replacement
+```
+
+The old reservation's identity, COMMITTED state, governor, owner and byte
+count are checked under the writer lock before admission. Local destinations
+are initialized EMPTY. Commit uses the existing saved-attempt API; after it
+returns COMMITTED, ownership moves are guaranteed by those checked invariants.
+An impossible move failure aborts rather than returning partial ownership.
+
+Two prepaid fixed regions precede the final cutoff, funding publication and
+the first old-resource retirement caller. The indivisible publication suffix
+has two straight-line reservation moves (the existing 40-action ceiling each)
+and at most112 further caller/local publication actions: a conservative
+192-action ceiling, below quantum256. There are no hooks, variable loops or
+admissions in this suffix. The count uses the existing release-store protocol.
+Old slots and the old reservation are disposed before unlocking, so a following
+writer does not see a completed replacement plus its unretired old footprint.
+Free/mutex bodies and raw refund/release CAS contention are explicitly narrow
+mandatory-cleanup boundaries, not claimed finite by prepaid caller work.
+No cleanup hook/poll can charge a successor attempt.
+
+Before commit, a stop/error discards private buffers, rolls back pending credit
+and unlocks. Previously published count, slot capacity, IDs and reverse pointer
+identities are unchanged after return, and governor totals return to baseline.
+A duplicate requires no growth admission, including at an exhausted growth
+budget; its speculative copy is disposed after a separate guarded cutoff.
+ENOMEM, EOVERFLOW, EINVAL, `WL_INTERN_ERR_MEMORY_BUDGET` and control dispositions
+remain distinct. Advisory status retains the governor's actual finite-limit
+semantics; it does not imply that a configured usable limit can be ignored.
+
+Independent ungoverned work fixtures (T=224):
+
+| Fixture | Exact work |
+| --- | --- |
+| First `x`, allocating64 reverse pointers | 95T =21280 |
+| Duplicate `x`, one probe | 30T =6720 |
+| `c19` then unique `c42`, both in bucket32 | 50T =11200 |
+| `key00`..`key47` then `next`, resize64→128 | 1373T =307552 |
+
+The resize oracle counts10 old probes and nine length5 collision scans,
+128 slot initializations, 48 length5 migration records, 61 destination probes
+and one pending-entry probe; it is not inferred from successful consumed work.
+A separate76T boundary stops during the first reverse-segment initialization.
+Independent memory tests set high-water exact/one-byte-short at the first
+segment, resize and second segment; denied calls retain the original footprint
+and retry after raising the limit. Collision values, high-byte raw/controlled
+lookup, empty/UTF-8/NUL compatibility, allocation failure, copy/comparison and
+commit-cutoff stops, controller rebind, interrupted duplicates and real
+pin-held owner retirement are exercised. A second raw-writer thread is joined
+at the unlocked prepared-copy boundary, proving duplicate serialization
+without racing hook state. Late cancellation is tested at the first subsequent
+observable boundary, not by adding a hook inside irreversible publication.
+This unit does not admit any additional expression tag.
