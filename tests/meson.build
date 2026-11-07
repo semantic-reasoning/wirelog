@@ -6344,6 +6344,25 @@ test_colname_vars_exe = executable(
 
 test('colname_vars', test_colname_vars_exe)
 
+# Compiled with the library sources: the TDD decision stats it reads are
+# hidden in libwirelog.
+test_aggregate_key_expr_exe = executable(
+  'test_aggregate_key_expr',
+  files('test_aggregate_key_expr.c'),
+  backend_src,
+  parser_src,
+  ir_src,
+  optimizer_src,
+  arena_src,
+  io_src,
+  thread_src,
+  workqueue_src,
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
+)
+
+test('aggregate_key_expr', test_aggregate_key_expr_exe, timeout: 300)
+
 test_easy_nullary_remove_exe = executable(
   'test_easy_nullary_remove',
   files('test_easy_nullary_remove.c'),

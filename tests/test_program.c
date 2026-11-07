@@ -4026,6 +4026,11 @@ test_head_const_lane_mismatches_rejected(void)
         /* .decl after the rule */
         ".decl s(x: int64)\ns(1).\no(5000000000) :- s(_).\n"
         ".decl o(x: int32)\n",
+        /* a constant key of an aggregate head, before and after it */
+        ".decl s(x: int64)\ns(1).\n.decl o(k: int64, n: int64)\n"
+        "o(2.5, count(x)) :- s(x).\n",
+        ".decl s(x: int64)\ns(1).\n.decl o(n: int64, k: int32)\n"
+        "o(count(x), 5000000000) :- s(x).\n",
     };
 
     TEST("Head constants: constants that do not fit their lane rejected");
@@ -4057,10 +4062,11 @@ test_head_const_lane_controls(void)
         ".decl s(x: int64)\ns(1).\n.decl o(x: int32)\no(2147483647) :- s(_).\n",
         ".decl s(x: int64)\ns(1).\n.decl o(id: int64, v: f/2)\n"
         "o(1, 2) :- s(_).\n",
-        /* an aggregate head is not checked (#980), even a float key in
-         * an int64 column */
+        /* constant keys of an aggregate head */
         ".decl s(x: int64)\ns(1).\n.decl o(k: int64, n: int64)\n"
-        "o(2.5, count(x)) :- s(x).\n",
+        "o(7, count(x)) :- s(x).\n",
+        ".decl s(x: int64)\ns(1).\n.decl o(n: int64, k: float)\n"
+        "o(count(x), 2.5) :- s(x).\n",
     };
 
     TEST("Head constants: constants that fit their lane are accepted");

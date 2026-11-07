@@ -1716,15 +1716,20 @@ domain_check_rule(struct wirelog_program *program,
         }
     }
 
-    /* Pass D: the head.  An aggregate head reorders its columns (#980),
-     * so it is skipped. */
+    /* Pass D: the head.  In a head with an aggregate only the literal
+     * group-by keys are checked: REDUCE emits its columns in head order, so
+     * a key's head position is its column (validate_head_constants()), and
+     * the aggregate and the other keys are not checked. */
     const wl_ir_relation_info_t *rel = rc == 0
         ? domain_checked_relation(program, head) : NULL;
-    for (uint32_t c = 0; rel && c < head->child_count; c++)
+    bool aggregate = false;
+    for (uint32_t c = 0; c < head->child_count; c++)
         if (head->children[c]->type == WL_PARSER_AST_NODE_AGGREGATE)
-            rel = NULL;
+            aggregate = true;
     for (uint32_t c = 0; rel && rc == 0 && c < head->child_count; c++) {
         const wl_parser_ast_node_t *arg = head->children[c];
+        if (aggregate && !node_is_constant(arg))
+            continue;
         wirelog_column_type_t type = rel->columns[c].type;
         wl_ir_coltype_t value = domain_of_value(arg, &env);
         if (!domain_head_conflict(value,
@@ -1767,8 +1772,10 @@ validate_rule_value_domains(struct wirelog_program *program,
  * fact_lane_type().  An integer in a float lane is converted when the rule
  * is lowered; this pass rejects what cannot be stored: an integer binary64
  * cannot represent exactly, a float in a lane that is not float, a string
- * in a float lane, and an integer outside 32 bits in an int32 lane.  A head
- * with an aggregate is skipped, because #980 reorders its columns. */
+ * in a float lane, and an integer outside 32 bits in an int32 lane.  In a
+ * head with an aggregate this checks the literal group-by keys: REDUCE
+ * emits its columns in head order, so a key's head position is its lane,
+ * and the aggregate argument is not a literal. */
 static int
 validate_head_constants(struct wirelog_program *program,
     const wl_parser_ast_node_t *ast)
@@ -1783,12 +1790,6 @@ validate_head_constants(struct wirelog_program *program,
         const wl_ir_relation_info_t *rel
             = find_relation_info(program, head->name);
         if (!rel || (!rel->has_decl && !rel->schema_from_facts))
-            continue;
-        bool has_aggregate = false;
-        for (uint32_t c = 0; c < head->child_count; c++)
-            if (head->children[c]->type == WL_PARSER_AST_NODE_AGGREGATE)
-                has_aggregate = true;
-        if (has_aggregate)
             continue;
         for (uint32_t c = 0; c < head->child_count; c++) {
             const wl_parser_ast_node_t *arg = head->children[c];
@@ -3602,6 +3603,100 @@ wl_ir_program_push_constant_filters(const wl_parser_ast_node_t *rule_node,
     return true;
 }
 
+static bool
+ast_has_extension_call(const wl_parser_ast_node_t *node)
+{
+    if (!node)
+        return false;
+    if (node->type == WL_PARSER_AST_NODE_EXTENSION_CALL)
+        return true;
+    for (uint32_t i = 0; i < node->child_count; i++)
+        if (ast_has_extension_call(node->children[i]))
+            return true;
+    return false;
+}
+
+/* The body column of a head argument that is a body variable, or
+ * UINT32_MAX for any other argument. */
+static uint32_t
+head_arg_body_column(const wl_parser_ast_node_t *arg, char **cur_vars,
+    uint32_t cur_vcount)
+{
+    if (arg->type != WL_PARSER_AST_NODE_VARIABLE || !arg->name)
+        return UINT32_MAX;
+    for (uint32_t j = 0; j < cur_vcount; j++)
+        if (cur_vars[j] && strcmp(arg->name, cur_vars[j]) == 0)
+            return j;
+    return UINT32_MAX;
+}
+
+/* #2231: a group-by key that is not a body variable -- a constant or an
+ * expression -- has no body column to group by.  Lowering used the column
+ * at the key's head position, so `t(g * 10, count(x)) :- n(g, x).` with
+ * n(1, 1), n(1, 2) and n(2, 3) grouped by g and derived t(1, 2) and
+ * t(2, 1).  Such keys are computed by a PROJECT below the AGGREGATE: its
+ * first @key_count lanes are the keys in head order, a body column for a
+ * body variable and an expression otherwise, named "$gk<i>" (no identifier
+ * the lexer produces starts with `$`), and the rest carry every body
+ * column, so the AGGREGATE sees the same rows as before, one per body row.
+ * An integer constant key in a float column is its binary64 value, as in a
+ * rule head without an aggregate.  Returns the PROJECT, which owns
+ * @current, or NULL with @current untouched. */
+static wirelog_ir_node_t *
+build_group_key_project(const wl_parser_ast_node_t *head,
+    wirelog_ir_node_t *current, char **cur_vars, uint32_t cur_vcount,
+    const wl_ir_relation_info_t *head_rel, uint32_t key_count)
+{
+    uint32_t width = key_count + cur_vcount;
+    wirelog_ir_node_t *p = wl_ir_node_create(WIRELOG_IR_PROJECT);
+    if (!p)
+        return NULL;
+    p->project_count = width;
+    p->column_count = width;
+    p->project_indices = (uint32_t *)calloc(width, sizeof(uint32_t));
+    p->project_exprs = (wl_ir_expr_t **)calloc(width, sizeof(wl_ir_expr_t *));
+    p->column_names = (char **)calloc(width, sizeof(char *));
+    bool ok = p->project_indices && p->project_exprs && p->column_names;
+    uint32_t k = 0;
+    for (uint32_t i = 0; ok && i < head->child_count; i++) {
+        const wl_parser_ast_node_t *arg = head->children[i];
+        if (arg->type == WL_PARSER_AST_NODE_AGGREGATE)
+            continue;
+        uint32_t col = head_arg_body_column(arg, cur_vars, cur_vcount);
+        wirelog_column_type_t lane_type;
+        if (col != UINT32_MAX) {
+            p->project_indices[k] = col;
+        } else if (arg->type == WL_PARSER_AST_NODE_INTEGER && head_rel
+            && fact_lane_type(head_rel, i, &lane_type)
+            && lane_type == WIRELOG_TYPE_FLOAT) {
+            p->project_exprs[k] = wl_ir_expr_create(WL_IR_EXPR_CONST_FLOAT);
+            if (p->project_exprs[k])
+                p->project_exprs[k]->float_value = (double)arg->int_value;
+            ok = p->project_exprs[k] != NULL;
+        } else {
+            p->project_exprs[k] = convert_expr(arg);
+            ok = p->project_exprs[k] != NULL;
+        }
+        char name[32];
+        snprintf(name, sizeof(name), "$gk%u", k);
+        p->column_names[k] = strdup_safe(name);
+        ok = ok && p->column_names[k];
+        k++;
+    }
+    for (uint32_t j = 0; ok && j < cur_vcount; j++) {
+        p->project_indices[key_count + j] = j;
+        if (cur_vars[j]) {
+            p->column_names[key_count + j] = strdup_safe(cur_vars[j]);
+            ok = p->column_names[key_count + j] != NULL;
+        }
+    }
+    if (!ok || wl_ir_node_add_child(p, current) != 0) {
+        wl_ir_node_free(p);
+        return NULL;
+    }
+    return p;
+}
+
 /* ---- Single Rule Conversion ---- */
 
 static wirelog_ir_node_t *
@@ -4192,6 +4287,49 @@ convert_rule(const wl_parser_ast_node_t *rule_node,
                 }
             }
 
+            bool computed_keys = false;
+            for (uint32_t i = 0; i < head->child_count; i++) {
+                const wl_parser_ast_node_t *arg = head->children[i];
+                if (arg->type == WL_PARSER_AST_NODE_AGGREGATE)
+                    continue;
+                if (ast_has_extension_call(arg)) {
+                    wl_ir_program_set_error(prog,
+                        "scalar extension call in a group-by key of rule '%s'"
+                        " is not supported; compute it in a separate rule"
+                        " first", head->name ? head->name : "?");
+                    wl_ir_node_free(root);
+                    root = NULL;
+                    goto conversion_failed;
+                }
+                if (head_arg_body_column(arg, cur_vars, cur_vcount)
+                    == UINT32_MAX && arg->type != WL_PARSER_AST_NODE_VARIABLE)
+                    computed_keys = true;
+            }
+            /* Lanes the AGGREGATE reads: the body's, or the key PROJECT's. */
+            char **lane_names = cur_vars;
+            uint32_t lane_count = cur_vcount;
+            if (computed_keys && current) {
+                const wl_ir_relation_info_t *head_rel
+                    = find_relation_info(prog, head->name);
+                if (head_rel && !head_rel->has_decl
+                    && !head_rel->schema_from_facts)
+                    head_rel = NULL;
+                wirelog_ir_node_t *keyed = build_group_key_project(head,
+                        current, cur_vars, cur_vcount, head_rel,
+                        non_agg_count);
+                if (!keyed) {
+                    wl_ir_program_set_error(prog,
+                        "allocation failed while computing the group-by keys"
+                        " of rule '%s'", head->name ? head->name : "?");
+                    wl_ir_node_free(root);
+                    root = NULL;
+                    goto conversion_failed;
+                }
+                current = keyed;
+                lane_names = current->column_names;
+                lane_count = current->column_count;
+            }
+
             if (agg_node->child_count >= 1) {
                 root->agg_expr = convert_expr(agg_node->children[0]);
                 if (!root->agg_expr) {
@@ -4203,8 +4341,8 @@ convert_rule(const wl_parser_ast_node_t *rule_node,
                     root = NULL;
                     goto conversion_failed;
                 }
-                if (!rewrite_expr_vars_to_columns(root->agg_expr, cur_vars,
-                    cur_vcount)) {
+                if (!rewrite_expr_vars_to_columns(root->agg_expr, lane_names,
+                    lane_count)) {
                     wl_ir_program_set_error(prog,
                         "allocation failed while rewriting an aggregate "
                         "expression in rule '%s'",
@@ -4215,16 +4353,16 @@ convert_rule(const wl_parser_ast_node_t *rule_node,
                 }
             }
 
-            root->column_count = cur_vcount;
+            root->column_count = lane_count;
             bool root_names_ok = true;
-            if (cur_vcount > 0) {
+            if (lane_count > 0) {
                 root->column_names
-                    = (char **)calloc(cur_vcount, sizeof(char *));
+                    = (char **)calloc(lane_count, sizeof(char *));
                 if (root->column_names) {
-                    for (uint32_t j = 0; j < cur_vcount; j++) {
-                        if (cur_vars[j]) {
+                    for (uint32_t j = 0; j < lane_count; j++) {
+                        if (lane_names[j]) {
                             root->column_names[j]
-                                = dup_required_name(cur_vars[j]);
+                                = dup_required_name(lane_names[j]);
                             if (!root->column_names[j]) {
                                 root_names_ok = false;
                                 break;
@@ -4265,17 +4403,15 @@ convert_rule(const wl_parser_ast_node_t *rule_node,
                 for (uint32_t i = 0; i < head->child_count; i++) {
                     if (head->children[i]->type
                         != WL_PARSER_AST_NODE_AGGREGATE) {
-                        /* Resolve head variable name to body column index */
-                        const char *var = head->children[i]->name;
-                        uint32_t col_idx = i; /* fallback to head position */
-                        if (var) {
-                            for (uint32_t j = 0; j < cur_vcount; j++) {
-                                if (cur_vars[j]
-                                    && strcmp(var, cur_vars[j]) == 0) {
-                                    col_idx = j;
-                                    break;
-                                }
-                            }
+                        /* The key PROJECT puts key gi in lane gi. */
+                        uint32_t col_idx = gi;
+                        if (lane_names == cur_vars) {
+                            /* Resolve head variable name to body column
+                             * index; fallback to head position */
+                            col_idx = head_arg_body_column(head->children[i],
+                                    cur_vars, cur_vcount);
+                            if (col_idx == UINT32_MAX)
+                                col_idx = i;
                         }
                         if (root->group_by_indices)
                             root->group_by_indices[gi++] = col_idx;

@@ -294,6 +294,39 @@ static void read_failure(void)
     CHECK(wl_session_snapshot(f.session, observe, &e) == 0 && e.count == 4);
     destroy(&f);
 }
+/* #2231: a constant or expression group-by key is computed by a MAP lane
+ * below the REDUCE, which the cold decoder does not accept, so a cold
+ * binding for the body relation is refused rather than evaluated. */
+static void constant_group_key_refusal(void)
+{
+    static const struct {
+        const char *rule;
+        wl_columnar_spill_status_t expected;
+    } cases[] = {
+        { "result(k, count(v)) :- b(k, v).\n", OK },
+        { "result(1, count(v)) :- b(1, v).\n", WL_COLUMNAR_SPILL_UNSUPPORTED },
+        { "result(k * 10, count(v)) :- b(k, v).\n",
+          WL_COLUMNAR_SPILL_UNSUPPORTED },
+        { "result(1, v) :- b(1, v).\n", WL_COLUMNAR_SPILL_UNSUPPORTED },
+    };
+    for (unsigned i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        char text[256];
+        snprintf(text, sizeof(text), ".decl b(k: int64, v: int64)\n"
+            ".decl result(k: int64, n: int64)\n%s", cases[i].rule);
+        fixture_t f = fixture(text, 4 * 1024 * 1024, 1024 * 1024);
+        uint64_t before = reserved(&f);
+        wl_columnar_spill_status_t rc = wl_columnar_session_begin_cold_input(
+            f.session, "b");
+        if (rc != cases[i].expected)
+            fprintf(stderr, "cold group key %u: %s -> %d\n", i,
+                cases[i].rule, (int)rc);
+        CHECK(rc == cases[i].expected);
+        if (rc != OK)
+            CHECK(reserved(&f) == before);
+        destroy(&f);
+    }
+}
+
 static void exclusions(void)
 {
     for (unsigned kind = 0; kind < 7; kind++) {
@@ -5504,6 +5537,7 @@ int main(int argc, char **argv)
             projection_numeric_lanes(filtered != 0);
         }
         lifecycle(); rollback(); read_failure(); exclusions();
+        constant_group_key_refusal();
         empty_and_multiple();
         typed_projection(); quota_and_alias(); loaders(); generation_boundary();
         fixed_budget(); retention_lifetime(); fixed_floors();
