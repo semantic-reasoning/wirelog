@@ -7093,3 +7093,15 @@ test('expression_inventory_selftest', py3,
   args: [files('../scripts/ci/test-check-expression-inventory.py')],
   suite: 'abi',
 )
+
+# #2299 immutable bytes: independent limits and interruption/lifetime checks.
+expression_bytes_exe = executable('test_evaluation_expression_bytes',
+  files('test_evaluation_expression_bytes.c'),
+  c_args: ['-DWL_SESSION_TEST_HOOKS=1'],
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
+  link_with: [testlib_prod],
+)
+test('evaluation_expression_bytes', expression_bytes_exe,
+  suite: ['unit', 'tsan'], timeout: 60,
+)
