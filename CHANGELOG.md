@@ -248,6 +248,17 @@ All notable changes to wirelog are documented in this file.
 
 ### Fixed
 
+- **Integer facts in float columns hold their value** (#2231): `g(1).`
+  against `.decl g(x: float)` stored the integer's bits, so `p(x) :- g(x).`
+  derived `p(4.9406564584124654e-324)` and `g(-3).` failed to load. Such a
+  fact is now stored as the binary64 value of the integer, in whichever
+  order the `.decl` and the fact appear, and `wirelog_program_get_facts`
+  returns that value's bits. The same applies to `float` slots of `inline`
+  compounds. A float literal in an `inline` slot not declared `float` or in
+  any `side` handle column, and a string literal in a `float` column or
+  slot, are now rejected with `WIRELOG_ERR_PARSE`; previously they were
+  stored as raw bits or an intern id.
+
 - **`/* */` block comments are accepted** (#2231): the lexer handled only
   `#` and `//` comments, so a `/*` was lexed as a slash and the program
   failed to parse; `bench/workloads/doop.dl`, `ddisasm.dl`, `crdt.dl` and

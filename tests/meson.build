@@ -6117,6 +6117,16 @@ if not is_android
     suite: 'cli', timeout: 120,
   )
 
+  test('fact_literal_lanes',
+    baseline_py3,
+    args: [
+      files('test_fact_literal_lanes.py')[0],
+      wirelog_cli.full_path(),
+    ],
+    depends: wirelog_cli,
+    suite: 'cli', timeout: 120,
+  )
+
   test('cli_version',
     baseline_py3,
     args: [

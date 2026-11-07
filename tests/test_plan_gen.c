@@ -1562,7 +1562,9 @@ test_float_plan_lowering(void)
     };
     for (size_t i = 0; i < sizeof(sources) / sizeof(sources[0]); i++) {
         wirelog_program_t *prog = wirelog_parse_string(sources[i], &err);
-        if (i == 1) {
+        if (i == 1 || i == 2) {
+            /* #2231: a side compound column holds an integer handle, so a
+             * float fact is rejected there as in an integer column. */
             ASSERT(prog == NULL,
                 "decimal float fact must not enter integer column");
             continue;
