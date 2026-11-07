@@ -623,6 +623,33 @@ checked and legacy `to_number()` contracts.
 
 ---
 
+## Expression stack limit (Status: Current)
+
+The columnar evaluators hold an expression's operands on a stack of 64
+values. Plan generation computes, for each serialized expression of a
+relation's plan operators (filter predicates, including a join's right-side
+filter, head and MAP expressions, and aggregate operands other than
+`count`'s, which is never evaluated), the largest
+number of values its evaluation holds at once, and rejects the program when
+that exceeds 64 (#2231). A value is held while a later argument of the same
+operator is computed: `bor(0, bor(0, ... x))` with 63 nested calls is
+accepted and with 64 is rejected, and `5 = <63 nested calls>` is rejected
+because the `5` is held too. Nesting a binary operator only in its first
+argument, with the other arguments simple values, holds two values at any
+depth.
+
+The rejection is a plan error naming the relation; the CLI prints
+`Plan error:` and exits non-zero. Before, such an expression was evaluated
+with a value missing: a head or aggregate could get a wrong value, and a
+filter could keep rows it should drop or drop rows it should keep. The
+evaluators' 64-value stack is unchanged, and bytecode built outside plan
+generation keeps the full-stack rule under "Numeric MAP result schemas".
+`tests/test_expr_stack_limit.c` pins the boundary for heads, filters on
+either side of a comparison, aggregate operands and `str_replace`, and
+that a `count` over a deeper operand still plans.
+
+---
+
 ## v0.40 API audit closure (Status: Current)
 
 The v0.40 API audit (epic #680, Risk-C and Blocker-B series catalogued

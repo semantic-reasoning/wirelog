@@ -733,6 +733,21 @@ subject to the literal syntax rules above. Call parentheses, such as those in
 general grouping parentheses. Use an intermediate relation when a different
 arithmetic grouping is needed.
 
+### Expression depth limit
+
+An expression is evaluated on a stack that holds 64 values. A value stays on
+the stack while a later argument of the same call or operator is computed.
+Nesting a binary call in its last argument, as in `bor(0, bor(0, x))`, holds
+one more value per level; `substr` and `str_replace` nested in their last
+argument hold two more. Nesting only in the first argument, with the other
+arguments simple values, holds the same number of values at any depth. So
+`bor(0, ... x)` with 63 nested calls fits and with 64 does not, and in
+`5 = bor(0, ... x)` the `5` is held as well, so 62 calls fit. An expression
+that does not fit is rejected when the program is planned, with an error
+naming the relation (#2231); compute part of it in a separate rule. The
+operand of `count` is never evaluated, so it is not checked. See
+[SEMANTICS.md](SEMANTICS.md#expression-stack-limit-status-current).
+
 ### Bitwise Operators
 
 `band(x, y)`, `bor(x, y)`, `bxor(x, y)`, `bnot(x)`, `bshl(x, y)`, `bshr(x, y)`

@@ -122,6 +122,24 @@ CASES = [
         'plan_label(x, min(9)) :- plan_big(x).\n',
         ["same stratum", "plan_label", "plan_big"],
     ),
+    # An expression that holds more than 64 values at once is a plan error
+    # (#2231); it used to be evaluated with a value missing.
+    (
+        "expression stack limit in a head",
+        '.decl n(x: int64)\n.decl stackdepthheadrelation(x: int64)\n'
+        'n(5).\n'
+        'stackdepthheadrelation(' + 'bor(0, ' * 64 + 'x' + ')' * 64
+        + ') :- n(x).\n',
+        ["stackdepthheadrelation"],
+    ),
+    (
+        "expression stack limit in a filter",
+        '.decl n(x: int64)\n.decl stackdepthfilterrelation(x: int64)\n'
+        'n(5).\n'
+        'stackdepthfilterrelation(x) :- n(x), '
+        + 'bor(0, ' * 64 + 'x' + ')' * 64 + ' = 5.\n',
+        ["stackdepthfilterrelation"],
+    ),
 ]
 
 # A syntactically malformed program.  This is the errbuf that
@@ -140,6 +158,21 @@ VALID = (
     'reach(x, y) :- e(x, y).\n'
     'reach(x, z) :- reach(x, y), e(y, z).\n'
 )
+
+STACK_CONTROLS = [
+    (
+        "stack_head_63",
+        '.decl n(x: int64)\n.decl m(x: int64)\n.output m\nn(5).\n'
+        'm(' + 'bor(0, ' * 63 + 'x' + ')' * 63 + ') :- n(x).\n',
+        "m(5)",
+    ),
+    (
+        "stack_cat_63",
+        '.decl n(x: int64)\n.decl q(s: string)\n.output q\nn(5).\n'
+        'q(' + 'cat("a", ' * 63 + '"b"' + ')' * 63 + ') :- n(_).\n',
+        'q("' + 'a' * 63 + 'b")',
+    ),
+]
 
 
 def _scrubbed_env():
@@ -237,6 +270,17 @@ def main() -> int:
             ok = _fail(
                 "control: the valid program must still evaluate "
                 "(reach(1, 3) missing); stdout was %r" % r.stdout.strip())
+
+        # Control: the deepest expressions that fit still evaluate, and a
+        # string built by 63 nested cat() calls keeps its last operand.
+        for label, text, want in STACK_CONTROLS:
+            r = _run(exe, text, tmpdir, label)
+            if r.returncode != 0 or want not in r.stdout:
+                ok = _fail(
+                    "%s: expected exit 0 and %r in stdout, got %d\n"
+                    "  stdout was: %r\n  stderr was: %r"
+                    % (label, want, r.returncode, r.stdout.strip(),
+                       r.stderr.strip()))
 
     if not ok:
         return 1

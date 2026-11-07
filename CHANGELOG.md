@@ -248,6 +248,14 @@ All notable changes to wirelog are documented in this file.
 
 ### Fixed
 
+- **Expressions deeper than the evaluator's stack are rejected** (#2231):
+  an expression whose evaluation holds more than 64 values at once, such as
+  64 calls nested in the last argument of `bor(0, bor(0, ... x))`, is now a
+  plan error naming the relation. It used to be evaluated with a value
+  missing: `m(<64 nested calls>) :- n(x).` with `n(5)` derived `m(0)`, and a
+  filter could keep rows it should drop or drop rows it should keep.
+  Nesting in the first argument is unaffected.
+
 - **Aggregate heads group by constant and expression keys** (#2231):
   `t(g * 10, count(x)) :- n(g, x).` with `n(1, 1)`, `n(1, 2)` and `n(2, 3)`
   derived `t(1, 2)` and `t(2, 1)`: a constant or expression group-by key
