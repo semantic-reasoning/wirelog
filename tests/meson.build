@@ -6996,10 +6996,28 @@ test_evaluation_join_hosts_exe = executable(
   c_args: ['-DWL_SESSION_TEST_HOOKS=1'],
   link_with: [testlib_prod],
 )
-foreach join_host_case : ['domains', 'recovery', 'failures', 'funding']
+# Each complete wide session history owns its existing watchdog. Keep every
+# domain tuple, including raw/repeat/cleanup, without a redundant aggregate.
+foreach join_host_case : [
+  'domains-empty-plain', 'domains-empty-filtered',
+  'domains-kind0', 'domains-kind2', 'domains-kind3', 'domains-kind4',
+  'domains-kind5', 'domains-kind6', 'domains-kind7', 'domains-kind8',
+  'domains-kind9', 'domains-kind11',
+  'domains-wide-plain', 'domains-wide-timestamped', 'domains-capacity',
+  'recovery', 'failures', 'funding',
+]
+  join_host_suites = ['unit', 'tsan', 'evaluation_join_hosts']
+  if join_host_case.startswith('domains-')
+    join_host_suites += ['evaluation_join_host_domains']
+  endif
+  # Complete wide histories need an exclusive scheduler slot under TSan.
+  join_host_parallel = true
+  if join_host_case in ['domains-wide-plain', 'domains-wide-timestamped']
+    join_host_parallel = false
+  endif
   test('evaluation_join_hosts_' + join_host_case,
        test_evaluation_join_hosts_exe, args: [join_host_case],
-       suite: ['unit', 'tsan', 'evaluation_join_hosts'], timeout: 60)
+       suite: join_host_suites, timeout: 60, is_parallel: join_host_parallel)
 endforeach
 
 # #2298: real generated LFTJ session admission, metadata and recovery.
@@ -7066,8 +7084,20 @@ test_evaluation_join_probes_exe = executable(
   c_args: ['-DWL_SESSION_TEST_HOOKS=1'],
   link_with: [testlib_prod],
 )
-test('evaluation_join_probes', test_evaluation_join_probes_exe,
-     suite: ['unit', 'tsan', 'evaluation_join_hosts'], timeout: 60)
+# Measurement/retry comparisons remain within one complete named history.
+foreach join_probe_case : [
+  'keys', 'keys-wide0', 'keys-wide1', 'keys-wide2', 'bindings',
+  'domains0', 'domains1', 'domains2', 'domains3', 'domains4', 'domains5',
+  'schema0', 'schema1',
+  'events0', 'events1', 'events2', 'events3', 'events4',
+  'allocations0', 'allocations1', 'allocations2', 'schema-final-denial',
+  'first-semi', 'first-anti', 'funding',
+]
+  test('evaluation_join_probes_' + join_probe_case,
+       test_evaluation_join_probes_exe, args: [join_probe_case],
+       suite: ['unit', 'tsan', 'evaluation_join_hosts', 'evaluation_join_probes'],
+       timeout: 60)
+endforeach
 
 # #2297: authentic unspecialized empty descriptors retain both source gates.
 test_relation_empty_source_exe = executable(
