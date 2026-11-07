@@ -248,6 +248,14 @@ All notable changes to wirelog are documented in this file.
 
 ### Fixed
 
+- **`int32` columns reject values outside 32 bits** (#2231): an inline fact
+  such as `g(5000000000).` against `.decl g(x: int32)`, or such a value in a
+  CSV `.input` file, was stored unchanged although the column is documented
+  as 32-bit and `wirelog_session_insert_typed` already refused it. Both are
+  now rejected: the fact with `WIRELOG_ERR_PARSE`, including in an `int32`
+  slot of an `inline` compound, and the CSV file when it is loaded. Other
+  `.input` adapters are not checked.
+
 - **Integer facts in float columns hold their value** (#2231): `g(1).`
   against `.decl g(x: float)` stored the integer's bits, so `p(x) :- g(x).`
   derived `p(4.9406564584124654e-324)` and `g(-3).` failed to load. Such a

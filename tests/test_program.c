@@ -3855,6 +3855,13 @@ test_fact_lane_mismatches_rejected(void)
           "float fact for non-float column 0" },
         { ".decl g(x: float)\ng(9007199254740993).\n",
           "is not exactly representable" },
+        { ".decl g(x: int32)\ng(2147483648).\n",
+          "integer fact 2147483648 for int32 column 0" },
+        { ".decl g(x: int32)\ng(-2147483649).\n",
+          "integer fact -2147483649 for int32 column 0" },
+        { ".decl g(id: int64, v: f(int32, int64) inline)\n"
+          "g(1, 5000000000, 3).\n",
+          "integer fact 5000000000 for int32 column 1" },
     };
 
     TEST("Fact lanes: literals that do not fit their lane are rejected");
@@ -3880,7 +3887,7 @@ test_fact_lane_mismatches_rejected(void)
 static void
 test_fact_lane_controls(void)
 {
-    TEST("Fact lanes: integers in symbol and handle lanes are kept");
+    TEST("Fact lanes: integers in symbol, int32 and handle lanes kept");
     struct wirelog_program *sym = make_program(".decl g(x: symbol)\ng(7).\n");
     const wl_ir_relation_info_t *g = relation_named(sym, "g");
     bool ok = g && g->fact_data && g->fact_data[0] == 7;
@@ -3891,6 +3898,13 @@ test_fact_lane_controls(void)
     ok = ok && str != NULL;
     if (str)
         wl_ir_program_free(str);
+    struct wirelog_program *edge = make_program(".decl g(x: int32)\n"
+            "g(2147483647).\ng(-2147483648).\n");
+    const wl_ir_relation_info_t *e = relation_named(edge, "g");
+    ok = ok && e && e->fact_data && e->fact_data[0] == INT32_MAX
+        && e->fact_data[1] == INT32_MIN;
+    if (edge)
+        wl_ir_program_free(edge);
     struct wirelog_program *handle = make_program(".decl g(id: int64,"
             " v: f/2)\ng(1, 2).\n");
     const wl_ir_relation_info_t *h = relation_named(handle, "g");
