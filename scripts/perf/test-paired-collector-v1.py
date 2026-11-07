@@ -295,6 +295,124 @@ class CollectorTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'profile'):
             M['collect'](self.args)
 
+    def test_cleanup_deadline_and_escalation_observations(self):
+        cases = (
+            ('responsive', False, None, 143, False, False),
+            ('stubborn', False, None, -9, True, True),
+            ('descendant', False, None, 143, True, False),
+            ('poll-send-race', False, None, 143, True, True),
+            ('stubborn', True, None, -9, True, True),
+            ('stubborn', False, 'error', -9, True, None),
+            ('stubborn', False, 'interrupt', None, True, None),
+        )
+        for mode, wait_error, observer_error, expected, killed, leader_alive in cases:
+            with self.subTest(mode=mode, wait_error=wait_error, observer_error=observer_error):
+                state = dict(now=0.0, group=True, leader=None, killed=False)
+                delivered, waits = [], []
+
+                def sleep(seconds):
+                    self.assertGreater(seconds, 0)
+                    state['now'] += seconds
+
+                def poll():
+                    if state['now'] >= 2.5 and not state['killed']:
+                        if observer_error == 'error':
+                            raise OSError('poll unavailable')
+                        if observer_error == 'interrupt':
+                            raise KeyboardInterrupt()
+                    return state['leader']
+
+                def send(pgid, number):
+                    self.assertEqual(pgid, 123)
+                    if not state['group']:
+                        raise ProcessLookupError()
+                    delivered.append((number, state['now']))
+                    if number == signal.SIGTERM:
+                        if mode == 'responsive':
+                            state.update(leader=143, group=False)
+                        elif mode == 'descendant':
+                            state['leader'] = 143
+                    elif number == signal.SIGKILL:
+                        if mode == 'poll-send-race':
+                            state['leader'] = 143
+                        elif state['leader'] is None:
+                            state['leader'] = -9
+                        state.update(group=False, killed=True)
+
+                def wait(timeout):
+                    waits.append(timeout)
+                    if wait_error:
+                        raise subprocess.TimeoutExpired('probe', timeout)
+                    return state['leader']
+
+                process = SimpleNamespace(pid=123, poll=poll, wait=wait)
+                clock = SimpleNamespace(monotonic=lambda: state['now'], sleep=sleep)
+                raw = {}
+                with patch.dict(G, time=clock), patch('os.killpg', side_effect=send):
+                    if observer_error == 'interrupt':
+                        with self.assertRaises(KeyboardInterrupt):
+                            M['cleanup_process_group'](process, raw)
+                    else:
+                        M['cleanup_process_group'](process, raw)
+                self.assertEqual(raw['cleanup_escalation'], dict(
+                    sigkill_sent=killed, leader_alive_before_sigkill=leader_alive))
+                self.assertEqual(delivered[0], (signal.SIGTERM, 0))
+                kills = [when for number, when in delivered if number == signal.SIGKILL]
+                if killed:
+                    self.assertEqual(len(kills), 1)
+                    self.assertAlmostEqual(kills[0], 2.5)
+                else:
+                    self.assertEqual(kills, [])
+                if observer_error == 'interrupt':
+                    self.assertNotIn('exit_code', raw)
+                    self.assertEqual(waits, [])
+                else:
+                    self.assertEqual(raw['exit_code'], expected)
+                    self.assertEqual(waits, [1])
+                if wait_error:
+                    self.assertIn('TimeoutExpired', raw['cleanup_error'])
+                elif observer_error == 'error':
+                    self.assertIn('poll-before-kill: OSError', raw['cleanup_error'])
+                else:
+                    self.assertNotIn('cleanup_error', raw)
+
+    def test_stopped_ready_launcher_records_forced_cleanup(self):
+        code = '''import signal, sys
+def stop(number, frame):
+    sys.exit(128 + number)
+signal.signal(signal.SIGTERM, stop)
+print('handler-ready', flush=True)
+signal.pause()
+'''
+        process = subprocess.Popen([sys.executable, '-c', code], start_new_session=True,
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                   text=True, encoding='utf-8')
+        try:
+            self.assertTrue(select.select([process.stdout], [], [], 10)[0])
+            self.assertEqual(process.stdout.readline(), 'handler-ready\n')
+            os.kill(process.pid, signal.SIGSTOP)
+            pid, status = os.waitpid(process.pid, os.WUNTRACED)
+            self.assertEqual(pid, process.pid)
+            self.assertTrue(os.WIFSTOPPED(status))
+            self.assertEqual(os.WSTOPSIG(status), signal.SIGSTOP)
+            raw = {}
+            M['cleanup_process_group'](process, raw)
+            self.assertEqual(raw['exit_code'], -signal.SIGKILL)
+            self.assertEqual(raw['cleanup_escalation'], dict(
+                sigkill_sent=True, leader_alive_before_sigkill=True))
+            self.assertNotIn('cleanup_error', raw)
+            self.assertEqual(process.communicate(timeout=10), ('', ''))
+            with self.assertRaises(ProcessLookupError):
+                os.killpg(process.pid, 0)
+        finally:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            process.wait(timeout=10)
+            process.stdout.close()
+            process.stderr.close()
+
     def test_termination_signals_persist_active_launch_and_reap_group(self):
         for iteration, number in ((i, s) for i in range(5) for s in (signal.SIGTERM, signal.SIGHUP)):
             with self.subTest(signal=number, iteration=iteration):
@@ -347,7 +465,12 @@ signal.pause()
                     self.assertEqual(raw['signal_name'], signal.Signals(number).name)
                     self.assertEqual(raw['stdout'], 'active partial output\n')
                     self.assertEqual(raw['stderr'], 'active partial stderr\n')
-                    self.assertEqual(raw['exit_code'], 128 + signal.SIGTERM)
+                    self.assertNotIn('cleanup_error', raw)
+                    if raw['exit_code'] == -signal.SIGKILL:
+                        self.assertIs(raw['cleanup_escalation']['sigkill_sent'], True)
+                        self.assertIs(raw['cleanup_escalation']['leader_alive_before_sigkill'], True)
+                    else:
+                        self.assertEqual(raw['exit_code'], 128 + signal.SIGTERM)
                     self.assertTrue(raw['host_before']['time_utc'])
                     self.assertTrue(raw['host_after']['time_utc'])
                     self.assertFalse((self.args.out_dir / 'campaign-v1.json').exists())
