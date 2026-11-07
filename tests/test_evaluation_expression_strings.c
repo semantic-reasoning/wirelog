@@ -766,7 +766,345 @@ static void scalar_interruption(void) {
     wl_columnar_memory_governor_ref_release(g);
 }
 
+static void utf8_primitives(void) {
+    struct vector { const char *text; size_t advance; int64_t cp;
+                    unsigned reads; } cases[] = {
+        {"", 0, -1, 1}, {"A", 1, 65, 1}, {"\xC2\xA2", 2, 162, 2},
+        {"\xE2\x82\xAC", 3, 8364, 3}, {"\xF0\x9F\x98\x80", 4, 128512, 4},
+        {"\x80", 1, -1, 1}, {"\xFF", 1, -1, 1}, {"\xC2" "A", 1, -1, 2},
+        {"\xE1\x80" "A", 2, -1, 3}, {"\xF1\x80\x80" "A", 3, -1, 4},
+        {"\xC0\x80", 2, 0, 2}, {"\xED\xA0\x80", 3, 55296, 3},
+        {"\xF4\x90\x80\x80", 4, 1114112, 4},
+        {"\xC2", 1, -1, 2}, {"\xE1", 1, -1, 2}, {"\xE1\x80", 2, -1, 3},
+        {"\xF1", 1, -1, 2}, {"\xF1\x80", 2, -1, 3}, {"\xF1\x80\x80", 3, -1, 4}
+    };
+    for (unsigned i = 0; i < sizeof(cases)/sizeof(*cases); ++i) {
+        size_t length = strlen(cases[i].text);
+        char *exact_storage = malloc(length + 1);
+        CHECK(exact_storage); memcpy(exact_storage, cases[i].text, length + 1);
+        for (unsigned shortfall = 0; shortfall < 2; ++shortfall) {
+            uint64_t limit = 224 * (2 + cases[i].reads) - shortfall;
+            wl_evaluation_control_t *c = begin(limit);
+            size_t advance = 999; int64_t cp = 999;
+            int rc =
+                wl_columnar_expr_utf8_next_attempt_controlled(exact_storage,
+                    &advance, &cp, c,
+                    wl_evaluation_control_active_attempt_id(c));
+            if (shortfall) CHECK(rc == WL_EVALUATION_CONTROL_WORK_LIMIT &&
+                    advance == 999 && cp == 999);
+            else CHECK(!rc && advance == cases[i].advance && cp == cases[i].cp);
+            finish(c, rc);
+        }
+        free(exact_storage);
+    }
+    for (unsigned phase = 90; phase <= 92; ++phase) {
+        wl_evaluation_control_t *c = begin(0);
+        stop_phase = phase; stop_progress = phase == 91 ? 2 : 0;
+        wl_columnar_expr_test_checkpoint = witness;
+        size_t advance = 999; int64_t cp = 999;
+        int rc = wl_columnar_expr_utf8_next_attempt_controlled("\xE2\x82\xAC",
+                &advance, &cp,
+                c, wl_evaluation_control_active_attempt_id(c));
+        wl_columnar_expr_test_checkpoint = NULL; stop_phase = 0;
+        CHECK(rc == WL_EVALUATION_CONTROL_CANCELLED && advance == 999 &&
+            cp == 999);
+        finish(c, rc);
+    }
+}
+static void direct_readers(void) {
+    const uint8_t tags[] = {WL_PLAN_EXPR_STR_FN_STRLEN,
+                            WL_PLAN_EXPR_STR_FN_STR_ORD,
+                            WL_PLAN_EXPR_STR_FN_CONTAINS,
+                            WL_PLAN_EXPR_STR_FN_STR_PREFIX,
+                            WL_PLAN_EXPR_STR_FN_STR_SUFFIX};
+    const char *strings[] = {"", "a", "aaaaab", "aaab", "\xC2" "A",
+                             "\xE1\x80" "A",
+                             "\xF1\x80\x80" "A", "\xC0\x80", "\xED\xA0\x80",
+                             "\xF4\x90\x80\x80", "\xF1\x80"};
+    wl_intern_t *intern = wl_intern_create(); CHECK(intern);
+    int64_t ids[sizeof(strings)/sizeof(*strings)];
+    for (unsigned i = 0; i < sizeof(strings)/sizeof(*strings); ++i) {
+        ids[i] = wl_intern_put(intern, strings[i]); CHECK(ids[i] >= 0);
+    }
+    for (unsigned tag = 0; tag < 5; ++tag)
+        for (unsigned null_context = 0; null_context < 2; ++null_context)
+            for (int a = -2; a < (int)(sizeof(ids)/sizeof(*ids)); ++a)
+                for (int b = -1;
+                    b < (tag < 2 ? 0 : (int)(sizeof(ids)/sizeof(*ids))); ++b){
+                    uint8_t bytes[24]; uint32_t n = 0;
+                    int64_t av = a < 0 ? -1 : ids[a], bv = b < 0 ? -1 : ids[b];
+                    if (a != -2) {
+                        bytes[n++] = WL_PLAN_EXPR_CONST_INT;
+                        memcpy(bytes+n, &av, 8); n += 8;
+                    }
+                    if (tag >= 2 && a != -2) {
+                        bytes[n++] = WL_PLAN_EXPR_CONST_INT;
+                        memcpy(bytes+n, &bv, 8); n += 8;
+                    }
+                    bytes[n++] = tags[tag];
+                    wl_evaluation_control_t *c = begin(0);
+                    wl_columnar_expr_attempt_scalar_t *program = NULL;
+                    bool supported = false;
+                    CHECK(!wl_columnar_expr_compile_scalar_attempt_controlled(
+                            bytes, n, NULL,
+                            &program, &supported, c,
+                            wl_evaluation_control_active_attempt_id(c)) &&
+                        supported);
+                    wl_columnar_expr_context_t context =
+                    {.intern = null_context ? NULL : intern};
+                    int64_t raw = 999, value = 999; bool failed = true;
+                    wl_columnar_expr_status_t status, raw_status;
+                    int rawrc = wl_columnar_expr_eval_run_ctx(bytes, n, NULL, 0,
+                            &raw, &context, &raw_status);
+                    CHECK(!wl_columnar_expr_eval_scalar_attempt_controlled(
+                            program, NULL, 0, &context,
+                            &value, &failed, &status, c,
+                            wl_evaluation_control_active_attempt_id(c)));
+                    CHECK(value == raw && failed == (rawrc != 0) &&
+                        status == raw_status);
+                    wirelog_column_type_t type = WIRELOG_TYPE_FLOAT;
+                    CHECK(
+                        !wl_columnar_expr_scalar_result_type_attempt_controlled(
+                            program, NULL, 0,
+                            &type, &supported, c,
+                            wl_evaluation_control_active_attempt_id(c)) &&
+                        supported);
+                    CHECK(type ==
+                        (tag < 2 ? WIRELOG_TYPE_INT64 : WIRELOG_TYPE_BOOL));
+                    wl_columnar_expr_attempt_scalar_free(program); finish(c, 0);
+                }
+    wl_intern_free(intern);
+}
+static unsigned utf8_rebind_phase;
+static void utf8_rebind(wl_evaluation_control_t *c, unsigned phase,
+    uint64_t progress, bool failed) {
+    (void)failed;
+    if (c && phase == utf8_rebind_phase &&
+        progress >= (phase == 91 ? 2u : 0u) && !rebound){
+        rebound = true;
+        CHECK(!wl_evaluation_control_finish(c, &direct_owner, 0, 0));
+        CHECK(!wl_evaluation_control_reset(c));
+        CHECK(!wl_evaluation_control_begin(c, &direct_owner));
+    }
+}
+static void reader_interruption(void) {
+    for (unsigned phase = 91; phase <= 92; ++phase) {
+        wl_evaluation_control_t *c = begin(0);
+        uint64_t old = wl_evaluation_control_active_attempt_id(c);
+        rebound = false; utf8_rebind_phase = phase;
+        wl_columnar_expr_test_checkpoint = utf8_rebind;
+        size_t advance = 999; int64_t cp = 999;
+        int rc = wl_columnar_expr_utf8_next_attempt_controlled("\xE2\x82\xAC",
+                &advance, &cp, c, old);
+        wl_columnar_expr_test_checkpoint = NULL;
+        CHECK(rebound && rc == EINVAL && advance == 999 && cp == 999);
+        uint64_t consumed = 999;
+        CHECK(!wl_evaluation_control_test_active_consumed(c,
+            wl_evaluation_control_active_attempt_id(c),
+            &consumed) && !consumed);
+        finish(c, 0);
+    }
+    const uint8_t tags[] = {WL_PLAN_EXPR_STR_FN_STRLEN,
+                            WL_PLAN_EXPR_STR_FN_STR_ORD,
+                            WL_PLAN_EXPR_STR_FN_CONTAINS,
+                            WL_PLAN_EXPR_STR_FN_STR_PREFIX,
+                            WL_PLAN_EXPR_STR_FN_STR_SUFFIX};
+    const unsigned phases[] = {94, 91, 47, 42, 42};
+    wl_intern_t *intern = wl_intern_create(); CHECK(intern);
+    int64_t a = wl_intern_put(intern, "\xE2\x82\xAC" "aaaaab"),
+        b = wl_intern_put(intern, "aaaab");
+    CHECK(a >= 0 && b >= 0);
+    for (unsigned tag = 0; tag < 5; ++tag) {
+        uint8_t bytes[24]; uint32_t n = 0;
+        bytes[n++] = WL_PLAN_EXPR_CONST_INT; memcpy(bytes+n, &a, 8); n += 8;
+        if (tag >= 2) {
+            bytes[n++] = WL_PLAN_EXPR_CONST_INT; memcpy(bytes+n, &b, 8); n += 8;
+        }
+        bytes[n++] = tags[tag];
+        wl_evaluation_control_t *c = begin(0);
+        wl_columnar_expr_attempt_scalar_t *program = NULL;
+        bool supported = false;
+        CHECK(!wl_columnar_expr_compile_scalar_attempt_controlled(bytes, n,
+            NULL,
+            &program, &supported, c,
+            wl_evaluation_control_active_attempt_id(c)) && supported);
+        wl_columnar_expr_context_t context = {.intern = intern};
+        stop_phase = phases[tag];
+        stop_progress = tag == 0 ? 1 : tag == 1 || tag == 2 ? 1 : 0;
+        wl_columnar_expr_test_checkpoint = witness;
+        int64_t value = 999; bool failed = true;
+        wl_columnar_expr_status_t status = WL_COLUMNAR_EXPR_INVALID_RESULT;
+        int rc = wl_columnar_expr_eval_scalar_attempt_controlled(program, NULL,
+                0, &context,
+                &value, &failed, &status, c,
+                wl_evaluation_control_active_attempt_id(c));
+        wl_columnar_expr_test_checkpoint = NULL; stop_phase = 0;
+        CHECK(rc == WL_EVALUATION_CONTROL_CANCELLED && value == 999 && failed &&
+            status == WL_COLUMNAR_EXPR_INVALID_RESULT);
+        CHECK(wl_evaluation_control_finish(c, &direct_owner, 0, 0) == rc);
+        CHECK(!wl_evaluation_control_reset(c));
+        CHECK(!wl_evaluation_control_begin(c, &direct_owner));
+        CHECK(!wl_columnar_expr_eval_scalar_attempt_controlled(program, NULL, 0,
+            &context,
+            &value, &failed, &status, c,
+            wl_evaluation_control_active_attempt_id(c)) && !failed);
+        wl_columnar_expr_attempt_scalar_free(program); finish(c, 0);
+    }
+    wl_intern_free(intern);
+}
+static const char *reader_words[] = {"", "a", "ba", "ab", "bbb"};
+static int64_t reader_values(unsigned op, const char *s) {
+    switch (op) {
+    case 0: return (int64_t)strlen(s);
+    case 1: return *s ? (unsigned char)*s : -1;
+    case 2: return strchr(s, 'a') != NULL;
+    case 3: return *s == 'a';
+    default: return *s && s[strlen(s)-1] == 'a';
+    }
+}
+static void reader_delta(const char *relation, const int64_t *row,
+    uint32_t cols,
+    int32_t diff, void *arg) {
+    fixture_t *f = arg;
+    CHECK(!strcmp(relation, "out") && cols == 6 && (diff == 1 || diff == -1));
+    const char *s = wl_intern_reverse(f->plan->intern, row[0]); CHECK(s);
+    for (unsigned i = 0; i < 5; ++i) CHECK(row[i+1] == reader_values(i, s));
+    ++events; positives += diff == 1; negatives += diff == -1;
+}
+static void check_reader_map(fixture_t *f, unsigned count) {
+    col_rel_t *out = session_find_rel(COL_SESSION(f->session), "out");
+    CHECK(out && out->ncols == 6 && out->nrows == count);
+    bool seen[5] = {0};
+    for (uint32_t r = 0; r < count; ++r) {
+        const char *s = wl_intern_reverse(f->plan->intern, out->columns[0][r]);
+        CHECK(s);
+        unsigned k = 0; while (k < 5 && strcmp(s, reader_words[k])) ++k;
+        CHECK(k < 5 && !seen[k]); seen[k] = true;
+        for (unsigned i = 0; i < 5;
+            ++i) CHECK(out->columns[i+1][r] == reader_values(i, s));
+    }
+}
+static unsigned reader_filter_op;
+static void reader_filter_delta(const char *relation, const int64_t *row,
+    uint32_t cols, int32_t diff, void *arg) {
+    fixture_t *f = arg;
+    CHECK(!strcmp(relation, "out") && cols == 1 && (diff == 1 || diff == -1));
+    const char *word = wl_intern_reverse(f->plan->intern, row[0]);
+    CHECK(word && reader_values(reader_filter_op, word) > 0);
+    ++events; positives += diff == 1; negatives += diff == -1;
+}
+static bool reader_exhaust;
+static void reader_session_stop(wl_evaluation_control_t *c, unsigned phase,
+    uint64_t progress, bool failed) {
+    (void)failed;
+    if (c && phase == 94 && progress >= 1) {
+        if (reader_exhaust) CHECK(wl_evaluation_control_charge(c,
+                UINT64_MAX) == WL_EVALUATION_CONTROL_WORK_LIMIT);
+        else wl_evaluation_control_request_cancel(c);
+    }
+}
+static void session_readers(void) {
+    const char *fn[] = {"strlen(x) > 0", "str_ord(x) > 0", "contains(x,\"a\")",
+                        "str_prefix(x,\"a\")", "str_suffix(x,\"a\")"};
+    for (unsigned op = 0; op < 5; ++op) for (unsigned mode = 0; mode < 2;
+            ++mode){
+            char source[512]; snprintf(source, sizeof(source),
+                ".decl input(x:string)\n.decl out(x:string)\nout(x) :- input(x), %s.\n",
+                fn[op]);
+            fixture_t f = create(source, mode != 0);
+            reader_filter_op = op; events = positives = negatives = 0;
+            wl_session_set_delta_cb(f.session, reader_filter_delta, &f);
+            CHECK(!step_complete(f.session));
+            col_rel_t *empty = session_find_rel(COL_SESSION(f.session), "out");
+            CHECK(empty && !empty->nrows);
+            for (unsigned i = 0; i < 5; ++i) add(&f, reader_words[i]);
+            const unsigned phases[] = {94, 91, 47, 42, 42};
+            stop_phase = phases[op]; stop_progress = op == 0 ? 1 : 0;
+            wl_columnar_expr_test_checkpoint = witness;
+            CHECK(step_complete(f.session) == WL_EVALUATION_CONTROL_CANCELLED);
+            wl_columnar_expr_test_checkpoint = NULL; stop_phase = 0;
+            CHECK(!events);
+            empty = session_find_rel(COL_SESSION(f.session), "out");
+            CHECK(empty && !empty->nrows);
+            CHECK(!wl_evaluation_control_reset(f.control));
+            evaluations = 0; stop_phase = 0;
+            wl_columnar_expr_test_checkpoint = witness;
+            CHECK(!step_complete(f.session));
+            wl_columnar_expr_test_checkpoint = NULL;
+            CHECK(evaluations > 0);
+            col_rel_t *out = session_find_rel(COL_SESSION(f.session), "out");
+            CHECK(out);
+            bool seen[5] = {0}; unsigned count = 0;
+            for (uint32_t r = 0; r < out->nrows; ++r) {
+                const char *s = wl_intern_reverse(f.plan->intern,
+                        out->columns[0][r]); CHECK(s);
+                unsigned k = 0; while (k < 5 && strcmp(s, reader_words[k])) ++k;
+                CHECK(k < 5 && !seen[k] && reader_values(op, s) > 0);
+                seen[k] = true;
+            }
+            for (unsigned i = 0; i < 5; ++i) {
+                bool want = reader_values(op, reader_words[i]) > 0;
+                CHECK(seen[i] == want); count += want;
+            }
+            if (events != count || positives != count ||
+                negatives) fprintf(stderr,
+                    "reader filter op=%u mode=%u rows=%u count=%u events=%u pos=%u neg=%u\n",
+                    op, mode, out->nrows, count, events, positives, negatives);
+            CHECK(out->nrows == count && events == count &&
+                positives == count && !negatives);
+            unsigned removed = 0;
+            while (removed < 5 && !seen[removed]) ++removed;
+            CHECK(removed < 5);
+            int64_t id = wl_intern_get(f.plan->intern, reader_words[removed]);
+            CHECK(!wl_session_remove(f.session, "input", &id, 1, 1));
+            CHECK(!step_complete(f.session));
+            out = session_find_rel(COL_SESSION(f.session), "out");
+            CHECK(out && out->nrows == count - 1 && events == count + 1 &&
+                negatives == 1);
+            CHECK(!step_complete(f.session) && events == count + 1);
+            destroy(&f);
+        }
+    const char *source =
+        ".decl input(x:string)\n.decl out(x:string,l:int64,o:int64,c:int64,p:int64,s:int64)\n"
+        "out(x,strlen(x),str_ord(x),contains(x,\"a\"),str_prefix(x,\"a\"),str_suffix(x,\"a\")) :- input(x).\n";
+    for (unsigned mode = 0; mode < 2; ++mode) {
+        fixture_t f = create(source, mode != 0);
+        events = positives = negatives = 0;
+        wl_session_set_delta_cb(f.session, reader_delta, &f);
+        CHECK(!step_complete(f.session)); check_reader_map(&f, 0);
+        for (unsigned i = 0; i < 5; ++i) add(&f, reader_words[i]);
+        reader_exhaust = mode != 0; evaluations = 0;
+        if (reader_exhaust) CHECK(!wl_evaluation_control_configure(f.control,
+                UINT64_MAX - 1));
+        wl_columnar_expr_test_checkpoint = reader_session_stop;
+        CHECK(step_complete(f.session) ==
+            (reader_exhaust ? WL_EVALUATION_CONTROL_WORK_LIMIT :
+            WL_EVALUATION_CONTROL_CANCELLED));
+        wl_columnar_expr_test_checkpoint = NULL; stop_phase = 0;
+        CHECK(!events); check_reader_map(&f, 0);
+        CHECK(!wl_evaluation_control_reset(f.control));
+        CHECK(!step_complete(f.session));
+        check_reader_map(&f, 5);
+        CHECK(events == 5 && positives == 5 && !negatives);
+        int64_t removed = wl_intern_get(f.plan->intern, "a");
+        CHECK(!wl_session_remove(f.session, "input", &removed, 1, 1));
+        CHECK(!step_complete(f.session)); check_reader_map(&f, 4);
+        CHECK(events == 6 && negatives == 1);
+        CHECK(!step_complete(f.session) && events == 6);
+        wl_columnar_memory_governor_ref_t *g =
+            COL_SESSION(f.session)->memory_governor;
+        wl_columnar_memory_governor_ref_retain(g); destroy(&f);
+        CHECK(!wl_columnar_memory_reserved(wl_columnar_memory_governor_ref_get(
+                g)));
+        wl_columnar_memory_governor_ref_release(g);
+    }
+}
+
 int main(void) {
+    utf8_primitives();
+    direct_readers();
+    reader_interruption();
+    session_readers();
     direct_comparisons();
     direct_limits_and_stack();
     direct_retained_literal();

@@ -3166,6 +3166,114 @@ wl_columnar_expr_scalar_region(wl_evaluation_control_t *control, uint64_t id,
                progress);
 }
 
+/* Raw-compatible permissive UTF-8 step. Inspect at most four bytes and never
+ * beyond the first NUL. Invalid continuation is inspected but not consumed. */
+int
+wl_columnar_expr_utf8_next_attempt_controlled(const char *text,
+    size_t *advance, int64_t *codepoint, wl_evaluation_control_t *control,
+    uint64_t id)
+{
+    if (!text || !advance || !codepoint) return EINVAL;
+    int rc = wl_columnar_expr_scalar_region(control, id, 90, 0);
+    if (rc) return rc;
+    rc = wl_columnar_expr_scalar_region(control, id, 91, 0);
+    if (rc) return rc;
+    unsigned char c = (unsigned char)text[0];
+    size_t used = 0, length = 1;
+    int64_t cp = -1;
+    if (!c) goto publish;
+    used = 1;
+    if (c < 0x80) cp = c;
+    else if ((c & 0xE0) == 0xC0) {
+        cp = c & 0x1F; length = 2;
+    }else if ((c & 0xF0) ==
+        0xE0){
+        cp = c & 0x0F; length = 3;
+    }else if ((c & 0xF8) ==
+        0xF0){
+        cp = c & 0x07; length = 4;
+    }else goto publish;
+    for (size_t i = 1; i < length; ++i) {
+        rc = wl_columnar_expr_scalar_region(control, id, 91, i);
+        if (rc) return rc;
+        unsigned char b = (unsigned char)text[i];
+        if ((b & 0xC0) != 0x80) {
+            cp = -1; used = i; goto publish;
+        }
+        cp = (cp << 6) | (b & 0x3F);
+        used = i + 1;
+    }
+publish:
+    rc = wl_columnar_expr_scalar_region(control, id, 92, used);
+    if (rc) return rc;
+    *advance = used; *codepoint = cp;
+    return 0;
+}
+
+static int
+wl_columnar_expr_scalar_reader(uint8_t tag, int64_t a, int64_t b,
+    wl_intern_t *intern, int64_t *value, wl_evaluation_control_t *control,
+    uint64_t id)
+{
+    int rc = wl_columnar_expr_scalar_region(control, id, 93, tag);
+    if (rc) return rc;
+    int64_t result = 0;
+    if (!intern) goto publish;
+    const char *left = wl_intern_reverse(intern, a);
+    if (tag == WL_PLAN_EXPR_STR_FN_STRLEN ||
+        tag == WL_PLAN_EXPR_STR_FN_STR_ORD) {
+        result = -1;
+        if (!left) goto publish;
+        size_t offset = 0; uint64_t count = 0;
+        for (;;) {
+            rc = wl_columnar_expr_scalar_region(control, id, 94, offset);
+            if (rc) return rc;
+            size_t advance = 0; int64_t cp = -1;
+            rc = wl_columnar_expr_utf8_next_attempt_controlled(left + offset,
+                    &advance, &cp, control, id);
+            if (rc) return rc;
+            if (tag == WL_PLAN_EXPR_STR_FN_STR_ORD) {
+                result = cp; break;
+            }
+            if (!advance) {
+                result = (int64_t)count; break;
+            }
+            offset += advance; ++count;
+        }
+    } else {
+        const char *right = wl_intern_reverse(intern, b);
+        if (!left || !right) goto publish;
+        size_t ln = 0, rn = 0;
+        rc = wl_columnar_expr_cstr_length_attempt_controlled(left, &ln,
+                control, id);
+        if (rc) return rc;
+        rc = wl_columnar_expr_cstr_length_attempt_controlled(right, &rn,
+                control, id);
+        if (rc) return rc;
+        if (tag == WL_PLAN_EXPR_STR_FN_CONTAINS) {
+            size_t position = 0; bool found = false;
+            rc = wl_columnar_expr_bytes_find_attempt_controlled(
+                (const uint8_t *)left, ln, (const uint8_t *)right, rn,
+                &position, &found, control, id);
+            if (rc) return rc;
+            result = found;
+        } else if (rn <= ln) {
+            size_t offset = tag == WL_PLAN_EXPR_STR_FN_STR_SUFFIX ? ln - rn : 0;
+            int order = 0;
+            rc = wl_columnar_expr_bytes_compare_attempt_controlled(
+                (const uint8_t *)left + offset, (const uint8_t *)right, rn,
+                &order, control, id);
+            if (rc) return rc;
+            result = order == 0;
+        }
+    }
+publish:
+    rc = wl_columnar_expr_scalar_region(control, id, 95, tag);
+    if (rc) return rc;
+    *value = result;
+    return 0;
+}
+
 static int
 wl_columnar_expr_scalar_decode(const uint8_t *bytes, uint32_t size,
     uint32_t *pos, expr_instr_t *instruction, wl_evaluation_control_t *control,
@@ -3213,6 +3321,9 @@ wl_columnar_expr_scalar_decode(const uint8_t *bytes, uint32_t size,
         *pos += length;
         break;
     }
+    case WL_PLAN_EXPR_STR_FN_STRLEN: case WL_PLAN_EXPR_STR_FN_STR_ORD:
+    case WL_PLAN_EXPR_STR_FN_CONTAINS: case WL_PLAN_EXPR_STR_FN_STR_PREFIX:
+    case WL_PLAN_EXPR_STR_FN_STR_SUFFIX:
     case WL_PLAN_EXPR_CMP_STR_EQ: case WL_PLAN_EXPR_CMP_STR_NEQ:
     case WL_PLAN_EXPR_CMP_STR_LT: case WL_PLAN_EXPR_CMP_STR_GT:
     case WL_PLAN_EXPR_CMP_STR_LTE: case WL_PLAN_EXPR_CMP_STR_GTE:
@@ -3292,6 +3403,7 @@ wl_columnar_expr_compile_scalar_attempt_controlled(const uint8_t *bytes,
         case WL_PLAN_EXPR_CONST_FLOAT: case WL_PLAN_EXPR_CONST_STR:
         case WL_PLAN_EXPR_BOOL:
             break;
+        case WL_PLAN_EXPR_STR_FN_STRLEN: case WL_PLAN_EXPR_STR_FN_STR_ORD:
         case WL_PLAN_EXPR_ARITH_BNOT: case WL_PLAN_EXPR_ARITH_HASH:
         case WL_PLAN_EXPR_ARITH_CRC32_ETH: case WL_PLAN_EXPR_ARITH_CRC32_CAST:
             if (depth) --depth;
@@ -3376,6 +3488,13 @@ wl_columnar_expr_scalar_result_type_attempt_controlled(
     if (owner->producer.op == WL_PLAN_EXPR_VAR_STRING
         || owner->producer.op ==
         WL_PLAN_EXPR_CONST_STR) result = WIRELOG_TYPE_STRING;
+    else if (owner->producer.op == WL_PLAN_EXPR_STR_FN_STRLEN ||
+        owner->producer.op ==
+        WL_PLAN_EXPR_STR_FN_STR_ORD) result = WIRELOG_TYPE_INT64;
+    else if (owner->producer.op == WL_PLAN_EXPR_STR_FN_CONTAINS ||
+        owner->producer.op == WL_PLAN_EXPR_STR_FN_STR_PREFIX ||
+        owner->producer.op ==
+        WL_PLAN_EXPR_STR_FN_STR_SUFFIX) result = WIRELOG_TYPE_BOOL;
     else valid = wl_columnar_expr_result_type(&owner->producer, 0, types,
                 width, &result);
     rc = wl_columnar_expr_scalar_region(control, id, 79, 0);
@@ -3475,6 +3594,19 @@ wl_columnar_expr_eval_scalar_attempt_controlled(
             if (rc) return rc;
             expr_push_string(&stack, v, owner->bytes + in.iarg,
                 (uint32_t)in.larg);
+        } else if (in.op == WL_PLAN_EXPR_STR_FN_STRLEN ||
+            in.op == WL_PLAN_EXPR_STR_FN_STR_ORD ||
+            in.op == WL_PLAN_EXPR_STR_FN_CONTAINS ||
+            in.op == WL_PLAN_EXPR_STR_FN_STR_PREFIX ||
+            in.op == WL_PLAN_EXPR_STR_FN_STR_SUFFIX) {
+            int64_t b = 0;
+            if (in.op != WL_PLAN_EXPR_STR_FN_STRLEN &&
+                in.op != WL_PLAN_EXPR_STR_FN_STR_ORD) b = expr_pop(&stack);
+            int64_t a = expr_pop(&stack), result = 0;
+            rc = wl_columnar_expr_scalar_reader(in.op, a, b, intern, &result,
+                    control, id);
+            if (rc) return rc;
+            expr_push(&stack, result);
         } else if (in.op >= WL_PLAN_EXPR_CMP_STR_EQ
             && in.op <= WL_PLAN_EXPR_CMP_STR_GTE) {
             int64_t b = expr_pop(&stack), a = expr_pop(&stack);
