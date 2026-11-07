@@ -3893,6 +3893,24 @@ wl_columnar_eval_stack_composed_source_abort(
                owner);
 }
 
+/* Same read-only prerequisites as release, without removing the owner. Keep
+ * the existing release caller packet unchanged; ACK can now poll while it
+ * still owns the frame. No cached permission replaces release's own proof. */
+int
+wl_columnar_eval_stack_composed_source_release_validate(
+    wl_columnar_eval_stack_cleanup_frame_t *frame, wl_col_session_t *sess,
+    wl_columnar_eval_plan_numeric_attempt_t *owner)
+{
+    int rc = wl_columnar_eval_stack_composed_source_frame(frame, sess, owner,
+            false, false);
+    if (rc) return rc;
+    if (owner->phase != WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_DONE
+        || owner->source_initialized || owner->source_bare
+        || owner->source_slot_borrowed)
+        return EBUSY;
+    return 0;
+}
+
 int
 wl_columnar_eval_stack_composed_source_release(
     wl_columnar_eval_stack_cleanup_frame_t *frame, wl_col_session_t *sess,

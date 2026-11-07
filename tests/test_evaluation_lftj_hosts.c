@@ -850,6 +850,51 @@ test_partial_append(void)
 
 static wl_session_t *metadata_maximum_session;
 static unsigned metadata_maximum_names, metadata_maximum_installs;
+static unsigned reset_target = UINT32_MAX, reset_calls;
+static bool reset_end_original, reset_stopped, reset_verified;
+static uint32_t reset_saved_position;
+static wl_evaluation_control_report_t reset_frozen;
+
+static void
+stop_reset(wl_evaluation_control_t *control,
+    const wl_columnar_lftj_attempt_t *a)
+{
+    if (reset_stopped || a->phase != WL_COLUMNAR_LFTJ_ATTEMPT_OUTPUT_BEGIN
+        || !a->writer_active) return;
+    CHECK(a->input_count == 64 && metadata_maximum_session
+        && control == metadata_maximum_session->evaluation_control);
+    if (reset_calls++ != reset_target) return;
+    reset_saved_position = a->inputs[reset_target].position;
+    CHECK(reset_saved_position && a->output_owned && a->output_pass);
+    reset_stopped = true;
+    if (reset_end_original) {
+        wl_evaluation_control_attempt_finish_result_t ended =
+            wl_evaluation_control_finish_attempt(control,
+                metadata_maximum_session->operation_admission,
+                wl_evaluation_control_active_attempt_id(control), 0, 0);
+        CHECK(!ended.protocol && ended.report_valid && !ended.report.result
+            && ended.report.consumed);
+        reset_frozen = ended.report;
+    } else wl_evaluation_control_request_cancel(control);
+}
+
+static void
+verify_reset_refusal(const wl_col_session_t *session,
+    wl_columnar_eval_serial_framed_host_action_t action,
+    wl_evaluation_control_t *funding, int protocol)
+{
+    (void)action; (void)funding; (void)protocol;
+    CHECK((const wl_session_t *)session == metadata_maximum_session);
+    if (!reset_stopped || reset_verified || !session->cleanup_active) return;
+    wl_columnar_eval_serial_framed_attempt_t *ctx = NULL;
+    if (wl_columnar_eval_stack_framed_context(session->cleanup_active,
+        (wl_col_session_t *)session, &ctx)) return;
+    const wl_columnar_lftj_attempt_t *a = &ctx->child.lftj;
+    CHECK(a->identity == a && a->phase == WL_COLUMNAR_LFTJ_ATTEMPT_RELEASE
+        && a->inputs && a->input_count == 64
+        && a->inputs[reset_target].position == reset_saved_position);
+    reset_verified = true;
+}
 
 static void
 metadata_maximum_host_checkpoint(wl_columnar_eval_plan_numeric_attempt_t *r)
@@ -918,12 +963,44 @@ test_session_metadata_maximum(void)
     }
     metadata_maximum_session = session;
     metadata_maximum_names = metadata_maximum_installs = 0;
+    reset_calls = 0; reset_stopped = reset_verified = false;
+    uint64_t reserved = wl_columnar_memory_reserved(
+        wl_columnar_memory_governor_ref_get(g));
+    if (reset_target != UINT32_MAX) {
+        wl_columnar_lftj_test_attempt_checkpoint = stop_reset;
+        wl_columnar_session_test_framed_grant_finished = verify_reset_refusal;
+    }
     wl_columnar_eval_plan_test_lftj_metadata_checkpoint =
         metadata_maximum_host_checkpoint;
-    CHECK(!finish_step(session));
+    int rc = EAGAIN;
+    for (unsigned turn = 0; turn < 100000 && rc == EAGAIN; ++turn)
+        rc = wl_session_step(session);
+    wl_columnar_lftj_test_attempt_checkpoint = NULL;
+    wl_columnar_session_test_framed_grant_finished = NULL;
     wl_columnar_eval_plan_test_lftj_metadata_checkpoint = NULL;
     metadata_maximum_session = NULL;
     CHECK(metadata_maximum_names == 64 && metadata_maximum_installs == 1);
+    if (reset_target != UINT32_MAX) {
+        CHECK(reset_stopped && reset_verified && reset_calls == reset_target + 1
+            && rc ==
+            (reset_end_original ? EINVAL : WL_EVALUATION_CONTROL_CANCELLED)
+            && !session_find_rel((wl_col_session_t *)session, "output")
+            && wl_columnar_memory_reserved(wl_columnar_memory_governor_ref_get(
+                g))
+            == reserved);
+        if (reset_end_original) {
+            wl_evaluation_control_report_t report;
+            CHECK(!wl_evaluation_control_report(control, &report)
+                && report.attempt_id == reset_frozen.attempt_id
+                && report.limit == reset_frozen.limit
+                && report.consumed == reset_frozen.consumed
+                && report.result == reset_frozen.result
+                && report.stop_reason == reset_frozen.stop_reason
+                && report.execution_status == reset_frozen.execution_status
+                && report.cleanup_status == reset_frozen.cleanup_status);
+        }
+        CHECK(!wl_evaluation_control_reset(control) && !finish_step(session));
+    } else CHECK(!rc);
     CHECK(!wl_session_step(raw));
     const col_rel_t *actual = session_find_rel((wl_col_session_t *)session,
             "output");
@@ -1257,6 +1334,10 @@ typedef struct {
     unsigned funding_refusals;
     unsigned initializer_mask;
     uintptr_t initializer_identity;
+    uint64_t copy_cut;
+    bool copy_refusal_observed;
+    size_t ack_cut;
+    bool ack_refused;
     uint64_t successor_id;
     wl_evaluation_control_report_t frozen;
 } native_source_test_t;
@@ -1317,6 +1398,10 @@ end_native_original(wl_evaluation_control_t *control,
         && !ended.report.result);
     test->frozen = ended.report;
     test->ended = true;
+    if (test->target == 0) {
+        CHECK(attempt->inputs[0].copy_cell == 1);
+        test->copy_cut = attempt->inputs[0].copy_cell;
+    }
     test->initializer_identity = (uintptr_t)&attempt->retirement_initializer;
     if (test->successor) {
         CHECK(!wl_evaluation_control_reset(control));
@@ -1342,6 +1427,25 @@ native_initializer_checkpoint(
     test->initializer_mask |= 1u << api;
 }
 
+static void
+verify_copy_refusal(const wl_col_session_t *session,
+    wl_columnar_eval_serial_framed_host_action_t action,
+    wl_evaluation_control_t *funding, int protocol)
+{
+    (void)action; (void)funding; (void)protocol;
+    native_source_test_t *test = native_source;
+    CHECK(test && session == (wl_col_session_t *)test->fixture->session);
+    if (!test->ended || !test->copy_cut || test->copy_refusal_observed
+        || !session->cleanup_active) return;
+    wl_columnar_eval_serial_framed_attempt_t *ctx = NULL;
+    if (wl_columnar_eval_stack_framed_context(session->cleanup_active,
+        (wl_col_session_t *)session, &ctx)) return;
+    const wl_columnar_lftj_attempt_t *a = &ctx->child.lftj;
+    CHECK(a->identity == a && a->phase == WL_COLUMNAR_LFTJ_ATTEMPT_RELEASE
+        && a->inputs && a->inputs[0].copy_cell == test->copy_cut);
+    test->copy_refusal_observed = true;
+}
+
 static uint64_t
 refuse_native_funding(const wl_col_session_t *session,
     wl_columnar_eval_serial_framed_host_action_t action, uint64_t limit)
@@ -1354,6 +1458,27 @@ refuse_native_funding(const wl_col_session_t *session,
         return 1;
     }
     return limit;
+}
+
+static void
+refuse_native_ack(wl_columnar_eval_plan_numeric_attempt_t *n,
+    wl_evaluation_control_t *funding, uint64_t id, size_t offset)
+{
+    native_source_test_t *test = native_source;
+    CHECK(test);
+    if (!test->ended || test->ack_refused || offset != test->ack_cut) return;
+    CHECK(n->control == test->fixture->control && n->composed_busy
+        && n->phase == WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_DONE
+        && funding != n->control
+        && !wl_columnar_eval_stack_numeric_owner(n->frame, n));
+    uint64_t before = 0, after = 0;
+    CHECK(!wl_evaluation_control_test_active_consumed(funding, id, &before)
+        && wl_columnar_eval_plan_numeric_composed_attempt_ack(n, funding,
+        id) == EBUSY
+        && !wl_evaluation_control_test_active_consumed(funding, id, &after)
+        && before == after);
+    test->ack_refused = true;
+    wl_evaluation_control_request_cancel(funding);
 }
 
 static void
@@ -1458,6 +1583,8 @@ test_native_owner_boundaries(wl_columnar_eval_serial_framed_attempt_t *ctx)
 static void
 test_native_cleanup(void)
 {
+    const size_t ack_cuts[] = {SIZE_MAX, 0, 1024,
+                               sizeof(wl_columnar_lftj_attempt_t)};
     for (unsigned batch = 0; batch < 2; ++batch)
         for (unsigned scenario = 0; scenario < 9; ++scenario)
             for (unsigned observed = 0; observed < 2; ++observed)
@@ -1484,10 +1611,16 @@ test_native_cleanup(void)
                                                      7 ? 0u : 5u,
                                                  .refuse_funding = scenario !=
                                                      7,
-                                                 .successor = scenario == 8};
+                                                 .successor = scenario == 8,
+                                                 .ack_cut = ack_cuts[scenario %
+                                                         4]};
                     native_source = &test;
                     wl_columnar_lftj_test_attempt_checkpoint =
                         end_native_original;
+                    wl_columnar_session_test_framed_grant_finished =
+                        verify_copy_refusal;
+                    wl_columnar_eval_plan_test_lftj_ack_checkpoint =
+                        refuse_native_ack;
                     wl_columnar_session_test_framed_grant_limit =
                         refuse_native_funding;
                     wl_columnar_relation_scalar_retirement_init_test_checkpoint
@@ -1531,7 +1664,11 @@ test_native_cleanup(void)
                         }
                     }
                     wl_columnar_session_test_framed_grant_limit = NULL;
+                    wl_columnar_session_test_framed_grant_finished = NULL;
+                    wl_columnar_eval_plan_test_lftj_ack_checkpoint = NULL;
+                    CHECK(test.ack_refused);
                     wl_columnar_lftj_test_attempt_checkpoint = NULL;
+                    CHECK(!test.copy_cut || test.copy_refusal_observed);
                     wl_columnar_relation_scalar_retirement_init_test_checkpoint
                         =
                         NULL;
@@ -1604,14 +1741,284 @@ test_native_cleanup(void)
                 }
 }
 
+static wl_columnar_lftj_metadata_phase_t native_metadata_target;
+
+static void
+end_metadata_between_activations(const wl_col_session_t *session,
+    wl_columnar_eval_serial_framed_host_action_t action,
+    wl_evaluation_control_t *funding, int protocol)
+{
+    (void)funding;
+    native_source_test_t *test = native_source;
+    CHECK(test && session == (wl_col_session_t *)test->fixture->session);
+    if (test->ended || protocol || action !=
+        WL_COLUMNAR_EVAL_SERIAL_FRAMED_ADVANCE || !session->cleanup_active)
+        return;
+    wl_columnar_eval_serial_framed_attempt_t *ctx = NULL;
+    if (wl_columnar_eval_stack_framed_context(session->cleanup_active,
+        (wl_col_session_t *)session, &ctx) || !ctx->child_bound) return;
+    const wl_columnar_eval_plan_numeric_attempt_t *n = &ctx->child;
+    if ((n->phase != WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_PREFLIGHT_LFTJ
+        && n->phase != WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_LFTJ_BEGIN)
+        || n->lftj.identity || n->lftj_metadata.phase != native_metadata_target
+        || (native_metadata_target == WL_COLUMNAR_LFTJ_METADATA_NAMES
+        && n->lftj_metadata.name_index != 1)) return;
+    CHECK(!n->composed_busy);
+    wl_evaluation_control_t *control = test->fixture->control;
+    uint64_t id = wl_evaluation_control_active_attempt_id(control);
+    wl_evaluation_control_attempt_finish_result_t ended =
+        wl_evaluation_control_finish_attempt(control,
+            test->fixture->session->operation_admission, id, 0, 0);
+    CHECK(!ended.protocol && ended.report_valid && ended.report.consumed
+        && !ended.report.result);
+    test->frozen = ended.report;
+    test->ended = true;
+    if (test->successor) {
+        CHECK(!wl_evaluation_control_reset(control));
+        wl_evaluation_control_attempt_begin_result_t next =
+            wl_evaluation_control_begin_attempt(control,
+                test->fixture->session->operation_admission);
+        CHECK(!next.protocol && next.attempt_id != id);
+        test->successor_id = next.attempt_id;
+    }
+}
+
+static void
+test_native_metadata_boundaries(wl_columnar_eval_serial_framed_attempt_t *ctx)
+{
+    wl_columnar_eval_plan_numeric_attempt_t *n = &ctx->child;
+    CHECK(!n->composed_busy && !n->lftj.identity);
+    for (unsigned variant = 0; variant < 14; ++variant) {
+        wl_columnar_lftj_metadata_proof_t saved = n->lftj_metadata;
+        uint32_t cursor = n->cursor;
+        bool dispatch = n->lftj_metadata_dispatch;
+        if (variant == 0) n->lftj_metadata_dispatch = true;
+        if (variant == 1) n->lftj_metadata.op_index = n->end;
+        if (variant == 2) n->lftj_metadata.operation = NULL;
+        if (variant == 3) ++n->cursor;
+        if (variant ==
+            4) n->lftj_metadata.phase = WL_COLUMNAR_LFTJ_METADATA_CONSUMED;
+        if (variant >= 5 &&
+            saved.phase == WL_COLUMNAR_LFTJ_METADATA_HEADER) continue;
+        if (variant == 5) n->lftj_metadata.metadata = NULL;
+        if (variant == 6) n->lftj_metadata.names = NULL;
+        if (variant == 7) n->lftj_metadata.keys = NULL;
+        if (variant == 8) n->lftj_metadata.name_index =
+                saved.phase == WL_COLUMNAR_LFTJ_METADATA_NAMES ? saved.k : 0;
+        if (variant == 9) {
+            if (saved.phase < WL_COLUMNAR_LFTJ_METADATA_PREFIX) continue;
+            n->lftj_metadata.prefix_cleared = !saved.prefix_cleared;
+        }
+        if (variant == 10) {
+            if (saved.phase <= WL_COLUMNAR_LFTJ_METADATA_BIND_HEADER) continue;
+            n->lftj_metadata.bindings = saved.bindings ? NULL :
+                (const wl_columnar_eval_private_bindings_t *)ctx;
+        }
+        if (variant == 11) {
+            if (saved.phase < WL_COLUMNAR_LFTJ_METADATA_PREFIX) continue;
+            n->lftj_metadata.registry = NULL;
+        }
+        if (variant == 12) n->lftj_metadata.k = WL_LFTJ_MAX_K + 1;
+        if (variant == 13) {
+            if (saved.phase <= WL_COLUMNAR_LFTJ_METADATA_BIND_HEADER) continue;
+            ++n->lftj_metadata.binding_generation;
+        }
+        wl_columnar_lftj_metadata_proof_t before = n->lftj_metadata;
+        int cause = n->semantic_result, primary = ctx->primary_result;
+        int owner = 0;
+        wl_evaluation_control_t *funding = NULL;
+        CHECK(!wl_evaluation_control_create(0, &funding)
+            && !wl_evaluation_control_attach(funding, &owner)
+            && !wl_evaluation_control_begin(funding, &owner));
+        CHECK(wl_columnar_eval_plan_numeric_join_cleanup_step(ctx, funding,
+            wl_evaluation_control_active_attempt_id(funding)) == EINVAL
+            && !memcmp(&n->lftj_metadata, &before, sizeof(before))
+            && n->semantic_result == cause && ctx->primary_result == primary
+            && !n->composed_busy && !n->lftj.identity);
+        CHECK(!wl_evaluation_control_finish(funding, &owner, 0, 0)
+            && !wl_evaluation_control_detach(funding, &owner));
+        wl_evaluation_control_release(funding);
+        n->lftj_metadata = saved; n->cursor = cursor;
+        n->lftj_metadata_dispatch = dispatch;
+    }
+    CHECK(wl_columnar_eval_plan_numeric_join_cleanup_step(ctx,
+        ctx->control, ctx->attempt_id) == EINVAL);
+    uint64_t proof = 80 + 64 + (ctx->private_bindings ? 104 : 48)
+        + (wl_columnar_eval_stack_cleanup_receipt_key_protected(ctx->frame) ?
+        112 : 72);
+    const unsigned ends[] = {31, 32, 39, 40};
+    for (unsigned i = 0; i < 4; ++i) {
+        wl_columnar_lftj_metadata_proof_t before = n->lftj_metadata;
+        int owner = 0;
+        wl_evaluation_control_t *funding = NULL;
+        CHECK(!wl_evaluation_control_create(proof + ends[i], &funding)
+            && !wl_evaluation_control_attach(funding, &owner)
+            && !wl_evaluation_control_begin(funding, &owner));
+        CHECK(wl_columnar_eval_plan_numeric_join_cleanup_step(ctx, funding,
+            wl_evaluation_control_active_attempt_id(funding)) ==
+            WL_EVALUATION_CONTROL_WORK_LIMIT
+            && !memcmp(&n->lftj_metadata, &before, sizeof(before))
+            && !n->composed_busy && !n->lftj.identity);
+        /* Forty pays genuine intent/redirect; the separate clear128 still
+        * refuses. Earlier endpoints stop before that owned transition. */
+        CHECK(i != 3 ||
+            n->phase == WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_RELEASE);
+        CHECK(wl_evaluation_control_finish(funding, &owner, 0, 0)
+            == WL_EVALUATION_CONTROL_WORK_LIMIT);
+        wl_evaluation_control_report_t report;
+        CHECK(!wl_evaluation_control_report(funding, &report)
+            && report.consumed == proof + (i == 0 ? 0 : i == 3 ? 40 : 32));
+        CHECK(!wl_evaluation_control_detach(funding, &owner));
+        wl_evaluation_control_release(funding);
+    }
+}
+
+static void
+test_metadata_native_cleanup(void)
+{
+    const wl_columnar_lftj_metadata_phase_t phases[] = {
+        WL_COLUMNAR_LFTJ_METADATA_HEADER, WL_COLUMNAR_LFTJ_METADATA_NAMES,
+        WL_COLUMNAR_LFTJ_METADATA_VALIDATED,
+        WL_COLUMNAR_LFTJ_METADATA_BIND_HEADER,
+        WL_COLUMNAR_LFTJ_METADATA_BIND_DYNAMIC,
+        WL_COLUMNAR_LFTJ_METADATA_BIND_FINAL, WL_COLUMNAR_LFTJ_METADATA_PREFIX,
+        WL_COLUMNAR_LFTJ_METADATA_INSTALL
+    };
+    for (unsigned phase = 0; phase < sizeof(phases)/sizeof(phases[0]); ++phase)
+        for (unsigned batch = 0; batch < 2; ++batch)
+            for (unsigned observed = 0; observed < 2; ++observed)
+                for (unsigned snapshot = 0; snapshot < 2; ++snapshot) {
+                    if (phases[phase] ==
+                        WL_COLUMNAR_LFTJ_METADATA_BIND_DYNAMIC &&
+                        !observed) continue;
+                    fixture_t f;
+                    native_fixture_init(&f, observed, batch);
+                    source_image_t before[3];
+                    for (unsigned i = 0; i < 3;
+                        ++i) before[i] = image(f.session, i);
+                    wl_columnar_memory_governor_t *g =
+                        wl_columnar_memory_governor_ref_get(f.governor);
+                    uint64_t reserved = wl_columnar_memory_reserved(g);
+                    wl_columnar_memory_reservation_t foreign;
+                    wl_columnar_memory_reservation_init(&foreign);
+                    CHECK(wl_columnar_memory_reserve_checked(g, 4096, &foreign)
+                        == WL_COLUMNAR_MEMORY_ADMISSION_OK);
+                    native_source_test_t test = {.fixture = &f,
+                                                 .refuse_funding = true,
+                                                 .successor = phases[phase] ==
+                                                     WL_COLUMNAR_LFTJ_METADATA_NAMES};
+                    native_source = &test;
+                    native_metadata_target = phases[phase];
+                    wl_columnar_session_test_framed_grant_finished =
+                        end_metadata_between_activations;
+                    wl_columnar_session_test_framed_grant_limit =
+                        refuse_native_funding;
+                    capture_t captured = {0};
+                    int rc = EAGAIN;
+                    if (snapshot) rc = wl_session_snapshot(f.session, on_tuple,
+                                &captured);
+                    else for (unsigned turn = 0; turn < 2048 && rc == EAGAIN;
+                            ++turn) {
+                            rc = wl_session_step(f.session);
+                            if (!batch && test.ended && !test.owner_probed) {
+                                wl_col_session_t *session =
+                                    (wl_col_session_t *)f.session;
+                                wl_columnar_eval_serial_framed_attempt_t *ctx =
+                                    NULL;
+                                if (wl_columnar_session_test_native_error_phase(
+                                        session)
+                                    == WL_COLUMNAR_SESSION_NATIVE_ERROR_CHILD
+                                    && !wl_columnar_eval_stack_framed_context(
+                                        session->cleanup_active,
+                                        session,
+                                        &ctx) &&
+                                    ctx->phase ==
+                                    WL_COLUMNAR_EVAL_SERIAL_FRAMED_CHILD
+                                    && (ctx->child.phase ==
+                                    WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_PREFLIGHT_LFTJ
+                                    || ctx->child.phase ==
+                                    WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_LFTJ_BEGIN))
+                                {
+                                    test_native_metadata_boundaries(ctx);
+                                    test.owner_probed = true;
+                                }
+                            }
+                        }
+                    wl_columnar_session_test_framed_grant_finished = NULL;
+                    wl_columnar_session_test_framed_grant_limit = NULL;
+                    if (!test.ended || test.funding_refusals != 1 ||
+                        rc != EINVAL)
+                        fprintf(stderr,
+                            "metadata native phase=%u batch=%u observed=%u snapshot=%u ended=%u refusals=%u rc=%d\n",
+                            (unsigned)phases[phase], batch, observed, snapshot,
+                            (unsigned)test.ended, test.funding_refusals, rc);
+                    CHECK(test.ended && test.funding_refusals == 1 &&
+                        rc == EINVAL);
+                    if (!batch && !snapshot) CHECK(test.owner_probed);
+                    CHECK(!session_find_rel((wl_col_session_t *)f.session,
+                        "output")
+                        && !f.events.count && !captured.count
+                        && wl_columnar_memory_reserved(g) == reserved + 4096
+                        && foreign.governor == g && foreign.bytes == 4096
+                        && atomic_load_explicit(&foreign.state,
+                        memory_order_acquire)
+                        == WL_COLUMNAR_MEMORY_RESERVATION_RESERVED);
+                    for (unsigned i = 0; i < 3;
+                        ++i) unchanged(f.session, i, &before[i], true);
+                    wl_evaluation_control_report_t report;
+                    CHECK(!wl_evaluation_control_report(f.control, &report)
+                        && report.attempt_id == test.frozen.attempt_id
+                        && report.limit == test.frozen.limit
+                        && report.consumed == test.frozen.consumed
+                        && report.result == test.frozen.result
+                        && report.stop_reason == test.frozen.stop_reason
+                        && report.execution_status ==
+                        test.frozen.execution_status
+                        && report.cleanup_status == test.frozen.cleanup_status);
+                    if (test.successor_id) {
+                        uint64_t used = UINT64_MAX;
+                        CHECK(wl_evaluation_control_active_attempt_id(
+                                f.control) == test.successor_id
+                            && !wl_evaluation_control_test_active_consumed(
+                                f.control,
+                                test.successor_id, &used) && !used);
+                        wl_session_t *slot = f.session;
+                        CHECK(wl_session_try_destroy(&slot) == EBUSY &&
+                            slot == f.session);
+                        wl_evaluation_control_attempt_finish_result_t ended =
+                            wl_evaluation_control_finish_attempt(f.control,
+                                f.session->operation_admission,
+                                test.successor_id, 0, 0);
+                        CHECK(!ended.protocol && ended.report_valid &&
+                            !ended.report.consumed);
+                    }
+                    CHECK(!wl_evaluation_control_reset(f.control));
+                    captured.count = 0;
+                    CHECK(!drive(&f, snapshot, &captured));
+                    capture_t expected = oracle(&f),
+                        actual = head_capture(f.session);
+                    equal(&actual, &expected);
+                    if (snapshot) equal(&captured, &expected);
+                    if (observed) equal(&f.events, &expected);
+                    CHECK(!finish_step(f.raw));
+                    head_schema_equal(&f);
+                    CHECK(wl_columnar_memory_rollback(&foreign));
+                    native_source = NULL;
+                    fixture_destroy(&f);
+                }
+}
+
 int
 main(int argc, char **argv)
 {
     if (argc > 2 || (argc == 2 && strcmp(argv[1], "domains")
         && strcmp(argv[1], "recovery") && strcmp(argv[1], "failures")
-        && strcmp(argv[1], "native") && strcmp(argv[1], "admission"))) {
+        && strcmp(argv[1], "native") && strcmp(argv[1], "admission")
+        && strcmp(argv[1], "metadata-native") && strcmp(argv[1],
+        "microsteps"))) {
         fprintf(stderr,
-            "usage: %s [domains|recovery|failures|admission|native]\n",
+            "usage: %s [domains|recovery|failures|admission|native|"
+            "metadata-native|microsteps]\n",
             argv[0]);
         return EXIT_FAILURE;
     }
@@ -1637,6 +2044,19 @@ main(int argc, char **argv)
         test_source_protected_worker_state();
     }
     if (argc == 1 || !strcmp(argv[1], "native")) test_native_cleanup();
+    if (argc == 1 || !strcmp(argv[1],
+        "metadata-native")) test_metadata_native_cleanup();
+    if (argc == 1 || !strcmp(argv[1], "microsteps")) {
+        const unsigned cuts[] = {0, 31, 63};
+        /* Allocated-k64 component limits; natural compiler paths have their
+         * separate domains/native literal schema and row oracles. */
+        for (unsigned ended = 0; ended < 2; ++ended)
+            for (unsigned i = 0; i < 3; ++i) {
+                reset_target = cuts[i]; reset_end_original = ended;
+                test_session_metadata_maximum();
+            }
+        reset_target = UINT32_MAX;
+    }
     puts("LFTJ session tests passed");
     return 0;
 }

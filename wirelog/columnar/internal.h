@@ -7015,6 +7015,12 @@ void wl_columnar_relation_private_batch_drain_init(
 int wl_columnar_relation_private_batch_drain_step(
     wl_columnar_relation_private_batch_drain_t *,
     wl_columnar_relation_append_batch_t *, int, bool *);
+/* LFTJ cleanup funding is distinct from Original. Physical release failures
+ * remain on release_error with done=false for retry; protocol errors return. */
+int wl_columnar_relation_private_batch_drain_step_funded(
+    wl_columnar_relation_private_batch_drain_t *,
+    wl_columnar_relation_append_batch_t *, int, bool *,
+    wl_evaluation_control_t *, uint64_t);
 
 typedef enum {
     WL_COLUMNAR_FILTER_STAGE_INERT = 0,
@@ -7501,7 +7507,13 @@ typedef struct wl_columnar_lftj_attempt {
 #endif
     bool thread_valid, busy;
     bool retirement_started, retirement_committed, retirement_drained;
+    wl_columnar_relation_private_batch_drain_t writer_drain;
 } wl_columnar_lftj_attempt_t;
+
+/* Actual owned LFTJ row and protected exact-capacity output; no generic
+ * alias capture, growth or renewal is selected by this internal producer. */
+int wl_columnar_relation_append_lftj_owned_row_operator_controlled(
+    wl_columnar_lftj_attempt_t *);
 
 #ifdef WL_SESSION_TEST_HOOKS
 extern void (*wl_columnar_lftj_test_attempt_checkpoint)(
@@ -8048,6 +8060,11 @@ extern void (*wl_columnar_eval_plan_test_lftj_metadata_checkpoint)(
     wl_columnar_eval_plan_numeric_attempt_t *);
 extern void (*wl_columnar_eval_plan_test_lftj_metadata_cleanup_checkpoint)(
     wl_columnar_eval_plan_numeric_attempt_t *, wl_evaluation_control_t *);
+extern void (*wl_columnar_eval_plan_test_static_validation_checkpoint)(
+    wl_evaluation_control_t *, uint64_t, uint32_t, uint32_t);
+extern void (*wl_columnar_eval_plan_test_lftj_ack_checkpoint)(
+    wl_columnar_eval_plan_numeric_attempt_t *, wl_evaluation_control_t *,
+    uint64_t, size_t);
 #endif
 int wl_columnar_ops_lftj_attempt_preflight(const wl_plan_op_t *,
     wl_col_session_t *);
@@ -8122,6 +8139,9 @@ int wl_columnar_eval_stack_composed_source_abort_funded(
     wl_columnar_eval_stack_cleanup_frame_t *, wl_col_session_t *,
     wl_columnar_eval_plan_numeric_attempt_t *);
 int wl_columnar_eval_stack_composed_source_release(
+    wl_columnar_eval_stack_cleanup_frame_t *, wl_col_session_t *,
+    wl_columnar_eval_plan_numeric_attempt_t *);
+int wl_columnar_eval_stack_composed_source_release_validate(
     wl_columnar_eval_stack_cleanup_frame_t *, wl_col_session_t *,
     wl_columnar_eval_plan_numeric_attempt_t *);
 

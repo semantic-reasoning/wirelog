@@ -574,6 +574,7 @@ wl_columnar_ops_lftj_attempt_begin(wl_columnar_lftj_attempt_t *attempt,
     rc = wl_evaluation_control_charge_attempt(control, attempt_id, 256);
     if (rc) return rc;
     memset(attempt, 0, offsetof(wl_columnar_lftj_attempt_t, retirement));
+    attempt->writer_drain.identity = NULL;
     attempt->retirement_initializer.identity = NULL;
     attempt->retirement_initializer.parent = NULL;
     attempt->retirement_initializer.retirement = NULL;
@@ -636,6 +637,7 @@ wl_columnar_lftj_attempt_begin_prevalidated(wl_columnar_lftj_attempt_t *attempt,
     rc = wl_evaluation_control_charge_attempt(context.control,
             context.attempt_id, 192);
     if (rc) return rc;
+    attempt->writer_drain.identity = NULL;
     attempt->retirement_initializer.identity = NULL;
     attempt->retirement_initializer.parent = NULL;
     attempt->retirement_initializer.retirement = NULL;
@@ -1034,17 +1036,18 @@ wl_columnar_lftj_attempt_reserve_scratch(wl_columnar_lftj_attempt_t *a)
     if (a->session->memory_governor && bytes) {
         wl_columnar_memory_governor_t *g =
             wl_columnar_memory_governor_ref_get(a->session->memory_governor);
-        wl_columnar_memory_admission_status_t status
-            = wl_columnar_memory_reserve_checked(g, bytes,
-                &a->scratch_reservation);
+        wl_columnar_memory_admission_status_t status;
+        int rc = wl_columnar_memory_governor_reserve_source_attempt_controlled(
+            g, bytes, &a->scratch_reservation, &status, a->control,
+            a->attempt_id);
+        if (rc) return rc;
         if (status != WL_COLUMNAR_MEMORY_ADMISSION_OK
             && status != WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY) {
             if (status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED)
                 a->session->memory_budget_denied = true;
-            return wl_columnar_lftj_attempt_fail(a,
-                       status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED ? ENOSPC
+            return status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED ? ENOSPC
                 : status == WL_COLUMNAR_MEMORY_ADMISSION_OVERFLOW
-                ? EOVERFLOW : EINVAL);
+                ? EOVERFLOW : EINVAL;
         }
         a->scratch_reserved = true;
     }
@@ -1056,7 +1059,7 @@ wl_columnar_lftj_attempt_alloc(wl_columnar_lftj_attempt_t *a)
 {
     if (!a->row) {
         int rc = wl_columnar_lftj_attempt_reserve_scratch(a);
-        if (rc) return rc;
+        if (rc) return wl_columnar_lftj_attempt_fail(a, rc);
 #ifdef WL_TEST_LFTJ_ADMISSION_HOOKS
         ++lftj_test_hook_state.controlled_row_allocations;
 #endif
@@ -1091,7 +1094,11 @@ wl_columnar_lftj_attempt_alloc(wl_columnar_lftj_attempt_t *a)
         return 0;
     }
     if (a->scratch_reserved) {
-        if (!wl_columnar_memory_commit(&a->scratch_reservation, a))
+        bool committed = false;
+        int rc = wl_columnar_memory_governor_commit_source_attempt_controlled(
+            &a->scratch_reservation, a, &committed, a->control, a->attempt_id);
+        if (rc) return wl_columnar_lftj_attempt_fail(a, rc);
+        if (!committed)
             return wl_columnar_lftj_attempt_fail(a, EINVAL);
         a->scratch_committed = true;
     }
@@ -1143,6 +1150,12 @@ wl_columnar_lftj_attempt_copy(wl_columnar_lftj_attempt_t *a)
         int rc = wl_columnar_lftj_attempt_charge(a, count);
         if (rc) return wl_columnar_lftj_attempt_fail(a, rc);
         for (uint32_t i = 0; i < count; i++, in->copy_cell++) {
+#ifdef WL_SESSION_TEST_HOOKS
+            if (wl_columnar_lftj_test_attempt_checkpoint)
+                wl_columnar_lftj_test_attempt_checkpoint(a->control, a);
+#endif
+            rc = wl_columnar_lftj_attempt_charge(a, 0);
+            if (rc) return wl_columnar_lftj_attempt_fail(a, rc);
             uint32_t row = (uint32_t)(in->copy_cell / in->ncols);
             uint32_t col = (uint32_t)(in->copy_cell % in->ncols);
             int64_t value = col_rel_get(in->relation, row, col);
@@ -1399,9 +1412,8 @@ wl_columnar_lftj_attempt_join(wl_columnar_lftj_attempt_t *a)
             int rc = wl_columnar_lftj_attempt_charge(a, 8u);
             if (rc) return wl_columnar_lftj_attempt_fail(a, rc);
             rc =
-                wl_columnar_relation_append_batch_numeric_row_operator_controlled
-                (
-                &a->writer, a->row, a->control, a->attempt_id);
+                wl_columnar_relation_append_lftj_owned_row_operator_controlled(
+                a);
             if (rc) return wl_columnar_lftj_attempt_fail(a, rc);
             ++a->output_written;
             a->join_phase = WL_COLUMNAR_LFTJ_JOIN_PRODUCT_ADVANCE;
@@ -1452,6 +1464,12 @@ wl_columnar_lftj_attempt_join(wl_columnar_lftj_attempt_t *a)
     return wl_columnar_lftj_attempt_fail(a, EINVAL);
 }
 
+/* Include the actual reset bytes and the full scalar caller suffix. */
+typedef char wl_columnar_lftj_writer_drain_reset_bound[
+        ((sizeof(wl_columnar_relation_private_batch_drain_t) + 7) / 8 + 96 <=
+        256)
+    ? 1 : -1];
+
 static int
 wl_columnar_lftj_attempt_cleanup_charge(wl_evaluation_control_t *funding,
     uint64_t funding_id)
@@ -1467,13 +1485,30 @@ wl_columnar_lftj_attempt_release(wl_columnar_lftj_attempt_t *a, bool *done,
         int charge_rc = wl_columnar_lftj_attempt_cleanup_charge(funding,
                 funding_id);
         if (charge_rc) return charge_rc;
-        int rc = wl_columnar_relation_append_batch_end_controlled(&a->writer,
-                a->semantic_result);
-        if (!a->writer.raw.active) {
-            a->writer_active = false;
-            if (rc && !a->semantic_result)
-                a->semantic_result = rc;
+        if (!a->writer_drain.identity) {
+            wl_columnar_relation_private_batch_drain_init(&a->writer_drain);
+            return 0;
         }
+        bool drained = false;
+        int rc = wl_columnar_relation_private_batch_drain_step_funded(
+            &a->writer_drain, &a->writer, a->semantic_result, &drained,
+            funding, funding_id);
+        if (rc) return rc;
+        if (drained) {
+            a->writer_active = false;
+            if (!a->semantic_result) a->semantic_result =
+                    a->writer.saved_result;
+        }
+        return 0;
+    }
+    if (a->writer_drain.identity) {
+        int rc = wl_columnar_lftj_attempt_cleanup_charge(funding, funding_id);
+        if (rc) return rc;
+        if (a->writer_drain.identity != &a->writer_drain
+            || a->writer_drain.batch != &a->writer
+            || a->writer_drain.phase != WL_COLUMNAR_RELATION_PRIVATE_BATCH_DONE)
+            return EINVAL;
+        memset(&a->writer_drain, 0, sizeof(a->writer_drain));
         return 0;
     }
     if (a->semantic_result && (a->output_owned || a->retirement_started
@@ -1667,12 +1702,20 @@ wl_columnar_ops_lftj_attempt_step_body(wl_columnar_lftj_attempt_t *a,
     case WL_COLUMNAR_LFTJ_ATTEMPT_OUTPUT_BEGIN:
         rc = wl_columnar_relation_append_batch_begin_controlled(&a->writer,
                 a->output, a->control);
+        /* BEGIN may retain a genuine partial writer on failure. */
+        a->writer_active = a->writer.identity == &a->writer;
         if (rc) return wl_columnar_lftj_attempt_fail(a, rc);
-        a->writer_active = true;
         a->output_pass = true;
         a->output_written = 0;
-        for (uint32_t i = 0; i < a->input_count; i++)
+        for (uint32_t i = 0; i < a->input_count; i++) {
+#ifdef WL_SESSION_TEST_HOOKS
+            if (wl_columnar_lftj_test_attempt_checkpoint)
+                wl_columnar_lftj_test_attempt_checkpoint(a->control, a);
+#endif
+            rc = wl_columnar_lftj_attempt_charge(a, 0);
+            if (rc) return wl_columnar_lftj_attempt_fail(a, rc);
             a->inputs[i].position = 0;
+        }
         a->join_index = 0;
         a->join_phase = WL_COLUMNAR_LFTJ_JOIN_INPUT_CHECK;
         a->phase = WL_COLUMNAR_LFTJ_ATTEMPT_JOIN;

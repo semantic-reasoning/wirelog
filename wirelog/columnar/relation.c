@@ -10905,6 +10905,97 @@ wl_columnar_relation_private_batch_drain_step(
     return 0;
 }
 
+int
+wl_columnar_relation_private_batch_drain_step_funded(
+    wl_columnar_relation_private_batch_drain_t *drain,
+    wl_columnar_relation_append_batch_t *batch, int initiating_result,
+    bool *done, wl_evaluation_control_t *funding, uint64_t id)
+{
+    if (!funding || !id || !batch || funding == batch->control) return EINVAL;
+    int rc = wl_evaluation_control_charge_attempt(funding, id, 0);
+    if (rc) return rc;
+    if (!done || !drain || drain->identity != drain
+        || !wl_columnar_relation_private_batch_thread(drain)
+        || (drain->batch && drain->batch != batch)) return EINVAL;
+    *done = false;
+    if (drain->phase == WL_COLUMNAR_RELATION_PRIVATE_BATCH_NEW) {
+        bool inert = false;
+        if (batch->phase == WL_COLUMNAR_RELATION_BATCH_EMPTY) {
+            inert = !batch->identity && !batch->raw_mode
+                && !batch->raw.active && !batch->raw.relation
+                && !batch->result_saved && !batch->saved_result
+                && wl_columnar_relation_single_inert(&batch->raw.single);
+        } else if (batch->phase == WL_COLUMNAR_RELATION_BATCH_ENDED) {
+            inert = batch->identity == batch && !batch->raw_mode
+                && !batch->raw.active
+                && wl_columnar_relation_single_inert(&batch->raw.single);
+        }
+        if (!inert) {
+            int rc = wl_columnar_relation_private_batch_authority(batch);
+            if (rc)
+                return rc;
+        }
+        /* Authority proof and publication are separate funded intervals. */
+        rc = wl_evaluation_control_charge_attempt(funding, id, 0);
+        if (rc) return rc;
+        drain->batch = batch;
+        drain->bound_nonce =
+            inert ? 0 : batch->raw.single.set.acquisition_nonce;
+        drain->bound_relation = inert ? NULL : batch->raw.relation;
+        drain->result_saved = true;
+        if (!batch->result_saved) {
+            batch->saved_result = initiating_result;
+            batch->result_saved = true;
+        }
+        if (inert) {
+            drain->phase = WL_COLUMNAR_RELATION_PRIVATE_BATCH_FINAL;
+        } else {
+            batch->phase = WL_COLUMNAR_RELATION_BATCH_DRAINING;
+            drain->phase = WL_COLUMNAR_RELATION_PRIVATE_BATCH_OWNER;
+        }
+        return 0;
+    }
+    if (!drain->result_saved || drain->batch != batch) return EINVAL;
+    if (drain->phase != WL_COLUMNAR_RELATION_PRIVATE_BATCH_OWNER
+        && drain->phase != WL_COLUMNAR_RELATION_PRIVATE_BATCH_DESCRIPTOR)
+        return wl_columnar_relation_private_batch_drain_step(drain, batch,
+                   initiating_result, done);
+    *done = false;
+    wl_columnar_relation_mutation_single_t *single = &batch->raw.single;
+    rc = wl_columnar_relation_private_batch_authority(batch);
+    if (rc || single->set.acquisition_nonce != drain->bound_nonce
+        || batch->raw.relation !=
+        drain->bound_relation) return rc ? rc : EINVAL;
+    /* Full native authority is established before this real saved-funding
+     * check. Never separate release from its acquired-count publication. */
+    rc = wl_evaluation_control_charge_attempt(funding, id, 0);
+    if (rc) return rc;
+    drain->release_error = 0;
+    if (drain->phase == WL_COLUMNAR_RELATION_PRIVATE_BATCH_OWNER) {
+        if (single->set.owners_acquired) {
+            rc = wl_columnar_relation_single_release(single, 1,
+                    &single->owners[0].writer);
+            if (rc) {
+                drain->release_error = rc; return 0;
+            }
+            --single->set.owners_acquired;
+        }
+        drain->phase = WL_COLUMNAR_RELATION_PRIVATE_BATCH_DESCRIPTOR;
+    } else {
+        if (single->set.owners_acquired) return EINVAL;
+        if (single->set.descriptors_acquired) {
+            rc = wl_columnar_relation_single_release(single, 0,
+                    &single->descriptor.writer);
+            if (rc) {
+                drain->release_error = rc; return 0;
+            }
+            single->set.descriptors_acquired = 0;
+        }
+        drain->phase = WL_COLUMNAR_RELATION_PRIVATE_BATCH_CLEAR;
+    }
+    return 0;
+}
+
 static void
 wl_columnar_relation_batch_capture_dispose(
     wl_columnar_relation_batch_capture_t *capture)
@@ -20088,7 +20179,7 @@ static int
 wl_columnar_relation_row_body_operator(col_rel_t *r, const int64_t *input,
     wl_evaluation_control_t *control, uint64_t attempt_id,
     wl_columnar_relation_mutation_single_t *single, bool borrowed,
-    uint32_t captured_width)
+    uint32_t captured_width, bool nongrowth)
 {
     wl_columnar_relation_row_t row;
     int rc;
@@ -20116,6 +20207,10 @@ wl_columnar_relation_row_body_operator(col_rel_t *r, const int64_t *input,
     if (rc)
         goto done;
     bool growth = r->nrows >= r->capacity;
+    if (nongrowth && (growth || r->ncols != captured_width)) {
+        rc = EINVAL;
+        goto done;
+    }
     if (borrowed && r->ncols != captured_width) {
         rc = ENOTSUP;
         goto done;
@@ -20659,7 +20754,7 @@ wl_columnar_relation_append_batch_row_operator_controlled(
     }
     rc = wl_columnar_relation_row_body_operator(r, capture.values,
             batch->control,
-            batch->attempt_id, &batch->raw.single, true, capture.width);
+            batch->attempt_id, &batch->raw.single, true, capture.width, false);
 done:
     wl_columnar_relation_batch_capture_dispose(&capture);
     return rc;
@@ -20698,6 +20793,69 @@ wl_columnar_relation_append_batch_numeric_row_operator_controlled(
     if (rc) return rc;
     return wl_evaluation_control_charge_attempt(control, attempt_id,
                0);
+}
+
+/* Actual LFTJ owns disjoint mutable scratch and protected counted capacity.
+* Generic rows retain capture/renewal. Reuse every checked ROW cell here. */
+int
+wl_columnar_relation_append_lftj_owned_row_operator_controlled(
+    wl_columnar_lftj_attempt_t *a)
+{
+    if (!a || a->identity != a) return EINVAL;
+    wl_evaluation_control_t *control = a->control;
+    uint64_t id = a->attempt_id;
+    int rc = wl_columnar_relation_constructor_attempt_charge(control, id,
+            WL_COLUMNAR_RELATION_SCALAR_SOURCE_SELECTED_WORK);
+    if (rc) return rc;
+    const wl_columnar_eval_plan_numeric_attempt_t *n = a->numeric_owner;
+    bool valid = a->busy && a->thread_valid && a->row && a->output_owned
+        && a->output && a->writer_active && a->output_pass
+        && a->phase == WL_COLUMNAR_LFTJ_ATTEMPT_JOIN
+        && a->join_phase == WL_COLUMNAR_LFTJ_JOIN_PRODUCT_EMIT
+        && a->fill_input == a->input_count && !a->fill_col
+        && a->writer.identity == &a->writer && !a->writer.raw_mode
+        && a->writer.phase == WL_COLUMNAR_RELATION_BATCH_HELD
+        && a->writer.control == control && a->writer.attempt_id == id;
+    if (valid && n)
+        valid = &n->lftj == a && n->composed_busy
+            && n->phase == WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_LFTJ_CHILD
+            && n->frame == a->frame && n->session == a->session
+            && n->control == control && n->attempt_id == id;
+    int tail = wl_columnar_relation_constructor_attempt_tail(control, id,
+            WL_COLUMNAR_RELATION_SCALAR_SOURCE_SELECTED_WORK);
+    if (tail > 0 || valid) {
+        if (tail) return tail;
+    }else return EINVAL;
+    eval_stack_t *stack = NULL;
+    rc = wl_columnar_eval_stack_operator_stack_owned(a->frame, a->session,
+            &stack, a->numeric_owner);
+    if (rc) return rc;
+    rc = wl_evaluation_control_charge_attempt(control, id, 0);
+    if (rc) return rc;
+    rc = wl_columnar_relation_constructor_attempt_charge(control, id,
+            WL_COLUMNAR_RELATION_SCALAR_SOURCE_ROW_CALL_WORK);
+    if (rc) return rc;
+    rc = wl_columnar_relation_constructor_attempt_tail(control, id,
+            WL_COLUMNAR_RELATION_SCALAR_SOURCE_ROW_CALL_WORK);
+    if (rc) return rc;
+    rc = wl_columnar_relation_batch_check(&a->writer);
+    if (rc) return rc;
+    rc = wl_evaluation_control_charge_attempt(control, id, 0);
+    if (rc) return rc;
+    col_rel_t *r = a->writer.raw.relation;
+    if (r != a->output || r->storage_owner != r
+        || !a->total_columns || r->ncols != a->total_columns
+        || r->column_types || r->timestamps
+        || a->output_written >= a->output_rows
+        || a->output_rows > r->capacity || r->nrows != a->output_written)
+        return EINVAL;
+    r->memory_budget_denial_pending = false;
+    rc = wl_columnar_relation_row_body_operator(r, a->row, control, id,
+            &a->writer.raw.single, true, a->total_columns, true);
+    if (rc) return rc;
+    /* Private nrows may precede output_written on a refused tail. Caller
+     * aborts/retire this attempt; it must not repeat the forward append. */
+    return wl_evaluation_control_charge_attempt(control, id, 0);
 }
 
 /* Additive operator-specific selection preserves the legacy API below byte

@@ -2270,12 +2270,93 @@ wl_columnar_eval_plan_composed_fund(wl_evaluation_control_t *funding,
                WL_COLUMNAR_EVAL_PLAN_NUMERIC_HOST_WORK);
 }
 
+/* A static entry/pair scan has its own saved host funding cuts. Preserve
+ * legacy numeric validation and never poll a sticky Original for cleanup. */
+#ifdef WL_SESSION_TEST_HOOKS
+/* Borrowed funding instrumentation may request a stop; it acquires no engine
+ * context or mutable relation/receipt authority. */
+void (*wl_columnar_eval_plan_test_static_validation_checkpoint)(
+    wl_evaluation_control_t *, uint64_t, uint32_t, uint32_t);
+#endif
+
+static int
+wl_columnar_eval_plan_composed_static_poll(wl_evaluation_control_t *funding,
+    uint64_t id, uint32_t entry, uint32_t pair)
+{
+#ifdef WL_SESSION_TEST_HOOKS
+    if (wl_columnar_eval_plan_test_static_validation_checkpoint)
+        wl_columnar_eval_plan_test_static_validation_checkpoint(funding, id,
+            entry, pair);
+#else
+    (void)entry; (void)pair;
+#endif
+    return wl_evaluation_control_charge_attempt(funding, id, 0);
+}
+
+static int
+wl_columnar_eval_plan_composed_validate_funded(
+    const wl_columnar_eval_plan_numeric_attempt_t *record,
+    wl_evaluation_control_t *funding, uint64_t funding_id)
+{
+    if (!record || !wl_columnar_eval_plan_numeric_owner_valid(record,
+        record->frame)) return EINVAL;
+    if (record->session->cleanup_active != record->frame) return EBUSY;
+    if (record->private_bindings) {
+        const wl_columnar_eval_private_bindings_t *bindings =
+            record->private_bindings;
+        if (bindings->identity != (uintptr_t)bindings
+            || bindings->session != record->session
+            || bindings->plan != record->plan
+            || bindings->control != record->control
+            || bindings->attempt_id != record->attempt_id
+            || !bindings->count
+            || (!bindings->dynamic_entries
+            && bindings->count > WL_COLUMNAR_EVAL_PRIVATE_BINDING_MAX)
+            || wl_evaluation_control_active_attempt_id(record->control)
+            != record->attempt_id)
+            return EINVAL;
+        if (bindings->dynamic_entries) {
+            if (!wl_columnar_session_observed_bindings_authorized(
+                    record->session, bindings)) return EINVAL;
+        }
+        if (!bindings->dynamic_entries
+            && (!funding || funding == record->control ||
+            !funding_id)) return EINVAL;
+        for (uint32_t i = 0; !bindings->dynamic_entries
+            && i < bindings->count; ++i) {
+            int rc = wl_columnar_eval_plan_composed_static_poll(funding,
+                    funding_id, i, UINT32_MAX);
+            if (rc) return rc;
+            const wl_columnar_eval_private_binding_t *entry =
+                &bindings->entries[i];
+            if (!wl_columnar_eval_plan_private_entry_valid(
+                    entry)) return EINVAL;
+            for (uint32_t j = 0; j < i; ++j) {
+                rc = wl_columnar_eval_plan_composed_static_poll(funding,
+                        funding_id, i, j);
+                if (rc) return rc;
+                if (!wl_columnar_eval_plan_private_pair_distinct(
+                        &bindings->entries[j], entry)) return EINVAL;
+            }
+        }
+    }
+    if (record->private_bindings &&
+        !record->private_bindings->dynamic_entries) {
+        int rc = wl_columnar_eval_plan_composed_static_poll(funding, funding_id,
+                UINT32_MAX, UINT32_MAX);
+        if (rc) return rc;
+    }
+    return wl_columnar_eval_stack_numeric_owner(record->frame, record);
+}
+
 static int
 wl_columnar_eval_plan_composed_validate(
-    const wl_columnar_eval_plan_numeric_attempt_t *record)
+    const wl_columnar_eval_plan_numeric_attempt_t *record,
+    wl_evaluation_control_t *funding, uint64_t funding_id)
 {
     if (record && record->lftj_metadata_ended) return EBUSY;
-    int rc = wl_columnar_eval_plan_numeric_validate(record);
+    int rc = wl_columnar_eval_plan_composed_validate_funded(record, funding,
+            funding_id);
     if (rc) return rc;
     if (!record->composed_mode || record->runtime_depth > COL_STACK_MAX
         || record->preflight_depth > COL_STACK_MAX
@@ -3566,7 +3647,8 @@ wl_columnar_eval_plan_numeric_composed_cleanup_lftj_body(
     wl_columnar_eval_plan_numeric_attempt_t *record,
     wl_evaluation_control_t *funding, uint64_t funding_id)
 {
-    int rc = wl_columnar_eval_plan_composed_validate(record);
+    int rc = wl_columnar_eval_plan_composed_validate(record, funding,
+            funding_id);
     if (rc) return rc;
     if ((record->phase != WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_LFTJ_CHILD
         && record->phase != WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_RELEASE)
@@ -3630,7 +3712,8 @@ wl_columnar_eval_plan_numeric_composed_cleanup_source(
     wl_columnar_eval_plan_numeric_attempt_t *record,
     wl_evaluation_control_t *funding, uint64_t funding_id)
 {
-    int rc = wl_columnar_eval_plan_composed_validate(record);
+    int rc = wl_columnar_eval_plan_composed_validate(record, funding,
+            funding_id);
     if (rc) return rc;
     if (wl_columnar_eval_stack_frame_mutation_blocked(
             record->frame)) return EBUSY;
@@ -3792,7 +3875,8 @@ wl_columnar_eval_plan_numeric_composed_consume_result(
     if (record && (record->composed_busy
         || wl_columnar_eval_stack_frame_mutation_blocked(
             record->frame))) return EBUSY;
-    int rc = wl_columnar_eval_plan_composed_validate(record);
+    int rc = wl_columnar_eval_plan_composed_validate(record, funding,
+            funding_id);
     if (rc) return rc;
     if (record->phase != WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_PENDING)
         return EBUSY;
@@ -3809,7 +3893,8 @@ wl_columnar_eval_plan_numeric_composed_attempt_status(
     wl_evaluation_control_t *funding, uint64_t funding_id)
 {
     if (!status) return EINVAL;
-    int rc = wl_columnar_eval_plan_composed_validate(record);
+    int rc = wl_columnar_eval_plan_composed_validate(record, funding,
+            funding_id);
     if (rc) return rc;
     /* Validation proves the frame's numeric owner is this exact record. */
     if (!wl_columnar_eval_stack_protocol_copy_output(record->frame, status,
@@ -3837,7 +3922,8 @@ wl_columnar_eval_plan_numeric_composed_abort_request(
     if (record && (record->composed_busy
         || wl_columnar_eval_stack_frame_mutation_blocked(
             record->frame))) return EBUSY;
-    int rc = wl_columnar_eval_plan_composed_validate(record);
+    int rc = wl_columnar_eval_plan_composed_validate(record, funding,
+            funding_id);
     if (rc) return rc;
     /* Closure is finalized by the bounded preflight before any child owner
      * can be started. Unsupported plans remain usable through ADVANCE. */
@@ -3883,16 +3969,65 @@ wl_columnar_eval_plan_composed_ack_clear(
     wl_evaluation_control_release(control);
 }
 
+static int wl_columnar_eval_plan_native_lftj_owner(
+    const wl_columnar_eval_plan_numeric_attempt_t *);
+
+#ifdef WL_SESSION_TEST_HOOKS
+void (*wl_columnar_eval_plan_test_lftj_ack_checkpoint)(
+    wl_columnar_eval_plan_numeric_attempt_t *, wl_evaluation_control_t *,
+    uint64_t, size_t);
+#endif
+
+static int
+wl_columnar_eval_plan_composed_ack_poll(
+    wl_columnar_eval_plan_numeric_attempt_t *record,
+    wl_evaluation_control_t *funding, uint64_t id, size_t offset)
+{
+#ifdef WL_SESSION_TEST_HOOKS
+    if (wl_columnar_eval_plan_test_lftj_ack_checkpoint)
+        wl_columnar_eval_plan_test_lftj_ack_checkpoint(record, funding, id,
+            offset);
+#else
+    (void)record; (void)offset;
+#endif
+    return wl_evaluation_control_charge_attempt(funding, id, 0);
+}
+
 static int
 wl_columnar_eval_plan_composed_ack_body(
-    wl_columnar_eval_plan_numeric_attempt_t *record)
+    wl_columnar_eval_plan_numeric_attempt_t *record,
+    wl_evaluation_control_t *funding, uint64_t id)
 {
-    int rc = wl_columnar_eval_stack_composed_source_release(record->frame,
+    record->composed_busy = true;
+    int rc = wl_columnar_eval_plan_composed_ack_poll(record, funding, id,
+            SIZE_MAX);
+    if (!rc) rc =
+            wl_columnar_eval_stack_composed_source_release_validate(
+            record->frame,
             record->session, record);
-    if (rc) return rc;
-    memset(&record->lftj, 0, sizeof(record->lftj));
-    wl_columnar_eval_plan_composed_ack_clear(record);
-    return 0;
+    if (!rc && record->lftj.identity) {
+        rc = record->lftj.phase == WL_COLUMNAR_LFTJ_ATTEMPT_DONE
+            ? wl_columnar_eval_plan_native_lftj_owner(record) : EBUSY;
+    }
+    /* NULL identity is a neverborn or already terminal partial-clear lineage.
+     * Do not read its potentially uninitialized historic storage. Retain the
+     * canonical numeric/frame owner until ALL refusing checks have passed. */
+    for (size_t offset = 0; !rc && offset < sizeof(record->lftj);) {
+        rc = wl_columnar_eval_plan_composed_ack_poll(record, funding, id,
+                offset);
+        if (rc) break;
+        size_t count = sizeof(record->lftj) - offset;
+        if (count > 1024u) count = 1024u;
+        memset((unsigned char *)&record->lftj + offset, 0, count);
+        offset += count;
+    }
+    if (!rc) rc = wl_columnar_eval_plan_composed_ack_poll(record, funding, id,
+                sizeof(record->lftj));
+    if (!rc) rc = wl_columnar_eval_stack_composed_source_release(record->frame,
+                record->session, record);
+    if (!rc) wl_columnar_eval_plan_composed_ack_clear(record);
+    else record->composed_busy = false;
+    return rc;
 }
 
 int
@@ -3903,7 +4038,8 @@ wl_columnar_eval_plan_numeric_composed_attempt_ack(
     if (record && (record->composed_busy
         || wl_columnar_eval_stack_frame_mutation_blocked(
             record->frame))) return EBUSY;
-    int rc = wl_columnar_eval_plan_composed_validate(record);
+    int rc = wl_columnar_eval_plan_composed_validate(record, funding,
+            funding_id);
     if (rc) return rc;
     if (record->phase != WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_DONE
         || record->source_initialized || record->source_bare
@@ -3912,7 +4048,7 @@ wl_columnar_eval_plan_numeric_composed_attempt_ack(
     rc = wl_columnar_eval_plan_composed_fund(funding, funding_id,
             record->control);
     if (rc) return rc;
-    return wl_columnar_eval_plan_composed_ack_body(record);
+    return wl_columnar_eval_plan_composed_ack_body(record, funding, funding_id);
 }
 
 /* This is an ended-Original Native owner, not ordinary sticky-stop authority.
@@ -3952,7 +4088,12 @@ wl_columnar_eval_plan_native_lftj_owner(
     if (a->phase == WL_COLUMNAR_LFTJ_ATTEMPT_DONE
         && (a->writer_active || a->output_owned || a->output || a->inputs
         || a->row || a->scratch_reserved || a->scratch_committed
-        || a->retirement_started || a->retirement_initializer.identity))
+        || a->retirement_started || a->retirement_initializer.identity
+        || a->writer_drain.identity))
+        return EINVAL;
+    if (a->writer_drain.identity
+        && (a->writer_drain.identity != &a->writer_drain
+        || (a->writer_drain.batch && a->writer_drain.batch != &a->writer)))
         return EINVAL;
     const wl_columnar_relation_scalar_retirement_initializer_t *i =
         &a->retirement_initializer;
@@ -3963,6 +4104,78 @@ wl_columnar_eval_plan_native_lftj_owner(
         && (a->retirement.storage.identity != (uintptr_t)&a->retirement.storage
         || a->retirement.committed != a->retirement_committed)) return EINVAL;
     if (a->retirement_drained && !a->retirement_started) return EINVAL;
+    return 0;
+}
+
+static int
+wl_columnar_eval_plan_native_lftj_metadata_owner(
+    const wl_columnar_eval_plan_numeric_attempt_t *n)
+{
+    const wl_columnar_lftj_metadata_proof_t *p = &n->lftj_metadata;
+    bool preflight = n->phase ==
+        WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_PREFLIGHT_LFTJ;
+    if ((!preflight &&
+        n->phase != WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_LFTJ_BEGIN)
+        || n->lftj_metadata_dispatch || !n->plan || !n->plan->ops
+        || n->end > n->plan->op_count || p->op_index < n->begin
+        || p->op_index >= n->end || n->cursor != p->op_index
+        || p->operation != &n->plan->ops[p->op_index]
+        || p->operation->op != WL_PLAN_OP_LFTJ
+        || n->source_initialized || n->source_slot_borrowed
+        || n->join_host || n->join_host_admitted || n->join_host_governor)
+        return EINVAL;
+    if (preflight) {
+        if (p->phase < WL_COLUMNAR_LFTJ_METADATA_HEADER
+            || p->phase > WL_COLUMNAR_LFTJ_METADATA_VALIDATED) return EINVAL;
+    } else if (p->phase < WL_COLUMNAR_LFTJ_METADATA_BIND_HEADER
+        || p->phase > WL_COLUMNAR_LFTJ_METADATA_INSTALL) return EINVAL;
+    /* HEADER precedes capture and semantic validation. It owns no child
+    * resources; malformed language metadata must still be clearable. */
+    if (p->phase == WL_COLUMNAR_LFTJ_METADATA_HEADER) return 0;
+    if (!p->metadata || p->metadata != p->operation->opaque_data
+        || p->k < 2 || p->k > WL_LFTJ_MAX_K
+        || p->k != p->metadata->k || !p->names || !p->keys
+        || p->names != p->metadata->rel_names ||
+        p->keys != p->metadata->key_cols)
+        return EINVAL;
+    if (p->phase == WL_COLUMNAR_LFTJ_METADATA_NAMES)
+        return p->name_index < p->k ? 0 : EINVAL;
+    if (p->name_index != p->k) return EINVAL;
+    /* BIND_HEADER has not captured a binding tuple yet. */
+    if (p->phase <= WL_COLUMNAR_LFTJ_METADATA_BIND_HEADER) return 0;
+    if (p->bindings != n->private_bindings || p->entry > p->binding_count
+        || p->pair > p->entry) return EINVAL;
+    const wl_columnar_eval_private_bindings_t *b = p->bindings;
+    if (b) {
+        if (b->identity != (uintptr_t)b || b->session != n->session
+            || b->plan != n->plan || b->control != n->control
+            || b->attempt_id != n->attempt_id || !b->count
+            || p->binding_count != b->count ||
+            p->dynamic_entries != b->dynamic_entries
+            || p->binding_generation != b->generation
+            || (!b->dynamic_entries &&
+            b->count > WL_COLUMNAR_EVAL_PRIVATE_BINDING_MAX))
+            return EINVAL;
+    } else if (p->binding_count || p->dynamic_entries || p->binding_generation)
+        return EINVAL;
+    if (p->phase == WL_COLUMNAR_LFTJ_METADATA_BIND_ENTRY
+        || p->phase == WL_COLUMNAR_LFTJ_METADATA_BIND_PAIR) {
+        if (!b || p->dynamic_entries || p->entry >= p->binding_count
+            || p->entry >= WL_COLUMNAR_EVAL_PRIVATE_BINDING_MAX
+            || (p->phase == WL_COLUMNAR_LFTJ_METADATA_BIND_PAIR &&
+            p->pair >= p->entry))
+            return EINVAL;
+    } else if (p->phase == WL_COLUMNAR_LFTJ_METADATA_BIND_DYNAMIC) {
+        if (!b || !p->dynamic_entries || p->entry || p->pair) return EINVAL;
+    } else if (p->entry != p->binding_count) return EINVAL;
+    if (p->phase >= WL_COLUMNAR_LFTJ_METADATA_PREFIX
+        && (p->registry != n->session->rels ||
+        p->registry_count != n->session->nrels
+        || p->prefix_cleared !=
+        (p->phase == WL_COLUMNAR_LFTJ_METADATA_INSTALL)))
+        return EINVAL;
+    /* Identity is published last in INSTALL, with no hook before child
+     * activation. Neverborn or prefix-cleared storage is not inspected. */
     return 0;
 }
 
@@ -3980,8 +4193,11 @@ wl_columnar_eval_plan_join_cleanup_admit(
     /* Finance only: the embedded observation grants no child authority. */
     bool native_lftj = n->lftj.identity
         && n->lftj.phase != WL_COLUMNAR_LFTJ_ATTEMPT_DONE;
+    bool native_metadata = n->phase ==
+        WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_PREFLIGHT_LFTJ
+        || n->phase == WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_LFTJ_BEGIN;
     rc = wl_evaluation_control_charge_attempt(funding, id,
-            native_lftj ? 32 : 128);
+            native_lftj || native_metadata ? 32 : 128);
     if (rc) return rc;
     if (!ctx->child_bound || !wl_columnar_eval_plan_numeric_owner_valid(n,
         ctx->frame)
@@ -3993,12 +4209,22 @@ wl_columnar_eval_plan_join_cleanup_admit(
         || n->phase < WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_INPUTS
         || n->phase > WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_DONE)
         return EINVAL;
+    if (native_lftj || native_metadata) {
+        rc = wl_evaluation_control_charge_attempt(funding, id, 8);
+        if (rc) return rc;
+    }
     if (n->lftj.identity) {
-        if (native_lftj) {
-            rc = wl_evaluation_control_charge_attempt(funding, id, 8);
-            if (rc) return rc;
-        }
+        if (native_metadata && native_lftj) return EINVAL;
         rc = wl_columnar_eval_plan_native_lftj_owner(n);
+        if (rc) return rc;
+    }
+    if (native_metadata) {
+        rc = wl_evaluation_control_charge_attempt(funding, id, 0);
+        if (rc) return rc;
+        rc = wl_columnar_eval_plan_native_lftj_metadata_owner(n);
+        if (rc) return rc;
+        /* Keep the nested stack/thread owner proof in its own real packet. */
+        rc = wl_evaluation_control_charge_attempt(funding, id, 0);
         if (rc) return rc;
     }
     rc = wl_columnar_eval_stack_numeric_owner(n->frame, n);
@@ -4020,6 +4246,8 @@ wl_columnar_eval_plan_join_cleanup_redirect(
     switch (n->phase) {
     case WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_INPUTS:
     case WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_PREFLIGHT:
+    case WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_PREFLIGHT_LFTJ:
+    case WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_LFTJ_BEGIN:
     case WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_READY:
     case WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_SOURCE_FULL:
     case WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_SOURCE_DELTA:
@@ -4183,7 +4411,7 @@ wl_columnar_eval_plan_numeric_join_cleanup_ack(
         return EBUSY;
     rc = wl_columnar_eval_plan_composed_fund(funding, id, n->control);
     if (rc) return rc;
-    rc = wl_columnar_eval_plan_composed_ack_body(n);
+    rc = wl_columnar_eval_plan_composed_ack_body(n, funding, id);
     if (!rc) wl_columnar_eval_stack_auto_child_acked(ctx);
     return rc;
 }
@@ -4267,7 +4495,8 @@ wl_columnar_eval_plan_numeric_composed_attempt_step(
     if (record && (record->composed_busy
         || wl_columnar_eval_stack_frame_mutation_blocked(
             record->frame))) return EBUSY;
-    int rc = wl_columnar_eval_plan_composed_validate(record);
+    int rc = wl_columnar_eval_plan_composed_validate(record, funding,
+            funding_id);
     if (rc) return rc;
     if (record->composed_busy) return EBUSY;
     bool setup = record->phase == WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_READY
@@ -4311,7 +4540,8 @@ wl_columnar_eval_plan_numeric_composed_cleanup_lftj(
     wl_columnar_eval_plan_numeric_attempt_t *record,
     wl_evaluation_control_t *funding, uint64_t funding_id)
 {
-    int rc = wl_columnar_eval_plan_composed_validate(record);
+    int rc = wl_columnar_eval_plan_composed_validate(record, funding,
+            funding_id);
     if (rc) return rc;
     if (wl_columnar_eval_stack_frame_mutation_blocked(
             record->frame)) return EBUSY;
