@@ -1439,9 +1439,14 @@ wl_columnar_eval_stack_anti_keep_all_body(
         || !wl_columnar_eval_stack_unary_entry_inert(&frame->unary_retired)
         || ctx->source_initialized || ctx->join_right_initialized
         || ctx->source_bare || ctx->join_right_bare || ctx->join_initialized
-        || ctx->batch_initialized || ctx->program || ctx->heap || ctx->admitted
+        || ctx->batch_initialized || ctx->program || ctx->scalar_program ||
+        ctx->heap || ctx->admitted
         || ctx->ref_held || ctx->governor || ctx->output || ctx->private_output
-        || ctx->table.programs || ctx->table.allocated || ctx->table.admitted
+        || ctx->table.programs || ctx->table.scalars ||
+        ctx->table.scalar_allocated
+        || ctx->table.scalar_admitted || ctx->table.scalar_initialized_slots
+        || ctx->table.scalar_committed || ctx->table.allocated ||
+        ctx->table.admitted
         || ctx->table.ref_held) return EBUSY;
     if ((ctx->source_empty_reader.identity &&
         (ctx->source_empty_reader.identity != &ctx->source_empty_reader
@@ -4676,9 +4681,13 @@ wl_columnar_eval_stack_prepared_join_state(
     const wl_columnar_filter_context_t *ctx = &p->frame->filter;
     if (ctx->source_initialized || ctx->join_right_initialized
         || ctx->source_bare || ctx->join_right_bare || ctx->join_initialized
-        || ctx->batch_initialized || ctx->program
+        || ctx->batch_initialized || ctx->program || ctx->scalar_program
         || ctx->heap || ctx->admitted || ctx->ref_held || ctx->governor
-        || ctx->table.programs || ctx->table.allocated || ctx->table.admitted
+        || ctx->table.programs || ctx->table.scalars ||
+        ctx->table.scalar_allocated
+        || ctx->table.scalar_admitted || ctx->table.scalar_initialized_slots
+        || ctx->table.scalar_committed || ctx->table.allocated ||
+        ctx->table.admitted
         || ctx->table.ref_held || ctx->table.governor
         || !wl_columnar_eval_stack_prepared_empty_source_inert(
             &ctx->source_empty_reader)

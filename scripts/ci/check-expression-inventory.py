@@ -35,15 +35,24 @@ def check(root: Path) -> tuple[list[str], int]:
     decoder = function_body(source, 'wl_columnar_expr_attempt_decode')
     raw_tags = set(re.findall(r'case (WL_PLAN_EXPR_[A-Z0-9_]+)', raw))
     decoded = set(re.findall(r'case (WL_PLAN_EXPR_[A-Z0-9_]+)', decoder))
+    scalar = function_body(source, 'wl_columnar_expr_scalar_decode')
+    scalar_tags = set(re.findall(r'case (WL_PLAN_EXPR_[A-Z0-9_]+)', scalar))
+    delegates = re.search(r'default:\s*return\s+'
+                          r'wl_columnar_expr_attempt_decode\s*\(', scalar)
     ledger = (root / 'docs/implementation/2299/EXPRESSION_ACCEPTANCE.md').read_text(encoding='utf-8')
-    rows = re.findall(r'^\| `(WL_PLAN_EXPR_[A-Z0-9_]+)` \| ([a-z-]+) \|$',
+    rows = re.findall(r'^\| `(WL_PLAN_EXPR_[A-Z0-9_]+)` \| ([a-z-]+) \| ([a-z-]+) \| ([a-z0-9-]+) \|$',
                       ledger, re.M)
     errors = []
-    if len(rows) != len(dict(rows)):
+    recorded = {row[0]: row[1:] for row in rows}
+    if len(rows) != len(recorded):
         errors.append('duplicate tag rows')
-    if set(dict(rows)) != tags:
-        errors.append(f'tag inventory differs: {sorted(tags ^ set(dict(rows)))}')
-    for tag, state in rows:
+    if set(recorded) != tags:
+        errors.append(f'tag inventory differs: {sorted(tags ^ set(recorded))}')
+    if decoded - raw_tags or scalar_tags - raw_tags:
+        errors.append('decoder admits raw-rejected tags')
+    if not delegates:
+        errors.append('scalar numeric delegation changed; review admission inventory')
+    for tag, state, scalar_state, qualification in rows:
         expected = 'legacy-rejected' if tag not in raw_tags else 'open'
         if tag in raw_tags and tag in decoded:
             start = decoder.index('case ' + tag + ':')
@@ -54,6 +63,19 @@ def check(root: Path) -> tuple[list[str], int]:
             expected = 'empty-only' if gated else 'existing-numeric'
         if state != expected:
             errors.append(f'{tag}: {state}, source requires review of {expected}')
+        scalar_expected = ('legacy-rejected' if tag not in raw_tags else
+                           'admitted' if tag in scalar_tags or
+                           (delegates and expected == 'existing-numeric') else 'open')
+        if scalar_state != scalar_expected:
+            errors.append(f'{tag}: scalar {scalar_state}, expected {scalar_expected}')
+        valid_qualification = (qualification == 'open' or
+                               qualification == 'baseline-numeric' and
+                               expected == 'existing-numeric' or
+                               qualification in {'unit4-sessions', 'unit5-sessions', 'unit5-decimal', 'unit5-digests', 'unit6-builders', 'unit6-selectors', 'unit6-replace'} and
+                               tag in scalar_tags and scalar_expected == 'admitted' or
+                               qualification == 'legacy-rejected' and tag not in raw_tags)
+        if not valid_qualification:
+            errors.append(f'{tag}: invalid host qualification {qualification}')
     return errors, len(tags)
 
 

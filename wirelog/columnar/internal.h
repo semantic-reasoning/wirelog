@@ -5904,6 +5904,88 @@ int wl_columnar_expr_bytes_find_attempt_controlled(const uint8_t *, size_t,
     const uint8_t *, size_t, size_t *, bool *, wl_evaluation_control_t *,
     uint64_t);
 
+/* Permissive UTF-8 step: empty => advance0/codepoint-1; invalid lead =>
+ * advance1/codepoint-1; invalid continuation at i => advance i/codepoint-1.
+ * Each actual inspected byte costs224, entry/final224 each. Outputs unchanged
+ * on nonzero; immutable NUL-terminated input borrowed from a live owner/pin. */
+int wl_columnar_expr_utf8_next_attempt_controlled(const char *, size_t *,
+    int64_t *, wl_evaluation_control_t *, uint64_t);
+
+/* Base10 prefix with locale isspace, optional sign and checked int64 range.
+ * Tariff224 per entry/final, inspected byte and digit accumulation. Traverses
+ * the entire digit prefix even after overflow; suffix is ignored. ERANGE and
+ * control/identity errors leave output unchanged. Input borrowed/immutable. */
+int wl_columnar_expr_decimal_attempt_controlled(const char *, int64_t *,
+    wl_evaluation_control_t *, uint64_t);
+
+/* Borrowed spans, NULL only for length0; saved active attempt required.
+ * No allocations/intern changes. Nonzero leaves output unchanged.
+ * XXH3: 224*(4+ceil(length/64)) engine work, narrow vendor reset/update/digest
+ * cooperation boundaries, each update<=64. CRC: 224*(2*length+2), distinct
+ * byte LOAD and immutable-table update, zero-extended complemented CRC. */
+int wl_columnar_expr_hash_bytes_attempt_controlled(const uint8_t *, size_t,
+    int64_t *, wl_evaluation_control_t *, uint64_t);
+int wl_columnar_expr_crc_bytes_attempt_controlled(const uint8_t *, size_t,
+    bool, uint32_t *, wl_evaluation_control_t *, uint64_t);
+
+/* Private disjoint case-copy destination, immutable source span. Like byte
+ * copy, copied reports completed stores after accepted entry, even on stop;
+ * rejected entry leaves it unchanged. Tariff224*(3*length+2): LOAD, ASCII-only
+ * transform, STORE separately funded. NUL/high bytes are ordinary span bytes. */
+int wl_columnar_expr_ascii_case_attempt_controlled(uint8_t *, const uint8_t *,
+    size_t, bool, size_t *, wl_evaluation_control_t *, uint64_t);
+/* Caller supplies private24-byte buffer. Fixed snprintf boundary; buffer may
+ * be modified before a later stop, length unchanged on nonzero. Two224 caller
+ * regions, independent of fixed-width int64 magnitude. No heap admission. */
+int wl_columnar_expr_format_i64_attempt_controlled(int64_t, char *, size_t *,
+    wl_evaluation_control_t *, uint64_t);
+
+/* Immutable C-string span selectors. Nonzero leaves all outputs unchanged.
+* Trim uses locale isspace on unsigned bytes, metered front/back inspections
+* plus the full bounded length scan. Slice preserves permissive UTF8 next;
+* negative/beyond-end indices publish valid=false without changing span,
+* start==end is valid, and no signed start+length addition is performed. */
+int wl_columnar_expr_trim_span_attempt_controlled(const char *, size_t *,
+    size_t *, wl_evaluation_control_t *, uint64_t);
+int wl_columnar_expr_utf8_slice_attempt_controlled(const char *, int64_t,
+    int64_t, size_t *, size_t *, bool *, wl_evaluation_control_t *, uint64_t);
+
+/* Checked nonoverlapping replacement metadata, excluding trailing NUL.
+ * old_length must be positive; count*old_length cannot exceed source_length.
+ * Normal exact work448, errors leave result unchanged. No allocation/input
+ * traversal; capacity includes a representable terminating NUL. */
+int wl_columnar_expr_replace_size_attempt_controlled(size_t, size_t, size_t,
+    size_t, size_t *, wl_evaluation_control_t *, uint64_t);
+
+/* Context-bearing scalar owner (#2299). Immutable bytecode copy, no intern
+ * mutation during compile. Numeric-only hosts keep the numeric owner path.
+ * Evaluation borrows the actual session/plan context (or caller-held pin),
+ * never rebinds the intern to the bytecode owner's governor. Temporary literal
+ * buffers use that owner governor; retained strings use their intern governor.
+ * Caller keeps context, row and owner live/immutable throughout evaluation.
+ * Compile initializes out=NULL/supported=false; unsupported grammar returns0.
+ * Nonzero eval leaves scalar outputs unchanged. Semantic failure publishes
+ * value0/failed=true/MALFORMED. Literal legacy interning failures map ENOMEM;
+ * temporary governed allocation keeps its own ENOSPC/admission dispositions.
+ * No raw expression fallback. Disposal is mandatory/noncancellable. */
+typedef struct wl_columnar_expr_attempt_scalar wl_columnar_expr_attempt_scalar_t;
+int wl_columnar_expr_compile_scalar_attempt_controlled(const uint8_t *,
+    uint32_t,
+    wl_columnar_memory_governor_ref_t *, wl_columnar_expr_attempt_scalar_t **,
+    bool *, wl_evaluation_control_t *, uint64_t);
+int wl_columnar_expr_eval_scalar_attempt_controlled(
+    const wl_columnar_expr_attempt_scalar_t *, const int64_t *, uint32_t,
+    const wl_columnar_expr_context_t *, int64_t *, bool *,
+    wl_columnar_expr_status_t *, wl_evaluation_control_t *, uint64_t);
+int wl_columnar_expr_scalar_result_type_attempt_controlled(
+    const wl_columnar_expr_attempt_scalar_t *, const wirelog_column_type_t *,
+    uint32_t, wirelog_column_type_t *, bool *, wl_evaluation_control_t *,
+    uint64_t);
+void wl_columnar_expr_attempt_scalar_free(wl_columnar_expr_attempt_scalar_t *);
+#ifdef WL_SESSION_TEST_HOOKS
+size_t wl_columnar_expr_test_scalar_owner_size(void);
+#endif
+
 /* #1821 numeric preparation/execution foundation; no engine activation.
  * Bytecode is immutable through both passes. Governor is borrowed until free;
  * owner/row must remain alive and immutable during evaluation. NULL control
@@ -7067,6 +7149,8 @@ typedef enum {
     WL_COLUMNAR_FILTER_STAGE_CONTROL,
     WL_COLUMNAR_FILTER_STAGE_FINISH,
     WL_COLUMNAR_FILTER_STAGE_RESET,
+    WL_COLUMNAR_FILTER_STAGE_SCALAR_TABLE_PHYSICAL,
+    WL_COLUMNAR_FILTER_STAGE_SCALAR_TABLE_CREDIT,
     WL_COLUMNAR_FILTER_STAGE_DONE
 } wl_columnar_filter_stage_t;
 
@@ -7077,6 +7161,10 @@ typedef enum {
 * A cleared table has no resources; dormant credit bits are not authority. */
 typedef struct {
     wl_columnar_expr_attempt_numeric_t **programs;
+    wl_columnar_expr_attempt_scalar_t **scalars;
+    wl_columnar_memory_reservation_t scalar_credit;
+    uint32_t scalar_initialized_slots;
+    bool scalar_allocated, scalar_admitted, scalar_committed;
     uint32_t initialized_slots;
     uint32_t retirement_cursor;
     wl_columnar_memory_reservation_t credit;
@@ -7189,6 +7277,7 @@ typedef struct wl_columnar_filter_context {
     wl_columnar_relation_append_batch_t batch;
     wl_columnar_relation_private_batch_drain_t batch_drain;
     wl_columnar_expr_attempt_numeric_t *program;
+    wl_columnar_expr_attempt_scalar_t *scalar_program;
     wl_columnar_memory_reservation_t credit;
     wl_columnar_memory_governor_ref_t *governor;
     col_rel_t *output;

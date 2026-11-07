@@ -33,6 +33,7 @@ bench_backend_src = files(
   subdir_wirelog / 'columnar/ops.c',
   subdir_wirelog / 'columnar/arithmetic.c',
   subdir_wirelog / 'columnar/expr.c',
+  subdir_wirelog / 'columnar/expr_hash.c',
   subdir_wirelog / 'intern_control.c',
   subdir_wirelog / 'columnar/filter.c',
   subdir_wirelog / 'columnar/join.c',
