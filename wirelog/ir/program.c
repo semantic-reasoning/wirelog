@@ -1821,6 +1821,65 @@ validate_head_constants(struct wirelog_program *program,
     return 0;
 }
 
+/* #2231: a compound term in a body atom must sit at a compound column.
+ * Lowering matched a compound term against the column at its argument's
+ * index and read it as `_` at any other column, so
+ * `o(i, z) :- e(i, box(z)).` against `.decl e(i: int64, x: int64)` holding
+ * e(1, 9) derived o(1, 1), with z not bound to the column's value.  In an
+ * atom that writes its inline columns one argument per slot, arguments
+ * keep their columns' indexes only up to the first inline column of arity
+ * greater than 1; a compound term from there on is rejected, and that
+ * column must be written as a compound term instead.  Before it, and in
+ * every other atom, a compound term must be at an inline or side column.
+ * Compound terms nested inside one are not checked here. */
+static int
+check_body_atom_compounds(struct wirelog_program *program,
+    const wl_ir_relation_info_t *rel, const wl_parser_ast_node_t *atom,
+    bool logical, const char *kind)
+{
+    uint32_t aligned = atom->child_count;
+    for (uint32_t c = 0; !logical && rel->columns && c < rel->column_count;
+        c++)
+        if (rel->columns[c].compound_kind == WIRELOG_COMPOUND_KIND_INLINE
+            && rel->columns[c].compound_arity > 1) {
+            aligned = c;
+            break;
+        }
+    for (uint32_t a = 0; a < atom->child_count; a++) {
+        if (atom->children[a]->type != WL_PARSER_AST_NODE_COMPOUND_TERM)
+            continue;
+        if (a >= aligned) {
+            const char *flat = rel->columns[aligned].name;
+            wl_ir_program_set_error(program,
+                "%s for relation '%s' has a compound term at argument %u,"
+                " after inline column '%s' written one argument per slot;"
+                " write that column as a compound term (line %u)", kind,
+                rel->name, a + 1, flat ? flat : "", atom->line);
+            return -1;
+        }
+        if (!rel->columns || a >= rel->column_count
+            || rel->columns[a].compound_kind == WIRELOG_COMPOUND_KIND_NONE) {
+            /* Columns inferred from facts carry generated names. */
+            const char *name = rel->has_decl && rel->columns
+                && a < rel->column_count ? rel->columns[a].name : NULL;
+            if (name)
+                wl_ir_program_set_error(program,
+                    "%s for relation '%s' has a compound term at argument %u,"
+                    " but column '%s' of '%s' is not a compound column"
+                    " (line %u)", kind, rel->name, a + 1, name, rel->name,
+                    atom->line);
+            else
+                wl_ir_program_set_error(program,
+                    "%s for relation '%s' has a compound term at argument %u,"
+                    " but column %u of '%s' is not a compound column"
+                    " (line %u)", kind, rel->name, a + 1, a + 1, rel->name,
+                    atom->line);
+            return -1;
+        }
+    }
+    return 0;
+}
+
 /* #2231: a body atom, positive or negated, must have its relation's width.
  * An atom wider than its relation read the missing columns as 0, so
  * `p(x, y) :- g(x, y).` against a one-column `g` holding g(5) derived
@@ -1874,10 +1933,10 @@ check_body_atom_width(struct wirelog_program *program,
     } else {
         ok = atom->child_count == physical;
     }
-    if (ok)
-        return 0;
-
     const char *kind = negated ? "negated body atom" : "body atom";
+    if (ok)
+        return check_body_atom_compounds(program, rel, atom, logical, kind);
+
     if (!rel->has_decl)
         wl_ir_program_set_error(program,
             "%s for relation '%s' has %u argument(s) but its facts have %u"

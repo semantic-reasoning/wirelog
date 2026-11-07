@@ -357,17 +357,31 @@ of arity greater than 1: `pred(a, f(b, c))` is accepted and
 compound term at the position of an `inline` column selects logical form, so
 against `.decl q(x: g/2 inline, y: f/2 inline)`, `q(g(a, b), c, d)` is
 rejected; write `q(g(a, b), f(c, d))` or `q(a, b, c, d)`. A compound term at
-any other position, such as `q(a, b, c, f(d))`, leaves the atom in flat form
-and is not checked by this rule. A compound term whose functor or arity
-differs from the declaration, such as `pred(a, g(b, c))`, is accepted in
-logical form and matches no row. Atoms of a relation with neither a `.decl`
-nor inline facts are not checked.
+any other position, such as `q(a, b, c, f(d))`, leaves the atom in flat
+form; see below for where a compound term is accepted there. A compound term
+whose functor or arity differs from the declaration, such as
+`pred(a, g(b, c))`, is accepted in logical form and matches no row. Atoms of
+a relation with neither a `.decl` nor inline facts are not checked.
 
 A single `_` or variable for a whole `inline` column of arity n greater than
 1 leaves a flat-form atom n - 1 slots short, so `pred(a, _)` is rejected;
 write `pred(a, _, _)` or `pred(a, f(_, _))`. It used to read the row's first
 slots in order: against `.decl a(i: int64, p: pair/2 inline, k: int64)`
 holding `a(1, 2, 3, 4)`, `o(i, k) :- a(i, _, k).` derived `o(1, 3)`.
+
+A compound term in a body atom must be at a compound column (#2231).
+Lowering read a compound term at any other column as `_`, so its variables
+were not bound to the column's value: `o(i, z) :- e(i, box(z)).` against
+`.decl e(i: int64, x: int64)` holding `e(1, 9)` derived `o(1, 1)`, and
+`q(a, b, c, f(d))` above derived `o(1, 2, 3, 1)` from `q(1, 2, 3, 4)`. A
+compound term is accepted at an `inline` or `side` column and rejected at a
+scalar column. In flat form, arguments line up with their columns only up to
+the first `inline` column of arity greater than 1; a compound term after it
+is rejected, and that column must be written as a compound term. So
+`ev(metadata(_, _, _, r), a, b, k)` against
+`.decl ev(h: metadata/4 side, p: pair/2 inline, k: int64)` is accepted, and
+`q(a, b, c, f(d))` is rejected. Compound terms nested inside a compound term
+are not checked by this rule.
 
 ### Rules must not mix symbol and numeric values
 

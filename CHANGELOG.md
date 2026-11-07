@@ -248,6 +248,20 @@ All notable changes to wirelog are documented in this file.
 
 ### Fixed
 
+- **Body compound terms must be at a compound column** (#2231):
+  `o(i, z) :- e(i, box(z)).` against `.decl e(i: int64, x: int64)` holding
+  `e(1, 9)` derived `o(1, 1)`: lowering read a compound term at a scalar
+  column as `_`, so its variables were not bound to the column's value. The
+  same held after an `inline` column written one argument per slot, where
+  `q(a, b, c, f(d))` against two `inline` columns `g/2` and `f/2` derived
+  `o(1, 2, 3, 1)` from `q(1, 2, 3, 4)`. Such atoms, positive or negated, are
+  now rejected with `WIRELOG_ERR_PARSE`. A compound term is accepted at an
+  `inline` or `side` column, except after an `inline` column of arity
+  greater than 1 written one argument per slot, where arguments no longer
+  line up with their columns. Relations with neither a `.decl` nor inline
+  facts are not checked, nor are compound terms nested inside a compound
+  term.
+
 - **Body atoms must match their relation's width** (#2231):
   `p(x, y) :- g(x, y).` against `.decl g(x: int64)` holding `g(5)` derived
   `p(5, 0)`, a narrower atom such as `p(x) :- g(x).` against a two-column
@@ -259,10 +273,11 @@ All notable changes to wirelog are documented in this file.
   greater than 1. A compound term at an `inline` column's position selects
   logical form, so `q(g(a, b), c, d)` against two inline columns `g/2` and
   `f/2` is rejected; a compound term at another position leaves the atom in
-  flat form and is not checked here. A compound term whose functor or arity
-  differs from the declaration is still accepted in logical form and matches
-  no row. Relations with neither a `.decl` nor inline facts are not checked.
-  A single `_` or variable for a whole `inline` column of arity greater than
+  flat form, where the entry **Body compound terms must be at a compound
+  column** covers it. A compound term whose functor or arity differs from
+  the declaration is still accepted in logical form and matches no row.
+  Relations with neither a `.decl` nor inline facts are not checked. A
+  single `_` or variable for a whole `inline` column of arity greater than
   1, as in `a(i, _)` against `p: pair/2 inline`, is now rejected; write
   `a(i, _, _)` or `a(i, pair(_, _))`. Against `a(i, p: pair/2 inline, k)`,
   `o(i, k) :- a(i, _, k).` derived `k` from the payload's second slot.

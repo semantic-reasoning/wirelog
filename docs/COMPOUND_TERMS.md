@@ -300,6 +300,7 @@ When in doubt, omit the hint. The default (`side`) is always correct.
 | Nesting > 64 levels                      | Parse error: "compound term nesting too deep"         |
 | `inline` hint with arity > 4            | Parse error |
 | `inline` hint with depth > 1            | Schema-apply error; `WL_LOG=COMPOUND:2` emits `error=depth_overflow` |
+| Body compound pattern at a scalar column, or after an `inline` column of arity > 1 written one argument per slot | Parse error (`WIRELOG_ERR_PARSE`, #2231) |
 | Negated side compound body pattern       | IR conversion error; not yet supported. See [Negation and side compounds](#negation-and-side-compounds) for the supported workaround |
 | Handle from session A used in session B  | `arena_lookup` returns NULL (session seed mismatch)   |
 | Handle after arena saturation (epoch 4095)| `arena_alloc` returns `WL_COMPOUND_HANDLE_NULL`      |
