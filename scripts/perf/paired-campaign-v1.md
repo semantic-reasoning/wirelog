@@ -180,7 +180,16 @@ collection, main-thread library calls temporarily handle SIGTERM and SIGHUP
 and restore the caller's handlers in `finally`. Signals are blocked only across
 `Popen` and process assignment; the child restores the inherited prior mask
 before exec. Process group cleanup targets only the launched PID as PGID,
-sends TERM with a 0.5-second grace, then KILL, and bounds subsequent reaping to one second. Each launch redirects stdout and
+sends TERM with a 2.5-second grace, then KILL, and bounds subsequent reaping to one second.
+Cleanup records the optional raw-only `cleanup_escalation` object:
+`sigkill_sent` is true only when the final group KILL call succeeds, and
+`leader_alive_before_sigkill` records the immediately preceding leader poll
+(null if that observation fails, with a cleanup diagnostic). These observations
+are not atomic: the leader can exit between polling and signaling, and a group
+can retain descendants after its leader exits. `exit_code` remains the actual
+observed process status, including `-9` after forced termination. Historical raw
+records without these optional fields remain valid; campaign attempt fields are
+unchanged. Each launch redirects stdout and
 stderr into binary temporary files opened before spawning. After cleanup the
 files are flushed, fsynced and read once with UTF-8 replacement decoding; an
 asynchronous signal cannot discard process output held in a pipe reader's

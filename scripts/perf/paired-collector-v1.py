@@ -70,6 +70,8 @@ def cleanup_process_group(process, raw):
     """Bound cleanup of the saved launch PGID, even after leader exit."""
     errors = []
     pgid = process.pid
+    escalation = dict(sigkill_sent=False, leader_alive_before_sigkill=None)
+    raw['cleanup_escalation'] = escalation
 
     def send(number):
         try:
@@ -95,7 +97,14 @@ def cleanup_process_group(process, raw):
                     break
                 time.sleep(min(0.01, max(0, deadline - time.monotonic())))
     finally:
-        send(signal.SIGKILL)
+        try:
+            escalation['leader_alive_before_sigkill'] = process.poll() is None
+        except Exception as error:
+            errors.append(f'poll-before-kill: {type(error).__name__}: {error}')
+        finally:
+            # Observation cannot prevent mandatory group cleanup. These are
+            # separate observations, not proof that KILL caused leader exit.
+            escalation['sigkill_sent'] = send(signal.SIGKILL)
     try:
         process.wait(timeout=1)
     except Exception as error:
