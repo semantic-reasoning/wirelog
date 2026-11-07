@@ -7083,3 +7083,13 @@ recursive_random_model_exe = executable(
   link_with: [testlib_prod],
 )
 test('recursive_random_model', recursive_random_model_exe, timeout: 180)
+
+# Every supported/rejected scalar tag must remain visible in the #2299 ledger.
+test('expression_inventory', py3,
+  args: [files('../scripts/ci/check-expression-inventory.py')],
+  suite: 'abi',
+)
+test('expression_inventory_selftest', py3,
+  args: [files('../scripts/ci/test-check-expression-inventory.py')],
+  suite: 'abi',
+)
