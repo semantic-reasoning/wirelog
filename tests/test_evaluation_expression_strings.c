@@ -5,6 +5,7 @@
 #include "../wirelog/passes/jpp.h"
 #include "../wirelog/passes/sip.h"
 #include "../wirelog/wirelog.h"
+#include <locale.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -1100,7 +1101,260 @@ static void session_readers(void) {
     }
 }
 
+static void decimal_primitives(void) {
+    struct number_vector { const char *text; uint64_t reads, digits; int rc;
+                           int64_t value; } cases[] = {
+        {"", 1, 0, 0, 0}, {"abc", 1, 0, 0, 0}, {"+", 2, 0, 0, 0},
+        {"++1", 2, 0, 0, 0},
+        {"12", 3, 2, 0, 12}, {"  -12x", 6, 2, 0, -12}, {"0x10", 2, 1, 0, 0},
+        {" \t\n\r\v\f+123tail", 11, 3, 0, 123},
+        {"9223372036854775807", 20, 19, 0, INT64_MAX},
+        {"-9223372036854775808", 21, 19, 0, INT64_MIN},
+        {"9223372036854775808", 20, 19, ERANGE, 0},
+        {"-9223372036854775809", 21, 19, ERANGE, 0},
+        {"9999999999999999999999999999999999999999x", 41, 40, ERANGE, 0}
+    };
+    for (unsigned i = 0; i < sizeof(cases)/sizeof(*cases); ++i)
+        for (unsigned below = 0; below < 2; ++below) {
+            wl_evaluation_control_t *c = begin(224 *
+                    (2+cases[i].reads+cases[i].digits)-below);
+            int64_t value = 999;
+            int rc = wl_columnar_expr_decimal_attempt_controlled(cases[i].text,
+                    &value,
+                    c, wl_evaluation_control_active_attempt_id(c));
+            CHECK(rc ==
+                (below ? WL_EVALUATION_CONTROL_WORK_LIMIT : cases[i].rc));
+            CHECK(value == (rc ? 999 : cases[i].value));
+            finish(c, rc);
+        }
+    for (unsigned phase = 97; phase <= 99; ++phase) {
+        wl_evaluation_control_t *c = begin(0);
+        stop_phase = phase; stop_progress = phase == 99 ? 0 : 32;
+        wl_columnar_expr_test_checkpoint = witness;
+        int64_t value = 999;
+        int rc = wl_columnar_expr_decimal_attempt_controlled(
+            "9999999999999999999999999999999999999999x", &value, c,
+            wl_evaluation_control_active_attempt_id(c));
+        wl_columnar_expr_test_checkpoint = NULL; stop_phase = 0;
+        CHECK(rc == WL_EVALUATION_CONTROL_CANCELLED && value == 999);
+        finish(c, rc);
+    }
+    {
+        wl_evaluation_control_t *c = begin(0);
+        char text[67]; memset(text, ' ', 64); text[64] = '+'; text[65] = '7';
+        text[66] = 0;
+        stop_phase = 97; stop_progress = 32;
+        wl_columnar_expr_test_checkpoint = witness;
+        int64_t value = 999;
+        int rc = wl_columnar_expr_decimal_attempt_controlled(text, &value, c,
+                wl_evaluation_control_active_attempt_id(c));
+        wl_columnar_expr_test_checkpoint = NULL; stop_phase = 0;
+        CHECK(rc == WL_EVALUATION_CONTROL_CANCELLED && value == 999);
+        CHECK(wl_evaluation_control_finish(c, &direct_owner, 0, 0) == rc);
+        CHECK(!wl_evaluation_control_reset(c));
+        CHECK(!wl_evaluation_control_begin(c, &direct_owner));
+        CHECK(!wl_columnar_expr_decimal_attempt_controlled(text, &value, c,
+            wl_evaluation_control_active_attempt_id(c)) && value == 7);
+        finish(c, 0);
+    }
+    for (unsigned phase = 98; phase <= 99; ++phase) {
+        wl_evaluation_control_t *c = begin(0);
+        uint64_t old = wl_evaluation_control_active_attempt_id(c);
+        rebound = false; utf8_rebind_phase = phase;
+        wl_columnar_expr_test_checkpoint = utf8_rebind;
+        int64_t value = 999;
+        int rc = wl_columnar_expr_decimal_attempt_controlled("12345", &value, c,
+                old);
+        wl_columnar_expr_test_checkpoint = NULL;
+        CHECK(rebound && rc == EINVAL && value == 999);
+        uint64_t consumed = 999;
+        CHECK(!wl_evaluation_control_test_active_consumed(c,
+            wl_evaluation_control_active_attempt_id(c),
+            &consumed) && !consumed);
+        finish(c, 0);
+    }
+}
+static void decimal_parity(void) {
+    const char *current = setlocale(LC_CTYPE, NULL); CHECK(current);
+    char *saved = malloc(strlen(current)+1); CHECK(saved);
+    strcpy(saved, current);
+    const char *locales[] = {"C", "C.UTF-8", "C.utf8", "en_US.utf8"};
+    const char *numbers[] = {"", "not a number", " 12tail", " -3 ", " +", "+-1",
+                             "0x10",
+                             "9223372036854775807", "-9223372036854775808",
+                             "9223372036854775808", "-9223372036854775809"};
+    unsigned checked_locales = 0;
+    for (unsigned locale = 0; locale < sizeof(locales)/sizeof(*locales);
+        ++locale){
+        if (!setlocale(LC_CTYPE, locales[locale])) continue;
+        ++checked_locales;
+        wl_intern_t *intern = wl_intern_create(); CHECK(intern);
+        for (unsigned i = 0; i < 256 + sizeof(numbers)/sizeof(*numbers); ++i) {
+            char encoded[] = {(char)i, '1', '2', 0};
+            const char *text = i < 256 ? encoded : numbers[i-256];
+            int64_t operand = wl_intern_put(intern, text); CHECK(operand >= 0);
+            uint8_t bytes[10] = {WL_PLAN_EXPR_CONST_INT};
+            memcpy(bytes+1, &operand, 8);
+            bytes[9] = WL_PLAN_EXPR_STR_FN_TO_NUMBER;
+            wl_evaluation_control_t *c = begin(0);
+            wl_columnar_expr_attempt_scalar_t *program = NULL;
+            bool supported = false;
+            CHECK(!wl_columnar_expr_compile_scalar_attempt_controlled(bytes,
+                sizeof(bytes), NULL,
+                &program, &supported, c,
+                wl_evaluation_control_active_attempt_id(c)) && supported);
+            for (unsigned context_case = 0; context_case < 3; ++context_case) {
+                wl_columnar_expr_context_t context = {.intern = context_case ==
+                                                          1 ? NULL : intern};
+                int64_t raw = 999, value = 999; bool failed = false;
+                wl_columnar_expr_status_t raw_status, status;
+                if (context_case == 2) {
+                    operand = -1; memcpy(bytes+1, &operand, 8);
+                    wl_columnar_expr_attempt_scalar_free(program);
+                    program = NULL;
+                    CHECK(!wl_columnar_expr_compile_scalar_attempt_controlled(
+                            bytes, sizeof(bytes), NULL,
+                            &program, &supported, c,
+                            wl_evaluation_control_active_attempt_id(c)) &&
+                        supported);
+                }
+                int rawrc = wl_columnar_expr_eval_run_ctx(bytes, sizeof(bytes),
+                        NULL, 0, &raw, &context, &raw_status);
+                CHECK(!wl_columnar_expr_eval_scalar_attempt_controlled(program,
+                    NULL, 0, &context,
+                    &value, &failed, &status, c,
+                    wl_evaluation_control_active_attempt_id(c)));
+                CHECK(value == raw && failed == (rawrc != 0) &&
+                    status == raw_status);
+            }
+            wirelog_column_type_t type = WIRELOG_TYPE_FLOAT;
+            CHECK(!wl_columnar_expr_scalar_result_type_attempt_controlled(
+                    program, NULL, 0,
+                    &type, &supported, c,
+                    wl_evaluation_control_active_attempt_id(c)) && supported &&
+                type == WIRELOG_TYPE_INT64);
+            wl_columnar_expr_attempt_scalar_free(program); finish(c, 0);
+        }
+        wl_intern_free(intern);
+    }
+    CHECK(checked_locales && setlocale(LC_CTYPE, saved)); free(saved);
+}
+static int64_t decimal_expected(const char *word) {
+    if (!strcmp(word, "12tail"))return 12;
+    if (!strcmp(word, " -3 "))return -3;
+    CHECK(!strcmp(word, "nonsense")); return 0;
+}
+static void decimal_delta(const char *relation, const int64_t *row,
+    uint32_t cols,
+    int32_t diff, void *arg) {
+    fixture_t *f = arg;
+    CHECK(!strcmp(relation, "out") && cols == 3 && (diff == 1 || diff == -1));
+    const char *word = wl_intern_reverse(f->plan->intern, row[0]); CHECK(word);
+    CHECK(row[1] == decimal_expected(word) && row[2] == row[1]+1);
+    ++events; positives += diff == 1; negatives += diff == -1;
+}
+static void check_decimal_map(fixture_t *f, unsigned count) {
+    col_rel_t *out = session_find_rel(COL_SESSION(f->session), "out");
+    CHECK(out && out->nrows == count && out->ncols == 3);
+    bool seen[3] = {0};
+    const char *words[] = {"12tail", " -3 ", "nonsense"};
+    for (uint32_t r = 0; r < count; ++r) {
+        const char *word = wl_intern_reverse(f->plan->intern,
+                out->columns[0][r]); CHECK(word);
+        unsigned k = 0;
+        while (k < 3 && strcmp(word, words[k]))
+            ++k;
+        CHECK(k < 3 && !seen[k]);
+        seen[k] = true;
+        CHECK(out->columns[1][r] == decimal_expected(word) &&
+            out->columns[2][r] == decimal_expected(word)+1);
+    }
+    if (count == 3) CHECK(seen[0] && seen[1] && seen[2]);
+    if (count == 2) CHECK(!seen[0] && seen[1] && seen[2]);
+    if (count == 1) CHECK(seen[0] && !seen[1] && !seen[2]);
+}
+static bool decimal_exhaust;
+static void decimal_session_stop(wl_evaluation_control_t *c, unsigned phase,
+    uint64_t progress, bool failed) {
+    (void)failed;
+    if (c && phase == 97 && progress >= 1) {
+        if (decimal_exhaust) CHECK(wl_evaluation_control_charge(c,
+                UINT64_MAX) == WL_EVALUATION_CONTROL_WORK_LIMIT);
+        else wl_evaluation_control_request_cancel(c);
+    }
+}
+static void session_decimal(void) {
+    const char *source =
+        ".decl input(x:string)\n.decl out(x:string,n:int64,m:int64)\n"
+        "out(x,to_number(x),to_number(x)+1) :- input(x).\n";
+    for (unsigned mode = 0; mode < 2; ++mode) {
+        fixture_t f = create(source, mode != 0);
+        events = positives = negatives = 0;
+        wl_session_set_delta_cb(f.session, decimal_delta, &f);
+        CHECK(!step_complete(f.session)); check_decimal_map(&f, 0);
+        add(&f, "12tail"); add(&f, " -3 "); add(&f, "nonsense");
+        decimal_exhaust = mode != 0;
+        if (decimal_exhaust) CHECK(!wl_evaluation_control_configure(f.control,
+                UINT64_MAX - 1));
+        wl_columnar_expr_test_checkpoint = decimal_session_stop;
+        CHECK(step_complete(f.session) ==
+            (decimal_exhaust ? WL_EVALUATION_CONTROL_WORK_LIMIT :
+            WL_EVALUATION_CONTROL_CANCELLED));
+        wl_columnar_expr_test_checkpoint = NULL; stop_phase = 0;
+        CHECK(!events); check_decimal_map(&f, 0);
+        CHECK(!wl_evaluation_control_reset(f.control));
+        CHECK(!step_complete(f.session));
+        check_decimal_map(&f, 3);
+        CHECK(events == 3 && positives == 3 && !negatives);
+        int64_t id = wl_intern_get(f.plan->intern, "12tail");
+        CHECK(!wl_session_remove(f.session, "input", &id, 1, 1));
+        CHECK(!step_complete(f.session)); check_decimal_map(&f, 2);
+        CHECK(events == 4 && negatives == 1);
+        CHECK(!step_complete(f.session) && events == 4);
+        wl_columnar_memory_governor_ref_t *g =
+            COL_SESSION(f.session)->memory_governor;
+        wl_columnar_memory_governor_ref_retain(g); destroy(&f);
+        CHECK(!wl_columnar_memory_reserved(wl_columnar_memory_governor_ref_get(
+                g)));
+        wl_columnar_memory_governor_ref_release(g);
+    }
+    fixture_t f = create(source, false);
+    events = positives = negatives = 0;
+    wl_session_set_delta_cb(f.session, decimal_delta, &f);
+    add(&f, "12tail"); add(&f, "9223372036854775808");
+    CHECK(step_complete(f.session) == ERANGE && !events);
+    col_rel_t *out = session_find_rel(COL_SESSION(f.session), "out");
+    CHECK(!out || !out->nrows);
+    int64_t id = wl_intern_get(f.plan->intern, "9223372036854775808");
+    CHECK(!wl_session_remove(f.session, "input", &id, 1, 1));
+    CHECK(!wl_evaluation_control_reset(f.control));
+    CHECK(!step_complete(f.session)); check_decimal_map(&f, 1);
+    CHECK(events == 1); destroy(&f);
+    const char *filter =
+        ".decl input(x:string)\n.decl out(x:string)\nout(x) :- input(x), to_number(x) >= 0.\n";
+    f = create(filter, false); CHECK(!step_complete(f.session));
+    add(&f, "12tail"); add(&f, " -3 "); add(&f, "nonsense");
+    add(&f, "9223372036854775808");
+    CHECK(!step_complete(f.session));
+    out = session_find_rel(COL_SESSION(f.session), "out");
+    CHECK(out && out->nrows == 2);
+    bool a = false, b = false;
+    for (uint32_t r = 0; r < out->nrows; ++r) {
+        const char *word = wl_intern_reverse(f.plan->intern,
+                out->columns[0][r]); CHECK(word);
+        if (!strcmp(word, "12tail")) {
+            CHECK(!a); a = true;
+        } else{
+            CHECK(!strcmp(word, "nonsense") && !b); b = true;
+        }
+    }
+    CHECK(a && b); destroy(&f);
+}
+
 int main(void) {
+    decimal_primitives();
+    decimal_parity();
+    session_decimal();
     utf8_primitives();
     direct_readers();
     reader_interruption();
