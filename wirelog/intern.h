@@ -32,6 +32,7 @@
 #define WIRELOG_INTERN_H
 
 #include <stdint.h>
+#include "evaluation_control.h"
 
 typedef struct wl_intern wl_intern_t;
 typedef struct wl_columnar_memory_governor_ref
@@ -123,6 +124,26 @@ wl_intern_put_checked(wl_intern_t *intern, const char *str, int64_t *out_id);
  *
  * Returns: non-negative ID if found, -1 if not found or @str is NULL.
  */
+/* #2299 controlled transaction; raw put behavior remains unchanged.
+ * Requires live owner or matching pin, immutable terminated source through
+ * preparation, exclusive out and stable governor attachment. Ungoverned
+ * tables use an explicit final guarded cutoff. Nonzero leaves out unchanged.
+ * Before commit, count/slots/reverse pointers/governor footprint are unchanged.
+ * After cutoff publication is indivisible, mandatory free/refund never polls.
+ * Temporary string copy is prepared outside writer lock, then used exclusively.
+ * Memory denial preserves WL_INTERN_ERR_MEMORY_BUDGET; other errno/control
+ * stops remain distinct. No byte-dependent raw hash/copy/compare/resize loops.
+ * Tests must not call a locking table API from a locked checkpoint (3..17).
+ * Phase2 is the unlocked prepared-copy boundary for concurrent duplicates. */
+int wl_intern_control_put_attempt(wl_intern_t *, const char *, int64_t *,
+    wl_evaluation_control_t *, uint64_t);
+#ifdef WL_SESSION_TEST_HOOKS
+extern void (*wl_intern_control_test_checkpoint)(wl_evaluation_control_t *,
+    unsigned, uint64_t);
+extern int wl_intern_control_test_fail_allocation;
+uint32_t wl_intern_control_test_slot_capacity(const wl_intern_t *);
+#endif
+
 int64_t
 wl_intern_get(const wl_intern_t *intern, const char *str);
 

@@ -5878,6 +5878,32 @@ typedef enum {
     WL_COLUMNAR_EXPR_CALLBACK_REENTRANT
 } wl_columnar_expr_status_t;
 
+/* #2299 immutable bytes: saved active attempt required, no allocation or
+ * intern ownership. Caller pins/keeps sources immutable and outputs disjoint.
+ * NULL spans are valid only at length0; C strings must remain terminated.
+ * Scalars are unchanged on error. Copy uses private disjoint scratch and
+ * reports completed stores after accepted entry, including on interruption;
+ * rejected entry leaves copied unchanged. Compare returns -1/0/1 unsigned;
+ * find returns position0/found=false on absence, 0/true for an empty needle.
+ * FNV1a wraps uint32_t and preserves initial for an empty span.
+ * Tariff224 per entry/final and action: length includes NUL, compare each
+ * inspected pair; copy/hash separate load+store/update; search each admitted
+ * candidate and inspected pair. Phases40entry,41length,42compare,43load,
+ * 44store,45hash,46candidate,47searchpair,48final. Hooks revalidate attempt.
+ * Final guarded poll precedes scalar publication. Invalid calls/stale IDs
+ * neither debit a successor attempt nor invoke a later checkpoint. */
+int wl_columnar_expr_cstr_length_attempt_controlled(const char *, size_t *,
+    wl_evaluation_control_t *, uint64_t);
+int wl_columnar_expr_bytes_compare_attempt_controlled(const uint8_t *,
+    const uint8_t *, size_t, int *, wl_evaluation_control_t *, uint64_t);
+int wl_columnar_expr_bytes_copy_attempt_controlled(uint8_t *, const uint8_t *,
+    size_t, size_t *, wl_evaluation_control_t *, uint64_t);
+int wl_columnar_expr_bytes_hash_attempt_controlled(const uint8_t *, size_t,
+    uint32_t, uint32_t *, wl_evaluation_control_t *, uint64_t);
+int wl_columnar_expr_bytes_find_attempt_controlled(const uint8_t *, size_t,
+    const uint8_t *, size_t, size_t *, bool *, wl_evaluation_control_t *,
+    uint64_t);
+
 /* #1821 numeric preparation/execution foundation; no engine activation.
  * Bytecode is immutable through both passes. Governor is borrowed until free;
  * owner/row must remain alive and immutable during evaluation. NULL control
