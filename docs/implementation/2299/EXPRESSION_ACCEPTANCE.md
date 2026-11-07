@@ -78,17 +78,17 @@ ledger explicitly.
 | `WL_PLAN_EXPR_AGG_MAX` | existing-numeric | admitted | baseline-numeric |
 | `WL_PLAN_EXPR_AGG_AVG` | legacy-rejected | legacy-rejected | legacy-rejected |
 | `WL_PLAN_EXPR_STR_FN_STRLEN` | open | admitted | unit5-sessions |
-| `WL_PLAN_EXPR_STR_FN_CAT` | open | open | open |
+| `WL_PLAN_EXPR_STR_FN_CAT` | open | admitted | unit6-builders |
 | `WL_PLAN_EXPR_STR_FN_SUBSTR` | open | open | open |
 | `WL_PLAN_EXPR_STR_FN_CONTAINS` | open | admitted | unit5-sessions |
 | `WL_PLAN_EXPR_STR_FN_STR_PREFIX` | open | admitted | unit5-sessions |
 | `WL_PLAN_EXPR_STR_FN_STR_SUFFIX` | open | admitted | unit5-sessions |
 | `WL_PLAN_EXPR_STR_FN_STR_ORD` | open | admitted | unit5-sessions |
-| `WL_PLAN_EXPR_STR_FN_TO_UPPER` | open | open | open |
-| `WL_PLAN_EXPR_STR_FN_TO_LOWER` | open | open | open |
+| `WL_PLAN_EXPR_STR_FN_TO_UPPER` | open | admitted | unit6-builders |
+| `WL_PLAN_EXPR_STR_FN_TO_LOWER` | open | admitted | unit6-builders |
 | `WL_PLAN_EXPR_STR_FN_STR_REPLACE` | open | open | open |
 | `WL_PLAN_EXPR_STR_FN_TRIM` | open | open | open |
-| `WL_PLAN_EXPR_STR_FN_TO_STRING` | open | open | open |
+| `WL_PLAN_EXPR_STR_FN_TO_STRING` | open | admitted | unit6-builders |
 | `WL_PLAN_EXPR_STR_FN_TO_NUMBER` | open | admitted | unit5-decimal |
 | `WL_PLAN_EXPR_STR_FN_UUID5_RFC` | open | open | open |
 | `WL_PLAN_EXPR_CMP_STR_EQ` | empty-only | admitted | unit4-sessions |
@@ -538,3 +538,84 @@ qualify this bundle. Matching production size profiles measure .text from
 850089 to853493 bytes (+3404), informational under the user's size policy.
 `unit5-digests` records this evidence; crypto, allocating strings, extensions
 and additional recursive/pipeline domain qualification remain outstanding.
+
+
+## Owned string results: CAT/case/integer format (unit 6a)
+
+CAT, TO_UPPER, TO_LOWER and TO_STRING enter the scalar owner with STRING result
+metadata. They pop the same integer IDs/values as raw expressions. Absent
+intern returns0 for CAT/TO_STRING and the original operand for UPPER/LOWER.
+With an intern, absent source IDs return-1 as a successful value, not semantic
+rejection. CAT and case conversion always allocate/intern, including empty or
+unchanged results; no new allocation-free shortcut changes their failure paths.
+UPPER/LOWER are ASCII-only and preserve high/malformed bytes. Checked size/NUL
+overflow returns EOVERFLOW instead of unsafe raw allocation arithmetic.
+
+The private builder admits length+1 scratch bytes from the scalar owner's
+governor, holds the pending receipt through filling and controlled interning,
+then physically frees the buffer before rolling back its credit. The owner
+retains that governor throughout; retained symbols remain with the actual
+intern governor, which can differ. Region130 prepays first free/refund caller
+work before admission/allocation. Allocator/free bodies and mandatory refund
+CAS contention remain the previously documented narrow boundaries. Cleanup
+checkpoint143 receives NULL and cannot debit a successor attempt. A final
+saved-ID cutoff precedes the returned ID and later expression publication.
+An interned output can legitimately survive a stop after its own cutoff;
+private scratch and owner credit still retire.
+
+For existing intern footprint B, owner P and result storage S=length+1, a
+non-resizing new entry requests full replacement B+S while old B remains live.
+Same-governor admission high-water is2B+P+2S; with separate governors, owner
+high-water is P+S and intern high-water2B+S. These are retained/reserved logical
+bytes. Physical scratch S and the intern primitive's speculative copied S are
+simultaneously live during preparation, alongside source/owner storage and any
+staged intern metadata. The speculative copy's existing unit3 accounting and
+mandatory cleanup contract are unchanged. A duplicate has no growth admission
+but still prepares its private intern copy. Tests derive the exact/one-byte-
+short example from B, sizeof(owner)+bytecode and S=2, not a successful debit.
+
+CAT uses the bounded byte copy twice and a separate NUL store. The case-copy
+primitive separately pays224 for LOAD145, ASCII transform146 and STORE147 per
+byte, plus entry144/final148: exact224*(3n+2). Its destination is private and
+disjoint; copied reports completed stores after accepted entry, even on stop.
+The builder's length scan includes the source NUL, then case-copy processes
+only non-NUL bytes and region135 stores a known terminator without rereading it.
+
+TO_STRING keeps raw-compatible fixed24-byte stack storage and snprintf with a
+fixed format/int64 argument. The formatter's narrow synchronous body emits at
+most20 sign/decimal bytes plus NUL; no input-sized engine traversal is hidden.
+Entry139 and final142 pay224 each, with guarded post-call141. The buffer is
+private and may be written before a later stop; length remains unchanged on
+nonzero. No new heap scratch admission is imposed for this fixed stack path.
+
+Successful builder caller work (excluding expression decode/dispatch, governor
+admission and intern child work) is7T plus existing length/copy tariffs for CAT,
+7T plus length/case-copy tariffs for UPPER/LOWER, and6T for TO_STRING (T=224,
+including its two formatter regions). Regions129/130/131/135/136/137/138 cover
+entry, prepared scratch/first cleanup, allocation, NUL, intern caller, post-call
+and final result. Each fixed region stays in the179-action envelope; the
+positive-error wrapper allowance is192<224<=256. Child traversal funding is
+separate from caller and prepaid cleanup, with no unbounded raw copy/transform.
+
+A shared intern-result mapper now preserves positive identity/accounting errors
+via an atomic saved-attempt zero-debit poll. Ordinary intern failures retain raw
+ENOMEM mapping. A genuine positive engine error precedes a later negative
+cancellation, matching the host return policy. This also corrects literal
+interning's former masking of sticky accounting EOVERFLOW. Phase150 is guarded
+before its test hook and atomically revalidates afterward; it never debits a
+successor. Tests assert no consumption wrap, exact final report/disposition,
+unchanged scalar outputs, complete cleanup and reset/retry, including an
+allocation failure followed by cancellation.
+
+Tests cover raw null/invalid-ID/default/underflow semantics, UTF8/high bytes,
+INT64 extrema, STRING schemas, exact/one-short case/format fees, scratch and
+intern high-water on one or two governors, allocation failures even for empty/
+unchanged results, and TO_STRING success with no remaining owner scratch budget.
+Stops/rebinds cover transform stages, scratch acquisition, nested intern prep/
+probe and post-intern/pre-expression cutoffs, distinguishing retained symbols
+from temporary leaks. Generated FILTER and MAP select each function, check
+positive/false/empty results, mixed numeric/string columns, mid-second-row
+cancellation/exhaustion, exact signed deletion and a later no-op call. Shared-
+plan sessions exercise different scratch/intern governors and final balances.
+`unit6-builders` records this evidence; SUBSTR/TRIM/REPLACE, crypto/extensions
+and further recursive/pipeline qualification remain outstanding.
