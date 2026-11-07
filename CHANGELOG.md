@@ -248,6 +248,17 @@ All notable changes to wirelog are documented in this file.
 
 ### Fixed
 
+- **Body atoms of a relation defined only by rules match its heads**
+  (#2231): `o(x, y) :- q(x, y).` with `q(x) :- e(x).` holding `e(1)` derived
+  `o(1, 0)`, and `q(x, z) :- path(x, y, z).` against two-argument heads of
+  `path` derived `q(1, 0)`. A relation with neither a `.decl` nor inline
+  facts now takes its width from its rule heads when they all have the same
+  number of arguments, an aggregate counting as one, and a body atom of
+  another width, positive or negated, is rejected with `WIRELOG_ERR_PARSE`.
+  A rule head cannot contain a compound term, so a compound term in such an
+  atom is rejected too. A relation whose rule heads differ in width, or that
+  has no rule head, is not checked.
+
 - **Body compound terms must be at a compound column** (#2231):
   `o(i, z) :- e(i, box(z)).` against `.decl e(i: int64, x: int64)` holding
   `e(1, 9)` derived `o(1, 1)`: lowering read a compound term at a scalar
@@ -258,9 +269,9 @@ All notable changes to wirelog are documented in this file.
   now rejected with `WIRELOG_ERR_PARSE`. A compound term is accepted at an
   `inline` or `side` column, except after an `inline` column of arity
   greater than 1 written one argument per slot, where arguments no longer
-  line up with their columns. Relations with neither a `.decl` nor inline
-  facts are not checked, nor are compound terms nested inside a compound
-  term.
+  line up with their columns. Atoms whose width is not checked are not
+  checked by this rule either, nor are compound terms nested inside a
+  compound term.
 
 - **Body atoms must match their relation's width** (#2231):
   `p(x, y) :- g(x, y).` against `.decl g(x: int64)` holding `g(5)` derived
@@ -275,8 +286,9 @@ All notable changes to wirelog are documented in this file.
   `f/2` is rejected; a compound term at another position leaves the atom in
   flat form, where the entry **Body compound terms must be at a compound
   column** covers it. A compound term whose functor or arity differs from
-  the declaration is still accepted in logical form and matches no row.
-  Relations with neither a `.decl` nor inline facts are not checked. A
+  the declaration is still accepted in logical form and matches no row. A
+  relation with neither a `.decl` nor inline facts is covered by the entry
+  **Body atoms of a relation defined only by rules match its heads**. A
   single `_` or variable for a whole `inline` column of arity greater than
   1, as in `a(i, _)` against `p: pair/2 inline`, is now rejected; write
   `a(i, _, _)` or `a(i, pair(_, _))`. Against `a(i, p: pair/2 inline, k)`,

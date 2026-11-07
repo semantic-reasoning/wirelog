@@ -3739,9 +3739,6 @@ test_body_arity_accepted_forms(void)
         /* a mismatched compound in logical form matches no row */
         PRED_DECL ".decl o(a: int64)\no(a) :- pred(a, g(b, _)).\n",
         PRED_DECL ".decl o(a: int64)\no(a) :- pred(a, f(_)).\n",
-        /* undeclared head-only relations are not checked */
-        ".decl e(x: int64, y: int64)\ne(1, 2).\npath(x, y) :- e(x, y).\n"
-        "q(x, z) :- path(x, y, z).\n",
         ".decl g(x: int64, y: int64)\ng(1, 2).\n.decl p(x: int64)\n"
         "p(x) :- g(x, _).\n",
     };
@@ -3847,12 +3844,100 @@ test_body_compound_placement_accepted(void)
         "o(i, z) :- a(i, pair(_, _), _, box(z)).\n",
         ".decl a(i: int64, p: pair(symbol, int64) inline)\n.decl o(i: int64)\n"
         "o(i) :- a(i, pair(nested(s), n)).\n",
-        /* undeclared head-only relations are not checked */
-        ".decl e(x: int64)\ne(1).\nt(x, x) :- e(x).\n"
-        ".decl o(x: int64)\no(x) :- t(x, f(y)).\n",
     };
 
     TEST("Body compounds: compound terms at compound columns still load");
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        struct wirelog_program *prog = make_program(cases[i]);
+        if (!prog) {
+            FAIL(cases[i]);
+            return;
+        }
+        wl_ir_program_free(prog);
+    }
+    PASS();
+}
+
+static void
+test_body_arity_head_only_rejected(void)
+{
+    static const struct {
+        const char *src;
+        const char *needle;
+    } cases[] = {
+        /* wider and narrower than the heads */
+        { ".decl e(x: int64)\ne(1).\nq(x) :- e(x).\n"
+          ".decl o(a: int64, b: int64)\no(x, y) :- q(x, y).\n",
+          "body atom for relation 'q' has 2 argument(s) but its rule heads"
+          " have 1 ('q' has no .decl)" },
+        { ".decl e(x: int64, y: int64)\ne(1, 2).\npath(x, y) :- e(x, y).\n"
+          "q(x, z) :- path(x, y, z).\n",
+          "body atom for relation 'path' has 3 argument(s) but its rule"
+          " heads have 2" },
+        /* negated, and used before its rule */
+        { ".decl e(x: int64)\ne(1).\n.decl o(x: int64)\n"
+          "o(x) :- e(x), !t(x, 0).\nt(x) :- e(x).\n",
+          "negated body atom for relation 't' has 2 argument(s) but its rule"
+          " heads have 1" },
+        /* in its own recursive rule, with two agreeing heads */
+        { ".decl e(x: int64, y: int64)\ne(1, 2).\npath(x, y) :- e(x, y).\n"
+          "path(x, z) :- path(x, y, q), e(y, z).\n",
+          "body atom for relation 'path' has 3 argument(s)" },
+        /* a zero-column head, and an aggregate counted as one column */
+        { ".decl e(x: int64)\ne(1).\nflag() :- e(1).\n.decl o(x: int64)\n"
+          "o(x) :- e(x), flag(x).\n",
+          "has 1 argument(s) but its rule heads have 0" },
+        { ".decl e(g: int64, x: int64)\ne(1, 2).\n"
+          "t(g, count(x)) :- e(g, x).\n.decl o(g: int64)\n"
+          "o(g) :- t(g).\n",
+          "has 1 argument(s) but its rule heads have 2" },
+        /* a compound term: heads write no compound column */
+        { ".decl e(x: int64)\ne(1).\nt(x, x) :- e(x).\n"
+          ".decl o(x: int64)\no(x) :- t(x, f(y)).\n",
+          "has a compound term at argument 2, but column 2 of 't' is not a"
+          " compound column" },
+    };
+
+    TEST("Body arity: atoms of head-only relations match their heads");
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        char errbuf[512];
+        wirelog_error_t err = WIRELOG_OK;
+        struct wirelog_program *prog = wl_ir_parse_string_err(cases[i].src,
+                &err, errbuf, sizeof(errbuf));
+        if (prog) {
+            wirelog_program_free(prog);
+            FAIL(cases[i].src);
+            return;
+        }
+        if (err != WIRELOG_ERR_PARSE || !strstr(errbuf, cases[i].needle)) {
+            printf(" [%s]", errbuf);
+            FAIL("wrong error for a head-only width mismatch");
+            return;
+        }
+    }
+    PASS();
+}
+
+static void
+test_body_arity_head_only_accepted(void)
+{
+    static const char *cases[] = {
+        /* agreeing heads, recursive and used before its rules */
+        ".decl o(x: int64)\no(x) :- path(x, _).\n"
+        ".decl e(x: int64, y: int64)\ne(1, 2).\npath(x, y) :- e(x, y).\n"
+        "path(x, z) :- path(x, y), e(y, z).\n",
+        /* an aggregate head and a zero-column head */
+        ".decl e(g: int64, x: int64)\ne(1, 2).\n"
+        "t(g, count(x)) :- e(g, x).\nflag() :- e(1, _).\n"
+        ".decl o(g: int64, n: int64)\no(g, n) :- t(g, n), flag().\n",
+        /* heads of different widths: left to fail at execution */
+        ".decl e(x: int64)\ne(1).\nv(x) :- e(x).\nv(x, y) :- e(x), e(y).\n"
+        ".decl o(x: int64)\no(x) :- v(x, _, _).\n",
+        /* a relation with no head, no facts and no .decl */
+        ".decl o(x: int64)\no(x) :- nothing(x, _, _).\n",
+    };
+
+    TEST("Body arity: head-only atoms of their heads' width are accepted");
     for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
         struct wirelog_program *prog = make_program(cases[i]);
         if (!prog) {
@@ -5031,6 +5116,8 @@ main(void)
     test_body_arity_accepted_forms();
     test_body_compound_placement_rejected();
     test_body_compound_placement_accepted();
+    test_body_arity_head_only_rejected();
+    test_body_arity_head_only_accepted();
 
     /* #2231: rule-head constants against their lanes */
     test_head_int_const_in_float_lane_converted();
