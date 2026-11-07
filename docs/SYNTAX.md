@@ -562,7 +562,8 @@ without sacrificing the termination guarantees of bottom-up evaluation.
 ## Types
 
 Supported column types:
-- `int32` -- 32-bit signed integer
+- `int32` -- 32-bit signed integer; an inline fact or a value read from a CSV
+  `.input` file outside that range is rejected (#2231)
 - `int64` -- 64-bit signed integer
 - `string` -- variable-length string
 - `symbol` -- interned symbol (string stored as integer ID)

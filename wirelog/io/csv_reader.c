@@ -14,6 +14,7 @@
 #include <ctype.h>
 #include <errno.h>
 #include <math.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -565,6 +566,11 @@ csv_parse_line_via_ctx(const char *line, char delimiter,
                 return -1; /* not a valid integer */
             if (errno == ERANGE)
                 return -1; /* do not silently clamp out-of-range values */
+            /* An int32 column takes 32-bit values only, as an inline fact
+             * and a typed insert do (#2231). */
+            if (col_types[col] == WIRELOG_TYPE_INT32
+                && (values[col] < INT32_MIN || values[col] > INT32_MAX))
+                return -1;
             p = end;
 
             /* Skip trailing whitespace */

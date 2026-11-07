@@ -13,7 +13,8 @@
 # a float column, and a float in an `inline` slot that is not float or in a
 # `side` handle column, used to be stored as an intern id or raw bits; they
 # are now parse errors.  The easy facade refuses float relations, so these
-# run through the CLI.
+# run through the CLI.  An int32 column now refuses a value outside 32
+# bits, in an inline fact and in an `.input` file.
 
 import os
 import subprocess
@@ -49,6 +50,18 @@ CASES = [
      ".decl g(id: int64, v: f/2)\ng(1, 2.5).\n", None),
 ]
 
+# (name, program with %s for the input file, file contents, expected stdout
+# lines or None for a failed run)
+INPUT_CASES = [
+    ("int32 input value in range",
+     ".decl g(x: int32)\n.decl p(x: int32)\n.input g(filename=\"%s\")\n"
+     ".output p\np(x) :- g(x).\n", "2147483647\n-2147483648\n",
+     ["p(-2147483648)", "p(2147483647)"]),
+    ("int32 input value out of range",
+     ".decl g(x: int32)\n.decl p(x: int32)\n.input g(filename=\"%s\")\n"
+     ".output p\np(x) :- g(x).\n", "5000000000\n", None),
+]
+
 
 def main() -> int:
     if len(sys.argv) != 2:
@@ -71,6 +84,25 @@ def main() -> int:
                 ok = r.returncode == 0 and got == sorted(want)
             status = "PASS" if ok else "FAIL"
             print("  %s: %s" % (status, name))
+            if not ok:
+                failures += 1
+                print("    rc=%d stdout=%r stderr=%r"
+                      % (r.returncode, r.stdout, r.stderr))
+        for i, (name, program, rows, want) in enumerate(INPUT_CASES):
+            data = os.path.join(td, "input%d.csv" % i)
+            with open(data, "w", encoding="utf-8") as f:
+                f.write(rows)
+            dl = os.path.join(td, "input%d.dl" % i)
+            with open(dl, "w", encoding="utf-8") as f:
+                f.write(program % data)
+            r = subprocess.run([exe, dl], capture_output=True, text=True,
+                               encoding="utf-8", timeout=60, check=False)
+            got = sorted(l for l in r.stdout.splitlines() if l.strip())
+            if want is None:
+                ok = r.returncode != 0 and not got
+            else:
+                ok = r.returncode == 0 and got == sorted(want)
+            print("  %s: %s" % ("PASS" if ok else "FAIL", name))
             if not ok:
                 failures += 1
                 print("    rc=%d stdout=%r stderr=%r"

@@ -16,6 +16,8 @@
 #include <stdio.h>
 #include <errno.h>
 #include <math.h>
+#include <stdbool.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -540,6 +542,42 @@ test_parse_line_ex_all_int(void)
     PASS();
 }
 
+/* #2231: an int32 column takes 32-bit values only, as an inline fact and a
+ * typed insert do; an int64 column keeps the full range. */
+static void
+test_parse_line_int32_range(void)
+{
+    TEST("int32 column rejects values outside 32 bits");
+    wl_intern_t *intern = wl_intern_create();
+    if (!intern) {
+        FAIL("intern create failed");
+        return;
+    }
+    wirelog_column_type_t types[] = { WIRELOG_TYPE_INT32, WIRELOG_TYPE_INT64 };
+    int64_t values[2];
+    uint32_t count = 0;
+    int ok_max = wl_csv_parse_line_ex("2147483647,5000000000", ',', types, 2,
+            values, 2, &count, intern);
+    bool kept = ok_max == 0 && values[0] == INT32_MAX
+        && values[1] == INT64_C(5000000000);
+    int ok_min = wl_csv_parse_line_ex("-2147483648,1", ',', types, 2, values,
+            2, &count, intern);
+    int bad_hi = wl_csv_parse_line_ex("2147483648,1", ',', types, 2, values,
+            2, &count, intern);
+    int bad_lo = wl_csv_parse_line_ex("-2147483649,1", ',', types, 2, values,
+            2, &count, intern);
+    wl_intern_free(intern);
+    if (ok_max != 0 || ok_min != 0 || !kept) {
+        FAIL("an in-range int32 or a wide int64 value was refused or changed");
+        return;
+    }
+    if (bad_hi == 0 || bad_lo == 0) {
+        FAIL("an int32 value outside 32 bits was accepted");
+        return;
+    }
+    PASS();
+}
+
 static void
 test_parse_line_rejects_erange(void)
 {
@@ -751,6 +789,7 @@ main(void)
     test_parse_line_ex_unquoted_strings();
     test_parse_line_ex_all_int();
     test_parse_line_rejects_erange();
+    test_parse_line_int32_range();
     test_parse_line_ex_rejects_malformed_fields();
 
     printf("\n--- File Reading ---\n");

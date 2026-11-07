@@ -17,6 +17,7 @@
 
 #include <ctype.h>
 #include <float.h>
+#include <inttypes.h>
 #include <math.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -1049,9 +1050,10 @@ validate_fact_arities(struct wirelog_program *program,
          * binary64 value of the integer: collect_fact() cannot do it,
          * because the `.decl` may follow the fact.  An integer that
          * binary64 cannot represent exactly is rejected, and so is a
-         * float literal in a lane that is not float, and a string literal
-         * in a float lane.  An integer or string in a symbol or integer
-         * lane is stored as written (#963). */
+         * float literal in a lane that is not float, an integer outside
+         * 32 bits in an int32 lane, and a string literal in a float lane.
+         * Any other integer or string in a symbol or integer lane is
+         * stored as written (#963). */
         for (uint32_t c = 0; rc == 0 && c < node->child_count; c++) {
             const wl_parser_ast_node_t *arg = node->children[c];
             wirelog_column_type_t lane_type;
@@ -1062,6 +1064,15 @@ validate_fact_arities(struct wirelog_program *program,
                 wl_ir_program_set_error(program,
                     "float fact for non-float column %u of relation '%s'"
                     " is not allowed (line %u)", c, rel->name, node->line);
+                rc = -1;
+            } else if (arg->type == WL_PARSER_AST_NODE_INTEGER
+                && lane_type == WIRELOG_TYPE_INT32
+                && (arg->int_value < INT32_MIN
+                || arg->int_value > INT32_MAX)) {
+                wl_ir_program_set_error(program,
+                    "integer fact %" PRId64 " for int32 column %u of"
+                    " relation '%s' is out of range (line %u)",
+                    arg->int_value, c, rel->name, node->line);
                 rc = -1;
             } else if (arg->type == WL_PARSER_AST_NODE_STRING
                 && lane_type == WIRELOG_TYPE_FLOAT) {
