@@ -79,7 +79,7 @@ ledger explicitly.
 | `WL_PLAN_EXPR_AGG_AVG` | legacy-rejected | legacy-rejected | legacy-rejected |
 | `WL_PLAN_EXPR_STR_FN_STRLEN` | open | admitted | unit5-sessions |
 | `WL_PLAN_EXPR_STR_FN_CAT` | open | admitted | unit6-builders |
-| `WL_PLAN_EXPR_STR_FN_SUBSTR` | open | open | open |
+| `WL_PLAN_EXPR_STR_FN_SUBSTR` | open | admitted | unit6-selectors |
 | `WL_PLAN_EXPR_STR_FN_CONTAINS` | open | admitted | unit5-sessions |
 | `WL_PLAN_EXPR_STR_FN_STR_PREFIX` | open | admitted | unit5-sessions |
 | `WL_PLAN_EXPR_STR_FN_STR_SUFFIX` | open | admitted | unit5-sessions |
@@ -87,7 +87,7 @@ ledger explicitly.
 | `WL_PLAN_EXPR_STR_FN_TO_UPPER` | open | admitted | unit6-builders |
 | `WL_PLAN_EXPR_STR_FN_TO_LOWER` | open | admitted | unit6-builders |
 | `WL_PLAN_EXPR_STR_FN_STR_REPLACE` | open | open | open |
-| `WL_PLAN_EXPR_STR_FN_TRIM` | open | open | open |
+| `WL_PLAN_EXPR_STR_FN_TRIM` | open | admitted | unit6-selectors |
 | `WL_PLAN_EXPR_STR_FN_TO_STRING` | open | admitted | unit6-builders |
 | `WL_PLAN_EXPR_STR_FN_TO_NUMBER` | open | admitted | unit5-decimal |
 | `WL_PLAN_EXPR_STR_FN_UUID5_RFC` | open | open | open |
@@ -619,3 +619,61 @@ cancellation/exhaustion, exact signed deletion and a later no-op call. Shared-
 plan sessions exercise different scratch/intern governors and final balances.
 `unit6-builders` records this evidence; SUBSTR/TRIM/REPLACE, crypto/extensions
 and further recursive/pipeline qualification remain outstanding.
+
+
+## UTF-8 substring and locale trim (unit 6b)
+
+SUBSTR has ternary stack bookkeeping; TRIM is unary, both with STRING result
+metadata. They retain raw C-string/ID semantics rather than using a literal's
+full typed payload. Missing intern returns0 for SUBSTR and the operand for TRIM.
+Invalid IDs, negative indices and beyond-end start are successful-1 values,
+not new semantic failures. Start exactly at end is valid, even for length0;
+beyond end is invalid even for length0. A valid selected span always allocates
+and interns, including empty/full/unchanged spans, preserving raw failures.
+
+The UTF-8 selector uses the previously qualified permissive step, retaining
+invalid-continuation advance and repeated inspection. Separate start/length
+walks never add signed start+length; huge requested counts stop at NUL. Entry155
+and final158 each pay224, and every walk transition156/157 pays224 in addition
+to the step's224*(I+2) for its actual I byte inspections. Independent work is
+224*(2+sum(I+3)) over visited steps, including terminating steps when visited.
+Zero length can avoid a second walk; negative indices require no source read.
+Nonzero leaves all metadata unchanged; a completed invalid selector changes
+only valid=false, leaving its span outputs unchanged.
+
+TRIM matches raw unsigned-byte locale isspace, not ASCII case transformation
+or Unicode whitespace decoding. Each front152/back153 inspection pays224;
+entry151/final154 pay224 each, and the original full C string is measured with
+the bounded length helper. For n non-NUL bytes, F front and B back inspections,
+exact work is224*(n+F+B+5). F includes the first nonspace/NUL; B includes a
+nonspace stopping byte when one is inspected, and is0 after an all-white front.
+Ctype classification is the existing fixed one-byte library boundary.
+
+Selector caller159 funds ID/context dispatch. Valid spans enter160 and reuse
+the unit6a scratch, copy/NUL, interning and cleanup/cutoff protocol. This adds
+7T span-caller work plus byte-copy/governor/intern children (T=224), separately
+from selector work and caller159. Source/pin lifetime and different owner/intern
+governors remain unchanged. Each fixed region fits the179-action envelope;
+each walk charges its own caller transition and UTF-8 child, with no raw
+strlen/UTF-8 walk, full-span debit, or unmetered copying. The selected source
+remains immutable through both span computation and copying.
+
+Independent exact/one-short vectors cover end/beyond-end, zero/negative/MAX
+counts, every relevant malformed/truncated/permissive UTF-8 shape, six C spaces,
+all-white/empty strings and nonspace high bytes. Stop/rebind tests cover every
+selector phase with unpublished metadata and no successor debit. Raw parity
+runs under available C/C.UTF-8/en_US locales and restores LC_CTYPE. A capped
+stack with SUBSTR followed by integer/float pushes verifies ternary cached
+producer depth; embedded-NUL literals retain C-string semantics. Valid empty
+operations still fail their real scratch allocation; invalid substring paths
+remain allocation-free as raw does.
+
+Generated FILTER/MAP exercise both functions, exact STRING/INT64 schemas and
+relation-qualified contents (including the raw-1 substring cell), positive/
+false/empty results, interruption inside a second-row UTF-8 continuation,
+deterministic work denial, retry, exact signed deletion and subsequent calls.
+Owned-scratch stops/rebinds before and after intern publication distinguish
+retained results from temporary credit. Shared-plan sessions with distinct
+governors assert final balances. `unit6-selectors` records this evidence;
+REPLACE, crypto/extensions and further recursive/pipeline qualification remain
+outstanding.

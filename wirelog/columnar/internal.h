@@ -5934,6 +5934,16 @@ int wl_columnar_expr_ascii_case_attempt_controlled(uint8_t *, const uint8_t *,
 int wl_columnar_expr_format_i64_attempt_controlled(int64_t, char *, size_t *,
     wl_evaluation_control_t *, uint64_t);
 
+/* Immutable C-string span selectors. Nonzero leaves all outputs unchanged.
+* Trim uses locale isspace on unsigned bytes, metered front/back inspections
+* plus the full bounded length scan. Slice preserves permissive UTF8 next;
+* negative/beyond-end indices publish valid=false without changing span,
+* start==end is valid, and no signed start+length addition is performed. */
+int wl_columnar_expr_trim_span_attempt_controlled(const char *, size_t *,
+    size_t *, wl_evaluation_control_t *, uint64_t);
+int wl_columnar_expr_utf8_slice_attempt_controlled(const char *, int64_t,
+    int64_t, size_t *, size_t *, bool *, wl_evaluation_control_t *, uint64_t);
+
 /* Context-bearing scalar owner (#2299). Immutable bytecode copy, no intern
  * mutation during compile. Numeric-only hosts keep the numeric owner path.
  * Evaluation borrows the actual session/plan context (or caller-held pin),
