@@ -487,6 +487,9 @@ static int
 wl_evaluation_control_source_bank_finish_phase(
     wl_evaluation_control_source_lane_state_t *lane)
 {
+    /* The lane remains active even after a refused payment. This real
+     * financial checkpoint preserves that diagnostic and adds no payment. */
+    (void)wl_evaluation_control_charge_attempt(lane->control, lane->id, 0);
     int finished = wl_evaluation_control_finish(lane->control, lane, 0, 0);
     wl_evaluation_control_report_t report;
     if (wl_evaluation_control_report(lane->control, &report)
@@ -666,6 +669,72 @@ wl_evaluation_control_source_bank_run(
     }
     int finished = wl_evaluation_control_source_bank_finish_phase(lane);
     result.financial_result = rc ? rc : finished;
+    wl_evaluation_control_source_bank_unlock(bank);
+    return result;
+}
+
+/* Synchronous SOURCE constructor activation. The canonical context never
+ * leaves this stack; its lane association is cleared under the same mutex
+ * after real phase settlement, including failed admissions/actions. */
+wl_evaluation_control_source_phase_result_t
+wl_evaluation_control_source_bank_run_lexical(
+    wl_evaluation_control_source_bank_t *bank,
+    wl_evaluation_control_source_lane_t index,
+    const wl_evaluation_control_source_phase_policy_t *policy,
+    wl_evaluation_control_source_action_fn action, void *payload)
+{
+    wl_evaluation_control_source_phase_result_t result = {EINVAL, 0, false};
+    if (!bank || bank->identity != bank
+        || (unsigned)index >= WL_EVALUATION_CONTROL_SOURCE_LANES
+        || !policy || !action || payload == bank
+        || !policy->bootstrap_work || !policy->current_work
+        || !policy->close_work
+        || policy->bootstrap_work > WL_EVALUATION_CONTROL_QUANTUM
+        || policy->current_work > WL_EVALUATION_CONTROL_QUANTUM
+        || policy->close_work > WL_EVALUATION_CONTROL_QUANTUM)
+        return result;
+    int rc = wl_evaluation_control_source_bank_lock(bank);
+    if (rc) {
+        result.financial_result = rc; return result;
+    }
+    wl_evaluation_control_source_lane_state_t *lane = &bank->lanes[index];
+    if (bank->closing || lane->context || lane->running
+        || lane->callback_active) {
+        wl_evaluation_control_source_bank_unlock(bank);
+        result.financial_result = EBUSY;
+        return result;
+    }
+    wl_evaluation_control_source_context_t context = {
+        .identity = &context, .bank = bank, .lane = (unsigned)index,
+        .thread_cookie = &wl_evaluation_control_source_thread_cookie
+    };
+    lane->context = &context;
+    rc = wl_evaluation_control_source_bank_rearm_phase(bank, (unsigned)index);
+    if (!rc) rc = wl_evaluation_control_begin(lane->control, lane);
+    if (rc) {
+        lane->context = NULL;
+        wl_evaluation_control_source_bank_unlock(bank);
+        result.financial_result = rc;
+        return result;
+    }
+    lane->id = wl_evaluation_control_active_attempt_id(lane->control);
+    if (!lane->id) abort();
+    lane->running = true;
+    rc = wl_evaluation_control_source_bank_charge(lane, policy->bootstrap_work);
+    if (!rc) rc = wl_evaluation_control_source_bank_charge(lane,
+                policy->current_work);
+    if (!rc) {
+        lane->callback_active = true;
+        wl_evaluation_control_source_bank_unlock(bank);
+        result.action_result = action(payload);
+        result.action_called = true;
+        if (wl_evaluation_control_source_bank_lock(bank)) abort();
+        lane->callback_active = false;
+        rc = wl_evaluation_control_source_bank_charge(lane, policy->close_work);
+    }
+    int finished = wl_evaluation_control_source_bank_finish_phase(lane);
+    result.financial_result = rc ? rc : finished;
+    lane->context = NULL;
     wl_evaluation_control_source_bank_unlock(bank);
     return result;
 }

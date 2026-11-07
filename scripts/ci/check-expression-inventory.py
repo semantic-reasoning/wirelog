@@ -26,11 +26,11 @@ def function_body(source: str, name: str) -> str:
 
 
 def check(root: Path) -> tuple[list[str], int]:
-    header = (root / 'wirelog/exec_plan.h').read_text()
+    header = (root / 'wirelog/exec_plan.h').read_text(encoding='utf-8')
     enum = header[header.index('WL_PLAN_EXPR_VAR ='):
                   header.index('} wl_plan_expr_tag_t;')]
     tags = set(re.findall(r'\b(WL_PLAN_EXPR_[A-Z0-9_]+)\s*(?==)', enum))
-    source = (root / 'wirelog/columnar/expr.c').read_text()
+    source = (root / 'wirelog/columnar/expr.c').read_text(encoding='utf-8')
     raw = function_body(source, 'wl_columnar_expr_eval_run_ctx')
     decoder = function_body(source, 'wl_columnar_expr_attempt_decode')
     raw_tags = set(re.findall(r'case (WL_PLAN_EXPR_[A-Z0-9_]+)', raw))
@@ -39,7 +39,7 @@ def check(root: Path) -> tuple[list[str], int]:
     scalar_tags = set(re.findall(r'case (WL_PLAN_EXPR_[A-Z0-9_]+)', scalar))
     delegates = re.search(r'default:\s*return\s+'
                           r'wl_columnar_expr_attempt_decode\s*\(', scalar)
-    ledger = (root / 'docs/implementation/2299/EXPRESSION_ACCEPTANCE.md').read_text()
+    ledger = (root / 'docs/implementation/2299/EXPRESSION_ACCEPTANCE.md').read_text(encoding='utf-8')
     rows = re.findall(r'^\| `(WL_PLAN_EXPR_[A-Z0-9_]+)` \| ([a-z-]+) \| ([a-z-]+) \| ([a-z0-9-]+) \|$',
                       ledger, re.M)
     errors = []

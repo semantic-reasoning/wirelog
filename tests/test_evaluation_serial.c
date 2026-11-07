@@ -8059,7 +8059,7 @@ test_controlled_batch_delta_selectors(void)
         {{false, 0}, {false, 0}, (wl_delta_mode_t)99,
          WL_DELTA_AUTO, true},
         {{false, 0}, {false, 0}, WL_DELTA_AUTO,
-         WL_DELTA_AUTO, true},
+         WL_DELTA_AUTO, false},
         {{false, 0}, {false, 0}, WL_DELTA_AUTO,
          WL_DELTA_AUTO, true},
         {{false, 0}, {false, 0}, WL_DELTA_AUTO,
@@ -8784,7 +8784,7 @@ test_controlled_session_admission_matrix(void)
         controlled_observer_framed_lookup_hits = 0;
         wl_columnar_eval_serial_test_framed_checkpoint =
             controlled_observer_count_rule_start;
-        if (mode == OTHER_BATCH_SHAPE) {
+        if (mode == OTHER_BATCH_SHAPE || mode == STRICT_BATCH) {
             CHECK(!controlled_recursive_run(base, control));
             const col_rel_t *output = session_find_rel(session, "output");
             CHECK(controlled_observer_framed_lookup_hits == 1 && output

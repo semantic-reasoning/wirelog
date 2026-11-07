@@ -4680,7 +4680,8 @@ wl_columnar_merge_concat_charge(wl_evaluation_control_t *control, uint64_t id,
     if (!control || !id
         || wl_evaluation_control_active_attempt_id(control) != id)
         return EINVAL;
-    return wl_evaluation_control_charge(control, work);
+    return wl_evaluation_control_charge_attempt(control, id,
+               work);
 }
 
 static int
@@ -4938,7 +4939,10 @@ wl_columnar_merge_concat_attempt_start_owned(const wl_plan_op_t *op,
         && !session->current_iteration && !session->diff_operators_active
         && !session->retraction_seeded && !session->retraction_right_pass
         && !session->tdd_input_run && !session->tdd_subpass_active
-        && !session->tdd_outbound_only_active && !session->join_batch_bytes
+        && !session->tdd_outbound_only_active
+        && (!session->join_batch_bytes
+        || wl_columnar_eval_plan_numeric_batch_fallback_authorized(owner,
+        frame, session, control, id))
         && !session->join_output_shared_count && !session->coordinator
         && session->num_workers <= 1;
     rc = wl_columnar_merge_concat_tail(control, id, 3, 0);
@@ -5064,8 +5068,8 @@ wl_columnar_merge_concat_attempt_start_owned(const wl_plan_op_t *op,
     rc = wl_columnar_merge_concat_charge(control, id,
             WL_COLUMNAR_MERGE_CONCAT_WORK);
     if (rc) goto done;
-    rc = wl_columnar_relation_append_batch_begin_controlled(&ctx->batch,
-            *out_slot, control);
+    rc = wl_columnar_relation_append_batch_begin_attempt_controlled(&ctx->batch,
+            *out_slot, control, id);
     rc = wl_columnar_merge_concat_return(control, id, rc);
     if (rc) goto done;
     for (unsigned side = 0; side < 2; ++side) {
@@ -5107,6 +5111,39 @@ inert:
     status->progress = WL_COLUMNAR_FILTER_PROGRESS_DONE;
     status->execution_result = rc; status->semantic_result = rc;
     status->cleanup_result = 0; status->committed = false;
+    return 0;
+}
+
+int
+wl_columnar_merge_concat_native_cleanup_latch_owned(
+    wl_columnar_eval_stack_cleanup_frame_t *frame, const void *owner,
+    wl_evaluation_control_t *funding, uint64_t id)
+{
+    const wl_columnar_eval_plan_numeric_attempt_t *r = owner;
+    if (!r || !funding || funding == r->control || !id) return EINVAL;
+    int paid = wl_evaluation_control_charge_attempt(funding, id,
+            88);
+    if (paid) return paid;
+    if (!r || !wl_columnar_eval_plan_numeric_owner_valid(r,
+        frame)) return EINVAL;
+    wl_columnar_eval_serial_framed_attempt_t *parent = NULL;
+    int rc = wl_columnar_eval_stack_framed_context(frame, r->session, &parent);
+    if (rc) return rc;
+    int cause = 0;
+    rc = wl_columnar_session_join_cleanup_prove(parent, funding, id, NULL,
+            &cause);
+    if (rc) return rc;
+    if (&parent->child != r) return EINVAL;
+    rc = wl_evaluation_control_charge_attempt(funding, id, 112);
+    if (rc) return rc;
+    wl_columnar_merge_concat_context_t *ctx = NULL;
+    rc = wl_columnar_eval_stack_concat_context_owned(frame, &ctx, owner);
+    if (rc) return rc;
+    rc = wl_columnar_merge_concat_valid(ctx, frame, owner);
+    if (rc) return rc;
+    if (ctx->phase == WL_COLUMNAR_MERGE_CONCAT_RUNNING) return EBUSY;
+    if (ctx->committed) return 0;
+    if (!ctx->execution_result) ctx->execution_result = cause;
     return 0;
 }
 

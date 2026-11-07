@@ -571,7 +571,9 @@ wl_columnar_session_hash_registry_charge(
 {
     if (wl_evaluation_control_active_attempt_id(parent->control)
         != parent->attempt_id) return EINVAL;
-    int rc = wl_evaluation_control_charge(parent->control, work);
+    int rc = wl_evaluation_control_charge_attempt(parent->control,
+            parent->attempt_id,
+            work);
     if (rc) return rc;
     return wl_evaluation_control_active_attempt_id(parent->control)
            == parent->attempt_id ? 0 : EINVAL;

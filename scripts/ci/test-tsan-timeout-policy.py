@@ -24,6 +24,7 @@ exists to protect.  The negative lookahead below is load-bearing.
 
 from pathlib import Path
 import re
+import shlex
 import unittest
 
 
@@ -63,8 +64,47 @@ def runtime_invocations(text: str) -> list:
     return RUNTIME_RE.findall(text)
 
 
+def runtime_setups(text: str) -> list:
+    """Read canonical literal/folded setup flags, excluding the native prefix."""
+    lines = text.splitlines()
+    commands = []
+    pattern = re.compile(r"meson setup builddir-tsan(?![\w-])")
+    for index, line in enumerate(lines):
+        match = pattern.search(line)
+        if not match:
+            continue
+        parts = [line[match.start():].rstrip(" \\")]
+        for continuation in lines[index + 1:]:
+            flags = continuation.strip()
+            if not flags.startswith(("-D", "--")):
+                break
+            parts.append(flags.rstrip(" \\"))
+        commands.append(" ".join(parts))
+    return commands
+
+
 def validate(sources: dict, doc: str) -> None:
     """@sources maps workflow basename to its text; @doc is THREADING.md."""
+    setup_counts = {}
+    for name, text in sorted(sources.items()):
+        setups = runtime_setups(text)
+        if setups:
+            setup_counts[name] = len(setups)
+        for setup in setups:
+            tokens = shlex.split(setup)
+            for required in ("-Db_sanitize=thread", "-Dthreads=posix",
+                             "-Doptimization=1", "--buildtype=debug"):
+                option = required.split("=", 1)[0] + "="
+                assert [token for token in tokens if token.startswith(option)] == [required], (
+                    f"{name}: runtime TSan profile requires {required!r}: "
+                    f"{setup!r}")
+            assert not any("NDEBUG" in token or token in (
+                "-Ddebug=false", "-Db_ndebug=true") for token in tokens), (
+                    f"{name}: runtime TSan profile must retain debug/assertions")
+    assert setup_counts == RUNTIME_LEGS, (
+        f"expected exactly one runtime TSan setup per gating workflow "
+        f"{RUNTIME_LEGS!r}, found {setup_counts!r}")
+
     counts = {}
     for name, text in sorted(sources.items()):
         found = runtime_invocations(text)
@@ -87,6 +127,10 @@ def validate(sources: dict, doc: str) -> None:
                 assert required in command, (
                     f"{name}: runtime TSan invocation lost {required!r}: "
                     f"{command!r}")
+
+            whole = MULTIPLIER_RE.sub("", command).replace("--print-errorlogs", "")
+            assert " ".join(whole.split()) == "meson test -C builddir-tsan", (
+                f"{name}: runtime TSan must run the whole suite: {command!r}")
 
     assert counts == RUNTIME_LEGS, (
         f"expected exactly one runtime TSan invocation per gating workflow "
@@ -192,6 +236,43 @@ class TsanTimeoutPolicyTests(unittest.TestCase):
                 continue
             self.assertEqual(runtime_invocations(text), [],
                              "perf-nightly.yml must not be policed")
+
+    def test_runtime_profile_drift_is_rejected(self):
+        for name in RUNTIME_LEGS:
+            for flag in ("-Doptimization=1", "-Db_sanitize=thread",
+                         "-Dthreads=posix", "--buildtype=debug"):
+                with self.subTest(workflow=name, flag=flag):
+                    sources = dict(self.sources)
+                    text = sources[name]
+                    start = re.search(r"meson setup builddir-tsan(?![\w-])", text).start()
+                    pos = text.index(flag, start)
+                    sources[name] = text[:pos] + text[pos:].replace(flag, "", 1)
+                    with self.assertRaisesRegex(AssertionError, "runtime TSan profile"):
+                        validate(sources, self.doc)
+
+    def test_runtime_profile_override_is_rejected(self):
+        sources = self.mutate("ci-pr.yml", "-Doptimization=1",
+                              "-Doptimization=1 -Doptimization=0")
+        with self.assertRaisesRegex(AssertionError, "runtime TSan profile"):
+            validate(sources, self.doc)
+
+    def test_native_setup_is_not_runtime(self):
+        self.assertEqual(runtime_setups(
+            "meson setup builddir-tsan-native -Db_sanitize=thread"), [])
+
+    def test_runtime_filters_are_rejected(self):
+        for suffix in (" --suite unit", " evaluation_control", " --exclude smoke"):
+            with self.subTest(filter=suffix):
+                sources = self.mutate("ci-pr.yml", RUNTIME_COMMAND,
+                                      RUNTIME_COMMAND + suffix)
+                with self.assertRaisesRegex(AssertionError, "whole suite"):
+                    validate(sources, self.doc)
+
+    def test_assertion_disable_is_rejected(self):
+        sources = self.mutate("ci-pr.yml", "-Doptimization=1",
+                              "-Doptimization=1 -Db_ndebug=true")
+        with self.assertRaisesRegex(AssertionError, "retain debug/assertions"):
+            validate(sources, self.doc)
 
     def test_doc_drift_is_rejected(self):
         with self.assertRaisesRegex(AssertionError, "must document"):
