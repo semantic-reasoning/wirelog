@@ -442,6 +442,8 @@ event_difference(const capture_t *before, const capture_t *after)
     return out;
 }
 
+static void qualification_cache(const fixture_t *);
+
 static void
 test_successors(void)
 {
@@ -478,6 +480,7 @@ test_successors(void)
                 CHECK(!finish_step(f.raw));
                 actual = head_capture(f.raw);
                 equal(&actual, &expected);
+                qualification_cache(&f);
                 prior = expected;
             }
             fixture_destroy(&f);
@@ -2219,7 +2222,7 @@ test_lftj_policy_error_order(void)
                         session->join_batch_strict = raw->join_batch_strict =
                             strict;
                         session->join_output_limit = raw->join_output_limit = 1;
-                        wl_plan_op_t *op =
+                        wl_plan_op_t *op = (wl_plan_op_t *)
                             &f.plan->strata[0].relations[0].ops[0];
                         CHECK(op->op == WL_PLAN_OP_LFTJ);
                         wl_plan_op_lftj_t *metadata = op->opaque_data;
@@ -2594,18 +2597,545 @@ test_lftj_join_suffix_policy(void)
                     }
 }
 
+/* Closing witnesses reuse real public sessions and existing controller hooks. */
+typedef void (*qualification_delta_cb_t)(const char *, const int64_t *,
+    uint32_t, int, void *);
+
+static void
+qualification_fixture(fixture_t *f, const char *text,
+    const int64_t *const rows[3], const unsigned counts[3],
+    const unsigned widths[3], bool batch, qualification_delta_cb_t callback,
+    void *user)
+{
+    memset(f, 0, sizeof(*f));
+    wirelog_error_t error;
+    f->program = wirelog_parse_string(text, &error);
+    CHECK(f->program && !wl_plan_from_program(f->program, &f->plan));
+    CHECK(!wl_evaluation_control_create(0, &f->control));
+    wl_columnar_memory_resolution_t resolution = {
+        .budget_bytes = UINT64_C(512)<<20, .usable_bytes = UINT64_C(512)<<20,
+            .mode = WL_COLUMNAR_MEMORY_MODE_ENFORCING
+    };
+    f->governor = wl_columnar_memory_governor_ref_create(&resolution);
+    CHECK(f->governor);
+    wl_session_options_t options; wl_session_options_init(&options);
+    options.evaluation_control = f->control;
+    options.memory_governor = f->governor;
+    CHECK(!wl_session_create_with_options(wl_backend_columnar(), f->plan, 1,
+        &options, &f->session)
+        && !wl_session_create(wl_backend_columnar(), f->plan, 1, &f->raw));
+    ((wl_col_session_t *)f->session)->join_batch_bytes = batch ? 64 : 0;
+    ((wl_col_session_t *)f->raw)->join_batch_bytes = batch ? 64 : 0;
+    ((wl_col_session_t *)f->session)->join_batch_strict = false;
+    ((wl_col_session_t *)f->raw)->join_batch_strict = false;
+    if (callback) wl_session_set_delta_cb(f->session, callback, user);
+    for (unsigned s = 0; s < 3; ++s) {
+        CHECK(counts[s] <= 4 && widths[s] <= 25);
+        f->counts[s] = counts[s]; f->widths[s] = widths[s];
+        memcpy(f->data[s], rows[s], counts[s] * widths[s] * sizeof(int64_t));
+        char name[2] = {(char)('a' + s), 0};
+        CHECK(!wl_session_insert(f->session, name, rows[s], counts[s],
+            widths[s])
+            && !wl_session_insert(f->raw, name, rows[s], counts[s], widths[s]));
+    }
+    CHECK(f->plan->stratum_count == 1
+        && f->plan->strata[0].relation_count == 1
+        && f->plan->strata[0].relations[0].ops[0].op == WL_PLAN_OP_LFTJ);
+}
+
+static void
+qualification_head(fixture_t *f, const int64_t *literal,
+    unsigned rows, unsigned width)
+{
+    col_rel_t *actual = session_find_rel((wl_col_session_t *)f->session,
+            "output");
+    col_rel_t *raw = session_find_rel((wl_col_session_t *)f->raw, "output");
+    CHECK(actual && raw && actual->nrows == rows && raw->nrows == rows
+        && actual->ncols == width && raw->ncols == width
+        && actual->schema.n_children == width && raw->schema.n_children == width
+        && !actual->timestamps && !raw->timestamps);
+    for (unsigned c = 0; c < width; ++c) {
+        CHECK(actual->column_types && raw->column_types
+            && actual->column_types[c] == WIRELOG_TYPE_INT64
+            && raw->column_types[c] == WIRELOG_TYPE_INT64
+            && !strcmp(actual->col_names[c], raw->col_names[c])
+            && !strcmp(actual->schema.children[c]->format,
+            raw->schema.children[c]->format));
+        for (unsigned r = 0; r < rows; ++r)
+            CHECK(actual->columns[c][r] == literal[r * width + c]
+                && raw->columns[c][r] == literal[r * width + c]);
+    }
+}
+
+static bool
+qualification_report_equal(const wl_evaluation_control_report_t *a,
+    const wl_evaluation_control_report_t *b)
+{
+    return a->attempt_id == b->attempt_id && a->limit == b->limit
+           && a->consumed == b->consumed && a->result == b->result
+           && a->stop_reason == b->stop_reason
+           && a->execution_status == b->execution_status
+           && a->cleanup_status == b->cleanup_status;
+}
+
+typedef struct {
+    fixture_t *fixture;
+    uint64_t prefix;
+    bool reached, compared, output_create, emitted, cancel;
+} qualification_seek_t;
+static qualification_seek_t *qualification_seek;
+
+static void
+qualification_seek_checkpoint(wl_evaluation_control_t *control,
+    const wl_columnar_lftj_attempt_t *a)
+{
+    qualification_seek_t *p = qualification_seek;
+    CHECK(p && control == p->fixture->control);
+    if (a->phase == WL_COLUMNAR_LFTJ_ATTEMPT_JOIN
+        && a->join_phase == WL_COLUMNAR_LFTJ_JOIN_PRODUCT_EMIT)
+        p->emitted = true;
+    if (a->phase == WL_COLUMNAR_LFTJ_ATTEMPT_OUTPUT_CREATE) {
+        p->output_create = true;
+        CHECK(!a->output_rows && !a->output_written && !a->output &&
+            !a->writer_active);
+    }
+    if (a->phase != WL_COLUMNAR_LFTJ_ATTEMPT_JOIN || a->output_pass
+        || a->join_phase != WL_COLUMNAR_LFTJ_JOIN_SEEK_SEARCH) return;
+    CHECK(a->join_index == 0 && a->input_count == 3 && a->max_key == 3
+        && a->inputs[0].nrows == 1 && a->inputs[0].ncols == 1
+        && a->inputs[0].rows[0] == 1 && !a->output_rows && !a->output
+        && !a->writer_active);
+    if (!p->reached) {
+        CHECK(!a->seek_lo && a->seek_hi == 1);
+        CHECK(!wl_evaluation_control_test_active_consumed(control,
+            a->attempt_id, &p->prefix));
+        p->reached = true;
+        if (p->cancel) wl_evaluation_control_request_cancel(control);
+    } else {
+        CHECK(a->seek_lo == 1 && a->seek_hi == 1);
+        p->compared = true;
+    }
+}
+
+static void
+test_lftj_nonoutput_seek(void)
+{
+    const char *text = ".decl a(x:int64)\n.decl b(x:int64)\n"
+        ".decl c(x:int64)\n.decl output(x:int64)\n"
+        "output(x):-a(x),b(x),c(x).\n";
+    const int64_t disjoint[] = {1, 2, 3}, positive = 3;
+    const int64_t *rows[] = {&disjoint[0], &disjoint[1], &disjoint[2]};
+    const unsigned counts[] = {1, 1, 1}, widths[] = {1, 1, 1};
+    for (unsigned batch = 0; batch < 2; ++batch)
+        for (unsigned observed = 0; observed < 2; ++observed)
+            for (unsigned snapshot = 0; snapshot < 2; ++snapshot) {
+                uint64_t empirical_prefix = 0;
+                for (unsigned mode = 0; mode < 4; ++mode) {
+                    fixture_t f; policy_capture_t events = {0}, tuples = {0};
+                    qualification_fixture(&f, text, rows, counts, widths, batch,
+                        observed ? policy_delta : NULL, &events);
+                    if (mode == 1 || mode == 2)
+                        CHECK(!wl_evaluation_control_configure(f.control,
+                            empirical_prefix + mode - 1));
+                    source_image_t before[3];
+                    for (unsigned i = 0; i < 3;
+                        ++i) before[i] = image(f.session, i);
+                    wl_columnar_memory_governor_t *g =
+                        wl_columnar_memory_governor_ref_get(f.governor);
+                    uint64_t baseline = wl_columnar_memory_reserved(g);
+                    wl_columnar_memory_reservation_t peer;
+                    wl_columnar_memory_reservation_init(&peer);
+                    CHECK(wl_columnar_memory_reserve_checked(g, 4096, &peer)
+                        == WL_COLUMNAR_MEMORY_ADMISSION_OK);
+                    qualification_seek_t probe = {.fixture = &f,
+                                                  .cancel = mode == 3};
+                    qualification_seek = &probe;
+                    wl_columnar_lftj_test_attempt_checkpoint =
+                        qualification_seek_checkpoint;
+                    int rc = snapshot ? wl_session_snapshot(f.session,
+                            policy_tuple, &tuples)
+                        : finish_step(f.session);
+                    wl_columnar_lftj_test_attempt_checkpoint = NULL;
+                    qualification_seek = NULL;
+                    CHECK(probe.reached && !probe.emitted && !events.count &&
+                        !tuples.count);
+                    if (!mode) {
+                        CHECK(!rc && probe.compared && probe.output_create);
+                        empirical_prefix = probe.prefix;
+                        CHECK(empirical_prefix);
+                        CHECK(!finish_step(f.raw));
+                        qualification_head(&f, NULL, 0, 1);
+                    } else {
+                        int expected = mode ==
+                            3 ? WL_EVALUATION_CONTROL_CANCELLED :
+                            WL_EVALUATION_CONTROL_WORK_LIMIT;
+                        if (rc != expected) fprintf(stderr,
+                                "seek mode=%u batch=%u observed=%u snapshot=%u rc=%d prefix=%llu actualprefix=%llu\n",
+                                mode, batch, observed, snapshot, rc,
+                                (unsigned long long)empirical_prefix,
+                                (unsigned long long)probe.prefix);
+                        CHECK(rc == expected && probe.prefix == empirical_prefix
+                            && probe.compared == (mode == 2)
+                            && probe.output_create == (mode == 2)
+                            && !session_find_rel((wl_col_session_t *)f.session,
+                            "output")
+                            );
+                        uint64_t retained = wl_columnar_memory_reserved(g);
+                        /* WORK can retain the actual prepared host image;
+                         * child/receipt debt is gone and readers still guard it. */
+                        if (mode == 3) CHECK(retained == baseline + 4096);
+                        else {
+                            CHECK(retained >= baseline + 4096);
+                            if (retained > baseline + 4096)
+                                CHECK(wl_session_insert(f.session, "a", rows[0],
+                                    1, 1) == EBUSY);
+                        }
+                        wl_col_session_t *session =
+                            (wl_col_session_t *)f.session;
+                        CHECK(!session->cleanup_active &&
+                            !session->cleanup_pending
+                            && !session->cleanup_reserved_bytes);
+
+                        wl_evaluation_control_report_t report, frozen;
+                        CHECK(!wl_evaluation_control_report(f.control, &report)
+                            && report.consumed == empirical_prefix + (mode == 2)
+                            && report.result == expected &&
+                            report.stop_reason == expected
+                            && !report.execution_status &&
+                            !report.cleanup_status);
+                        frozen = report;
+                        for (unsigned i = 0; i < 3;
+                            ++i) unchanged(f.session, i, &before[i], true);
+                        CHECK(!wl_evaluation_control_report(f.control, &report)
+                            && qualification_report_equal(&report, &frozen));
+                        CHECK(!wl_evaluation_control_reset(f.control)
+                            && !wl_evaluation_control_configure(f.control, 0));
+                        CHECK(!(snapshot ? wl_session_snapshot(f.session,
+                            policy_tuple, &tuples)
+                            : finish_step(f.session)) && !finish_step(f.raw));
+                        qualification_head(&f, NULL, 0, 1);
+                    }
+                    CHECK(peer.governor == g && peer.bytes == 4096
+                        && wl_columnar_memory_rollback(&peer));
+                    CHECK(!finish_step(f.session) && !events.count);
+                    fixture_destroy(&f);
+                }
+                /* Same natural plan/domain has a nonvacuous intersecting control. */
+                const int64_t *matching[] = {&positive, &positive, &positive};
+                fixture_t f; policy_capture_t events = {0}, tuples = {0};
+                qualification_fixture(&f, text, matching, counts, widths, batch,
+                    observed ? policy_delta : NULL, &events);
+                CHECK(!(snapshot ? wl_session_snapshot(f.session, policy_tuple,
+                    &tuples)
+                    : finish_step(f.session)) && !finish_step(f.raw));
+                qualification_head(&f, &positive, 1, 1);
+                if (observed) CHECK(events.count == 1 && events.mask == 4);
+                if (snapshot) CHECK(tuples.count == 1 && tuples.mask == 4);
+                fixture_destroy(&f);
+            }
+}
+
+static void
+qualification_cache(const fixture_t *f)
+{
+    const wl_col_session_t *actual = (const wl_col_session_t *)f->session;
+    wl_col_session_t *raw = (wl_col_session_t *)f->raw;
+    CHECK(!actual->sarr_count && raw->sarr_count >= 3 &&
+        !raw->sarr_active_pins);
+    for (uint32_t e = 0; e < raw->sarr_count; ++e)
+        CHECK(!raw->sarr_entries[e].sarr.pin_count);
+    for (unsigned i = 0; i < 3; ++i) {
+        char name[2] = {(char)('a' + i), 0};
+        col_rel_t *source = session_find_rel(raw, name);
+        CHECK(source);
+        bool present = false; uint32_t key = 0;
+        for (uint32_t e = 0; e < raw->sarr_count; ++e)
+            if (!strcmp(raw->sarr_entries[e].rel_name, name)) {
+                key = raw->sarr_entries[e].key_col; present = true; break;
+            }
+        CHECK(present && key < source->ncols);
+        /* Public bookkeeping can advance the source generation after a raw
+         * call. A genuine lease reuses or rebuilds the warm entry as needed;
+         * a historical cache slot need not remain current after publication. */
+        col_sorted_arrangement_probe_t probe = {0};
+        CHECK(!col_session_acquire_sorted_arrangement_probe(f->raw, source, key,
+            &probe)
+            && probe.active && probe.source == source && probe.arr
+            && probe.arr->pin_count == 1
+            && probe.arr->indexed_rows == source->nrows
+            && probe.arr->ncols == source->ncols
+            && wl_columnar_relation_snapshot_equal(probe.source_snapshot,
+            wl_columnar_relation_snapshot(source))
+            && wl_columnar_relation_snapshot_equal(probe.arr->source_snapshot,
+            probe.source_snapshot));
+        CHECK(!col_sorted_arrangement_probe_release(&probe)
+            && !raw->sarr_active_pins);
+    }
+
+}
+
+static void
+aggregate_delta(const char *name, const int64_t *row, uint32_t width,
+    int diff, void *data)
+{
+    if (strcmp(name, "output")) return;
+    capture_t *capture = data;
+    CHECK(width == 2 && capture->count < 128 && (diff == -1 || diff == 1));
+    tuple_t *tuple = &capture->rows[capture->count++];
+    memset(tuple, 0, sizeof(*tuple));
+    tuple->cells[0] = row[0]; tuple->cells[1] = row[1]; tuple->diff = diff;
+}
+
+static void
+aggregate_tuple(const char *name, const int64_t *row, uint32_t width,
+    void *data)
+{
+    aggregate_delta(name, row, width, 1, data);
+}
+
+static capture_t
+aggregate_expected(unsigned cycle)
+{
+    CHECK(cycle < 3);
+    const int64_t values[3][4] = {{1, 8, 2, 1}, {1, 4, 2, 1}, {1, 4, 2, 2}};
+    capture_t out = {0};
+    aggregate_delta("output", values[cycle], 2, 1, &out);
+    aggregate_delta("output", values[cycle] + 2, 2, 1, &out);
+    return out;
+}
+
+static void
+test_lftj_aggregate_successors(void)
+{
+    const char *text = ".decl a(k:int64,v:int64)\n.decl b(k:int64,p:int64)\n"
+        ".decl c(k:int64,q:int64)\n.decl output(k:int64,n:int64)\n"
+        "output(k,count(v)):-a(k,v),b(k,p),c(k,q).\n";
+    const int64_t a[] = {1, 10, 1, 20, 2, 7};
+    const int64_t b[] = {1, 100, 1, 101, 2, 102};
+    const int64_t c[] = {1, 200, 1, 201, 2, 202};
+    const int64_t *rows[] = {a, b, c};
+    const unsigned counts[] = {3, 3, 3}, widths[] = {2, 2, 2};
+    const int64_t literals[3][4] = {{1, 8, 2, 1}, {1, 4, 2, 1}, {1, 4, 2, 2}};
+    for (unsigned batch = 0; batch < 2; ++batch)
+        for (unsigned observed = 0; observed < 2; ++observed)
+            for (unsigned snapshot = 0; snapshot < 2; ++snapshot)
+                for (unsigned work = 0; work < 2; ++work) {
+                    fixture_t f; capture_t events = {0}, tuples = {0};
+                    qualification_fixture(&f, text, rows, counts, widths, batch,
+                        observed ? aggregate_delta : NULL, &events);
+                    CHECK(!wl_evaluation_control_configure(f.control,
+                        UINT64_C(1000000000)));
+                    const wl_plan_relation_t *head =
+                        &f.plan->strata[0].relations[0];
+                    bool reduced = false;
+                    for (uint32_t i = 1; i < head->op_count; ++i)
+                        reduced |= head->ops[i].op == WL_PLAN_OP_REDUCE;
+                    CHECK(reduced &&
+                        head->ops[head->op_count - 1].op ==
+                        WL_PLAN_OP_CONSOLIDATE);
+                    int initial = snapshot ? wl_session_snapshot(f.session,
+                            aggregate_tuple, &tuples)
+                        : finish_step(f.session);
+                    int reference = finish_step(f.raw);
+                    if (initial || reference) fprintf(stderr,
+                            "aggregate initial batch=%u observed=%u snapshot=%u work=%u rc=%d raw=%d\n",
+                            batch, observed, snapshot, work, initial,
+                            reference);
+                    CHECK(!initial && !reference);
+                    qualification_head(&f, literals[0], 2, 2);
+                    qualification_cache(&f);
+                    capture_t prior = aggregate_expected(0);
+                    if (observed) equal(&events, &prior);
+                    if (snapshot) equal(&tuples, &prior);
+                    events.count = tuples.count = 0;
+                    wl_columnar_memory_governor_t *g =
+                        wl_columnar_memory_governor_ref_get(f.governor);
+                    wl_columnar_memory_reservation_t peer;
+                    wl_columnar_memory_reservation_init(&peer);
+                    CHECK(wl_columnar_memory_reserve_checked(g, 4096, &peer)
+                        == WL_COLUMNAR_MEMORY_ADMISSION_OK);
+                    const int64_t removed[] = {1, 20};
+                    CHECK(!wl_session_remove(f.session, "a", removed, 1, 2)
+                        && !wl_session_remove(f.raw, "a", removed, 1, 2));
+                    col_rel_t *old =
+                        session_find_rel((wl_col_session_t *)f.session,
+                            "output");
+                    col_relation_snapshot_t old_snapshot =
+                        wl_columnar_relation_snapshot(old);
+                    source_image_t before[3];
+                    for (unsigned i = 0; i < 3;
+                        ++i) before[i] = image(f.session, i);
+                    uint64_t reserved = wl_columnar_memory_reserved(g);
+                    stopping = &f; stop_target = WL_COLUMNAR_LFTJ_ATTEMPT_COPY;
+                    stop_work = work; stop_hit = false;
+                    wl_columnar_lftj_test_attempt_checkpoint = stop_checkpoint;
+                    int rc = snapshot ? wl_session_snapshot(f.session,
+                            aggregate_tuple, &tuples)
+                        : finish_step(f.session);
+                    wl_columnar_lftj_test_attempt_checkpoint = NULL;
+                    stopping = NULL;
+                    CHECK(stop_hit &&
+                        rc == (work ? WL_EVALUATION_CONTROL_WORK_LIMIT
+                        : WL_EVALUATION_CONTROL_CANCELLED)
+                        && !events.count && !tuples.count
+                        && session_find_rel((wl_col_session_t *)f.session,
+                        "output") == old
+                        && wl_columnar_relation_snapshot_equal(old_snapshot,
+                        wl_columnar_relation_snapshot(old)));
+                    qualification_head(&f, literals[0], 2, 2);
+                    for (unsigned i = 0; i < 3;
+                        ++i) unchanged(f.session, i, &before[i], true);
+                    uint64_t retained = wl_columnar_memory_reserved(g);
+                    if (!observed &&
+                        !snapshot) CHECK(work ? retained >=
+                            reserved : retained == reserved);
+                    else {
+                        /* A fresh observed/Snapshot call can retire previous
+                        * delivery storage. Its old credit is not a rollback
+                        * baseline; peer ownership and final teardown are. */
+                        CHECK(retained >= 4096 && peer.governor == g
+                            && peer.bytes == 4096
+                            && atomic_load_explicit(&peer.state,
+                            memory_order_acquire)
+                            == WL_COLUMNAR_MEMORY_RESERVATION_RESERVED);
+                    }
+                    if (retained > reserved)
+                        CHECK(wl_session_insert(f.session, "a", a, 1,
+                            2) == EBUSY);
+                    wl_evaluation_control_report_t frozen, report;
+                    CHECK(!wl_evaluation_control_report(f.control, &frozen)
+                        && frozen.result == rc && frozen.stop_reason == rc
+                        && !frozen.execution_status && !frozen.cleanup_status
+                        && !wl_evaluation_control_report(f.control, &report)
+                        && qualification_report_equal(&frozen, &report));
+                    CHECK(!wl_evaluation_control_reset(f.control));
+                    for (unsigned cycle = 1; cycle < 3; ++cycle) {
+                        if (cycle == 2) {
+                            const int64_t added[] = {2, 9};
+                            CHECK(!wl_session_insert(f.session, "a", added, 1,
+                                2)
+                                && !wl_session_insert(f.raw, "a", added, 1, 2));
+                        }
+                        events.count = tuples.count = 0;
+                        CHECK(!(snapshot ? wl_session_snapshot(f.session,
+                            aggregate_tuple, &tuples)
+                            : finish_step(f.session)) && !finish_step(f.raw));
+                        qualification_head(&f, literals[cycle], 2, 2);
+                        qualification_cache(&f);
+                        capture_t expected = aggregate_expected(cycle);
+                        capture_t delta = event_difference(&prior, &expected);
+                        CHECK(delta.count == 2);
+                        if (observed) equal(&events, &delta);
+                        if (snapshot) equal(&tuples, &expected);
+                        prior = expected;
+                        unsigned delivered = events.count;
+                        CHECK(!finish_step(f.session) &&
+                            events.count == delivered);
+                    }
+                    CHECK(peer.governor == g && peer.bytes == 4096
+                        && wl_columnar_memory_rollback(&peer));
+                    fixture_destroy(&f);
+                }
+}
+
+typedef struct {
+    fixture_t *fixture;
+    capture_t expected;
+    bool work, fired;
+    uint64_t id, consumed;
+} qualification_postcut_t;
+
+static void
+qualification_postcut_delta(const char *name, const int64_t *row,
+    uint32_t width, int diff, void *user)
+{
+    qualification_postcut_t *p = user;
+    if (strcmp(name, "output")) return;
+    if (!p->fired) {
+        capture_t actual = head_capture(p->fixture->session);
+        equal(&actual, &p->expected);
+        p->fired = true;
+        p->id = wl_evaluation_control_active_attempt_id(p->fixture->control);
+        CHECK(p->id && !wl_evaluation_control_test_active_consumed(
+                p->fixture->control, p->id, &p->consumed));
+        if (p->work) {
+            /* Explicit user-callback stop propagation, not a finite engine
+             * action oracle or a SOURCE performed-work contribution. */
+            CHECK(wl_evaluation_control_charge_attempt(p->fixture->control,
+                p->id, UINT64_MAX) == WL_EVALUATION_CONTROL_WORK_LIMIT);
+        } else wl_evaluation_control_request_cancel(p->fixture->control);
+    }
+    on_delta(name, row, width, diff, &p->fixture->events);
+}
+
+static void
+test_lftj_postcut_delivery(void)
+{
+    for (unsigned batch = 0; batch < 2; ++batch)
+        for (unsigned snapshot = 0; snapshot < 2; ++snapshot)
+            for (unsigned work = 0; work < 2; ++work) {
+                fixture_t f; native_fixture_init(&f, true, batch);
+                CHECK(!wl_evaluation_control_configure(f.control,
+                    UINT64_C(1000000000)));
+                qualification_postcut_t cut = {.fixture = &f,
+                                               .expected = oracle(&f),
+                                               .work = work};
+                CHECK(cut.expected.count == 10);
+                wl_session_set_delta_cb(f.session, qualification_postcut_delta,
+                    &cut);
+                capture_t tuples = {0};
+                int rc = snapshot ? wl_session_snapshot(f.session, on_tuple,
+                        &tuples)
+                    : finish_step(f.session);
+                int expected = work ? WL_EVALUATION_CONTROL_WORK_LIMIT : 0;
+                if (rc != expected) fprintf(stderr,
+                        "postcut batch=%u snapshot=%u work=%u rc=%d expected=%d\n",
+                        batch, snapshot, work, rc, expected);
+                CHECK(cut.fired && rc == expected);
+                capture_t actual = head_capture(f.session);
+                equal(&actual, &cut.expected); equal(&f.events, &cut.expected);
+                if (snapshot) equal(&tuples, &cut.expected);
+                CHECK(!finish_step(f.raw)); head_schema_equal(&f);
+                actual = head_capture(f.raw); equal(&actual, &cut.expected);
+                wl_evaluation_control_report_t report, frozen;
+                CHECK(!wl_evaluation_control_report(f.control, &report)
+                    && report.attempt_id == cut.id
+                    && report.limit == UINT64_C(1000000000)
+                    && report.consumed == cut.consumed
+                    && report.result == expected
+                    && report.stop_reason ==
+                    (work ? WL_EVALUATION_CONTROL_WORK_LIMIT :
+                    WL_EVALUATION_CONTROL_NONE)
+                    && !report.execution_status && !report.cleanup_status);
+                frozen = report;
+                unsigned delivered = f.events.count;
+                CHECK(!wl_evaluation_control_reset(f.control));
+                CHECK(!finish_step(f.session) && f.events.count == delivered
+                    && !wl_evaluation_control_report(f.control, &report));
+                if (report.attempt_id == frozen.attempt_id)
+                    CHECK(qualification_report_equal(&report, &frozen));
+                else CHECK(report.attempt_id > frozen.attempt_id &&
+                        !report.result
+                        && report.stop_reason == WL_EVALUATION_CONTROL_NONE
+                        && !report.execution_status && !report.cleanup_status);
+                actual = head_capture(f.session); equal(&actual, &cut.expected);
+                fixture_destroy(&f);
+            }
+}
+
 int
 main(int argc, char **argv)
 {
     if (argc > 2 || (argc == 2 && strcmp(argv[1], "domains")
         && strcmp(argv[1], "recovery") && strcmp(argv[1], "failures")
         && strcmp(argv[1], "native") && strcmp(argv[1], "admission")
+        && strcmp(argv[1], "qualification")
         && strcmp(argv[1], "metadata-native") && strcmp(argv[1],
         "policy") && strcmp(argv[1],
         "microsteps"))) {
         fprintf(stderr,
             "usage: %s [domains|recovery|failures|admission|native|"
-            "metadata-native|policy|microsteps]\n",
+            "metadata-native|policy|qualification|microsteps]\n",
             argv[0]);
         return EXIT_FAILURE;
     }
@@ -2652,6 +3182,11 @@ main(int argc, char **argv)
         test_second_lftj_metadata_cleanup();
         test_lftj_join_suffix_policy();
         wl_log_thresholds[WL_LOG_SEC_JOIN] = threshold;
+    }
+    if (argc == 1 || !strcmp(argv[1], "qualification")) {
+        test_lftj_nonoutput_seek();
+        test_lftj_postcut_delivery();
+        test_lftj_aggregate_successors();
     }
     puts("LFTJ session tests passed");
     return 0;

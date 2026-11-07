@@ -3913,7 +3913,7 @@ The remaining activation boundary is explicit:
 | Initial scalar SEMIJOIN/ANTIJOIN | Supported in the named existing-right scalar domain, including numeric composition |
 | Initial scalar REDUCE | Supported in the documented scalar numeric child domain |
 | Initial scalar CONCAT/UNION | Supported as a two-input child and complete private composed numeric body through terminal CONSOLIDATE |
-| Generated LFTJ | Supported in serial controlled composition with a 64-column cap; source discovery, descriptor/storage-reader admission, merge-sort, traversal, and output-cell actions are bounded. Before governor admission or allocating its private output row and copied input/scratch arrays, a resumable tariff charges one unit per scalar slot plus eight per allocation action in chunks of at most 256; a one-unit-short limit allocates none, and empty inputs allocate no row/scratch arrays. Contended reader admission resumes with the same input cursor and retires partial descriptor pins on cancellation. Reservation receipts are prepared before credit return, and successful writer-finalization refusals retry without changing semantic success. The tariff is logical, not an allocator latency bound. Relation destruction, allocator/Arrow release, and stack publication/disposal remain synchronous cleanup boundaries. |
+| Generated LFTJ | Supported through real default serial session composition with at most 64 input relations (not a total output-column cap); source discovery, descriptor/storage-reader admission, merge-sort, traversal, and output-cell actions are bounded. Before governor admission or allocating its private output row and copied input/scratch arrays, a resumable tariff charges one unit per scalar slot plus eight per allocation action in chunks of at most 256; a one-unit-short limit allocates none, and empty inputs allocate no row/scratch arrays. Contended reader admission resumes with the same input cursor and retires partial descriptor pins on cancellation. Reservation receipts are prepared before credit return, and successful writer-finalization refusals retry without changing semantic success. The tariff is logical, not an allocator latency bound. Writer, descriptor and scalar retirement and chunked ACK are bounded on the controlled session path; stack publication/disposal have separately bounded caller actions. Only the named allocator, Arrow and library interiors retain synchronous boundaries; their call fronts and first native iterations are included in the [source map](implementation/2298/LFTJ_SOURCE_ACCOUNTING.md). |
 | LFTJ fallbacks/fused alternatives | Further implementation and path-specific qualification required |
 | Differential/weighted, recursive, batch/pipeline/TDD/parallel dispatch | Further implementation and path-specific qualification required |
 | Known numeric/projection MAP result schemas and FLOAT ordering/deduplication | Supported in the documented scalar domain; raw interpreter-only mixed schemas remain legacy/untyped |
@@ -3992,6 +3992,10 @@ failures at either probe retain the exact preceding owned result and prevent
 later children from starting. Retained scratch credit uses real pending/child
 HOST383/384 retries; operation turnover consumes no successor allowance, and
 a fresh original record on the same stable source recovers canonical results.
+
+The serial LFTJ session contract, optional-cache bounded rebuild, finite
+no-output traversal, aggregate/deletion and committed-delivery evidence are
+recorded in [LFTJ acceptance](implementation/2298/LFTJ_ACCEPTANCE.md).
 
 ### Initial numeric REDUCE ownership
 
