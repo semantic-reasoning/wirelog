@@ -5,8 +5,8 @@ serial framed host. Its saved Original may have ended while the child still
 owns readers, copied inputs, a writer or private output. The registered native
 cleanup destination drains that owner and its actual receipt before returning
 the execution error. Default batch-off financial admission is recorded in
-[LFTJ_SOURCE_ACCOUNTING.md](LFTJ_SOURCE_ACCOUNTING.md). Runtime policy and
-complete issue qualification remain subsequent work under #2298.
+[LFTJ_SOURCE_ACCOUNTING.md](LFTJ_SOURCE_ACCOUNTING.md). Runtime policy is also covered there; final coverage-ledger and complete
+issue qualification remain subsequent work under #2298.
 
 ## Authority and disposition
 

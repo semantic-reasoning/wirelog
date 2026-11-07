@@ -9794,7 +9794,7 @@ metadata_trace_checkpoint(wl_columnar_eval_plan_numeric_attempt_t *record)
     CHECK(!record->lftj.identity && !record->lftj.inputs &&
         !record->lftj.output);
     if (p->phase == WL_COLUMNAR_LFTJ_METADATA_NAMES) {
-        CHECK(p->name_index == t->next_name++ && !record->preflight_depth);
+        CHECK(p->name_index == t->next_name++ && record->preflight_depth == 1);
     }
     if (p->phase == WL_COLUMNAR_LFTJ_METADATA_BIND_ENTRY) {
         CHECK(p->entry == t->entries++);
@@ -9905,7 +9905,7 @@ test_lftj_metadata_maximum(void)
         composed_run(&f);
         wl_columnar_eval_plan_test_lftj_metadata_checkpoint = NULL;
         metadata_trace = NULL;
-        int expected = kind < 2 ? 0 : kind == 5 || kind == 6 ? ENOENT : EINVAL;
+        int expected = kind < 2 ? 0 : kind <= 6 ? ENOENT : EINVAL;
         CHECK(f.record.semantic_result == expected);
         CHECK(f.record.lftj_metadata.phase == WL_COLUMNAR_LFTJ_METADATA_INERT &&
             !f.record.lftj_metadata_dispatch);
@@ -9924,12 +9924,12 @@ test_lftj_metadata_maximum(void)
             for (unsigned c = 0; c < 64;
                 ++c) CHECK(stack->items[0].rel->columns[c][0] == 0);
             composed_raw_parity(&f, &body, 0);
-        } else if (kind == 2 || kind == 4) {
-            CHECK(trace.next_name == 64 &&
-                !trace.hits[WL_COLUMNAR_LFTJ_METADATA_BIND_HEADER]
-                && !f.record.lftj.identity);
-        } else if (kind == 3) CHECK(trace.next_name == 1 &&
-                !f.record.lftj.identity);
+        } else if (kind >= 2 && kind <= 4) {
+            CHECK(trace.next_name == 64
+                && trace.hits[WL_COLUMNAR_LFTJ_METADATA_BIND_HEADER] == 1
+                && f.record.lftj.identity == &f.record.lftj
+                && f.record.lftj.phase == WL_COLUMNAR_LFTJ_ATTEMPT_DONE);
+        }
         CHECK(source->nrows == 1 && source->columns[0][0] == 0
             && !f.session.arr_count && !f.session.rel_hash_nbuckets);
         composed_close(&f); col_rel_destroy(source);
@@ -10148,6 +10148,7 @@ test_lftj_metadata_ended_cleanup(void)
 {
     const struct { wl_columnar_lftj_metadata_phase_t phase;
                    uint32_t entry, pair; } targets[] = {
+        {WL_COLUMNAR_LFTJ_METADATA_INERT, 0, 0},
         {WL_COLUMNAR_LFTJ_METADATA_HEADER, 0, 0},
         {WL_COLUMNAR_LFTJ_METADATA_NAMES, 0, 0},
         {WL_COLUMNAR_LFTJ_METADATA_NAMES, 63, 0},
@@ -10171,6 +10172,9 @@ test_lftj_metadata_ended_cleanup(void)
                 const wl_columnar_lftj_metadata_proof_t *p =
                     &f->record.lftj_metadata;
                 if (p->phase == targets[trial].phase
+                    && (p->phase != WL_COLUMNAR_LFTJ_METADATA_INERT
+                    || f->record.phase ==
+                    WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_READY)
                     && (p->phase != WL_COLUMNAR_LFTJ_METADATA_NAMES ||
                     p->name_index == targets[trial].entry)
                     && (p->phase != WL_COLUMNAR_LFTJ_METADATA_BIND_ENTRY ||
@@ -10224,6 +10228,52 @@ test_lftj_metadata_ended_cleanup(void)
             CHECK(metadata_ended_turn(&m, false, 0, 1, &charge,
                 &output) == EINVAL
                 && !charge && output == 12345);
+            if (targets[trial].phase == WL_COLUMNAR_LFTJ_METADATA_INERT) {
+                /* Component negatives on a genuine nevercaptured READY. */
+                wl_columnar_lftj_metadata_proof_t saved =
+                    f->record.lftj_metadata;
+                for (unsigned variant = 0; variant < 23; ++variant) {
+                    wl_columnar_lftj_metadata_proof_t *p =
+                        &f->record.lftj_metadata;
+                    uint32_t cursor = f->record.cursor;
+                    if (variant == 0) p->operation = &m.op;
+                    else if (variant == 1) p->metadata = &m.metadata;
+                    else if (variant == 2) p->names = m.names;
+                    else if (variant == 3) p->keys = m.keys;
+                    else if (variant == 4) p->op_index = 1;
+                    else if (variant == 5) p->k = 2;
+                    else if (variant == 6) p->name_index = 1;
+                    else if (variant == 7) p->bindings = &m.bindings;
+                    else if (variant == 8) p->dynamic_entries = m.names;
+                    else if (variant == 9) p->binding_generation = 1;
+                    else if (variant == 10) p->binding_count = 1;
+                    else if (variant == 11) p->entry = 1;
+                    else if (variant == 12) p->pair = 1;
+                    else if (variant == 13) p->registry = m.relations;
+                    else if (variant == 14) p->registry_count = 1;
+                    else if (variant == 15) p->prefix_cleared = true;
+                    else if (variant ==
+                        16) p->phase = WL_COLUMNAR_LFTJ_METADATA_CONSUMED;
+                    else if (variant == 17) f->record.cursor = f->record.end;
+                    else if (variant == 18) f->record.completed = 1;
+                    else if (variant == 19) f->record.runtime_depth = 1;
+                    else if (variant == 20) m.op.op = WL_PLAN_OP_MAP;
+                    else if (variant ==
+                        21) f->record.lftj.identity = &f->record.lftj;
+                    else f->record.source_installed = true;
+                    CHECK(metadata_ended_turn(&m, false, 192, 0, &charge,
+                        &output) == EINVAL
+                        && !charge && output == 12345 &&
+                        !f->record.lftj_metadata_ended);
+                    *p = saved; f->record.cursor = cursor;
+                    f->record.completed = 0; f->record.runtime_depth = 0;
+                    m.op.op = WL_PLAN_OP_LFTJ;
+                    f->record.lftj.identity = NULL;
+                    f->record.source_installed = false;
+                }
+                /* No captured metadata means even opaque poison is unread. */
+                m.op.opaque_data = (void *)(uintptr_t)1;
+            }
             metadata_ended_probe = &m; metadata_ended_reentries = 0;
             wl_columnar_eval_plan_test_lftj_metadata_cleanup_checkpoint =
                 metadata_ended_checkpoint;
@@ -10258,6 +10308,7 @@ test_lftj_metadata_ended_cleanup(void)
                 &after) && metadata_reports_equal(&before, &after));
             CHECK(m.relations[0]->nrows == 1 &&
                 m.relations[0]->columns[0][0] == 0);
+            m.op.opaque_data = &m.metadata;
             metadata_fixture_close(&m);
         }
 }
@@ -14184,6 +14235,28 @@ test_abort_scan_semantics_and_boundaries(void)
     plan.ops = deep; plan.op_count = COL_STACK_MAX + 1u;
     abort_scan_case(&plan, 0, plan.op_count, 0, ENOBUFS, false,
         33u + 64u * plan.op_count);
+    for (unsigned i = 0; i <= COL_STACK_MAX; ++i)
+        deep[i].op = WL_PLAN_OP_LFTJ;
+    bool supported = true;
+    CHECK(wl_columnar_eval_plan_numeric_composed_abort_supported(&plan,
+        0, plan.op_count, &supported) == ENOBUFS && !supported);
+    abort_scan_case(&plan, 0, plan.op_count, 0, ENOBUFS, false,
+        33u + 64u * plan.op_count);
+    const uint64_t before_overflow = 33u + 64u * COL_STACK_MAX;
+    abort_scan_case(&plan, 0, plan.op_count, before_overflow + 63,
+        WL_EVALUATION_CONTROL_WORK_LIMIT, false, before_overflow);
+    abort_scan_case(&plan, 0, plan.op_count, before_overflow + 64,
+        ENOBUFS, false, before_overflow + 64);
+    wl_plan_op_t union_ops[] = {{.op = WL_PLAN_OP_LFTJ},
+                                {.op = WL_PLAN_OP_LFTJ},
+                                {.op = WL_PLAN_OP_CONCAT},
+                                {.op = WL_PLAN_OP_CONSOLIDATE}};
+    wl_plan_relation_t union_plan = {.ops = union_ops, .op_count = 4};
+    CHECK(!wl_columnar_eval_plan_numeric_composed_abort_supported(&union_plan,
+        0, 4, &supported) && supported);
+    abort_scan_case(&union_plan, 0, 4, 305, WL_EVALUATION_CONTROL_WORK_LIMIT,
+        false, 289);
+    abort_scan_case(&union_plan, 0, 4, 306, 0, true, 306);
     free(deep);
 }
 

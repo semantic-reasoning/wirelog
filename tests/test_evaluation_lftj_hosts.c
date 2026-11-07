@@ -3,6 +3,8 @@
 #define _DEFAULT_SOURCE 1
 #endif
 #include "../wirelog/columnar/internal.h"
+#include "../wirelog/columnar/join_batch.h"
+#include "../wirelog/util/log.h"
 #include "../wirelog/exec_plan_gen.h"
 #include "../wirelog/session.h"
 #include "../wirelog/session_options.h"
@@ -1303,6 +1305,183 @@ configure_native(const char *name, const char *value)
 #endif
 }
 
+typedef struct { unsigned count, mask; } policy_capture_t;
+static bool policy_batch, policy_strict;
+static unsigned policy_depth_mask, policy_names_mask;
+
+static void
+policy_delta(const char *name, const int64_t *row, uint32_t width, int diff,
+    void *data)
+{
+    if (strcmp(name, "output")) return;
+    policy_capture_t *capture = data;
+    CHECK(width == 1 && diff == 1 && row[0] >= 1 && row[0] <= 4);
+    ++capture->count; capture->mask |= 1u << (unsigned)(row[0] - 1);
+}
+
+static void
+policy_tuple(const char *name, const int64_t *row, uint32_t width, void *data)
+{
+    policy_delta(name, row, width, 1, data);
+}
+
+static void
+policy_metadata_depth(wl_columnar_eval_plan_numeric_attempt_t *record)
+{
+    const wl_columnar_lftj_metadata_proof_t *proof = &record->lftj_metadata;
+    if (proof->phase != WL_COLUMNAR_LFTJ_METADATA_HEADER
+        && proof->phase != WL_COLUMNAR_LFTJ_METADATA_NAMES) return;
+    CHECK(record->runtime_depth <= 1 && proof->op_index == record->cursor);
+    unsigned bit = 1u << record->runtime_depth;
+    if (proof->phase == WL_COLUMNAR_LFTJ_METADATA_HEADER) {
+        policy_depth_mask |= bit;
+        if (record->runtime_depth) {
+            eval_stack_t *stack =
+                wl_columnar_eval_stack_cleanup_stack(record->frame);
+            CHECK(record->lftj.phase == WL_COLUMNAR_LFTJ_ATTEMPT_DONE
+                && stack->top == 1 && stack->items[0].rel->nrows == 2
+                && stack->items[0].rel->ncols == 1
+                && stack->items[0].rel->columns[0][0] == 1
+                && stack->items[0].rel->columns[0][1] == 2);
+        }
+    } else {
+        policy_names_mask |= bit;
+        CHECK(!policy_batch || !policy_strict);
+        CHECK(record->session->join_batch_fallback_count ==
+            (policy_batch ? record->runtime_depth + 1 : 0));
+    }
+}
+
+static void
+test_two_lftj_policy(void)
+{
+    const char *text = ".decl a(x:int64)\n.decl b(x:int64)\n"
+        ".decl c(x:int64)\n.decl d(x:int64)\n.decl e(x:int64)\n"
+        ".decl output(x:int64)\n"
+        "output(x):-a(x),b(x),c(x).\noutput(x):-a(x),d(x),e(x).\n";
+    const char *env_names[] = {"WIRELOG_JOIN_BATCH_BYTES",
+                               "WIRELOG_JOIN_BATCH_STRICT"};
+    char *saved[2] = {NULL, NULL};
+    for (unsigned i = 0; i < 2; ++i) {
+        const char *value = getenv(env_names[i]);
+        if (value) {
+            saved[i] = malloc(strlen(value) + 1); CHECK(saved[i]);
+            memcpy(saved[i], value, strlen(value) + 1);
+        }
+    }
+    for (unsigned batch = 0; batch < 2; ++batch)
+        for (unsigned strict = 0; strict < 2; ++strict)
+            for (unsigned observed = 0; observed < 2; ++observed)
+                for (unsigned snapshot = 0; snapshot < 2; ++snapshot) {
+                    configure_native(env_names[0], batch ? "64" : "0");
+                    configure_native(env_names[1], strict ? "1" : "0");
+                    wirelog_error_t error;
+                    wirelog_program_t *program = wirelog_parse_string(text,
+                            &error);
+                    wl_plan_t *plan = NULL;
+                    CHECK(program && !wl_plan_from_program(program, &plan));
+                    unsigned lftj = 0, concat = 0;
+                    for (uint32_t st = 0; st < plan->stratum_count; ++st)
+                        for (uint32_t r =
+                            0; r < plan->strata[st].relation_count;
+                            ++r)
+                            for (uint32_t op = 0;
+                                op < plan->strata[st].relations[r].op_count;
+                                ++op){
+                                wl_plan_op_type_t kind =
+                                    plan->strata[st].relations[r].ops[op].op;
+                                lftj += kind == WL_PLAN_OP_LFTJ;
+                                concat += kind == WL_PLAN_OP_CONCAT;
+                            }
+                    CHECK(lftj == 2 && concat == 1);
+                    wl_evaluation_control_t *control = NULL;
+                    CHECK(!wl_evaluation_control_create(0, &control));
+                    wl_session_options_t options;
+                    wl_session_options_init(&options);
+                    options.evaluation_control = control;
+                    wl_session_t *session = NULL, *raw = NULL;
+                    CHECK(!wl_session_create_with_options(wl_backend_columnar(),
+                        plan, 1,
+                        &options, &session)
+                        && !wl_session_create(wl_backend_columnar(), plan, 1,
+                        &raw));
+                    /* Ordinary JOIN cap is not an LFTJ output cap. */
+                    ((wl_col_session_t *)session)->join_output_limit = 1;
+                    ((wl_col_session_t *)raw)->join_output_limit = 1;
+                    policy_capture_t events = {0}, tuples = {0};
+                    if (observed) wl_session_set_delta_cb(session, policy_delta,
+                            &events);
+                    const char *names[] = {"a", "b", "c", "d", "e"};
+                    const int64_t values[][4] = {{1, 2, 3, 4}, {1, 2}, {2, 1},
+                                                 {3, 4}, {4, 3}};
+                    for (unsigned i = 0; i < 5; ++i) {
+                        CHECK(!wl_session_insert(session, names[i], values[i],
+                            i ? 2 : 4, 1)
+                            && !wl_session_insert(raw, names[i], values[i],
+                            i ? 2 : 4, 1));
+                    }
+                    wl_log_thresholds[WL_LOG_SEC_JOIN] = WL_LOG_WARN;
+                    policy_batch = batch; policy_strict = strict;
+                    policy_depth_mask = policy_names_mask = 0;
+                    wl_columnar_eval_plan_test_lftj_metadata_checkpoint =
+                        policy_metadata_depth;
+                    int rc = snapshot ? wl_session_snapshot(session,
+                            policy_tuple, &tuples)
+                        : finish_step(session);
+                    wl_columnar_eval_plan_test_lftj_metadata_checkpoint = NULL;
+                    bool refused = batch && strict;
+                    if (rc != (refused ? ENOTSUP : 0)) fprintf(stderr,
+                            "policy batch=%u strict=%u observed=%u snapshot=%u rc=%d depth=%u names=%u\n",
+                            batch, strict, observed, snapshot, rc,
+                            policy_depth_mask, policy_names_mask);
+                    CHECK(rc == (refused ? ENOTSUP : 0));
+                    CHECK(finish_step(raw) == rc);
+                    CHECK(policy_depth_mask == (refused ? 1u : 3u)
+                        && policy_names_mask == (refused ? 0u : 3u));
+                    wl_col_session_t *actual = (wl_col_session_t *)session;
+                    wl_col_session_t *reference = (wl_col_session_t *)raw;
+                    CHECK(actual->join_batch_fallback_count == (batch &&
+                        !strict ? 2u : 0u)
+                        && reference->join_batch_fallback_count ==
+                        actual->join_batch_fallback_count);
+                    if (batch &&
+                        !strict) CHECK(actual->join_batch_last_reason ==
+                            COL_JOIN_BATCH_EXCLUDED_LFTJ);
+                    if (refused) CHECK(!events.count && !tuples.count);
+                    else {
+                        col_rel_t *out = session_find_rel(actual, "output");
+                        col_rel_t *expected = session_find_rel(reference,
+                                "output");
+                        CHECK(out && expected && out->nrows == 4 &&
+                            expected->nrows == 4
+                            && out->ncols == 1 && expected->ncols == 1);
+                        for (unsigned row = 0; row < 4; ++row)
+                            CHECK(out->columns[0][row] == (int64_t)row + 1
+                                && expected->columns[0][row] ==
+                                out->columns[0][row]);
+                        CHECK(!strcmp(out->col_names[0], expected->col_names[0])
+                            && out->schema.n_children ==
+                            expected->schema.n_children);
+                        if (observed) CHECK(events.count == 4 &&
+                                events.mask == 15);
+                        if (snapshot) CHECK(tuples.count == 4 &&
+                                tuples.mask == 15);
+                        unsigned count = actual->join_batch_fallback_count;
+                        CHECK(!finish_step(session) &&
+                            actual->join_batch_fallback_count == count);
+                    }
+                    CHECK(!actual->sarr_count && !actual->cleanup_active &&
+                        !actual->cleanup_pending);
+                    CHECK(!wl_session_try_destroy(&session) &&
+                        !wl_session_try_destroy(&raw));
+                    wl_evaluation_control_release(control); wl_plan_free(plan);
+                    wirelog_program_free(program);
+                }
+    for (unsigned i = 0; i < 2; ++i) {
+        configure_native(env_names[i], saved[i]); free(saved[i]);
+    }
+}
+
 static void
 native_fixture_init(fixture_t *f, bool observed, bool batch)
 {
@@ -1742,6 +1921,7 @@ test_native_cleanup(void)
 }
 
 static wl_columnar_lftj_metadata_phase_t native_metadata_target;
+static uint32_t native_metadata_depth;
 
 static void
 end_metadata_between_activations(const wl_col_session_t *session,
@@ -1760,10 +1940,24 @@ end_metadata_between_activations(const wl_col_session_t *session,
     const wl_columnar_eval_plan_numeric_attempt_t *n = &ctx->child;
     if ((n->phase != WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_PREFLIGHT_LFTJ
         && n->phase != WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_LFTJ_BEGIN)
-        || n->lftj.identity || n->lftj_metadata.phase != native_metadata_target
+        || n->runtime_depth != native_metadata_depth
+        || (!native_metadata_depth && n->lftj.identity)
+        || n->lftj_metadata.phase != native_metadata_target
         || (native_metadata_target == WL_COLUMNAR_LFTJ_METADATA_NAMES
         && n->lftj_metadata.name_index != 1)) return;
     CHECK(!n->composed_busy);
+    if (native_metadata_depth) {
+        eval_stack_t *stack = wl_columnar_eval_stack_cleanup_stack(n->frame);
+        CHECK(native_metadata_depth == 1 && stack->top == 1
+            && stack->items[0].owned && stack->items[0].rel->nrows == 2
+            && stack->items[0].rel->ncols == 1
+            && stack->items[0].rel->columns[0][0] == 1
+            && stack->items[0].rel->columns[0][1] == 2
+            && (n->lftj_metadata.phase == WL_COLUMNAR_LFTJ_METADATA_INSTALL
+                ? !n->lftj.identity
+                : n->lftj.identity == &n->lftj
+            && n->lftj.phase == WL_COLUMNAR_LFTJ_ATTEMPT_DONE));
+    }
     wl_evaluation_control_t *control = test->fixture->control;
     uint64_t id = wl_evaluation_control_active_attempt_id(control);
     wl_evaluation_control_attempt_finish_result_t ended =
@@ -2008,6 +2202,398 @@ test_metadata_native_cleanup(void)
                 }
 }
 
+static void
+test_lftj_policy_error_order(void)
+{
+    for (unsigned batch = 0; batch < 2; ++batch)
+        for (unsigned strict = 0; strict < 2; ++strict)
+            for (unsigned observed = 0; observed < 2; ++observed)
+                for (unsigned snapshot = 0; snapshot < 2; ++snapshot)
+                    for (unsigned mode = 0; mode < 10; ++mode) {
+                        fixture_t f;
+                        native_fixture_init(&f, observed, batch);
+                        wl_log_thresholds[WL_LOG_SEC_JOIN] = WL_LOG_WARN;
+                        wl_col_session_t *session =
+                            (wl_col_session_t *)f.session;
+                        wl_col_session_t *raw = (wl_col_session_t *)f.raw;
+                        session->join_batch_strict = raw->join_batch_strict =
+                            strict;
+                        session->join_output_limit = raw->join_output_limit = 1;
+                        wl_plan_op_t *op =
+                            &f.plan->strata[0].relations[0].ops[0];
+                        CHECK(op->op == WL_PLAN_OP_LFTJ);
+                        wl_plan_op_lftj_t *metadata = op->opaque_data;
+                        wl_plan_op_lftj_t saved = *metadata;
+                        char *last_name = metadata->rel_names[2];
+                        uint32_t last_key = metadata->key_cols[2];
+                        uint32_t first_key = metadata->key_cols[0];
+                        char *names[65]; uint32_t keys[65];
+                        for (unsigned i = 0; i < 65; ++i) {
+                            names[i] = saved.rel_names[i < 3 ? i : 0];
+                            keys[i] = saved.key_cols[i < 3 ? i : 0];
+                        }
+                        if (!mode) op->opaque_data = NULL;
+                        else if (mode == 1) metadata->k = 1;
+                        else if (mode == 2) metadata->rel_names = NULL;
+                        else if (mode == 3) metadata->key_cols = NULL;
+                        else if (mode == 4) metadata->rel_names[2] = NULL;
+                        else if (mode == 5) metadata->rel_names[2] = "missing";
+                        else if (mode == 6) metadata->key_cols[2] = UINT32_MAX;
+                        else if (mode == 7) {
+                            metadata->k = 65; metadata->rel_names = names;
+                            metadata->key_cols = keys;
+                        }
+                        if (mode == 9) {
+                            metadata->rel_names[2] = NULL;
+                            metadata->key_cols[0] = UINT32_MAX;
+                        }
+                        /* The reusable helper must remain policy-pure. */
+                        (void)wl_columnar_lftj_metadata_header(op, session);
+                        CHECK(!session->join_batch_fallback_count
+                            && !session->join_batch_warned_reasons);
+                        source_image_t before[3];
+                        for (unsigned i = 0; i < 3;
+                            ++i) before[i] = image(f.session, i);
+                        bool minimal = mode >= 4;
+                        int expected = minimal && batch && strict ? ENOTSUP
+                            : mode == 8 ? 0 : mode == 4 ||
+                            mode == 5 ? ENOENT : EINVAL;
+                        capture_t captured = {0};
+                        int rc = drive(&f, snapshot, &captured);
+                        int raw_rc = finish_step(f.raw);
+                        if (rc != expected || raw_rc != expected)
+                            fprintf(stderr,
+                                "policy order mode=%u batch=%u strict=%u observed=%u snapshot=%u rc=%d raw=%d expected=%d\n",
+                                mode, batch, strict, observed, snapshot, rc,
+                                raw_rc, expected);
+                        CHECK(rc == expected && raw_rc == expected);
+                        unsigned count = minimal && batch && !strict ? 1 : 0;
+                        CHECK(session->join_batch_fallback_count == count
+                            && raw->join_batch_fallback_count == count);
+                        if (count) CHECK(session->join_batch_last_reason ==
+                                COL_JOIN_BATCH_EXCLUDED_LFTJ
+                                && raw->join_batch_last_reason ==
+                                COL_JOIN_BATCH_EXCLUDED_LFTJ);
+                        if (expected) CHECK(!captured.count && !f.events.count);
+                        else {
+                            capture_t literal = oracle(&f),
+                                actual = head_capture(f.session);
+                            CHECK(literal.count == 10);
+                            equal(&actual, &literal);
+                            if (observed) equal(&f.events, &literal);
+                            if (snapshot) equal(&captured, &literal);
+                            head_schema_equal(&f);
+                        }
+                        for (unsigned i = 0; i < 3;
+                            ++i) unchanged(f.session, i, &before[i],
+                                expected != 0);
+                        /* Restore owned metadata before its real destructor. */
+                        op->opaque_data = metadata; *metadata = saved;
+                        metadata->rel_names[2] = last_name;
+                        metadata->key_cols[2] = last_key;
+                        metadata->key_cols[0] = first_key;
+                        if (expected) {
+                            session->join_batch_strict =
+                                raw->join_batch_strict = false;
+                            CHECK(!wl_evaluation_control_reset(f.control));
+                            CHECK(!drive(&f, snapshot,
+                                &captured) && !finish_step(f.raw));
+                            capture_t literal = oracle(&f),
+                                actual = head_capture(f.session);
+                            CHECK(literal.count == 10);
+                            equal(&actual, &literal);
+                            if (observed) equal(&f.events, &literal);
+                            if (snapshot) equal(&captured, &literal);
+                            CHECK(session->join_batch_fallback_count ==
+                                count + batch
+                                && raw->join_batch_fallback_count ==
+                                count + batch);
+                        }
+                        fixture_destroy(&f);
+                    }
+}
+
+static void
+test_second_lftj_metadata_cleanup(void)
+{
+    const char *text = ".decl a(x:int64)\n.decl b(x:int64)\n"
+        ".decl c(x:int64)\n.decl d(x:int64)\n.decl e(x:int64)\n"
+        ".decl output(x:int64)\n"
+        "output(x):-a(x),b(x),c(x).\noutput(x):-a(x),d(x),e(x).\n";
+    const wl_columnar_lftj_metadata_phase_t phases[] = {
+        WL_COLUMNAR_LFTJ_METADATA_HEADER, WL_COLUMNAR_LFTJ_METADATA_NAMES,
+        WL_COLUMNAR_LFTJ_METADATA_VALIDATED,
+        WL_COLUMNAR_LFTJ_METADATA_BIND_HEADER,
+        WL_COLUMNAR_LFTJ_METADATA_BIND_DYNAMIC,
+        WL_COLUMNAR_LFTJ_METADATA_BIND_FINAL,
+        WL_COLUMNAR_LFTJ_METADATA_PREFIX, WL_COLUMNAR_LFTJ_METADATA_INSTALL
+    };
+    for (unsigned batch = 0; batch < 2; ++batch)
+        for (unsigned observed = 0; observed < 2; ++observed)
+            for (unsigned snapshot = 0; snapshot < 2; ++snapshot)
+                for (unsigned phase = 0;
+                    phase < sizeof(phases)/sizeof(phases[0]); ++phase){
+                    if (!observed &&
+                        phases[phase] ==
+                        WL_COLUMNAR_LFTJ_METADATA_BIND_DYNAMIC) continue;
+                    fixture_t f = {0}; wirelog_error_t error;
+                    f.program = wirelog_parse_string(text, &error);
+                    CHECK(f.program && !wl_plan_from_program(f.program,
+                        &f.plan));
+                    CHECK(!wl_evaluation_control_create(0, &f.control));
+                    wl_columnar_memory_resolution_t resolution = {
+                        .budget_bytes = UINT64_C(512)<<20,
+                            .usable_bytes = UINT64_C(512)<<20,
+                            .mode = WL_COLUMNAR_MEMORY_MODE_ENFORCING
+                    };
+                    f.governor =
+                        wl_columnar_memory_governor_ref_create(&resolution);
+                    CHECK(f.governor);
+                    wl_session_options_t options;
+                    wl_session_options_init(&options);
+                    options.evaluation_control = f.control;
+                    options.memory_governor = f.governor;
+                    CHECK(!wl_session_create_with_options(wl_backend_columnar(),
+                        f.plan, 1,
+                        &options, &f.session)
+                        && !wl_session_create(wl_backend_columnar(), f.plan, 1,
+                        &f.raw));
+                    ((wl_col_session_t *)f.session)->join_batch_bytes =
+                        batch ? 64 : 0;
+                    ((wl_col_session_t *)f.raw)->join_batch_bytes =
+                        batch ? 64 : 0;
+                    ((wl_col_session_t *)f.session)->join_batch_strict = false;
+                    ((wl_col_session_t *)f.raw)->join_batch_strict = false;
+                    wl_log_thresholds[WL_LOG_SEC_JOIN] = WL_LOG_WARN;
+                    policy_capture_t events = {0}, captured = {0};
+                    if (observed) wl_session_set_delta_cb(f.session,
+                            policy_delta, &events);
+                    const char *names[] = {"a", "b", "c", "d", "e"};
+                    const int64_t values[][4] = {{1, 2, 3, 4}, {1, 2}, {2, 1},
+                                                 {3, 4}, {4, 3}};
+                    for (unsigned i = 0; i < 5; ++i) {
+                        CHECK(!wl_session_insert(f.session, names[i], values[i],
+                            i ? 2 : 4, 1)
+                            && !wl_session_insert(f.raw, names[i], values[i],
+                            i ? 2 : 4, 1));
+                    }
+                    source_image_t before[5];
+                    for (unsigned i = 0; i < 5;
+                        ++i) before[i] = image(f.session, i);
+                    wl_columnar_memory_governor_t *g =
+                        wl_columnar_memory_governor_ref_get(f.governor);
+                    uint64_t baseline = wl_columnar_memory_reserved(g);
+                    wl_columnar_memory_reservation_t peer;
+                    wl_columnar_memory_reservation_init(&peer);
+                    CHECK(wl_columnar_memory_reserve_checked(g, 4096, &peer)
+                        == WL_COLUMNAR_MEMORY_ADMISSION_OK);
+                    native_source_test_t test = {.fixture = &f,
+                                                 .refuse_funding = true,
+                                                 .successor = phases[phase] ==
+                                                     WL_COLUMNAR_LFTJ_METADATA_NAMES};
+                    native_source = &test;
+                    native_metadata_target = phases[phase];
+                    native_metadata_depth = 1;
+                    wl_columnar_session_test_framed_grant_finished =
+                        end_metadata_between_activations;
+                    wl_columnar_session_test_framed_grant_limit =
+                        refuse_native_funding;
+                    int rc = EAGAIN;
+                    if (snapshot) rc = wl_session_snapshot(f.session,
+                                policy_tuple, &captured);
+                    else for (unsigned turn = 0; turn < 2048 && rc == EAGAIN;
+                            ++turn)
+                            rc = wl_session_step(f.session);
+                    wl_columnar_session_test_framed_grant_finished = NULL;
+                    wl_columnar_session_test_framed_grant_limit = NULL;
+                    CHECK(test.ended && test.funding_refusals == 1 &&
+                        rc == EINVAL
+                        && !events.count && !captured.count
+                        && !session_find_rel((wl_col_session_t *)f.session,
+                        "output")
+                        && wl_columnar_memory_reserved(g) == baseline + 4096
+                        && peer.governor == g && peer.bytes == 4096);
+                    unsigned recorded = batch ? phases[phase] ==
+                        WL_COLUMNAR_LFTJ_METADATA_HEADER ? 1 : 2 : 0;
+                    CHECK(
+                        ((wl_col_session_t *)f.session)->
+                        join_batch_fallback_count == recorded);
+                    for (unsigned i = 0; i < 5;
+                        ++i) unchanged(f.session, i, &before[i], true);
+                    wl_evaluation_control_report_t report;
+                    CHECK(!wl_evaluation_control_report(f.control, &report)
+                        && report.attempt_id == test.frozen.attempt_id
+                        && report.limit == test.frozen.limit
+                        && report.consumed == test.frozen.consumed
+                        && report.result == test.frozen.result
+                        && report.stop_reason == test.frozen.stop_reason
+                        && report.execution_status ==
+                        test.frozen.execution_status
+                        && report.cleanup_status == test.frozen.cleanup_status);
+                    if (test.successor_id) {
+                        uint64_t used = UINT64_MAX;
+                        CHECK(wl_evaluation_control_active_attempt_id(
+                                f.control) == test.successor_id
+                            && !wl_evaluation_control_test_active_consumed(
+                                f.control, test.successor_id, &used)
+                            && !used);
+                        wl_session_t *slot = f.session;
+                        CHECK(wl_session_try_destroy(&slot) == EBUSY &&
+                            slot == f.session);
+                        wl_evaluation_control_attempt_finish_result_t ended =
+                            wl_evaluation_control_finish_attempt(
+                            f.control, f.session->operation_admission,
+                            test.successor_id, 0, 0);
+                        CHECK(!ended.protocol && ended.report_valid &&
+                            !ended.report.consumed);
+                    }
+                    CHECK(!wl_evaluation_control_reset(f.control));
+                    native_source = NULL; native_metadata_depth = 0;
+                    CHECK(!(snapshot ? wl_session_snapshot(f.session,
+                        policy_tuple, &captured)
+                        : finish_step(f.session)) && !finish_step(f.raw));
+                    col_rel_t *out =
+                        session_find_rel((wl_col_session_t *)f.session,
+                            "output");
+                    col_rel_t *raw = session_find_rel((wl_col_session_t *)f.raw,
+                            "output");
+                    CHECK(out && raw && out->ncols == 1 && raw->ncols == 1
+                        && out->nrows == 4 && raw->nrows == 4);
+                    for (unsigned row = 0; row < 4; ++row)
+                        CHECK(out->columns[0][row] == (int64_t)row + 1
+                            && raw->columns[0][row] == out->columns[0][row]);
+                    if (observed) CHECK(events.count == 4 && events.mask == 15);
+                    if (snapshot) CHECK(captured.count == 4 &&
+                            captured.mask == 15);
+                    CHECK(
+                        ((wl_col_session_t *)f.session)->
+                        join_batch_fallback_count == recorded + 2 * batch
+                        && ((wl_col_session_t *)f.raw)->
+                        join_batch_fallback_count == 2 * batch);
+                    CHECK(wl_columnar_memory_rollback(&peer));
+                    fixture_destroy(&f);
+                }
+}
+
+static void
+test_lftj_join_suffix_policy(void)
+{
+    const char *text = ".decl a(x:int64,y:int64)\n.decl b(x:int64)\n"
+        ".decl c(x:int64)\n.decl d(y:int64)\n.decl output(x:int64)\n"
+        "output(x):-a(x,y),b(x),c(x),d(y).\n";
+    for (unsigned batch = 0; batch < 2; ++batch)
+        for (unsigned strict = 0; strict < 2; ++strict)
+            for (unsigned limited = 0; limited < 2; ++limited)
+                for (unsigned observed = 0; observed < 2; ++observed)
+                    for (unsigned snapshot = 0; snapshot < 2; ++snapshot) {
+                        wirelog_error_t error;
+                        wirelog_program_t *program = wirelog_parse_string(text,
+                                &error);
+                        wl_plan_t *plan = NULL;
+                        CHECK(program && !wl_plan_from_program(program, &plan));
+                        unsigned lftj = 0, join = 0;
+                        for (uint32_t st = 0; st < plan->stratum_count; ++st)
+                            for (uint32_t r = 0;
+                                r < plan->strata[st].relation_count; ++r)
+                                for (uint32_t op = 0;
+                                    op < plan->strata[st].relations[r].op_count;
+                                    ++op){
+                                    lftj +=
+                                        plan->strata[st].relations[r].ops[op].op
+                                        == WL_PLAN_OP_LFTJ;
+                                    join +=
+                                        plan->strata[st].relations[r].ops[op].op
+                                        == WL_PLAN_OP_JOIN;
+                                }
+                        CHECK(lftj == 1 && join == 1);
+                        wl_evaluation_control_t *control = NULL;
+                        CHECK(!wl_evaluation_control_create(0, &control));
+                        wl_session_options_t options;
+                        wl_session_options_init(&options);
+                        options.evaluation_control = control;
+                        wl_session_t *session = NULL, *reference = NULL;
+                        CHECK(!wl_session_create_with_options(
+                                wl_backend_columnar(), plan, 1,
+                                &options, &session)
+                            && !wl_session_create(wl_backend_columnar(), plan,
+                            1, &reference));
+                        wl_col_session_t *actual = (wl_col_session_t *)session;
+                        wl_col_session_t *raw = (wl_col_session_t *)reference;
+                        actual->join_batch_bytes = raw->join_batch_bytes =
+                            batch ? 64 : 0;
+                        actual->join_batch_strict = raw->join_batch_strict =
+                            strict;
+                        actual->join_output_limit = raw->join_output_limit =
+                            limited ? 1 : 0;
+                        wl_log_thresholds[WL_LOG_SEC_JOIN] = WL_LOG_WARN;
+                        policy_capture_t events = {0}, captured = {0};
+                        if (observed) wl_session_set_delta_cb(session,
+                                policy_delta, &events);
+                        const int64_t a[] = {1, 10, 2, 20}, keys[] = {1, 2},
+                            d[] = {10, 20};
+                        wl_session_t *sessions[] = {session, reference};
+                        for (unsigned i = 0; i < 2; ++i) {
+                            CHECK(!wl_session_insert(sessions[i], "a", a, 2, 2)
+                                && !wl_session_insert(sessions[i], "b", keys, 2,
+                                1)
+                                && !wl_session_insert(sessions[i], "c", keys, 2,
+                                1)
+                                && !wl_session_insert(sessions[i], "d", d, 2,
+                                1));
+                        }
+                        int expected = batch &&
+                            strict ? ENOTSUP : limited ? EOVERFLOW : 0;
+                        int rc = snapshot ? wl_session_snapshot(session,
+                                policy_tuple, &captured)
+                            : finish_step(session);
+                        int raw_rc = finish_step(reference);
+                        if (rc != expected || raw_rc != expected)
+                            fprintf(stderr,
+                                "suffix batch=%u strict=%u limited=%u observed=%u snapshot=%u rc=%d raw=%d expected=%d\n",
+                                batch, strict, limited, observed, snapshot, rc,
+                                raw_rc, expected);
+                        CHECK(rc == expected && raw_rc == expected
+                            && actual->join_batch_fallback_count ==
+                            raw->join_batch_fallback_count
+                            && actual->join_batch_last_reason ==
+                            raw->join_batch_last_reason);
+                        if (batch &&
+                            !strict) CHECK(actual->join_batch_fallback_count >=
+                                1);
+                        else CHECK(!actual->join_batch_fallback_count);
+                        if (expected) {
+                            CHECK(!events.count && !captured.count);
+                            actual->join_batch_strict = raw->join_batch_strict =
+                                false;
+                            actual->join_output_limit = raw->join_output_limit =
+                                3;
+                            CHECK(!wl_evaluation_control_reset(control));
+                            CHECK(!(snapshot ? wl_session_snapshot(session,
+                                policy_tuple, &captured)
+                                : finish_step(session)) &&
+                                !finish_step(reference));
+                        }
+                        col_rel_t *out = session_find_rel(actual, "output");
+                        col_rel_t *oracle = session_find_rel(raw, "output");
+                        CHECK(out && oracle && out->nrows == 2 &&
+                            oracle->nrows == 2
+                            && out->ncols == 1 && oracle->ncols == 1);
+                        for (unsigned row = 0; row < 2; ++row)
+                            CHECK(out->columns[0][row] == (int64_t)row + 1
+                                && oracle->columns[0][row] ==
+                                out->columns[0][row]);
+                        if (observed) CHECK(events.count == 2 &&
+                                events.mask == 3);
+                        if (snapshot) CHECK(captured.count == 2 &&
+                                captured.mask == 3);
+                        CHECK(!wl_session_try_destroy(&session) &&
+                            !wl_session_try_destroy(&reference));
+                        wl_evaluation_control_release(control);
+                        wl_plan_free(plan);
+                        wirelog_program_free(program);
+                    }
+}
+
 int
 main(int argc, char **argv)
 {
@@ -2015,10 +2601,11 @@ main(int argc, char **argv)
         && strcmp(argv[1], "recovery") && strcmp(argv[1], "failures")
         && strcmp(argv[1], "native") && strcmp(argv[1], "admission")
         && strcmp(argv[1], "metadata-native") && strcmp(argv[1],
+        "policy") && strcmp(argv[1],
         "microsteps"))) {
         fprintf(stderr,
             "usage: %s [domains|recovery|failures|admission|native|"
-            "metadata-native|microsteps]\n",
+            "metadata-native|policy|microsteps]\n",
             argv[0]);
         return EXIT_FAILURE;
     }
@@ -2056,6 +2643,15 @@ main(int argc, char **argv)
                 test_session_metadata_maximum();
             }
         reset_target = UINT32_MAX;
+    }
+    if (argc == 1 || !strcmp(argv[1], "policy")) {
+        uint8_t threshold = wl_log_thresholds[WL_LOG_SEC_JOIN];
+        wl_log_thresholds[WL_LOG_SEC_JOIN] = WL_LOG_WARN;
+        test_two_lftj_policy();
+        test_lftj_policy_error_order();
+        test_second_lftj_metadata_cleanup();
+        test_lftj_join_suffix_policy();
+        wl_log_thresholds[WL_LOG_SEC_JOIN] = threshold;
     }
     puts("LFTJ session tests passed");
     return 0;

@@ -1179,11 +1179,16 @@ or256. Test-only fixed counter observation has no production tariff or ABI.
 
 ### Bounded LFTJ metadata validation and stopped-parent cleanup
 
-The actual numeric host validates LFTJ metadata before acquiring child resources.
-HEADER, one input-name check per NAMES action, and VALIDATED each pay128.
-All names, including input63 at the maximum k64, are checked before source lookup,
-preserving raw error precedence. After whole-plan preflight, BIND_HEADER,
-one BIND_ENTRY, and BIND_FINAL pay192; each prior-name pair pays128.
+The actual numeric host validates LFTJ metadata at each operator's runtime
+reach before acquiring that child's resources. Whole-plan preflight checks only
+stack shape: LFTJ pushes one result, including when another result already
+exists, and CONCAT consumes two. HEADER, one bounded NAMES position action and
+VALIDATED each pay128. HEADER applies the raw minimum-header then strict or
+nonstrict policy order; the reusable direct preflight remains pure and eager.
+Name values, including NULL, resolve in actual input order so an earlier key or
+size error precedes a later missing name. The runtime NULL result is ENOENT;
+legacy direct preflight retains EINVAL. BIND_HEADER, one BIND_ENTRY and
+BIND_FINAL pay192; each prior-name pair pays128.
 The dynamic session binding path uses its actual registered generation and a
 separate192 validation. These actions preserve the existing outer host proof
 and its separate384 charge; that charge does not subsidize metadata work.
@@ -1207,7 +1212,7 @@ frame release before dropping the parent's final original-control reference.
 Neither action revives the original attempt or relaxes normal private-binding
 validation. Active successors or replaced completed reports refuse cleanup.
 
-The numeric suite exercises all64 names, null tails and source-error priority,
+The numeric suite exercises all64 positions, deferred null tails and source-error priority,
 all four static bindings/six pairs, exact/one-short action grants,11 genuine
 metadata stop phases under CANCEL and WORK, real copied/native/reentrant
 refusal, sole-reference ACK, occupied frame and hook-injected payload refusal.
@@ -1219,9 +1224,15 @@ real observed dynamic binding registry larger than the static four-entry limit.
 The k64 fixture deliberately edits owned plan metadata before session binding;
 it is not evidence that the compiler naturally emits a64-input operator.
 
-This closes the metadata caller-scan gap only. Prepared unary publication,
-registered cache ownership/insertion, strict/cap/shared policy and complete
-observed/configured successor qualification remain separate bundle obligations.
+The first empty READY can now stop before metadata capture. Its dedicated
+completed-CANCEL/WORK cleanup accepts only canonical READY, current LFTJ,
+zero meaningful proof fields, no completed operator and an actually empty frame.
+It checks distinct saved funding before that proof; it does not widen nonempty,
+historic-child or successor authority. Registered native cleanup separately owns
+second-LFTJ admission with prior stack output and a genuine active successor.
+Current policy, source packets and real host evidence are recorded in
+[the #2298 source map](../2298/LFTJ_SOURCE_ACCOUNTING.md). Full coverage closure
+and unrelated cache/materialized/worker units remain tracked separately.
 
 
 ### Copied framed authentication and status foundation
