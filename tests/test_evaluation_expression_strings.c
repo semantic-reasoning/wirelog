@@ -2824,7 +2824,272 @@ static void selector_extra_resources(void) {
     wl_columnar_memory_governor_ref_release(g2);
 }
 
+static uint32_t replace_bytes(uint8_t *bytes, const int64_t args[3]) {
+    uint32_t n = 0;
+    for (unsigned i = 0; i < 3; ++i) {
+        bytes[n++] = WL_PLAN_EXPR_CONST_INT;
+        memcpy(bytes+n, &args[i], 8); n += 8;
+    }
+    bytes[n++] = WL_PLAN_EXPR_STR_FN_STR_REPLACE;
+    return n;
+}
+static void replace_sizes(void) {
+    for (unsigned below = 0; below < 2; ++below) {
+        wl_evaluation_control_t *c = begin(448-below);
+        size_t size = 999;
+        int rc = wl_columnar_expr_replace_size_attempt_controlled(3, 2, 1, 1,
+                &size, c, wl_evaluation_control_active_attempt_id(c));
+        CHECK(rc == (below?WL_EVALUATION_CONTROL_WORK_LIMIT:0));
+        CHECK(size == (below?999:2)); finish(c, rc);
+    }
+    struct {size_t src, old, replacement, count; int rc; size_t expected;
+    } v[] = {
+        {4, 2, 0, 2, 0, 0}, {0, 1, SIZE_MAX, 0, 0, 0},
+        {1, 1, SIZE_MAX, 1, EOVERFLOW, 999},
+        {SIZE_MAX-1, 1, 2, 1, EOVERFLOW, 999}, {3, 2, 1, 2, EINVAL, 999}
+    };
+    for (unsigned i = 0; i < sizeof(v)/sizeof(*v); ++i) {
+        wl_evaluation_control_t *c = begin(0); size_t size = 999;
+        int rc = wl_columnar_expr_replace_size_attempt_controlled(v[i].src,
+                v[i].old, v[i].replacement, v[i].count, &size, c,
+                wl_evaluation_control_active_attempt_id(c));
+        CHECK(rc == v[i].rc && size == v[i].expected); finish(c, rc);
+    }
+}
+static void replace_parity(void) {
+    const char *v[][4] = {
+        {"", "", "x", ""}, {"", "a", "x", ""},
+        {"abc", "", "x", "abc"}, {"abc", "d", "x", "abc"},
+        {"aaa", "aa", "x", "xa"}, {"aaaa", "aa", "", ""},
+        {"aaaaab", "aaab", "x", "aax"},
+        {"ababa", "a", "long", "longblongblong"},
+        {"aaaa", "aa", "aa", "aaaa"}, {"a", "a", "a", "a"},
+        {"\x80\xff\x80", "\x80", "\xc2", "\xc2\xff\xc2"}
+    };
+    wl_intern_t *intern = wl_intern_create(); CHECK(intern);
+    for (unsigned i = 0; i < sizeof(v)/sizeof(*v)+4; ++i) {
+        int64_t args[3];
+        for (unsigned j = 0; j < 3; ++j)
+            args[j] = wl_intern_put(intern, v[i < sizeof(v)/sizeof(*v)?i:0][j]);
+        if (i >= sizeof(v)/sizeof(*v) && i < sizeof(v)/sizeof(*v)+3)
+            args[i-sizeof(v)/sizeof(*v)] = -1;
+        uint8_t bytes[32]; uint32_t n = replace_bytes(bytes, args);
+        wl_evaluation_control_t *c = begin(0); bool supported = false;
+        wl_columnar_expr_attempt_scalar_t *program = NULL;
+        CHECK(!wl_columnar_expr_compile_scalar_attempt_controlled(bytes, n,
+            NULL, &program, &supported, c,
+            wl_evaluation_control_active_attempt_id(c)) && supported);
+        for (unsigned null = 0; null < 2; ++null) {
+            wl_columnar_expr_context_t context = {.intern = null?NULL:intern};
+            int64_t raw = 999, value = 999; bool failed = true;
+            wl_columnar_expr_status_t a, b;
+            CHECK(!wl_columnar_expr_eval_run_ctx(bytes, n, NULL, 0, &raw,
+                &context, &a));
+            CHECK(!wl_columnar_expr_eval_scalar_attempt_controlled(program,
+                NULL, 0, &context, &value, &failed, &b, c,
+                wl_evaluation_control_active_attempt_id(c)) && !failed &&
+                value == raw && a == b);
+            if (!null && i < sizeof(v)/sizeof(*v))
+                CHECK(!strcmp(wl_intern_reverse(intern, value), v[i][3]));
+        }
+        wl_columnar_expr_attempt_scalar_free(program); finish(c, 0);
+    }
+    wl_intern_free(intern);
+}
+static unsigned replace_pass, replace_target;
+static bool replace_rebind;
+static void replace_stop(wl_evaluation_control_t *c, unsigned phase,
+    uint64_t progress, bool failed) {
+    (void)failed;
+    if (phase == 172 || phase == 175) replace_pass = phase;
+    if (c && phase == 47 && progress >= 2 && replace_pass == replace_target) {
+        if (replace_rebind) utf8_rebind(c, utf8_rebind_phase, 0, false);
+        else wl_evaluation_control_request_cancel(c);
+    }
+}
+static void replace_resources(void) {
+    for (unsigned pass = 0; pass < 4; ++pass)
+        for (unsigned rebind = 0; rebind < 2; ++rebind) {
+            wl_intern_t *intern = wl_intern_create(); CHECK(intern);
+            int64_t args[] = {wl_intern_put(intern, "aaaaab"),
+                              wl_intern_put(intern, "aaab"),
+                              wl_intern_put(intern, "x")};
+            uint8_t bytes[32]; uint32_t n = replace_bytes(bytes, args);
+            wl_columnar_memory_governor_ref_t *g = builder_governor();
+            wl_evaluation_control_t *c = begin(0); bool supported = false;
+            wl_columnar_expr_attempt_scalar_t *program = NULL;
+            uint64_t id = wl_evaluation_control_active_attempt_id(c);
+            CHECK(!wl_columnar_expr_compile_scalar_attempt_controlled(bytes,
+                n, g, &program, &supported, c, id) && supported);
+            uint64_t reserved = wl_columnar_memory_reserved(
+                wl_columnar_memory_governor_ref_get(g));
+            replace_pass = 0; replace_target = pass?175:172;
+            replace_rebind = rebind != 0; rebound = false;
+            utf8_rebind_phase = pass < 2?47:pass == 2?44:137;
+            stop_phase = utf8_rebind_phase; stop_progress = 0;
+            wl_columnar_expr_test_checkpoint = pass <
+                2?replace_stop:rebind?utf8_rebind:witness;
+            int64_t value = 999; bool failed = true;
+            wl_columnar_expr_status_t status = WL_COLUMNAR_EXPR_INVALID_RESULT;
+            wl_columnar_expr_context_t context = {.intern = intern};
+            int rc = wl_columnar_expr_eval_scalar_attempt_controlled(program,
+                    NULL, 0, &context, &value, &failed, &status, c, id);
+            wl_columnar_expr_test_checkpoint = NULL; stop_phase = 0;
+            CHECK(rc == (rebind?EINVAL:WL_EVALUATION_CONTROL_CANCELLED));
+            CHECK(value == 999 && failed &&
+                status == WL_COLUMNAR_EXPR_INVALID_RESULT);
+            CHECK(wl_intern_count(intern) == (pass == 3?4:3) && reserved ==
+                wl_columnar_memory_reserved(wl_columnar_memory_governor_ref_get(
+                    g)));
+            if (rebind) {
+                uint64_t consumed = 999;
+                CHECK(rebound && !wl_evaluation_control_test_active_consumed(c,
+                    wl_evaluation_control_active_attempt_id(c),
+                    &consumed) && !consumed);
+            } else {
+                CHECK(wl_evaluation_control_finish(c, &direct_owner, 0,
+                    0) == rc);
+                CHECK(!wl_evaluation_control_reset(c));
+                CHECK(!wl_evaluation_control_begin(c, &direct_owner));
+            }
+            CHECK(!wl_columnar_expr_eval_scalar_attempt_controlled(program,
+                NULL, 0, &context, &value, &failed, &status, c,
+                wl_evaluation_control_active_attempt_id(c)) && !failed &&
+                !strcmp(wl_intern_reverse(intern, value), "aax"));
+            wl_columnar_expr_attempt_scalar_free(program); finish(c, 0);
+            CHECK(!wl_columnar_memory_reserved(
+                    wl_columnar_memory_governor_ref_get(g)));
+            wl_columnar_memory_governor_ref_release(g); wl_intern_free(intern);
+        }
+    /* The two shortcuts allocate neither scratch nor a speculative intern copy. */
+    for (unsigned matched = 0; matched < 3; ++matched) {
+        wl_intern_t *intern = wl_intern_create(); CHECK(intern);
+        int64_t args[] = {wl_intern_put(intern, "aaa"),
+                          wl_intern_put(intern,
+                              matched == 0?"":matched == 1?"z":"a"),
+                          wl_intern_put(intern, "a")};
+        uint8_t bytes[32]; uint32_t n = replace_bytes(bytes, args);
+        wl_evaluation_control_t *c = begin(0); bool supported = false;
+        wl_columnar_expr_attempt_scalar_t *program = NULL;
+        CHECK(!wl_columnar_expr_compile_scalar_attempt_controlled(bytes, n,
+            NULL, &program, &supported, c,
+            wl_evaluation_control_active_attempt_id(c)) && supported);
+        wl_columnar_expr_test_fail_allocation = 0;
+        int64_t value = 999; bool failed = true;
+        wl_columnar_expr_status_t status = WL_COLUMNAR_EXPR_INVALID_RESULT;
+        wl_columnar_expr_context_t context = {.intern = intern};
+        int rc = wl_columnar_expr_eval_scalar_attempt_controlled(program,
+                NULL, 0, &context, &value, &failed, &status, c,
+                wl_evaluation_control_active_attempt_id(c));
+        CHECK(matched == 2?rc == ENOMEM && value == 999:
+            !rc && !failed && value == args[0] &&
+            wl_columnar_expr_test_fail_allocation == 0);
+        wl_columnar_expr_test_fail_allocation = -1;
+        wl_columnar_expr_attempt_scalar_free(program); finish(c, rc);
+        wl_intern_free(intern);
+    }
+}
+
+static void replace_delta(const char *relation, const int64_t *row,
+    uint32_t cols, int32_t diff, void *arg) {
+    fixture_t *f = arg;
+    CHECK(!strcmp(relation, "out") && (cols == 1 || cols == 3));
+    const char *x = wl_intern_reverse(f->plan->intern, row[0]);
+    CHECK(x && (!strcmp(x, "aaaa") || !strcmp(x, "ba")));
+    CHECK(diff == 1 || diff == -1); ++events;
+    positives += diff == 1; negatives += diff == -1;
+}
+static void replace_budget(void) {
+    for (unsigned shared = 0; shared < 2; ++shared)
+        for (unsigned shortcut = 0; shortcut < 3; ++shortcut) {
+            wl_intern_t *intern = wl_intern_create(); CHECK(intern);
+            int64_t args[] = {wl_intern_put(intern, "aaa"),
+                              wl_intern_put(intern,
+                                  shortcut == 0?"":shortcut == 1?"z":"a"),
+                              wl_intern_put(intern, "a")};
+            wl_columnar_memory_governor_ref_t *gi = builder_governor(),
+                *go = shared?gi:builder_governor();
+            CHECK(!wl_intern_attach_memory_governor(intern, gi));
+            wl_columnar_memory_governor_t *bi =
+                wl_columnar_memory_governor_ref_get(gi),
+                *bo = wl_columnar_memory_governor_ref_get(go);
+            uint8_t bytes[32]; uint32_t n = replace_bytes(bytes, args);
+            wl_evaluation_control_t *c = begin(0); bool supported = false;
+            wl_columnar_expr_attempt_scalar_t *program = NULL;
+            CHECK(!wl_columnar_expr_compile_scalar_attempt_controlled(bytes, n,
+                go,
+                &program, &supported, c,
+                wl_evaluation_control_active_attempt_id(c)) && supported);
+            uint64_t old_i = wl_columnar_memory_reserved(bi),
+                old_o = wl_columnar_memory_reserved(bo);
+            atomic_store_explicit(&bi->usable_bytes, old_i,
+                memory_order_relaxed);
+            atomic_store_explicit(&bo->usable_bytes, old_o,
+                memory_order_relaxed);
+            int64_t value = 999; bool failed = true;
+            wl_columnar_expr_status_t status = WL_COLUMNAR_EXPR_INVALID_RESULT;
+            wl_columnar_expr_context_t context = {.intern = intern};
+            int rc = wl_columnar_expr_eval_scalar_attempt_controlled(program,
+                    NULL, 0,
+                    &context, &value, &failed, &status, c,
+                    wl_evaluation_control_active_attempt_id(c));
+            CHECK(shortcut == 2?rc == ENOSPC && value == 999:
+                !rc && !failed && value == args[0]);
+            CHECK(wl_columnar_memory_reserved(bi) == old_i &&
+                wl_columnar_memory_reserved(bo) == old_o);
+            wl_columnar_expr_attempt_scalar_free(program); finish(c, rc);
+            wl_intern_free(intern); CHECK(!wl_columnar_memory_reserved(bi));
+            CHECK(!wl_columnar_memory_reserved(bo));
+            if (!shared) wl_columnar_memory_governor_ref_release(go);
+            wl_columnar_memory_governor_ref_release(gi);
+        }
+}
+static void session_replace(void) {
+    for (unsigned filter = 0; filter < 2; ++filter) {
+        const char *source = filter?
+            ".decl input(x:string)\n.decl out(x:string)\nout(x) :- input(x), str_replace(x,\"aa\",\"z\") = \"zz\".\n"
+            :
+            ".decl input(x:string)\n.decl out(x:string,y:string,n:int64)\nout(x,str_replace(x,\"aa\",\"z\"),strlen(x)) :- input(x).\n";
+        fixture_t f = create(source, filter != 0);
+        events = positives = negatives = 0;
+        wl_session_set_delta_cb(f.session, replace_delta, &f);
+        CHECK(!step_complete(f.session)); add(&f, "aaaa"); add(&f, "ba");
+        stop_phase = 175; stop_progress = 0;
+        wl_columnar_expr_test_checkpoint = witness;
+        CHECK(step_complete(f.session) == WL_EVALUATION_CONTROL_CANCELLED);
+        wl_columnar_expr_test_checkpoint = NULL; stop_phase = 0;
+        col_rel_t *out = session_find_rel(COL_SESSION(f.session), "out");
+        CHECK(out && !out->nrows && !events);
+        CHECK(!wl_evaluation_control_reset(f.control));
+        CHECK(!step_complete(f.session));
+        out = session_find_rel(COL_SESSION(f.session), "out");
+        CHECK(out && out->nrows == (filter?1:2) &&
+            out->column_types[0] == WIRELOG_TYPE_STRING);
+        for (uint32_t r = 0; r < out->nrows; ++r) {
+            const char *x = wl_intern_reverse(f.plan->intern,
+                    out->columns[0][r]);
+            CHECK(x && (!strcmp(x, "aaaa") || (!filter && !strcmp(x, "ba"))));
+            if (!filter) {
+                CHECK(out->column_types[1] == WIRELOG_TYPE_STRING);
+                CHECK(!strcmp(wl_intern_reverse(f.plan->intern,
+                    out->columns[1][r]),
+                    !strcmp(x, "aaaa")?"zz":"ba"));
+                CHECK(out->columns[2][r] == (int64_t)strlen(x));
+            }
+        }
+        CHECK(events == (filter?1:2) && positives == events && !negatives);
+        int64_t removed = wl_intern_get(f.plan->intern, "aaaa");
+        CHECK(!wl_session_remove(f.session, "input", &removed, 1, 1));
+        CHECK(!step_complete(f.session));
+        out = session_find_rel(COL_SESSION(f.session), "out");
+        CHECK(out && out->nrows == (filter?0:1));
+        CHECK(events == (filter?2:3) && negatives == 1);
+        CHECK(!step_complete(f.session)); destroy(&f);
+    }
+}
 int main(void) {
+    replace_sizes(); replace_parity(); replace_resources(); replace_budget();
+    session_replace();
     selector_extra_resources();
     selector_primitives();
     selector_parity();

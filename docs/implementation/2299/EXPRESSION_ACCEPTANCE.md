@@ -86,7 +86,7 @@ ledger explicitly.
 | `WL_PLAN_EXPR_STR_FN_STR_ORD` | open | admitted | unit5-sessions |
 | `WL_PLAN_EXPR_STR_FN_TO_UPPER` | open | admitted | unit6-builders |
 | `WL_PLAN_EXPR_STR_FN_TO_LOWER` | open | admitted | unit6-builders |
-| `WL_PLAN_EXPR_STR_FN_STR_REPLACE` | open | open | open |
+| `WL_PLAN_EXPR_STR_FN_STR_REPLACE` | open | admitted | unit6-replace |
 | `WL_PLAN_EXPR_STR_FN_TRIM` | open | admitted | unit6-selectors |
 | `WL_PLAN_EXPR_STR_FN_TO_STRING` | open | admitted | unit6-builders |
 | `WL_PLAN_EXPR_STR_FN_TO_NUMBER` | open | admitted | unit5-decimal |
@@ -677,3 +677,44 @@ retained results from temporary credit. Shared-plan sessions with distinct
 governors assert final balances. `unit6-selectors` records this evidence;
 REPLACE, crypto/extensions and further recursive/pipeline qualification remain
 outstanding.
+
+
+### Unit6c: nonoverlapping replacement
+
+REPLACE validates all three symbol IDs before either allocation-free shortcut.
+A missing intern returns the original source operand; invalid IDs yield the
+ordinary value -1. Empty patterns and zero matches return the original ID,
+even when both owner/intern budgets have no spare byte. A nonempty match still
+allocates and interns when the replacement equals the pattern. Matching uses
+C-string spans, byte equality and nonoverlapping advancement by pattern length.
+Source and pattern lengths are bounded; replacement traversal is delayed until
+at least one match exists. Both passes use the same immutable source/pattern.
+No match vector, raw strlen/strstr/memcpy or raw expression fallback is used.
+
+Phases170/171 admit entry and each of three reverse lookups;172/173 admit each
+first-pass search and accepted match;174/178 admit checked sizing;175/176
+admit each second-pass search and match;177 admits tail consistency and182
+admits final publication. Every region costs T=224. The sizing primitive costs
+2T on success, leaves output unchanged on stop, and checks removed bytes,
+replacement multiplication, addition and room for NUL. Impossible metadata
+returns EINVAL; unrepresentable size returns EOVERFLOW before allocation.
+For M>=1 matches the scalar caller costs T(4M+15), separately from three
+length traversals, both bounded find passes, prefix/replacement/tail copies,
+and nested interning. Every search includes its failed partial comparisons.
+Monotonic positions stay within source length; checked remaining-output
+subtractions and the final match-count/written-size checks protect both passes.
+
+Scratch follows unit6a ownership and cleanup: reservation overlaps the live
+owner/source, and survives through speculative intern preparation. Physical
+scratch is freed before credit rollback, including cancellation during either
+search/copy pass. Published intern entries survive a later cutoff legitimately.
+Raw-reference tests cover aliasing, adjacent/overlapping candidate matches,
+empty source/pattern/replacement, growth/shrink, repeated-prefix misses, high
+bytes, null intern and invalid IDs. Exact448/one-short447 sizing tests and
+synthetic overflow cases need no giant allocation. Stops/rebinds inside both
+search passes assert unchanged caller outputs/status, scratch retirement, no
+successor debit and exact retry. Generated FILTER/MAP verify STRING metadata,
+mixed numeric columns, empty/false/positive results, cancellation before
+publication, retry, signed deletion and subsequent no-op calls.
+`unit6-replace` records this evidence. Crypto/extensions and further actual
+recursive/pipeline domain qualification remain pending.

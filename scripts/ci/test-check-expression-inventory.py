@@ -41,6 +41,8 @@ with tempfile.TemporaryDirectory(prefix='expression-inventory-') as folder:
     ledger = ledger_path.read_text(encoding='utf-8')
     row = '| `WL_PLAN_EXPR_AGG_AVG` | legacy-rejected | legacy-rejected | legacy-rejected |\n'
     assert row in ledger
+    ledger_path.write_text(ledger.replace('unit6-replace', 'unreviewed-domain'), encoding='utf-8')
+    assert gate.check(fixture)[0], 'unknown qualification must fail'
     ledger_path.write_text(ledger + row, encoding='utf-8')
     assert gate.check(fixture)[0], 'duplicate rows must fail'
     ledger_path.write_text(ledger.replace(row, ''), encoding='utf-8')
