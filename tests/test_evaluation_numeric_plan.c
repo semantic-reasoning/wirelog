@@ -4320,6 +4320,94 @@ composed_join_setup_wrong_thread(void *argument)
 /* Refuse at every genuine setup boundary on the same constructor-created
  * READY owner. Completed metadata is paid; the stack/context remain untouched
  * until a later fully funded call performs the original forward/child work. */
+static uint32_t static_cut_entry, static_cut_pair;
+static unsigned static_entry_mask, static_pair_mask;
+static bool static_cut_seen, static_final_seen, static_work_stop;
+
+static void
+static_validation_checkpoint(wl_evaluation_control_t *funding, uint64_t id,
+    uint32_t entry, uint32_t pair)
+{
+    if (entry == UINT32_MAX) static_final_seen = true;
+    else if (pair == UINT32_MAX) static_entry_mask |= 1u << entry;
+    else static_pair_mask |= 1u << (entry * (entry - 1) / 2 + pair);
+    if (static_cut_seen || entry != static_cut_entry
+        || pair != static_cut_pair) return;
+    static_cut_seen = true;
+    if (static_work_stop) {
+        /* Explicit probe debit makes genuine WORK sticky at this boundary;
+         * it is not evidence of engine SOURCE work or a production fee. */
+        CHECK(!wl_evaluation_control_charge_attempt(funding, id, 384));
+        CHECK(wl_evaluation_control_charge_attempt(funding, id, 1)
+            == WL_EVALUATION_CONTROL_WORK_LIMIT);
+    } else wl_evaluation_control_request_cancel(funding);
+}
+
+static void
+composed_static_validation_refusals(fixture_t *f)
+{
+    const uint32_t entries[] = {0, 1, 1, 2, 2, 2, 3, 3, 3, 3, UINT32_MAX};
+    const uint32_t pairs[] = {UINT32_MAX, UINT32_MAX, 0, UINT32_MAX, 0, 1,
+                              UINT32_MAX, 0, 1, 2, UINT32_MAX};
+    wl_columnar_eval_plan_numeric_attempt_t saved = f->record;
+    uint64_t before = 0, after = 0;
+    CHECK(!wl_evaluation_control_test_active_consumed(f->operation,
+        f->operation_id, &before));
+    for (unsigned work = 0; work < 2; ++work)
+        for (unsigned cut = 0; cut < sizeof(entries)/sizeof(entries[0]);
+            ++cut){
+            int owner = 0;
+            wl_evaluation_control_t *funding = control_new(384, &owner);
+            uint64_t id = wl_evaluation_control_active_attempt_id(funding);
+            wl_columnar_eval_plan_numeric_status_t status;
+            memset(&status, 0xa5, sizeof(status));
+            wl_columnar_eval_plan_numeric_status_t poison = status;
+            static_cut_entry = entries[cut]; static_cut_pair = pairs[cut];
+            static_cut_seen = static_final_seen = false;
+            static_work_stop = work != 0;
+            static_entry_mask = static_pair_mask = 0;
+            wl_columnar_eval_plan_test_static_validation_checkpoint =
+                static_validation_checkpoint;
+            int expected = work ? WL_EVALUATION_CONTROL_WORK_LIMIT
+                : WL_EVALUATION_CONTROL_CANCELLED;
+            CHECK(wl_columnar_eval_plan_numeric_composed_attempt_status(
+                    &f->record, &status, funding, id) == expected
+                && static_cut_seen && !memcmp(&status, &poison, sizeof(status))
+                && !memcmp(&saved, &f->record, sizeof(saved))
+                && !wl_columnar_eval_stack_numeric_owner(f->frame, &f->record));
+            wl_columnar_eval_plan_test_static_validation_checkpoint = NULL;
+            CHECK(wl_evaluation_control_finish(funding, &owner, 0, 0)
+                == expected);
+            wl_evaluation_control_report_t report;
+            CHECK(!wl_evaluation_control_report(funding, &report)
+                && report.consumed == (work ? 384u : 0u));
+            CHECK(!wl_evaluation_control_reset(funding)
+                && !wl_evaluation_control_begin(funding, &owner));
+            uint64_t fresh = wl_evaluation_control_active_attempt_id(funding);
+            CHECK(fresh != id
+                && wl_columnar_eval_plan_numeric_composed_attempt_status(
+                    &f->record, &status, funding, id) == EINVAL
+                && !wl_evaluation_control_test_active_consumed(funding,
+                fresh, &after) && !after);
+            /* The same genuine owner remains usable with fresh funding. */
+            static_cut_seen = true; static_final_seen = false;
+            static_entry_mask = static_pair_mask = 0;
+            wl_columnar_eval_plan_test_static_validation_checkpoint =
+                static_validation_checkpoint;
+            CHECK(!wl_columnar_eval_plan_numeric_composed_attempt_status(
+                    &f->record, &status, funding, fresh)
+                && static_entry_mask == 15 && static_pair_mask == 63
+                && static_final_seen && status.phase == saved.phase);
+            wl_columnar_eval_plan_test_static_validation_checkpoint = NULL;
+            CHECK(!wl_evaluation_control_finish(funding, &owner, 0, 0)
+                && !wl_evaluation_control_detach(funding, &owner));
+            wl_evaluation_control_release(funding);
+        }
+    CHECK(!wl_evaluation_control_test_active_consumed(f->operation,
+        f->operation_id, &after) && before == after
+        && !memcmp(&saved, &f->record, sizeof(saved)));
+}
+
 static void
 composed_join_setup_refusals(fixture_t *f, bool static_four)
 {
@@ -5168,6 +5256,7 @@ test_composed_private_input_binding(void)
             f.operation, f.operation_id, f.funding, f.funding_id,
             &join_bindings));
     composed_until(&f, WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_READY, 1);
+    composed_static_validation_refusals(&f);
     composed_join_setup_refusals(&f, true);
     composed_run(&f);
     CHECK(!f.record.semantic_result
@@ -6009,6 +6098,326 @@ lftj_leaf_cleanup_turn(wl_columnar_lftj_attempt_t *attempt, bool preconsume,
     CHECK(!wl_evaluation_control_detach(funding, &owner));
     wl_evaluation_control_release(funding);
     return rc;
+}
+
+static fixture_t *ack_fixture;
+static size_t ack_cut;
+static bool ack_cut_seen;
+
+static void
+cancel_ack_clear(wl_columnar_eval_plan_numeric_attempt_t *n,
+    wl_evaluation_control_t *funding, uint64_t id, size_t offset)
+{
+    CHECK(ack_fixture && n == &ack_fixture->record && n->composed_busy
+        && n->phase == WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_DONE
+        && !wl_columnar_eval_stack_numeric_owner(n->frame, n));
+    if (ack_cut_seen || offset != ack_cut) return;
+    uint64_t before = 0, after = 0;
+    CHECK(!wl_evaluation_control_test_active_consumed(funding, id, &before)
+        && wl_columnar_eval_plan_numeric_composed_attempt_ack(n, funding,
+        id) == EBUSY
+        && !wl_evaluation_control_test_active_consumed(funding, id, &after)
+        && before == after);
+    ack_cut_seen = true;
+    wl_evaluation_control_request_cancel(funding);
+}
+
+static void
+test_lftj_ack_clear_funding(void)
+{
+    const size_t cuts[] = {SIZE_MAX, 0, 1024,
+                           sizeof(wl_columnar_lftj_attempt_t)};
+    for (unsigned stopped = 0; stopped < 3; ++stopped)
+        for (unsigned cut = 0; cut < sizeof(cuts)/sizeof(cuts[0]); ++cut) {
+            fixture_t f;
+            wl_plan_relation_t body; wl_plan_op_t op;
+            wl_plan_op_lftj_t metadata; char *names[3]; uint32_t keys[3];
+            col_rel_t *relations[3];
+            composed_lftj_fixture(&f, stopped == 2 ? UINT64_C(1)<<20 : 0,
+                &body, &op, &metadata, names, keys, relations);
+            if (stopped) {
+                for (unsigned turn = 0;; ++turn) {
+                    CHECK(turn < 100000);
+                    if (f.record.phase ==
+                        WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_LFTJ_CHILD
+                        && f.record.lftj.phase ==
+                        WL_COLUMNAR_LFTJ_ATTEMPT_COPY) break;
+                    composed_action(&f);
+                }
+                if (stopped ==
+                    2) CHECK(wl_evaluation_control_charge_attempt(f.operation,
+                        f.operation_id,
+                        UINT64_MAX) == WL_EVALUATION_CONTROL_WORK_LIMIT);
+                else wl_evaluation_control_request_cancel(f.operation);
+            }
+            composed_run(&f);
+            CHECK(f.record.phase == WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_DONE
+                && f.record.lftj.phase == WL_COLUMNAR_LFTJ_ATTEMPT_DONE);
+            eval_stack_t *stack = wl_columnar_eval_stack_cleanup_stack(f.frame);
+            col_rel_t *held = !stopped ? stack->items[0].rel : NULL;
+            CHECK(stack->top == (stopped ? 0u : 1u));
+            if (held) {
+                const int64_t expected[2][6] = {{1, 2, 1, 2, 1, 2},
+                                                {10, 11, 10, 11, 10, 11}};
+                CHECK(held->nrows == 2 && held->ncols == 6 &&
+                    !held->column_types);
+                for (unsigned row = 0; row < 2; ++row)
+                    for (unsigned col = 0; col < 6; ++col)
+                        CHECK(held->columns[col][row]
+                            == expected[row][col]);
+            }
+            uint64_t original = 0;
+            CHECK(!wl_evaluation_control_test_active_consumed(f.operation,
+                f.operation_id, &original));
+            int owner = 0;
+            wl_evaluation_control_t *grant = control_new(383, &owner);
+            uint64_t id = wl_evaluation_control_active_attempt_id(grant);
+            CHECK(wl_columnar_eval_plan_numeric_composed_attempt_ack(&f.record,
+                grant, id)
+                == WL_EVALUATION_CONTROL_WORK_LIMIT
+                && !wl_columnar_eval_stack_numeric_owner(f.frame, &f.record)
+                && wl_evaluation_control_finish(grant, &owner, 0, 0)
+                == WL_EVALUATION_CONTROL_WORK_LIMIT
+                && !wl_evaluation_control_detach(grant, &owner));
+            wl_evaluation_control_release(grant);
+
+            if (!stopped && !cut) {
+                grant = control_new(0, &owner);
+                id = wl_evaluation_control_active_attempt_id(grant);
+                wl_columnar_eval_plan_numeric_attempt_t *copy =
+                    malloc(sizeof(*copy));
+                CHECK(copy); memcpy(copy, &f.record, sizeof(*copy));
+                CHECK(wl_columnar_eval_plan_numeric_composed_attempt_ack(copy,
+                    grant, id) == EINVAL);
+                free(copy);
+                uint64_t used = UINT64_MAX;
+                CHECK(!wl_evaluation_control_test_active_consumed(grant, id,
+                    &used) && !used);
+                /* Explicit malformed terminal-debt component control. */
+                f.record.lftj.writer_active = true;
+                CHECK(wl_columnar_eval_plan_numeric_composed_attempt_ack(
+                        &f.record, grant, id) == EINVAL
+                    && f.record.lftj.writer_active && !f.record.composed_busy
+                    && !wl_columnar_eval_stack_numeric_owner(f.frame,
+                    &f.record));
+                f.record.lftj.writer_active = false;
+                CHECK(!wl_evaluation_control_finish(grant, &owner, 0, 0)
+                    && !wl_evaluation_control_detach(grant, &owner));
+                wl_evaluation_control_release(grant);
+            }
+
+            ack_fixture = &f; ack_cut = cuts[cut]; ack_cut_seen = false;
+            wl_columnar_eval_plan_test_lftj_ack_checkpoint = cancel_ack_clear;
+            grant = control_new(384, &owner);
+            id = wl_evaluation_control_active_attempt_id(grant);
+            CHECK(wl_columnar_eval_plan_numeric_composed_attempt_ack(&f.record,
+                grant, id)
+                == WL_EVALUATION_CONTROL_CANCELLED && ack_cut_seen
+                && !f.record.composed_busy && f.record.identity == &f.record
+                && f.record.control == f.operation
+                && stack->top == (stopped ? 0u : 1u)
+                && (stopped || stack->items[0].rel == held)
+                && !wl_columnar_eval_stack_numeric_owner(f.frame, &f.record));
+            wl_columnar_eval_plan_test_lftj_ack_checkpoint = NULL;
+            CHECK(wl_evaluation_control_finish(grant, &owner, 0, 0)
+                == WL_EVALUATION_CONTROL_CANCELLED);
+            wl_evaluation_control_report_t report;
+            CHECK(!wl_evaluation_control_report(grant,
+                &report) && report.consumed == 384);
+            CHECK(!wl_evaluation_control_reset(grant)
+                && !wl_evaluation_control_begin(grant, &owner));
+            uint64_t fresh_id = wl_evaluation_control_active_attempt_id(grant);
+            uint64_t used = UINT64_MAX;
+            CHECK(fresh_id != id
+                && wl_columnar_eval_plan_numeric_composed_attempt_ack(&f.record,
+                grant, id) == EINVAL
+                && !wl_evaluation_control_test_active_consumed(grant, fresh_id,
+                &used) && !used
+                && !wl_columnar_eval_stack_numeric_owner(f.frame, &f.record));
+            CHECK(!wl_columnar_eval_plan_numeric_composed_attempt_ack(&f.record,
+                grant, fresh_id)
+                && !f.record.identity && !f.record.composed_mode);
+            CHECK(!wl_evaluation_control_finish(grant, &owner, 0, 0)
+                && !wl_evaluation_control_detach(grant, &owner));
+            wl_evaluation_control_release(grant);
+            CHECK(!wl_evaluation_control_test_active_consumed(f.operation,
+                f.operation_id, &used) && used == original);
+            ack_fixture = NULL;
+            composed_close(&f);
+            for (unsigned i = 0; i < 3; ++i) col_rel_destroy(relations[i]);
+        }
+}
+
+static bool funded_drain_fail_once;
+
+static int
+funded_drain_release_failure(wl_columnar_relation_mutation_single_t *single,
+    unsigned slot)
+{
+    CHECK(single && slot <= 1);
+    if (funded_drain_fail_once) {
+        funded_drain_fail_once = false; return EAGAIN;
+    }
+    return 0;
+}
+
+static void
+test_lftj_funded_writer_drain(void)
+{
+    int owner = 0, host_owner = 0;
+    wl_evaluation_control_t *original = control_new(0, &owner);
+    uint64_t original_id = wl_evaluation_control_active_attempt_id(original);
+    col_rel_t *output = source_new(3, 0);
+    wl_columnar_relation_append_batch_t batch = {0};
+    CHECK(!wl_columnar_relation_append_batch_begin_attempt_controlled(&batch,
+        output, original, original_id));
+    wl_columnar_relation_private_batch_drain_t drain;
+    wl_columnar_relation_private_batch_drain_init(&drain);
+    wl_evaluation_control_request_cancel(original);
+    CHECK(wl_evaluation_control_charge_attempt(original, original_id, 0)
+        == WL_EVALUATION_CONTROL_CANCELLED);
+    uint64_t before = 0, after = 0;
+    CHECK(!wl_evaluation_control_test_active_consumed(original, original_id,
+        &before));
+    unsigned phases = 0, releases = 0;
+    bool done = false;
+    for (unsigned turn = 0; !done; ++turn) {
+        CHECK(turn < 32);
+        phases |= 1u << drain.phase;
+        wl_columnar_relation_private_batch_drain_t saved = drain;
+        wl_columnar_relation_append_batch_t saved_batch = batch;
+        wl_evaluation_control_t *funding = control_new(1, &host_owner);
+        uint64_t id = wl_evaluation_control_active_attempt_id(funding);
+        wl_evaluation_control_request_cancel(funding);
+        CHECK(wl_columnar_relation_private_batch_drain_step_funded(&drain,
+            &batch, ECANCELED, &done, funding, id)
+            == WL_EVALUATION_CONTROL_CANCELLED
+            && !memcmp(&saved, &drain, sizeof(drain))
+            && !memcmp(&saved_batch, &batch, sizeof(batch)));
+        CHECK(wl_evaluation_control_finish(funding, &host_owner, 0, 0)
+            == WL_EVALUATION_CONTROL_CANCELLED);
+        CHECK(!wl_evaluation_control_reset(funding)
+            && !wl_evaluation_control_begin(funding, &host_owner));
+        uint64_t fresh = wl_evaluation_control_active_attempt_id(funding);
+        CHECK(wl_columnar_relation_private_batch_drain_step_funded(&drain,
+            &batch, ECANCELED, &done, funding, id) == EINVAL
+            && !memcmp(&saved, &drain, sizeof(drain)));
+        wl_columnar_relation_private_batch_drain_t copied = drain;
+        CHECK(wl_columnar_relation_private_batch_drain_step_funded(&copied,
+            &batch, ECANCELED, &done, funding, fresh) == EINVAL);
+        if (drain.phase == WL_COLUMNAR_RELATION_PRIVATE_BATCH_OWNER
+            || drain.phase == WL_COLUMNAR_RELATION_PRIVATE_BATCH_DESCRIPTOR) {
+            drain.result_saved = false;
+            CHECK(wl_columnar_relation_private_batch_drain_step_funded(&drain,
+                &batch, ECANCELED, &done, funding, fresh) == EINVAL);
+            drain.result_saved = true;
+            drain.batch = NULL;
+            CHECK(wl_columnar_relation_private_batch_drain_step_funded(&drain,
+                &batch, ECANCELED, &done, funding, fresh) == EINVAL);
+            drain.batch = &batch;
+            uint64_t nonce = drain.bound_nonce;
+            ++drain.bound_nonce;
+            CHECK(wl_columnar_relation_private_batch_drain_step_funded(&drain,
+                &batch, ECANCELED, &done, funding, fresh) == EINVAL);
+            drain.bound_nonce = nonce;
+            funded_drain_fail_once = true;
+            wl_columnar_relation_test_single_release =
+                funded_drain_release_failure;
+            CHECK(!wl_columnar_relation_private_batch_drain_step_funded(&drain,
+                &batch, ECANCELED, &done, funding, fresh)
+                && !done && drain.release_error == EAGAIN
+                && drain.phase == saved.phase
+                && !memcmp(&saved_batch, &batch, sizeof(batch)));
+            wl_columnar_relation_test_single_release = NULL;
+            ++releases;
+        }
+        CHECK(!wl_columnar_relation_private_batch_drain_step_funded(&drain,
+            &batch, ECANCELED, &done, funding, fresh));
+        CHECK(!wl_evaluation_control_test_active_consumed(funding, fresh,
+            &after) && !after);
+        CHECK(!wl_evaluation_control_finish(funding, &host_owner, 0, 0)
+            && !wl_evaluation_control_detach(funding, &host_owner));
+        wl_evaluation_control_release(funding);
+    }
+    CHECK(phases == 31 && releases == 2
+        && drain.phase == WL_COLUMNAR_RELATION_PRIVATE_BATCH_DONE
+        && batch.phase == WL_COLUMNAR_RELATION_BATCH_ENDED
+        && batch.saved_result == ECANCELED
+        && !wl_evaluation_control_test_active_consumed(original, original_id,
+        &after) && before == after);
+    CHECK(wl_evaluation_control_finish(original, &owner, 0, 0)
+        == WL_EVALUATION_CONTROL_CANCELLED
+        && !wl_evaluation_control_detach(original, &owner));
+    wl_evaluation_control_release(original); col_rel_destroy(output);
+}
+
+static bool owned_row_fault_armed;
+
+static void
+arm_owned_row_allocation_fault(wl_evaluation_control_t *control,
+    const wl_columnar_lftj_attempt_t *a)
+{
+    CHECK(control == a->control);
+    if (!owned_row_fault_armed && a->output_pass
+        && a->phase == WL_COLUMNAR_LFTJ_ATTEMPT_JOIN
+        && a->join_phase == WL_COLUMNAR_LFTJ_JOIN_PRODUCT_EMIT
+        && a->fill_input == a->input_count) {
+        CHECK(a->total_columns == 75 && a->output_rows == 64
+            && a->output->capacity >= a->output_rows);
+        owned_row_fault_armed = true;
+        wl_columnar_relation_test_growth_fail_allocation = 1;
+    }
+}
+
+static void
+test_lftj_owned_row_no_capture(void)
+{
+    /* Positive fault control: the generic wide row really captures and may
+     * allocate. The private LFTJ route must avoid that allocation entirely. */
+    int owner = 0;
+    wl_evaluation_control_t *control = control_new(0, &owner);
+    col_rel_t *generic = source_new(75, 0);
+    wl_columnar_relation_append_batch_t batch = {0};
+    int64_t row[75] = {0};
+    CHECK(!wl_columnar_relation_append_batch_begin_controlled(&batch, generic,
+        control));
+    wl_columnar_relation_test_growth_fail_allocation = 1;
+    CHECK(wl_columnar_relation_append_batch_row_controlled(&batch, row)
+        == ENOMEM && !wl_columnar_relation_test_growth_fail_allocation
+        && !generic->nrows);
+    CHECK(wl_columnar_relation_append_batch_end_controlled(&batch, ENOMEM)
+        == ENOMEM);
+    CHECK(!wl_evaluation_control_finish(control, &owner, 0, 0)
+        && !wl_evaluation_control_detach(control, &owner));
+    wl_evaluation_control_release(control); col_rel_destroy(generic);
+
+    fixture_t f;
+    wl_plan_relation_t body; wl_plan_op_t op; wl_plan_op_lftj_t metadata;
+    char *names[3]; uint32_t keys[3]; col_rel_t *relations[3];
+    composed_lftj_fixture(&f, 0, &body, &op, &metadata, names, keys, relations);
+    static const double duplicate_values[] = {1, 1, 1, 1};
+    for (unsigned i = 0; i < 3; ++i) {
+        col_rel_destroy(relations[i]);
+        relations[i] = composed_source(names[i], 25, duplicate_values, 4,
+                false);
+    }
+    owned_row_fault_armed = false;
+    wl_columnar_lftj_test_attempt_checkpoint = arm_owned_row_allocation_fault;
+    composed_run(&f);
+    wl_columnar_lftj_test_attempt_checkpoint = NULL;
+    CHECK(owned_row_fault_armed
+        && wl_columnar_relation_test_growth_fail_allocation == 1
+        && !f.record.semantic_result);
+    wl_columnar_relation_test_growth_fail_allocation = 0;
+    eval_stack_t *stack = wl_columnar_eval_stack_cleanup_stack(f.frame);
+    CHECK(stack->top == 1 && stack->items[0].rel->nrows == 64
+        && stack->items[0].rel->ncols == 75);
+    for (unsigned r = 0; r < 64; ++r)
+        for (unsigned c = 0; c < 75; ++c)
+            CHECK(stack->items[0].rel->columns[c][r] == 1 + (int64_t)(c % 25));
+    composed_raw_parity(&f, &body, 0);
+    session_rel_free_hash(&f.session); composed_close(&f);
+    for (unsigned i = 0; i < 3; ++i) col_rel_destroy(relations[i]);
 }
 
 static void
@@ -13941,6 +14350,9 @@ main(void)
     test_composed_recursive_terminal_exchange();
     test_recursive_kernel_two_join_and_metadata();
     test_lftj_descriptor_cleanup_funding();
+    test_lftj_ack_clear_funding();
+    test_lftj_owned_row_no_capture();
+    test_lftj_funded_writer_drain();
     test_composed_lftj_stopped_cleanup();
     test_composed_source_stopped_cleanup();
     test_composed_source_cleanup_abort_retry();

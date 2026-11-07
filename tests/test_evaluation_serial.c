@@ -13357,16 +13357,60 @@ test_entry_generated_lftj_allocation_precharge(void)
     wl_columnar_lftj_test_get_hook_state(&exact_hooks);
     CHECK(exact_hooks.controlled_allocation_work_total == allocation_tariff
         && exact_hooks.controlled_allocation_work_charged == allocation_tariff
-        && exact_hooks.controlled_row_allocations == 1
-        && exact_hooks.controlled_input_array_allocations
-        == 2u * INPUT_COUNT
-        && exact_hooks.controlled_input_array_bytes
-        == 2u * INPUT_COUNT * ROW_COUNT * sizeof(int64_t));
+        && !exact_hooks.controlled_row_allocations
+        && !exact_hooks.controlled_input_array_allocations
+        && !exact_hooks.controlled_input_array_bytes);
     entry_retry_after_stop(&exact, source, inputs, INPUT_COUNT);
     const col_rel_t *exact_output = session_rel_hash_lookup(exact.session,
             "output");
     CHECK(exact_output && exact_output->nrows == ROW_COUNT);
     entry_destroy(&exact);
+
+    /* The discovered precharge prefix is an empirical host allowance.
+     * Independently specified source-reserve/commit stages add466/242.
+     * Physical allocation requires actual admission, even after its separate
+     * logical allocation tariff has been paid in full. */
+    const uint64_t funding[] = {465, 466, 707, 708};
+    const uint64_t admitted[] = {388, 466, 645, 708};
+    for (unsigned boundary = 0; boundary < 4; ++boundary) {
+        wl_columnar_lftj_test_clear_hooks();
+        entry_fixture_t governed;
+        entry_init_inputs(&governed, source, inputs, INPUT_COUNT,
+            precharge_prefix + allocation_tariff + funding[boundary]);
+        uint64_t reserved = wl_columnar_memory_reserved(
+            wl_columnar_memory_governor_ref_get(
+                governed.session->memory_governor));
+        CHECK(entry_lftj_phase_reached(&governed,
+            WL_COLUMNAR_LFTJ_ATTEMPT_ALLOC_PRECHARGE,
+            WL_COLUMNAR_LFTJ_JOIN_INPUT_CHECK));
+        entry_complete(&governed);
+        uint64_t consumed = 0;
+        CHECK(governed.reply.execution_result ==
+            WL_EVALUATION_CONTROL_WORK_LIMIT
+            && !governed.reply.committed
+            && !wl_evaluation_control_test_active_consumed(governed.operation,
+            governed.id, &consumed)
+            && consumed ==
+            precharge_prefix + allocation_tariff + admitted[boundary]
+            && wl_columnar_memory_reserved(wl_columnar_memory_governor_ref_get(
+                governed.session->memory_governor)) == reserved);
+        wl_columnar_lftj_test_hook_state_t hooks;
+        wl_columnar_lftj_test_get_hook_state(&hooks);
+        CHECK(hooks.controlled_allocation_work_total == allocation_tariff
+            && hooks.controlled_allocation_work_charged == allocation_tariff
+            && hooks.controlled_row_allocations == (boundary ? 1u : 0u)
+            && hooks.controlled_input_array_allocations
+            == (boundary ? 2u * INPUT_COUNT : 0u)
+            && hooks.controlled_input_array_bytes
+            == (boundary ? 2u * INPUT_COUNT * ROW_COUNT *
+            sizeof(int64_t) : 0u));
+        entry_assert_lftj_inputs_unchanged(&governed, inputs, INPUT_COUNT);
+        entry_retry_after_stop(&governed, source, inputs, INPUT_COUNT);
+        const col_rel_t *out = session_rel_hash_lookup(governed.session,
+                "output");
+        CHECK(out && out->nrows == ROW_COUNT);
+        entry_destroy(&governed);
+    }
 
     {
         static const int64_t one[] = {7};

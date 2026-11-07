@@ -4,8 +4,9 @@ This prerequisite covers a compiler-selected LFTJ already owned by the real
 serial framed host. Its saved Original may have ended while the child still
 owns readers, copied inputs, a writer or private output. The registered native
 cleanup destination drains that owner and its actual receipt before returning
-the execution error. Default batch-off financial admission, complete traversal
-qualification and batch-policy integration remain work under #2298.
+the execution error. Default batch-off financial admission is recorded in
+[LFTJ_SOURCE_ACCOUNTING.md](LFTJ_SOURCE_ACCOUNTING.md). Runtime policy and
+complete issue qualification remain subsequent work under #2298.
 
 ## Authority and disposition
 
@@ -19,7 +20,7 @@ cleanup cursor/stage. An unrelated pending action cannot inherit that owner.
 
 The child proof validates scalar-retirement initializer and storage identity.
 A `DONE` phase with retained writer, output, input array, row, reservation or
-retirement debt is invalid. Historic completed LFTJ state remains usable by a
+retirement debt, including the private writer-drain identity, is invalid. Historic completed LFTJ state remains usable by a
 later ordinary operator in the same numeric body.
 
 After authentication the existing registered cause is latched only where no
@@ -66,7 +67,7 @@ identity observation selects payment only; the complete proof still precedes
 native mutation. Absent or historic-DONE LFTJ retains the existing 128 numeric
 admission. Historic DONE receives no new child cause.
 
-The new read-only child proof has conservative local source upper 68:
+The read-only child proof has conservative local source upper 74:
 
 | Source rows | Upper |
 | --- | ---: |
@@ -78,7 +79,8 @@ The new read-only child proof has conservative local source upper 68:
 | Initializer address and initializer identity/parent/storage/relation | 6 |
 | Retirement identity/commit and drained/started checks | 6 |
 | Return and conservative endpoint reserve | 14 |
-| Total | 68 |
+| Private writer-drain canonical identity and debt guards | 6 |
+| Total | 74 |
 
 That local upper excludes the caller. A genuine saved-generation zero check on
 the distinct cleanup funding, immediately before native abort, splits the
@@ -88,10 +90,10 @@ refund or Original poll.
 | Complete reached source interval | Upper |
 | --- | ---: |
 | Prior receipt packet plus new financial-selector fronts | protected 117; plain 77 |
-| Child-validation check through full owner/stack/cause/dispatch to funding zero | 170 |
-| Funding zero through abort/thread/release and initializer BEGIN check | 167 |
-| Funding zero through initializer ZERO/BIND first check | 162 |
-| Funding zero through initializer RESET first check | 104 |
+| Child-validation check through full owner/stack/cause/dispatch to funding zero | 176 |
+| Funding zero through abort/thread/release and initializer BEGIN check | 169 |
+| Funding zero through initializer ZERO/BIND first check | 164 |
+| Funding zero through initializer RESET first check | 106 |
 | Initializer BEGIN check through actual native/SOURCE return | 128 |
 | Initializer ZERO or retirement-record clear through actual return | 205 |
 | Initializer BIND through actual return | 254 |
@@ -100,9 +102,10 @@ refund or Original poll.
 | Non-LFTJ numeric admission with added selectors | 134 |
 | Separate metadata clear through framed return and LATE check | 96 |
 
-The 170 interval is `3+4+68+54+9+24+8`: check suffix, child call, full child
+The 176 interval is `3+4+74+54+9+24+8`: check suffix, child call, full child
 proof, nested stack/numeric/thread owner proof, cause/return, dispatch, and the
-actual zero front. Initializer entry has common abort/release prefix 64.
+actual zero front. Initializer entry has common abort/release prefix at most 66, including
+the added drain selector.
 BEGIN adds 103, including all three complete overlap checks at 26 each;
 STEP adds 98, including native enter and two overlap checks; RESET adds 40.
 These include the first reached native call and hook fronts, not only retries.
@@ -174,8 +177,8 @@ these failed native attempts publish no heads or callbacks.
 
 ## Executable evidence
 
-`evaluation_lftj_hosts_native` creates real batch-on compiler LFTJ sessions with
-plain/observed STEP and Snapshot. Its 36 histories end Original inside actual
+`evaluation_lftj_hosts_native` creates real batch-off and batch-on compiler LFTJ sessions with
+plain/observed STEP and Snapshot. Its 72 histories end Original inside actual
 COPY, SORT, non-output SEEK, duplicate-product counting, private output creation,
 partial emission or writer completion. Cases cover a genuinely rejected cleanup
 grant, its successful retry, no-refusal control, and a genuine different active
@@ -212,3 +215,36 @@ ASan/UBSan and POSIX TSan use separate builds and the same actual host and
 numeric/serial/work regressions. Final candidate/commit identities and actual
 validation results belong to the PR record. This source map is a prerequisite
 for the remaining #2298 integration and does not declare umbrella completion.
+
+## Prechild metadata and terminal ACK
+
+An authentic registered native owner can end between metadata activations,
+before a child is born. HEADER does not read opaque metadata or uncaptured
+binding fields. Later stages prove exactly the captured metadata, name cursor,
+binding snapshot/generation, registry and PREFIX/INSTALL lineage. NULL child
+identity denotes canonical neverborn or prefix-cleared storage; it does not
+authorize reading the uninitialized tail. A historic nonnull child must prove
+real resource-free DONE. Live child debt is rejected in a metadata phase.
+
+Metadata admission uses the same 32+8 financial split, then a genuine saved
+cleanup-funding zero before the metadata proof and another before the full
+nested stack-owner proof. After authentication, registered cause is retained,
+metadata routes to numeric RELEASE, and a separate 128 action clears metadata
+before DONE. No probe of ended Original is inserted into that drain.
+
+The metadata-native host group ends Original between actual HEADER/NAMES,
+static/dynamic binding and PREFIX/INSTALL activations. It verifies real rejected
+and accepted grants, distinct active successor, frozen full report, peer
+credit, source images, no publication and exact retry. Component negatives
+reject mismatched operation/cursor, metadata/binding identities and generations,
+registry and prefix state. Payments 31/32/39/40 remain independent financial
+controls, distinct from source bounds. A 40 grant may latch intent and redirect
+to RELEASE before the later metadata-clear debit refuses.
+
+Terminal composed ACK keeps composed_busy and actual frame ownership through
+full child proof and bounded 1024-byte clears. Real funding checks separate
+chunks and precede final unbind. On refusal the record remains owned for
+idempotent retry; its Original/report, frame-held rows and native receipt are
+not replaced. Genuine host ACK cancellation histories exercise this same
+protocol. See the source-accounting document for the static four-entry proof
+and private output/writer retirement qualifications.
