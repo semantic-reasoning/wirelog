@@ -31,10 +31,15 @@ with tempfile.TemporaryDirectory(prefix='expression-inventory-') as folder:
     source_path.write_text(original + '\nvoid unrelated(int x) { switch (x) {'
                            'case WL_PLAN_EXPR_AGG_AVG: break;} }\n')
     assert not gate.check(fixture)[0], 'unrelated helper is not raw support'
+    scalar_start = original.index('wl_columnar_expr_scalar_decode(')
+    scalar_case = original.index('case WL_PLAN_EXPR_VAR_STRING:', scalar_start)
+    scalar_end = original.index('case WL_PLAN_EXPR_CONST_STR:', scalar_case)
+    source_path.write_text(original[:scalar_case] + original[scalar_end:])
+    assert gate.check(fixture)[0], 'removed scalar admission must be detected'
     source_path.write_text(original)
     ledger_path = fixture / paths[2]
     ledger = ledger_path.read_text()
-    row = '| `WL_PLAN_EXPR_AGG_AVG` | legacy-rejected |\n'
+    row = '| `WL_PLAN_EXPR_AGG_AVG` | legacy-rejected | legacy-rejected | legacy-rejected |\n'
     assert row in ledger
     ledger_path.write_text(ledger + row)
     assert gate.check(fixture)[0], 'duplicate rows must fail'

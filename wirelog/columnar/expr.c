@@ -3139,6 +3139,391 @@ wl_columnar_expr_eval_attempt_controlled(
     return 0;
 }
 
+/* Context-bearing scalar expressions (#2299). Numeric-only owners and their
+ * source/debit oracles remain independent. Bytecode is copied, context is
+ * borrowed only for synchronous evaluation under its plan/session owner. */
+struct wl_columnar_expr_attempt_scalar {
+    uint8_t *bytes;
+    uint32_t size;
+    expr_instr_t producer;
+    wl_columnar_memory_governor_ref_t *governor;
+    wl_columnar_memory_reservation_t credit;
+    bool held, committed;
+};
+#ifdef WL_SESSION_TEST_HOOKS
+size_t wl_columnar_expr_test_scalar_owner_size(void)
+{
+    return sizeof(wl_columnar_expr_attempt_scalar_t);
+}
+#endif
+
+static int
+wl_columnar_expr_scalar_region(wl_evaluation_control_t *control, uint64_t id,
+    unsigned phase, uint64_t progress)
+{
+    int rc = wl_columnar_expr_byte_region(control, id);
+    return rc ? rc : wl_columnar_expr_attempt_tail(control, id, phase,
+               progress);
+}
+
+static int
+wl_columnar_expr_scalar_decode(const uint8_t *bytes, uint32_t size,
+    uint32_t *pos, expr_instr_t *instruction, wl_evaluation_control_t *control,
+    uint64_t id)
+{
+    int rc = wl_columnar_expr_scalar_region(control, id, 70, *pos);
+    if (rc) return rc;
+    if (*pos >= size) return ENOTSUP;
+    uint8_t tag = bytes[*pos];
+    instruction->op = tag; instruction->iarg = 0; instruction->larg = 0;
+    switch ((wl_plan_expr_tag_t)tag) {
+    case WL_PLAN_EXPR_VAR_STRING: {
+        ++*pos;
+        uint8_t encoded[2], name[12]; uint16_t length;
+        rc = wl_columnar_expr_attempt_bytes(bytes, size, pos, encoded, 2,
+                70, control, id);
+        if (rc) return rc;
+        memcpy(&length, encoded, 2);
+        if (length < 4 || length > sizeof(name)) return ENOTSUP;
+        rc = wl_columnar_expr_attempt_bytes(bytes, size, pos, name, length,
+                70, control, id);
+        if (rc) return rc;
+        if (name[0] != 'c' || name[1] != 'o' || name[2] != 'l') return ENOTSUP;
+        for (uint32_t d = 3; d < length; ++d) {
+            rc = wl_columnar_expr_scalar_region(control, id, 71, d);
+            if (rc) return rc;
+            if (name[d] < '0' || name[d] > '9') return ENOTSUP;
+            instruction->iarg = instruction->iarg * 10u + (name[d] - '0');
+        }
+        break;
+    }
+    case WL_PLAN_EXPR_CONST_STR: {
+        ++*pos;
+        uint8_t encoded[2]; uint16_t length;
+        rc = wl_columnar_expr_attempt_bytes(bytes, size, pos, encoded, 2,
+                70, control, id);
+        if (rc) return rc;
+        memcpy(&length, encoded, 2);
+        rc = wl_columnar_expr_scalar_region(control, id, 72, length);
+        if (rc) return rc;
+        if (*pos > size || length > size - *pos) return ENOTSUP;
+        instruction->iarg = *pos; instruction->larg = length;
+        /* Opaque payload needs no validation traversal. Compilation owns a
+         * separately metered byte-for-byte copy; evaluation meters its use. */
+        *pos += length;
+        break;
+    }
+    case WL_PLAN_EXPR_CMP_STR_EQ: case WL_PLAN_EXPR_CMP_STR_NEQ:
+    case WL_PLAN_EXPR_CMP_STR_LT: case WL_PLAN_EXPR_CMP_STR_GT:
+    case WL_PLAN_EXPR_CMP_STR_LTE: case WL_PLAN_EXPR_CMP_STR_GTE:
+        ++*pos;
+        break;
+    default:
+        return wl_columnar_expr_attempt_decode(bytes, size, pos, instruction,
+                   1, control, id, false);
+    }
+    return wl_columnar_expr_attempt_charge(control, id, 0);
+}
+
+static int
+wl_columnar_expr_scalar_admit(wl_columnar_memory_governor_ref_t *governor,
+    uint64_t bytes, wl_columnar_memory_reservation_t *credit, bool *held,
+    wl_evaluation_control_t *control, uint64_t id)
+{
+    if (!governor) return 0;
+    wl_columnar_memory_admission_status_t status;
+    int rc = wl_columnar_memory_governor_reserve_checked_attempt_controlled(
+        wl_columnar_memory_governor_ref_get(governor), bytes, credit, &status,
+        control, id);
+    if (rc) return rc;
+    *held = status == WL_COLUMNAR_MEMORY_ADMISSION_OK
+        || status == WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY;
+    return *held ? 0 : status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED ? ENOSPC
+        : status == WL_COLUMNAR_MEMORY_ADMISSION_OVERFLOW ? EOVERFLOW : EINVAL;
+}
+
+void
+wl_columnar_expr_attempt_scalar_free(wl_columnar_expr_attempt_scalar_t *owner)
+{
+    if (!owner) return;
+    wl_columnar_memory_reservation_t retirement;
+    bool held = owner->held, committed = owner->committed;
+    wl_columnar_memory_governor_ref_t *governor = owner->governor;
+    if (held) {
+        wl_columnar_memory_reservation_init(&retirement);
+        if (!wl_columnar_memory_reservation_move(&retirement,
+            &owner->credit)) abort();
+    }
+    free(owner->bytes); free(owner);
+    wl_columnar_expr_checkpoint(NULL, 8, 0, false);
+    if (held && !(committed ? wl_columnar_memory_release(&retirement)
+        : wl_columnar_memory_rollback(&retirement))) abort();
+    if (governor) wl_columnar_memory_governor_ref_release(governor);
+}
+
+int
+wl_columnar_expr_compile_scalar_attempt_controlled(const uint8_t *bytes,
+    uint32_t size, wl_columnar_memory_governor_ref_t *governor,
+    wl_columnar_expr_attempt_scalar_t **out, bool *supported,
+    wl_evaluation_control_t *control, uint64_t id)
+{
+    if (!out || !supported) return EINVAL;
+    *out = NULL; *supported = false;
+    int rc = wl_columnar_expr_scalar_region(control, id, 73, size);
+    if (rc) return rc;
+    if (!bytes && size) return EINVAL;
+    if (!size) return 0;
+    uint32_t pos = 0, depth = 0;
+    expr_instr_t producer = { .op = WL_PLAN_EXPR_CONST_INT };
+    while (pos < size) {
+        expr_instr_t instruction;
+        rc = wl_columnar_expr_scalar_decode(bytes, size, &pos, &instruction,
+                control, id);
+        if (rc) return rc == ENOTSUP
+            ? wl_columnar_expr_attempt_charge(control, id, 0) : rc;
+        rc = wl_columnar_expr_scalar_region(control, id, 74, pos);
+        if (rc) return rc;
+        switch ((wl_plan_expr_tag_t)instruction.op) {
+        case WL_PLAN_EXPR_AGG_COUNT: case WL_PLAN_EXPR_AGG_SUM:
+        case WL_PLAN_EXPR_AGG_MIN: case WL_PLAN_EXPR_AGG_MAX:
+            continue;
+        case WL_PLAN_EXPR_VAR: case WL_PLAN_EXPR_VAR_FLOAT:
+        case WL_PLAN_EXPR_VAR_STRING: case WL_PLAN_EXPR_CONST_INT:
+        case WL_PLAN_EXPR_CONST_FLOAT: case WL_PLAN_EXPR_CONST_STR:
+        case WL_PLAN_EXPR_BOOL:
+            break;
+        case WL_PLAN_EXPR_ARITH_BNOT: case WL_PLAN_EXPR_ARITH_HASH:
+        case WL_PLAN_EXPR_ARITH_CRC32_ETH: case WL_PLAN_EXPR_ARITH_CRC32_CAST:
+            if (depth) --depth;
+            break;
+        default:
+            depth = depth > 1 ? depth - 2 : 0;
+        }
+        if (depth < COL_FILTER_STACK) {
+            ++depth; producer = instruction;
+        }
+    }
+    /* Prepay local first disposal/ref release before acquiring resources. */
+    rc = wl_columnar_expr_scalar_region(control, id, 75, 0);
+    if (rc) return rc;
+    uint64_t total;
+    if (!wl_columnar_memory_size_add(sizeof(wl_columnar_expr_attempt_scalar_t),
+        size, &total) || total > SIZE_MAX) return EOVERFLOW;
+    wl_columnar_memory_reservation_t credit;
+    wl_columnar_memory_reservation_init(&credit);
+    bool held = false;
+    wl_columnar_expr_attempt_scalar_t *owner = NULL;
+    if (governor) wl_columnar_memory_governor_ref_retain(governor);
+    rc = wl_columnar_expr_scalar_admit(governor, total, &credit, &held,
+            control, id);
+    if (rc) goto fail;
+    rc = wl_columnar_expr_scalar_region(control, id, 76, 0);
+    if (rc) goto fail;
+    owner = wl_columnar_expr_allocate(sizeof(*owner));
+    if (!owner) {
+        rc = ENOMEM; goto fail;
+    }
+    owner->bytes = NULL; owner->governor = NULL;
+    owner->held = false; owner->committed = false;
+    wl_columnar_memory_reservation_init(&owner->credit);
+    owner->size = size; owner->producer = producer;
+    rc = wl_columnar_expr_scalar_region(control, id, 76, 1);
+    if (rc) goto fail;
+    owner->bytes = wl_columnar_expr_allocate(size);
+    if (!owner->bytes) {
+        rc = ENOMEM; goto fail;
+    }
+    size_t copied = 0;
+    rc = wl_columnar_expr_bytes_copy_attempt_controlled(owner->bytes, bytes,
+            size, &copied, control, id);
+    if (rc) goto fail;
+    rc = wl_columnar_expr_scalar_region(control, id, 77, size);
+    if (rc) goto fail;
+    if (held) {
+        bool committed = false;
+        rc = wl_columnar_memory_governor_commit_attempt_controlled(&credit,
+                owner, &committed, control, id);
+        if (rc) goto fail;
+        if (!committed) {
+            rc = ENOMEM; goto fail;
+        }
+        if (!wl_columnar_memory_reservation_move(&owner->credit,
+            &credit)) abort();
+        owner->held = true; owner->committed = true; held = false;
+    }
+    owner->governor = governor;
+    *out = owner; *supported = true;
+    return 0;
+fail:
+    wl_columnar_expr_attempt_scalar_free(owner);
+    if (held && !wl_columnar_memory_rollback(&credit)) abort();
+    if (governor) wl_columnar_memory_governor_ref_release(governor);
+    return rc;
+}
+
+int
+wl_columnar_expr_scalar_result_type_attempt_controlled(
+    const wl_columnar_expr_attempt_scalar_t *owner,
+    const wirelog_column_type_t *types, uint32_t width,
+    wirelog_column_type_t *type, bool *supported,
+    wl_evaluation_control_t *control, uint64_t id)
+{
+    if (!owner || !type || !supported) return EINVAL;
+    int rc = wl_columnar_expr_scalar_region(control, id, 78, 0);
+    if (rc) return rc;
+    wirelog_column_type_t result;
+    bool valid = true;
+    if (owner->producer.op == WL_PLAN_EXPR_VAR_STRING
+        || owner->producer.op ==
+        WL_PLAN_EXPR_CONST_STR) result = WIRELOG_TYPE_STRING;
+    else valid = wl_columnar_expr_result_type(&owner->producer, 0, types,
+                width, &result);
+    rc = wl_columnar_expr_scalar_region(control, id, 79, 0);
+    if (rc) return rc;
+    if (valid) *type = result;
+    *supported = valid;
+    return 0;
+}
+
+static int
+wl_columnar_expr_scalar_literal(const wl_columnar_expr_attempt_scalar_t *owner,
+    const expr_instr_t *in, wl_intern_t *intern, int64_t *value,
+    wl_evaluation_control_t *control, uint64_t id)
+{
+    if (!intern) {
+        *value = 0; return 0;
+    }
+    int rc = wl_columnar_expr_scalar_region(control, id, 80, 0);
+    if (rc) return rc;
+    wl_columnar_memory_reservation_t credit;
+    wl_columnar_memory_reservation_init(&credit);
+    bool held = false;
+    uint32_t length = (uint32_t)in->larg;
+    rc = wl_columnar_expr_scalar_admit(owner->governor, (uint64_t)length + 1,
+            &credit, &held, control, id);
+    if (rc) return rc;
+    char *temporary = NULL;
+    rc = wl_columnar_expr_scalar_region(control, id, 81, length);
+    if (rc) goto done;
+    temporary = wl_columnar_expr_allocate((size_t)length + 1u);
+    if (!temporary) {
+        rc = ENOMEM; goto done;
+    }
+    size_t copied = 0;
+    rc = wl_columnar_expr_bytes_copy_attempt_controlled((uint8_t *)temporary,
+            owner->bytes + in->iarg, length, &copied, control, id);
+    if (rc) goto done;
+    rc = wl_columnar_expr_scalar_region(control, id, 82, length);
+    if (rc) goto done;
+    temporary[length] = 0;
+    rc = wl_intern_control_put_attempt(intern, temporary, value, control, id);
+    /* Raw CONST_STR collapses every failed legacy put into allocation
+     * failure. The controlled intern primitive preserves richer diagnostics
+     * for its own callers; this evaluator keeps the raw expression policy. */
+    if (rc > 0) {
+        int identity = wl_columnar_expr_attempt_guard(control, id);
+        rc = identity ? identity : ENOMEM;
+    }
+done:
+    free(temporary);
+    if (held && !wl_columnar_memory_rollback(&credit)) abort();
+    return rc;
+}
+
+int
+wl_columnar_expr_eval_scalar_attempt_controlled(
+    const wl_columnar_expr_attempt_scalar_t *owner, const int64_t *row,
+    uint32_t width, const wl_columnar_expr_context_t *context,
+    int64_t *value, bool *failed, wl_columnar_expr_status_t *status,
+    wl_evaluation_control_t *control, uint64_t id)
+{
+    if (!owner || !value || !failed || (width && !row)) return EINVAL;
+    int rc = wl_columnar_expr_scalar_region(control, id, 83, 0);
+    if (rc) return rc;
+    wl_intern_t *intern = context ? context->intern : NULL;
+    expr_stack_t stack; stack.top = 0;
+    uint32_t pos = 0; bool semantic = false;
+    while (pos < owner->size) {
+        expr_instr_t in;
+        rc = wl_columnar_expr_scalar_decode(owner->bytes, owner->size, &pos,
+                &in, control, id);
+        if (rc) return rc;
+        rc = wl_columnar_expr_scalar_region(control, id, 84, pos);
+        if (rc) return rc;
+        if (in.op == WL_PLAN_EXPR_VAR_STRING) {
+            if (!intern || in.iarg >= width) {
+                semantic = true; break;
+            }
+            int64_t v = row[in.iarg];
+            const char *data = wl_intern_reverse(intern, v);
+            if (!data) {
+                semantic = true; break;
+            }
+            size_t n = 0;
+            rc = wl_columnar_expr_cstr_length_attempt_controlled(data, &n,
+                    control, id);
+            if (rc) return rc;
+            rc = wl_columnar_expr_scalar_region(control, id, 85, n);
+            if (rc) return rc;
+            expr_push_string(&stack, v, (const uint8_t *)data, (uint32_t)n);
+        } else if (in.op == WL_PLAN_EXPR_CONST_STR) {
+            int64_t v = 0;
+            rc = wl_columnar_expr_scalar_literal(owner, &in, intern, &v,
+                    control, id);
+            if (rc) return rc;
+            rc = wl_columnar_expr_scalar_region(control, id, 86, pos);
+            if (rc) return rc;
+            expr_push_string(&stack, v, owner->bytes + in.iarg,
+                (uint32_t)in.larg);
+        } else if (in.op >= WL_PLAN_EXPR_CMP_STR_EQ
+            && in.op <= WL_PLAN_EXPR_CMP_STR_GTE) {
+            int64_t b = expr_pop(&stack), a = expr_pop(&stack);
+            const char *left = intern ? wl_intern_reverse(intern, a) : NULL;
+            const char *right = intern ? wl_intern_reverse(intern, b) : NULL;
+            bool result = false;
+            if (left && right) {
+                size_t ln = 0, rn = 0;
+                rc = wl_columnar_expr_cstr_length_attempt_controlled(left,
+                        &ln, control, id);
+                if (rc) return rc;
+                rc = wl_columnar_expr_cstr_length_attempt_controlled(right,
+                        &rn, control, id);
+                if (rc) return rc;
+                int order = 0;
+                rc = wl_columnar_expr_bytes_compare_attempt_controlled(
+                    (const uint8_t *)left, (const uint8_t *)right,
+                    ln < rn ? ln : rn, &order, control, id);
+                if (rc) return rc;
+                if (!order) order = (ln > rn) - (ln < rn);
+                switch ((wl_plan_expr_tag_t)in.op) {
+                case WL_PLAN_EXPR_CMP_STR_EQ: result = order == 0; break;
+                case WL_PLAN_EXPR_CMP_STR_NEQ: result = order != 0; break;
+                case WL_PLAN_EXPR_CMP_STR_LT: result = order < 0; break;
+                case WL_PLAN_EXPR_CMP_STR_GT: result = order > 0; break;
+                case WL_PLAN_EXPR_CMP_STR_LTE: result = order <= 0; break;
+                default: result = order >= 0; break;
+                }
+            } else if (in.op == WL_PLAN_EXPR_CMP_STR_EQ) result = a == b;
+            else if (in.op == WL_PLAN_EXPR_CMP_STR_NEQ) result = a != b;
+            rc = wl_columnar_expr_scalar_region(control, id, 87, pos);
+            if (rc) return rc;
+            expr_push(&stack, result);
+        } else {
+            rc = wl_columnar_expr_attempt_numeric_step(&stack, &in, row,
+                    width, &semantic, control, id);
+            if (rc) return rc;
+            if (semantic) break;
+        }
+    }
+    rc = wl_columnar_expr_scalar_region(control, id, 88, pos);
+    if (rc) return rc;
+    *value = !semantic && stack.top ? stack.vals[stack.top - 1] : 0;
+    *failed = semantic;
+    if (status) *status =
+            semantic ? WL_COLUMNAR_EXPR_MALFORMED : WL_COLUMNAR_EXPR_OK;
+    return 0;
+}
+
 static int
 wl_columnar_expr_numeric_step(expr_stack_t *stack,
     const expr_instr_t *in, const int64_t *row, uint32_t ncols,

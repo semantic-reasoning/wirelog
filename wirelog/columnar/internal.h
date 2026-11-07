@@ -5898,6 +5898,35 @@ int wl_columnar_expr_bytes_find_attempt_controlled(const uint8_t *, size_t,
     const uint8_t *, size_t, size_t *, bool *, wl_evaluation_control_t *,
     uint64_t);
 
+/* Context-bearing scalar owner (#2299). Immutable bytecode copy, no intern
+ * mutation during compile. Numeric-only hosts keep the numeric owner path.
+ * Evaluation borrows the actual session/plan context (or caller-held pin),
+ * never rebinds the intern to the bytecode owner's governor. Temporary literal
+ * buffers use that owner governor; retained strings use their intern governor.
+ * Caller keeps context, row and owner live/immutable throughout evaluation.
+ * Compile initializes out=NULL/supported=false; unsupported grammar returns0.
+ * Nonzero eval leaves scalar outputs unchanged. Semantic failure publishes
+ * value0/failed=true/MALFORMED. Literal legacy interning failures map ENOMEM;
+ * temporary governed allocation keeps its own ENOSPC/admission dispositions.
+ * No raw expression fallback. Disposal is mandatory/noncancellable. */
+typedef struct wl_columnar_expr_attempt_scalar wl_columnar_expr_attempt_scalar_t;
+int wl_columnar_expr_compile_scalar_attempt_controlled(const uint8_t *,
+    uint32_t,
+    wl_columnar_memory_governor_ref_t *, wl_columnar_expr_attempt_scalar_t **,
+    bool *, wl_evaluation_control_t *, uint64_t);
+int wl_columnar_expr_eval_scalar_attempt_controlled(
+    const wl_columnar_expr_attempt_scalar_t *, const int64_t *, uint32_t,
+    const wl_columnar_expr_context_t *, int64_t *, bool *,
+    wl_columnar_expr_status_t *, wl_evaluation_control_t *, uint64_t);
+int wl_columnar_expr_scalar_result_type_attempt_controlled(
+    const wl_columnar_expr_attempt_scalar_t *, const wirelog_column_type_t *,
+    uint32_t, wirelog_column_type_t *, bool *, wl_evaluation_control_t *,
+    uint64_t);
+void wl_columnar_expr_attempt_scalar_free(wl_columnar_expr_attempt_scalar_t *);
+#ifdef WL_SESSION_TEST_HOOKS
+size_t wl_columnar_expr_test_scalar_owner_size(void);
+#endif
+
 /* #1821 numeric preparation/execution foundation; no engine activation.
  * Bytecode is immutable through both passes. Governor is borrowed until free;
  * owner/row must remain alive and immutable during evaluation. NULL control
@@ -7056,6 +7085,8 @@ typedef enum {
     WL_COLUMNAR_FILTER_STAGE_CONTROL,
     WL_COLUMNAR_FILTER_STAGE_FINISH,
     WL_COLUMNAR_FILTER_STAGE_RESET,
+    WL_COLUMNAR_FILTER_STAGE_SCALAR_TABLE_PHYSICAL,
+    WL_COLUMNAR_FILTER_STAGE_SCALAR_TABLE_CREDIT,
     WL_COLUMNAR_FILTER_STAGE_DONE
 } wl_columnar_filter_stage_t;
 
@@ -7066,6 +7097,10 @@ typedef enum {
 * A cleared table has no resources; dormant credit bits are not authority. */
 typedef struct {
     wl_columnar_expr_attempt_numeric_t **programs;
+    wl_columnar_expr_attempt_scalar_t **scalars;
+    wl_columnar_memory_reservation_t scalar_credit;
+    uint32_t scalar_initialized_slots;
+    bool scalar_allocated, scalar_admitted, scalar_committed;
     uint32_t initialized_slots;
     uint32_t retirement_cursor;
     wl_columnar_memory_reservation_t credit;
@@ -7178,6 +7213,7 @@ typedef struct wl_columnar_filter_context {
     wl_columnar_relation_append_batch_t batch;
     wl_columnar_relation_private_batch_drain_t batch_drain;
     wl_columnar_expr_attempt_numeric_t *program;
+    wl_columnar_expr_attempt_scalar_t *scalar_program;
     wl_columnar_memory_reservation_t credit;
     wl_columnar_memory_governor_ref_t *governor;
     col_rel_t *output;
