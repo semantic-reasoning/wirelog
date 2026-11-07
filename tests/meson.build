@@ -2885,7 +2885,8 @@ test('sub_ms_graph_correctness', test_sub_ms_graph_perf_gate_exe,
 
 test_consolidate_incremental_delta_exe = executable(
   'test_consolidate_incremental_delta',
-  files('test_consolidate_incremental_delta.c', '../wirelog/evaluation_control.c'),
+  files('test_consolidate_incremental_delta.c', '../wirelog/evaluation_control.c',
+        '../wirelog/session.c'),
   backend_src,
   intern_src,
   arena_src,
@@ -2954,7 +2955,8 @@ endforeach
 
 test_consolidate_kway_merge_exe = executable(
   'test_consolidate_kway_merge',
-  files('test_consolidate_kway_merge.c', '../wirelog/evaluation_control.c'),
+  files('test_consolidate_kway_merge.c', '../wirelog/evaluation_control.c',
+        '../wirelog/session.c'),
   backend_src,
   intern_src,
   arena_src,
@@ -4714,7 +4716,8 @@ test('col_rel_deep_copy', test_col_rel_deep_copy_exe, timeout: 120)
 # Relation identity/generation contract and mutation instrumentation (Issue #1441)
 relation_mutation_set_exe = executable(
   'test_relation_mutation_set',
-  files('test_relation_mutation_set.c', '../wirelog/evaluation_control.c'),
+  files('test_relation_mutation_set.c', '../wirelog/evaluation_control.c',
+        '../wirelog/session.c'),
   backend_src, intern_src, arena_src, thread_src, workqueue_src,
   include_directories: [wirelog_inc, wirelog_src_inc],
   dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
@@ -4725,7 +4728,8 @@ test('relation_mutation_set', relation_mutation_set_exe,
 
 test_relation_generations_exe = executable(
   'test_relation_generations',
-  files('test_relation_generations.c', '../wirelog/evaluation_control.c'),
+  files('test_relation_generations.c', '../wirelog/evaluation_control.c',
+        '../wirelog/session.c'),
   backend_src,
   intern_src,
   arena_src,
@@ -4743,7 +4747,8 @@ test('relation_generations', test_relation_generations_exe)
 if host_machine.system() == 'linux'
   test_relation_generations_oom_exe = executable(
     'test_relation_generations_oom',
-    files('test_relation_generations.c', '../wirelog/evaluation_control.c'),
+    files('test_relation_generations.c', '../wirelog/evaluation_control.c',
+        '../wirelog/session.c'),
     backend_src,
     intern_src,
     arena_src,
@@ -6993,10 +6998,28 @@ test_evaluation_join_hosts_exe = executable(
   c_args: ['-DWL_SESSION_TEST_HOOKS=1'],
   link_with: [testlib_prod],
 )
-foreach join_host_case : ['domains', 'recovery', 'failures', 'funding']
+# Each complete wide session history owns its existing watchdog. Keep every
+# domain tuple, including raw/repeat/cleanup, without a redundant aggregate.
+foreach join_host_case : [
+  'domains-empty-plain', 'domains-empty-filtered',
+  'domains-kind0', 'domains-kind2', 'domains-kind3', 'domains-kind4',
+  'domains-kind5', 'domains-kind6', 'domains-kind7', 'domains-kind8',
+  'domains-kind9', 'domains-kind11',
+  'domains-wide-plain', 'domains-wide-timestamped', 'domains-capacity',
+  'recovery', 'failures', 'funding',
+]
+  join_host_suites = ['unit', 'tsan', 'evaluation_join_hosts']
+  if join_host_case.startswith('domains-')
+    join_host_suites += ['evaluation_join_host_domains']
+  endif
+  # Complete wide histories need an exclusive scheduler slot under TSan.
+  join_host_parallel = true
+  if join_host_case in ['domains-wide-plain', 'domains-wide-timestamped']
+    join_host_parallel = false
+  endif
   test('evaluation_join_hosts_' + join_host_case,
        test_evaluation_join_hosts_exe, args: [join_host_case],
-       suite: ['unit', 'tsan', 'evaluation_join_hosts'], timeout: 60)
+       suite: join_host_suites, timeout: 60, is_parallel: join_host_parallel)
 endforeach
 
 # #2298: real generated LFTJ session admission, metadata and recovery.
@@ -7063,8 +7086,20 @@ test_evaluation_join_probes_exe = executable(
   c_args: ['-DWL_SESSION_TEST_HOOKS=1'],
   link_with: [testlib_prod],
 )
-test('evaluation_join_probes', test_evaluation_join_probes_exe,
-     suite: ['unit', 'tsan', 'evaluation_join_hosts'], timeout: 60)
+# Measurement/retry comparisons remain within one complete named history.
+foreach join_probe_case : [
+  'keys', 'keys-wide0', 'keys-wide1', 'keys-wide2', 'bindings',
+  'domains0', 'domains1', 'domains2', 'domains3', 'domains4', 'domains5',
+  'schema0', 'schema1',
+  'events0', 'events1', 'events2', 'events3', 'events4',
+  'allocations0', 'allocations1', 'allocations2', 'schema-final-denial',
+  'first-semi', 'first-anti', 'funding',
+]
+  test('evaluation_join_probes_' + join_probe_case,
+       test_evaluation_join_probes_exe, args: [join_probe_case],
+       suite: ['unit', 'tsan', 'evaluation_join_hosts', 'evaluation_join_probes'],
+       timeout: 60)
+endforeach
 
 # #2297: authentic unspecialized empty descriptors retain both source gates.
 test_relation_empty_source_exe = executable(
@@ -7118,3 +7153,37 @@ expression_intern_exe = executable('test_evaluation_expression_intern',
 test('evaluation_expression_intern', expression_intern_exe,
   suite: ['unit', 'tsan'], timeout: 60,
 )
+# #2297: configured controlled JOIN sink policy and recovery.
+test_evaluation_join_host_policies_exe = executable(
+  'test_evaluation_join_host_policies', files('test_evaluation_join_host_policies.c'),
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
+  c_args: ['-DWL_SESSION_TEST_HOOKS=1'],
+  link_with: [testlib_prod],
+)
+test('evaluation_join_host_policies', test_evaluation_join_host_policies_exe,
+     suite: ['unit', 'tsan', 'evaluation_join_hosts'], timeout: 60)
+
+test_evaluation_join_host_strict_exe = executable(
+  'test_evaluation_join_host_strict', files('test_evaluation_join_host_strict.c'),
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
+  c_args: ['-DWL_SESSION_TEST_HOOKS=1'],
+  link_with: [testlib_prod],
+)
+test('evaluation_join_host_strict', test_evaluation_join_host_strict_exe,
+     suite: ['unit', 'tsan', 'evaluation_join_hosts'], timeout: 60)
+
+# #2297: transaction-owned JOIN sources across real public operations.
+test_evaluation_join_host_lifecycle_exe = executable(
+  'test_evaluation_join_host_lifecycle', files('test_evaluation_join_host_lifecycle.c'),
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
+  c_args: ['-DWL_SESSION_TEST_HOOKS=1'],
+  link_with: [testlib_prod],
+)
+foreach join_lifecycle_case : ['successors', 'snapshots', 'recovery', 'funding', 'snapshot-recovery', 'appends', 'strict', 'native-end', 'snapshot-end', 'bootstrap-end', 'snapshot-finance-birth', 'snapshot-exhaust-evaluating-end', 'snapshot-exhaust-evaluating-successor', 'snapshot-exhaust-completed-end', 'snapshot-exhaust-completed-successor', 'admission-strata-step', 'admission-strata-snapshot', 'admission-strata-refusal', 'admission-read-failure', 'private-cap']
+  test('evaluation_join_host_lifecycle_' + join_lifecycle_case,
+       test_evaluation_join_host_lifecycle_exe, args: [join_lifecycle_case],
+       suite: ['unit', 'tsan', 'evaluation_join_hosts'], timeout: 60)
+endforeach

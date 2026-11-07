@@ -74,6 +74,110 @@ same_report(const wl_evaluation_control_report_t *a,
         && a->cleanup_status == b->cleanup_status && a->result == b->result);
 }
 
+typedef struct {
+    wl_evaluation_control_t *control;
+    uint64_t id;
+} lexical_birth_t;
+
+static int
+lexical_birth(void *payload)
+{
+    lexical_birth_t *birth = payload;
+    int rc = wl_evaluation_control_create(0, &birth->control);
+    if (rc) return rc;
+    rc = wl_evaluation_control_attach(birth->control, birth);
+    if (rc) {
+        wl_evaluation_control_release(birth->control);
+        birth->control = NULL;
+        return rc;
+    }
+    rc = wl_evaluation_control_begin(birth->control, birth);
+    if (rc) {
+        CHECK(!wl_evaluation_control_detach(birth->control, birth));
+        wl_evaluation_control_release(birth->control);
+        birth->control = NULL;
+        return rc;
+    }
+    birth->id = wl_evaluation_control_active_attempt_id(birth->control);
+    return birth->id ? 0 : EINVAL;
+}
+
+/* Deliberately invalid reentrant SOURCE caller, never a production action. */
+static wl_evaluation_control_source_bank_t *negative_lexical_bank;
+static int
+lexical_reentry(void *payload)
+{
+    wl_evaluation_control_source_phase_result_t nested =
+        wl_evaluation_control_source_bank_run_lexical(negative_lexical_bank,
+            WL_EVALUATION_CONTROL_SOURCE_OPERATION, &test_policy,
+            count_action, payload);
+    CHECK(nested.financial_result == EBUSY && !nested.action_called);
+    return 0;
+}
+
+static void
+lexical_lifetime(wl_evaluation_control_source_bank_t *bank,
+    wl_evaluation_control_t *original)
+{
+    wl_evaluation_control_report_t before, after;
+    CHECK(!wl_evaluation_control_report(original, &before));
+    unsigned calls = 0;
+    wl_evaluation_control_source_context_t borrowed = {0};
+    CHECK(!wl_evaluation_control_source_context_begin(bank,
+        WL_EVALUATION_CONTROL_SOURCE_OPERATION, &borrowed));
+    wl_evaluation_control_source_phase_result_t r =
+        wl_evaluation_control_source_bank_run_lexical(bank,
+            WL_EVALUATION_CONTROL_SOURCE_OPERATION, &test_policy,
+            count_action, &calls);
+    CHECK(r.financial_result == EBUSY && !r.action_called && !calls);
+    CHECK(!wl_evaluation_control_source_context_end(&borrowed));
+    const wl_evaluation_control_source_phase_policy_t invalid[] = {
+        {0, 1, 1}, {1, 0, 1}, {1, 1, 0},
+        {WL_EVALUATION_CONTROL_QUANTUM + 1, 1, 1},
+        {1, WL_EVALUATION_CONTROL_QUANTUM + 1, 1},
+        {1, 1, WL_EVALUATION_CONTROL_QUANTUM + 1}
+    };
+    for (unsigned i = 0; i < sizeof(invalid) / sizeof(*invalid); ++i) {
+        r = wl_evaluation_control_source_bank_run_lexical(bank,
+                WL_EVALUATION_CONTROL_SOURCE_OPERATION, &invalid[i],
+                count_action, &calls);
+        CHECK(r.financial_result == EINVAL && !r.action_called && !calls);
+    }
+    negative_lexical_bank = bank;
+    r = wl_evaluation_control_source_bank_run_lexical(bank,
+            WL_EVALUATION_CONTROL_SOURCE_OPERATION, &test_policy,
+            lexical_reentry, &calls);
+    CHECK(!r.financial_result && r.action_called && !r.action_result && !calls);
+    negative_lexical_bank = NULL;
+    for (unsigned lane = 0; lane < 2; ++lane) {
+        lexical_birth_t birth = {0};
+        r = wl_evaluation_control_source_bank_run_lexical(bank,
+                (wl_evaluation_control_source_lane_t)lane, &test_policy,
+                lexical_birth, &birth);
+        CHECK(!r.financial_result && r.action_called && !r.action_result
+            && birth.control && birth.id);
+        CHECK(!wl_evaluation_control_charge_attempt(birth.control, birth.id,
+            1));
+        CHECK(!wl_evaluation_control_finish(birth.control, &birth, 0, 0));
+        CHECK(!wl_evaluation_control_detach(birth.control, &birth));
+        wl_evaluation_control_release(birth.control);
+        /* Each lexical call released its real lane association, so an ordinary
+         * context can immediately acquire it and complete its own lifetime. */
+        CHECK(!wl_evaluation_control_source_context_begin(bank,
+            (wl_evaluation_control_source_lane_t)lane, &borrowed));
+        CHECK(!wl_evaluation_control_source_context_end(&borrowed));
+    }
+    for (unsigned i = 0; i < 4096; ++i) {
+        r = wl_evaluation_control_source_bank_run_lexical(bank,
+                WL_EVALUATION_CONTROL_SOURCE_OPERATION, &test_policy,
+                count_action, &calls);
+        CHECK(!r.financial_result && r.action_called && !r.action_result);
+    }
+    CHECK(calls == 4096);
+    CHECK(!wl_evaluation_control_report(original, &after));
+    same_report(&before, &after);
+}
+
 static void
 public_birth_and_partial_failure(void)
 {
@@ -146,6 +250,7 @@ main(void)
 
     wl_evaluation_control_source_bank_t *bank = NULL;
     CHECK(!wl_evaluation_control_source_bank_create(&bank) && bank);
+    lexical_lifetime(bank, original);
     wl_evaluation_control_source_context_t context = {0};
     CHECK(!wl_evaluation_control_source_context_begin(bank,
         WL_EVALUATION_CONTROL_SOURCE_OPERATION, &context));
@@ -236,6 +341,14 @@ main(void)
         && r.action_result == EOVERFLOW && !failed);
     CHECK(!wl_evaluation_control_report(original, &after));
     same_report(&before, &after);
+    CHECK(!wl_evaluation_control_source_context_end(&context));
+    r = wl_evaluation_control_source_bank_run_lexical(bank,
+            WL_EVALUATION_CONTROL_SOURCE_OPERATION, &test_policy,
+            real_failed_constructor, &failed);
+    CHECK(!r.financial_result && r.action_called
+        && r.action_result == EOVERFLOW && !failed);
+    CHECK(!wl_evaluation_control_source_context_begin(bank,
+        WL_EVALUATION_CONTROL_SOURCE_OPERATION, &context));
     CHECK(!wl_evaluation_control_source_context_end(&context));
     CHECK(!wl_evaluation_control_source_bank_destroy(&bank) && !bank);
     CHECK(wl_evaluation_control_active_attempt_id(original) == 2);

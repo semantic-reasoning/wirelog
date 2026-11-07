@@ -1937,7 +1937,8 @@ wl_columnar_eval_delta_observer_build_advance(wl_col_session_t *sess,
         bool release = b->phase == WL_COLUMNAR_DELTA_BUILD_RELEASE;
         rc = r ? wl_columnar_relation_reader_step(r, &b->reader, release,
                 control, id)
-            : wl_evaluation_control_charge(control, 1);
+            : wl_evaluation_control_charge_attempt(control, id,
+                1);
         if (rc) return rc;
         if (!release && r) {
             b->row = 0;
@@ -1954,13 +1955,16 @@ wl_columnar_eval_delta_observer_build_advance(wl_col_session_t *sess,
         } else b->phase = WL_COLUMNAR_DELTA_BUILD_ACQUIRE;
         if (wl_evaluation_control_active_attempt_id(control) !=
             id) return EINVAL;
-        rc = wl_evaluation_control_charge(control, 0);
+        rc = wl_evaluation_control_charge_attempt(control, id,
+                0);
         return rc ? rc : EAGAIN;
     }
-    rc = wl_evaluation_control_charge(control, 1);
+    rc = wl_evaluation_control_charge_attempt(control, id,
+            1);
     if (rc) return rc;
     if (b->phase == WL_COLUMNAR_DELTA_BUILD_READY) {
-        rc = wl_evaluation_control_charge(control, 0);
+        rc = wl_evaluation_control_charge_attempt(control, id,
+                0);
         if (rc) return rc;
         sess->delta_observer = b->observer;
         sess->delta_observer_reserved_bytes = b->metadata_bytes +
@@ -1973,7 +1977,8 @@ wl_columnar_eval_delta_observer_build_advance(wl_col_session_t *sess,
     int action = wl_columnar_eval_delta_build_action(sess, b);
     if (action > 0) b->error = action;
     if (wl_evaluation_control_active_attempt_id(control) != id) return EINVAL;
-    rc = wl_evaluation_control_charge(control, 0);
+    rc = wl_evaluation_control_charge_attempt(control, id,
+            0);
     return rc > 0 ? rc : action ? action : rc ? rc : EAGAIN;
 }
 
@@ -2640,7 +2645,9 @@ wl_columnar_eval_delta_observer_prepare_advance_action(wl_col_session_t *sess,
             || (p->phase == WL_COLUMNAR_DELTA_PREPARE_CAPTURE
             && p->row == p->observer->entries[p->entry].current_nrows);
     }
-    int rc = reader_action ? 0 : wl_evaluation_control_charge(control, 1);
+    int rc = reader_action ? 0 : wl_evaluation_control_charge_attempt(control,
+            id,
+            1);
     if (rc) return rc;
     if (p->phase == WL_COLUMNAR_DELTA_PREPARE_STREAM_VALIDATE) {
         col_rel_t *rel = o->stream_relation;
@@ -2937,12 +2944,14 @@ wl_columnar_eval_delta_observer_prepare_advance_action(wl_col_session_t *sess,
 #endif
             if (wl_evaluation_control_active_attempt_id(control) != id)
                 return EINVAL;
-            rc = wl_evaluation_control_charge(control, 0);
+            rc = wl_evaluation_control_charge_attempt(control, id,
+                    0);
             if (rc) return rc;
         } else {
             if (wl_evaluation_control_active_attempt_id(control) != id)
                 return EINVAL;
-            rc = wl_evaluation_control_charge(control, 0);
+            rc = wl_evaluation_control_charge_attempt(control, id,
+                    0);
             if (rc) return rc;
         }
         o->prepared = true;
@@ -2953,7 +2962,8 @@ wl_columnar_eval_delta_observer_prepare_advance_action(wl_col_session_t *sess,
     } else return EINVAL;
 action_done:
     if (wl_evaluation_control_active_attempt_id(control) != id) return EINVAL;
-    rc = wl_evaluation_control_charge(control, 0);
+    rc = wl_evaluation_control_charge_attempt(control, id,
+            0);
     return rc ? rc : EAGAIN;
 }
 

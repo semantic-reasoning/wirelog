@@ -1153,6 +1153,15 @@ enum {
     WL_COLUMNAR_JOIN_HOST_STAGE_LEFT_HOLD,
     WL_COLUMNAR_JOIN_HOST_STAGE_KEYS_ALLOC,
     WL_COLUMNAR_JOIN_HOST_STAGE_KEYS,
+    WL_COLUMNAR_JOIN_HOST_CLASSIFY,
+    WL_COLUMNAR_JOIN_HOST_APPEND_SELECT,
+    WL_COLUMNAR_JOIN_HOST_STRICT_SUCCESSOR,
+    WL_COLUMNAR_JOIN_HOST_STRICT_CACHE_BEGIN,
+    WL_COLUMNAR_JOIN_HOST_STRICT_CACHE_ENTRY,
+    WL_COLUMNAR_JOIN_HOST_STRICT_CACHE_NAME,
+    WL_COLUMNAR_JOIN_HOST_STRICT_CACHE_KEY,
+    WL_COLUMNAR_JOIN_HOST_STRICT_CACHE_MATCH,
+    WL_COLUMNAR_JOIN_HOST_STRICT_CACHE_FINAL,
     WL_COLUMNAR_JOIN_HOST_DRAIN = 60,
     WL_COLUMNAR_JOIN_HOST_FINAL_UNARY,
     WL_COLUMNAR_JOIN_HOST_OLD_PREPARE,
@@ -1250,6 +1259,14 @@ typedef struct {
     unsigned phase;
     int result;
     wl_columnar_join_host_setup_t setup;
+    /* Read-only strict policy cursors. They never authorize native work. */
+    uint32_t strict_cursor, strict_depth, strict_return;
+    bool strict_early, strict_final, strict_empty;
+    col_arr_entry_t *strict_entries;
+    uint32_t strict_count, strict_capacity, strict_key;
+    size_t strict_byte;
+    col_relation_snapshot_t strict_snapshot;
+    bool strict_tombstone, strict_pin, strict_victim;
 } wl_columnar_join_host_t;
 
 size_t
@@ -1550,12 +1567,12 @@ static uint64_t
 wl_columnar_join_pipeline_phase_work(const wl_columnar_join_host_t *h,
     int semantic_result)
 {
-    return h->phase == WL_COLUMNAR_JOIN_HOST_CONSUMER_START
-           || h->phase == WL_COLUMNAR_JOIN_HOST_CONSUMER_STEP
-           || h->phase == WL_COLUMNAR_JOIN_HOST_CONSUMER_ACK
+    return (h->phase >= WL_COLUMNAR_JOIN_HOST_CONSUMER_START
+           && h->phase <= WL_COLUMNAR_JOIN_HOST_CONSUMER_ACK)
            || (h->exchange_active && h->consumer_live
            && (h->phase == WL_COLUMNAR_JOIN_HOST_ABORT || semantic_result))
-        ? 384 : 1;
+        ? 384 : (h->phase >= WL_COLUMNAR_JOIN_HOST_APPEND_SELECT
+           && h->phase <= WL_COLUMNAR_JOIN_HOST_STRICT_CACHE_FINAL) ? 192 : 1;
 }
 
 int
@@ -1647,6 +1664,175 @@ wl_columnar_join_host_consumer(wl_columnar_join_host_t *h, unsigned action)
     return 0;
 }
 
+/* A native-error consumer uses the actual stream dispatch and closes it on
+ * every path. Financial proof cuts neither select nor authorize a native op. */
+static int
+wl_columnar_join_host_consumer_cleanup(wl_columnar_join_host_t *h,
+    wl_evaluation_control_t *funding, uint64_t id)
+{
+    wl_columnar_eval_plan_numeric_attempt_t *r = h->parent;
+    wl_columnar_eval_serial_framed_attempt_t *parent = NULL;
+    int rc = wl_columnar_eval_stack_framed_context(r->frame, r->session,
+            &parent);
+    if (rc) return rc;
+    rc = wl_evaluation_control_charge_attempt(funding, id, 0);
+    if (rc) return rc;
+    unsigned action = h->consumer_status.progress ==
+        WL_COLUMNAR_FILTER_PROGRESS_DONE
+        ? WL_COLUMNAR_JOIN_STREAM_ACK : WL_COLUMNAR_JOIN_STREAM_STEP;
+    if (!parent->native_cleanup) return wl_columnar_join_host_consumer(h,
+                   action);
+    const wl_plan_op_t *op = &r->plan->ops[h->consumer_cursor];
+    rc = wl_columnar_eval_stack_stream_dispatch_owned(r->frame, r, h, op,
+            action, true);
+    if (rc) return rc;
+    WL_COLUMNAR_JOIN_HOST_HOOK(h, WL_COLUMNAR_JOIN_PIPELINE_TEST_CONSUMER);
+    rc = wl_columnar_filter_op_native_cleanup_latch_owned(r->frame, r, funding,
+            id, NULL);
+    if (!rc) rc = wl_evaluation_control_charge_attempt(funding, id, 0);
+    if (!rc) rc = action == WL_COLUMNAR_JOIN_STREAM_STEP
+        ? wl_columnar_filter_op_attempt_step_owned(r->frame,
+                &h->consumer_status, r)
+        : wl_columnar_filter_op_attempt_ack_owned(r->frame, r);
+    int paid = wl_evaluation_control_charge_attempt(funding, id, 0);
+    if (!rc) rc = paid;
+    bool done = false;
+    int state = wl_columnar_eval_stack_stream_consumer_state_owned(r->frame,
+            r, h, &h->consumer_live, &done);
+    int closed = wl_columnar_eval_stack_stream_dispatch_owned(r->frame, r, h,
+            op, action, false);
+    if (state || closed) return state ? state : closed;
+    h->consumer_protocol = rc; h->consumer_pending = true;
+    if (!rc && action == WL_COLUMNAR_JOIN_STREAM_ACK &&
+        h->consumer_live) return EBUSY;
+    /* h->phase remains ABORT; no next consumer/producer or sink commit. */
+    return rc;
+}
+
+static int
+wl_columnar_join_host_strict_successor(wl_columnar_join_host_t *h)
+{
+    WL_COLUMNAR_JOIN_HOST_HOOK(h,
+        WL_COLUMNAR_JOIN_PIPELINE_TEST_STRICT_SUCCESSOR);
+    int rc = wl_columnar_join_host_original(h, 128);
+    if (rc) return rc;
+    if (h->strict_cursor == h->parent->plan->op_count) {
+        h->phase = h->strict_return;
+        return 0;
+    }
+    const wl_plan_op_t *op = &h->parent->plan->ops[h->strict_cursor++];
+    switch (op->op) {
+    case WL_PLAN_OP_VARIABLE:
+    case WL_PLAN_OP_LFTJ:
+    case WL_PLAN_OP_K_FUSION:
+        if (h->strict_depth == UINT32_MAX) return EOVERFLOW;
+        ++h->strict_depth;
+        break;
+    case WL_PLAN_OP_MAP:
+    case WL_PLAN_OP_FILTER:
+    case WL_PLAN_OP_JOIN:
+    case WL_PLAN_OP_SEMIJOIN:
+    case WL_PLAN_OP_ANTIJOIN:
+    case WL_PLAN_OP_REDUCE:
+        if (!h->strict_depth) return ENOTSUP;
+        break;
+    case WL_PLAN_OP_CONSOLIDATE:
+        break;
+    case WL_PLAN_OP_CONCAT:
+        h->strict_depth = h->strict_depth <= 1u ? 0u : h->strict_depth - 1u;
+        break;
+    case WL_PLAN_OP_EXCHANGE: {
+        const wl_plan_op_exchange_t *meta = op->opaque_data;
+        if (!meta) return ENOTSUP;
+        if (meta->num_workers <= 1u) break;
+        if (!h->strict_depth) h->phase = h->strict_return;
+        else --h->strict_depth;
+        break;
+    }
+    default: return ENOTSUP;
+    }
+    return 0;
+}
+
+/* The private prepared index replaces cache construction, not a live cache
+* borrower's protection. Inspect one entry, name byte or key per action. */
+static int
+wl_columnar_join_host_strict_cache(wl_columnar_join_host_t *h)
+{
+    WL_COLUMNAR_JOIN_HOST_HOOK(h, WL_COLUMNAR_JOIN_PIPELINE_TEST_STRICT_CACHE);
+    wl_col_session_t *session = h->parent->session;
+    int rc = wl_columnar_join_host_original(h, 128);
+    if (rc) return rc;
+    if (h->strict_entries != session->arr_entries
+        || h->strict_count != session->arr_count
+        || h->strict_capacity != session->arr_cap) return EAGAIN;
+    if (h->phase == WL_COLUMNAR_JOIN_HOST_STRICT_CACHE_FINAL) {
+        bool pressure = session->arr_count >= COL_ARR_CACHE_MAX
+            || session->arr_total_bytes >= session->arr_cache_limit_bytes;
+        bool evicts = pressure && h->strict_victim
+            && session->arr_total_bytes >
+            (session->arr_cache_limit_bytes / 4u) * 3u;
+        if (!h->strict_tombstone && !evicts && h->strict_pin
+            && h->strict_count >= h->strict_capacity) return EBUSY;
+        h->phase = WL_COLUMNAR_JOIN_HOST_UNARY;
+        return 0;
+    }
+    if (h->strict_cursor == h->strict_count) {
+        h->phase = WL_COLUMNAR_JOIN_HOST_STRICT_CACHE_FINAL;
+        return 0;
+    }
+    col_arr_entry_t *entry = &h->strict_entries[h->strict_cursor];
+    switch (h->phase) {
+    case WL_COLUMNAR_JOIN_HOST_STRICT_CACHE_ENTRY:
+        h->strict_pin |= entry->pin_count != 0;
+        h->strict_tombstone |= !entry->mem_bytes && !entry->pin_count;
+        h->strict_victim |= entry->mem_bytes && !entry->pin_count
+            && (!entry->arr.nbuckets
+            || !wl_columnar_relation_snapshot_valid(entry->source_snapshot)
+            || entry->lru_clock < UINT64_MAX);
+        if (entry->key_count == h->op->key_count && entry->rel_name) {
+            h->strict_byte = 0;
+            h->phase = WL_COLUMNAR_JOIN_HOST_STRICT_CACHE_NAME;
+        } else ++h->strict_cursor;
+        break;
+    case WL_COLUMNAR_JOIN_HOST_STRICT_CACHE_NAME: {
+        char actual = entry->rel_name[h->strict_byte];
+        char expected = h->right->name[h->strict_byte];
+        if (actual != expected) {
+            ++h->strict_cursor;
+            h->phase = WL_COLUMNAR_JOIN_HOST_STRICT_CACHE_ENTRY;
+        } else if (!actual) {
+            h->strict_key = 0;
+            h->phase = WL_COLUMNAR_JOIN_HOST_STRICT_CACHE_KEY;
+        } else {
+            if (h->strict_byte == SIZE_MAX) return EOVERFLOW;
+            ++h->strict_byte;
+        }
+        break;
+    }
+    case WL_COLUMNAR_JOIN_HOST_STRICT_CACHE_KEY:
+        if (h->strict_key == h->op->key_count)
+            h->phase = WL_COLUMNAR_JOIN_HOST_STRICT_CACHE_MATCH;
+        else if (entry->key_cols[h->strict_key]
+            != h->keys[h->op->key_count + h->strict_key]) {
+            ++h->strict_cursor;
+            h->phase = WL_COLUMNAR_JOIN_HOST_STRICT_CACHE_ENTRY;
+        } else ++h->strict_key;
+        break;
+    case WL_COLUMNAR_JOIN_HOST_STRICT_CACHE_MATCH:
+        if (entry->pin_count && (!entry->arr.nbuckets
+            || !wl_columnar_relation_snapshot_equal(entry->source_snapshot,
+            h->strict_snapshot)
+            || entry->arr.indexed_rows != h->right_source.nrows
+            || entry->rebuild_deferred)) return EBUSY;
+        if (entry->pin_count == UINT32_MAX) return EOVERFLOW;
+        h->phase = WL_COLUMNAR_JOIN_HOST_UNARY;
+        break;
+    default: return EINVAL;
+    }
+    return 0;
+}
+
 static int
 wl_columnar_join_host_forward(wl_columnar_join_host_t *h)
 {
@@ -1655,6 +1841,15 @@ wl_columnar_join_host_forward(wl_columnar_join_host_t *h)
     int rc;
     switch (h->phase) {
     case WL_COLUMNAR_JOIN_HOST_LEFT_INIT:
+        if (r->session->join_batch_strict && !h->strict_early
+            && (!op->key_count || op->materialized ||
+            op->right_filter_expr.size)) {
+            h->strict_early = true;
+            h->strict_cursor = r->cursor + 1u;
+            h->strict_return = WL_COLUMNAR_JOIN_HOST_LEFT_INIT;
+            h->phase = WL_COLUMNAR_JOIN_HOST_STRICT_SUCCESSOR;
+            return 0;
+        }
         /* Routing hint only: ordinary JOIN must authenticate the descriptor.
          * Normal scalar HOLD cannot acquire a never-inserted EDB. */
         if (!h->left->ncols) {
@@ -1696,6 +1891,10 @@ wl_columnar_join_host_forward(wl_columnar_join_host_t *h)
             && h->delta->nrows < h->right->nrows) {
             h->right = h->delta; h->used_delta = true;
         }
+        if (h->bindings) {
+            h->phase = WL_COLUMNAR_JOIN_HOST_APPEND_SELECT;
+            return 0;
+        }
         col_rel_t *append = NULL;
         rc = wl_columnar_session_delta_source(r->session, h->bindings, op,
                 &append);
@@ -1704,15 +1903,33 @@ wl_columnar_join_host_forward(wl_columnar_join_host_t *h)
             h->right = append; h->used_delta = true;
             h->forced_empty = append->nrows == 0;
         }
+    }
+    /* fall through */
+    case WL_COLUMNAR_JOIN_HOST_CLASSIFY:
         /* These are named intrinsic ordinary destinations. No unary claim
          * has started, so the existing bounded child can run after drain. */
         if (!h->right || !h->right->ncols || h->forced_empty
-            || h->used_delta || !op->key_count
+            || !op->key_count
             || op->materialized || op->right_filter_expr.size
             || (op->project_count && !op->project_indices)) {
             r->join_host_declined = true;
             h->phase = WL_COLUMNAR_JOIN_HOST_ABORT;
         } else h->phase = WL_COLUMNAR_JOIN_HOST_RIGHT_INIT;
+        return 0;
+    /* Dynamic append selection owns its full tuple/geometry/snapshot work.
+     * Its native binding remains transaction-owned through the child ACK. */
+    case WL_COLUMNAR_JOIN_HOST_APPEND_SELECT: {
+        rc = wl_columnar_join_host_original(h, 192);
+        if (rc) return rc;
+        col_rel_t *append = NULL;
+        rc = wl_columnar_session_delta_source(r->session, h->bindings, op,
+                &append);
+        if (rc) return rc;
+        if (append) {
+            h->right = append; h->used_delta = true;
+            h->forced_empty = append->nrows == 0;
+        }
+        h->phase = WL_COLUMNAR_JOIN_HOST_CLASSIFY;
         return 0;
     }
     case WL_COLUMNAR_JOIN_HOST_RIGHT_INIT:
@@ -1769,6 +1986,13 @@ wl_columnar_join_host_forward(wl_columnar_join_host_t *h)
                 (rt == WIRELOG_TYPE_FLOAT)) return EINVAL;
             ++h->key_cursor;
         } else {
+            if (h->used_delta) {
+                if (r->session->join_batch_strict) return ENOTSUP;
+                r->join_host_declined = true;
+                h->phase = WL_COLUMNAR_JOIN_HOST_ABORT;
+                return 0;
+            }
+            h->strict_empty = !h->left_source.nrows || !h->right_source.nrows;
             h->stage_cursor = r->cursor + 1u;
             h->phase = h->streaming ? WL_COLUMNAR_JOIN_HOST_PROBE_SCAN
                 : WL_COLUMNAR_JOIN_HOST_UNARY;
@@ -1950,7 +2174,23 @@ wl_columnar_join_host_forward(wl_columnar_join_host_t *h)
     case WL_COLUMNAR_JOIN_HOST_UNARY:
         /* Runtime probe qualification precedes producer row-fit refusal, as
          * in the raw pipeline. A declined producer owns no unary claim. */
+        if (r->session->join_batch_strict && !h->strict_final) {
+            h->strict_final = true;
+            h->strict_cursor = (h->streaming ? h->tail_end : r->cursor) + 1u;
+            h->strict_depth = 0;
+            h->strict_return = (!h->streaming && h->strict_empty)
+                || !r->session->arr_count ? WL_COLUMNAR_JOIN_HOST_UNARY
+                : WL_COLUMNAR_JOIN_HOST_STRICT_CACHE_BEGIN;
+            h->phase = WL_COLUMNAR_JOIN_HOST_STRICT_SUCCESSOR;
+            return 0;
+        }
+        if (r->session->join_batch_strict && !h->streaming && h->strict_empty) {
+            r->join_host_declined = true;
+            h->phase = WL_COLUMNAR_JOIN_HOST_ABORT;
+            return 0;
+        }
         if (!h->row_fits) {
+            if (r->session->join_batch_strict) return ENOTSUP;
             r->join_host_declined = true;
             h->phase = WL_COLUMNAR_JOIN_HOST_ABORT;
             return 0;
@@ -1973,6 +2213,32 @@ wl_columnar_join_host_forward(wl_columnar_join_host_t *h)
                 &h->output_slot, r);
         if (!rc) h->phase = WL_COLUMNAR_JOIN_HOST_PREPARE_BEGIN;
         return rc;
+    case WL_COLUMNAR_JOIN_HOST_STRICT_SUCCESSOR:
+        return wl_columnar_join_host_strict_successor(h);
+    case WL_COLUMNAR_JOIN_HOST_STRICT_CACHE_BEGIN: {
+        /* A transaction image with the same name is not the public cache's
+         * source. Resolve the canonical public source before applying it. */
+        col_rel_t *public_right = NULL;
+        rc = wl_columnar_join_attempt_lookup(r->session, op->right_relation,
+                false, &public_right, r->control, r->attempt_id, NULL);
+        if (rc) return rc;
+        h->phase = WL_COLUMNAR_JOIN_HOST_UNARY;
+        if (public_right == h->right && r->session->arr_count) {
+            h->strict_entries = r->session->arr_entries;
+            h->strict_count = r->session->arr_count;
+            h->strict_capacity = r->session->arr_cap;
+            h->strict_snapshot = wl_columnar_relation_snapshot(h->right);
+            h->strict_cursor = 0;
+            h->phase = WL_COLUMNAR_JOIN_HOST_STRICT_CACHE_ENTRY;
+        }
+        return 0;
+    }
+    case WL_COLUMNAR_JOIN_HOST_STRICT_CACHE_ENTRY:
+    case WL_COLUMNAR_JOIN_HOST_STRICT_CACHE_NAME:
+    case WL_COLUMNAR_JOIN_HOST_STRICT_CACHE_KEY:
+    case WL_COLUMNAR_JOIN_HOST_STRICT_CACHE_MATCH:
+    case WL_COLUMNAR_JOIN_HOST_STRICT_CACHE_FINAL:
+        return wl_columnar_join_host_strict_cache(h);
     case WL_COLUMNAR_JOIN_HOST_PREPARE_BEGIN:
         rc = wl_columnar_join_batch_prepare_begin(&h->prepare, r->session,
                 op, h->left, h->right, h->left_delta, h->keys,
@@ -2166,8 +2432,10 @@ wl_columnar_join_host_forward(wl_columnar_join_host_t *h)
         wl_columnar_filter_attempt_batch_init(&h->writer);
         wl_columnar_relation_private_batch_drain_init(&h->writer_drain);
         h->writer_initialized = true;
-        rc = wl_columnar_relation_append_batch_begin_controlled(&h->writer,
-                h->output, r->control);
+        rc =
+            wl_columnar_relation_append_batch_begin_attempt_controlled(
+            &h->writer,
+            h->output, r->control, r->attempt_id);
         if (!rc) h->phase = WL_COLUMNAR_JOIN_HOST_GATHER;
         return rc;
     case WL_COLUMNAR_JOIN_HOST_GATHER:
@@ -2390,12 +2658,8 @@ wl_columnar_join_host_cleanup(wl_columnar_join_host_t *h,
         return rc;
     }
     if (h->exchange_active) {
-        if (h->consumer_live) {
-            unsigned action = h->consumer_status.progress
-                == WL_COLUMNAR_FILTER_PROGRESS_DONE
-                ? WL_COLUMNAR_JOIN_STREAM_ACK : WL_COLUMNAR_JOIN_STREAM_STEP;
-            return wl_columnar_join_host_consumer(h, action);
-        }
+        if (h->consumer_live)
+            return wl_columnar_join_host_consumer_cleanup(h, funding, id);
         rc = wl_evaluation_control_charge_attempt(funding, id, 128);
         if (rc) return rc;
         rc = wl_columnar_eval_stack_stream_restore_owned(r->frame, r, h,
@@ -2645,6 +2909,14 @@ wl_columnar_join_pipeline_host_ack(wl_columnar_join_host_t *h,
         h->pending = NULL; h->phase = h->streaming
             ? WL_COLUMNAR_JOIN_HOST_TRANSFORM_RETIRE :
             WL_COLUMNAR_JOIN_HOST_PRODUCE;
+        /* The committed extent is post-consumer for streaming, and JOIN
+         * output for a direct sink. Phase advance journals this once,
+         * before the ACK hook; a later cancellation cannot mask overflow. */
+        wl_col_session_t *session = h->parent->session;
+        if (h->extent > session->join_output_peak)
+            session->join_output_peak = h->extent;
+        if (session->join_output_limit
+            && h->extent >= session->join_output_limit) rc = EOVERFLOW;
         WL_COLUMNAR_JOIN_HOST_HOOK(h,
             WL_COLUMNAR_JOIN_PIPELINE_TEST_AFTER_ACK);
     }
@@ -2788,7 +3060,7 @@ wl_columnar_join_pipeline_numeric_step_funded(
     rc = wl_columnar_eval_stack_numeric_owner(r->frame, r);
     if (rc) return rc;
     if (!r->composed_busy || !r->composed_mode
-        || !r->controlled_materialized_batch_fallback || r->private_bindings
+        || !r->controlled_materialized_batch_fallback
         || !r->control || !r->attempt_id
         || r->session->cleanup_active != r->frame
         || r->phase != WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_JOIN_BATCH
@@ -3017,25 +3289,21 @@ wl_columnar_join_pipeline_setup_bootstrap(
             ? r->session->memory_governor
             : stack->items[stack->top - 1].rel->memory_governor;
         col_rel_t *right = NULL, *delta = NULL;
+        const wl_columnar_eval_private_bindings_t *bindings = NULL;
         const wl_plan_op_t *op = &r->plan->ops[r->cursor];
         bool left_delta = stack->items[stack->top - 1].is_delta;
         if (!candidate) {
-            const wl_columnar_eval_private_bindings_t *bindings = NULL;
             wl_columnar_join_setup_result_t checked =
                 wl_columnar_eval_plan_numeric_private_bindings_get_funded(r,
                     r->frame, r->session, r->control, r->attempt_id,
                     funding, id, &bindings);
             result = wl_columnar_join_pipeline_setup_result(checked);
             if (result.protocol) return result;
-            if (bindings) return (wl_columnar_join_pipeline_setup_result_t){
-                           EINVAL,
-                           WL_COLUMNAR_JOIN_PIPELINE_SETUP_SEMANTIC
-                };
             result = wl_columnar_join_pipeline_setup_head(r, funding, id,
                     WL_COLUMNAR_JOIN_PIPELINE_SETUP_LOOKUP_WORK);
             if (result.protocol) return result;
             rc = wl_columnar_join_attempt_lookup(r->session, op->right_relation,
-                    false, &right, r->control, r->attempt_id, NULL);
+                    false, &right, r->control, r->attempt_id, bindings);
             result = wl_columnar_join_pipeline_setup_resource_tail(r, funding,
                     id, rc);
             if (result.protocol) return result;
@@ -3046,7 +3314,7 @@ wl_columnar_join_pipeline_setup_bootstrap(
                 if (result.protocol) return result;
                 rc = wl_columnar_join_attempt_lookup(r->session,
                         op->right_relation,
-                        true, &delta, r->control, r->attempt_id, NULL);
+                        true, &delta, r->control, r->attempt_id, bindings);
                 result = wl_columnar_join_pipeline_setup_resource_tail(r,
                         funding, id, rc);
                 if (result.protocol) return result;
@@ -3061,7 +3329,7 @@ wl_columnar_join_pipeline_setup_bootstrap(
                 || (op->delta_mode != WL_DELTA_FORCE_FULL && !left_delta
                 && delta->nrows < right->nrows))) right = delta;
             col_rel_t *append = NULL;
-            rc = wl_columnar_session_delta_source(r->session, NULL, op,
+            rc = wl_columnar_session_delta_source(r->session, bindings, op,
                     &append);
             if (!rc && append) right = append;
             if (!rc && right) candidate = right->memory_governor;
@@ -3245,8 +3513,7 @@ wl_columnar_join_pipeline_setup_unready(
                 funding, id, &bindings);
         result = wl_columnar_join_pipeline_setup_result(checked);
         if (result.protocol) return result;
-        if (bindings) return (wl_columnar_join_pipeline_setup_result_t){EINVAL,
-                                                                        WL_COLUMNAR_JOIN_PIPELINE_SETUP_SEMANTIC};
+        h->bindings = bindings;
         h->setup.phase = WL_COLUMNAR_JOIN_HOST_SETUP_PUBLISH;
         return result;
     }
@@ -3269,13 +3536,13 @@ wl_columnar_join_pipeline_setup_unready(
         || h->key_credit.governor || h->row_credit.governor
         || h->stages_credit.governor || h->keys_admitted
         || h->row_admitted || h->stages_admitted)) rc = EINVAL;
-    /* HEADER initialized these tokens. The pure classifier and NONE binding
-    * proof cannot mutate them; no child has run before this publication. */
+    /* HEADER initialized these tokens. The pure classifier and authenticated
+     * binding proof cannot mutate them; no child ran before publication. */
     result = wl_columnar_join_pipeline_setup_tail(r, funding, id, rc);
     if (result.protocol) return result;
     h->left = stack->items[stack->top - 1].rel;
     h->left_delta = stack->items[stack->top - 1].is_delta;
-    h->bindings = NULL; h->phase = WL_COLUMNAR_JOIN_HOST_LEFT_INIT;
+    h->phase = WL_COLUMNAR_JOIN_HOST_LEFT_INIT;
     r->join_host_initialized_bytes = sizeof(*h) + 1u;
     return result;
 }
@@ -3290,7 +3557,7 @@ wl_columnar_join_pipeline_numeric_setup_step(
     int rc = wl_columnar_eval_stack_numeric_owner(r->frame, r);
     if (rc) return rc;
     if (!r->composed_busy || !r->composed_mode
-        || !r->controlled_materialized_batch_fallback || r->private_bindings
+        || !r->controlled_materialized_batch_fallback
         || !r->control || !r->attempt_id
         || r->session->cleanup_active != r->frame
         || r->phase != WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_PENDING

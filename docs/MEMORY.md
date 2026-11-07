@@ -2718,14 +2718,30 @@ following earlier published rows. Inspect DRAINING authority even when an
 initiating positive error masks a cleanup error.
 
 The held-batch region ceilings are begin170, original validation220, each
-capture initialization/pin phase80, renewal128 and set70. Full valid begin
-read-only bootstrap86 includes the inert-single helper63; rejected inert paths
-are bounded by78. This is an explicit retrospective bootstrap exception: dirty,
-inactive and first-refused admissions may report consumed0. Renewal is funded
-before old release and includes both original-ID guards, reinitialization and
-refused-child return continuations. The maximum conservative forward envelope
-is248; the complete post-CAS publication through outer return is225, including
-both wrappers' ordinary return work. Mandatory cleanup bodies remain excluded.
+capture initialization/pin phase80, renewal128 and set70. The caller-generation
+`wl_columnar_relation_append_batch_begin_attempt_controlled` entry admits the
+writer against the supplied saved ID before publishing batch state or acquiring
+source access. A stale ID leaves the successor accounting and batch unchanged.
+Its read-only bootstrap84 includes the inert-single helper63; rejected inert
+paths are bounded by78. Count the extra saved-ID argument in the actual caller.
+The legacy `begin_controlled` entry still captures the current ID, then delegates;
+it does not authenticate an earlier caller generation. Its ordinary wrapper9
+makes the complete bootstrap93 and inert rejection87. These are the concrete
+fixed metadata initialization bounds under the existing retrospective bootstrap
+exception: dirty, inactive and first-refused admissions may report consumed0.
+No refused action receives future body credit. The NULL-control legacy branch
+adds at most10 fixed front/return operations around the unchanged raw begin;
+this does not qualify the raw algorithm as controlled work.
+
+Renewal is funded before old release and includes both original-ID guards,
+reinitialization and refused-child return continuations. The caller-generation
+route retains the conservative forward248 and complete post-CAS publication
+through outer return225. The legacy wrapper adds one final return, giving249
+and226 respectively, including controlled LFTJ/REDUCE callers that retain that
+entry. Begin170 remains sufficient because its actual generic charge expansion
+is replaced by the qualified saved-ID primitive; that reduction supplies no
+credit to the precharge rejection or final return. Mandatory cleanup bodies
+remain excluded.
 
 
 ### Caller-attempt-bound empty scalar schema clone
@@ -6028,6 +6044,18 @@ its owning admission slot is cleared before the admission itself is freed.
 Existing qualified mandatory backend/extension retirement keeps its scoped
 contract. These prices do not qualify other callbacks or public queries.
 
+The common BANK phase finisher checkpoints its still-active saved generation
+immediately before FINISH. A refused positive payment leaves that same phase
+active with a sticky financial stop; the zero payment preserves its diagnostic
+and leaves both consumed work and the private charge journal unchanged. The
+four ordinary call fronts fit the existing finisher ceiling31: its prior
+literal body23 becomes27. FINISH and REPORT remain ordinary settlement work,
+not checkpoints. This narrows the settlement-to-caller interval without
+exporting a controller, changing a positive fee, or granting native authority.
+The lexical runner's remaining settlement, unbind, unlock and caller return
+fronts are bounded by48 after this check. A containing caller still needs its
+own bound; the cut alone does not qualify a Snapshot loop or a native action.
+
 The reusable internal runner requires a separately source-qualified private
 immutable policy and bounded SOURCE-only action. Positive fees no larger than
 256 and finite capacity alone prove no source fit. Complete caller/context,
@@ -6036,6 +6064,17 @@ lifetimes and slack must be established for each real integration. No arbitrary
 BODY/user callback, PENDING loan or native mutation authority comes from BANK
 finance. This foundation does not enable the unfinished ordinary recovery,
 materialized compiler driver or policy/cap acceptance paths.
+
+The synchronous lexical runner keeps its canonical context on its own stack,
+binds the lane under the bank mutex, and clears that association after actual
+phase settlement before returning. Existing external contexts still exclude a
+lexical activation on the same lane; reentry cannot replace an active context.
+It preserves separate financial/action results, including a constructor that
+was called and failed, and exports no private controller or ID. This removes
+the separate context-begin/run/end prefixes for future synchronous issuers.
+It does not supply a production policy: the actual caller, first/unused,
+action, late/close and repeat source/slack still require qualification. Kernel
+test prices exercise lifetime and failure handling only.
 
 ### Generation-bound controller completion
 
@@ -6070,3 +6109,186 @@ remain valid. No future CURRENT payment finances already executed BOOT work.
 This additive protocol has no new production consumer. Public STEP/Snapshot
 adoption, complete caller pricing and all remaining ownership/materialized/cap
 acceptance require their own integration and validation.
+
+### JOIN host SOURCE ownership and native error retirement (#2297)
+
+Configured ordinary serial JOIN hosts construct a local SOURCE financier through
+an admission-owned BANK. Its constructor performs only financial creation,
+attachment and BEGIN. The record stays at its original stack address; neither
+its control nor its saved ID is stored in a native frame, transaction, pending
+receipt or TLS. TLS carries only the admitted session, admission and lane.
+Financial permission never replaces native frame/context/thread/source/key
+validation. All metered shared JOIN work uses the actual saved attempt ID.
+
+SOURCE construction uses BANK phases 248/88/104 and a private phase capacity672.
+Host construction pays HEADER105, CLASSIFY100 and REQUEST140, then checks and
+settles the actual financial report before BODY. A still-active unused gateway
+phase pays81 before settlement; the fresh post-BODY phase pays LATE148 (frame)
+or48 (no frame), first-birth170 (private binding) or126 (default), TUPLE72 and
+CLOSE176. These are SOURCE fees, not extra semantic JOIN output or native grants.
+The typed native cleanup dispatcher instead uses its own 2304 capacity and
+separate checked phase reports. Its ENTRY140/GUARD80 and actual saved-ID zero
+precede checked close. Original AUTO native-error ownership is unchanged.
+
+Semantic completion has a separate private capacity240. ENTRY64, conditional
+bootstrap report retirement96 and WINDUP80 settle before expected Original
+FINISH. A fresh224 owns that actual saved-ID FINISH and its returned result;
+checked private settlement/rebegin precedes fresh RETURN208. Refused financial
+birth retains semantic completion debt without dropping native ownership. The
+BANK-only public footer190/54/208 constructs no new controller and works after
+process-wide controller identity exhaustion.
+
+Controlled Snapshot constructs its final-address financier before any prior
+retry disposal, Original BEGIN or callback. SETUP224 pays local payload and
+reservation initialization, then real checked settlement/rebegin leaves zero
+admitted work across native execution. Optional160 pays prior-disposal metadata
+and/or Original BEGIN and also settles before native execution. The same dormant
+private generation provides the real zero checkpoint on a false typed-cleanup
+probe before the original wrapper. Outer saved-ID FINISH224 settles before a
+fresh RETURN208; all post-birth exits retire only this private controller. At
+most four financial attempts use one controller. Existing static admission and
+preflight validation precede this constructor; local constructor costs do not
+claim to measure the entire public admission path.
+
+Actual native error recovery retains the producer/frame/receipt and its creator
+thread until genuine ACK and cursor retirement. A foreign-thread retry cannot
+mutate them. Snapshot callback END/rebind preserves the frozen Original report
+and does not charge or finish its successor. An active successor prevents
+try-destroy and preserves the owning slot. Financial-only bootstrap failures
+retire only their authentic saved grant; they do not invent a native frame.
+The existing fully prepaid Snapshot callback-batch cutoff and mandatory scalar
+source retirement qualifications remain unchanged.
+
+
+Snapshot-owned inner completion uses the preborn BANK directly with208/144/80
+for SOURCE bookkeeping: pending-debt checks, authentic completed financial BOOT
+grant retirement, and scalar metadata reset. It performs no Native action or
+Original FINISH. Its real action result remains separate from financial status.
+This branch creates no generic controller after callback delivery, so exhaustion
+of controller identities cannot turn completion into an endless EAGAIN loop.
+The synchronous evaluating loop checks its existing dormant private generation
+before each probe; the selected-false fallback keeps its separate checkpoint.
+The expanded metadata actor upper92 gives CURRENT142/144, total432 and unused
+admission236; its return-to-loop upper76 fits CLOSE80. These are local
+post-admission SOURCE bounds, not a qualification of static public preflight.
+
+### Public C1 admission SOURCE boundary
+
+An owning controlled single-worker session with configured JOIN batches and an
+acyclic plan of at most32 strata selects financial admission reads. The cached
+bit selects payment only; actual program, callback, source and Native eligibility
+remain live predicates. Worker copies explicitly clear it. The locked quiescent
+STEP gate uses208/96/96; Snapshot uses212/160/96 and reads its actual backend
+state once. The actual typed-frame birth-before-child invariant also covers
+FILTER, ANTIJOIN and LFTJ-containing numeric frames; this does not complete LFTJ
+algorithm recovery or alter its qualified row-local MAP context.
+
+The C1 getter bound76 plus its actor5 and financial surroundings50 gives131
+under CURRENT160. Snapshot FIRST210 fits212. The compatible shortest profile
+processes116+41+13+68=238 before CLOSE: the updated total468 leaves230, so the old
+conservative lower206 must not be reused for this policy. Complete locked-gate
+return77 and the admitted scope/fronts fit CLOSE96. On every successfully
+admitted STEP/Snapshot, actual SOURCE TLS is installed before body validation;
+the existing allocation-free BANK footer then bounds entry work. The resulting
+gate-to-next-check interval is at most254. TLS is restored before end-step
+arbitration on invalid backend/input/callback paths as well as successful ones.
+These local gate/entry statements do not replace the separate static-read
+callback qualification.
+
+Controlled destruction drains the same finite owned observed transaction until
+its existing disposal returns a genuine terminal status. The old16-turn cap
+could abort successful32-head Snapshots. Each disposal still uses its actual
+maintenance owner and existing bounded reader/retirement/refund actions; real
+busy/identity/error returns propagate. No evaluation, Original reset or invented
+receipt completion is introduced by draining the remaining cleanup cursors.
+
+### JOIN static metadata and owner-read SOURCE seams
+
+The C1 public host uses explicit SOURCE mode for STEP/Snapshot static metadata;
+mutation and nonC1 routes select DIRECT before execution. A SOURCE error never
+selects DIRECT. The scalar read class is208/96/80. Its callbacks inspect bounded
+metadata rather than scanning a whole plan, operator list or expression: strata
+advance one callback at a time, and separate callbacks inspect relation shape,
+MAP geometry and the fixed supported expression. The acyclic single-stratum
+arm skips the irrelevant recursive seven/eight-operator matcher using the real
+is_recursive flag; this does not cache or widen Native eligibility. Payload
+initialization, caller return/status branches and test-only fault fronts are
+ordinary source, not part of an opaque callback fee.
+
+Snapshot's actual post-admission state read uses208/160/80, followed immediately
+by the existing190/54/208 no-op BANK footer. A separate no-op after the active
+Original guard pays the outer financier constructor seam. Actual read errors
+retain their semantic status; the error-return footer pays the admitted public
+unwind without executing a direct read or a callback. The fresh-shape read runs
+before canonical publication; its error frees the unpublished allocation.
+
+All three retirement-entry guard callers use the unchanged read-only proof
+through the existing208/144/80 metadata executor on C1. The full guard ceiling79
+includes native thread equality, foreign staging readers and the actual saved
+WORK report proof. Callback fronts5 make84; existing surroundings72 minus old
+constructor23 plus84 and result reserve1 give134/144. This is not the40-action
+read class. Its conservative short-called lower181 is kernel116 plus distinct
+wrapper/payload/call7, BOOT13 and minimum CURRENT45, leaving432−181=251 unused.
+Financial status and action_called are checked separately; the saved action
+status survives the genuine no-op return footer. No Source result replaces
+Native authority, Original status or cleanup ownership.
+
+There are three real no-op entry seams: outer STEP after typed and old-AUTO
+selected-false, controlled STEP after its busy check, and drive after its busy
+check. Every guard lease also ends at its own real no-op before returning.
+The tight ongoing Snapshot route counts both payload associations and the
+actual attempt setter: postguard return3, begin-failure2, staging2, retry3,
+first association5, successor initialization1, recursive selector3,
+successor-mutation selector3, skipped preflight4, absent-step1, final association
+and setter10, drive call4 and busy3 total44. Previous no-op tail48 plus44,
+C1 flag1 and next no-op FIRST162 is255/256; the preceding positive208 owns93
+performed units. The new drive cut to guard FIRST is48+178=226. The metadata
+return-to-own-footer interval is below225 and its return fronts fit CLOSE80.
+These active-route numbers do not price fresh allocation or successor reset as
+an opaque44 action; those branches retain their actual reader, allocator and
+existing transaction/retirement payers.
+
+Fresh admission has three additional actual no-op seams: after successful static
+preflight, before the optional general-shape read and its test hook, and at the
+common successful point before canonical publication. Their complete selected
+windows are238/228/251/227/233, including ten-field read payload initialization,
+actual status/return fronts and test hooks. Snapshot preserves its short-circuit;
+a read failure frees the unpublished descriptor and returns its exact status.
+The fixed expression callback explicitly compares memcmp against zero; its
+expanded ceiling33 remains within the40-action class.
+
+A genuine completed successor transaction already has active unlimited
+maintenance: CUTOFF constructs it before publication, then RETIRE/FINISH drain
+ownership before complete/DONE. Its disposal connector uses a real saved-ID
+maintenance zero after the existing maintenance lookup succeeds. Original BEGIN
+stays outside SOURCE callbacks, and no new Original poll changes pending-denial
+metadata. The successful BEGIN-to-maintenance-zero window is170, paid by the
+preceding208; the failed-BEGIN return uses a real no-op and its shorter branch
+window255. A maintenance-zero error retains the actual transaction/status and
+executes the real return footer.
+
+Only the genuine C1 complete/successor-mutation conjunction selects the three
+additional disposal no-ops: after differential drain0, before committed terminal
+release, and before maintenance FINISH. These flags select payment, never Native
+authority. Existing owner/thread/reader/retirement and reservation checks and
+actions remain outside callbacks. The selected connector windows are190,239,254
+and242 through the final reset-entry no-op. The254 packet spends all eight
+reserved source cells on actual metadata-credit done initialization, arguments,
+call, result store and predicates. FINISH and REPORT are not work checkpoints.
+An empty-head EAGAIN exit has a compatible194-cell DIRTY/public-end packet;
+reserve8 gives202 within208, without combining incompatible getter/closing arms.
+The no-transaction successor instead uses its own235-cell saved-local path.
+
+After successful actual disposal (or the genuine no-transaction completion),
+the old descriptor is inert. Its reset uses SOURCE metadata chunks of at most64
+byte writes under existing208/144/80, with no Native action, Original transition,
+resource destructor or user hook in the callback. The conservative actor84 fits
+CURRENT134/144; actual short-called lower181 leaves at most251 unused. Loop
+return/advance/next-FIRST is248 and final restoration/return-footer is239; the
+single test-only TLS increment gives249/240. The preloop connector is245.
+All saved semantic identity/active/id, observer/general and append fields remain
+outside the cleared storage and restore before further Native use. Unexpected
+financial/noncalled/action errors integrity-abort; no ordinary return exposes a
+partially reset canonical descriptor. NonC1 keeps its original reset. Real
+successor histories assert multiple completed chunks while retaining literal,
+signed/raw, report and callback oracles; the counter is not a cost oracle.

@@ -1232,7 +1232,7 @@ call.
 | `snapshot_stable_valid` | `col_controlled_step_recursive_drive`, `col_session_remove`, `col_session_remove_incremental`, `col_session_snapshot_impl`, `col_session_step_impl`, `session_note_inserted_input`, `wl_columnar_session_observed_action`, `wl_columnar_session_note_iteration_cap` | `col_session_snapshot_impl` | PRESERVE |
 | `delta_seeded` | `insert_clone_prepare`, `tdd_worker_subpass_fn` | `col_op_variable`, `has_empty_forced_delta`, `tdd_worker_subpass_fn`, `wl_columnar_eval_nonrec_relation_parallel`, `wl_columnar_join_select_right`, `wl_columnar_join_op_attempt_start_owned_initialize`, `wl_columnar_join_host_forward`, `wl_columnar_eval_plan_numeric_source_select`, `wl_columnar_eval_plan_composed_source_select`, `wl_columnar_eval_tdd_plan_prepare_inputs`, `wl_columnar_eval_tdd_plan_prepare_insert`, `wl_columnar_join_spill_eligible`, `wl_columnar_session_cold_mode` | PRESERVE |
 | `last_removed_relation` | `col_session_remove_incremental`, `col_worker_session_create`, `session_retraction_cleanup`, `col_controlled_step_staging_finish`, `wl_columnar_session_observed_action` | `col_session_remove_incremental`, `col_session_snapshot_impl`, `col_session_step_impl`, `col_controlled_step_staging_prepare`, `wl_columnar_session_cold_busy`, `wl_columnar_session_observed_action` | PRESERVE |
-| `retraction_seeded` | `col_session_step_impl`, `col_stratum_step_retraction_nonrecursive`, `col_stratum_step_with_delta`, `insert_clone_prepare`, `session_retraction_cleanup`, `col_controlled_step_staging_finish`, `wl_columnar_session_observed_action` | `col_controlled_step_static_preflight`, `wl_columnar_filter_consolidate_attempt_start_owned`, `col_op_variable`, `col_session_snapshot_impl`, `col_stratum_step_with_delta`, `has_empty_forced_delta`, `wl_columnar_eval_nonrec_relation_parallel`, `wl_columnar_join_select_right`, `wl_columnar_join_op_attempt_start_owned_initialize`, `wl_columnar_join_probe_op_attempt_start_owned_initialize`, `wl_columnar_eval_plan_numeric_source_attempt_begin`, `wl_columnar_eval_tdd_plan_prepare_inputs`, `wl_columnar_eval_tdd_plan_prepare_insert`, `wl_columnar_ops_reduce_attempt_start_owned`, `wl_columnar_merge_concat_attempt_start_owned`, `wl_columnar_eval_plan_numeric_composed_attempt_begin_internal`, `wl_columnar_eval_serial_framed_relation`, `wl_columnar_join_spill_eligible`, `wl_columnar_session_cold_mode` | PRESERVE |
+| `retraction_seeded` | `col_session_step_impl`, `col_stratum_step_retraction_nonrecursive`, `col_stratum_step_with_delta`, `insert_clone_prepare`, `session_retraction_cleanup`, `col_controlled_step_staging_finish`, `wl_columnar_session_observed_action` | `wl_columnar_session_preflight_foreign_first`, `wl_columnar_filter_consolidate_attempt_start_owned`, `col_op_variable`, `col_session_snapshot_impl`, `col_stratum_step_with_delta`, `has_empty_forced_delta`, `wl_columnar_eval_nonrec_relation_parallel`, `wl_columnar_join_select_right`, `wl_columnar_join_op_attempt_start_owned_initialize`, `wl_columnar_join_probe_op_attempt_start_owned_initialize`, `wl_columnar_eval_plan_numeric_source_attempt_begin`, `wl_columnar_eval_tdd_plan_prepare_inputs`, `wl_columnar_eval_tdd_plan_prepare_insert`, `wl_columnar_ops_reduce_attempt_start_owned`, `wl_columnar_merge_concat_attempt_start_owned`, `wl_columnar_eval_plan_numeric_composed_attempt_begin_internal`, `wl_columnar_eval_serial_framed_relation_internal`, `wl_columnar_join_spill_eligible`, `wl_columnar_session_cold_mode` | PRESERVE |
 | `plain_step_completion_pending` | `col_eval_stratum_tdd_nonrecursive`, `col_eval_stratum_tdd_recursive`, `col_session_step_impl`, `col_worker_session_create`, `wl_columnar_session_note_iteration_cap` | `col_session_insert`, `col_session_insert_incremental`, `col_session_make_compound`, `col_session_remove`, `col_session_remove_incremental`, `col_session_snapshot_impl`, `col_session_step_impl`, `wl_columnar_eval_resume_stratum_completion`, `wl_columnar_session_cold_busy` | PRESERVE -- with `plain_step_completion_phase` this is the resume token |
 | `plain_step_completion_phase` | `col_eval_stratum_tdd_nonrecursive`, `col_eval_stratum_tdd_recursive`, `col_session_step_impl`, `col_worker_session_create`, `wl_columnar_eval_resume_stratum_completion`, `wl_columnar_session_note_iteration_cap` | `col_session_step_impl`, `wl_columnar_eval_resume_stratum_completion` | PRESERVE |
 | `plain_step_completion_step_context` | `col_session_snapshot_impl`, `col_session_step_impl`, `col_worker_session_create`, `wl_columnar_session_note_iteration_cap` | `col_eval_stratum_tdd_nonrecursive`, `col_eval_stratum_tdd_recursive`, `col_session_step_impl` | PRESERVE |
@@ -2291,3 +2291,116 @@ use the actual physical allocation size including the native receipt tail.
 These local bounds do not qualify unrelated ordinary/coordinator actions or
 whole-consumer/policy completion; integrated adoption requires fresh layout,
 copy-exclusion, native and source carry.
+
+### Controlled JOIN local output policy
+
+The admitted scalar session host preserves the configured local
+`WIRELOG_JOIN_OUTPUT_LIMIT`. A consumed FILTER/MAP/probe pipeline counts its
+committed sink rows; a direct JOIN sink counts its committed JOIN rows. A later,
+separately executed FILTER does not reduce that JOIN's policy count. Zero
+turns the cap off, while reaching or exceeding a positive cap returns
+`EOVERFLOW`. The peak records committed private output even when the cap is off.
+
+The policy decision follows successful batch extent publication and producer
+ACK in the same activation. It executes once and precedes the existing
+AFTER_ACK hook, so cancellation requested by that hook cannot replace an
+already selected overflow. Cancellation before precommit still prevents the
+ACK and policy update. Failed attempts publish no session head; reset and a
+raised local limit can retry with the configured producer retained. Batch
+capacity can cause the same bounded cap overshoot as raw batching.
+
+The local cap composes with the strict and private transaction contracts below.
+Worker shared counters retain their separate ownership and policy contract.
+
+### Controlled JOIN transaction bindings
+
+Configured eligible JOIN batches and their FILTER/MAP/FULL-probe consumers
+can run inside the existing ordinary nonrecursive private transaction. The
+child reads the current transaction's exact head images, including a preceding
+private head and a derived FULL anti-probe source. It uses the same semantic
+attempt through producer capacity pauses, internal funding retries and sinks.
+The binding table, generation and head plan remain owned by the transaction
+until the child's terminal cleanup receipt is acknowledged; only then may the
+transaction replace that binding or advance to another head.
+
+This also applies to evaluating SNAPSHOT and configured insert/remove
+successors. The existing final cutoff and completed-Snapshot callback-batch
+contract remain unchanged. Cancellation publishes no partial head or delta
+batch. A work-limit retry can reuse a completed private head while its source
+leases still refuse input mutation; caller reset starts a new semantic attempt
+without reinterpreting internal suspension as a budget reset.
+
+Ordinary append optimization retains its selector/effect semantics. A changed
+right operand uses the controlled ordinary JOIN destination; a changed left
+operand can use the prepared producer with a FULL right source. The existing
+controlled CONCAT combines the increment with the previous head under the
+same authenticated batch context. Worker shared counters remain a separate
+admission and policy domain.
+
+### Controlled strict JOIN policy
+
+The owning serial host admits configured strict keyed FULL-input producers,
+including eligible FILTER/MAP/probe tails and private transaction inputs.
+Strictness is not a blanket session refusal. The host follows the actual final
+tail to its destination before constructing a producer: a materializing
+successor refuses with `ENOTSUP`, while a relation sink can run bounded batches.
+One metered action examines one successor operator, registry entry, relation
+name byte or key; it does not invoke the raw whole-plan/cache builder.
+
+Selected delta-right input validates keys and compatible types before its
+strict refusal. Ordinary product/right-filter destinations preserve their
+filter/key/type processing before intrinsic strict refusal, even if filtering
+rejects every row. Missing, forced-empty and bare inputs retain their ordinary
+empty/schema disposition. A nonempty producer row exceeding the batch budget
+refuses; non-strict execution retains its controlled ordinary alternative.
+An initialized zero-row input with valid physical keys still undergoes strict
+successor qualification. Only a direct ordinary empty destination bypasses
+cache/row-fit afterward; a consumed tail keeps its producer and row-fit policy
+even with no rows.
+The local output cap and ACK ordering described above also apply in strict
+mode.
+
+The bounded private index replaces optional primary-cache construction. Cold
+cache absence does not mean the input is unsupported, and unattempted cache
+allocations do not manufacture `ENOMEM`. An exact public-source cache census
+preserves protected stale/deferred-pinned and relocation failures. An
+authenticated private image with the same name does not inherit an unrelated
+public cache's error. Actual source-reader, generation and memory admission
+failures remain authoritative.
+
+The primary registry stays empty in the current owning controlled public
+graph: construction starts empty, controlled operators build private indexes,
+and mutations do not create a first primary entry. Prewarmed/pinned cache tests
+are explicitly internal component fixtures. Their registry metadata and pins
+remain quiescent for the entire logical census, including internal yields;
+fixtures release pins after terminal cleanup. No user callback runs inside the
+census, and financial/test hooks may observe or stop the controller without
+mutating the borrowed registry. Pointer/count/cap checks are defensive checks,
+not a detector for arbitrary in-place mutation. A future public primary-cache
+producer or independently interleaved internal cache mutation requires renewed
+ownership and boundedness qualification.
+
+### Controlled JOIN public admission and completion
+
+The single-worker, configured acyclic JOIN domain uses the admission-owned
+SOURCE BANK for public STEP/Snapshot metadata, actual state reads and static
+preflight. Each bounded read returns its own status before any output predicate
+is consumed. A failed SOURCE read never falls back to direct execution.
+Mutation preflight and routes outside that domain retain their explicit direct
+mode. Lexical SOURCE scope is installed after admission and restored before
+end-step arbitration, including invalid callback/backend/input returns.
+
+The saved Original generation owns semantic charges and completion throughout
+producer/consumer suspension, Native recovery and observed transactions. Private
+financial controllers carry no Native permission. Snapshot completion uses its
+preborn financial owner even when a user callback ends Original, starts a
+successor or exhausts process-wide controller identities. It preserves the
+frozen Original report and leaves the successor uncharged. Cleanup validates
+the actual owner, creator thread, source binding and receipt before Native
+action, ACK or cursor retirement. An active successor prevents destruction.
+
+Synchronous destruction drains the existing finite observed-disposal cursors
+until their genuine terminal status; it is not limited to sixteen calls.
+Busy, identity and cleanup errors remain authoritative. The complete ordinary
+JOIN coverage and reproducible regression commands are recorded in
+[JOIN host acceptance](implementation/2297/JOIN_HOST_ACCEPTANCE.md).

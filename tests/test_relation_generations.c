@@ -15,19 +15,6 @@
 #ifdef WL_TEST_CONSOLIDATE_ALLOC_HOOK
 wl_columnar_consolidate_alloc_hook_t wl_columnar_consolidate_alloc_hook;
 #endif
-#ifdef WL_SESSION_TEST_HOOKS
-/* This standalone backend target has no generic session implementation. */
-void
-wl_session_testhook_before_workqueue_drain(wl_session_t *session)
-{
-    (void)session;
-}
-void
-wl_session_testhook_after_worker_lease_release(wl_session_t *session)
-{
-    (void)session;
-}
-#endif
 
 #ifdef WL_TEST_ALLOC_WRAP
 void *__real_malloc(size_t size);

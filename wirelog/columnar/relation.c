@@ -1704,7 +1704,8 @@ wl_columnar_relation_reader_step(const col_rel_t *rel,
     if (control && (!attempt_id
         || wl_evaluation_control_active_attempt_id(control) != attempt_id))
         return EINVAL;
-    int rc = control ? wl_evaluation_control_charge(control, 1) : 0;
+    int rc = control ? wl_evaluation_control_charge_attempt(control, attempt_id,
+            1) : 0;
     if (rc)
         return rc;
     wl_columnar_source_access_gate_t *gate = release
@@ -1773,7 +1774,8 @@ wl_columnar_relation_reader_step(const col_rel_t *rel,
     if (control) {
         if (wl_evaluation_control_active_attempt_id(control) != attempt_id)
             return EINVAL;
-        rc = wl_evaluation_control_charge(control, 0);
+        rc = wl_evaluation_control_charge_attempt(control, attempt_id,
+                0);
     }
     return rc > 0 ? rc : (result != 0 && result != EAGAIN) ? result
         : rc ? rc : result;
@@ -8649,7 +8651,8 @@ wl_columnar_relation_attempt_tail(wl_evaluation_control_t *control,
     uint64_t active = wl_evaluation_control_active_attempt_id(control);
     if (!active || active != attempt_id)
         return EINVAL;
-    return wl_evaluation_control_charge(control, 0);
+    return wl_evaluation_control_charge_attempt(control, attempt_id,
+               0);
 }
 
 static int
@@ -9890,7 +9893,7 @@ wl_columnar_relation_batch_check(wl_columnar_relation_append_batch_t *batch)
             batch->attempt_id);
     if (rc)
         return rc;
-    rc = wl_evaluation_control_charge(batch->control,
+    rc = wl_evaluation_control_charge_attempt(batch->control, batch->attempt_id,
             WL_COLUMNAR_RELATION_BATCH_CHECK_WORK);
     if (rc)
         return rc;
@@ -9922,7 +9925,7 @@ static int
 wl_columnar_relation_batch_nonce_source(uint64_t *nonce,
     wl_evaluation_control_t *control, uint64_t attempt_id)
 {
-    int rc = wl_evaluation_control_charge(control,
+    int rc = wl_evaluation_control_charge_attempt(control, attempt_id,
             WL_COLUMNAR_RELATION_BATCH_SOURCE_READ_WORK);
     if (rc)
         return rc;
@@ -9938,7 +9941,7 @@ wl_columnar_relation_batch_nonce_source(uint64_t *nonce,
     if (rc)
         return rc;
     for (;;) {
-        rc = wl_evaluation_control_charge(control,
+        rc = wl_evaluation_control_charge_attempt(control, attempt_id,
                 WL_COLUMNAR_RELATION_BATCH_SOURCE_ROUND_WORK);
         if (rc)
             return rc;
@@ -9982,7 +9985,7 @@ wl_columnar_relation_batch_single_acquire_source(
     uint64_t active = wl_evaluation_control_active_attempt_id(control);
     if (!active || active != attempt_id)
         return EINVAL;
-    int rc = wl_evaluation_control_charge(control,
+    int rc = wl_evaluation_control_charge_attempt(control, attempt_id,
             WL_COLUMNAR_RELATION_BATCH_SOURCE_ENTRY_WORK);
     if (rc)
         return rc;
@@ -9997,7 +10000,7 @@ wl_columnar_relation_batch_single_acquire_source(
             attempt_id);
     if (rc)
         return rc;
-    rc = wl_evaluation_control_charge(control,
+    rc = wl_evaluation_control_charge_attempt(control, attempt_id,
             WL_COLUMNAR_RELATION_BATCH_SOURCE_FRAME_WORK);
     if (rc)
         return rc;
@@ -10035,13 +10038,14 @@ wl_columnar_relation_batch_single_acquire_source(
         if (!active || active != attempt_id) {
             rc = EINVAL; goto fail;
         }
-        rc = wl_evaluation_control_charge(control, 0);
+        rc = wl_evaluation_control_charge_attempt(control, attempt_id,
+                0);
     }
     if (rc)
         goto fail;
     {
 
-        rc = wl_evaluation_control_charge(control,
+        rc = wl_evaluation_control_charge_attempt(control, attempt_id,
                 WL_COLUMNAR_RELATION_BATCH_SOURCE_WRITER_DESCRIPTOR_WORK);
         if (rc)
             goto fail;
@@ -10098,13 +10102,14 @@ wl_columnar_relation_batch_single_acquire_source(
             if (!active || active != attempt_id) {
                 rc = EINVAL; goto fail;
             }
-            rc = wl_evaluation_control_charge(control, 0);
+            rc = wl_evaluation_control_charge_attempt(control, attempt_id,
+                    0);
         }
         rc = rc > 0?rc:!acquired?EBUSY:rc;
         if (rc) goto fail;
 
     }
-    rc = wl_evaluation_control_charge(control,
+    rc = wl_evaluation_control_charge_attempt(control, attempt_id,
             WL_COLUMNAR_RELATION_BATCH_SOURCE_BIND_WORK);
     if (rc)
         goto fail;
@@ -10152,13 +10157,14 @@ wl_columnar_relation_batch_single_acquire_source(
         if (!active || active != attempt_id) {
             rc = EINVAL; goto fail;
         }
-        rc = wl_evaluation_control_charge(control, 0);
+        rc = wl_evaluation_control_charge_attempt(control, attempt_id,
+                0);
     }
     if (rc)
         goto fail;
     {
 
-        rc = wl_evaluation_control_charge(control,
+        rc = wl_evaluation_control_charge_attempt(control, attempt_id,
                 WL_COLUMNAR_RELATION_BATCH_SOURCE_WRITER_OWNER_WORK);
         if (rc)
             goto fail;
@@ -10215,13 +10221,14 @@ wl_columnar_relation_batch_single_acquire_source(
             if (!active || active != attempt_id) {
                 rc = EINVAL; goto fail;
             }
-            rc = wl_evaluation_control_charge(control, 0);
+            rc = wl_evaluation_control_charge_attempt(control, attempt_id,
+                    0);
         }
         rc = rc > 0?rc:!acquired?EBUSY:rc;
         if (rc) goto fail;
 
     }
-    rc = wl_evaluation_control_charge(control,
+    rc = wl_evaluation_control_charge_attempt(control, attempt_id,
             WL_COLUMNAR_RELATION_BATCH_SOURCE_BORROW_WORK);
     if (rc)
         goto fail;
@@ -10240,11 +10247,12 @@ wl_columnar_relation_batch_single_acquire_source(
         if (!active || active != attempt_id) {
             rc = EINVAL; goto fail;
         }
-        rc = wl_evaluation_control_charge(control, 0);
+        rc = wl_evaluation_control_charge_attempt(control, attempt_id,
+                0);
     }
     if (rc)
         goto fail;
-    rc = wl_evaluation_control_charge(control,
+    rc = wl_evaluation_control_charge_attempt(control, attempt_id,
             WL_COLUMNAR_RELATION_BATCH_SOURCE_VROOT_WORK);
     if (rc) goto fail;
     const wl_columnar_relation_mutation_lease_t *lease = &single->lease;
@@ -10264,7 +10272,7 @@ wl_columnar_relation_batch_single_acquire_source(
         || lease->descriptor_slot >= set->descriptor_count) {
         rc = EINVAL; goto fail;
     }
-    rc = wl_evaluation_control_charge(control,
+    rc = wl_evaluation_control_charge_attempt(control, attempt_id,
             WL_COLUMNAR_RELATION_BATCH_SOURCE_VMEMBER_WORK);
     if (rc) goto fail;
     bool member = false;
@@ -10280,7 +10288,7 @@ wl_columnar_relation_batch_single_acquire_source(
         set->descriptors[lease->descriptor_slot].relation != relation){
         rc = EINVAL; goto fail;
     }
-    rc = wl_evaluation_control_charge(control,
+    rc = wl_evaluation_control_charge_attempt(control, attempt_id,
             WL_COLUMNAR_RELATION_BATCH_SOURCE_VOWNER_WORK);
     if (rc) goto fail;
     col_rel_t *owner;
@@ -10295,7 +10303,7 @@ wl_columnar_relation_batch_single_acquire_source(
         || !wl_columnar_relation_generation_valid(lease->owner_generation)) {
         rc = EINVAL; goto fail;
     }
-    rc = wl_evaluation_control_charge(control,
+    rc = wl_evaluation_control_charge_attempt(control, attempt_id,
             WL_COLUMNAR_RELATION_BATCH_SOURCE_VROLE_WORK);
     if (rc) goto fail;
     if (lease->role_flags != WL_COLUMNAR_RELATION_PAYLOAD_MUTATION
@@ -10305,7 +10313,7 @@ wl_columnar_relation_batch_single_acquire_source(
         || set->owners[lease->self_owner_slot].owner != relation) {
         rc = EINVAL; goto fail;
     }
-    rc = wl_evaluation_control_charge(control,
+    rc = wl_evaluation_control_charge_attempt(control, attempt_id,
             WL_COLUMNAR_RELATION_BATCH_SOURCE_VDESC_WORK);
     if (rc) goto fail;
     rc =
@@ -10313,7 +10321,7 @@ wl_columnar_relation_batch_single_acquire_source(
         &set->descriptors[lease->descriptor_slot].writer,
         &relation->descriptor_access);
     if (rc) goto fail;
-    rc = wl_evaluation_control_charge(control,
+    rc = wl_evaluation_control_charge_attempt(control, attempt_id,
             WL_COLUMNAR_RELATION_BATCH_SOURCE_VSELF_WORK);
     if (rc) goto fail;
     rc =
@@ -10327,7 +10335,7 @@ wl_columnar_relation_batch_single_acquire_source(
             &lease->owner->source_access);
         if (rc) goto fail;
     }
-    rc = wl_evaluation_control_charge(control,
+    rc = wl_evaluation_control_charge_attempt(control, attempt_id,
             WL_COLUMNAR_RELATION_BATCH_SOURCE_VTAIL_WORK);
     if (rc) goto fail;
     int tail = wl_columnar_relation_attempt_tail(control, attempt_id,
@@ -10550,9 +10558,9 @@ cleanup_error:
 }
 
 int
-wl_columnar_relation_append_batch_begin_controlled(
+wl_columnar_relation_append_batch_begin_attempt_controlled(
     wl_columnar_relation_append_batch_t *batch, col_rel_t *r,
-    wl_evaluation_control_t *control)
+    wl_evaluation_control_t *control, uint64_t attempt_id)
 {
     /* Zero-initialized EMPTY is the only begin state. Explicit caller reset
      * after completed end may establish a new inert original wrapper. */
@@ -10563,6 +10571,7 @@ wl_columnar_relation_append_batch_begin_controlled(
         || !wl_columnar_relation_single_inert(&batch->raw.single))
         return EINVAL;
     if (!control) {
+        if (attempt_id) return EINVAL;
         int rc = col_rel_append_batch_begin(&batch->raw, r);
         if (rc)
             return rc;
@@ -10571,10 +10580,9 @@ wl_columnar_relation_append_batch_begin_controlled(
         batch->phase = WL_COLUMNAR_RELATION_BATCH_HELD;
         return 0;
     }
-    uint64_t attempt_id = wl_evaluation_control_active_attempt_id(control);
     if (!attempt_id)
         return EINVAL;
-    int rc = wl_evaluation_control_charge(control,
+    int rc = wl_evaluation_control_charge_attempt(control, attempt_id,
             WL_COLUMNAR_RELATION_BATCH_BEGIN_WORK);
     if (rc)
         return rc;
@@ -10597,6 +10605,16 @@ wl_columnar_relation_append_batch_begin_controlled(
         batch->phase = WL_COLUMNAR_RELATION_BATCH_DRAINING;
     }
     return rc;
+}
+
+int
+wl_columnar_relation_append_batch_begin_controlled(
+    wl_columnar_relation_append_batch_t *batch, col_rel_t *r,
+    wl_evaluation_control_t *control)
+{
+    uint64_t id = wl_evaluation_control_active_attempt_id(control);
+    return wl_columnar_relation_append_batch_begin_attempt_controlled(batch,
+               r, control, id);
 }
 
 /* Persistent private-output batch retirement. Every step returns to a real
@@ -10908,7 +10926,7 @@ wl_columnar_relation_batch_capture(
     col_rel_t *r = batch->raw.relation;
     wl_evaluation_control_t *control = batch->control;
     uint64_t attempt_id = batch->attempt_id;
-    int rc = wl_evaluation_control_charge(control,
+    int rc = wl_evaluation_control_charge_attempt(control, attempt_id,
             WL_COLUMNAR_RELATION_BATCH_CAPTURE_WORK);
     if (rc)
         return rc;
@@ -10939,11 +10957,12 @@ wl_columnar_relation_batch_capture(
         if (!active || active != attempt_id) {
             rc = EINVAL; goto done;
         }
-        rc = wl_evaluation_control_charge(control, 0);
+        rc = wl_evaluation_control_charge_attempt(control, attempt_id,
+                0);
     }
     if (rc) goto done;
     if (capture->width > 16) {
-        rc = wl_evaluation_control_charge(control,
+        rc = wl_evaluation_control_charge_attempt(control, attempt_id,
                 WL_COLUMNAR_RELATION_BATCH_CAPTURE_WORK);
         if (rc)
             goto done;
@@ -10968,7 +10987,8 @@ wl_columnar_relation_batch_capture(
             if (!active || active != attempt_id) {
                 rc = EINVAL; goto done;
             }
-            rc = wl_evaluation_control_charge(control, 0);
+            rc = wl_evaluation_control_charge_attempt(control, attempt_id,
+                    0);
         }
         if (rc) goto done;
         if (capture->governor) {
@@ -11001,7 +11021,7 @@ wl_columnar_relation_batch_capture(
                 goto done;
             }
         }
-        rc = wl_evaluation_control_charge(control,
+        rc = wl_evaluation_control_charge_attempt(control, attempt_id,
                 WL_COLUMNAR_RELATION_BATCH_CAPTURE_ALLOC_WORK);
         if (rc)
             goto done;
@@ -11023,7 +11043,8 @@ wl_columnar_relation_batch_capture(
             if (!active || active != attempt_id) {
                 rc = EINVAL; goto done;
             }
-            rc = wl_evaluation_control_charge(control, 0);
+            rc = wl_evaluation_control_charge_attempt(control, attempt_id,
+                    0);
         }
         if (rc > 0)
             goto done;
@@ -11033,7 +11054,7 @@ wl_columnar_relation_batch_capture(
             goto done;
     }
     for (uint32_t c = 0; c < capture->width; ++c) {
-        rc = wl_evaluation_control_charge(control,
+        rc = wl_evaluation_control_charge_attempt(control, attempt_id,
                 WL_COLUMNAR_RELATION_ROW_CELL_WORK);
         if (rc)
             goto done;
@@ -11055,7 +11076,7 @@ wl_columnar_relation_batch_renew(wl_columnar_relation_append_batch_t *batch)
 {
     wl_evaluation_control_t *control = batch->control;
     uint64_t attempt_id = batch->attempt_id;
-    int rc = wl_evaluation_control_charge(control,
+    int rc = wl_evaluation_control_charge_attempt(control, attempt_id,
             WL_COLUMNAR_RELATION_BATCH_RENEW_WORK);
     if (rc) return rc;
     /* Literal inline of old first attempt_tail(control,id,128). */
@@ -11066,7 +11087,8 @@ wl_columnar_relation_batch_renew(wl_columnar_relation_append_batch_t *batch)
 #endif
     uint64_t active = wl_evaluation_control_active_attempt_id(control);
     if (!active || active != attempt_id) return EINVAL;
-    rc = wl_evaluation_control_charge(control, 0);
+    rc = wl_evaluation_control_charge_attempt(control, attempt_id,
+            0);
     if (rc) return rc;
     batch->phase = WL_COLUMNAR_RELATION_BATCH_RENEWING;
     wl_columnar_relation_mutation_single_t *single = &batch->raw.single;
@@ -11152,7 +11174,8 @@ wl_columnar_relation_batch_renew(wl_columnar_relation_append_batch_t *batch)
 #endif
     active = wl_evaluation_control_active_attempt_id(control);
     if (!active || active != attempt_id) return EINVAL;
-    rc = wl_evaluation_control_charge(control, 0);
+    rc = wl_evaluation_control_charge_attempt(control, attempt_id,
+            0);
     if (rc) return rc;
     rc = wl_columnar_relation_batch_single_acquire_source(
         batch->raw.relation, &batch->raw.single, control, attempt_id);
@@ -20043,7 +20066,7 @@ wl_columnar_relation_row_bytes_operator(unsigned char *to,
 {
     size_t offset = 0;
     while (offset < bytes) {
-        int rc = wl_evaluation_control_charge(control,
+        int rc = wl_evaluation_control_charge_attempt(control, attempt_id,
                 WL_COLUMNAR_RELATION_ROW_BYTES_WORK);
         if (rc)
             return rc;
@@ -20069,7 +20092,7 @@ wl_columnar_relation_row_body_operator(col_rel_t *r, const int64_t *input,
 {
     wl_columnar_relation_row_t row;
     int rc;
-    rc = wl_evaluation_control_charge(control,
+    rc = wl_evaluation_control_charge_attempt(control, attempt_id,
             WL_COLUMNAR_RELATION_ROW_RECORD_WORK);
     if (rc)
         return rc;
@@ -20088,7 +20111,7 @@ wl_columnar_relation_row_body_operator(col_rel_t *r, const int64_t *input,
     /* Match raw append's provenance boundary, including failures of the next
      * work admission. Failed single acquisition preserves an earlier denial. */
     r->memory_budget_denial_pending = false;
-    rc = wl_evaluation_control_charge(control,
+    rc = wl_evaluation_control_charge_attempt(control, attempt_id,
             WL_COLUMNAR_RELATION_ROW_SHAPE_WORK);
     if (rc)
         goto done;
@@ -20141,7 +20164,7 @@ wl_columnar_relation_row_body_operator(col_rel_t *r, const int64_t *input,
         goto done;
     /* Validate every lane before staging or changing even spare cells. */
     for (uint32_t c = 0; c < r->ncols; ++c) {
-        rc = wl_evaluation_control_charge(control,
+        rc = wl_evaluation_control_charge_attempt(control, attempt_id,
                 WL_COLUMNAR_RELATION_ROW_CELL_WORK);
         if (rc)
             goto done;
@@ -20158,7 +20181,7 @@ wl_columnar_relation_row_body_operator(col_rel_t *r, const int64_t *input,
     }
     if (!borrowed) {
         if (r->ncols > 16) {
-            rc = wl_evaluation_control_charge(control,
+            rc = wl_evaluation_control_charge_attempt(control, attempt_id,
                     WL_COLUMNAR_RELATION_ROW_CREDIT_WORK);
             if (rc)
                 goto done;
@@ -20192,7 +20215,7 @@ wl_columnar_relation_row_body_operator(col_rel_t *r, const int64_t *input,
                     goto done;
                 }
             }
-            rc = wl_evaluation_control_charge(control,
+            rc = wl_evaluation_control_charge_attempt(control, attempt_id,
                     WL_COLUMNAR_RELATION_ROW_ALLOC_WORK);
             if (rc)
                 goto done;
@@ -20211,7 +20234,7 @@ wl_columnar_relation_row_body_operator(col_rel_t *r, const int64_t *input,
         row.captured = (int64_t *)input;
     }
     for (uint32_t c = 0; c < r->ncols; ++c) {
-        rc = wl_evaluation_control_charge(control,
+        rc = wl_evaluation_control_charge_attempt(control, attempt_id,
                 WL_COLUMNAR_RELATION_ROW_CELL_WORK);
         if (rc)
             goto done;
@@ -20225,7 +20248,7 @@ wl_columnar_relation_row_body_operator(col_rel_t *r, const int64_t *input,
     }
     if (!growth) {
         for (uint32_t c = 0; c < r->ncols; ++c) {
-            rc = wl_evaluation_control_charge(control,
+            rc = wl_evaluation_control_charge_attempt(control, attempt_id,
                     WL_COLUMNAR_RELATION_ROW_CELL_WORK);
             if (rc)
                 goto done;
@@ -20242,7 +20265,7 @@ wl_columnar_relation_row_body_operator(col_rel_t *r, const int64_t *input,
             if (rc)
                 goto done;
         }
-        rc = wl_evaluation_control_charge(control,
+        rc = wl_evaluation_control_charge_attempt(control, attempt_id,
                 WL_COLUMNAR_RELATION_ROW_TERMINAL_WORK);
         if (rc)
             goto done;
@@ -20259,7 +20282,7 @@ wl_columnar_relation_row_body_operator(col_rel_t *r, const int64_t *input,
 
     /* Each full grid calculation is independently admitted. All auxiliary
      * payload stays live across replacement and retains its original credit. */
-    rc = wl_evaluation_control_charge(control,
+    rc = wl_evaluation_control_charge_attempt(control, attempt_id,
             WL_COLUMNAR_RELATION_ROW_SIZE_WORK);
     if (rc)
         goto done;
@@ -20289,7 +20312,7 @@ wl_columnar_relation_row_body_operator(col_rel_t *r, const int64_t *input,
     if (rc)
         goto done;
     for (unsigned component = 0; component < 4; ++component) {
-        rc = wl_evaluation_control_charge(control,
+        rc = wl_evaluation_control_charge_attempt(control, attempt_id,
                 WL_COLUMNAR_RELATION_ROW_SIZE_WORK);
         if (rc)
             goto done;
@@ -20319,7 +20342,7 @@ wl_columnar_relation_row_body_operator(col_rel_t *r, const int64_t *input,
         if (rc)
             goto done;
     }
-    rc = wl_evaluation_control_charge(control,
+    rc = wl_evaluation_control_charge_attempt(control, attempt_id,
             WL_COLUMNAR_RELATION_ROW_CREDIT_WORK);
     if (rc)
         goto done;
@@ -20370,7 +20393,7 @@ wl_columnar_relation_row_body_operator(col_rel_t *r, const int64_t *input,
         row.growth_held = true;
     }
     if (r->ncols) {
-        rc = wl_evaluation_control_charge(control,
+        rc = wl_evaluation_control_charge_attempt(control, attempt_id,
                 WL_COLUMNAR_RELATION_ROW_ALLOC_WORK);
         if (rc)
             goto done;
@@ -20387,7 +20410,7 @@ wl_columnar_relation_row_body_operator(col_rel_t *r, const int64_t *input,
             goto done;
     }
     for (uint32_t c = 0; c < r->ncols; ++c) {
-        rc = wl_evaluation_control_charge(control,
+        rc = wl_evaluation_control_charge_attempt(control, attempt_id,
                 WL_COLUMNAR_RELATION_ROW_ALLOC_WORK);
         if (rc)
             goto done;
@@ -20409,7 +20432,7 @@ wl_columnar_relation_row_body_operator(col_rel_t *r, const int64_t *input,
             (size_t)r->nrows * sizeof(int64_t), control, attempt_id);
         if (rc)
             goto done;
-        rc = wl_evaluation_control_charge(control,
+        rc = wl_evaluation_control_charge_attempt(control, attempt_id,
                 WL_COLUMNAR_RELATION_ROW_CELL_WORK);
         if (rc)
             goto done;
@@ -20420,7 +20443,7 @@ wl_columnar_relation_row_body_operator(col_rel_t *r, const int64_t *input,
             goto done;
     }
     if (r->timestamps) {
-        rc = wl_evaluation_control_charge(control,
+        rc = wl_evaluation_control_charge_attempt(control, attempt_id,
                 WL_COLUMNAR_RELATION_ROW_ALLOC_WORK);
         if (rc)
             goto done;
@@ -20446,7 +20469,7 @@ wl_columnar_relation_row_body_operator(col_rel_t *r, const int64_t *input,
         if (rc)
             goto done;
     }
-    rc = wl_evaluation_control_charge(control,
+    rc = wl_evaluation_control_charge_attempt(control, attempt_id,
             WL_COLUMNAR_RELATION_ROW_RECIPE_WORK);
     if (rc)
         goto done;
@@ -20505,7 +20528,7 @@ wl_columnar_relation_row_body_operator(col_rel_t *r, const int64_t *input,
             WL_COLUMNAR_RELATION_ROW_RECIPE_WORK);
     if (rc)
         goto done;
-    rc = wl_evaluation_control_charge(control,
+    rc = wl_evaluation_control_charge_attempt(control, attempt_id,
             WL_COLUMNAR_RELATION_ROW_VALIDATE_WORK);
     if (rc)
         goto done;
@@ -20516,7 +20539,7 @@ wl_columnar_relation_row_body_operator(col_rel_t *r, const int64_t *input,
     if (rc)
         goto done;
     if (governed) {
-        rc = wl_evaluation_control_charge(control,
+        rc = wl_evaluation_control_charge_attempt(control, attempt_id,
                 WL_COLUMNAR_RELATION_ROW_PREPARE_WORK);
         if (rc)
             goto done;
@@ -20539,7 +20562,7 @@ wl_columnar_relation_row_body_operator(col_rel_t *r, const int64_t *input,
         }
     }
     if (ledger) {
-        rc = wl_evaluation_control_charge(control,
+        rc = wl_evaluation_control_charge_attempt(control, attempt_id,
                 WL_COLUMNAR_RELATION_ROW_PREPARE_WORK);
         if (rc)
             goto done;
@@ -20555,7 +20578,7 @@ wl_columnar_relation_row_body_operator(col_rel_t *r, const int64_t *input,
     }
     /* Admit caller publication glue before the cutoff. Nested prepared
     * records already fund governor finish and ledger apply/release. */
-    rc = wl_evaluation_control_charge(control,
+    rc = wl_evaluation_control_charge_attempt(control, attempt_id,
             WL_COLUMNAR_RELATION_ROW_TERMINAL_WORK);
     if (rc)
         goto done;
@@ -20673,7 +20696,8 @@ wl_columnar_relation_append_batch_numeric_row_operator_controlled(
     if (rc) return rc;
     rc = wl_columnar_relation_attempt_guard(control, attempt_id);
     if (rc) return rc;
-    return wl_evaluation_control_charge(control, 0);
+    return wl_evaluation_control_charge_attempt(control, attempt_id,
+               0);
 }
 
 /* Additive operator-specific selection preserves the legacy API below byte
@@ -20692,7 +20716,8 @@ wl_columnar_relation_selected_operator_checkpoint(
 {
     int poll_result = wl_columnar_relation_attempt_guard(control, id);
     if (poll_result) return poll_result;
-    poll_result = wl_evaluation_control_charge(control, 0);
+    poll_result = wl_evaluation_control_charge_attempt(control, id,
+            0);
     if (poll_result > 0) return poll_result;
     if (poll_result < 0)
         return typed_result > 0 ? typed_result : poll_result;
@@ -20842,7 +20867,8 @@ wl_columnar_relation_append_batch_selected_source_row_operator_controlled(
      * locals. Mandatory capture disposal can have restarted the control. */
     rc = wl_columnar_relation_attempt_guard(call_control, call_id);
     if (rc) return rc;
-    rc = wl_evaluation_control_charge(call_control, 0);
+    rc = wl_evaluation_control_charge_attempt(call_control, call_id,
+            0);
     if (rc) return rc;
     /* Operator-only caller/cutpoint work: provisional until full recount. */
     rc = wl_columnar_relation_constructor_attempt_charge(call_control, call_id,
@@ -21417,12 +21443,12 @@ wl_columnar_relation_copy_rows_controlled(const char *name,
             WL_COLUMNAR_RELATION_COPY_ROWS_BEGIN_CALL_WORK);
     if (rc)
         goto done;
-    /* Adjacent guard prevents begin's capture-on-entry from charging a new ID. */
+    /* Preserve the caller guard and pass the same ID into writer admission. */
     rc = wl_columnar_relation_attempt_guard(control, attempt_id);
     if (rc)
         goto done;
-    rc = wl_columnar_relation_append_batch_begin_controlled(&ctx.batch,
-            ctx.local, control);
+    rc = wl_columnar_relation_append_batch_begin_attempt_controlled(&ctx.batch,
+            ctx.local, control, attempt_id);
     if (rc)
         goto done;
     if (ctx.batch.identity != &ctx.batch ||

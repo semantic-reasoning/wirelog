@@ -1782,7 +1782,8 @@ wl_columnar_filter_attempt_charge(wl_evaluation_control_t *control,
     uint64_t id, uint64_t work)
 {
     int rc = wl_columnar_filter_attempt_guard(control, id);
-    return rc ? rc : wl_evaluation_control_charge(control, work);
+    return rc ? rc : wl_evaluation_control_charge_attempt(control, id,
+               work);
 }
 
 static int
@@ -2305,8 +2306,8 @@ wl_columnar_filter_op_attempt_start_owned(const wl_plan_op_t *op,
     rc = wl_columnar_filter_attempt_tail(control, attempt_id, 11, 0);
     if (rc)
         goto done;
-    rc = wl_columnar_relation_append_batch_begin_controlled(&ctx->batch,
-            *out_slot, control);
+    rc = wl_columnar_relation_append_batch_begin_attempt_controlled(&ctx->batch,
+            *out_slot, control, attempt_id);
     rc = wl_columnar_filter_attempt_return(control, attempt_id, rc);
     if (rc)
         goto done;
@@ -2801,8 +2802,8 @@ wl_columnar_filter_consolidate_attempt_start_owned(const wl_plan_op_t *op,
     rc = wl_columnar_filter_attempt_tail(control, attempt_id, 11, 0);
     if (rc)
         goto done;
-    rc = wl_columnar_relation_append_batch_begin_controlled(&ctx->batch,
-            *out_slot, control);
+    rc = wl_columnar_relation_append_batch_begin_attempt_controlled(&ctx->batch,
+            *out_slot, control, attempt_id);
     rc = wl_columnar_filter_attempt_return(control, attempt_id, rc);
     if (rc)
         goto done;
@@ -3461,8 +3462,8 @@ wl_columnar_filter_map_attempt_start_owned(const wl_plan_op_t *op,
     rc = wl_columnar_filter_attempt_tail(control, attempt_id, 11, 0);
     if (rc)
         goto done;
-    rc = wl_columnar_relation_append_batch_begin_controlled(&ctx->batch,
-            *out_slot, control);
+    rc = wl_columnar_relation_append_batch_begin_attempt_controlled(&ctx->batch,
+            *out_slot, control, attempt_id);
     rc = wl_columnar_filter_attempt_return(control, attempt_id, rc);
     if (rc)
         goto done;
@@ -3650,6 +3651,47 @@ wl_columnar_filter_empty_end_step_owned(
         ? WL_COLUMNAR_FILTER_PROGRESS_YIELD
         : WL_COLUMNAR_FILTER_PROGRESS_RETAINED);
     return rc == EAGAIN ? 0 : rc;
+}
+
+int
+wl_columnar_filter_op_native_cleanup_latch_owned(
+    wl_columnar_eval_stack_cleanup_frame_t *frame, const void *owner,
+    wl_evaluation_control_t *funding, uint64_t id, bool *bare_end)
+{
+    const wl_columnar_eval_plan_numeric_attempt_t *r = owner;
+    if (!r || !funding || funding == r->control || !id) return EINVAL;
+    int paid = wl_evaluation_control_charge_attempt(funding, id,
+            88);
+    if (paid) return paid;
+    if (!r || !wl_columnar_eval_plan_numeric_owner_valid(r,
+        frame)) return EINVAL;
+    wl_columnar_eval_serial_framed_attempt_t *parent = NULL;
+    int rc = wl_columnar_eval_stack_framed_context(frame, r->session, &parent);
+    if (rc) return rc;
+    int cause = 0;
+    rc = wl_columnar_session_join_cleanup_prove(parent, funding, id, NULL,
+            &cause);
+    if (rc) return rc;
+    if (&parent->child != r) return EINVAL;
+    rc = wl_evaluation_control_charge_attempt(funding, id, 112);
+    if (rc) return rc;
+    wl_columnar_filter_context_t *ctx = NULL;
+    rc = wl_columnar_eval_stack_filter_context_owned(frame, &ctx, owner);
+    if (rc) return rc;
+    rc = wl_columnar_filter_attempt_context_valid(frame, ctx);
+    if (rc) return rc;
+    if (ctx->stage == WL_COLUMNAR_FILTER_STAGE_RUNNING) return EBUSY;
+    /* Same-call routing only. The selected End callee still proves its real
+     * source, cursor, owner and generation before any resource mutation. */
+    if (bare_end) *bare_end =
+            (ctx->stage == WL_COLUMNAR_FILTER_STAGE_JOIN_RIGHT_SOURCE
+            && ctx->join_right_bare && ctx->join_right_initialized)
+            || (ctx->stage == WL_COLUMNAR_FILTER_STAGE_SOURCE
+            && ctx->source_bare && ctx->source_initialized);
+    if (ctx->committed) return 0;
+    if (!ctx->execution_result) ctx->execution_result = cause;
+    if (!ctx->semantic_result) ctx->semantic_result = ctx->execution_result;
+    return 0;
 }
 
 int

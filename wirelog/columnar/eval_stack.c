@@ -634,7 +634,8 @@ wl_columnar_eval_stack_attempt_charge(wl_evaluation_control_t *control,
     uint64_t id, uint64_t work)
 {
     int rc = wl_columnar_eval_stack_attempt_guard(control, id);
-    return rc ? rc : wl_evaluation_control_charge(control, work);
+    return rc ? rc : wl_evaluation_control_charge_attempt(control, id,
+               work);
 }
 
 static int
@@ -2742,6 +2743,20 @@ wl_columnar_eval_stack_cleanup_receipt_cancel_begin(
     return 0;
 }
 
+/* Financial classification only. The key getter repeats its actual complete
+ * native/output proof; this observation supplies no mutation permission. */
+bool
+wl_columnar_eval_stack_cleanup_receipt_key_protected(
+    wl_columnar_eval_stack_cleanup_frame_t *frame)
+{
+    if (!frame) return false;
+    const wl_columnar_eval_stack_auto_t *automatic =
+        wl_columnar_eval_stack_automatic(frame);
+    return frame->prepared_unary || (automatic->identity == automatic
+           && automatic->frame == frame
+           && automatic->phase != WL_COLUMNAR_EVAL_STACK_AUTO_UNUSED);
+}
+
 int
 wl_columnar_eval_stack_cleanup_receipt_key_for_frame(
     wl_columnar_eval_stack_cleanup_frame_t *frame,
@@ -3108,13 +3123,21 @@ wl_columnar_eval_stack_cleanup_receipt_free_target(
     return 0;
 }
 
-int
-wl_columnar_eval_stack_cleanup_receipt_host(const wl_plan_relation_t *rp,
+static int
+wl_columnar_eval_stack_cleanup_receipt_host_internal(
+    const wl_plan_relation_t *rp,
     wl_col_session_t *session, bool recursive,
-    const wl_columnar_eval_serial_framed_host_request_t *request)
+    const wl_columnar_eval_serial_framed_host_request_t *request,
+    wl_session_source_finance_t *source)
 {
+    int source_rc = source ? wl_session_source_finance_charge(source,
+            48) : 0;
+    if (source_rc) return source_rc;
     if (request && !wl_columnar_eval_stack_host_geometry(session, request))
         return EINVAL;
+    source_rc = source ? wl_session_source_finance_charge(source,
+            72) : 0;
+    if (source_rc) return source_rc;
     if (request && request->reply) {
         request->reply->kind = WL_COLUMNAR_EVAL_SERIAL_FRAMED_REPLY_REJECTED;
         request->reply->execution_result = EINVAL;
@@ -3150,6 +3173,9 @@ wl_columnar_eval_stack_cleanup_receipt_host(const wl_plan_relation_t *rp,
         || key->operation_attempt_id != request->operation_id
         || key->operation_id != request->operation_identity)
         return EINVAL;
+    source_rc = source ? wl_session_source_finance_charge(source,
+            80) : 0;
+    if (source_rc) return source_rc;
     wl_columnar_eval_cleanup_receipt_t *receipt =
         wl_columnar_eval_cleanup_receipt_find(session, key);
     if (!receipt) return ENOENT;
@@ -3158,6 +3184,10 @@ wl_columnar_eval_stack_cleanup_receipt_host(const wl_plan_relation_t *rp,
         || wl_evaluation_control_active_attempt_id(request->funding)
         != request->funding_id)
         return EINVAL;
+    if (source) {
+        source_rc = wl_session_source_finance_finish(source);
+        if (source_rc) return source_rc;
+    }
     /* No callback can invalidate this fresh full-key match at admission. */
     int rc = wl_evaluation_control_charge_attempt(request->funding,
             request->funding_id, WL_COLUMNAR_EVAL_SERIAL_FRAMED_HOST_WORK);
@@ -3232,6 +3262,26 @@ wl_columnar_eval_stack_cleanup_receipt_host(const wl_plan_relation_t *rp,
     return rc;
 }
 
+int
+wl_columnar_eval_stack_cleanup_receipt_host(const wl_plan_relation_t *rp,
+    wl_col_session_t *session, bool recursive,
+    const wl_columnar_eval_serial_framed_host_request_t *request)
+{
+    return wl_columnar_eval_stack_cleanup_receipt_host_internal(rp, session,
+               recursive, request, NULL);
+}
+
+int
+wl_columnar_eval_stack_cleanup_receipt_host_source(const wl_plan_relation_t *rp,
+    wl_col_session_t *session, bool recursive,
+    const wl_columnar_eval_serial_framed_host_request_t *request,
+    wl_session_source_finance_t *source)
+{
+    if (!source) return EINVAL;
+    return wl_columnar_eval_stack_cleanup_receipt_host_internal(rp, session,
+               recursive, request, source);
+}
+
 /* Binary replacement has its own original owner. The old ACTIVE phase is
  * only an exclusion gate; old unary bindings stay inert, including thread. */
 #define WL_COLUMNAR_EVAL_STACK_BINARY_ENTRY_WORK 256u
@@ -3300,7 +3350,7 @@ wl_columnar_eval_stack_binary_fund(
     if (!funding || funding == ctx->control || !id
         || wl_evaluation_control_active_attempt_id(funding) != id)
         return EINVAL;
-    return wl_evaluation_control_charge(funding,
+    return wl_evaluation_control_charge_attempt(funding, id,
                WL_COLUMNAR_EVAL_STACK_BINARY_HOST_WORK);
 }
 
@@ -3837,7 +3887,7 @@ wl_columnar_eval_stack_composed_source_abort(
     if (!funding || funding == owner->control || !funding_id
         || wl_evaluation_control_active_attempt_id(funding) != funding_id)
         return EINVAL;
-    rc = wl_evaluation_control_charge(funding, 384);
+    rc = wl_evaluation_control_charge_attempt(funding, funding_id, 384);
     if (rc) return rc;
     return wl_columnar_eval_stack_composed_source_abort_funded(frame, sess,
                owner);

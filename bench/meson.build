@@ -14,7 +14,6 @@ bench_ir_src = files(
   subdir_wirelog / 'ir/stratify.c',
   subdir_wirelog / 'ir/api.c',
   subdir_wirelog / 'intern.c',
-  subdir_wirelog / 'session.c',
   subdir_wirelog / 'evaluation_control.c',
   subdir_wirelog / 'exec_plan_gen.c',
   subdir_wirelog / 'session_facts.c',
@@ -27,6 +26,7 @@ bench_optimizer_src = files(
 )
 
 bench_backend_src = files(
+  subdir_wirelog / 'session.c',
   subdir_wirelog / 'exec_plan_scalar_view.c',
   subdir_wirelog / 'columnar/relation.c',
   subdir_wirelog / 'columnar/cache.c',
