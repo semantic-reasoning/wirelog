@@ -34,11 +34,13 @@
  *   EXPR_BOOL             [value:u8]   (0 = false, 1 = true)
  *   EXPR_ARITH_ADD..MOD   (no payload; pops 2 operands from stack)
  *   EXPR_CMP_EQ..GTE      (no payload; pops 2 operands from stack)
- *   EXPR_AGG_COUNT..MAX   (no payload; pops 1 operand from stack)
+ *   EXPR_AGG_COUNT..MAX   (no payload; the columnar evaluators skip it)
  *
  * Evaluation: walk the buffer left-to-right, push values onto a stack.
  * Operators pop their operands and push the result.  A well-formed
- * expression leaves exactly one value on the stack.
+ * expression leaves exactly one value on the stack.  The stack holds
+ * WL_PLAN_EXPR_STACK_MAX values; plan generation rejects an expression
+ * whose evaluation would hold more at once (Issue #2231).
  *
  * Example:  X > 5  encodes as:
  *   [EXPR_VAR][1][X] [EXPR_CONST_INT][5,0,0,0,0,0,0,0] [EXPR_CMP_GT]
@@ -91,7 +93,7 @@
  *   WL_PLAN_EXPR_CMP_EQ     .. WL_PLAN_EXPR_CMP_GTE
  *   WL_PLAN_EXPR_CMP_FLOAT_EQ .. WL_PLAN_EXPR_CMP_FLOAT_GTE
  *
- * Unary aggregate tags (pop 1, push 1):
+ * Aggregate tags (the columnar evaluators skip COUNT..MAX and reject AVG):
  *   WL_PLAN_EXPR_AGG_COUNT .. WL_PLAN_EXPR_AGG_AVG
  */
 typedef enum {
@@ -173,7 +175,7 @@ typedef enum {
     WL_PLAN_EXPR_CMP_FLOAT_LTE = 0x78,
     WL_PLAN_EXPR_CMP_FLOAT_GTE = 0x79,
 
-    /* Aggregate operators (unary, pop 1 push 1) */
+    /* Aggregate operators (no stack effect; see the comment above) */
     WL_PLAN_EXPR_AGG_COUNT = 0x30,
     WL_PLAN_EXPR_AGG_SUM = 0x31,
     WL_PLAN_EXPR_AGG_MIN = 0x32,
@@ -256,6 +258,15 @@ typedef enum {
     WL_PLAN_EXPR_ARITH_UUID5_SI      = 0x6B,
     WL_PLAN_EXPR_ARITH_UUID5_IS      = 0x6C,
 } wl_plan_expr_tag_t;
+
+/**
+ * WL_PLAN_EXPR_STACK_MAX:
+ *
+ * The evaluation stack holds this many values.  Plan generation rejects an
+ * expression whose evaluation would hold more at once (Issue #2231); a
+ * count's operand, which REDUCE never evaluates, is not checked.
+ */
+#define WL_PLAN_EXPR_STACK_MAX 64u
 
 /**
  * wl_plan_expr_buffer_t:

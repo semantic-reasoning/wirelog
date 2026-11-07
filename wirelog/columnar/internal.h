@@ -189,7 +189,7 @@ now_ns(void)
 
 #define COL_REL_INIT_CAP 64u
 #define COL_STACK_MAX 32u
-#define COL_FILTER_STACK 64u
+#define COL_FILTER_STACK WL_PLAN_EXPR_STACK_MAX
 #define MAX_ITERATIONS 4096u
 #define EVAL_STRIDE 8u /* sub-passes per outer iteration (Issue #237) */
 

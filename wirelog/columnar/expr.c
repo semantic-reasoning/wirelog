@@ -1420,8 +1420,12 @@ typedef struct {
 } expr_instr_t;
 
 /* The evaluators cap pushes, zero-fill underflow, and ignore aggregate tags.
- * Track the instruction that really supplies the returned top, rather than
- * assuming the final decoded instruction supplies it. All other instructions
+ * Plan generation rejects an expression that needs more than
+ * COL_FILTER_STACK slots (Issue #2231), except a count's operand, which
+ * REDUCE compiles but never evaluates; so this cap is exceeded only there
+ * and by bytecode built outside plan generation, as the tests do. Track the
+ * instruction that really supplies the returned top, rather than assuming
+ * the final decoded instruction supplies it. All other instructions
  * accepted by these compilers are binary pop/pop/push operations. Keep this
  * grammar in sync with both compilers when adding an opcode. No payload is
  * evaluated, and no stack-sized scratch or second traversal is required. */

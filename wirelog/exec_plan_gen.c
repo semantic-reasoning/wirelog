@@ -1138,6 +1138,213 @@ serialize_expr_to_buffer_ctx(const wl_ir_expr_t *expr, const col_ctx_t *ctx,
     return 0;
 }
 
+/*
+ * Largest number of values the postfix evaluation of @e holds at once
+ * (Issue #2231).  Each opcode pops and pushes a fixed number of values in
+ * columnar/expr.c, so counting them over the bytes gives the exact peak.
+ * Payloads are decoded as the interpreter decodes them.  Returns false for
+ * a truncated payload or a tag outside the plan encoding.
+ */
+static bool
+plan_expr_stack_need(const wl_plan_expr_buffer_t *e, uint32_t *need)
+{
+    uint32_t depth = 0;
+    uint32_t peak = 0;
+    uint32_t i = 0;
+
+    while (i < e->size) {
+        uint8_t tag = e->data[i++];
+        uint32_t pops = 0;
+        uint32_t pushes = 1;
+
+        switch ((wl_plan_expr_tag_t)tag) {
+        case WL_PLAN_EXPR_VAR:
+        case WL_PLAN_EXPR_VAR_FLOAT:
+        case WL_PLAN_EXPR_VAR_STRING:
+        case WL_PLAN_EXPR_CONST_STR: {
+            uint16_t len;
+            if (e->size - i < 2)
+                return false;
+            memcpy(&len, e->data + i, 2);
+            i += 2;
+            if (e->size - i < len)
+                return false;
+            i += len;
+            break;
+        }
+        case WL_PLAN_EXPR_CONST_INT:
+        case WL_PLAN_EXPR_CONST_FLOAT:
+            if (e->size - i < 8)
+                return false;
+            i += 8;
+            break;
+        case WL_PLAN_EXPR_BOOL:
+            if (e->size - i < 1)
+                return false;
+            i += 1;
+            break;
+        case WL_PLAN_EXPR_EXTENSION_CALL:
+        case WL_PLAN_EXPR_EXTENSION_CALL_ABI: {
+            uint32_t name_len;
+            if (e->size - i < 2)
+                return false;
+            name_len = (uint32_t)e->data[i] | (uint32_t)e->data[i + 1] << 8;
+            i += 2;
+            if (e->size - i < name_len || e->size - i - name_len < 4)
+                return false;
+            i += name_len;
+            pops = (uint32_t)e->data[i] | (uint32_t)e->data[i + 1] << 8
+                | (uint32_t)e->data[i + 2] << 16
+                | (uint32_t)e->data[i + 3] << 24;
+            i += 4;
+            if ((wl_plan_expr_tag_t)tag == WL_PLAN_EXPR_EXTENSION_CALL_ABI) {
+                if (e->size - i < 12)
+                    return false;
+                i += 12;
+            }
+            break;
+        }
+        case WL_PLAN_EXPR_AGG_COUNT:
+        case WL_PLAN_EXPR_AGG_SUM:
+        case WL_PLAN_EXPR_AGG_MIN:
+        case WL_PLAN_EXPR_AGG_MAX:
+        case WL_PLAN_EXPR_AGG_AVG:
+            pushes = 0;
+            break;
+        case WL_PLAN_EXPR_ARITH_UUID4:
+            break;
+        case WL_PLAN_EXPR_ARITH_BNOT:
+        case WL_PLAN_EXPR_ARITH_HASH:
+        case WL_PLAN_EXPR_ARITH_CRC32_ETH:
+        case WL_PLAN_EXPR_ARITH_CRC32_CAST:
+        case WL_PLAN_EXPR_ARITH_MD5:
+        case WL_PLAN_EXPR_ARITH_SHA1:
+        case WL_PLAN_EXPR_ARITH_SHA256:
+        case WL_PLAN_EXPR_ARITH_SHA512:
+        case WL_PLAN_EXPR_ARITH_HASH_S:
+        case WL_PLAN_EXPR_ARITH_CRC32_ETH_S:
+        case WL_PLAN_EXPR_ARITH_CRC32_CAST_S:
+        case WL_PLAN_EXPR_ARITH_MD5_S:
+        case WL_PLAN_EXPR_ARITH_SHA1_S:
+        case WL_PLAN_EXPR_ARITH_SHA256_S:
+        case WL_PLAN_EXPR_ARITH_SHA512_S:
+        case WL_PLAN_EXPR_STR_FN_STRLEN:
+        case WL_PLAN_EXPR_STR_FN_STR_ORD:
+        case WL_PLAN_EXPR_STR_FN_TO_UPPER:
+        case WL_PLAN_EXPR_STR_FN_TO_LOWER:
+        case WL_PLAN_EXPR_STR_FN_TRIM:
+        case WL_PLAN_EXPR_STR_FN_TO_STRING:
+        case WL_PLAN_EXPR_STR_FN_TO_NUMBER:
+            pops = 1;
+            break;
+        case WL_PLAN_EXPR_ARITH_ADD:
+        case WL_PLAN_EXPR_ARITH_SUB:
+        case WL_PLAN_EXPR_ARITH_MUL:
+        case WL_PLAN_EXPR_ARITH_DIV:
+        case WL_PLAN_EXPR_ARITH_MOD:
+        case WL_PLAN_EXPR_ARITH_BAND:
+        case WL_PLAN_EXPR_ARITH_BOR:
+        case WL_PLAN_EXPR_ARITH_BXOR:
+        case WL_PLAN_EXPR_ARITH_SHL:
+        case WL_PLAN_EXPR_ARITH_SHR:
+        case WL_PLAN_EXPR_ARITH_FLOAT_ADD:
+        case WL_PLAN_EXPR_ARITH_FLOAT_SUB:
+        case WL_PLAN_EXPR_ARITH_FLOAT_MUL:
+        case WL_PLAN_EXPR_ARITH_FLOAT_DIV:
+        case WL_PLAN_EXPR_ARITH_HMAC_SHA256:
+        case WL_PLAN_EXPR_ARITH_HMAC_SHA256_SS:
+        case WL_PLAN_EXPR_ARITH_HMAC_SHA256_SI:
+        case WL_PLAN_EXPR_ARITH_HMAC_SHA256_IS:
+        case WL_PLAN_EXPR_ARITH_UUID5:
+        case WL_PLAN_EXPR_ARITH_UUID5_SS:
+        case WL_PLAN_EXPR_ARITH_UUID5_SI:
+        case WL_PLAN_EXPR_ARITH_UUID5_IS:
+        case WL_PLAN_EXPR_CMP_EQ:
+        case WL_PLAN_EXPR_CMP_NEQ:
+        case WL_PLAN_EXPR_CMP_LT:
+        case WL_PLAN_EXPR_CMP_GT:
+        case WL_PLAN_EXPR_CMP_LTE:
+        case WL_PLAN_EXPR_CMP_GTE:
+        case WL_PLAN_EXPR_CMP_FLOAT_EQ:
+        case WL_PLAN_EXPR_CMP_FLOAT_NEQ:
+        case WL_PLAN_EXPR_CMP_FLOAT_LT:
+        case WL_PLAN_EXPR_CMP_FLOAT_GT:
+        case WL_PLAN_EXPR_CMP_FLOAT_LTE:
+        case WL_PLAN_EXPR_CMP_FLOAT_GTE:
+        case WL_PLAN_EXPR_CMP_STR_EQ:
+        case WL_PLAN_EXPR_CMP_STR_NEQ:
+        case WL_PLAN_EXPR_CMP_STR_LT:
+        case WL_PLAN_EXPR_CMP_STR_GT:
+        case WL_PLAN_EXPR_CMP_STR_LTE:
+        case WL_PLAN_EXPR_CMP_STR_GTE:
+        case WL_PLAN_EXPR_STR_FN_CAT:
+        case WL_PLAN_EXPR_STR_FN_CONTAINS:
+        case WL_PLAN_EXPR_STR_FN_STR_PREFIX:
+        case WL_PLAN_EXPR_STR_FN_STR_SUFFIX:
+        case WL_PLAN_EXPR_STR_FN_UUID5_RFC:
+            pops = 2;
+            break;
+        case WL_PLAN_EXPR_STR_FN_SUBSTR:
+        case WL_PLAN_EXPR_STR_FN_STR_REPLACE:
+            pops = 3;
+            break;
+        default:
+            return false;
+        }
+        depth = depth >= pops ? depth - pops : 0;
+        depth += pushes;
+        if (depth > peak)
+            peak = depth;
+    }
+    *need = peak;
+    return true;
+}
+
+/*
+ * Reject a relation whose operators carry an expression that needs more
+ * than WL_PLAN_EXPR_STACK_MAX stack slots (Issue #2231).  The evaluators
+ * would drop the excess values and return a wrong result, or keep or drop
+ * the wrong rows in a filter.  A count's operand is skipped: REDUCE never
+ * evaluates it (columnar/ops.c).  Returns 0 when every checked expression
+ * fits.
+ */
+static int
+check_relation_expr_stack(const wl_plan_op_t *ops, uint32_t count,
+    const char *rel_name, struct wirelog_program *prog)
+{
+    for (uint32_t o = 0; o < count; o++) {
+        const wl_plan_op_t *op = &ops[o];
+        const wl_plan_expr_buffer_t *single[3] = {
+            &op->filter_expr, &op->right_filter_expr,
+            op->op == WL_PLAN_OP_REDUCE && op->agg_fn == WIRELOG_AGG_COUNT
+            ? NULL : &op->agg_expr
+        };
+        uint32_t total = 3 + (op->map_exprs ? op->map_expr_count : 0);
+        for (uint32_t k = 0; k < total; k++) {
+            const wl_plan_expr_buffer_t *e
+                = k < 3 ? single[k] : &op->map_exprs[k - 3];
+            uint32_t need = 0;
+            if (!e || !e->data || e->size == 0)
+                continue;
+            if (!plan_expr_stack_need(e, &need)) {
+                set_plan_error(prog,
+                    "expression in a rule for '%s' could not be decoded "
+                    "for the operand stack check", rel_name);
+                return -1;
+            }
+            if (need > WL_PLAN_EXPR_STACK_MAX) {
+                set_plan_error(prog,
+                    "expression in a rule for '%s' holds %u values at once "
+                    "during evaluation, more than the %u the evaluator "
+                    "provides; compute part of it in a separate rule",
+                    rel_name, need, WL_PLAN_EXPR_STACK_MAX);
+                return -1;
+            }
+        }
+    }
+    return 0;
+}
+
 #ifdef WIRELOG_TEST_EXTENSION_SERIALIZATION
 int
 wl_exec_plan_gen_serialize_expr_for_test(const wl_ir_expr_t *expr,
@@ -4955,6 +5162,9 @@ wl_plan_from_program_with_snapshot(struct wirelog_program *prog,
                 }
 
                 int rc = translate_ir_node(ir_root, &ol, prog, snapshot);
+                if (rc == 0)
+                    rc = check_relation_expr_stack(ol.ops, ol.count,
+                            rel_name, prog);
                 if (rc != 0) {
                     /* Clean up ops */
                     for (uint32_t o = 0; o < ol.count; o++)
