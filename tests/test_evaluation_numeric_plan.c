@@ -5985,6 +5985,142 @@ test_composed_generated_union(void)
     }
 }
 
+static int
+lftj_leaf_cleanup_turn(wl_columnar_lftj_attempt_t *attempt, bool preconsume,
+    bool stale, bool *done, uint64_t *used)
+{
+    int owner = 0;
+    wl_evaluation_control_t *funding = control_new(1, &owner);
+    uint64_t id = wl_evaluation_control_active_attempt_id(funding);
+    if (stale) {
+        CHECK(!wl_evaluation_control_finish(funding, &owner, 0, 0));
+        CHECK(!wl_evaluation_control_reset(funding));
+        CHECK(!wl_evaluation_control_begin(funding, &owner));
+        CHECK(id != wl_evaluation_control_active_attempt_id(funding));
+    }
+    if (preconsume) CHECK(!wl_evaluation_control_charge(funding, 1));
+    int rc = wl_columnar_ops_lftj_attempt_abort(attempt, done, funding, id);
+    int expected = rc == WL_EVALUATION_CONTROL_WORK_LIMIT ? rc : 0;
+    CHECK(wl_evaluation_control_finish(funding, &owner, expected,
+        0) == expected);
+    wl_evaluation_control_report_t report;
+    CHECK(!wl_evaluation_control_report(funding, &report));
+    *used = report.consumed;
+    CHECK(!wl_evaluation_control_detach(funding, &owner));
+    wl_evaluation_control_release(funding);
+    return rc;
+}
+
+static void
+test_lftj_descriptor_cleanup_funding(void)
+{
+    for (unsigned work = 0; work < 2; ++work)
+        for (unsigned variant = 0; variant < 4; ++variant) {
+            wl_plan_relation_t body;
+            wl_plan_op_t op;
+            wl_plan_op_lftj_t metadata;
+            char *names[64];
+            uint32_t keys[64];
+            col_rel_t *relations[3];
+            fixture_t f;
+            composed_lftj_fixture(&f, work ? UINT64_C(1) << 20 : 0, &body, &op,
+                &metadata,
+                names, keys, relations);
+            metadata.k = 64;
+            for (unsigned i = 3; i < 64; ++i) {
+                names[i] = "a"; keys[i] = 0;
+            }
+            unsigned held = variant == 0 ? 0 : variant == 1 ? 1 : 3;
+            for (unsigned turns = 0;; ++turns) {
+                CHECK(turns < 100000);
+                if (f.record.phase ==
+                    WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_LFTJ_CHILD
+                    && f.record.lftj.inputs && f.record.lftj.cursor == held
+                    && composed_lftj_reader_count(&f.record.lftj) ==
+                    held) break;
+                composed_action(&f);
+            }
+            wl_columnar_lftj_attempt_t *a = &f.record.lftj;
+            CHECK(a->input_count == held && !a->row && !a->output
+                && !a->scratch_reserved);
+            /* Only variant3 is a component limit control: actual calloc owns64
+             * descriptors, but production's resolved high-water is still3. It
+             * deliberately checks a valid allocated inert tail, not a claimed
+             * naturally reached failure with64 resolved inputs. */
+            if (variant == 3) a->input_count = 64;
+            unsigned count = a->input_count;
+            if (work) CHECK(wl_evaluation_control_charge_attempt(f.operation,
+                    f.operation_id,
+                    UINT64_MAX) == WL_EVALUATION_CONTROL_WORK_LIMIT);
+            else {
+                wl_evaluation_control_request_cancel(f.operation);
+                CHECK(wl_evaluation_control_charge_attempt(f.operation,
+                    f.operation_id,
+                    0) == WL_EVALUATION_CONTROL_CANCELLED);
+            }
+            CHECK(composed_cleanup_lftj_turn(&f, 384, 0)
+                == WL_EVALUATION_CONTROL_WORK_LIMIT);
+            uint64_t original_before = 0;
+            CHECK(!wl_evaluation_control_test_active_consumed(f.operation,
+                f.operation_id, &original_before));
+            bool done = false;
+            uint64_t used = 0;
+            {
+                CHECK(lftj_leaf_cleanup_turn(a, false, false, &done, &used)
+                    == WL_EVALUATION_CONTROL_WORK_LIMIT && used == 1 && !done);
+                CHECK(a->phase == WL_COLUMNAR_LFTJ_ATTEMPT_RELEASE
+                    && !a->cleanup_cursor && !a->cleanup_input_stage);
+            }
+            unsigned advances = 0;
+            for (unsigned turns = 0; a->inputs && a->cleanup_cursor < count;
+                ++turns) {
+                CHECK(turns < 512);
+                uint32_t cursor = a->cleanup_cursor;
+                wl_columnar_lftj_input_attempt_t *in = &a->inputs[cursor];
+                bool advancing = !(a->cleanup_input_stage == 0 &&
+                    in->reader.owner)
+                    && !(a->cleanup_input_stage <= 1 && in->rows)
+                    && !(a->cleanup_input_stage <= 2 && in->scratch);
+                if (advancing) {
+                    wl_columnar_lftj_attempt_t before = *a;
+                    CHECK(lftj_leaf_cleanup_turn(a, true, false, &done, &used)
+                        == WL_EVALUATION_CONTROL_WORK_LIMIT && used == 1 &&
+                        !done);
+                    CHECK(!memcmp(a, &before, sizeof(before)));
+                    CHECK(lftj_leaf_cleanup_turn(a, false, true, &done, &used)
+                        == EINVAL && !used && !done);
+                    CHECK(!memcmp(a, &before, sizeof(before)));
+                }
+                wl_columnar_lftj_input_attempt_t *array = a->inputs;
+                CHECK(!lftj_leaf_cleanup_turn(a, false, false, &done, &used)
+                    && used == 1 && !done);
+                CHECK(a->inputs == array &&
+                    a->cleanup_cursor == cursor + advancing);
+                if (advancing) {
+                    ++advances; CHECK(!a->cleanup_input_stage);
+                }
+            }
+            CHECK(advances == count && a->inputs && a->cleanup_cursor == count);
+            /* The last advance did not also free the array. Its own next paid
+             * action frees exactly that resource; a later action marks DONE. */
+            CHECK(!lftj_leaf_cleanup_turn(a, false, false, &done, &used)
+                && !a->inputs && !done && used == 1);
+            CHECK(!lftj_leaf_cleanup_turn(a, false, false, &done, &used)
+                && done && !used);
+            uint64_t original_after = 0;
+            CHECK(!wl_evaluation_control_test_active_consumed(f.operation,
+                f.operation_id,
+                &original_after) && original_before == original_after);
+            while (f.record.phase != WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_DONE)
+                CHECK(!composed_cleanup_lftj_turn(&f, 0, 0));
+            int stop =
+                work ? WL_EVALUATION_CONTROL_WORK_LIMIT :
+                WL_EVALUATION_CONTROL_CANCELLED;
+            composed_lftj_finish_stop(&f, stop, stop);
+            for (unsigned i = 0; i < 3; ++i) col_rel_destroy(relations[i]);
+        }
+}
+
 static void
 test_composed_lftj_stopped_cleanup(void)
 {
@@ -13804,6 +13940,7 @@ main(void)
     test_composed_lftj_private_shadow();
     test_composed_recursive_terminal_exchange();
     test_recursive_kernel_two_join_and_metadata();
+    test_lftj_descriptor_cleanup_funding();
     test_composed_lftj_stopped_cleanup();
     test_composed_source_stopped_cleanup();
     test_composed_source_cleanup_abort_retry();
