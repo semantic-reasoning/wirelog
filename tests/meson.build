@@ -7229,3 +7229,14 @@ expression_intern_exe = executable('test_evaluation_expression_intern',
 test('evaluation_expression_intern', expression_intern_exe,
   suite: ['unit', 'tsan'], timeout: 60,
 )
+
+expression_strings_exe = executable('test_evaluation_expression_strings',
+  files('test_evaluation_expression_strings.c'),
+  c_args: ['-DWL_SESSION_TEST_HOOKS=1'],
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
+  link_with: [testlib_prod],
+)
+test('evaluation_expression_strings', expression_strings_exe,
+  suite: ['unit', 'tsan'], timeout: 120,
+)
