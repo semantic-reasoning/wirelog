@@ -97,9 +97,9 @@ ledger explicitly.
 | `WL_PLAN_EXPR_CMP_STR_GT` | empty-only | admitted | unit4-sessions |
 | `WL_PLAN_EXPR_CMP_STR_LTE` | empty-only | admitted | unit4-sessions |
 | `WL_PLAN_EXPR_CMP_STR_GTE` | empty-only | admitted | unit4-sessions |
-| `WL_PLAN_EXPR_ARITH_HASH_S` | open | open | open |
-| `WL_PLAN_EXPR_ARITH_CRC32_ETH_S` | open | open | open |
-| `WL_PLAN_EXPR_ARITH_CRC32_CAST_S` | open | open | open |
+| `WL_PLAN_EXPR_ARITH_HASH_S` | open | admitted | unit5-digests |
+| `WL_PLAN_EXPR_ARITH_CRC32_ETH_S` | open | admitted | unit5-digests |
+| `WL_PLAN_EXPR_ARITH_CRC32_CAST_S` | open | admitted | unit5-digests |
 | `WL_PLAN_EXPR_ARITH_MD5_S` | open | open | open |
 | `WL_PLAN_EXPR_ARITH_SHA1_S` | open | open | open |
 | `WL_PLAN_EXPR_ARITH_SHA256_S` | open | open | open |
@@ -473,3 +473,68 @@ and governor balance. A real overflowing MAP fails ERANGE then recovers after
 the bad input is removed; generated FILTER rejects overflow while retaining
 valid/zero-prefix rows. `unit5-decimal` records this session evidence; additional
 host qualification and other open domains remain outstanding.
+
+
+## String XXH3 and CRC (unit 5c)
+
+HASH_S and CRC32_ETH_S/CRC32_CAST_S are unary INT64 scalar instructions.
+A valid intern ID selects its C-string bytes excluding NUL. Absent IDs or
+absent intern/context select the operand's actual native sizeof(int64_t)
+object bytes; they never select an empty string. Embedded-NUL literals digest
+their intern value, independently of the full typed payload. CRC results are
+zero-extended uint32; XXH3 uses the raw uint64-to-int64 conversion. The same
+fixed debug diagnostic is retained for absent symbol IDs. Its logger body is
+a narrow synchronous boundary around a fixed message and int64 formatting.
+Numeric HASH/CRC decoding, evaluator and established tariffs are unchanged.
+
+The separate expr_hash.c translation unit includes XXH_INLINE_ALL before any
+xxhash include. The pinned xxHash0.8.4 state layout and implementation therefore
+share one header identity, avoiding the vendor prohibition on exposed stack
+states crossing a dynamic-library ABI. State uses vendor-declared alignment
+and XXH3_INITSTATE, never exposed fields or a hidden heap state. Wrapper symbols
+are internal; no XXH implementation symbol is newly exported. Every update
+accepts at most64 bytes. Reset/update/digest are explicit vendor cooperation
+boundaries even if the compiler/LTO inlines them: their bodies are not claimed
+as engine source actions funded by224. An update may also process the fixed
+256-byte internal buffer; digest may consume retained stripes. There is no
+input-sized whole-span update or one-shot fallback and no cancellation claim
+inside a synchronous vendor routine.
+
+XXH3 engine work is224*(4+ceil(n/64)): entry120, INITSTATE/reset caller121,
+each update caller123, digest caller125 and final cutoff127. Zero-cost guarded
+post-call checkpoints122/124/126 immediately observe stops and saved-ID changes.
+Every pre-call hook revalidates before invoking the vendor; final publication
+follows the saved-ID cutoff. The caller source envelope is G9+C13+two T29 tails
+plus at most99 local/branch/loop/child-call actions,179<224<=256, excluding only
+the named vendor bodies. INITSTATE's fixed stores remain engine work.
+
+CRC reuses immutable wl_columnar_expr_crc_eth_bytes/cast_bytes, with no lazy
+table generation. Entry114 and final117 each pay224. Every source LOAD115 and
+separate table/update116 pays224, so independent exact work is224*(2n+2).
+The common179-action envelope covers one load or update and caller transitions.
+Scalar102/103/104 regions separately cover ID/native-byte preparation, child
+selection and final push. All helpers borrow immutable spans, allocate nothing,
+retain no context and leave outputs unchanged on nonzero returns.
+
+Tests compare streaming boundaries0/1/8/16/17/63/64/65/127/128/129/240/241/255/
+256/257/1024/4096 against the linked one-shot oracle, with independent literal
+exact/one-short budgets. Empty XXH3 has fixed vendor-vector golden
+0x2D06800538D394C2; CRC123456789 goldens are0xCBF43926/0xE3069283. Stops and
+attempt replacement cover each pre/post vendor call, final cutoff, CRC LOAD/
+update seams and long traversal. Direct raw parity covers empty/large/malformed
+symbols, native fallback including INT64 limits, underflow/capped stack,
+embedded NUL, cached type and reuse of a stopped compiled owner.
+
+Generated FILTER and MAP assert actual _S tags and compare exact relation
+values. MAP mixes string projection, all three digests and numeric arithmetic;
+empty output, mid-work cancellation/exhaustion after earlier columns, retry,
+exact signed deletion, subsequent calls and no new result interning are checked.
+Shared-plan sessions with different governors check ownership retirement.
+Legacy retained serial symbol-HASH/CRC refusal fixtures now require successful
+publication and exact raw-reference values, including native fallback IDs.
+Production/benchmark/standalone source lists include the helper. Native and
+ASan/UBSan plus mbedTLS-on optimized/non-LTO and default mbedTLS-off/LTO builds
+qualify this bundle. Matching production size profiles measure .text from
+850089 to853493 bytes (+3404), informational under the user's size policy.
+`unit5-digests` records this evidence; crypto, allocating strings, extensions
+and additional recursive/pipeline domain qualification remain outstanding.
