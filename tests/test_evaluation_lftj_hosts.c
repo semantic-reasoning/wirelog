@@ -1,4 +1,7 @@
 /* Real session wrappers over compiler-selected LFTJ. */
+#ifndef _WIN32
+#define _DEFAULT_SOURCE 1
+#endif
 #include "../wirelog/columnar/internal.h"
 #include "../wirelog/exec_plan_gen.h"
 #include "../wirelog/session.h"
@@ -1043,12 +1046,390 @@ test_session_metadata_dynamic_bindings(void)
     wl_columnar_memory_governor_ref_release(g);
 }
 
+static void
+configure_native(const char *name, const char *value)
+{
+#ifdef _WIN32
+    CHECK(!_putenv_s(name, value ? value : ""));
+#else
+    CHECK(value ? !setenv(name, value, 1) : !unsetenv(name));
+#endif
+}
+
+static void
+native_fixture_init(fixture_t *f, bool observed)
+{
+    const char *names[] = {"WIRELOG_JOIN_BATCH_BYTES",
+                           "WIRELOG_JOIN_BATCH_STRICT"};
+    char *saved[2] = {NULL, NULL};
+    for (unsigned i = 0; i < 2; ++i) {
+        const char *value = getenv(names[i]);
+        if (value) {
+            saved[i] = malloc(strlen(value) + 1);
+            CHECK(saved[i]);
+            memcpy(saved[i], value, strlen(value) + 1);
+        }
+        configure_native(names[i], i ? "0" : "64");
+    }
+    fixture_init(f, true, false, observed, true, false);
+    for (unsigned i = 0; i < 2; ++i) {
+        configure_native(names[i], saved[i]);
+        free(saved[i]);
+    }
+}
+
+typedef struct {
+    fixture_t *fixture;
+    bool ended;
+    bool refuse_funding, successor;
+    bool owner_probed;
+    unsigned target;
+    unsigned funding_refusals;
+    unsigned initializer_mask;
+    uintptr_t initializer_identity;
+    uint64_t successor_id;
+    wl_evaluation_control_report_t frozen;
+} native_source_test_t;
+
+static native_source_test_t *native_source;
+
+static void
+end_native_original(wl_evaluation_control_t *control,
+    const wl_columnar_lftj_attempt_t *attempt)
+{
+    native_source_test_t *test = native_source;
+    CHECK(test && control == test->fixture->control);
+    if (test->ended) return;
+    bool ready = false;
+    switch (test->target) {
+    case 0:
+        ready = attempt->phase == WL_COLUMNAR_LFTJ_ATTEMPT_COPY
+            && attempt->inputs && attempt->inputs[0].copy_cell;
+        break;
+    case 1:
+        ready = attempt->phase == WL_COLUMNAR_LFTJ_ATTEMPT_SORT
+            && (attempt->inputs[0].sort_run || attempt->inputs[0].sort_copying);
+        break;
+    case 2:
+        ready = attempt->phase == WL_COLUMNAR_LFTJ_ATTEMPT_JOIN
+            && !attempt->output_pass
+            && attempt->join_phase == WL_COLUMNAR_LFTJ_JOIN_SEEK_SEARCH
+            && attempt->seek_lo < attempt->seek_hi;
+        break;
+    case 3:
+        ready = attempt->phase == WL_COLUMNAR_LFTJ_ATTEMPT_JOIN
+            && !attempt->output_pass && attempt->output_rows
+            && attempt->join_phase == WL_COLUMNAR_LFTJ_JOIN_PRODUCT_COUNT;
+        break;
+    case 4:
+        ready = attempt->phase == WL_COLUMNAR_LFTJ_ATTEMPT_OUTPUT_BEGIN
+            && attempt->output_owned && attempt->output &&
+            !attempt->writer_active;
+        break;
+    case 5:
+        ready = attempt->phase == WL_COLUMNAR_LFTJ_ATTEMPT_JOIN
+            && attempt->output_pass && attempt->output_written
+            && attempt->writer_active && attempt->fill_col
+            && attempt->join_phase == WL_COLUMNAR_LFTJ_JOIN_PRODUCT_EMIT;
+        break;
+    case 6:
+        ready = attempt->phase == WL_COLUMNAR_LFTJ_ATTEMPT_OUTPUT_END
+            && attempt->writer_active && attempt->output_written == 10;
+        break;
+    default: CHECK(false);
+    }
+    if (!ready) return;
+    uint64_t id = wl_evaluation_control_active_attempt_id(control);
+    wl_evaluation_control_attempt_finish_result_t ended =
+        wl_evaluation_control_finish_attempt(control,
+            test->fixture->session->operation_admission, id, 0, 0);
+    CHECK(!ended.protocol && ended.report_valid && ended.report.consumed
+        && !ended.report.result);
+    test->frozen = ended.report;
+    test->ended = true;
+    test->initializer_identity = (uintptr_t)&attempt->retirement_initializer;
+    if (test->successor) {
+        CHECK(!wl_evaluation_control_reset(control));
+        wl_evaluation_control_attempt_begin_result_t next =
+            wl_evaluation_control_begin_attempt(control,
+                test->fixture->session->operation_admission);
+        CHECK(!next.protocol && next.attempt_id != id);
+        test->successor_id = next.attempt_id;
+    }
+}
+
+static void
+native_initializer_checkpoint(
+    wl_columnar_relation_scalar_retirement_initializer_t *initializer,
+    wl_evaluation_control_t *funding, unsigned api)
+{
+    native_source_test_t *test = native_source;
+    CHECK(test);
+    if (!test->ended ||
+        (uintptr_t)initializer != test->initializer_identity) return;
+    CHECK(api >= 1 && api <= 4 && funding != test->fixture->control
+        && wl_evaluation_control_active_attempt_id(funding));
+    test->initializer_mask |= 1u << api;
+}
+
+static uint64_t
+refuse_native_funding(const wl_col_session_t *session,
+    wl_columnar_eval_serial_framed_host_action_t action, uint64_t limit)
+{
+    native_source_test_t *test = native_source;
+    CHECK(test && session == (wl_col_session_t *)test->fixture->session);
+    if (test->ended && test->refuse_funding && !test->funding_refusals
+        && action == WL_COLUMNAR_EVAL_SERIAL_FRAMED_NATIVE_CLEANUP) {
+        ++test->funding_refusals;
+        return 1;
+    }
+    return limit;
+}
+
+static void
+test_native_owner_boundaries(wl_columnar_eval_serial_framed_attempt_t *ctx)
+{
+    /* A real paused owner supplies provenance. Calls below are component
+     * funding/negative probes; they do not synthesize a public scheduler. */
+    wl_columnar_eval_plan_numeric_attempt_t *n = &ctx->child;
+    CHECK(n->semantic_result
+        && n->phase == WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_LFTJ_CHILD
+        && n->lftj.phase == WL_COLUMNAR_LFTJ_ATTEMPT_RELEASE);
+    uint64_t proof = 80 + 64 + (ctx->private_bindings ? 104 : 48)
+        + (wl_columnar_eval_stack_cleanup_receipt_key_protected(ctx->frame)
+        ? 112 : 72);
+    const unsigned ends[] = {31, 32, 39, 40};
+    for (unsigned i = 0; i < sizeof(ends) / sizeof(ends[0]); ++i) {
+        wl_columnar_eval_plan_numeric_attempt_t before = *n;
+        wl_evaluation_control_t *funding = NULL;
+        int owner = 0;
+        CHECK(!wl_evaluation_control_create(proof + ends[i], &funding)
+            && !wl_evaluation_control_attach(funding, &owner)
+            && !wl_evaluation_control_begin(funding, &owner));
+        uint64_t id = wl_evaluation_control_active_attempt_id(funding);
+        CHECK(wl_columnar_eval_plan_numeric_join_cleanup_step(ctx, funding, id)
+            == WL_EVALUATION_CONTROL_WORK_LIMIT);
+        CHECK(!memcmp(n, &before, sizeof(before)));
+        CHECK(wl_evaluation_control_finish(funding, &owner, 0, 0)
+            == WL_EVALUATION_CONTROL_WORK_LIMIT);
+        wl_evaluation_control_report_t report;
+        CHECK(!wl_evaluation_control_report(funding, &report)
+            && report.consumed == proof + (i == 0 ? 0 : i == 3 ? 40 : 32));
+        CHECK(!wl_evaluation_control_detach(funding, &owner));
+        wl_evaluation_control_release(funding);
+    }
+    for (unsigned variant = 0; variant < 13; ++variant) {
+        wl_columnar_lftj_attempt_t original = n->lftj;
+        wl_columnar_eval_plan_numeric_phase_t phase = n->phase;
+        wl_columnar_eval_plan_numeric_phase_t pending = n->pending_action;
+        if (variant == 0) n->lftj.identity = &original;
+        if (variant == 1) n->lftj.numeric_owner = NULL;
+        if (variant == 2) n->lftj.thread_valid = false;
+        if (variant == 3) n->lftj.busy = true;
+        if (variant == 4) n->lftj.metadata = NULL;
+        if (variant == 5) n->lftj.phase = WL_COLUMNAR_LFTJ_ATTEMPT_DONE;
+        if (variant == 6) {
+            n->phase = WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_PENDING;
+            n->pending_action =
+                WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_UNARY_CHILD;
+        }
+        if (variant == 7) ++n->lftj.attempt_id;
+        if (variant == 8) n->lftj.frame = NULL;
+        if (variant == 9) n->lftj.session = NULL;
+        if (variant == 10) n->lftj.control = NULL;
+        if (variant == 11) n->lftj.cleanup_cursor = n->lftj.input_count + 1;
+        if (variant == 12) n->lftj.cleanup_input_stage = 4;
+        wl_columnar_eval_plan_numeric_attempt_t before = *n;
+        int owner = 0;
+        wl_evaluation_control_t *funding = NULL;
+        CHECK(!wl_evaluation_control_create(0, &funding)
+            && !wl_evaluation_control_attach(funding, &owner)
+            && !wl_evaluation_control_begin(funding, &owner));
+        int rc = wl_columnar_eval_plan_numeric_join_cleanup_step(ctx, funding,
+                wl_evaluation_control_active_attempt_id(funding));
+        CHECK(rc == (variant == 3 ? EBUSY : EINVAL));
+        CHECK(!memcmp(n, &before, sizeof(before)));
+        CHECK(!wl_evaluation_control_finish(funding, &owner, 0, 0)
+            && !wl_evaluation_control_detach(funding, &owner));
+        wl_evaluation_control_release(funding);
+        n->lftj = original;
+        n->phase = phase; n->pending_action = pending;
+    }
+    wl_columnar_eval_plan_numeric_attempt_t before = *n;
+    CHECK(wl_columnar_eval_plan_numeric_join_cleanup_step(ctx,
+        ctx->control, ctx->attempt_id) == EINVAL);
+    CHECK(!memcmp(n, &before, sizeof(before)));
+    int owner = 0;
+    wl_evaluation_control_t *funding = NULL;
+    CHECK(!wl_evaluation_control_create(0, &funding)
+        && !wl_evaluation_control_attach(funding, &owner)
+        && !wl_evaluation_control_begin(funding, &owner));
+    uint64_t stale_id = wl_evaluation_control_active_attempt_id(funding);
+    CHECK(!wl_evaluation_control_finish(funding, &owner, 0, 0)
+        && !wl_evaluation_control_reset(funding)
+        && !wl_evaluation_control_begin(funding, &owner));
+    uint64_t id = wl_evaluation_control_active_attempt_id(funding);
+    CHECK(id != stale_id && wl_columnar_eval_plan_numeric_join_cleanup_step(ctx,
+        funding, stale_id) == EINVAL && !memcmp(n, &before, sizeof(before)));
+    uint64_t used = UINT64_MAX;
+    CHECK(!wl_evaluation_control_test_active_consumed(funding, id,
+        &used) && !used);
+    wl_columnar_eval_serial_framed_attempt_t *copy = malloc(sizeof(*copy));
+    CHECK(copy); *copy = *ctx;
+    CHECK(wl_columnar_eval_plan_numeric_join_cleanup_step(copy, funding,
+        id) == EINVAL
+        && !memcmp(n, &before, sizeof(before)));
+    free(copy);
+    CHECK(!wl_evaluation_control_finish(funding, &owner, 0, 0)
+        && !wl_evaluation_control_detach(funding, &owner));
+    wl_evaluation_control_release(funding);
+}
+
+static void
+test_native_cleanup(void)
+{
+    for (unsigned scenario = 0; scenario < 9; ++scenario)
+        for (unsigned observed = 0; observed < 2; ++observed)
+            for (unsigned snapshot = 0; snapshot < 2; ++snapshot) {
+                fixture_t f;
+                native_fixture_init(&f, observed);
+                CHECK(f.session->source_c1_admission
+                    && ((wl_col_session_t *)f.session)->join_batch_bytes == 64);
+                source_image_t sources[3];
+                for (unsigned i = 0; i < 3;
+                    ++i) sources[i] = image(f.session, i);
+                wl_columnar_memory_governor_t *governor =
+                    wl_columnar_memory_governor_ref_get(f.governor);
+                uint64_t reserved = wl_columnar_memory_reserved(governor);
+                wl_columnar_memory_reservation_t foreign;
+                wl_columnar_memory_reservation_init(&foreign);
+                CHECK(wl_columnar_memory_reserve_checked(governor, 4096,
+                    &foreign)
+                    == WL_COLUMNAR_MEMORY_ADMISSION_OK);
+                native_source_test_t test = {.fixture = &f,
+                                             .target = scenario <
+                                                 7 ? scenario : scenario ==
+                                                 7 ? 0u : 5u,
+                                             .refuse_funding = scenario != 7,
+                                             .successor = scenario == 8};
+                native_source = &test;
+                wl_columnar_lftj_test_attempt_checkpoint = end_native_original;
+                wl_columnar_session_test_framed_grant_limit =
+                    refuse_native_funding;
+                wl_columnar_relation_scalar_retirement_init_test_checkpoint =
+                    native_initializer_checkpoint;
+                capture_t captured = {0};
+                int rc = EAGAIN;
+                if (snapshot) rc = wl_session_snapshot(f.session, on_tuple,
+                            &captured);
+                else {
+                    for (unsigned i = 0; i < 1000000 && rc == EAGAIN; ++i) {
+                        rc = wl_session_step(f.session);
+                        uint64_t active =
+                            wl_evaluation_control_active_attempt_id(f.control);
+                        if (test.ended) CHECK(active == test.successor_id);
+                        else if (rc == EAGAIN) CHECK(active);
+                        if (test.ended && !scenario && !observed &&
+                            !test.owner_probed) {
+                            wl_col_session_t *session =
+                                (wl_col_session_t *)f.session;
+                            wl_columnar_eval_serial_framed_attempt_t *ctx =
+                                NULL;
+                            if (wl_columnar_session_test_native_error_phase(
+                                    session)
+                                == WL_COLUMNAR_SESSION_NATIVE_ERROR_CHILD
+                                && !wl_columnar_eval_stack_framed_context(
+                                    session->cleanup_active,
+                                    session, &ctx)
+                                && ctx->phase ==
+                                WL_COLUMNAR_EVAL_SERIAL_FRAMED_CHILD
+                                && ctx->child.semantic_result
+                                && ctx->child.phase ==
+                                WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_LFTJ_CHILD
+                                && ctx->child.lftj.phase ==
+                                WL_COLUMNAR_LFTJ_ATTEMPT_RELEASE) {
+                                test_native_owner_boundaries(ctx);
+                                test.owner_probed = true;
+                            }
+                        }
+                    }
+                }
+                wl_columnar_session_test_framed_grant_limit = NULL;
+                wl_columnar_lftj_test_attempt_checkpoint = NULL;
+                wl_columnar_relation_scalar_retirement_init_test_checkpoint =
+                    NULL;
+                if (!test.ended ||
+                    test.funding_refusals != test.refuse_funding ||
+                    rc != EINVAL)
+                    fprintf(stderr,
+                        "native scenario=%u observed=%u snapshot=%u ended=%u funding=%u rc=%d\n",
+                        scenario, observed, snapshot, test.ended,
+                        test.funding_refusals, rc);
+                CHECK(test.ended &&
+                    test.funding_refusals == test.refuse_funding &&
+                    rc == EINVAL);
+                CHECK(test.initializer_mask == (test.target >= 4 ? 30u : 0u));
+                if (!scenario && !observed &&
+                    !snapshot) CHECK(test.owner_probed);
+                CHECK(!captured.count && !f.events.count
+                    && !session_find_rel((wl_col_session_t *)f.session,
+                    "output"));
+                CHECK(wl_columnar_memory_reserved(governor) == reserved + 4096
+                    && foreign.governor == governor && foreign.bytes == 4096
+                    && atomic_load_explicit(&foreign.state,
+                    memory_order_acquire)
+                    == WL_COLUMNAR_MEMORY_RESERVATION_RESERVED);
+                for (unsigned i = 0; i < 3; ++i)
+                    unchanged(f.session, i, &sources[i], true);
+                wl_evaluation_control_report_t report;
+                CHECK(!wl_evaluation_control_report(f.control, &report));
+                CHECK(report.attempt_id == test.frozen.attempt_id
+                    && report.consumed == test.frozen.consumed
+                    && report.result == test.frozen.result
+                    && report.limit == test.frozen.limit
+                    && report.stop_reason == test.frozen.stop_reason
+                    && report.execution_status == test.frozen.execution_status
+                    && report.cleanup_status == test.frozen.cleanup_status);
+                if (test.successor_id) {
+                    uint64_t consumed = UINT64_MAX;
+                    CHECK(wl_evaluation_control_active_attempt_id(f.control) ==
+                        test.successor_id
+                        && !wl_evaluation_control_test_active_consumed(
+                            f.control,
+                            test.successor_id, &consumed) && !consumed);
+                    wl_session_t *slot = f.session;
+                    CHECK(wl_session_try_destroy(&slot) == EBUSY &&
+                        slot == f.session);
+                    wl_evaluation_control_attempt_finish_result_t ended =
+                        wl_evaluation_control_finish_attempt(f.control,
+                            f.session->operation_admission, test.successor_id,
+                            0, 0);
+                    CHECK(!ended.protocol && ended.report_valid &&
+                        !ended.report.consumed
+                        && !ended.report.result);
+                }
+                CHECK(!wl_evaluation_control_reset(f.control));
+                captured.count = 0;
+                CHECK(!drive(&f, snapshot, &captured));
+                capture_t expected = oracle(&f),
+                    actual = head_capture(f.session);
+                equal(&actual, &expected);
+                if (snapshot) equal(&captured, &expected);
+                if (observed) equal(&f.events, &expected);
+                CHECK(wl_columnar_memory_rollback(&foreign));
+                native_source = NULL;
+                fixture_destroy(&f);
+            }
+}
+
 int
 main(int argc, char **argv)
 {
     if (argc > 2 || (argc == 2 && strcmp(argv[1], "domains")
-        && strcmp(argv[1], "recovery") && strcmp(argv[1], "failures"))) {
-        fprintf(stderr, "usage: %s [domains|recovery|failures]\n", argv[0]);
+        && strcmp(argv[1], "recovery") && strcmp(argv[1], "failures")
+        && strcmp(argv[1], "native"))) {
+        fprintf(stderr, "usage: %s [domains|recovery|failures|native]\n",
+            argv[0]);
         return EXIT_FAILURE;
     }
     if (argc == 1 || !strcmp(argv[1], "domains")) {
@@ -1067,6 +1448,7 @@ main(int argc, char **argv)
         test_output_failures();
         test_private_authority();
     }
+    if (argc == 1 || !strcmp(argv[1], "native")) test_native_cleanup();
     puts("LFTJ session tests passed");
     return 0;
 }

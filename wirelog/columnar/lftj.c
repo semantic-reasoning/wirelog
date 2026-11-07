@@ -1525,7 +1525,8 @@ wl_columnar_lftj_attempt_release(wl_columnar_lftj_attempt_t *a, bool *done,
         if (!rc) a->retirement_drained = true;
         return rc;
     }
-    for (uint32_t i = a->cleanup_cursor; a->inputs && i < a->input_count; i++) {
+    if (a->inputs && a->cleanup_cursor < a->input_count) {
+        uint32_t i = a->cleanup_cursor;
         wl_columnar_lftj_input_attempt_t *in = &a->inputs[i];
         if (a->cleanup_input_stage == 0 && in->reader.owner) {
             int rc = wl_columnar_lftj_attempt_cleanup_charge(funding,
@@ -1557,8 +1558,11 @@ wl_columnar_lftj_attempt_release(wl_columnar_lftj_attempt_t *a, bool *done,
             a->cleanup_input_stage = 3;
             return 0;
         }
+        int rc = wl_columnar_lftj_attempt_cleanup_charge(funding, funding_id);
+        if (rc) return rc;
         a->cleanup_cursor = i + 1;
         a->cleanup_input_stage = 0;
+        return 0;
     }
     if (a->row) {
         int rc = wl_columnar_lftj_attempt_cleanup_charge(funding,

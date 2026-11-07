@@ -3915,6 +3915,57 @@ wl_columnar_eval_plan_numeric_composed_attempt_ack(
     return wl_columnar_eval_plan_composed_ack_body(record);
 }
 
+/* This is an ended-Original Native owner, not ordinary sticky-stop authority.
+* The registered parent proves the real frame/key before this bounded child
+* read; no copied child or unrelated pending operation acquires that proof. */
+static int
+wl_columnar_eval_plan_native_lftj_owner(
+    const wl_columnar_eval_plan_numeric_attempt_t *n)
+{
+    const wl_columnar_lftj_attempt_t *a = &n->lftj;
+    if (a->identity != a || a->numeric_owner != n || a->frame != n->frame
+        || a->session != n->session || a->control != n->control
+        || a->attempt_id != n->attempt_id || !a->thread_valid
+        || a->phase < WL_COLUMNAR_LFTJ_ATTEMPT_RESOLVE
+        || a->phase > WL_COLUMNAR_LFTJ_ATTEMPT_DONE) return EINVAL;
+    if (a->busy) return EBUSY;
+#if defined(WL_HAVE_C11_THREADS)
+    if (!thrd_equal(a->owner_thread, thrd_current())) return EINVAL;
+#elif defined(_WIN32) || defined(_WIN64)
+    if (a->owner_thread != GetCurrentThreadId()) return EINVAL;
+#else
+    if (!pthread_equal(a->owner_thread, pthread_self())) return EINVAL;
+#endif
+    wl_columnar_eval_plan_numeric_phase_t phase = n->phase ==
+        WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_PENDING ? n->pending_action
+        : n->phase;
+    if (a->phase != WL_COLUMNAR_LFTJ_ATTEMPT_DONE
+        && phase != WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_LFTJ_CHILD
+        && phase !=
+        WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_RELEASE) return EINVAL;
+    if (a->phase != WL_COLUMNAR_LFTJ_ATTEMPT_DONE
+        && (n->lftj_metadata.phase != WL_COLUMNAR_LFTJ_METADATA_CONSUMED
+        || !a->metadata || a->metadata != n->lftj_metadata.metadata
+        || a->input_count > n->lftj_metadata.k
+        || a->cleanup_cursor > a->input_count || a->cleanup_input_stage > 3))
+        return EINVAL;
+    if (a->phase == WL_COLUMNAR_LFTJ_ATTEMPT_DONE
+        && (a->writer_active || a->output_owned || a->output || a->inputs
+        || a->row || a->scratch_reserved || a->scratch_committed
+        || a->retirement_started || a->retirement_initializer.identity))
+        return EINVAL;
+    const wl_columnar_relation_scalar_retirement_initializer_t *i =
+        &a->retirement_initializer;
+    if (i->identity && (i->identity != i || i->parent != a
+        || i->retirement != &a->retirement || i->relation != a->output))
+        return EINVAL;
+    if (a->retirement_started
+        && (a->retirement.storage.identity != (uintptr_t)&a->retirement.storage
+        || a->retirement.committed != a->retirement_committed)) return EINVAL;
+    if (a->retirement_drained && !a->retirement_started) return EINVAL;
+    return 0;
+}
+
 static int
 wl_columnar_eval_plan_join_cleanup_admit(
     wl_columnar_eval_serial_framed_attempt_t *ctx,
@@ -3925,10 +3976,13 @@ wl_columnar_eval_plan_join_cleanup_admit(
     int rc = wl_columnar_session_join_cleanup_prove(ctx, funding, id, NULL,
             &cause);
     if (rc) return rc;
-    rc = wl_evaluation_control_charge_attempt(funding, id,
-            128);
-    if (rc) return rc;
     wl_columnar_eval_plan_numeric_attempt_t *n = &ctx->child;
+    /* Finance only: the embedded observation grants no child authority. */
+    bool native_lftj = n->lftj.identity
+        && n->lftj.phase != WL_COLUMNAR_LFTJ_ATTEMPT_DONE;
+    rc = wl_evaluation_control_charge_attempt(funding, id,
+            native_lftj ? 32 : 128);
+    if (rc) return rc;
     if (!ctx->child_bound || !wl_columnar_eval_plan_numeric_owner_valid(n,
         ctx->frame)
         || n->session != ctx->session || n->plan != ctx->plan
@@ -3939,12 +3993,20 @@ wl_columnar_eval_plan_join_cleanup_admit(
         || n->phase < WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_INPUTS
         || n->phase > WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_DONE)
         return EINVAL;
-    if (n->lftj.identity && n->lftj.phase != WL_COLUMNAR_LFTJ_ATTEMPT_DONE)
-        return ENOTSUP; /* The active LFTJ owner's recovery is a separate domain. */
+    if (n->lftj.identity) {
+        if (native_lftj) {
+            rc = wl_evaluation_control_charge_attempt(funding, id, 8);
+            if (rc) return rc;
+        }
+        rc = wl_columnar_eval_plan_native_lftj_owner(n);
+        if (rc) return rc;
+    }
     rc = wl_columnar_eval_stack_numeric_owner(n->frame, n);
     if (rc) return rc;
     if (!ctx->primary_result) ctx->primary_result = cause;
     if (!n->semantic_result) n->semantic_result = cause;
+    if (native_lftj && !n->lftj.semantic_result)
+        n->lftj.semantic_result = cause;
     /* Error intent is now a native cleanup obligation, not permission to
      * request cancellation on whatever generation the controller holds. */
     n->abort_requested = false;
@@ -3993,6 +4055,15 @@ wl_columnar_eval_plan_numeric_join_cleanup_step(
     wl_columnar_eval_plan_join_cleanup_redirect(n);
     n->composed_busy = true;
     switch (n->phase) {
+    case WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_LFTJ_CHILD: {
+        rc = wl_evaluation_control_charge_attempt(funding, id, 0);
+        if (rc) break;
+        bool done = false;
+        rc = wl_columnar_ops_lftj_attempt_abort(&n->lftj, &done, funding, id);
+        if (!rc &&
+            done) n->phase = WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_RELEASE;
+        break;
+    }
     case WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_UNARY_CHILD: {
         bool bare;
         rc = wl_columnar_filter_op_native_cleanup_latch_owned(n->frame, n,
@@ -4058,7 +4129,19 @@ wl_columnar_eval_plan_numeric_join_cleanup_step(
         if (n->source_initialized || n->source_slot_borrowed
             || n->join_host || n->join_host_admitted ||
             n->join_host_governor) rc = EBUSY;
-        else n->phase = WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_DONE;
+        else if (n->lftj.identity
+            && n->lftj.phase != WL_COLUMNAR_LFTJ_ATTEMPT_DONE) {
+            rc = wl_evaluation_control_charge_attempt(funding, id, 0);
+            if (rc) break;
+            bool done = false;
+            rc = wl_columnar_ops_lftj_attempt_abort(&n->lftj, &done, funding,
+                    id);
+        } else if (n->lftj_metadata.phase != WL_COLUMNAR_LFTJ_METADATA_INERT) {
+            rc = wl_evaluation_control_charge_attempt(funding, id, 128);
+            if (rc) break;
+            memset(&n->lftj_metadata, 0, sizeof(n->lftj_metadata));
+            n->lftj_metadata_dispatch = false;
+        }else n->phase = WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_DONE;
         break;
     case WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_DONE:
         break;
