@@ -248,6 +248,14 @@ All notable changes to wirelog are documented in this file.
 
 ### Fixed
 
+- **`/* */` block comments are accepted** (#2231): the lexer handled only
+  `#` and `//` comments, so a `/*` was lexed as a slash and the program
+  failed to parse; `bench/workloads/doop.dl`, `ddisasm.dl`, `crdt.dl` and
+  `examples/08-delta-queries/access_control.dl` use them, as do code blocks
+  in `docs/SYNTAX.md`. A block comment now runs to the next `*/`, across
+  lines and without nesting, and an unterminated one is a parse error naming
+  the line where it opened.
+
 - **Facts of a relation with no `.decl` keep their values** (#2231): `g(5).`
   with no `.decl g` was loaded as a zero-width row, so `p(x) :- g(x).`
   derived `p(0)`, and `q(). q(1).` dropped the 1. Such a relation now takes

@@ -6,13 +6,31 @@
 
 ## Table of Contents
 
-1. [Declarations](#declarations)
-2. [Rules](#rules)
-3. [Inline Facts](#inline-facts)
-4. [Directives](#directives)
-5. [Query Directive](#query-directive)
-6. [Types](#types)
-7. [Expressions](#expressions)
+1. [Comments](#comments)
+2. [Declarations](#declarations)
+3. [Rules](#rules)
+4. [Inline Facts](#inline-facts)
+5. [Directives](#directives)
+6. [Query Directive](#query-directive)
+7. [Types](#types)
+8. [Expressions](#expressions)
+
+---
+
+## Comments
+
+`#` and `//` start a comment that runs to the end of the line. `/*` starts
+a comment that runs to the next `*/`, across lines; block comments do not
+nest, so the first `*/` ends one. A `/*` with no `*/` after it is a parse
+error that names the line where the comment opened (#2231).
+
+```
+.decl e(x: int64)   // a line comment
+# another line comment
+/* a block comment,
+   over two lines */
+e(1). /* inline */ e(2).
+```
 
 ---
 

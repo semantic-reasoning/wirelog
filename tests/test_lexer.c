@@ -654,6 +654,67 @@ test_comment_only(void)
     PASS();
 }
 
+static void
+test_block_comment(void)
+{
+    TEST("block comment, inline and across lines");
+    wl_parser_lexer_t lex;
+    wl_parser_lexer_init(&lex, "foo /* one */ bar /* two\nlines * / */\nbaz");
+    ASSERT_TOK_STR(lex, WL_PARSER_LEXER_TOK_IDENT, "foo");
+    ASSERT_TOK_STR(lex, WL_PARSER_LEXER_TOK_IDENT, "bar");
+    wl_parser_lexer_token_t baz = wl_parser_lexer_next_token(&lex);
+    if (baz.type != WL_PARSER_LEXER_TOK_IDENT || baz.line != 3) {
+        FAIL("token after a two-line block comment is not on line 3");
+        return;
+    }
+    ASSERT_TOK(lex, WL_PARSER_LEXER_TOK_EOF);
+    PASS();
+}
+
+static void
+test_block_comment_not_nested(void)
+{
+    TEST("block comment ends at the first */");
+    wl_parser_lexer_t lex;
+    wl_parser_lexer_init(&lex, "/* a /* b */ c */");
+    ASSERT_TOK_STR(lex, WL_PARSER_LEXER_TOK_IDENT, "c");
+    PASS();
+}
+
+static void
+test_block_comment_unterminated(void)
+{
+    TEST("unterminated block comment is an error at its start");
+    wl_parser_lexer_t lex;
+    wl_parser_lexer_init(&lex, "foo\n  /* never closed\nbar");
+    ASSERT_TOK_STR(lex, WL_PARSER_LEXER_TOK_IDENT, "foo");
+    wl_parser_lexer_token_t err = wl_parser_lexer_next_token(&lex);
+    if (err.type != WL_PARSER_LEXER_TOK_ERROR || err.line != 2
+        || err.col != 3
+        || !strstr(lex.error_msg, "unterminated block comment")) {
+        FAIL("expected an unterminated-comment error at line 2, col 3");
+        return;
+    }
+    PASS();
+}
+
+static void
+test_slash_still_a_token(void)
+{
+    TEST("a lone slash is still a token");
+    wl_parser_lexer_t lex;
+    wl_parser_lexer_init(&lex, "x / y");
+    ASSERT_TOK_STR(lex, WL_PARSER_LEXER_TOK_IDENT, "x");
+    wl_parser_lexer_token_t slash = wl_parser_lexer_next_token(&lex);
+    if (slash.type == WL_PARSER_LEXER_TOK_ERROR
+        || slash.type == WL_PARSER_LEXER_TOK_EOF) {
+        FAIL("slash was not lexed as an operator");
+        return;
+    }
+    ASSERT_TOK_STR(lex, WL_PARSER_LEXER_TOK_IDENT, "y");
+    PASS();
+}
+
 /* ======================================================================== */
 /* Lexer: Line/Column Tracking                                              */
 /* ======================================================================== */
@@ -1060,6 +1121,10 @@ main(void)
     test_double_slash_comment();
     test_comment_at_end_of_line();
     test_comment_only();
+    test_block_comment();
+    test_block_comment_not_nested();
+    test_block_comment_unterminated();
+    test_slash_still_a_token();
 
     printf("\n--- Line/Column Tracking ---\n");
     test_line_tracking();
