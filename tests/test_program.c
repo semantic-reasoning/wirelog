@@ -10,6 +10,7 @@
 
 #define _POSIX_C_SOURCE 200809L
 
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -3634,6 +3635,132 @@ test_head_arity_mismatch_maps_to_parse_error(void)
 }
 
 /* ======================================================================== */
+/* Rule-head constants against their lanes (#2231)                          */
+/* ======================================================================== */
+
+/* The float value of head column @col of the first rule of @prog, or NAN
+ * when it is not a float constant. */
+static double
+head_float_const(const struct wirelog_program *prog, uint32_t col)
+{
+    if (!prog || prog->rule_count < 1 || !prog->rules[0].ir_root)
+        return NAN;
+    const wirelog_ir_node_t *root = prog->rules[0].ir_root;
+    if (col >= root->project_count || !root->project_exprs
+        || !root->project_exprs[col]
+        || root->project_exprs[col]->type != WL_IR_EXPR_CONST_FLOAT)
+        return NAN;
+    return root->project_exprs[col]->float_value;
+}
+
+static void
+test_head_int_const_in_float_lane_converted(void)
+{
+    TEST("Head constants: integer in a float lane is converted");
+    struct wirelog_program *a = make_program_with_rules(".decl s(x: int64)\n"
+            "s(1).\n.decl o(x: float)\no(1) :- s(_).\n");
+    struct wirelog_program *b = make_program_with_rules(".decl s(x: int64)\n"
+            "s(1).\no(-3) :- s(_).\n.decl o(x: float)\n");
+    struct wirelog_program *c = make_program_with_rules(".decl s(x: int64)\n"
+            "s(1).\n.decl o(id: int64, v: f(float, int64) inline)\n"
+            "o(1, 2, 3) :- s(_).\n");
+    bool ok = head_float_const(a, 0) == 1.0 && head_float_const(b, 0) == -3.0
+        && head_float_const(c, 1) == 2.0 && isnan(head_float_const(c, 0));
+    if (a)
+        wl_ir_program_free(a);
+    if (b)
+        wl_ir_program_free(b);
+    if (c)
+        wl_ir_program_free(c);
+    if (!ok) {
+        FAIL("expected float constants 1.0, -3.0 and 2.0 in the heads");
+        return;
+    }
+    PASS();
+}
+
+static void
+test_head_const_lane_mismatches_rejected(void)
+{
+    static const char *cases[] = {
+        /* float in an inline int64 slot */
+        ".decl s(x: int64)\ns(1).\n"
+        ".decl o(id: int64, v: f(int64, int64) inline)\n"
+        "o(1, 2.5, 3) :- s(_).\n",
+        /* float in a side handle column */
+        ".decl s(x: int64)\ns(1).\n.decl o(id: int64, v: f/2)\n"
+        "o(1, 2.5) :- s(_).\n",
+        /* inexact integer in a float column */
+        ".decl s(x: int64)\ns(1).\n.decl o(x: float)\n"
+        "o(9007199254740993) :- s(_).\n",
+        /* int32 column, value outside 32 bits */
+        ".decl s(x: int64)\ns(1).\n.decl o(x: int32)\n"
+        "o(5000000000) :- s(_).\n",
+        /* int32 inline slot, value outside 32 bits */
+        ".decl s(x: int64)\ns(1).\n"
+        ".decl o(id: int64, v: f(int32, int64) inline)\n"
+        "o(1, 5000000000, 3) :- s(_).\n",
+        /* string in an inline float slot */
+        ".decl s(x: int64)\ns(1).\n"
+        ".decl o(id: int64, v: f(float, int64) inline)\n"
+        "o(1, \"a\", 3) :- s(_).\n",
+        /* float in an int64 column, rejected since U3c */
+        ".decl s(x: int64)\ns(1).\n.decl o(x: int64)\no(2.5) :- s(_).\n",
+        /* string in a float column, rejected since U3c */
+        ".decl s(x: int64)\ns(1).\n.decl o(x: float)\no(\"a\") :- s(_).\n",
+        /* .decl after the rule */
+        ".decl s(x: int64)\ns(1).\no(5000000000) :- s(_).\n"
+        ".decl o(x: int32)\n",
+    };
+
+    TEST("Head constants: constants that do not fit their lane rejected");
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        char errbuf[512];
+        wirelog_error_t err = WIRELOG_OK;
+        struct wirelog_program *prog = wl_ir_parse_string_err(cases[i], &err,
+                errbuf, sizeof(errbuf));
+        if (prog) {
+            wirelog_program_free(prog);
+            FAIL(cases[i]);
+            return;
+        }
+        if (err != WIRELOG_ERR_PARSE) {
+            printf(" [%s]", errbuf);
+            FAIL("error should be WIRELOG_ERR_PARSE");
+            return;
+        }
+    }
+    PASS();
+}
+
+static void
+test_head_const_lane_controls(void)
+{
+    static const char *cases[] = {
+        ".decl s(x: int64)\ns(1).\n.decl o(x: float, y: int64)\n"
+        "o(1.5, x) :- s(x).\n",
+        ".decl s(x: int64)\ns(1).\n.decl o(x: int32)\no(2147483647) :- s(_).\n",
+        ".decl s(x: int64)\ns(1).\n.decl o(id: int64, v: f/2)\n"
+        "o(1, 2) :- s(_).\n",
+        /* an aggregate head is not checked (#980), even a float key in
+         * an int64 column */
+        ".decl s(x: int64)\ns(1).\n.decl o(k: int64, n: int64)\n"
+        "o(2.5, count(x)) :- s(x).\n",
+    };
+
+    TEST("Head constants: constants that fit their lane are accepted");
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        struct wirelog_program *prog = make_program_with_rules(cases[i]);
+        if (!prog) {
+            FAIL(cases[i]);
+            return;
+        }
+        wl_ir_program_free(prog);
+    }
+    PASS();
+}
+
+/* ======================================================================== */
 /* Schema of undeclared fact relations (#2231)                              */
 /* ======================================================================== */
 
@@ -4016,9 +4143,10 @@ test_rule_value_domains(void)
     expect_domain_rejected("Domains: string constant in an int64 head",
         DOMAIN_BASE ".decl p(x: int64)\np(\"z\") :- g(1).\n",
         "string/symbol constant in column 0 of 'p'");
+    /* The head-constant pass runs first and reports this one. */
     expect_domain_rejected("Domains: float constant in an int64 head",
         DOMAIN_BASE ".decl p(x: int64)\np(2.5) :- g(1).\n",
-        "float constant in column 0 of 'p', which is declared int64");
+        "puts a float constant in a column that is not float, column 0");
     /* E4: head values of the other kind. */
     expect_domain_rejected("Domains: int64 variable into a symbol head",
         ".decl g(x: symbol)\ng(\"a\").\n.decl n(x: int64)\nn(7).\n"
@@ -4667,6 +4795,11 @@ main(void)
     test_head_arity_undeclared_head_accepted();
     test_head_arity_matching_accepted();
     test_head_arity_mismatch_maps_to_parse_error();
+
+    /* #2231: rule-head constants against their lanes */
+    test_head_int_const_in_float_lane_converted();
+    test_head_const_lane_mismatches_rejected();
+    test_head_const_lane_controls();
 
     /* #2231: inline fact literals against their lanes */
     test_fact_int_in_float_column_converted();

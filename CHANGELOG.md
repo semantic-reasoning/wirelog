@@ -248,6 +248,18 @@ All notable changes to wirelog are documented in this file.
 
 ### Fixed
 
+- **Rule-head constants follow their column's type** (#2231):
+  `o(1) :- s(_).` against `.decl o(x: float)` derived
+  `o(4.9406564584124654e-324)`, and `o(5000000000)` against an `int32`
+  column was kept. A literal head argument is now checked against its column
+  or `inline` slot by the rules inline facts follow: an integer in a `float`
+  lane is stored as its binary64 value, and is rejected when binary64 cannot
+  represent it exactly; a float in an `inline` slot not declared `float` or
+  in any `side` handle column, a string in a `float` slot, and an `int32`
+  value outside 32 bits are rejected with `WIRELOG_ERR_PARSE`. Only literals
+  written directly as head arguments are checked, and heads with an
+  aggregate are not.
+
 - **`int32` columns reject values outside 32 bits** (#2231): an inline fact
   such as `g(5000000000).` against `.decl g(x: int32)`, or such a value in a
   CSV `.input` file, was stored unchanged although the column is documented
