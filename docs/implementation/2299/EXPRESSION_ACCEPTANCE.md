@@ -14,7 +14,8 @@ are independent: adding a scalar route never hides numeric/empty-only support.
 `admitted` means the separate scalar decoder recognizes a tag; it does not
 certify all contexts. `baseline-numeric` retains existing numeric evidence;
 `unit4-sessions` names the first string-domain session qualification below,
-not all recursive/pipeline/library contexts. `existing-numeric`
+not all recursive/pipeline/library contexts. `unit5-sessions` records the
+read-only function evidence in unit5a below. `existing-numeric`
 means the current attempt decoder admits it; it does not certify every host
 context. `empty-only` means the decoder admits it only for raw-compatible empty
 setup, not ordinary evaluation. `open` identifies raw-supported work still
@@ -76,13 +77,13 @@ ledger explicitly.
 | `WL_PLAN_EXPR_AGG_MIN` | existing-numeric | admitted | baseline-numeric |
 | `WL_PLAN_EXPR_AGG_MAX` | existing-numeric | admitted | baseline-numeric |
 | `WL_PLAN_EXPR_AGG_AVG` | legacy-rejected | legacy-rejected | legacy-rejected |
-| `WL_PLAN_EXPR_STR_FN_STRLEN` | open | open | open |
+| `WL_PLAN_EXPR_STR_FN_STRLEN` | open | admitted | unit5-sessions |
 | `WL_PLAN_EXPR_STR_FN_CAT` | open | open | open |
 | `WL_PLAN_EXPR_STR_FN_SUBSTR` | open | open | open |
-| `WL_PLAN_EXPR_STR_FN_CONTAINS` | open | open | open |
-| `WL_PLAN_EXPR_STR_FN_STR_PREFIX` | open | open | open |
-| `WL_PLAN_EXPR_STR_FN_STR_SUFFIX` | open | open | open |
-| `WL_PLAN_EXPR_STR_FN_STR_ORD` | open | open | open |
+| `WL_PLAN_EXPR_STR_FN_CONTAINS` | open | admitted | unit5-sessions |
+| `WL_PLAN_EXPR_STR_FN_STR_PREFIX` | open | admitted | unit5-sessions |
+| `WL_PLAN_EXPR_STR_FN_STR_SUFFIX` | open | admitted | unit5-sessions |
+| `WL_PLAN_EXPR_STR_FN_STR_ORD` | open | admitted | unit5-sessions |
 | `WL_PLAN_EXPR_STR_FN_TO_UPPER` | open | open | open |
 | `WL_PLAN_EXPR_STR_FN_TO_LOWER` | open | open | open |
 | `WL_PLAN_EXPR_STR_FN_STR_REPLACE` | open | open | open |
@@ -385,3 +386,51 @@ relation/events, retry, verify exact insertion/deletion events and a subsequent
 no-op call. Empty MAP and shared-plan sessions with different governors exercise
 context ownership. These constitute `unit4-sessions`; recursive/pipeline host
 qualification and all other open function/library/extension rows remain pending.
+
+
+## Read-only string functions (unit 5a)
+
+STRLEN, STR_ORD, CONTAINS, STR_PREFIX and STR_SUFFIX enter the scalar decoder
+and retain raw ID-based operands; numeric-carried valid intern IDs are valid.
+With no intern the expression returns0 for all five. With an intern, absent IDs
+produce-1 for length/ordinal and false for predicates. Empty ordinal returns-1.
+The predicates return true for empty needles only when both IDs resolve.
+Prefix and suffix prove needle length <= source length before offset/comparison.
+No function allocates or interns a result; literal operands retain unit4 policy.
+
+`wl_columnar_expr_utf8_next_attempt_controlled` preserves the raw permissive
+UTF-8 step. It accepts overlong/surrogate/out-of-range values, skips an invalid
+lead by1, and advances by i on an invalid continuation at i, leaving that
+inspected byte for the next step. It stops inspecting at the first NUL; empty
+input returns advance0/codepoint-1. Outputs are unchanged on stop. Entry and
+final publication each pay224; each actual byte inspection pays224. Thus an
+I-byte inspection has exact work224*(I+2), including an inspected terminating
+NUL. No more than four bytes are inspected in one invocation. Counting repeats
+steps until advance0, charging repeated inspections when a bad continuation or
+NUL is revisited. Phases90 entry,91 byte,92 final expose saved-attempt checks.
+Reader phases93/95 separately fund caller entry/publication; phase94 pays one
+224 region per UTF-8 step, including the terminating step. Reader-only work
+(excluding expression decode/dispatch) is224*(2+sum(3+I_i)) for STRLEN and
+224*(5+I) for ORD. Predicates pay two caller regions plus existing exact length
+and comparison/search tariffs; an oversized needle never compares a pair.
+
+Each fixed region uses the prior G9+C13+T29 bound and at most128 additional
+source actions for bounded decode branches, one byte/stack operation, checked
+lookup and loop/child transitions:179<224<=256. UTF-8 continuation reads each
+have a distinct admission; variable string lengths/search use existing byte
+primitives. Final output publication follows the saved-attempt guard. No raw
+strlen/strstr/strncmp/memcmp or whole-string raw UTF-8 counting is called.
+
+The string test target adds exact/one-short UTF-8 steps for empty, ASCII,
+2/3/4-byte, invalid lead/continuation, permissive values and every truncation.
+Inputs end exactly at their NUL under sanitizers. Direct raw parity covers all
+five functions with ordinary/invalid/zero-underflow integer-carried IDs and null
+context, plus cached result types. It cancels each reader inside its traversal,
+retries the same owner, and replaces attempts during continuation/final cutoff
+without scalar publication or successor debit. Generated FILTER and MAP cover
+all five functions with exact positive/false/empty results, mixed string and
+numeric columns, stops after earlier work, retry, signed deletion and a later
+no-op call. MAP additionally forces deterministic mid-traversal budget denial.
+Observers are installed before the initial empty step. Owner/intern resource
+retirement is checked. `unit5-sessions` is this evidence; recursive/pipeline
+string-domain qualification and all other open tags remain outstanding.

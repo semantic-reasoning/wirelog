@@ -5904,6 +5904,13 @@ int wl_columnar_expr_bytes_find_attempt_controlled(const uint8_t *, size_t,
     const uint8_t *, size_t, size_t *, bool *, wl_evaluation_control_t *,
     uint64_t);
 
+/* Permissive UTF-8 step: empty => advance0/codepoint-1; invalid lead =>
+ * advance1/codepoint-1; invalid continuation at i => advance i/codepoint-1.
+ * Each actual inspected byte costs224, entry/final224 each. Outputs unchanged
+ * on nonzero; immutable NUL-terminated input borrowed from a live owner/pin. */
+int wl_columnar_expr_utf8_next_attempt_controlled(const char *, size_t *,
+    int64_t *, wl_evaluation_control_t *, uint64_t);
+
 /* Context-bearing scalar owner (#2299). Immutable bytecode copy, no intern
  * mutation during compile. Numeric-only hosts keep the numeric owner path.
  * Evaluation borrows the actual session/plan context (or caller-held pin),
