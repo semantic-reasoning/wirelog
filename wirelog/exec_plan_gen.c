@@ -1441,9 +1441,12 @@ collect_output_columns(const wirelog_ir_node_t *node, col_ctx_t *out)
         /* Intermediate PROJECT nodes (inserted by jpp passes) have
          * column_names set but no project_exprs. Return their projected
          * output column layout so that downstream join key resolution
-         * sees the correct (narrowed) column set. */
-        if (!node->project_exprs && node->column_names
-            && node->column_count > 0) {
+         * sees the correct (narrowed) column set.  The group-by key
+         * PROJECT below an AGGREGATE (#2231) also has column_names, and
+         * project_exprs for its computed keys next to project_indices for
+         * its other lanes. */
+        if ((!node->project_exprs || node->project_indices)
+            && node->column_names && node->column_count > 0) {
             /* The node records the projected names but not their types, so
              * the types are recovered from the child through
              * project_indices -- the same mapping the MAP operator applies
@@ -1470,7 +1473,11 @@ collect_output_columns(const wirelog_ir_node_t *node, col_ctx_t *out)
                         return -1;
                     }
                 }
-                if (node->project_indices && i < node->project_count)
+                if (node->project_exprs && i < node->project_count
+                    && node->project_exprs[i])
+                    out->types[i]
+                        = expr_result_type(node->project_exprs[i], &child);
+                else if (node->project_indices && i < node->project_count)
                     out->types[i]
                         = col_ctx_type_at(&child, node->project_indices[i]);
                 else
@@ -1983,13 +1990,14 @@ translate_ir_node(const wirelog_ir_node_t *node, op_list_t *ops,
             col_ctx_t agg_ctx;
             if (node->column_names && node->column_count > 0) {
                 /*
-                 * The AGGREGATE node records the body's variable names but
-                 * no types, and it is the one serialize_expr() entry point
+                 * The AGGREGATE node records its child's lane names but no
+                 * types, and it is the one serialize_expr() entry point
                  * that does not take its layout from collect_output_columns()
                  * -- so without this the aggregated expression would be the
-                 * only untyped expression in the plan.  The names here are
-                 * the body variables, which is exactly what the child's
-                 * layout is keyed by, so the types come across by name.
+                 * only untyped expression in the plan.  The names are the
+                 * child's layout: the body variables, or, below a group-by
+                 * key PROJECT (#2231), its "$gk<i>" key lanes followed by
+                 * the body variables.
                  */
                 col_ctx_t child_ctx;
                 collect_output_columns(child0, &child_ctx);
@@ -2002,7 +2010,7 @@ translate_ir_node(const wirelog_ir_node_t *node, op_list_t *ops,
                 for (uint32_t i = 0; i < agg_ctx.count; i++) {
                     agg_ctx.names[i] = dup_str(node->column_names[i]);
                     /* Positional first: the AGGREGATE's column list is the
-                     * body layout verbatim, and agg_expr's variables were
+                     * child's layout verbatim, and agg_expr's variables were
                      * rewritten to "colN" against that same list.  Fall back
                      * to the name only where the child is narrower. */
                     agg_ctx.types[i] = (i < child_ctx.count)

@@ -248,6 +248,20 @@ All notable changes to wirelog are documented in this file.
 
 ### Fixed
 
+- **Aggregate heads group by constant and expression keys** (#2231):
+  `t(g * 10, count(x)) :- n(g, x).` with `n(1, 1)`, `n(1, 2)` and `n(2, 3)`
+  derived `t(1, 2)` and `t(2, 1)`: a constant or expression group-by key
+  grouped by the body column at its head position and carried that column's
+  value. Such a key is now computed for each body row before grouping, in
+  recursive `min`/`max` rules too, and `t(5, count(x))` derives one row. A
+  cold input binding is refused for the body relation of such a rule, as it
+  is for a rule whose head has a constant column;
+  `result(1, count(v)) :- b(1, v).` used to accept one and derive the right
+  row. A literal key is checked against its column like other head literals,
+  so `t(2.5, count(x))` against an `int64` key column is rejected and an
+  integer key in a `float` column is stored as its binary64 value. A scalar
+  extension call in a group-by key is rejected with `WIRELOG_ERR_PARSE`.
+
 - **Rule variables named like `col1` keep their meaning** (#2231): with
   `n(9, 1, 1)` and `n(3, 7, 3)`, `m(a) :- n(col1, a, a).` derived `m(7)`
   instead of `m(1)`, and with `n(1, 10)` and `n(2, 20)`,
@@ -314,8 +328,9 @@ All notable changes to wirelog are documented in this file.
   represent it exactly; a float in an `inline` slot not declared `float` or
   in any `side` handle column, a string in a `float` slot, and an `int32`
   value outside 32 bits are rejected with `WIRELOG_ERR_PARSE`. Only literals
-  written directly as head arguments are checked, and heads with an
-  aggregate are not.
+  written directly as head arguments are checked; in a head with an
+  aggregate these are its group-by keys, as the entry **Aggregate heads
+  group by constant and expression keys** describes.
 
 - **`int32` columns reject values outside 32 bits** (#2231): an inline fact
   such as `g(5000000000).` against `.decl g(x: int32)`, or such a value in a
@@ -376,10 +391,11 @@ All notable changes to wirelog are documented in this file.
   only for relations typed by a `.decl`, with no compound column and used at
   their declared width; a comparison is checked when both operand types are
   known from a column, a literal, a string function, arithmetic or an `=`
-  binding. Inline facts, host inserts, aggregate heads, the operands of
-  string and arithmetic functions, the results of scalar extension calls, an
-  integer in a `float` head column, and a `float` against a number in a body
-  comparison or join are not.
+  binding. Inline facts, host inserts, the aggregate and the variable or
+  expression keys of an aggregate head, the operands of string and
+  arithmetic functions, the results of scalar extension calls, an integer in
+  a `float` head column, and a `float` against a number in a body comparison
+  or join are not.
 
 - **`wirelog_easy_print_delta` no longer aborts on a symbol id it cannot
   resolve** (#2231): a row whose `symbol` or `string` column held an id

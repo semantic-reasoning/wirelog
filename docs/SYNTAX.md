@@ -150,6 +150,24 @@ Two scope notes:
   are complementary: an arity check accepts `t(g, min(v), max(v))`, and the
   aggregate-count check accepts `cc(y, min(c))`.
 
+### Group-by keys
+
+Every argument of an aggregate head other than the aggregate is a group-by
+key. A key may be a body variable, a constant or an expression over body
+variables; the rows are grouped by its value, and the value is what the head
+carries (#2231). So `t(g * 10, count(x)) :- n(g, x).` with `n(1, 1)`,
+`n(1, 2)` and `n(2, 3)` derives `t(10, 2)` and `t(20, 1)`, and
+`t(5, count(x)) :- n(g, x).` derives one row whose count covers every row of
+`n`. A constant or expression key used to group by the body column at the
+key's head position and carry that column's value: the first rule derived
+`t(1, 2)` and `t(2, 1)`. Such a key is computed before grouping, so a cold
+input binding for the rule's body relation is refused, as for a rule head
+with a constant column. A literal key is checked against its column like any
+head literal, so an integer key in a `float` column is stored as its
+binary64 value and `t(2.5, count(x))` against an `int64` key column is
+rejected. A scalar extension call in a key is rejected with
+`WIRELOG_ERR_PARSE`; compute it in a separate rule first.
+
 ### `average()`
 
 `average(x)` and `AVG(x)` require `x` to be a `float` column, declared or
@@ -430,15 +448,16 @@ and gave no diagnostic, so loading now rejects them with
 A variable bound only by an `=` takes the type of the expression it is
 equal to, so `p(c) :- s(x), c = to_upper(x).` puts a string into `p`.
 
-Relation columns are checked only for relations typed by a `.decl`, or
-by the inline facts of an undeclared relation, with no compound column
-and at their declared width; a comparison is checked when both of its
-operand types are known from a column, a literal, a string function,
-arithmetic or an `=` binding. Not checked: inline facts and host inserts
-(#963), the columns of relations with neither a `.decl` nor inline
-facts, aggregate heads, the operands of string and arithmetic functions,
-the results of scalar extension calls, an integer in a `float` head
-column, and a `float` against a number in a body comparison or join.
+Relation columns are checked only for relations typed by a `.decl`, or by
+the inline facts of an undeclared relation, with no compound column and at
+their declared width; a comparison is checked when both of its operand types
+are known from a column, a literal, a string function, arithmetic or an `=`
+binding. Not checked: inline facts and host inserts (#963), the columns of
+relations with neither a `.decl` nor inline facts, the aggregate and the
+variable or expression keys of an aggregate head, the operands of string and
+arithmetic functions, the results of scalar extension calls, an integer in a
+`float` head column, and a `float` against a number in a body comparison or
+join.
 
 ---
 
@@ -676,13 +695,14 @@ rejected in a `float` column or slot. An integer or string literal in a
 `int64` column holds its intern id, which is not stable across runs.
 
 A literal written directly as an argument of a rule head, for a relation
-typed by a `.decl` or by its inline facts, follows the same rules (#2231): an
-integer in a `float` column or slot is stored as its binary64 value, so
+typed by a `.decl` or by its inline facts, follows the same rules (#2231):
+an integer in a `float` column or slot is stored as its binary64 value, so
 `o(1) :- s(_).` against `.decl o(x: float)` derives `o(1)`, and an inexact
 integer, a float in a column, slot or `side` handle column not declared
 `float`, a string in a `float` column or slot, and an `int32` value outside
-32 bits are rejected with `WIRELOG_ERR_PARSE`. Constants in the head of a
-rule with an aggregate are not checked or converted.
+32 bits are rejected with `WIRELOG_ERR_PARSE`. In the head of a rule with an
+aggregate, these rules apply to its literal group-by keys (see [Group-by
+keys](#group-by-keys)).
 
 ---
 
