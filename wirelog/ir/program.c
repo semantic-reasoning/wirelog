@@ -920,10 +920,11 @@ atom_physical_column_count(const wl_parser_ast_node_t *atom,
  * information is gone by the time the loop ends.  Hence the re-walk.
  *
  * Relations with no `.decl` are skipped: undeclared derived heads are
- * widespread and legitimate (bench/workloads/doop.dl has ~90 of them).  An
- * undeclared relation that carries facts still fails later at session load
- * because column_count is 0; that is a separate defect and is deliberately
- * left unchanged here.  The guard keys off has_decl rather than
+ * widespread and legitimate (bench/workloads/doop.dl has ~90 of them).
+ * Facts on an undeclared relation are handled by infer_fact_schemas()
+ * below, which takes the relation's width from its facts and each column's
+ * type from their literals, and rejects facts that disagree on either
+ * (#2231).  The guard keys off has_decl rather than
  * `column_count > 0` because `.decl p()` parses and leaves column_count
  * == 0, and those relations must be checked, not skipped.
  *
@@ -1031,6 +1032,127 @@ validate_fact_arities(struct wirelog_program *program,
     return 0;
 }
 
+/* #2231: the schema of a relation that has inline facts and no `.decl`.
+ *
+ * Such a relation had column_count 0, so session load inserted each fact
+ * as a zero-width row: `g(5).` lost its 5 and `p(x) :- g(x).` derived p(0).
+ * Its width now comes from its first fact and each column's type from that
+ * fact's literals: an integer gives int64, a float float, a string string.
+ * Every later fact must have the same number of arguments and the same
+ * kind of literal in each column; collect_fact() packs fact_data at each
+ * fact's own argument count, so a fact of another width would also shift
+ * every row after it.  The redirect for mixed facts is a `.decl`. */
+static const char *
+fact_literal_word(const wl_parser_ast_node_t *arg)
+{
+    switch (arg->type) {
+    case WL_PARSER_AST_NODE_FLOAT:
+        return "a float";
+    case WL_PARSER_AST_NODE_STRING:
+        return "a string";
+    default:
+        return "an integer";
+    }
+}
+
+static wirelog_column_type_t
+fact_literal_column_type(const wl_parser_ast_node_t *arg)
+{
+    switch (arg->type) {
+    case WL_PARSER_AST_NODE_FLOAT:
+        return WIRELOG_TYPE_FLOAT;
+    case WL_PARSER_AST_NODE_STRING:
+        return WIRELOG_TYPE_STRING;
+    default:
+        return WIRELOG_TYPE_INT64;
+    }
+}
+
+static const char *
+column_type_fact_word(wirelog_column_type_t type)
+{
+    switch (type) {
+    case WIRELOG_TYPE_FLOAT:
+        return "a float";
+    case WIRELOG_TYPE_STRING:
+        return "a string";
+    case WIRELOG_TYPE_INT32:
+    case WIRELOG_TYPE_INT64:
+    case WIRELOG_TYPE_UINT32:
+    case WIRELOG_TYPE_UINT64:
+    case WIRELOG_TYPE_BOOL:
+        break;
+    }
+    return "an integer";
+}
+
+static int
+infer_fact_schemas(struct wirelog_program *program,
+    const wl_parser_ast_node_t *ast)
+{
+    for (uint32_t i = 0; i < ast->child_count; i++) {
+        const wl_parser_ast_node_t *node = ast->children[i];
+        if (node->type != WL_PARSER_AST_NODE_FACT || !node->name)
+            continue;
+        wl_ir_relation_info_t *rel = find_relation_info(program, node->name);
+        if (!rel || rel->has_decl
+            || (rel->columns && !rel->schema_from_facts))
+            continue;
+
+        if (!rel->schema_from_facts) {
+            rel->schema_from_facts = true;
+            rel->column_count = node->child_count;
+            if (node->child_count == 0)
+                continue;
+            rel->columns = (wirelog_column_t *)calloc(node->child_count,
+                    sizeof(*rel->columns));
+            if (!rel->columns) {
+                rel->column_count = 0;
+                wl_ir_program_set_error(program,
+                    "out of memory inferring the schema of '%s'", rel->name);
+                return -1;
+            }
+            for (uint32_t c = 0; c < node->child_count; c++) {
+                char col_name[32];
+                snprintf(col_name, sizeof(col_name), "c%u", c);
+                rel->columns[c].name = strdup_safe(col_name);
+                if (!rel->columns[c].name) {
+                    wl_ir_program_set_error(program,
+                        "out of memory inferring the schema of '%s'",
+                        rel->name);
+                    return -1;
+                }
+                rel->columns[c].type
+                    = fact_literal_column_type(node->children[c]);
+            }
+            continue;
+        }
+
+        if (node->child_count != rel->column_count) {
+            wl_ir_program_set_error(program,
+                "fact for relation '%s' has %u argument(s) but an earlier"
+                " fact of '%s' has %u; '%s' has no .decl, so its facts must"
+                " agree (line %u)", rel->name, node->child_count, rel->name,
+                rel->column_count, rel->name, node->line);
+            return -1;
+        }
+        for (uint32_t c = 0; c < node->child_count; c++) {
+            const wl_parser_ast_node_t *arg = node->children[c];
+            if (fact_literal_column_type(arg) != rel->columns[c].type) {
+                wl_ir_program_set_error(program,
+                    "fact for relation '%s' has %s in column %u where an"
+                    " earlier fact has %s; '%s' has no .decl, so its facts"
+                    " must agree (line %u)", rel->name,
+                    fact_literal_word(arg), c,
+                    column_type_fact_word(rel->columns[c].type), rel->name,
+                    node->line);
+                return -1;
+            }
+        }
+    }
+    return 0;
+}
+
 /* Issue #977: validate every rule head against its relation's declared
  * arity.
  *
@@ -1105,7 +1227,8 @@ validate_fact_arities(struct wirelog_program *program,
  * may legally follow its rules, and it keys off has_decl rather than
  * `column_count > 0` so that `.decl p()` is checked instead of skipped.
  * Undeclared heads are skipped: they are widespread and legitimate
- * (bench/workloads/doop.dl has ~90). */
+ * (bench/workloads/doop.dl has ~90), unless the relation's width was fixed
+ * by its facts (schema_from_facts, #2231). */
 static int
 validate_head_arities(struct wirelog_program *program,
     const wl_parser_ast_node_t *ast)
@@ -1121,13 +1244,18 @@ validate_head_arities(struct wirelog_program *program,
 
         const wl_ir_relation_info_t *rel
             = find_relation_info(program, head->name);
-        if (!rel || !rel->has_decl)
+        if (!rel || (!rel->has_decl && !rel->schema_from_facts))
             continue;
 
         uint32_t emitted = atom_physical_column_count(head, rel, program);
         uint32_t declared = wl_ir_relation_physical_width(rel);
         if (emitted != declared) {
-            if (declared != rel->column_count)
+            if (!rel->has_decl)
+                wl_ir_program_set_error(program,
+                    "rule head for relation '%s' emits %u column(s) but its"
+                    " facts have %u argument(s) ('%s' has no .decl) (line %u)",
+                    rel->name, emitted, declared, rel->name, head->line);
+            else if (declared != rel->column_count)
                 wl_ir_program_set_error(program,
                     "rule head for relation '%s' emits %u column(s) but '%s'"
                     " occupies %u column(s) (%u declared, inline compound"
@@ -1168,8 +1296,9 @@ validate_head_arities(struct wirelog_program *program,
  *       value lands in a column that is not `float`, whose bits it would
  *       be stored as.
  *
- * Relation columns are checked only for relations typed by a `.decl`,
- * with no compound column and used at their declared width; a comparison
+ * Relation columns are checked only for relations typed by a `.decl` or
+ * by inline facts (schema_from_facts), with no compound column and used at
+ * their declared width; a comparison
  * is checked when both of its operand types are known from a column, a
  * literal, a string function, arithmetic or an `=` binding.  A variable
  * whose only binding is an `=` with a typed expression takes that
@@ -1293,7 +1422,7 @@ domain_checked_relation(const struct wirelog_program *program,
         return NULL;
     const wl_ir_relation_info_t *rel = find_relation_info(program,
             atom->name);
-    if (!rel || !rel->has_decl || !rel->columns
+    if (!rel || (!rel->has_decl && !rel->schema_from_facts) || !rel->columns
         || atom->child_count != rel->column_count)
         return NULL;
     for (uint32_t c = 0; c < rel->column_count; c++)
@@ -1607,6 +1736,8 @@ wl_ir_program_collect_metadata(struct wirelog_program *program,
      * independent and a program failing both is reported by whichever runs
      * first. */
     if (validate_fact_arities(program, ast) != 0)
+        return -1;
+    if (infer_fact_schemas(program, ast) != 0)
         return -1;
     if (validate_head_arities(program, ast) != 0)
         return -1;

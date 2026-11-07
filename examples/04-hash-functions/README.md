@@ -65,9 +65,9 @@ record below it a different fingerprint. It also put the fingerprints in the sam
 value domain as the Part 3 checksums, which hash genuine integers — `hash("carol@example.com")`
 and `hash(5)` were the same number.
 
-This depends on `email` being declared `symbol` in `.decl record(...)`. Column types
-are not enforced, so an undeclared column still digests its id — see
-`docs/SYNTAX.md`, "What the digest functions cover".
+This depends on `email` being declared `symbol` in `.decl record(...)`. Column types are
+not enforced, so a column of a relation with no `.decl` and no inline facts still
+digests its id — see `docs/SYNTAX.md`, "What the digest functions cover".
 
 ### Part 2: Deduplication
 

@@ -168,6 +168,19 @@ one, as the z-set rules below describe.  A removal with nonzero `ncols`
 from a relation that holds, or has held, zero-width rows returns
 `WIRELOG_ERR_EXEC`.
 
+A relation with inline facts and no `.decl` takes its width from its first
+fact and its column types from that fact's literals: an integer gives an
+`int64` column, a float a `float` column, a string a `string` column
+(#2231). Every fact of such a relation must have the same number of
+arguments and the same kind of literal in each column, and a rule head for
+it must emit that many columns; otherwise the program is rejected at load.
+`wirelog_program_get_schema` and `wirelog_program_get_facts` report its
+inferred columns, and the check on rules that mix symbol and numeric
+values reads their types. The easy facade, which refuses relations with
+`float` columns, now also refuses one whose `float` column was inferred:
+`wirelog_easy_snapshot` of it and `wirelog_easy_set_delta_cb` on its
+program return `WIRELOG_ERR_EXEC`.
+
 ### Z-set semantics for host insert / remove
 
 `wirelog_easy_insert()` and `wirelog_easy_remove()` are differential operations
@@ -218,8 +231,9 @@ Two patterns are supported:
   aggregates `min()`/`max()` therefore compare `string`/`symbol` columns
   **lexicographically**, not by id — see `docs/SYNTAX.md`, "Comparison
   Operators". Id order still leaks through in two places. A column with no
-  declared type: the engine has nothing to compare but the ids, so the
-  result is as unstable as they are -- declare the relation. And a
+  declared type, of a relation with no `.decl` and no inline facts: the
+  engine has nothing to compare but the ids, so the result is as unstable
+  as they are -- declare the relation. And a
   comparison with one string and one numeric operand whose types are not
   both known at load: it stays an integer comparison, described in
   `docs/SYNTAX.md`; when both are known the rule is rejected (#2231).
@@ -238,15 +252,15 @@ Two patterns are supported:
   the 8-byte `int64` representation for a numeric one. So a fingerprint is
   a property of the data and reproduces outside wirelog. Two caveats
   remain where the declared type cannot vouch for the bytes. A column with
-  no declared type digests the id, and is therefore as unstable as the id
-  assignment. A column declared `symbol` that holds integers digests their
-  `int64` representation — the numeric answer for numeric data — rather
-  than failing the query, unless an integer equals the id of an interned
-  string, which then digests that string's bytes; in head position a
-  failure would abort the whole projection, not drop a row. Both fallbacks
-  are reported under `WL_LOG=EVAL`; an integer that aliases an interned
-  string is not, since its lookup succeeds. The guarantee is only as good
-  as the declaration.
+  no declared type (no `.decl` and no inline facts) digests the id, and is
+  therefore as unstable as the id assignment. A column declared `symbol`
+  that holds integers digests their `int64` representation — the numeric
+  answer for numeric data — rather than failing the query, unless an
+  integer equals the id of an interned string, which then digests that
+  string's bytes; in head position a failure would abort the whole
+  projection, not drop a row. Both fallbacks are reported under
+  `WL_LOG=EVAL`; an integer that aliases an interned string is not, since
+  its lookup succeeds. The guarantee is only as good as the declaration.
 - Multiplicities other than the basic z-set arithmetic above (e.g.
   weighted aggregates) are subject to the engine's
   multiplicity-tracking rules, not promised by this document.
@@ -467,8 +481,8 @@ from producing semantically correct output at workers in {1, 4, 8, 16}.
 - Issue #692 — Blocker B5: Recursive aggregation residue = 0.
 - Issue #973 — at most one aggregate per rule head.
 - Issue #977 — `.decl`-versus-program arity validation: inline facts and
-  rule heads are validated; rule *bodies* and facts on undeclared relations
-  are not.
+  rule heads are validated against the `.decl`, or, for a relation with
+  facts and no `.decl`, against its facts (#2231); rule *bodies* are not.
 - Issue #2231 — rules that mix symbol and numeric values are rejected at
   load; see `docs/SYNTAX.md`, "Rules must not mix symbol and numeric
   values".

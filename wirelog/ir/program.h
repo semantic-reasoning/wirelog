@@ -55,8 +55,14 @@ typedef struct {
      * compiler-generated and must not be validated against user-facing
      * arity rules.  That is inert today -- they are created after metadata
      * collection and never carry facts -- but any future consumer of this
-     * flag should read it as "user-declared", not "has a known width". */
+     * flag should read it as "user-declared", not "has a known width".
+     *
+     * A relation with inline facts and no `.decl` takes column_count and
+     * columns from its facts instead (#2231) and sets schema_from_facts,
+     * not has_decl: its width and column types are known, but nobody
+     * declared them. */
     bool has_decl;
+    bool schema_from_facts;
     bool has_input;
     bool has_output;
     bool has_printsize;

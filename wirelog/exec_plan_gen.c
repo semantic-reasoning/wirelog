@@ -4720,7 +4720,9 @@ wl_plan_from_program_with_snapshot(struct wirelog_program *prog,
             edb_decl_w[edb_count] = rel->has_decl
                 ? wl_ir_relation_physical_width(rel)
                 : WL_PLAN_WIDTH_UNDECLARED;
-            uint32_t type_count = rel->has_decl
+            /* #2231: a relation whose schema came from its facts has
+             * column types too, though no declared width. */
+            uint32_t type_count = (rel->has_decl || rel->schema_from_facts)
                 ? wl_ir_relation_physical_width(rel) : 0;
             if (type_count > 0) {
                 edb_types[edb_count] = (wirelog_column_type_t *)calloc(

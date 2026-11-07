@@ -30,7 +30,8 @@ grouping, such as adding `A` and `B` before multiplying by `C`.
 
 Each aggregate is in its own rule because a rule head accepts at most one
 aggregate. `min` and `max` operate on the integer column, `average` requires a
-declared `float` operand, and `count` returns the number of input rows. The
+`float` operand, declared or inferred from the facts of an undeclared relation,
+and `count` returns the number of input rows. The
 aggregate program used by the demo is:
 
 ```datalog
