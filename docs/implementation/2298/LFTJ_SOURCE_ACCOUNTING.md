@@ -498,3 +498,70 @@ LFTJ can exceed the ordinary JOIN cap, while the actual suffix JOIN returns
 EOVERFLOW at its own cap. Strict and fallback counts/reasons match the raw
 route; raised-cap retry returns literal rows without failed-attempt delivery.
 These tests qualify this actual route and do not widen unsupported outer modes.
+
+## Composed aggregate admission with JOIN batch policy
+
+A natural LFTJ body can feed an ordinary grouped REDUCE. The configured JOIN
+batch option does not make that otherwise supported composed aggregate
+unsupported. The exception is restricted to the actual admitted composed
+numeric owner: full frame/thread proof, exact session/control/saved Original,
+active frame, composed fallback bit, busy COMPOSE_PENDING from COMPOSE_READY,
+valid plan/cursor/range, current REDUCE address and exact child-status address.
+All differential, TDD, shared-counter, coordinator and worker guards remain.
+The full readonly helper rechecks the new domain after the existing phase1
+hook and real Original zero. No session flag is toggled and no raw aggregate
+fallback executes. Standalone/noncomposed batch entry retains ENOTSUP.
+
+An additional genuine saved-Original zero splits initial stack/owner validation
+from repeated context validation. A stopped valid Original returns the same
+five DONE/status fields as the original first192 refusal, without a live
+context pin. Invalid saved IDs/owners retain protocol errors and unchanged
+output. The newly eligible composed batch status address is checked before
+context/status mutation and repeated after the hook. The raw control-NULL
+branch is unchanged.
+
+| Complete changed interval, including actual caller/refusal fronts | Source upper |
+| --- | ---: |
+| Owning caller, full stack/owner proof to initial zero or pure rejection | 240 |
+| Initial zero through repeated context proof and first192 refusal | 176 |
+| Successful first192 through fixed initialization and phase1 check | 240 |
+| Phase1 zero through full batch permission and new saved-Original zero | 208 |
+| New permission zero through next payment/refusal and full return | 144 |
+| Phase1 zero through false permission, common DONE and full return | 248 |
+
+The readonly permission helper136 includes the real stack numeric-owner54
+and complete existing framed-context getter24, not a bare identity Boolean.
+The getter supplies exact opaque frame/session identity without exposing its
+layout. Its borrowed output remains local and grants no cached permission. Entry uses the direct nested numeric-owner36
+expansion inside complete operator-stack128; it does not add overlapping
+padded helper bounds. Initialization75 includes all three scratch records
+(seven stores each), the snapshot's scalar slots and inline-values address.
+Actual control-retain44 includes fetch-add(0) and the first weak-CAS iteration;
+publication12, domain/mode32 and the complete phase1 tail74 yield237 plus
+reserve3 =240. Native atomic/thread interiors retain only their existing
+narrow qualified boundaries, with call/front and first-iteration work counted.
+The permission packet counts helper136, call/branch fronts20, saved guard/zero32
+and reserve20 =208. False permission counts136+36+68+8reserve =248; it cannot
+borrow the successful branch's future zero. After successful permission, a
+real saved-Original zero separates that work from the first retirement
+payment. The next payment/refusal and complete caller fit144. These are
+source uppers, not logical charges.
+
+Both numeric dispatch sites, the real framed public host, observer/private
+binding variants and legacy standalone/noncomposed callers use this shared
+entry. Their complete caller envelopes are included; batch-off skips only the
+new permission helper. The existing ENTRY192, CELL128, numeric-update192 and
+84 retirement payments of192 are unchanged. Initial zero settles no Source
+loan or processed lower. Future retirement shares cannot pay for earlier
+authentication; all deeper unary/source/scratch/aggregate/cleanup actions
+retain their independently matched source contracts.
+
+`evaluation_reduce_batch_owner` drives32 real public histories across batch,
+observation and STEP/Snapshot. It checks literal grouped counts8/1→4/1→4/2,
+exact signed changes, malformed canonical components and wrong native thread,
+phase1 cancellation, finite first-payment C/C+192, and genuine Original
+FINISH/reset/successor behavior. C is explicitly empirical host-prefix credit;
+192 is the independently specified selected tariff. The UINT64_MAX case is
+stop propagation only. `evaluation_numeric_operators` adds standalone and
+noncomposed batch refusal and pre-entry CANCEL/WORK without source ownership;
+its independent exact191/192 and existing inner finite oracles remain intact.

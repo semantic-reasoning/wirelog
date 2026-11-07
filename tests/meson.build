@@ -7153,3 +7153,14 @@ foreach join_lifecycle_case : ['successors', 'snapshots', 'recovery', 'funding',
        test_evaluation_join_host_lifecycle_exe, args: [join_lifecycle_case],
        suite: ['unit', 'tsan', 'evaluation_join_hosts'], timeout: 60)
 endforeach
+
+# #2298 actual composed aggregate admission under configured JOIN batches.
+test_evaluation_reduce_batch_owner_exe = executable(
+  'test_evaluation_reduce_batch_owner', files('test_evaluation_reduce_batch_owner.c'),
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
+  c_args: ['-DWL_SESSION_TEST_HOOKS=1'],
+  link_with: [testlib_prod],
+)
+test('evaluation_reduce_batch_owner', test_evaluation_reduce_batch_owner_exe,
+     suite: ['unit', 'tsan'], timeout: 120)
