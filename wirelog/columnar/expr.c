@@ -3482,6 +3482,28 @@ publish:
     return 0;
 }
 
+int
+wl_columnar_expr_replace_size_attempt_controlled(size_t source_length,
+    size_t old_length, size_t new_length, size_t count, size_t *result,
+    wl_evaluation_control_t *control, uint64_t id)
+{
+    if (!old_length || !result) return EINVAL;
+    int rc = wl_columnar_expr_scalar_region(control, id, 174, count);
+    if (rc) return rc;
+    uint64_t removed = 0, added = 0, total = 0;
+    if (!wl_columnar_memory_size_mul(count, old_length,
+        &removed)) return EOVERFLOW;
+    if (removed > source_length) return EINVAL;
+    if (!wl_columnar_memory_size_mul(count, new_length, &added) ||
+        !wl_columnar_memory_size_add((uint64_t)source_length - removed, added,
+        &total) ||
+        total >= SIZE_MAX) return EOVERFLOW;
+    rc = wl_columnar_expr_scalar_region(control, id, 178, total);
+    if (rc) return rc;
+    *result = (size_t)total;
+    return 0;
+}
+
 static int
 wl_columnar_expr_scalar_decode(const uint8_t *bytes, uint32_t size,
     uint32_t *pos, expr_instr_t *instruction, wl_evaluation_control_t *control,
@@ -3529,6 +3551,7 @@ wl_columnar_expr_scalar_decode(const uint8_t *bytes, uint32_t size,
         *pos += length;
         break;
     }
+    case WL_PLAN_EXPR_STR_FN_STR_REPLACE:
     case WL_PLAN_EXPR_STR_FN_SUBSTR: case WL_PLAN_EXPR_STR_FN_TRIM:
     case WL_PLAN_EXPR_STR_FN_CAT: case WL_PLAN_EXPR_STR_FN_TO_UPPER:
     case WL_PLAN_EXPR_STR_FN_TO_LOWER: case WL_PLAN_EXPR_STR_FN_TO_STRING:
@@ -3617,6 +3640,7 @@ wl_columnar_expr_compile_scalar_attempt_controlled(const uint8_t *bytes,
         case WL_PLAN_EXPR_CONST_FLOAT: case WL_PLAN_EXPR_CONST_STR:
         case WL_PLAN_EXPR_BOOL:
             break;
+        case WL_PLAN_EXPR_STR_FN_STR_REPLACE:
         case WL_PLAN_EXPR_STR_FN_SUBSTR:
             depth = depth > 2 ? depth - 3 : 0;
             break;
@@ -3709,7 +3733,8 @@ wl_columnar_expr_scalar_result_type_attempt_controlled(
     if (rc) return rc;
     wirelog_column_type_t result;
     bool valid = true;
-    if (owner->producer.op == WL_PLAN_EXPR_STR_FN_SUBSTR ||
+    if (owner->producer.op == WL_PLAN_EXPR_STR_FN_STR_REPLACE ||
+        owner->producer.op == WL_PLAN_EXPR_STR_FN_SUBSTR ||
         owner->producer.op == WL_PLAN_EXPR_STR_FN_TRIM ||
         owner->producer.op == WL_PLAN_EXPR_STR_FN_CAT ||
         owner->producer.op == WL_PLAN_EXPR_STR_FN_TO_UPPER ||
@@ -3988,6 +4013,139 @@ publish:
     return 0;
 }
 
+static int
+wl_columnar_expr_scalar_replace(const wl_columnar_expr_attempt_scalar_t *owner,
+    int64_t a, int64_t b, int64_t c, wl_intern_t *intern, int64_t *value,
+    wl_evaluation_control_t *control, uint64_t id)
+{
+    int rc = wl_columnar_expr_scalar_region(control, id, 170, 0);
+    if (rc) return rc;
+    int64_t result = intern ? -1 : a;
+    wl_columnar_expr_scratch_t scratch = {.data = NULL, .size = 0,
+                                          .held = false};
+    if (!intern) goto done;
+    int64_t operands[3] = {a, b, c};
+    const char *strings[3];
+    for (unsigned i = 0; i < 3; ++i) {
+        rc = wl_columnar_expr_scalar_region(control, id, 171, i);
+        if (rc) goto done;
+        strings[i] = wl_intern_reverse(intern, operands[i]);
+    }
+    if (!strings[0] || !strings[1] || !strings[2]) goto done;
+    size_t old_length = 0, source_length = 0, new_length = 0;
+    rc = wl_columnar_expr_cstr_length_attempt_controlled(strings[1],
+            &old_length, control, id);
+    if (rc) goto done;
+    if (!old_length) {
+        result = a; goto done;
+    }
+    rc = wl_columnar_expr_cstr_length_attempt_controlled(strings[0],
+            &source_length, control, id);
+    if (rc) goto done;
+    size_t position = 0, count = 0;
+    while (position <= source_length) {
+        rc = wl_columnar_expr_scalar_region(control, id, 172, position);
+        if (rc) goto done;
+        size_t match = 0; bool found = false;
+        rc =
+            wl_columnar_expr_bytes_find_attempt_controlled(
+            (const uint8_t *)strings[0] + position,
+            source_length - position, (const uint8_t *)strings[1],
+            old_length,
+            &match, &found, control, id);
+        if (rc) goto done;
+        if (!found) break;
+        rc = wl_columnar_expr_scalar_region(control, id, 173, position + match);
+        if (rc) goto done;
+        ++count; position += match + old_length;
+    }
+    if (!count) {
+        result = a; goto done;
+    }
+    /* A no-match result never needs replacement traversal or any allocation.
+    * All three IDs were validated before either allocation-free shortcut. */
+    rc = wl_columnar_expr_cstr_length_attempt_controlled(strings[2],
+            &new_length, control, id);
+    if (rc) goto done;
+    size_t output_length = 0;
+    rc = wl_columnar_expr_replace_size_attempt_controlled(source_length,
+            old_length,
+            new_length, count, &output_length, control, id);
+    if (rc) goto done;
+    rc = wl_columnar_expr_scratch_prepare(&scratch, owner, output_length,
+            control, id);
+    if (rc) goto done;
+    position = 0;
+    size_t written = 0, matches = 0;
+    while (position <= source_length) {
+        rc = wl_columnar_expr_scalar_region(control, id, 175, position);
+        if (rc) goto done;
+        size_t match = 0; bool found = false;
+        rc =
+            wl_columnar_expr_bytes_find_attempt_controlled(
+            (const uint8_t *)strings[0] + position,
+            source_length - position, (const uint8_t *)strings[1],
+            old_length,
+            &match, &found, control, id);
+        if (rc) goto done;
+        if (!found) break;
+        rc = wl_columnar_expr_scalar_region(control, id, 176, position + match);
+        if (rc) goto done;
+        if (match > output_length - written) {
+            rc = EIO; goto done;
+        }
+        size_t copied = 0;
+        rc =
+            wl_columnar_expr_bytes_copy_attempt_controlled(
+            (uint8_t *)scratch.data + written,
+            (const uint8_t *)strings[0] + position, match, &copied, control,
+            id);
+        if (rc) goto done;
+        written += match;
+        if (new_length > output_length - written) {
+            rc = EIO; goto done;
+        }
+        rc =
+            wl_columnar_expr_bytes_copy_attempt_controlled(
+            (uint8_t *)scratch.data + written,
+            (const uint8_t *)strings[2], new_length, &copied, control, id);
+        if (rc) goto done;
+        written += new_length; ++matches; position += match + old_length;
+    }
+    rc = wl_columnar_expr_scalar_region(control, id, 177, position);
+    if (rc) goto done;
+    size_t tail = source_length - position;
+    if (tail > output_length - written || matches != count) {
+        rc = EIO; goto done;
+    }
+    size_t copied = 0;
+    rc =
+        wl_columnar_expr_bytes_copy_attempt_controlled((uint8_t *)scratch.data +
+            written,
+            (const uint8_t *)strings[0] + position, tail, &copied, control, id);
+    if (rc) goto done;
+    written += tail;
+    if (written != output_length) {
+        rc = EIO; goto done;
+    }
+    rc = wl_columnar_expr_scalar_region(control, id, 135, written);
+    if (rc) goto done;
+    scratch.data[written] = 0;
+    rc = wl_columnar_expr_scalar_region(control, id, 136, written);
+    if (rc) goto done;
+    rc = wl_columnar_expr_scalar_intern(intern, scratch.data, &result, control,
+            id);
+    if (rc) goto done;
+    rc = wl_columnar_expr_scalar_region(control, id, 137, written);
+done:
+    wl_columnar_expr_scratch_release(&scratch);
+    if (rc) return rc;
+    rc = wl_columnar_expr_scalar_region(control, id, 182, 0);
+    if (rc) return rc;
+    *value = result;
+    return 0;
+}
+
 int
 wl_columnar_expr_eval_scalar_attempt_controlled(
     const wl_columnar_expr_attempt_scalar_t *owner, const int64_t *row,
@@ -4072,6 +4230,13 @@ wl_columnar_expr_eval_scalar_attempt_controlled(
             }
             if (rc) return rc;
             rc = wl_columnar_expr_scalar_region(control, id, 104, pos);
+            if (rc) return rc;
+            expr_push(&stack, result);
+        } else if (in.op == WL_PLAN_EXPR_STR_FN_STR_REPLACE) {
+            int64_t c = expr_pop(&stack), b = expr_pop(&stack),
+                a = expr_pop(&stack), result = 0;
+            rc = wl_columnar_expr_scalar_replace(owner, a, b, c, intern,
+                    &result, control, id);
             if (rc) return rc;
             expr_push(&stack, result);
         } else if (in.op == WL_PLAN_EXPR_STR_FN_SUBSTR ||

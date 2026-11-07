@@ -5944,6 +5944,13 @@ int wl_columnar_expr_trim_span_attempt_controlled(const char *, size_t *,
 int wl_columnar_expr_utf8_slice_attempt_controlled(const char *, int64_t,
     int64_t, size_t *, size_t *, bool *, wl_evaluation_control_t *, uint64_t);
 
+/* Checked nonoverlapping replacement metadata, excluding trailing NUL.
+ * old_length must be positive; count*old_length cannot exceed source_length.
+ * Normal exact work448, errors leave result unchanged. No allocation/input
+ * traversal; capacity includes a representable terminating NUL. */
+int wl_columnar_expr_replace_size_attempt_controlled(size_t, size_t, size_t,
+    size_t, size_t *, wl_evaluation_control_t *, uint64_t);
+
 /* Context-bearing scalar owner (#2299). Immutable bytecode copy, no intern
  * mutation during compile. Numeric-only hosts keep the numeric owner path.
  * Evaluation borrows the actual session/plan context (or caller-held pin),
