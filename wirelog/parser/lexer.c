@@ -108,7 +108,9 @@ make_error(wl_parser_lexer_t *lexer, const char *message)
 /* Whitespace and Comments                                                  */
 /* ======================================================================== */
 
-static void
+/* Returns false when a block comment runs to the end of the input; the
+ * lexer's start fields then mark where that comment opened. */
+static bool
 skip_whitespace_and_comments(wl_parser_lexer_t *lexer)
 {
     for (;;) {
@@ -136,8 +138,30 @@ skip_whitespace_and_comments(wl_parser_lexer_t *lexer)
             continue;
         }
 
+        /* Block comment: / * ... * /, not nested (#2231).  It may span
+         * lines; the line count advances through it. */
+        if (c == '/' && peek_next(lexer) == '*') {
+            lexer->start = lexer->current;
+            lexer->start_line = lexer->line;
+            lexer->start_col = lexer->col;
+            advance(lexer); /* skip / */
+            advance(lexer); /* skip * */
+            for (;;) {
+                if (is_at_end(lexer))
+                    return false;
+                if (peek(lexer) == '*' && peek_next(lexer) == '/') {
+                    advance(lexer);
+                    advance(lexer);
+                    break;
+                }
+                advance(lexer);
+            }
+            continue;
+        }
+
         break;
     }
+    return true;
 }
 
 /* ======================================================================== */
@@ -441,7 +465,8 @@ scan_directive(wl_parser_lexer_t *lexer)
 static wl_parser_lexer_token_t
 scan_token(wl_parser_lexer_t *lexer)
 {
-    skip_whitespace_and_comments(lexer);
+    if (!skip_whitespace_and_comments(lexer))
+        return make_error(lexer, "unterminated block comment");
 
     lexer->start = lexer->current;
     lexer->start_line = lexer->line;

@@ -93,6 +93,46 @@ test_parse_empty(void)
     PASS();
 }
 
+/* #2231: block comments, as in bench/workloads/doop.dl, were lexed as a
+ * slash and failed the parse. */
+static void
+test_parse_block_comments(void)
+{
+    TEST("block comments between and inside clauses");
+    PARSE("/* header\n   two lines */\n"
+        ".decl e(x: int64 /* the key */)\n"
+        "e(1). /* inline */ e(2).\n"
+        "p(x) :- e(x), /* in a body */ x > 0.\n");
+    ASSERT_PARSED();
+    if (program->child_count != 4) {
+        CLEANUP();
+        FAIL("expected 4 children");
+        return;
+    }
+    CLEANUP();
+    PASS();
+}
+
+static void
+test_parse_unterminated_block_comment(void)
+{
+    TEST("unterminated block comment fails the parse");
+    char errbuf[256] = { 0 };
+    wl_parser_ast_node_t *ast = wl_parser_parse_string(
+        ".decl e(x: int64)\n/* open\ne(1).\n", errbuf, sizeof(errbuf));
+    if (ast) {
+        wl_parser_ast_node_free(ast);
+        FAIL("an unterminated block comment parsed");
+        return;
+    }
+    if (!strstr(errbuf, "line 2") || !strstr(errbuf, "unterminated block")) {
+        printf(" [%s]", errbuf);
+        FAIL("error does not name the comment's line");
+        return;
+    }
+    PASS();
+}
+
 static void
 test_parse_comments_only(void)
 {
@@ -2380,6 +2420,8 @@ main(void)
     printf("--- Empty/Minimal ---\n");
     test_parse_empty();
     test_parse_comments_only();
+    test_parse_block_comments();
+    test_parse_unterminated_block_comment();
 
     printf("\n--- Declarations ---\n");
     test_parse_simple_decl();
