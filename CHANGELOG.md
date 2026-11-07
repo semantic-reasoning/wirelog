@@ -248,6 +248,25 @@ All notable changes to wirelog are documented in this file.
 
 ### Fixed
 
+- **Body atoms must match their relation's width** (#2231):
+  `p(x, y) :- g(x, y).` against `.decl g(x: int64)` holding `g(5)` derived
+  `p(5, 0)`, a narrower atom such as `p(x) :- g(x).` against a two-column
+  `g` was accepted, and `!h(x, 0)` against a one-column `h` holding `h(5)`
+  let `p(5)` through. A body atom, positive or negated, is now rejected with
+  `WIRELOG_ERR_PARSE` when its width differs from its relation's: one
+  argument per physical slot in flat form, or, in logical form, one per
+  declared column with a compound term for each `inline` column of arity
+  greater than 1. A compound term at an `inline` column's position selects
+  logical form, so `q(g(a, b), c, d)` against two inline columns `g/2` and
+  `f/2` is rejected; a compound term at another position leaves the atom in
+  flat form and is not checked here. A compound term whose functor or arity
+  differs from the declaration is still accepted in logical form and matches
+  no row. Relations with neither a `.decl` nor inline facts are not checked.
+  A single `_` or variable for a whole `inline` column of arity greater than
+  1, as in `a(i, _)` against `p: pair/2 inline`, is now rejected; write
+  `a(i, _, _)` or `a(i, pair(_, _))`. Against `a(i, p: pair/2 inline, k)`,
+  `o(i, k) :- a(i, _, k).` derived `k` from the payload's second slot.
+
 - **Rule-head constants follow their column's type** (#2231):
   `o(1) :- s(_).` against `.decl o(x: float)` derived
   `o(4.9406564584124654e-324)`, and `o(5000000000)` against an `int32`

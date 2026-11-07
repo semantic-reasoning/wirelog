@@ -306,9 +306,11 @@ by the same physical comparison (see [Inline facts must match their declared
 arity](#inline-facts-must-match-their-declared-arity) above). It was accepted
 until #985, which is where the `outr(1, 99, 0)` above was observed.
 
-Rule **bodies** are not validated against their `.decl` for arity. Their
-symbol and numeric values are checked; see [Rules must not mix symbol and
-numeric values](#rules-must-not-mix-symbol-and-numeric-values) below.
+Rule **body atoms** are validated too; see [Rule body atoms must match
+their declared arity](#rule-body-atoms-must-match-their-declared-arity)
+below. Their symbol and numeric values are checked as well; see [Rules must
+not mix symbol and numeric
+values](#rules-must-not-mix-symbol-and-numeric-values).
 
 The count is not the only constraint on aggregates in a head — the aggregate
 must also be written **last**. `t(min(v), g) :- val(g, v).` lowers with a
@@ -324,6 +326,48 @@ and `AVG` are recognized by the lexer and require a float operand at lowering.
 The keywords are
 kept reserved so that `avg`/`AVERAGE` do not have to be taken away from user
 identifiers later.)
+
+### Rule body atoms must match their declared arity
+
+A body atom, positive or negated, whose width differs from its relation's is
+rejected when the program is loaded, with `WIRELOG_ERR_PARSE` (#2231). The
+relation's width is its `.decl`, or, for a relation with inline facts and no
+`.decl`, its facts:
+
+```
+.decl g(x: int64, y: int64)
+.decl p(x: int64)
+p(x) :- g(x, y).        /* accepted */
+p(x) :- g(x, _).        /* accepted */
+p(x) :- g(x).           /* rejected: 1 argument, 2 declared */
+p(x) :- g(x, y, z).     /* rejected: 3 arguments, 2 declared */
+p(x) :- g(x, y), !g(y). /* rejected: negated atoms are checked too */
+```
+
+Before this check, `p(x, y) :- g(x, y).` against a one-column `g` holding
+`g(5)` derived `p(5, 0)`. An atom of a relation with an `inline` compound
+column is written in one of two forms. In flat form it has one argument per
+physical slot: against `.decl pred(id: int64, payload: f/2 inline)`,
+`pred(a, b, c)` is accepted and `pred(a, b)` rejected. Once an `inline`
+column is written as a compound term, the atom is in logical form, with one
+argument per declared column and a compound term for every `inline` column
+of arity greater than 1: `pred(a, f(b, c))` is accepted and
+`pred(a, f(b, c), d)` rejected. A one-slot `inline` column, such as
+`q: box/1 inline`, may also take a variable or `_` in logical form. Only a
+compound term at the position of an `inline` column selects logical form, so
+against `.decl q(x: g/2 inline, y: f/2 inline)`, `q(g(a, b), c, d)` is
+rejected; write `q(g(a, b), f(c, d))` or `q(a, b, c, d)`. A compound term at
+any other position, such as `q(a, b, c, f(d))`, leaves the atom in flat form
+and is not checked by this rule. A compound term whose functor or arity
+differs from the declaration, such as `pred(a, g(b, c))`, is accepted in
+logical form and matches no row. Atoms of a relation with neither a `.decl`
+nor inline facts are not checked.
+
+A single `_` or variable for a whole `inline` column of arity n greater than
+1 leaves a flat-form atom n - 1 slots short, so `pred(a, _)` is rejected;
+write `pred(a, _, _)` or `pred(a, f(_, _))`. It used to read the row's first
+slots in order: against `.decl a(i: int64, p: pair/2 inline, k: int64)`
+holding `a(1, 2, 3, 4)`, `o(i, k) :- a(i, _, k).` derived `o(1, 3)`.
 
 ### Rules must not mix symbol and numeric values
 

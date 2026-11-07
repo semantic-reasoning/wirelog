@@ -3635,6 +3635,130 @@ test_head_arity_mismatch_maps_to_parse_error(void)
 }
 
 /* ======================================================================== */
+/* Body atom width (#2231)                                                  */
+/* ======================================================================== */
+
+#define PRED_DECL ".decl pred(id: int64, payload: f/2 inline)\n" \
+        "pred(1, 10, 20).\n"
+
+static void
+test_body_arity_mismatches_rejected(void)
+{
+    static const struct {
+        const char *src;
+        const char *needle;
+    } cases[] = {
+        /* wider than the .decl, before and after it */
+        { ".decl g(x: int64)\ng(5).\n.decl p(x: int64, y: int64)\n"
+          "p(x, y) :- g(x, y).\n",
+          "body atom for relation 'g' has 2 argument(s) but 'g' is declared"
+          " with 1 column(s)" },
+        { "g(5).\n.decl p(x: int64, y: int64)\np(x, y) :- g(x, y).\n"
+          ".decl g(x: int64)\n", "body atom for relation 'g' has 2" },
+        /* narrower */
+        { ".decl g(x: int64, y: int64)\ng(5, 6).\n.decl p(x: int64)\n"
+          "p(x) :- g(x).\n", "body atom for relation 'g' has 1" },
+        /* negated, either way */
+        { ".decl e(x: int64)\ne(5).\n.decl h(x: int64, y: int64)\n"
+          ".decl p(x: int64)\np(x) :- e(x), !h(x).\n",
+          "negated body atom for relation 'h' has 1" },
+        { ".decl e(x: int64)\ne(5).\n.decl h(x: int64)\n.decl p(x: int64)\n"
+          "p(x) :- e(x), !h(x, 0).\n",
+          "negated body atom for relation 'h' has 2" },
+        /* inline compound: the handle spelling, and logical form with an
+         * extra argument */
+        { PRED_DECL ".decl o(a: int64, b: int64)\no(a, b) :- pred(a, b).\n",
+          "occupies 3 column(s) (2 declared" },
+        /* `_` for a whole inline column is a handle-width atom too */
+        { PRED_DECL ".decl o(a: int64)\no(a) :- pred(a, _).\n",
+          "occupies 3 column(s) (2 declared" },
+        { PRED_DECL ".decl o(a: int64, b: int64, c: int64, d: int64)\n"
+          "o(a, b, c, d) :- pred(a, f(b, c), d).\n",
+          "has 3 argument(s) with a compound term" },
+        /* logical form straddling two inline columns (critique m4) */
+        { ".decl q(x: g/2 inline, y: f/2 inline)\nq(1, 2, 3, 4).\n"
+          ".decl o(a: int64, c: int64, d: int64, e: int64)\n"
+          "o(a, c, d, e) :- q(a, f(c, d), e).\n",
+          "has 3 argument(s) with a compound term" },
+        /* a compound term, then a flat-written inline column */
+        { ".decl q(x: g/2 inline, y: f/2 inline)\nq(1, 2, 3, 4).\n"
+          ".decl o(a: int64, b: int64, c: int64, d: int64)\n"
+          "o(a, b, c, d) :- q(g(a, b), c, d).\n",
+          "has 3 argument(s) with a compound term" },
+        /* logical form with a variable for a second inline column */
+        { ".decl q(x: g/2 inline, y: f/2 inline)\nq(1, 2, 3, 4).\n"
+          ".decl o(a: int64)\no(a) :- q(g(a, _), y).\n",
+          "argument 2, for inline column 'y' of arity 2, must be one too" },
+        /* mismatched compounds with an extra argument (critique m7) */
+        { PRED_DECL ".decl o(a: int64)\no(a) :- pred(a, g(b, c), _).\n",
+          "has 3 argument(s) with a compound term" },
+        { PRED_DECL ".decl o(a: int64)\no(a) :- pred(a, f(b), c).\n",
+          "has 3 argument(s) with a compound term" },
+        /* an undeclared relation whose width comes from its facts */
+        { "g(5).\n.decl p(x: int64, y: int64)\np(x, y) :- g(x, y).\n",
+          "but its facts have 1 ('g' has no .decl)" },
+    };
+
+    TEST("Body arity: atoms of the wrong width are rejected");
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        char errbuf[512];
+        wirelog_error_t err = WIRELOG_OK;
+        struct wirelog_program *prog = wl_ir_parse_string_err(cases[i].src,
+                &err, errbuf, sizeof(errbuf));
+        if (prog) {
+            wirelog_program_free(prog);
+            FAIL(cases[i].src);
+            return;
+        }
+        if (err != WIRELOG_ERR_PARSE || !strstr(errbuf, cases[i].needle)) {
+            printf(" [%s]", errbuf);
+            FAIL("wrong error for a body width mismatch");
+            return;
+        }
+    }
+    PASS();
+}
+
+static void
+test_body_arity_accepted_forms(void)
+{
+    static const char *cases[] = {
+        PRED_DECL ".decl o(a: int64, b: int64, c: int64)\n"
+        "o(a, b, c) :- pred(a, f(b, c)).\n",
+        PRED_DECL ".decl o(a: int64, b: int64, c: int64)\n"
+        "o(a, b, c) :- pred(a, b, c).\n",
+        /* a one-slot inline column may take a variable in logical form */
+        ".decl a(i: int64, p: pair/2 inline, m: int64, q: box/1 inline)\n"
+        "a(1, 2, 3, 4, 5).\n.decl o(i: int64, s: int64, n: int64, m: int64,"
+        " z: int64)\no(i, s, n, m, z) :- a(i, pair(s, n), m, z).\n",
+        ".decl a(i: int64, p: pair/2 inline, m: int64, q: box/1 inline)\n"
+        "a(1, 2, 3, 4, 5).\n.decl o(i: int64)\no(i) :- a(i, pair(_, _), _, _).\n",
+        /* the two spellings of "any payload" */
+        PRED_DECL ".decl o(a: int64)\no(a) :- pred(a, _, _).\n",
+        PRED_DECL ".decl o(a: int64)\no(a) :- pred(a, f(_, _)).\n",
+        /* a mismatched compound in logical form matches no row */
+        PRED_DECL ".decl o(a: int64)\no(a) :- pred(a, g(b, _)).\n",
+        PRED_DECL ".decl o(a: int64)\no(a) :- pred(a, f(_)).\n",
+        /* undeclared head-only relations are not checked */
+        ".decl e(x: int64, y: int64)\ne(1, 2).\npath(x, y) :- e(x, y).\n"
+        "q(x, z) :- path(x, y, z).\n",
+        ".decl g(x: int64, y: int64)\ng(1, 2).\n.decl p(x: int64)\n"
+        "p(x) :- g(x, _).\n",
+    };
+
+    TEST("Body arity: atoms of the right width are accepted");
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        struct wirelog_program *prog = make_program(cases[i]);
+        if (!prog) {
+            FAIL(cases[i]);
+            return;
+        }
+        wl_ir_program_free(prog);
+    }
+    PASS();
+}
+
+/* ======================================================================== */
 /* Rule-head constants against their lanes (#2231)                          */
 /* ======================================================================== */
 
@@ -4795,6 +4919,10 @@ main(void)
     test_head_arity_undeclared_head_accepted();
     test_head_arity_matching_accepted();
     test_head_arity_mismatch_maps_to_parse_error();
+
+    /* #2231: body atom width */
+    test_body_arity_mismatches_rejected();
+    test_body_arity_accepted_forms();
 
     /* #2231: rule-head constants against their lanes */
     test_head_int_const_in_float_lane_converted();

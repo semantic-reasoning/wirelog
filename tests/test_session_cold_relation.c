@@ -2601,8 +2601,10 @@ static void inline_initialization_budget(void)
         } else CHECK(rc == WL_ERR_MEMORY_BUDGET && !f.session);
         destroy(&f);
     }
-    const char *patterns[] = {"pair(nested(s),n)", "whole", "_"};
-    for (unsigned i = 0; i < 3; i++) {
+    /* A variable or `_` for the whole inline column is rejected at load
+     * (#2231), so only a compound spelling reaches the session. */
+    const char *patterns[] = {"pair(nested(s),n)"};
+    for (unsigned i = 0; i < 1; i++) {
         char query_text[256];
         snprintf(query_text, sizeof(query_text),
             ".decl a(i:int64,p:pair/2 inline)\n"
@@ -2995,7 +2997,10 @@ static void inline_source_refusals(void)
             e.bits[0] == 504 && e.bits[1] == 511);
         destroy(&f);
     }
-    const char *patterns[] = {"pair(nested(s),n)", "whole", "_", "wrong(s,n)",
+    /* A variable or `_` for the whole inline column is rejected at load
+     * (#2231); the flat spellings read the column without a compound term
+     * and, like the mismatched compounds, mark the cold use unsupported. */
+    const char *patterns[] = {"pair(nested(s),n)", "s,n", "_,_", "wrong(s,n)",
                               "pair(s)"};
     for (unsigned i = 0; i < 5; i++) {
         char text[512];
