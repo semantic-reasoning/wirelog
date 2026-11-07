@@ -4,7 +4,8 @@ This records default serial LFTJ admission, bounded child preparation/output,
 retirement and per-operator runtime policy for #2298. It extends the framed
 destination to the public batch-off host. The coverage ledger and final issue
 qualification are tracked separately; this source map alone does not declare
-whole-issue completion.
+whole-issue completion. The completed serial issue predicates and current
+ledger mapping are recorded in [LFTJ_ACCEPTANCE.md](LFTJ_ACCEPTANCE.md).
 Registered ended-Original cleanup is specified in
 [LFTJ_NATIVE_CLEANUP.md](LFTJ_NATIVE_CLEANUP.md).
 
