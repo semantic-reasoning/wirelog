@@ -70,6 +70,18 @@ Features:
 - **Wildcards**: `_` for anonymous variables
 - **Plan marker**: `.plan` before a rule for optimization hints
 
+### Variables named like `col1`
+
+Lowering refers to a column by position with an internal variable named
+`col` followed by the column's index, and a rule variable spelled the same
+way used to be read as that reference (#2231). With `n(9, 1, 1)` and
+`n(3, 7, 3)`, `m(a) :- n(col1, a, a).` derived `m(7)` instead of `m(1)`;
+with `n(1, 10)` and `n(2, 20)`, `t(sum(x)) :- n(col1, x).` derived `t(3)`,
+the sum of the first column, instead of `t(30)`. Such a variable is now
+renamed before lowering, so these rules derive what they derive with the
+variable spelled differently. IR dumps (`wirelog_ir_node_to_string`) show
+it with a `$` prefix, as `$col1`.
+
 ### Limitation: one aggregate per rule head
 
 A rule head may contain **at most one** aggregate. The internal `AGGREGATE`

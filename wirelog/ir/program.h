@@ -277,6 +277,14 @@ int
 wl_ir_program_collect_metadata(struct wirelog_program *program,
     const wl_parser_ast_node_t *ast);
 
+/* #2231: renames each rule variable spelled `col` followed by digits so
+ * that it cannot be read as lowering's positional column references; call
+ * it after wl_ir_program_collect_metadata() and before
+ * wl_ir_program_convert_rules().  Returns -1 when out of memory. */
+int
+wl_ir_program_rename_positional_vars(struct wirelog_program *program,
+    wl_parser_ast_node_t *ast);
+
 int
 wl_ir_program_convert_rules(struct wirelog_program *program,
     const wl_parser_ast_node_t *ast);

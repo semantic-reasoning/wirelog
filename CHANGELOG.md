@@ -248,6 +248,17 @@ All notable changes to wirelog are documented in this file.
 
 ### Fixed
 
+- **Rule variables named like `col1` keep their meaning** (#2231): with
+  `n(9, 1, 1)` and `n(3, 7, 3)`, `m(a) :- n(col1, a, a).` derived `m(7)`
+  instead of `m(1)`, and with `n(1, 10)` and `n(2, 20)`,
+  `t(sum(x)) :- n(col1, x).` derived `t(3)` instead of `t(30)`. Lowering
+  refers to a column by position with an internal variable named `col`
+  followed by the column's index -- for an aggregate's operand, a constant
+  in a body atom or an equality with a constant pushed into one, and a
+  variable repeated in an atom -- and plan generation read a rule variable
+  of that spelling as the reference. Such variables are now renamed before
+  lowering; IR dumps show them with a `$` prefix, as `$col1`.
+
 - **Body atoms of a relation defined only by rules match its heads**
   (#2231): `o(x, y) :- q(x, y).` with `q(x) :- e(x).` holding `e(1)` derived
   `o(1, 0)`, and `q(x, z) :- path(x, y, z).` against two-argument heads of

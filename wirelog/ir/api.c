@@ -140,6 +140,14 @@ wl_ir_parse_string_err(const char *program_text, wirelog_error_t *error,
         return NULL;
     }
 
+    if (wl_ir_program_rename_positional_vars(prog, ast) != 0) {
+        copy_err(errbuf, errcap, prog->parse_error);
+        wl_ir_program_free(prog);
+        if (error)
+            *error = WIRELOG_ERR_MEMORY;
+        return NULL;
+    }
+
     if (wl_ir_program_convert_rules(prog, ast) != 0) {
         copy_err(errbuf, errcap, prog->parse_error);
         wl_ir_program_free(prog);
