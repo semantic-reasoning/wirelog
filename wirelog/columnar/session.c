@@ -651,6 +651,9 @@ void (*wl_columnar_session_test_metadata_finished)(
 int wl_columnar_session_test_exhaust_after_relation;
 unsigned wl_columnar_session_test_preflight_quantum = 64;
 void (*wl_columnar_session_test_before_fresh_shape)(wl_col_session_t *);
+/* Read-only borrowed financier observation; never retained by the hook. */
+void (*wl_columnar_session_test_source_tail)(const wl_col_session_t *,
+    const wl_session_source_finance_t *);
 #if defined(_MSC_VER)
 __declspec(thread) unsigned wl_columnar_session_test_step_reset_chunks;
 #else
@@ -4903,6 +4906,26 @@ wl_columnar_session_scalar_view_release(void *context, void *storage,
     wl_columnar_memory_reservation_init(token);
 }
 
+/* Financial classification during session construction, before Original
+ * BEGIN. Inspect structural enums only; runtime metadata and Native authority
+ * remain live checks. Work scales with the visited plan arrays, not row data. */
+static bool
+wl_columnar_session_plan_has_lftj(const wl_plan_t *plan)
+{
+    if (!plan->strata || plan->stratum_count > MAX_STRATA) return false;
+    for (uint32_t si = 0; si < plan->stratum_count; ++si) {
+        const wl_plan_stratum_t *stratum = &plan->strata[si];
+        if (!stratum->relations) continue;
+        for (uint32_t ri = 0; ri < stratum->relation_count; ++ri) {
+            const wl_plan_relation_t *relation = &stratum->relations[ri];
+            if (!relation->ops) continue;
+            for (uint32_t oi = 0; oi < relation->op_count; ++oi)
+                if (relation->ops[oi].op == WL_PLAN_OP_LFTJ) return true;
+        }
+    }
+    return false;
+}
+
 static int
 col_session_create_internal(const wl_plan_t *plan, uint32_t num_workers,
     const wl_session_options_t *options, wl_session_t **out)
@@ -5449,8 +5472,8 @@ col_session_create_internal(const wl_plan_t *plan, uint32_t num_workers,
      * Conservative default (all false from calloc) is already set,
      * so only copy if strata exist. */
     sess->base.source_c1_admission = options && options->evaluation_control
-        && sess->num_workers == 1 && sess->join_batch_bytes
-        && plan->stratum_count <= MAX_STRATA;
+        && sess->num_workers == 1 && plan->stratum_count <= MAX_STRATA
+        && (sess->join_batch_bytes || wl_columnar_session_plan_has_lftj(plan));
     for (uint32_t si = 0; si < plan->stratum_count && si < MAX_STRATA; si++) {
         sess->stratum_is_monotone[si] = plan->strata[si].is_monotone;
         if (plan->strata[si].is_recursive)
@@ -9068,10 +9091,11 @@ col_controlled_step_join_birth_register(wl_col_session_t *sess,
     const wl_columnar_eval_serial_framed_host_request_t *request,
     wl_session_source_finance_t *source)
 {
-    if (!sess->join_batch_bytes || step->recursive_route
-        || !request->controlled_materialized_batch_fallback) return 0;
     wl_columnar_eval_stack_cleanup_frame_t *frame = sess->cleanup_active;
     if (!frame) return 0;
+    if ((!sess->join_batch_bytes && !sess->base.source_c1_admission)
+        || step->recursive_route || (sess->join_batch_bytes
+        && !request->controlled_materialized_batch_fallback)) return 0;
     wl_columnar_eval_serial_framed_attempt_t *ctx = NULL;
     int rc = wl_columnar_eval_stack_framed_context(frame, sess, &ctx);
     if (rc == EBUSY && step->join_cleanup.frame == frame) return 0;
@@ -9086,7 +9110,8 @@ col_controlled_step_join_birth_register(wl_col_session_t *sess,
         || ctx->private_bindings != request->private_bindings
         || ctx->capture_only != request->capture_only
         || ctx->capture_out != request->capture_out
-        || !ctx->controlled_materialized_batch_fallback) return EINVAL;
+        || ctx->controlled_materialized_batch_fallback
+        != request->controlled_materialized_batch_fallback) return EINVAL;
     unsigned kind = step->general_observed ? WL_COLUMNAR_SESSION_JOIN_DYNAMIC
         : WL_COLUMNAR_SESSION_JOIN_DEFAULT;
     wl_columnar_session_join_cleanup_t *p = &step->join_cleanup;
@@ -9273,7 +9298,7 @@ col_controlled_step_host_action_financed(wl_col_session_t *sess,
         if (wl_session_source_finance_rebegin(source)) abort();
     }
     if (source && wl_session_source_finance_charge(source,
-        sess->cleanup_active ? 148 : 48)) abort();
+        sess->cleanup_active ? 157 : 48)) abort();
     int birth_rc = col_controlled_step_join_birth_register(sess, step, relation,
             &request, source);
     if (birth_rc && !protocol) protocol = birth_rc;
@@ -9290,8 +9315,19 @@ col_controlled_step_host_action_financed(wl_col_session_t *sess,
             protocol);
 #endif
 
-    if (source && wl_session_source_finance_charge(source,
-        72)) abort();
+    if (source) {
+        /* Short prepared/error returns cannot borrow the longer successful
+         * registration path. Retire this real financial generation before
+         * admitting the independent tuple/return tail. */
+        if (wl_session_source_finance_charge(source, 80)) abort();
+        if (wl_session_source_finance_finish(source)) abort();
+        if (wl_session_source_finance_rebegin(source)) abort();
+        if (wl_session_source_finance_charge(source, 72)) abort();
+    }
+#ifdef WL_SESSION_TEST_HOOKS
+    if (source && wl_columnar_session_test_source_tail)
+        wl_columnar_session_test_source_tail(sess, source);
+#endif
     if (action == WL_COLUMNAR_EVAL_SERIAL_FRAMED_STATUS
         || step->reply.kind ==
         WL_COLUMNAR_EVAL_SERIAL_FRAMED_REPLY_PREPARED_MORE
@@ -9348,7 +9384,8 @@ col_controlled_step_host_action(wl_col_session_t *sess,
     wl_columnar_controlled_step_t *step, const wl_plan_relation_t *relation,
     wl_columnar_eval_serial_framed_host_action_t action)
 {
-    if (!sess->join_batch_bytes || step->recursive_route)
+    if ((!sess->join_batch_bytes && !sess->base.source_c1_admission)
+        || step->recursive_route)
         return col_controlled_step_host_action_financed(sess, step, relation,
                    action, NULL);
     static const wl_evaluation_control_source_phase_policy_t policy = {
@@ -9687,7 +9724,8 @@ static int
 col_controlled_step_finish(wl_col_session_t *sess,
     wl_columnar_controlled_step_t *step, int result)
 {
-    if (!sess->join_batch_bytes || step->recursive_route)
+    if ((!sess->join_batch_bytes && !sess->base.source_c1_admission)
+        || step->recursive_route)
         return col_controlled_step_finish_inner(sess, step, result, NULL, NULL);
     if (step->snapshot_owned) {
         wl_columnar_session_snapshot_finish_source_t payload = {sess, step,
@@ -16521,7 +16559,8 @@ col_session_snapshot_controlled(wl_session_t *session,
         abort();
     /* Only financial state is constructed here. Its positive setup phases
      * end before native evaluation; the local record is never lent to it. */
-    bool source_enabled = sess->join_batch_bytes
+    bool source_enabled = (sess->join_batch_bytes ||
+        session->source_c1_admission)
         && (!sess->controlled_step || !sess->controlled_step->recursive_route);
     static const wl_evaluation_control_source_phase_policy_t policy = {
         248, 88, 104
