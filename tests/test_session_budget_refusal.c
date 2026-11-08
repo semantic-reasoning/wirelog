@@ -50,7 +50,9 @@ static const char *const scenario_names[SCENARIO_COUNT] = {
         "p(x,y) :- e(x,y).\n"
 static const char *const programs[] = {
     DECLS "p(x,w) :- p(x,y), p(y,w).\n",
-    DECLS "p(x,w) :- p(x,y), e(y,w).\n"
+    DECLS "p(x,w) :- p(x,y), e(y,w).\n",
+    /* Rows in the head that come from the program rather than from e. */
+    DECLS "p(x,w) :- p(x,y), p(y,w).\np(30,31).\np(1,2).\n"
 };
 static const char ballast_text[] =
     ".decl bx(x: int64, y: int64)\n.decl by(x: int64, y: int64)\n"

@@ -7078,9 +7078,9 @@ test_session_budget_refusal_exe = executable(
   c_args: ['-DWL_SESSION_TEST_HOOKS=1'],
   link_with: [testlib_prod],
 )
-# 18 cells of 17 governed runs, each creating its own sessions.  meson
-# sets MALLOC_PERTURB_, which makes glibc scrub every session's 64MB arena, so
-# this runs several times slower under meson than run directly.
+# 27 cells of 17 governed runs, each creating its own sessions.  Measured on
+# the dev host at 5s run directly and 55s with MALLOC_PERTURB_, which meson sets
+# and which makes glibc scrub every session's 64MB arena.
 test('session_budget_refusal', test_session_budget_refusal_exe,
      suite: ['unit', 'tsan'], timeout: 300)
 
