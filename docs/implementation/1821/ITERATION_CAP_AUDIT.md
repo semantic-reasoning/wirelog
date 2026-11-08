@@ -28,8 +28,11 @@ successful first evaluation. The derived prefix is recorded only as the extent
 to clear on retry. Plain completion tokens cannot send that retry straight to
 compaction. A SNAPSHOT draining a pending plain STEP checks the cap immediately.
 Raw SNAPSHOT may still deliver its historical partial image with status0, but
-the next call must evaluate again. Observed STEP retains its original
-unevaluated notification baseline and emits no partial completed difference.
+the next call must evaluate again. Observed STEP emits no partial completed
+difference and gives up its notification baseline at the cap, together with a
+removal's retraction pre-seed (#2348). Input and snapshots are then accepted;
+on a committed session the STEP that finishes the evaluation reports nothing,
+and on a first evaluation it reports the whole model.
 
 `evaluation_iteration_cap` runs a generated two-head SCC over a13-edge chain,
 checks its independent complete value set, and reaches boundaries through real

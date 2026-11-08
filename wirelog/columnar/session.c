@@ -7566,7 +7566,8 @@ col_session_discard_uncommitted_strata(const wl_plan_t *plan,
 }
 
 /* Raw cap status remains zero for compatibility, but the partial model is
- * not stable. Retain input staging and the original observer baseline. */
+ * not stable. Retain input staging; a step that holds an observer gives it
+ * up after this (#2348). */
 static void
 wl_columnar_session_note_iteration_cap(wl_col_session_t *sess, uint32_t si)
 {
@@ -7867,6 +7868,26 @@ col_session_step_impl(wl_session_t *session)
         }
         if (sess->eval_stratum_iteration_capped) {
             wl_columnar_session_note_iteration_cap(sess, si);
+            /* A held observer refuses input and snapshots, so a retry that
+             * caps again would leave the host no way to shrink its input.
+             * Give it up and finish the evaluation the way a capped plain step
+             * does: on a committed session unobserved, with the callback
+             * observing from the step after; on a first evaluation from a
+             * fresh baseline, reporting the whole model.  A retry still
+             * finishes only once the evaluation fits within the cap
+             * (#2348). */
+            if (!completing_plain_step && sess->delta_observer) {
+                /* The removal's pre-seed belongs to the observed attempt.  An
+                 * unobserved step or snapshot re-derives from scratch, and a
+                 * stale flag would make it read the removed rows in place of
+                 * the relation (#1994).  A step that observes again sets it
+                 * anew. */
+                sess->retraction_seeded = false;
+                sess->retraction_right_pass = false;
+                int discard_rc = wl_columnar_eval_delta_observer_discard(sess);
+                if (discard_rc != 0)
+                    return discard_rc;
+            }
             return 0;
         }
         if (sess->plain_step_completion_step_context) {
