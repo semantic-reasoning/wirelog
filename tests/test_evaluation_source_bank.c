@@ -235,9 +235,103 @@ public_birth_and_partial_failure(void)
     wirelog_program_free(program);
 }
 
+typedef struct {
+    wl_evaluation_control_source_bank_t *bank;
+    unsigned first, between, second;
+    int first_error, second_error;
+} pair_fixture_t;
+
+static pair_fixture_t *observed_pair;
+
+static void
+pair_checkpoint(void)
+{
+    CHECK(observed_pair && observed_pair->first == 1 && !observed_pair->second);
+    ++observed_pair->between;
+}
+
+static int
+pair_second(void *payload)
+{
+    pair_fixture_t *p = payload;
+    CHECK(p->first == 1 && p->between == 1 && !p->second);
+    ++p->second;
+    return p->second_error;
+}
+
+static int
+pair_first(void *payload)
+{
+    pair_fixture_t *p = payload;
+    CHECK(!p->first && !p->between && !p->second);
+    ++p->first;
+    const wl_evaluation_control_source_pair_policy_t small = {1, 1, 1, 1};
+    wl_evaluation_control_source_pair_result_t nested =
+        wl_evaluation_control_source_bank_run_lexical_pair(p->bank,
+            WL_EVALUATION_CONTROL_SOURCE_OPERATION, &small,
+            pair_first, p, pair_second, p);
+    CHECK(nested.financial_result == EBUSY && !nested.first_called &&
+        !nested.second_called);
+    return p->first_error;
+}
+
+static void
+lexical_pair(void)
+{
+    wl_evaluation_control_source_bank_t *bank = NULL;
+    CHECK(!wl_evaluation_control_source_bank_create(&bank));
+    for (unsigned mode = 0; mode < 3; ++mode) {
+        pair_fixture_t p = {bank, 0, 0, 0, mode == 1 ? EIO : 0,
+                            mode == 2 ? ENOMEM : 0};
+        observed_pair = &p;
+        wl_evaluation_control_test_source_pair_checkpoint = pair_checkpoint;
+        /* Actual four-payment finite phase, exactly the old 3Q capacity.
+         * Test prices are not a source-distance or production tariff proof. */
+        const wl_evaluation_control_source_pair_policy_t policy = {256, 256,
+                                                                   255, 1};
+        wl_evaluation_control_source_pair_result_t r =
+            wl_evaluation_control_source_bank_run_lexical_pair(bank,
+                WL_EVALUATION_CONTROL_SOURCE_OPERATION, &policy,
+                pair_first, &p, pair_second, &p);
+        CHECK(!r.financial_result && r.first_called &&
+            r.first_result == p.first_error
+            && r.second_called == (mode != 1) &&
+            r.second_result == (mode == 2 ? ENOMEM : 0)
+            && p.first == 1 && p.between == 1 && p.second == (mode != 1));
+        wl_evaluation_control_test_source_pair_checkpoint = NULL;
+        observed_pair = NULL;
+    }
+    unsigned calls = 0;
+    const wl_evaluation_control_source_pair_policy_t invalid[] = {
+        {256, 256, 256, 256}, {0, 1, 1, 1}, {1, 0, 1, 1},
+        {1, 1, 0, 1}, {1, 1, 1, 0}, {UINT64_MAX, 1, 1, 1},
+    };
+    for (unsigned i = 0; i < sizeof(invalid) / sizeof(*invalid); ++i) {
+        wl_evaluation_control_source_pair_result_t r =
+            wl_evaluation_control_source_bank_run_lexical_pair(bank,
+                WL_EVALUATION_CONTROL_SOURCE_OPERATION, &invalid[i],
+                count_action, &calls, count_action, &calls);
+        CHECK(r.financial_result == EINVAL && !r.first_called &&
+            !r.second_called && !calls);
+    }
+    const wl_evaluation_control_source_pair_policy_t small = {1, 1, 1, 1};
+    wl_evaluation_control_source_context_t context = {0};
+    CHECK(!wl_evaluation_control_source_context_begin(bank,
+        WL_EVALUATION_CONTROL_SOURCE_OPERATION, &context));
+    wl_evaluation_control_source_pair_result_t busy =
+        wl_evaluation_control_source_bank_run_lexical_pair(bank,
+            WL_EVALUATION_CONTROL_SOURCE_OPERATION, &small,
+            count_action, &calls, count_action, &calls);
+    CHECK(busy.financial_result == EBUSY && !busy.first_called &&
+        !busy.second_called && !calls);
+    CHECK(!wl_evaluation_control_source_context_end(&context));
+    CHECK(!wl_evaluation_control_source_bank_destroy(&bank) && !bank);
+}
+
 int
 main(void)
 {
+    lexical_pair();
     int owner;
     wl_evaluation_control_t *original = NULL;
     CHECK(!wl_evaluation_control_create(9, &original));

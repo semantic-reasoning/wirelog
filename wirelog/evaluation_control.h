@@ -257,6 +257,32 @@ wl_evaluation_control_source_bank_run_lexical(
     const wl_evaluation_control_source_phase_policy_t *policy,
     wl_evaluation_control_source_action_fn action, void *payload);
 
+typedef struct {
+    uint64_t bootstrap_work, first_work, second_work, close_work;
+} wl_evaluation_control_source_pair_policy_t;
+
+typedef struct {
+    int financial_result, first_result, second_result;
+    bool first_called, second_called;
+} wl_evaluation_control_source_pair_result_t;
+
+/* Two synchronous SOURCE-only actions under one actual lexical lane. A real
+ * saved-generation zero separates the actions, followed by the independent
+ * second positive admission. A nonzero first action suppresses the second.
+ * No BANK/context/control/ID is lent to either action. Actual caller source
+ * and chronological promise accounting require their own qualification. */
+wl_evaluation_control_source_pair_result_t
+    wl_evaluation_control_source_bank_run_lexical_pair(
+    wl_evaluation_control_source_bank_t *, wl_evaluation_control_source_lane_t,
+    const wl_evaluation_control_source_pair_policy_t *,
+    wl_evaluation_control_source_action_fn, void *,
+    wl_evaluation_control_source_action_fn, void *);
+
+#ifdef WL_SESSION_TEST_HOOKS
+/* Observation after the real successful between-actions saved0; no loan. */
+extern void (*wl_evaluation_control_test_source_pair_checkpoint)(void);
+#endif
+
 /* Atomic identity siblings for hosts holding a live controller reference and
  * its stable attached owner. Workers must be drained before FINISH. These
  * mutex-serialized transitions do not authorize concurrent session/native

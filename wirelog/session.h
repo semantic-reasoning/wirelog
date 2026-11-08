@@ -47,6 +47,12 @@ typedef struct {
     bool applied, closed;
 } wl_session_source_finance_close_result_t;
 
+typedef struct {
+    wl_session_source_finance_close_result_t close;
+    wl_evaluation_control_source_pair_result_t phase;
+    int protocol;
+} wl_session_source_finance_pair_result_t;
+
 /* Paired lexical birth provenance. Before start_checked initialize ONLY
  * identity=NULL. Birth writes all other fields before publishing identity.
  * Never copy, retain, expose to Native work, or outlive the actual record. */
@@ -59,6 +65,8 @@ typedef struct wl_session_source_close_scope {
     uint64_t control_identity, limit;
     wl_evaluation_control_source_phase_result_t birth_phase;
     wl_session_source_finance_close_result_t result;
+    wl_evaluation_control_source_pair_result_t pair_phase;
+    bool pair_complete;
 } wl_session_source_close_scope_t;
 
 /* Internal persistent exclusion lease used by controlled attempts. Zero-init
@@ -150,6 +158,15 @@ int wl_session_source_finance_start_checked(wl_session_t *,
 wl_session_source_finance_close_result_t
 wl_session_source_finance_close_owned(wl_session_t *,
     wl_session_source_finance_t *, wl_session_source_close_scope_t *);
+/* Same actual financial close, then synchronous SOURCE-only metadata under
+ * a genuine intervening BANK check. Payload stays valid through return and
+ * is disjoint from the retiring Source allocation and lexical pair. Never
+ * pass user/native work or retain a BANK/context/controller/ID. Repeated
+ * completed calls retrieve the actual cached pair outcome without replay. */
+wl_session_source_finance_pair_result_t
+    wl_session_source_finance_close_then_metadata(wl_session_t *,
+    wl_session_source_finance_t *, wl_session_source_close_scope_t *,
+    wl_evaluation_control_source_action_fn, void *);
 int wl_session_source_footer(wl_session_t *);
 /* Actual admitted SOURCE scope only. Read callbacks do at most 40 scalar
  * actions and never perform Native work; errors have no direct-read fallback. */
