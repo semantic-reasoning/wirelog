@@ -3040,14 +3040,16 @@ wl_columnar_filter_map_prepare_scalars(wl_columnar_filter_context_t *ctx,
     rc = wl_columnar_filter_attempt_charge(control, id,
             WL_COLUMNAR_FILTER_MAP_FORWARD_WORK);
     if (rc) return rc;
-    table->scalars = wl_columnar_filter_attempt_allocate((size_t)bytes);
+    table->scalars = (wl_columnar_expr_attempt_scalar_t **)
+        wl_columnar_filter_attempt_allocate((size_t)bytes);
     table->scalar_allocated = table->scalars != NULL;
     if (!table->scalar_allocated) return ENOMEM;
     rc = wl_columnar_filter_attempt_tail(control, id, 141, count);
     if (rc) return rc;
     if (table->scalar_admitted) {
         rc = wl_columnar_memory_governor_commit_attempt_controlled(
-            &table->scalar_credit, table->scalars, &table->scalar_committed,
+            &table->scalar_credit, (const void *)table->scalars,
+            &table->scalar_committed,
             control, id);
         if (rc) return rc;
         if (!table->scalar_committed) return ENOMEM;
@@ -3883,7 +3885,7 @@ wl_columnar_filter_op_attempt_step_owned(
         break;
     case WL_COLUMNAR_FILTER_STAGE_SCALAR_TABLE_PHYSICAL:
         if (ctx->table.scalar_allocated) {
-            void *physical = ctx->table.scalars;
+            void *physical = (void *)ctx->table.scalars;
             ctx->table.scalars = NULL;
             ctx->table.scalar_allocated = false;
             free(physical);
