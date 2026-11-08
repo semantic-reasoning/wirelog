@@ -141,6 +141,15 @@ wl_ir_parse_string_err(const char *program_text, wirelog_error_t *error,
         return NULL;
     }
 
+    int safety_rc = wl_ir_program_check_rule_safety(prog, ast);
+    if (safety_rc != 0) {
+        copy_err(errbuf, errcap, prog->parse_error);
+        wl_ir_program_free(prog);
+        if (error)
+            *error = safety_rc == -2 ? WIRELOG_ERR_MEMORY : WIRELOG_ERR_PARSE;
+        return NULL;
+    }
+
     if (wl_ir_program_collect_metadata(prog, ast) != 0) {
         copy_err(errbuf, errcap, prog->parse_error);
         wl_ir_program_free(prog);

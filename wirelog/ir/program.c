@@ -4957,6 +4957,104 @@ wl_ir_program_resolve_eq_bindings(struct wirelog_program *program,
     return 0;
 }
 
+/* #2231: rule safety.  Every variable in the head, in a comparison, in a
+ * string predicate or in a scalar extension call must occur in a positive
+ * body atom; wl_ir_program_resolve_eq_bindings() has already replaced the
+ * variables a body equality binds.  Lowering used to read any other
+ * variable as the first body column: `m(y) :- n(x).` derived m(1), and
+ * `m(x) :- n(x), z < 4.` acted as `x < 4`.  A rule needs a positive body
+ * atom too: one without failed at evaluation.  Negated atoms keep their
+ * own check in convert_rule() (issue #920). */
+
+#define RULE_SAFETY_HINT "; bind it in a positive body atom or by a body" \
+        " equality (`%s = <expr>`)"
+
+/* Returns 0, -1 with an error set when the rule is rejected, or -2 when
+ * out of memory. */
+static int
+check_rule_safety(struct wirelog_program *program,
+    const wl_parser_ast_node_t *rule)
+{
+    const wl_parser_ast_node_t *head = rule->children[0];
+    const char *rule_name = head->name ? head->name : "?";
+    uint32_t var_cap = count_variable_nodes(rule);
+    eq_scope_t scope = { NULL, 0, NULL, 0 };
+    scope.atom_vars = (const char **)calloc(var_cap > 0 ? var_cap : 1,
+            sizeof(const char *));
+    if (!scope.atom_vars) {
+        wl_ir_program_set_error(program,
+            "out of memory checking rule '%s'", rule_name);
+        return -2;
+    }
+    uint32_t atoms = 0;
+    for (uint32_t i = 1; i < rule->child_count; i++) {
+        if (rule->children[i]->type == WL_PARSER_AST_NODE_ATOM) {
+            atoms++;
+            eq_collect_atom_vars(rule->children[i], &scope, var_cap);
+        }
+    }
+
+    int rc = 0;
+    if (atoms == 0) {
+        wl_ir_program_set_error(program,
+            "rule for '%s' has no positive body atom; write a ground rule"
+            " as a fact, or guard it with a nullary relation (`.decl"
+            " unit()`, `unit().`, `%s(...) :- unit(), ...`)", rule_name,
+            rule_name);
+        rc = -1;
+    }
+    for (uint32_t i = 0; rc == 0 && i < head->child_count; i++) {
+        const char *v = eq_first_unknown_var(head->children[i], &scope);
+        if (v) {
+            wl_ir_program_set_error(program,
+                "unsafe variable '%s' in the head of rule '%s'"
+                RULE_SAFETY_HINT, v, rule_name, v);
+            rc = -1;
+        }
+    }
+    for (uint32_t i = 1; rc == 0 && i < rule->child_count; i++) {
+        const wl_parser_ast_node_t *b = rule->children[i];
+        if (b->type != WL_PARSER_AST_NODE_COMPARISON
+            && b->type != WL_PARSER_AST_NODE_STR_FUNCTION
+            && b->type != WL_PARSER_AST_NODE_EXTENSION_CALL)
+            continue;
+        const char *v = eq_first_unknown_var(b, &scope);
+        if (!v)
+            continue;
+        if (b->type == WL_PARSER_AST_NODE_EXTENSION_CALL)
+            wl_ir_program_set_error(program,
+                "unsafe variable '%s' in scalar extension call '%s' in rule"
+                " '%s'" RULE_SAFETY_HINT, v, b->name ? b->name : "?",
+                rule_name, v);
+        else
+            wl_ir_program_set_error(program,
+                "unsafe variable '%s' in %s in rule '%s'" RULE_SAFETY_HINT,
+                v, b->type == WL_PARSER_AST_NODE_COMPARISON
+                ? "a comparison" : "a string predicate", rule_name, v);
+        rc = -1;
+    }
+    free((void *)scope.atom_vars);
+    return rc;
+}
+
+int
+wl_ir_program_check_rule_safety(struct wirelog_program *program,
+    const wl_parser_ast_node_t *ast)
+{
+    if (!program || !ast)
+        return -1;
+    for (uint32_t i = 0; i < ast->child_count; i++) {
+        const wl_parser_ast_node_t *child = ast->children[i];
+        if (child->type != WL_PARSER_AST_NODE_RULE || child->child_count < 1
+            || child->children[0]->type != WL_PARSER_AST_NODE_HEAD)
+            continue;
+        int rc = check_rule_safety(program, child);
+        if (rc != 0)
+            return rc;
+    }
+    return 0;
+}
+
 /* #2231: lowering refers to a column by position with a synthesised
  * variable named `col` and the column's index -- the operand of an
  * aggregate (rewrite_expr_vars_to_columns()), the filter for a constant in

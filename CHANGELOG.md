@@ -248,6 +248,18 @@ All notable changes to wirelog are documented in this file.
 
 ### Fixed
 
+- **Rules with unbound head or condition variables are rejected** (#2231):
+  `m(y) :- n(x).` with `n(1)` derived `m(1)`, and `m(x) :- n(x), z < 4.`
+  acted as `x < 4`, because a variable that no positive body atom or body
+  equality binds was read as the first body column. Such a variable in the
+  head, in a comparison, in a string predicate or in a scalar extension call
+  is now rejected at load with its name. That includes an aggregate operand:
+  `m(count(z)) :- n(x).` derived the number of `n` rows and is now rejected;
+  write `count(x)`. A rule with no positive body atom, such as
+  `m(2) :- 1 < 2.`, failed at evaluation with "execution failed" and is now
+  rejected at load; write it as a fact or guard it with a nullary relation
+  (`unit().` and `m(2) :- unit().`).
+
 - **Body equalities bind an unbound variable to an expression** (#2231):
   `m(y) :- n(x), y = x + 1.` derived nothing and `y = 2` kept only the rows
   whose first body column was 2, because such a variable was read as the
