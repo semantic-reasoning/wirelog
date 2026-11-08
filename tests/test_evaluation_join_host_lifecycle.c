@@ -592,6 +592,7 @@ static bool native_metadata_denial, native_metadata_refused,
 static unsigned native_metadata_reports;
 static uint64_t native_successor_id;
 static wl_evaluation_control_report_t native_report;
+static unsigned operator_finish_native_domains;
 extern int wl_columnar_eval_stack_test_fail_allocation;
 
 typedef struct {
@@ -615,6 +616,53 @@ native_report_same(const wl_evaluation_control_report_t *a,
         && a->consumed == b->consumed && a->stop_reason == b->stop_reason
         && a->execution_status == b->execution_status
         && a->cleanup_status == b->cleanup_status && a->result == b->result);
+}
+
+static void
+operator_finish_excludes_registered_native(const wl_col_session_t *session)
+{
+    unsigned bit = native_successor ? 2u : 1u;
+    if ((operator_finish_native_domains & bit) || !native_ended
+        || !session->cleanup_active ||
+        wl_columnar_session_test_native_error_phase(
+            session) != WL_COLUMNAR_SESSION_NATIVE_ERROR_CHILD) return;
+    wl_columnar_eval_serial_framed_attempt_t *ctx = NULL;
+    CHECK(!wl_columnar_eval_stack_framed_context(session->cleanup_active,
+        (wl_col_session_t *)session, &ctx));
+    if (!ctx->child_bound || wl_columnar_eval_stack_numeric_owner(ctx->frame,
+        &ctx->child)) return;
+    int proof_owner = 0, component_owner = 0, cause = 0;
+    wl_evaluation_control_t *proof = NULL, *funding = NULL;
+    CHECK(!wl_evaluation_control_create(0, &proof)
+        && !wl_evaluation_control_attach(proof, &proof_owner)
+        && !wl_evaluation_control_begin(proof, &proof_owner));
+    uint64_t proof_id = wl_evaluation_control_active_attempt_id(proof);
+    /* Actual registration/ended-generation proof, never seeded native bits. */
+    CHECK(!wl_columnar_session_join_cleanup_prove(ctx, proof, proof_id, NULL,
+        &cause) && cause);
+    CHECK(!wl_evaluation_control_finish(proof, &proof_owner, 0, 0)
+        && !wl_evaluation_control_detach(proof, &proof_owner));
+    wl_evaluation_control_release(proof);
+    wl_columnar_eval_serial_framed_attempt_t *saved = malloc(sizeof(*saved));
+    CHECK(saved); memcpy(saved, ctx, sizeof(*saved));
+    wl_columnar_eval_stack_unary_prepared_t p = {0}, inert = p;
+    CHECK(!wl_evaluation_control_create(0, &funding)
+        && !wl_evaluation_control_attach(funding, &component_owner)
+        && !wl_evaluation_control_begin(funding, &component_owner));
+    uint64_t id = wl_evaluation_control_active_attempt_id(funding), spent;
+    CHECK(wl_columnar_eval_stack_unary_prepared_operator_finish_begin(&p,
+        ctx->frame, &ctx->child, funding, id) == EBUSY
+        && !memcmp(&p, &inert, sizeof(p))
+        && !memcmp(ctx, saved, sizeof(*saved))
+        && !wl_evaluation_control_test_active_consumed(funding, id, &spent)
+        && !spent);
+    CHECK(!wl_evaluation_control_finish(funding, &component_owner, 0, 0)
+        && !wl_evaluation_control_detach(funding, &component_owner));
+    wl_evaluation_control_release(funding); free(saved);
+    wl_evaluation_control_report_t original;
+    CHECK(!wl_evaluation_control_report(native_fixture->control, &original));
+    native_report_same(&native_report, &original);
+    operator_finish_native_domains |= bit;
 }
 
 static void
@@ -666,6 +714,7 @@ native_grant_finished(const wl_col_session_t *session,
     (void)session; (void)action; (void)grant; (void)protocol;
     if (!native_at_limit && (!native_late || !session->cleanup_active))
         native_end_original();
+    operator_finish_excludes_registered_native(session);
 }
 
 static uint64_t
@@ -870,6 +919,7 @@ native_end_history(bool observed, bool evaluating_snapshot, unsigned event,
 static void
 native_end(void)
 {
+    operator_finish_native_domains = 0;
     const unsigned events[] = {WL_COLUMNAR_JOIN_PIPELINE_TEST_PREPARED,
                                WL_COLUMNAR_JOIN_PIPELINE_TEST_PRODUCE,
                                WL_COLUMNAR_JOIN_PIPELINE_TEST_EXCHANGED,
@@ -908,6 +958,7 @@ native_end(void)
     native_end_history(true, false, WL_COLUMNAR_JOIN_PIPELINE_TEST_CONSUMER,
         true, false, false, false);
     native_metadata_denial = false;
+    CHECK(operator_finish_native_domains == 3);
     configure("WIRELOG_JOIN_BATCH_STRICT", NULL);
 }
 

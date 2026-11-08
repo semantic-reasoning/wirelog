@@ -275,3 +275,143 @@ copied receipts, thread/session/control/status-alias refusal, reentry and
 legacy STEP/END/ACK refusal are asserted. Ended Original reports retain all
 seven fields and genuine successors spend zero. DONE queries work after
 frame/control destruction before a fresh header-only reset.
+
+
+## U0b.2: externally owned FINISH retirement component
+
+The generic operator FINISH component reuses the existing finite scalar
+retirement machine. It admits actual FILTER, MAP, JOIN, SEMIJOIN, ANTIJOIN,
+REDUCE and CONSOLIDATE contexts only after CONTROL has released the output
+writer/pin and reached quiet nonstream FINISH. It does not activate a new
+production route. An external direct or composed numeric owner, including an
+actual outstanding CHILD result, remains frozen under the prepared marker.
+The embedded framed child is excluded by its actual address after canonical
+owner proof and before any financier API. This excludes ordinary framed and
+registered native/error parents; it does not rely on a native-cleanup flag.
+Their existing production behavior is unchanged. Coherent production ROW,
+stream, framed/native and SOURCE integration remains a later required unit.
+
+The caller supplies fresh zero or genuinely ACKED final-address prepared
+storage, distinct from frame, owner and selected descriptors. The constructor
+never reads a dormant owner-thread payload. Fixed bounded proof packets check
+actual operation, context, range, scalar state and scratch ownership; captured
+plan/cursor/phase and actual context/control lineage are rechecked before
+retaining Original and publishing the marker last. Original is retained for
+identity/lifetime, never polled during cleanup. An ended Original and an
+active successor therefore authorize neither work nor a debit here.
+
+HEAD distinguishes committed replacement, uncommitted provisional output,
+present-empty ANTI metadata-only keep-all, and an inert selected owner.
+Missing right is MISSING_EXACT: it preserves the exact original entry without
+a replacement commit. ANTI keep-all retains the live relation and exact owned/borrowed bit,
+clears live delta/segment metadata and retires only the actual historical
+segment array. HEAD never selects that live relation for destruction. The
+segment action is irreversible; decline cannot resurrect a freed array.
+Before scalar commit, decline performs real partial initializer reset and
+claim release, restores only the legal retained entry, then clears and ACKs.
+After irreversible scalar commit, work must drain through the finite machine.
+There is no generic destructor or unlimited fallback.
+
+### Source contours and financier schedules
+
+The emitted-source support counts actual helper/caller paths separately from
+logical admission totals. All new financiers have incoming assigned promise0.
+The constructor has one positive256 admission with conservative lower0;
+HEAD has one positive192 admission with lower0. Each proof packet executes a
+real zero check. A zero check does not discharge an existing promise and a
+phase with several positive admissions does not claim a whole-call256 source
+loan. HOST384 is not imported as a SOURCE tariff. Correlated production carry
+and containing serial/native caller bounds must be qualified at integration.
+
+| Actual contour | Conservative source upper |
+| --- | ---: |
+| context / operator state / completed-resource state | 48 / 80 / 64 |
+| each scratch group / terminal-inert receipt / prepared+funding proof | 32 / 128 / 96 |
+| begin initial proof / geometry / operator-state packet | 160 / 112 / 112 |
+| begin completed-resource / scratch / descriptor-range packet | 112 / 80 / 80 |
+| begin inert receipt / final lineage / positive binding packet | 176 / 144 / 160 |
+| generic step or decline initial proof | 128 |
+| HEAD observer and renewed proof / context and state | 144 / 192 |
+| HEAD completed-resource or scratch / disposition / fixed handoff | 112 / 112 / 96 |
+| generic non-HEAD delegation prefix / decline prefix | 144 / 144 |
+| segments / selection / commit / ordinary dispose | 82 / 95 / 190 / 161 |
+| ledger wrapper / scalar clear / claim release / decline restore | 121 / 211 / 189 / 71 |
+| work clear / ACK / error or footer | 99 / 125 / 48 |
+| scalar INIT BOOT first prefix / post128 / ZERO / BIND / RESET | 176 / 144 / 208 / 224 / 192 |
+| finite timestamp payload including the generic return | 192 |
+
+The new generic non-HEAD dispatcher returns the existing helper directly:
+there is exactly one extra returned cell after its actual final check. In
+particular timestamp payload191 becomes192, rather than hiding a new result
+or status-copy suffix. The initializer BIND224 is counted along the real
+staged path, not formed by adding a wrapper to the separate legacy BIND254.
+The old INERT authority, BIND254 and numeric PREFIX249 stay literal. Shared
+read-only JOIN-state and scratch extraction adds six and seven cells to those
+old helpers respectively: their uppers become89 and72.
+
+| Actual phase | Logical admissions in order |
+| --- | --- |
+| begin / HEAD | 256 / 192 |
+| segments / select | 128 / 128 |
+| INIT BOOT / ZERO / BIND / RESET | 192+128 / 192+256 / 192+192 / 128+128 |
+| PREPARE phase0 / phase1 or2 / ordinary token or pair | 256+1 / 192+1 / 128+1 |
+| timestamp payload21 | 128+1+192 |
+| COMMIT | 192 |
+| ordinary DISPOSE / native credit | 256+1 / 256+64 |
+| ledger DISPOSE12 with actual debt | 128+109+166+28 |
+| scalar clear / work clear / ACK | 256 / 128 / 192 |
+| decline / partial initializer reset if needed | 128 / 128 |
+| decline claims / clear / restore / work clear | 256 / 256 / 128 / 128 |
+
+The inherited native charge/lower identities remain distinct; in particular
+BOOT's real overlap lower64 precedes its128. No earlier setup intent pays for
+a future retry. Each exact/one-short phase oracle states cumulative logical
+admissions independently of production fee selection. These tables qualify
+the component and its real native subpaths; they do not certify the sum of
+unused loans for a future containing serial SOURCE turn.
+
+### Actual component evidence
+
+`evaluation_numeric_plan` drives real generated MAP/FILTER/JOIN/ANTI/COUNT
+operations after an actual preceding owned output. SEMI and CONSOLIDATE
+fixtures are explicitly IR components, not claims of compiler selection.
+Direct CHILD/PENDING and composed UNARY_CHILD/COMPOSE_PENDING witnesses retain
+the old result tuple and completed host financier allocation/report through
+component ACK, then consume the old tuple first. STEP, consume and ACK are
+refused without mutation while the marker owns the frame. All seven fields
+of ended Original reports remain equal; genuine successors consume zero.
+
+The absent-right and present-empty ANTI fixtures separately cover actual
+borrowed VARIABLE input and owned MAP output, with and without historical
+segment/delta metadata, plus decline after irreversible segment disposal.
+They preserve the input snapshot, exact ownership and literal values. The
+borrowed keep-all regression fails on the old HEAD ownership predicate and
+passes only when equality of owned bits permits the real false/false case.
+
+Independent literal content, actual ownership and peer37/governor and11/13
+ledger baselines cover successful and cancelled families. A real peer reserve1
+between the governor total read and credit CAS forces native EAGAIN; a fresh
+step settles it exactly once. Funding-generation turnover is injected at the
+outer HEAD observer, each of four initializer APIs, ledger READY before CAS,
+and governor credit before CAS. The old generation is rejected, successor
+consumption remains zero, irreversible progress is retained and fresh grants
+finish cleanup. Ledger READY refusal leaves its actual writer gate clear.
+
+Explicit existing constant-true FILTER bytecode isolates actual retirement
+for nullary,1,65,257 columns, empty/nonempty and mixed INT64/FLOAT/STRING/
+UINT64/BOOL storage. Values use real interned symbols and typed constructors;
+timestamps carry literal stratum/worker/iteration and signed multiplicity.
+Owned input comes from executing the preceding FILTER. Every scalar-init
+phase is declined through actual reset/claim release, then reentered and
+fully drained. Critical timestamp payload321 logical admission is exercised.
+These are component intersections; natural session/recursive coverage remains
+required before issue closure.
+
+`evaluation_serial` independently produces an ordinary framed quiet FINISH
+and proves generic begin returns EBUSY without financier consumption or frame
+mutation, then resumes the legitimate driver. The existing host lifecycle
+`native-end` fixture proves actual session registration with its read-only
+API for both ended Original and active successor. It rejects generic begin
+on the real embedded child before funding, preserves full context/report,
+then completes the existing native cleanup and verifies literal retry and
+resource baselines. Neither fixture manufactures native permission flags.
