@@ -318,6 +318,16 @@ All notable changes to wirelog are documented in this file.
   atom is rejected too. A relation whose rule heads differ in width, or that
   has no rule head, is not checked.
 
+- **A variable bound only by a compound term of another functor is
+  rejected** (#2231): a compound term in a body atom whose functor or arity
+  its column does not hold, such as `pred(a, g(b, _))` against
+  `payload: f/2 inline`, matches no row, and its variables get no value from
+  it. A variable that only such a term binds, used in the head, a condition
+  or a negated atom, as in `o(b) :- pred(a, g(b, _)).`, is now rejected at
+  load, naming the functor and arity the column holds; such a rule derived
+  nothing. The term itself, with its variables unused or bound by another
+  atom, is still accepted and matches no row.
+
 - **Body compound terms must be at a compound column** (#2231):
   `o(i, z) :- e(i, box(z)).` against `.decl e(i: int64, x: int64)` holding
   `e(1, 9)` derived `o(1, 1)`: lowering read a compound term at a scalar

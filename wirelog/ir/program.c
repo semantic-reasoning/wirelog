@@ -1884,6 +1884,113 @@ check_body_atom_compounds(struct wirelog_program *program,
     return 0;
 }
 
+/* #2231: a compound term in a positive body atom whose functor or arity
+ * its column does not hold matches no row, and lowering gives the
+ * variables inside it no column.  A variable bound by nothing else but
+ * used in the head, a condition or a negated atom therefore has no value;
+ * it is rejected here, naming the pattern, since lowering cannot give it
+ * a column.  A variable of such a term that is used nowhere else, or that
+ * a positive atom binds outside such a term, is left alone: the term just
+ * matches no row, as before. */
+static bool
+compound_arg_functor_matches(const wl_parser_ast_node_t *arg,
+    const wirelog_column_t *col, const struct wirelog_program *prog);
+
+/* The column of @atom's argument @a when that argument is a compound term
+ * the column cannot hold, else NULL. */
+static const wirelog_column_t *
+mismatched_term_column(struct wirelog_program *program,
+    const wl_parser_ast_node_t *atom, uint32_t a)
+{
+    if (atom->children[a]->type != WL_PARSER_AST_NODE_COMPOUND_TERM)
+        return NULL;
+    const wl_ir_relation_info_t *rel = atom->name
+        ? find_relation_info(program, atom->name) : NULL;
+    if (!rel || !rel->columns || a >= rel->column_count
+        || rel->columns[a].compound_kind == WIRELOG_COMPOUND_KIND_NONE)
+        return NULL;
+    return compound_arg_functor_matches(atom->children[a], &rel->columns[a],
+               program) ? NULL : &rel->columns[a];
+}
+
+/* Whether @name occurs under @node outside every mismatched compound
+ * term. */
+static bool
+var_outside_mismatched(struct wirelog_program *program,
+    const wl_parser_ast_node_t *node, const char *name)
+{
+    if (node->type == WL_PARSER_AST_NODE_VARIABLE)
+        return node->name && strcmp(node->name, name) == 0;
+    for (uint32_t i = 0; i < node->child_count; i++) {
+        if (node->type == WL_PARSER_AST_NODE_ATOM
+            && mismatched_term_column(program, node, i))
+            continue;
+        if (var_outside_mismatched(program, node->children[i], name))
+            return true;
+    }
+    return false;
+}
+
+static int
+check_mismatched_term_vars(struct wirelog_program *program,
+    const wl_parser_ast_node_t *rule, const wl_parser_ast_node_t *atom,
+    uint32_t a, const wl_parser_ast_node_t *node)
+{
+    if (node->type != WL_PARSER_AST_NODE_VARIABLE) {
+        for (uint32_t i = 0; i < node->child_count; i++)
+            if (check_mismatched_term_vars(program, rule, atom, a,
+                node->children[i]) != 0)
+                return -1;
+        return 0;
+    }
+    if (!node->name)
+        return 0;
+    bool bound = false;
+    bool used = false;
+    for (uint32_t i = 0; i < rule->child_count; i++) {
+        const wl_parser_ast_node_t *c = rule->children[i];
+        if (!var_outside_mismatched(program, c, node->name))
+            continue;
+        if (i > 0 && c->type == WL_PARSER_AST_NODE_ATOM)
+            bound = true;
+        else
+            used = true;
+    }
+    if (bound || !used)
+        return 0;
+    const wirelog_column_t *col = mismatched_term_column(program, atom, a);
+    const wl_parser_ast_node_t *term = atom->children[a];
+    const char *functor = program->intern
+        ? wl_intern_reverse(program->intern,
+            (int64_t)col->compound_functor_id) : NULL;
+    const char *head = rule->children[0]->name;
+    wl_ir_program_set_error(program,
+        "variable '%s' in a rule for '%s' is bound only by compound term"
+        " %s/%u at argument %u of '%s', but column '%s' of '%s' holds %s/%u,"
+        " so it can match no row (line %u)", node->name, head ? head : "?",
+        term->name ? term->name : "?", term->child_count, a + 1, atom->name,
+        col->name ? col->name : "", atom->name, functor ? functor : "?",
+        col->compound_arity, atom->line);
+    return -1;
+}
+
+static int
+check_mismatched_terms(struct wirelog_program *program,
+    const wl_parser_ast_node_t *rule)
+{
+    for (uint32_t b = 1; b < rule->child_count; b++) {
+        const wl_parser_ast_node_t *atom = rule->children[b];
+        if (atom->type != WL_PARSER_AST_NODE_ATOM)
+            continue;
+        for (uint32_t a = 0; a < atom->child_count; a++)
+            if (mismatched_term_column(program, atom, a)
+                && check_mismatched_term_vars(program, rule, atom, a,
+                atom->children[a]) != 0)
+                return -1;
+    }
+    return 0;
+}
+
 /* #2231: a body atom, positive or negated, must have its relation's width.
  * An atom wider than its relation read the missing columns as 0, so
  * `p(x, y) :- g(x, y).` against a one-column `g` holding g(5) derived
@@ -1899,7 +2006,8 @@ check_body_atom_compounds(struct wirelog_program *program,
  * Otherwise it is in flat form, one argument per physical slot
  * (`pred(a, b, c)`), as facts and heads are written.  A compound term
  * whose functor or arity differs from the declaration is accepted in
- * logical form and matches no row, as before.
+ * logical form and matches no row, as before, unless check_mismatched_terms()
+ * rejects a variable bound only by it.
  *
  * A relation typed neither by a `.decl` nor by inline facts takes its width
  * from its rule heads when they all agree, @heads holding that width plus 1
@@ -2040,6 +2148,8 @@ validate_body_arities(struct wirelog_program *program,
                 rc = check_body_atom_width(program, lit->children[0], true,
                         heads);
         }
+        if (rc == 0)
+            rc = check_mismatched_terms(program, node);
     }
     free(heads);
     return rc;
