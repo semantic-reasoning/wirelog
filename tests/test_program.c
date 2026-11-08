@@ -4546,12 +4546,31 @@ test_rule_value_domains(void)
     expect_domain_accepted("Domains: float arithmetic into a float head",
         ".decl g(x: float)\ng(1.5).\n.decl p(x: float)\n"
         "p(x * 2.0) :- g(x).\n");
-    /* Only the literal group-by keys of an aggregate head are checked
-     * (domain_check_rule(), Pass D), so a symbol variable key in an int64
-     * column is accepted. */
-    expect_domain_accepted("Domains: aggregate head is not checked",
+    /* The group-by keys of an aggregate head are checked like any head
+     * argument. */
+    expect_domain_rejected("Domains: symbol variable key of an aggregate",
         DOMAIN_BASE ".decl c(x: int64, n: int64)\n"
-        "c(x, count(y)) :- s(x), g(y).\n");
+        "c(x, count(y)) :- s(x), g(y).\n",
+        "rule head for 'c' puts a string/symbol value into column 0, which"
+        " is declared int64");
+    expect_domain_rejected("Domains: int64 variable key after an aggregate",
+        DOMAIN_BASE ".decl c(n: int64, x: symbol)\n"
+        "c(count(y), x) :- s(y), g(x).\n",
+        "rule head for 'c' puts a numeric value into column 1, which"
+        " is declared string/symbol");
+    expect_domain_rejected("Domains: arithmetic key of an aggregate",
+        DOMAIN_BASE ".decl c(x: symbol, n: int64)\n"
+        "c(x + 1, count(y)) :- g(x), g(y).\n",
+        "rule head for 'c' puts a numeric value into column 0");
+    expect_domain_rejected("Domains: float variable key of an aggregate",
+        DOMAIN_BASE ".decl f(x: float)\nf(1.5).\n"
+        ".decl c(x: int64, n: int64)\n"
+        "c(x, count(y)) :- f(x), g(y).\n",
+        "rule head for 'c' puts a float value into column 0, which"
+        " is declared int64");
+    expect_domain_accepted("Domains: aggregate keys of their columns' kinds",
+        DOMAIN_BASE ".decl c(x: symbol, y: int64, n: int64)\n"
+        "c(x, y, count(y)) :- s(x), g(y).\n");
 }
 
 /* ======================================================================== */

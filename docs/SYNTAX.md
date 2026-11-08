@@ -223,8 +223,12 @@ input binding for the rule's body relation is refused, as for a rule head
 with a constant column. A literal key is checked against its column like any
 head literal, so an integer key in a `float` column is stored as its
 binary64 value and `t(2.5, count(x))` against an `int64` key column is
-rejected. A scalar extension call in a key is rejected with
-`WIRELOG_ERR_PARSE`; compute it in a separate rule first.
+rejected. A variable or expression key is checked like any head argument (see
+[Rules must not mix symbol and numeric
+values](#rules-must-not-mix-symbol-and-numeric-values)), so a `symbol` or
+`float` key in an `int64` column is rejected. A scalar extension call in a
+key is rejected with `WIRELOG_ERR_PARSE`; compute it in a separate rule
+first.
 
 ### `average()`
 
@@ -516,11 +520,11 @@ the inline facts of an undeclared relation, with no compound column and at
 their declared width; a comparison is checked when both of its operand types
 are known from a column, a literal, a string function, arithmetic or an `=`
 binding. Not checked: inline facts and host inserts (#963), the columns of
-relations with neither a `.decl` nor inline facts, the aggregate and the
-variable or expression keys of an aggregate head, the operands of string and
-arithmetic functions, the results of scalar extension calls, an integer in a
-`float` head column, and a `float` against a number in a body comparison or
-join.
+relations with neither a `.decl` nor inline facts, the aggregate column of
+an aggregate head (its group-by keys are checked like any head argument),
+the operands of string and arithmetic functions, the results of scalar
+extension calls, an integer in a `float` head column, and a `float` against
+a number in a body comparison or join.
 
 ---
 

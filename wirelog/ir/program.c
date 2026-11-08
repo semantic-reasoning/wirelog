@@ -1376,11 +1376,12 @@ validate_head_arities(struct wirelog_program *program,
  * literal, a string function, arithmetic or an `=` binding.  A variable
  * whose only binding is an `=` with a typed expression takes that
  * expression's type, which is the binding U4 gives it.  Not checked:
- * inline facts and host inserts (#963), aggregate heads, the operands of
- * string and arithmetic functions, the results of scalar extension calls,
- * which a plan may route into a string column (test_plan_gen's
- * `text.keep`), an integer value in a `float` head column, and a float
- * against a number in a body comparison or join. */
+ * inline facts and host inserts (#963), the aggregate column of an
+ * aggregate head (its group-by keys are checked like any head argument),
+ * the operands of string and arithmetic functions, the results of scalar
+ * extension calls, which a plan may route into a string column
+ * (test_plan_gen's `text.keep`), an integer value in a `float` head
+ * column, and a float against a number in a body comparison or join. */
 
 typedef struct {
     const char *name;
@@ -1716,20 +1717,14 @@ domain_check_rule(struct wirelog_program *program,
         }
     }
 
-    /* Pass D: the head.  In a head with an aggregate only the literal
-     * group-by keys are checked: REDUCE emits its columns in head order, so
-     * a key's head position is its column (validate_head_constants()), and
-     * the aggregate and the other keys are not checked. */
+    /* Pass D: the head.  REDUCE emits its columns in head order, so a
+     * group-by key's head position is its column and keys are checked like
+     * any head argument; an aggregate has no known domain
+     * (domain_of_value()), so its column is not checked. */
     const wl_ir_relation_info_t *rel = rc == 0
         ? domain_checked_relation(program, head) : NULL;
-    bool aggregate = false;
-    for (uint32_t c = 0; c < head->child_count; c++)
-        if (head->children[c]->type == WL_PARSER_AST_NODE_AGGREGATE)
-            aggregate = true;
     for (uint32_t c = 0; rel && rc == 0 && c < head->child_count; c++) {
         const wl_parser_ast_node_t *arg = head->children[c];
-        if (aggregate && !node_is_constant(arg))
-            continue;
         wirelog_column_type_t type = rel->columns[c].type;
         wl_ir_coltype_t value = domain_of_value(arg, &env);
         if (!domain_head_conflict(value,
