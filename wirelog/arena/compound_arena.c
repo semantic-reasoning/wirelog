@@ -64,6 +64,11 @@ compound_gate_store(wl_atomic_u64 *gate, uint64_t value)
 
 static void compound_arena_destroy(wl_compound_arena_t *arena);
 
+#ifdef WL_SESSION_TEST_HOOKS
+void (*wl_arena_compound_arena_test_retirement_peer)(wl_compound_arena_t *,
+    unsigned);
+#endif
+
 /* The caller already owns an owner/hold/operation reference. Initial raw
  * pointer admission must not race loss of that external lifetime authority. */
 static bool
@@ -604,6 +609,326 @@ wl_arena_compound_arena_gc_hold_release(wl_arena_compound_arena_gc_hold_t *hold)
             hold->identity = (uintptr_t)hold;
             return EINVAL;
         }
+    }
+}
+
+static bool
+wl_arena_compound_arena_step_thread(
+    const wl_arena_compound_arena_step_owner_t *owner)
+{
+    if (!owner->thread_valid) return false;
+#if defined(WL_HAVE_C11_THREADS)
+    return thrd_equal(owner->thread, thrd_current()) != 0;
+#elif defined(_WIN32) || defined(_WIN64)
+    return owner->thread == GetCurrentThreadId();
+#else
+    return pthread_equal(owner->thread, pthread_self()) != 0;
+#endif
+}
+
+static void
+wl_arena_compound_arena_step_bind(wl_arena_compound_arena_step_owner_t *owner,
+    wl_compound_arena_t *arena, const void *parent)
+{
+    owner->arena = arena; owner->parent = parent;
+#if defined(WL_HAVE_C11_THREADS)
+    owner->thread = thrd_current();
+#elif defined(_WIN32) || defined(_WIN64)
+    owner->thread = GetCurrentThreadId();
+#else
+    owner->thread = pthread_self();
+#endif
+    owner->thread_valid = true; owner->identity = owner;
+}
+
+static int
+wl_arena_compound_arena_step_prove(
+    const wl_arena_compound_arena_step_owner_t *owner,
+    wl_compound_arena_t *arena, const void *parent)
+{
+    if (owner->identity != owner || owner->arena != arena ||
+        owner->parent != parent
+        || !wl_arena_compound_arena_step_thread(owner)) return EBUSY;
+    uint64_t lifetime = compound_gate_load(&arena->lifetime_state);
+    return (lifetime & WL_COMPOUND_RETIRED) ||
+           !(lifetime & WL_COMPOUND_REFS_MAX)
+        ? EBUSY : 0;
+}
+
+int
+wl_arena_compound_arena_gc_hold_release_step_owned(
+    wl_arena_compound_arena_gc_hold_t *hold,
+    wl_compound_arena_t *expected_arena,
+    wl_arena_compound_arena_hold_release_t *receipt, const void *parent,
+    wl_evaluation_control_t *control, uint64_t saved_id, bool *done)
+{
+    if (!hold || !expected_arena || !receipt || !parent || !control ||
+        !saved_id || !done)
+        return EINVAL;
+    *done = false;
+    int rc = wl_evaluation_control_charge_attempt(control, saved_id, 0);
+    if (rc) return rc;
+    if (receipt->phase == WL_ARENA_COMPOUND_ARENA_HOLD_INERT) {
+        if (receipt->owner.identity || receipt->owner.arena ||
+            receipt->owner.parent
+            || receipt->owner.thread_valid || receipt->hold ||
+            receipt->reference_owed
+            || hold->identity != (uintptr_t)hold ||
+            hold->arena != expected_arena)
+            return EINVAL;
+        uint64_t lifetime = compound_gate_load(&expected_arena->lifetime_state);
+        if ((lifetime & WL_COMPOUND_RETIRED) || lifetime < 2
+            || !compound_gate_load(
+                &expected_arena->gc_hold_count)) return EBUSY;
+        rc = wl_evaluation_control_charge_attempt(control, saved_id, 128);
+        if (rc) return rc;
+        wl_arena_compound_arena_step_bind(&receipt->owner, expected_arena,
+            parent);
+        receipt->hold = hold;
+        receipt->phase = WL_ARENA_COMPOUND_ARENA_HOLD_COUNT;
+        return EAGAIN;
+    }
+    rc = wl_arena_compound_arena_step_prove(&receipt->owner, expected_arena,
+            parent);
+    if (rc) return rc;
+    if (receipt->hold != hold) return EINVAL;
+    if (receipt->phase == WL_ARENA_COMPOUND_ARENA_HOLD_DONE) {
+        if (receipt->reference_owed) return EINVAL;
+        *done = true; return 0;
+    }
+    if (receipt->phase == WL_ARENA_COMPOUND_ARENA_HOLD_COUNT) {
+        if (receipt->reference_owed || hold->arena != expected_arena
+            || hold->identity != (uintptr_t)hold) return EINVAL;
+        uint64_t count = compound_gate_load(&expected_arena->gc_hold_count);
+        if (!count) return EINVAL;
+        rc = wl_evaluation_control_charge_attempt(control, saved_id, 128);
+        if (rc) return rc;
+#ifdef WL_SESSION_TEST_HOOKS
+        if (wl_arena_compound_arena_test_retirement_peer)
+            wl_arena_compound_arena_test_retirement_peer(expected_arena,
+                WL_ARENA_COMPOUND_ARENA_HOLD_COUNT);
+#endif
+        rc = wl_evaluation_control_charge_attempt(control, saved_id, 0);
+        if (rc) return rc;
+        if (!atomic_compare_exchange_strong_explicit(
+                &expected_arena->gc_hold_count,
+                &count, count - 1u, memory_order_release,
+                memory_order_relaxed)) return EAGAIN;
+        /* The receipt owns the original hold's remaining lifetime reference.
+         * No callback or refusal separates its journal from invalidation. */
+        hold->arena = NULL; hold->identity = 0;
+        receipt->reference_owed = true;
+        receipt->phase = WL_ARENA_COMPOUND_ARENA_HOLD_REFERENCE;
+        return EAGAIN;
+    }
+    if (receipt->phase != WL_ARENA_COMPOUND_ARENA_HOLD_REFERENCE
+        || !receipt->reference_owed) return EINVAL;
+    uint64_t lifetime = compound_gate_load(&expected_arena->lifetime_state);
+    if ((lifetime & WL_COMPOUND_RETIRED) || lifetime < 2) return EBUSY;
+    rc = wl_evaluation_control_charge_attempt(control, saved_id, 128);
+    if (rc) return rc;
+#ifdef WL_SESSION_TEST_HOOKS
+    if (wl_arena_compound_arena_test_retirement_peer)
+        wl_arena_compound_arena_test_retirement_peer(expected_arena,
+            WL_ARENA_COMPOUND_ARENA_HOLD_REFERENCE);
+#endif
+    rc = wl_evaluation_control_charge_attempt(control, saved_id, 0);
+    if (rc) return rc;
+    if (!atomic_compare_exchange_strong_explicit(
+            &expected_arena->lifetime_state,
+            &lifetime, lifetime - 1u, memory_order_acq_rel,
+            memory_order_acquire)) return EAGAIN;
+    receipt->reference_owed = false;
+    receipt->phase = WL_ARENA_COMPOUND_ARENA_HOLD_DONE;
+    *done = true;
+    return 0;
+}
+
+static int
+wl_arena_compound_arena_gc_snapshot_prove(const wl_compound_arena_t *arena,
+    const wl_arena_compound_arena_gc_step_t *receipt)
+{
+    if (!receipt->generations) return receipt->gate_owned ? 0 : EINVAL;
+    if (arena->gens != receipt->generations ||
+        arena->max_epochs != receipt->max_epochs
+        || receipt->epoch >= receipt->max_epochs ||
+        receipt->index > receipt->count)
+        return EINVAL;
+    const wl_compound_gen_t *gen = &arena->gens[receipt->epoch];
+    uint32_t expected_epoch = receipt->reset
+        ? (receipt->epoch + 1u <
+        receipt->max_epochs ? receipt->epoch + 1u : receipt->max_epochs)
+        : receipt->epoch;
+    return arena->current_epoch == expected_epoch && gen->base == receipt->base
+           && gen->entry_offsets == receipt->offsets &&
+           gen->multiplicity == receipt->multiplicity
+           && gen->entry_cap == receipt->capacity
+           && gen->used == (receipt->reset ? 0 : receipt->used)
+           && gen->entry_count ==
+           (receipt->reset ? 0 : receipt->count) ? 0 : EINVAL;
+}
+
+int
+wl_arena_compound_arena_gc_epoch_step_owned(wl_compound_arena_t *arena,
+    wl_arena_compound_arena_gc_step_t *receipt, const void *parent,
+    wl_evaluation_control_t *control, uint64_t saved_id, bool *done,
+    uint32_t *result)
+{
+    if (!arena || !receipt || !parent || !control || !saved_id || !done ||
+        !result) return EINVAL;
+    *done = false;
+    int rc = wl_evaluation_control_charge_attempt(control, saved_id, 0);
+    if (rc) return rc;
+    if (receipt->phase == WL_ARENA_COMPOUND_ARENA_GC_INERT) {
+        if (receipt->owner.identity || receipt->owner.arena ||
+            receipt->owner.parent
+            || receipt->owner.thread_valid || receipt->generations ||
+            receipt->base
+            || receipt->offsets || receipt->multiplicity ||
+            receipt->live_handles
+            || receipt->epoch || receipt->max_epochs || receipt->count ||
+            receipt->capacity
+            || receipt->used || receipt->index || receipt->reclaimed ||
+            receipt->result
+            || receipt->disposition || receipt->gate_owned ||
+            receipt->reset) return EINVAL;
+        uint64_t lifetime = compound_gate_load(&arena->lifetime_state);
+        if ((lifetime & WL_COMPOUND_RETIRED) || !lifetime) return EBUSY;
+        rc = wl_evaluation_control_charge_attempt(control, saved_id, 128);
+        if (rc) return rc;
+        wl_arena_compound_arena_step_bind(&receipt->owner, arena, parent);
+        receipt->phase = WL_ARENA_COMPOUND_ARENA_GC_GATE;
+        return EAGAIN;
+    }
+    rc = wl_arena_compound_arena_step_prove(&receipt->owner, arena, parent);
+    if (rc) return rc;
+    if (receipt->phase == WL_ARENA_COMPOUND_ARENA_GC_DONE) {
+        if (receipt->gate_owned ||
+            receipt->disposition == WL_ARENA_COMPOUND_ARENA_GC_PENDING)
+            return EINVAL;
+        *result = receipt->result; *done = true; return 0;
+    }
+    if (receipt->phase == WL_ARENA_COMPOUND_ARENA_GC_GATE) {
+        if (receipt->gate_owned || receipt->generations) return EINVAL;
+        rc = wl_evaluation_control_charge_attempt(control, saved_id, 128);
+        if (rc) return rc;
+        uint64_t gate = 0;
+#ifdef WL_SESSION_TEST_HOOKS
+        if (wl_arena_compound_arena_test_retirement_peer)
+            wl_arena_compound_arena_test_retirement_peer(arena, 0);
+#endif
+        rc = wl_evaluation_control_charge_attempt(control, saved_id, 0);
+        if (rc) return rc;
+        if (!atomic_compare_exchange_strong_explicit(&arena->access_gate, &gate,
+            WL_COMPOUND_GATE_WRITER, memory_order_acquire,
+            memory_order_relaxed)) return EAGAIN;
+        receipt->gate_owned = true;
+        receipt->phase = WL_ARENA_COMPOUND_ARENA_GC_SNAPSHOT;
+        return EAGAIN;
+    }
+    if (!receipt->gate_owned ||
+        compound_gate_load(&arena->access_gate) != WL_COMPOUND_GATE_WRITER)
+        return EBUSY;
+    rc = wl_arena_compound_arena_gc_snapshot_prove(arena, receipt);
+    if (rc) return rc;
+    uint64_t work = receipt->phase == WL_ARENA_COMPOUND_ARENA_GC_SCAN ? 1 : 128;
+    rc = wl_evaluation_control_charge_attempt(control, saved_id, work);
+    if (rc) return rc;
+    switch (receipt->phase) {
+    case WL_ARENA_COMPOUND_ARENA_GC_SNAPSHOT: {
+        receipt->epoch = arena->current_epoch;
+        receipt->max_epochs = arena->max_epochs;
+        receipt->result = arena->current_epoch;
+        if (compound_gate_load(&arena->gc_hold_count)) {
+            receipt->disposition = WL_ARENA_COMPOUND_ARENA_GC_HELD;
+            receipt->phase = WL_ARENA_COMPOUND_ARENA_GC_RELEASE;
+            return EAGAIN;
+        }
+        if (arena->current_epoch >= arena->max_epochs) {
+            receipt->result = 0;
+            receipt->disposition = WL_ARENA_COMPOUND_ARENA_GC_SATURATED;
+            receipt->phase = WL_ARENA_COMPOUND_ARENA_GC_LOG;
+            return EAGAIN;
+        }
+        if (arena->frozen) {
+            receipt->disposition = WL_ARENA_COMPOUND_ARENA_GC_FROZEN;
+            receipt->phase = WL_ARENA_COMPOUND_ARENA_GC_LOG;
+            return EAGAIN;
+        }
+        if (!arena->gens || !arena->max_epochs ||
+            arena->max_epochs > WL_COMPOUND_DEFAULT_MAX_EPOCHS)
+            return EINVAL;
+        const wl_compound_gen_t *gen = &arena->gens[arena->current_epoch];
+        if (gen->entry_count > gen->entry_cap || gen->used > gen->capacity
+            || (gen->entry_count &&
+            (!gen->multiplicity || !gen->entry_offsets))) return EINVAL;
+        receipt->generations = arena->gens; receipt->base = gen->base;
+        receipt->offsets = gen->entry_offsets;
+        receipt->multiplicity = gen->multiplicity;
+        receipt->count = gen->entry_count; receipt->capacity = gen->entry_cap;
+        receipt->used = gen->used; receipt->live_handles = arena->live_handles;
+        receipt->phase =
+            receipt->count ? WL_ARENA_COMPOUND_ARENA_GC_SCAN :
+            WL_ARENA_COMPOUND_ARENA_GC_RESET;
+        return EAGAIN;
+    }
+    case WL_ARENA_COMPOUND_ARENA_GC_SCAN:
+        if (!receipt->generations ||
+            receipt->index >= receipt->count) return EINVAL;
+        if (receipt->multiplicity[receipt->index] <= 0) ++receipt->reclaimed;
+        ++receipt->index;
+        if (receipt->index ==
+            receipt->count) receipt->phase = WL_ARENA_COMPOUND_ARENA_GC_RESET;
+        return EAGAIN;
+    case WL_ARENA_COMPOUND_ARENA_GC_RESET:
+        if (!receipt->generations || receipt->index != receipt->count ||
+            receipt->reset) return EINVAL;
+        arena->gens[receipt->epoch].used = 0;
+        arena->gens[receipt->epoch].entry_count = 0;
+        arena->current_epoch = receipt->epoch + 1u <
+            receipt->max_epochs ? receipt->epoch + 1u : receipt->max_epochs;
+        receipt->reset = true; receipt->result = receipt->reclaimed;
+        receipt->disposition = WL_ARENA_COMPOUND_ARENA_GC_COLLECTED;
+        receipt->phase = WL_ARENA_COMPOUND_ARENA_GC_LOG;
+        return EAGAIN;
+    case WL_ARENA_COMPOUND_ARENA_GC_LOG:
+        /* Invocation is journaled before entering the fixed-format logger. */
+        receipt->phase = receipt->disposition ==
+            WL_ARENA_COMPOUND_ARENA_GC_COLLECTED
+            && arena->current_epoch + 5u >= receipt->max_epochs
+            ? WL_ARENA_COMPOUND_ARENA_GC_LOG_WARNING :
+            WL_ARENA_COMPOUND_ARENA_GC_RELEASE;
+        if (receipt->disposition == WL_ARENA_COMPOUND_ARENA_GC_COLLECTED) {
+            WL_LOG(WL_LOG_SEC_ARENA, WL_LOG_INFO,
+                "gc_epoch_boundary(epoch=%u, freed_handles=%u, remaining=%"
+                PRIu64 ")",
+                receipt->epoch, receipt->reclaimed, receipt->live_handles);
+        } else if (receipt->disposition == WL_ARENA_COMPOUND_ARENA_GC_FROZEN) {
+            WL_LOG(WL_LOG_SEC_COMPOUND, WL_LOG_WARN,
+                "lifecycle event=gc_skip_frozen current_epoch=%u",
+                receipt->epoch);
+        } else if (receipt->disposition ==
+            WL_ARENA_COMPOUND_ARENA_GC_SATURATED) {
+            WL_LOG(WL_LOG_SEC_COMPOUND, WL_LOG_WARN,
+                "lifecycle event=gc_skip_saturated current_epoch=%u max_epochs=%u",
+                receipt->epoch, receipt->max_epochs);
+        } else return EINVAL;
+        return EAGAIN;
+    case WL_ARENA_COMPOUND_ARENA_GC_LOG_WARNING:
+        receipt->phase = WL_ARENA_COMPOUND_ARENA_GC_RELEASE;
+        WL_LOG(WL_LOG_SEC_ARENA, WL_LOG_WARN,
+            "epoch nearing saturation (current=%u, max=%u)",
+            arena->current_epoch, receipt->max_epochs);
+        return EAGAIN;
+    case WL_ARENA_COMPOUND_ARENA_GC_RELEASE:
+        if (receipt->disposition ==
+            WL_ARENA_COMPOUND_ARENA_GC_PENDING) return EINVAL;
+        compound_gate_store(&arena->access_gate, 0);
+        receipt->gate_owned = false;
+        receipt->phase = WL_ARENA_COMPOUND_ARENA_GC_DONE;
+        *done = true; *result = receipt->result;
+        return 0;
+    default: return EINVAL;
     }
 }
 

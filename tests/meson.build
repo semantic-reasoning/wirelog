@@ -4220,6 +4220,7 @@ test('rotation_strategy', test_rotation_strategy_exe)
 test_session_compound_arena_lifecycle_exe = executable(
   'test_session_compound_arena_lifecycle',
   files('test_session_compound_arena_lifecycle.c'),
+  c_args: ['-DWL_SESSION_TEST_HOOKS=1'],
   include_directories: [wirelog_inc, wirelog_src_inc],
   dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
   link_with: [testlib_prod],
