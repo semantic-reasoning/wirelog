@@ -238,6 +238,194 @@ wl_session_source_finance_dispose(wl_session_source_finance_t *record)
     return rc;
 }
 
+static bool
+wl_session_source_close_storage(wl_session_t *session,
+    wl_session_source_finance_t *record,
+    wl_session_source_close_scope_t *scope)
+{
+    if (!session || !record || !scope) return false;
+    uintptr_t r = (uintptr_t)record, s = (uintptr_t)scope,
+        b = (uintptr_t)session;
+    if (sizeof(*record) > UINTPTR_MAX - r || sizeof(*scope) > UINTPTR_MAX - s
+        || sizeof(*session) > UINTPTR_MAX - b) return false;
+    uintptr_t re = r + sizeof(*record), se = s + sizeof(*scope),
+        be = b + sizeof(*session);
+    return !(r < se && s < re) && !(r < be && b < re) && !(s < be && b < se);
+}
+
+typedef struct {
+    wl_session_t *session;
+    wl_session_source_finance_t *record;
+    wl_session_source_close_scope_t *scope;
+    const wl_evaluation_control_source_phase_policy_t *policy;
+    uint64_t limit;
+    bool bound;
+} wl_session_source_checked_birth_t;
+
+static int
+wl_session_source_checked_birth(void *payload)
+{
+    wl_session_source_checked_birth_t *p = payload;
+    wl_session_source_finance_t *record = p->record;
+    wl_session_source_close_scope_t *scope = p->scope;
+    if (!p->session || !record || !scope || !p->policy) return EINVAL;
+    uintptr_t r = (uintptr_t)record, s = (uintptr_t)scope;
+    uintptr_t b = (uintptr_t)p->session, q = (uintptr_t)p->policy;
+    if (sizeof(*record) > UINTPTR_MAX - r || sizeof(*scope) > UINTPTR_MAX - s
+        || sizeof(*p->session) > UINTPTR_MAX - b ||
+        sizeof(*p->policy) > UINTPTR_MAX - q)
+        return EINVAL;
+    uintptr_t re = r + sizeof(*record), se = s + sizeof(*scope);
+    uintptr_t be = b + sizeof(*p->session), qe = q + sizeof(*p->policy);
+    if ((r < se && s < re) || (r < be && b < re) || (s < be && b < se)
+        || (r < qe && q < re) || (s < qe && q < se)) return EINVAL;
+    if (scope->identity) return EINVAL;
+    if (record->control || record->id || record->active || record->attached
+        || record->limit || record->charged || !p->limit) return EINVAL;
+    wl_evaluation_control_lexical_finance_birth_result_t born =
+        wl_evaluation_control_lexical_finance_birth_try(p->limit, record);
+    if (born.protocol) return born.protocol;
+    record->control = born.control; record->id = born.id;
+    record->limit = p->limit; record->charged = 0;
+    record->attached = record->active = true;
+    scope->record = record; scope->session = p->session;
+    scope->thread_cookie = &wl_session_thread_cookie;
+    scope->control = record->control;
+    scope->control_identity = born.identity;
+    scope->limit = p->limit;
+    scope->birth_phase = (wl_evaluation_control_source_phase_result_t){0};
+    scope->result = (wl_session_source_finance_close_result_t){0};
+    scope->identity = scope;
+    p->bound = true;
+    return 0;
+}
+
+int
+wl_session_source_finance_start_checked(wl_session_t *session,
+    wl_session_source_finance_t *record,
+    const wl_evaluation_control_source_phase_policy_t *policy, uint64_t limit,
+    wl_session_source_close_scope_t *scope)
+{
+    /* All record/scope field validation is behind the actual BANK CURRENT.
+     * No uninitialized scope field beyond its initial marker is read here. */
+    if (!record || !scope || !limit) return EINVAL;
+    wl_session_source_checked_birth_t payload = {session, record, scope, policy,
+                                                 limit, false};
+    wl_evaluation_control_source_phase_result_t phase =
+        wl_session_source_run(session,
+            policy, wl_session_source_checked_birth, &payload);
+    if (payload.bound) scope->birth_phase = phase;
+    return phase.financial_result ? phase.financial_result
+        : phase.action_called ? phase.action_result : EINVAL;
+}
+
+static int
+wl_session_source_close_scope_prove(wl_session_t *session,
+    wl_session_source_finance_t *record, wl_session_source_close_scope_t *scope)
+{
+    if (!wl_session_source_close_storage(session, record, scope)) return EINVAL;
+    if (scope->identity != scope || scope->record != record ||
+        scope->session != session)
+        return EINVAL;
+    if (scope->thread_cookie != &wl_session_thread_cookie) return EBUSY;
+    if (scope->result.closed)
+        return !record->control && !record->id && !record->active &&
+               !record->attached
+               && !scope->control ? 0 : EINVAL;
+    if (!record->control || record->control != scope->control ||
+        !record->attached
+        || record->limit != scope->limit ||
+        !scope->control_identity) return EINVAL;
+    return 0;
+}
+
+static wl_evaluation_control_lexical_finance_expectation_t
+wl_session_source_close_expectation(wl_session_source_finance_t *record,
+    wl_session_source_close_scope_t *scope)
+{
+    return (wl_evaluation_control_lexical_finance_expectation_t){
+               .owner = record, .scope = scope,
+               .owner_bytes = sizeof(*record), .scope_bytes = sizeof(*scope),
+               .identity = scope->control_identity, .limit = scope->limit,
+               .id = record->id, .charged = record->charged,
+               .active = record->active,
+    };
+}
+
+static int
+wl_session_source_close_actual(wl_session_source_close_scope_t *scope)
+{
+    wl_session_source_finance_t *record = scope->record;
+    wl_evaluation_control_lexical_finance_expectation_t e =
+        wl_session_source_close_expectation(record, scope);
+    wl_evaluation_control_lexical_finance_result_t closed =
+        wl_evaluation_control_lexical_finance_close_checked(record->control,
+            &e);
+    if (closed.protocol) return closed.protocol;
+    if (!closed.closed || !closed.report_valid) return EINVAL;
+    /* No callback or refusing operation separates physical financial free
+     * from invalidation of both lexical pointers and the applied journal. */
+    record->control = NULL; record->id = 0;
+    record->active = record->attached = false;
+    scope->control = NULL;
+    scope->result.source_result = closed.result;
+    scope->result.checkpoint_result = closed.checkpoint_result;
+    scope->result.applied = scope->result.closed = true;
+    return closed.result;
+}
+
+static int
+wl_session_source_close_action(void *payload)
+{
+    /* close_owned proved this original-address lexical pair immediately
+     * before synchronous BANK entry. Its prefix invokes no external action
+     * and cannot change this private scope. The core still revalidates all
+     * actual owner/ref/generation/alias state before its financial poll. */
+    return wl_session_source_close_actual(payload);
+}
+
+wl_session_source_finance_close_result_t
+wl_session_source_finance_close_owned(wl_session_t *session,
+    wl_session_source_finance_t *record, wl_session_source_close_scope_t *scope)
+{
+    wl_session_source_finance_close_result_t out = {0};
+    out.protocol = wl_session_source_close_scope_prove(session, record, scope);
+    if (out.protocol) return out;
+    if (scope->result.closed) return scope->result;
+    static const wl_evaluation_control_source_phase_policy_t policy = {208, 144,
+                                                                       80};
+    wl_evaluation_control_source_phase_result_t phase =
+        wl_session_source_run(session,
+            &policy, wl_session_source_close_action, scope);
+    if (!phase.action_called) {
+        /* No BANK activation/context is retained. Authenticate the genuine
+         * private pair before its saved0; arbitrary inputs cannot poll it. */
+        wl_evaluation_control_lexical_finance_expectation_t e =
+            wl_session_source_close_expectation(record, scope);
+        out.protocol =
+            wl_evaluation_control_lexical_finance_prove_checked(record->control,
+                &e);
+        if (out.protocol) return out;
+        int checkpoint = record->active
+            ? wl_evaluation_control_charge_attempt(record->control, record->id,
+                0) : 0;
+        int rc = wl_session_source_close_actual(scope);
+        if (!scope->result.closed) {
+            out.protocol = rc; return out;
+        }
+        if (checkpoint) scope->result.checkpoint_result = checkpoint;
+    }
+    if (scope->result.closed) {
+        scope->result.phase = phase;
+        return scope->result;
+    }
+    /* Strict invalid-input refusal leaves the real owner intact. Proper
+     * paired private births cannot acquire a foreign owner or extra ref. */
+    out.phase = phase;
+    out.protocol = phase.action_called ? phase.action_result : EINVAL;
+    return out;
+}
+
 #undef WL_SESSION_THREAD_LOCAL
 
 static void

@@ -429,6 +429,162 @@ identity_generation(void)
     }
 }
 
+/* Core component checks. Actual paired lexical Session issuance remains a
+* separate caller proof; the expected fields are never a Native permit. */
+static void
+lexical_finance_close(void)
+{
+    for (unsigned mode = 0; mode < 6; ++mode) {
+        uint64_t owner[8] = {0}, scope[8] = {0}, foreign[8] = {0};
+        wl_evaluation_control_t *c = NULL;
+        CHECK(!wl_evaluation_control_create(3, &c));
+        CHECK(!wl_evaluation_control_attach(c, owner));
+        CHECK(!wl_evaluation_control_begin(c, owner));
+        uint64_t id = wl_evaluation_control_active_attempt_id(c);
+        CHECK(!wl_evaluation_control_charge_attempt(c, id, 1));
+        wl_evaluation_control_lexical_finance_expectation_t e = {
+            .owner = owner, .scope = scope,
+            .owner_bytes = sizeof(owner), .scope_bytes = sizeof(scope),
+            .identity = wl_evaluation_control_identity(c), .limit = 3,
+            .id = id, .charged = 1, .active = true,
+        };
+        /* Readonly/refused queries leave this request unlatched. Mode4's
+         * valid close polls it; mode5 independently FINISHes first to prove
+         * the prior rejected/proof calls did not poll. */
+        if (mode == 4 || mode == 5) wl_evaluation_control_request_cancel(c);
+        CHECK(!wl_evaluation_control_lexical_finance_prove_checked(c, &e));
+        CHECK(wl_evaluation_control_lexical_finance_prove_checked(c,
+            (const wl_evaluation_control_lexical_finance_expectation_t *)(void *)
+            c) == EINVAL);
+        for (unsigned bad = 0; bad < 11; ++bad) {
+            wl_evaluation_control_lexical_finance_expectation_t wrong = e;
+            switch (bad) {
+            case 0: wrong.owner = foreign; break;
+            case 1: ++wrong.identity; break;
+            case 2: ++wrong.limit; break;
+            case 3: ++wrong.id; break;
+            case 4: ++wrong.charged; break;
+            case 5: wrong.scope = owner; break;
+            case 6: wrong.owner = c; break;
+            case 7: wrong.scope = c; break;
+            case 8: wrong.scope = (void *)(uintptr_t)UINTPTR_MAX; break;
+            case 9: wrong.owner = &wrong; break;
+            default: wrong.scope = &wrong; break;
+            }
+            CHECK(wl_evaluation_control_lexical_finance_prove_checked(c,
+                &wrong) == EINVAL);
+            wl_evaluation_control_lexical_finance_result_t refused =
+                wl_evaluation_control_lexical_finance_close_checked(c, &wrong);
+            CHECK(refused.protocol == EINVAL && !refused.closed &&
+                !refused.report_valid);
+            uint64_t used = UINT64_MAX;
+            CHECK(wl_evaluation_control_active_attempt_id(c) == id
+                && !wl_evaluation_control_test_active_consumed(c, id,
+                &used) && used == 1);
+            wl_evaluation_control_report_t report;
+            CHECK(wl_evaluation_control_report(c, &report) == ENOENT);
+        }
+        CHECK(!wl_evaluation_control_retain(c));
+        CHECK(wl_evaluation_control_lexical_finance_prove_checked(c,
+            &e) == EBUSY);
+        wl_evaluation_control_lexical_finance_result_t borrowed =
+            wl_evaluation_control_lexical_finance_close_checked(c, &e);
+        CHECK(borrowed.protocol == EBUSY && !borrowed.closed &&
+            !borrowed.report_valid);
+        wl_evaluation_control_release(c);
+        int expected = 0;
+        if (mode == 1) {
+            wl_evaluation_control_request_cancel(c);
+            /* A readonly owner proof cannot latch cancellation or charge. */
+            CHECK(!wl_evaluation_control_lexical_finance_prove_checked(c, &e));
+            CHECK(wl_evaluation_control_charge_attempt(c, id,
+                0) == WL_EVALUATION_CONTROL_CANCELLED);
+            expected = WL_EVALUATION_CONTROL_CANCELLED;
+        } else if (mode == 2) {
+            CHECK(wl_evaluation_control_charge_attempt(c, id,
+                3) == WL_EVALUATION_CONTROL_WORK_LIMIT);
+            expected = WL_EVALUATION_CONTROL_WORK_LIMIT;
+        } else if (mode == 3 || mode == 5) {
+            CHECK(!wl_evaluation_control_finish(c, owner, 0, 0));
+            e.active = false; e.id = 0;
+            CHECK(!wl_evaluation_control_lexical_finance_prove_checked(c, &e));
+        } else if (mode == 4) expected = WL_EVALUATION_CONTROL_CANCELLED;
+        wl_evaluation_control_lexical_finance_result_t closed =
+            wl_evaluation_control_lexical_finance_close_checked(c, &e);
+        /* The actual allocation and both refs are gone. Only value results
+         * remain readable; never query the old c afterward. */
+        CHECK(!closed.protocol && closed.closed && closed.report_valid
+            && closed.result == expected && closed.report.result == expected
+            && closed.checkpoint_result == expected
+            && closed.report.attempt_id == id && closed.report.limit == 3
+            && closed.report.consumed == 1 && !closed.report.execution_status
+            && !closed.report.cleanup_status &&
+            (int)closed.report.stop_reason == expected);
+    }
+}
+
+static uint64_t finance_peer_identity;
+
+static void
+finance_birth_peer(void)
+{
+    wl_evaluation_control_test_finance_birth_claim = NULL;
+    wl_evaluation_control_t *peer = NULL;
+    CHECK(!wl_evaluation_control_create(1, &peer));
+    finance_peer_identity = wl_evaluation_control_identity(peer);
+    wl_evaluation_control_release(peer);
+}
+
+static void
+lexical_finance_birth(void)
+{
+    uint64_t owner[8] = {0}, scope[8] = {0};
+    wl_evaluation_control_test_finance_birth_claim = finance_birth_peer;
+    wl_evaluation_control_lexical_finance_birth_result_t born =
+        wl_evaluation_control_lexical_finance_birth_try(3, owner);
+    /* A genuine peer claimed the observed identity: this constructor loses
+     * its single strong CAS before allocation, and does not retry here. */
+    CHECK(born.protocol == EAGAIN && !born.control && !born.id && !born.identity
+        && finance_peer_identity &&
+        !wl_evaluation_control_test_finance_birth_claim);
+    uint64_t next_identity = finance_peer_identity + 1;
+    for (unsigned fault = 0; fault < 3; ++fault) {
+        if (fault) {
+            wl_evaluation_control_test_finance_birth_fail = fault;
+            born = wl_evaluation_control_lexical_finance_birth_try(3, owner);
+            CHECK(born.protocol == ENOMEM && !born.control && !born.id &&
+                !born.identity
+                && !wl_evaluation_control_test_finance_birth_fail);
+            ++next_identity; /* A claimed failed identity is never reused. */
+        }
+        born = wl_evaluation_control_lexical_finance_birth_try(3, owner);
+        CHECK(!born.protocol && born.control && born.id &&
+            born.identity == next_identity++);
+        CHECK(wl_evaluation_control_active_attempt_id(born.control) == born.id);
+        wl_evaluation_control_lexical_finance_expectation_t e = {
+            .owner = owner, .scope = scope,
+            .owner_bytes = sizeof(owner), .scope_bytes = sizeof(scope),
+            .identity = born.identity, .limit = 3, .id = born.id,
+            .active = true,
+        };
+        CHECK(!wl_evaluation_control_lexical_finance_prove_checked(born.control,
+            &e));
+        wl_evaluation_control_lexical_finance_result_t closed =
+            wl_evaluation_control_lexical_finance_close_checked(born.control,
+                &e);
+        CHECK(!closed.protocol && !closed.result && !closed.checkpoint_result
+            && closed.closed && closed.report_valid &&
+            closed.report.attempt_id == born.id
+            && closed.report.limit == 3 && !closed.report.consumed);
+    }
+    born = wl_evaluation_control_lexical_finance_birth_try(0, owner);
+    CHECK(born.protocol == EINVAL && !born.control && !born.id &&
+        !born.identity);
+    born = wl_evaluation_control_lexical_finance_birth_try(3, NULL);
+    CHECK(born.protocol == EINVAL && !born.control && !born.id &&
+        !born.identity);
+}
+
 int
 main(void)
 {
@@ -440,6 +596,8 @@ main(void)
     cross_thread_cancel();
     shared_allowance();
     identity_generation();
+    lexical_finance_close();
+    lexical_finance_birth();
     CHECK(wl_evaluation_control_test_seed_next_identity(UINT64_MAX - 1) == 0);
     wl_evaluation_control_t *last = NULL;
     CHECK(wl_evaluation_control_create(0, &last) == 0);
@@ -448,6 +606,11 @@ main(void)
     wl_evaluation_control_t *exhausted = NULL;
     CHECK(wl_evaluation_control_create(0, &exhausted) == EOVERFLOW);
     CHECK(exhausted == NULL);
+    int exhausted_owner;
+    wl_evaluation_control_lexical_finance_birth_result_t no_identity =
+        wl_evaluation_control_lexical_finance_birth_try(1, &exhausted_owner);
+    CHECK(no_identity.protocol == EOVERFLOW && !no_identity.control
+        && !no_identity.id && !no_identity.identity);
     puts("evaluation_control: OK");
     return 0;
 }
