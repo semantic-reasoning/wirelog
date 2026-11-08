@@ -3697,6 +3697,23 @@ test_body_arity_mismatches_rejected(void)
         /* an undeclared relation whose width comes from its facts */
         { "g(5).\n.decl p(x: int64, y: int64)\np(x, y) :- g(x, y).\n",
           "but its facts have 1 ('g' has no .decl)" },
+        /* a variable bound only by a compound term its column cannot hold
+         * (#2231) */
+        { PRED_DECL ".decl o(a: int64)\no(b) :- pred(a, g(b, _)).\n",
+          "variable 'b' in a rule for 'o' is bound only by compound term"
+          " g/2 at argument 2 of 'pred', but column 'payload' of 'pred'"
+          " holds f/2" },
+        { PRED_DECL ".decl o(a: int64)\no(b) :- pred(a, f(b)).\n",
+          "bound only by compound term f/1 at argument 2" },
+        { PRED_DECL ".decl o(a: int64)\no(a) :- pred(a, g(b, _)), b > 1.\n",
+          "variable 'b' in a rule for 'o' is bound only by compound term" },
+        { PRED_DECL ".decl q(x: int64)\n.decl o(a: int64)\n"
+          "o(a) :- pred(a, g(b, _)), !q(b).\n",
+          "variable 'b' in a rule for 'o' is bound only by compound term" },
+        { ".decl ev(id: int64, m: meta/2)\n.decl o(i: int64, x: int64)\n"
+          "o(i, x) :- ev(i, other(x, y)).\n",
+          "bound only by compound term other/2 at argument 2 of 'ev', but"
+          " column 'm' of 'ev' holds meta/2" },
     };
 
     TEST("Body arity: atoms of the wrong width are rejected");
@@ -3736,9 +3753,14 @@ test_body_arity_accepted_forms(void)
         /* the two spellings of "any payload" */
         PRED_DECL ".decl o(a: int64)\no(a) :- pred(a, _, _).\n",
         PRED_DECL ".decl o(a: int64)\no(a) :- pred(a, f(_, _)).\n",
-        /* a mismatched compound in logical form matches no row */
+        /* a mismatched compound in logical form matches no row; its
+         * variables may be unused or bound by another atom */
         PRED_DECL ".decl o(a: int64)\no(a) :- pred(a, g(b, _)).\n",
         PRED_DECL ".decl o(a: int64)\no(a) :- pred(a, f(_)).\n",
+        PRED_DECL ".decl q(x: int64)\n.decl o(a: int64, b: int64)\n"
+        "o(a, b) :- pred(a, g(b, _)), q(b).\n",
+        PRED_DECL ".decl o(a: int64)\n"
+        "o(a) :- pred(a, f(_, _)), !pred(a, g(_, _)).\n",
         ".decl g(x: int64, y: int64)\ng(1, 2).\n.decl p(x: int64)\n"
         "p(x) :- g(x, _).\n",
     };

@@ -189,6 +189,16 @@ CASES = [
         'noatomrelation(2) :- 1 < 2.\n',
         ["noatomrelation", "no positive body atom"],
     ),
+    # A variable bound only by a compound term its column cannot hold
+    # (#2231).
+    (
+        "compound term with another functor",
+        '.decl mismatchrelation(id: int64, p: pairfunctor/2 inline)\n'
+        '.decl mismatchout(id: int64, a: int64)\n'
+        'mismatchout(i, mismatchvariable) :- '
+        'mismatchrelation(i, otherfunctor(mismatchvariable, b)).\n',
+        ["mismatchvariable", "otherfunctor/2", "pairfunctor/2"],
+    ),
 ]
 
 # A syntactically malformed program.  This is the errbuf that

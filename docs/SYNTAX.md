@@ -448,8 +448,9 @@ rejected; write `q(g(a, b), f(c, d))` or `q(a, b, c, d)`. A compound term at
 any other position, such as `q(a, b, c, f(d))`, leaves the atom in flat
 form; see below for where a compound term is accepted there. A compound term
 whose functor or arity differs from the declaration, such as
-`pred(a, g(b, c))`, is accepted in logical form and matches no row. A
-relation with neither a `.decl` nor inline facts takes its width from its
+`pred(a, g(b, c))`, is accepted in logical form and matches no row, but a
+variable bound only by it may not be used elsewhere in the rule; see below.
+A relation with neither a `.decl` nor inline facts takes its width from its
 rule heads when they all have the same number of arguments, an aggregate
 counting as one: with `q(x) :- e(x).`, `o(x, y) :- q(x, y).` is rejected,
 where it derived `o(1, 0)` from `e(1)`. A relation whose rule heads differ
@@ -472,11 +473,17 @@ the first `inline` column of arity greater than 1; a compound term after it
 is rejected, and that column must be written as a compound term. So
 `ev(metadata(_, _, _, r), a, b, k)` against
 `.decl ev(h: metadata/4 side, p: pair/2 inline, k: int64)` is accepted, and
-`q(a, b, c, f(d))` is rejected. A rule head cannot contain a compound term,
-so a relation that takes its width from its rule heads has no compound
-column, and a compound term in one of its atoms is rejected. Atoms whose
-width is not checked, as above, are not checked by this rule either, nor are
-compound terms nested inside a compound term.
+`q(a, b, c, f(d))` is rejected. A compound term whose functor or arity its
+column does not hold matches no row, and its variables get no value from it,
+so a variable that only such a term binds may not be used in the head, a
+condition or a negated atom: `o(b) :- pred(a, g(b, _)).` against
+`payload: f/2 inline` is rejected, naming the functor and arity the column
+holds, while `o(a) :- pred(a, g(b, _)).` is accepted and derives nothing. A
+rule head cannot contain a compound term, so a relation that takes its width
+from its rule heads has no compound column, and a compound term in one of
+its atoms is rejected. Atoms whose width is not checked, as above, are not
+checked by this rule either, nor are compound terms nested inside a compound
+term.
 
 ### Rules must not mix symbol and numeric values
 
