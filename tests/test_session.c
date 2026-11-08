@@ -19530,6 +19530,71 @@ clear_cb_cleanup:
 #undef CLEAR_CB_CHECK
 }
 
+/* A committed step that stops at its iteration cap leaves no baseline, observed
+ * or not.  An observer gives its baseline up, so input is accepted while the
+ * session caps, and in both shapes the finishing step reports nothing and the
+ * next one is exact (#2348). */
+static void
+test_capped_step_then_callback(uint32_t workers, bool observed)
+{
+    TEST("callback after a capped committed step starts at the next step");
+    /* 0 needs a hundred rounds to reach 100; the others derive nothing. */
+    static const char program[] =
+        ".decl s(x: int64)\n.decl p(x: int64)\np(x) :- s(x).\n"
+        "p(x + 1) :- p(x), x < 100.\n";
+    static const int64_t base = 1000, first = 0, second = 200, third = -5;
+    failed_attempt_env_t env;
+    failed_attempt_events_t events = { 0 };
+    wl_session_t *session = NULL;
+    const char *failure = NULL;
+#define CAP_CB_CHECK(c, m) do { if (!(c)) { failure = (m); \
+                                            goto cap_cb_cleanup; \
+                                } } while (0)
+    failed_attempt_env_set(&env);
+    wl_plan_t *plan = build_plan(program);
+    CAP_CB_CHECK(plan, "cap callback plan");
+    CAP_CB_CHECK(wl_session_create(wl_backend_columnar(), plan, workers,
+        &session) == 0, "cap callback session");
+    wl_col_session_t *coord = COL_SESSION(session);
+    if (observed)
+        wl_session_set_delta_cb(session, failed_attempt_count_event, &events);
+    CAP_CB_CHECK(wl_session_insert(session, "s", &base, 1, 1) == 0
+        && wl_session_step(session) == 0, "cap callback commit");
+    events = (failed_attempt_events_t){ 0 };
+    CAP_CB_CHECK(wl_session_insert(session, "s", &first, 1, 1) == 0,
+        "cap callback input");
+    wl_columnar_eval_serial_test_iteration_limit = 1;
+    CAP_CB_CHECK(wl_session_step(session) == 0
+        && coord->eval_stratum_iteration_capped && events.added == 0
+        && events.removed == 0, "cap callback capped step");
+    wl_columnar_eval_serial_test_iteration_limit = 0;
+    CAP_CB_CHECK(coord->delta_observer == NULL, "cap callback kept observer");
+    if (!observed)
+        wl_session_set_delta_cb(session, failed_attempt_count_event, &events);
+    CAP_CB_CHECK(wl_session_insert(session, "s", &second, 1, 1) == 0,
+        "cap callback input after the cap");
+    CAP_CB_CHECK(wl_session_step(session) == 0
+        && !coord->eval_stratum_iteration_capped && events.added == 0
+        && events.removed == 0, "cap callback finishing step reported events");
+    const col_rel_t *p = session_find_rel(coord, "p");
+    CAP_CB_CHECK(p && p->nrows == 103, "cap callback model");
+    CAP_CB_CHECK(wl_session_insert(session, "s", &third, 1, 1) == 0
+        && wl_session_step(session) == 0, "cap callback next step");
+    p = session_find_rel(coord, "p");
+    CAP_CB_CHECK(p && p->nrows == 108 && events.added == 5
+        && events.removed == 0, "cap callback next step events");
+cap_cb_cleanup:
+    wl_columnar_eval_serial_test_iteration_limit = 0;
+    wl_session_destroy(session);
+    wl_plan_free(plan);
+    failed_attempt_env_restore(&env);
+    if (failure) {
+        FAIL(failure); return;
+    }
+    PASS();
+#undef CAP_CB_CHECK
+}
+
 /* An observed step detaches the head's columns but keeps its timestamp array.
  * A re-derivation whose first append outgrows that array must grow from no
  * column storage instead of refusing with EINVAL on every retry (#2348).  The
@@ -19585,6 +19650,79 @@ regrow_cleanup:
     }
     PASS();
 #undef REGROW_CHECK
+}
+
+/* An observed step that carries a removal and stops at its iteration cap gives
+ * up the removal's retraction pre-seed together with its baseline.  Whatever
+ * the host does next -- step again, snapshot, or add input first -- the model
+ * then matches a session built from the final input (#2348).  Mode 0 steps
+ * with input unchanged, 1 snapshots first, 2 inserts before stepping. */
+static void
+test_capped_removal_then_followup(uint32_t workers, unsigned mode)
+{
+    TEST("capped observed removal leaves no stale retraction seed");
+    static const char program[] =
+        ".decl s(x: int64)\n.decl p(x: int64)\np(x) :- s(x).\n"
+        "p(x + 1) :- p(x), x < 100.\n";
+    static const int64_t kept = 1000, removed = 50, added = 0, extra = -5;
+    failed_attempt_env_t env;
+    failed_attempt_events_t events = { 0 };
+    wl_session_t *session = NULL, *reference = NULL;
+    const char *failure = NULL;
+#define CAP_RM_CHECK(c, m) do { if (!(c)) { failure = (m); \
+                                            goto cap_rm_cleanup; \
+                                } } while (0)
+    failed_attempt_env_set(&env);
+    wl_plan_t *plan = build_plan(program);
+    CAP_RM_CHECK(plan, "capped removal plan");
+    CAP_RM_CHECK(wl_session_create(wl_backend_columnar(), plan, workers,
+        &session) == 0 && wl_session_create(wl_backend_columnar(), plan,
+        workers, &reference) == 0, "capped removal sessions");
+    wl_col_session_t *coord = COL_SESSION(session);
+    wl_session_set_delta_cb(session, failed_attempt_count_event, &events);
+    CAP_RM_CHECK(wl_session_insert(session, "s", &kept, 1, 1) == 0
+        && wl_session_insert(session, "s", &removed, 1, 1) == 0
+        && wl_session_step(session) == 0, "capped removal commit");
+    CAP_RM_CHECK(wl_session_remove(session, "s", &removed, 1, 1) == 0
+        && wl_session_insert(session, "s", &added, 1, 1) == 0,
+        "capped removal input");
+    wl_columnar_eval_serial_test_iteration_limit = 1;
+    int rc = wl_session_step(session);
+    wl_columnar_eval_serial_test_iteration_limit = 0;
+    CAP_RM_CHECK(rc == 0 && coord->eval_stratum_iteration_capped
+        && coord->delta_observer == NULL, "capped removal capped step");
+    if (mode == 2)
+        CAP_RM_CHECK(wl_session_insert(session, "s", &extra, 1, 1) == 0,
+            "capped removal input after the cap");
+    CAP_RM_CHECK(failed_attempt_verb(session, mode == 1) == 0,
+        "capped removal follow-up");
+    CAP_RM_CHECK(!coord->eval_stratum_iteration_capped,
+        "capped removal follow-up capped");
+    CAP_RM_CHECK(wl_session_insert(reference, "s", &kept, 1, 1) == 0
+        && wl_session_insert(reference, "s", &added, 1, 1) == 0
+        && (mode != 2 || wl_session_insert(reference, "s", &extra, 1, 1) == 0)
+        && wl_session_step(reference) == 0, "capped removal reference");
+    const col_rel_t *a = session_find_rel(coord, "p");
+    const col_rel_t *b = session_find_rel(COL_SESSION(reference), "p");
+    CAP_RM_CHECK(a && b && a->nrows == b->nrows
+        && b->nrows == (mode == 2 ? 107u : 102u), "capped removal row count");
+    for (uint32_t i = 0; i < a->nrows; i++) {
+        bool found = false;
+        for (uint32_t j = 0; j < b->nrows && !found; j++)
+            found = col_rel_get(a, i, 0) == col_rel_get(b, j, 0);
+        CAP_RM_CHECK(found, "capped removal model differs");
+    }
+cap_rm_cleanup:
+    wl_columnar_eval_serial_test_iteration_limit = 0;
+    wl_session_destroy(session);
+    wl_session_destroy(reference);
+    wl_plan_free(plan);
+    failed_attempt_env_restore(&env);
+    if (failure) {
+        FAIL(failure); return;
+    }
+    PASS();
+#undef CAP_RM_CHECK
 }
 
 /* The W=1 analog: the second stratum keeps failing past the cursor that the
@@ -20120,6 +20258,10 @@ main(void)
     test_completion_cursor_then_callback();
     for (uint32_t w = 1; w <= 2; w++) {
         test_committed_clear_failure_then_callback(w);
+        test_capped_step_then_callback(w, false);
+        test_capped_step_then_callback(w, true);
+        for (unsigned mode = 0; mode < 3; mode++)
+            test_capped_removal_then_followup(w, mode);
         test_observed_regrow_from_detached_head(w);
     }
     for (uint32_t workers = 2; workers <= 8; workers += 6) {
