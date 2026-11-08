@@ -4988,10 +4988,12 @@ wl_columnar_join_diff_op(const wl_plan_op_t *op, eval_stack_t *stack,
         }
     }
 
-    if (darr && darr->indexed_rows != right->nrows) {
+    if (darr && (darr->indexed_rows != right->nrows || !darr->ht_head)) {
         /* Relation snapshots change on mutation, so a partial same-token
          * index is never a supported state. Rebuild the private transaction
-         * copy from row zero after token invalidation or unexpected drift. */
+         * copy from row zero after token invalidation or unexpected drift.
+         * A worker's clone starts with no hash table at all, and an empty
+         * right relation would otherwise probe it as it is (#2348). */
         wl_columnar_arrangement_diff_reset_state(darr);
         if (col_diff_arrangement_ensure_ht_capacity(darr, right->nrows) != 0) {
             wl_columnar_arrangement_diff_txn_abort(&diff_txn);
