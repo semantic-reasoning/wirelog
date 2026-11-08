@@ -169,6 +169,26 @@ CASES = [
         '!eqnegatedatom(eqnegvariable).\n',
         ["eqnegvariable", "eqnegrelation", "eqnegatedatom"],
     ),
+    # A rule's head and conditions use only bound variables, and a rule
+    # has a positive body atom (#2231).
+    (
+        "unbound head variable",
+        '.decl n(x: int64)\n.decl unsafeheadrelation(x: int64)\nn(1).\n'
+        'unsafeheadrelation(unsafeheadvariable) :- n(x).\n',
+        ["unsafeheadvariable", "unsafeheadrelation"],
+    ),
+    (
+        "unbound comparison variable",
+        '.decl n(x: int64)\n.decl unsafecmprelation(x: int64)\nn(1).\n'
+        'unsafecmprelation(x) :- n(x), unsafecmpvariable < 4.\n',
+        ["unsafecmpvariable", "unsafecmprelation"],
+    ),
+    (
+        "rule without a positive body atom",
+        '.decl n(x: int64)\n.decl noatomrelation(x: int64)\nn(1).\n'
+        'noatomrelation(2) :- 1 < 2.\n',
+        ["noatomrelation", "no positive body atom"],
+    ),
 ]
 
 # A syntactically malformed program.  This is the errbuf that

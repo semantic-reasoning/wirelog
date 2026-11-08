@@ -285,6 +285,15 @@ int
 wl_ir_program_resolve_eq_bindings(struct wirelog_program *program,
     wl_parser_ast_node_t *ast);
 
+/* #2231: rejects a rule with a variable in its head, a comparison, a
+ * string predicate or a scalar extension call that no positive body atom
+ * binds, or with no positive body atom; call it after
+ * wl_ir_program_resolve_eq_bindings().  Returns -1 with an error set when a
+ * rule is rejected, or -2 when out of memory. */
+int
+wl_ir_program_check_rule_safety(struct wirelog_program *program,
+    const wl_parser_ast_node_t *ast);
+
 /* #2231: renames each rule variable spelled `col` followed by digits so
  * that it cannot be read as lowering's positional column references; call
  * it after wl_ir_program_collect_metadata() and before

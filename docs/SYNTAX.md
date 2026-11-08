@@ -121,6 +121,25 @@ Substitution can nest an expression deeper than the evaluator's stack; such
 a rule fails to plan (see [Expression depth
 limit](#expression-depth-limit)).
 
+### Rule safety
+
+Every variable in a rule's head, in a comparison, in a string predicate
+and in a scalar extension call must be bound by a positive body atom or by
+a body equality (see above), and a rule must have a positive body atom
+(#2231). A negated atom does not bind its variables (#920). Before, such a
+variable was read as the first body column: `m(y) :- n(x).` with `n(1)`
+derived `m(1)`, and `m(x) :- n(x), z < 4.` acted as `x < 4`. A rule with
+no positive body atom, such as `m(2) :- 1 < 2.`, failed at evaluation with
+"execution failed". All of these are now rejected when the program is
+loaded, naming the variable, or the rule when it has no positive body
+atom. Write a ground rule as a fact, or guard it with a nullary relation:
+
+```
+.decl unit()
+unit().
+m(5) :- unit(), !n(3).
+```
+
 ### Limitation: one aggregate per rule head
 
 A rule head may contain **at most one** aggregate. The internal `AGGREGATE`
@@ -1003,7 +1022,7 @@ Scalar addons use the explicit `@call` marker so their syntax cannot be
 confused with an existing relation named `call`:
 
 ```
-result(y) :- input(x), @call("vendor.normalize", x, y).
+result(x) :- input(x), @call("vendor.is_valid", x).
 ```
 
 The addon name must be a quoted `namespace.name` made from ASCII letters,
