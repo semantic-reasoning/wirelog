@@ -48,6 +48,139 @@ nested_close(void *payload)
     return 0;
 }
 
+typedef struct {
+    wl_session_t *session;
+    wl_session_source_finance_t *record;
+    wl_session_source_close_scope_t *scope;
+    unsigned checks, calls;
+    int metadata_error;
+    wl_session_source_finance_pair_result_t result;
+} pair_call_t;
+
+static pair_call_t *observed_pair_call;
+
+static void
+pair_finance_checkpoint(void)
+{
+    CHECK(observed_pair_call && !observed_pair_call->calls);
+    ++observed_pair_call->checks;
+}
+
+static int
+closed_metadata(void *payload)
+{
+    pair_call_t *p = payload;
+    CHECK(p->checks == 1 && !p->calls && !p->record->control && !p->record->id
+        && !p->record->active && !p->record->attached && !p->scope->control
+        && p->scope->result.closed && p->scope->result.applied &&
+        !p->scope->pair_complete);
+    ++p->calls;
+    return p->metadata_error;
+}
+
+static int
+nested_pair_close(void *payload)
+{
+    pair_call_t *p = payload;
+    p->result = wl_session_source_finance_close_then_metadata(p->session,
+            p->record, p->scope, closed_metadata, p);
+    return 0;
+}
+
+static void
+finance_pair_cases(wl_session_t *session)
+{
+    static const wl_evaluation_control_source_phase_policy_t policy = {208, 128,
+                                                                       80};
+    for (unsigned mode = 0; mode < 7; ++mode) {
+        wl_session_source_finance_t record = {0};
+        wl_session_source_close_scope_t scope;
+        scope.identity = NULL;
+        CHECK(!wl_session_source_finance_start_checked(session, &record,
+            &policy, 672, &scope));
+        CHECK(!wl_session_source_finance_charge(&record, 17));
+        pair_call_t call = {session, &record, &scope, 0, 0, mode == 3 ? EIO : 0,
+                            {0}};
+        observed_pair_call = &call;
+        wl_evaluation_control_test_source_pair_checkpoint =
+            pair_finance_checkpoint;
+        if (mode == 6) {
+            wl_session_source_finance_close_result_t ordinary =
+                wl_session_source_finance_close_owned(session, &record, &scope);
+            CHECK(ordinary.closed && !ordinary.protocol &&
+                !scope.pair_complete);
+            call.result = wl_session_source_finance_close_then_metadata(session,
+                    &record, &scope, closed_metadata, &call);
+            CHECK(call.result.protocol == EINVAL && call.result.close.closed
+                && !call.result.phase.first_called &&
+                !call.result.phase.second_called
+                && !scope.pair_complete && !call.calls && !call.checks &&
+                !record.control);
+            wl_evaluation_control_test_source_pair_checkpoint = NULL;
+            observed_pair_call = NULL;
+            continue;
+        }
+        if (mode == 1) {
+            wl_evaluation_control_source_phase_result_t outer =
+                wl_session_source_snapshot_metadata(session, nested_pair_close,
+                    &call);
+            CHECK(!outer.financial_result && outer.action_called &&
+                !outer.action_result);
+            CHECK(call.result.phase.financial_result == EBUSY
+                && !call.result.phase.first_called &&
+                !call.result.phase.second_called
+                && !call.calls && !call.checks);
+        } else {
+            if (mode == 2) wl_evaluation_control_request_cancel(record.control);
+            if (mode == 4) {
+                /* A genuinely completed unlatched cancellation remains a
+                 * completed report; inactive close must not poll it anew. */
+                wl_evaluation_control_request_cancel(record.control);
+                CHECK(!wl_session_source_finance_finish(&record));
+            }
+            if (mode == 5) {
+                CHECK(!wl_evaluation_control_retain(record.control));
+                wl_session_source_finance_pair_result_t refused =
+                    wl_session_source_finance_close_then_metadata(session,
+                        &record,
+                        &scope, closed_metadata, &call);
+                CHECK(refused.protocol == EBUSY && refused.phase.first_called
+                    && refused.phase.first_result == EBUSY &&
+                    !refused.phase.second_called
+                    && !scope.result.closed && !scope.pair_complete &&
+                    record.control && !call.calls);
+                wl_evaluation_control_release(record.control);
+                call.checks = 0; /* Observation only, no owner or permission. */
+            }
+            call.result = wl_session_source_finance_close_then_metadata(session,
+                    &record, &scope, closed_metadata, &call);
+            CHECK(!call.result.phase.financial_result &&
+                call.result.phase.first_called
+                && call.result.phase.first_result ==
+                (mode == 2 ? WL_EVALUATION_CONTROL_CANCELLED : 0)
+                && call.result.phase.second_called == (mode != 2)
+                && call.result.phase.second_result == call.metadata_error
+                && call.checks == 1 && call.calls == (mode == 2 ? 0u : 1u));
+        }
+        CHECK(!call.result.protocol && call.result.close.closed &&
+            call.result.close.applied
+            && !record.control && !record.id && !scope.control &&
+            scope.pair_complete);
+        wl_session_source_finance_pair_result_t again =
+            wl_session_source_finance_close_then_metadata(session, &record,
+                &scope, closed_metadata, &call);
+        CHECK(!again.protocol && again.close.closed
+            && again.phase.financial_result ==
+            call.result.phase.financial_result
+            && again.phase.first_called == call.result.phase.first_called
+            && again.phase.second_called == call.result.phase.second_called
+            && again.phase.first_result == call.result.phase.first_result
+            && again.phase.second_result == call.result.phase.second_result);
+        wl_evaluation_control_test_source_pair_checkpoint = NULL;
+        observed_pair_call = NULL;
+    }
+}
+
 static void
 finance_birth_negatives(wl_session_t *session)
 {
@@ -103,6 +236,7 @@ finance_cases(wl_session_t *session)
     static const wl_evaluation_control_source_phase_policy_t policy = {208, 128,
                                                                        80};
     finance_birth_negatives(session);
+    finance_pair_cases(session);
     for (unsigned mode = 0; mode < 7; ++mode) {
         wl_session_source_finance_t record = {0};
         wl_session_source_close_scope_t scope;

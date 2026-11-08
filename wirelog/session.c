@@ -295,6 +295,8 @@ wl_session_source_checked_birth(void *payload)
     scope->limit = p->limit;
     scope->birth_phase = (wl_evaluation_control_source_phase_result_t){0};
     scope->result = (wl_session_source_finance_close_result_t){0};
+    scope->pair_phase = (wl_evaluation_control_source_pair_result_t){0};
+    scope->pair_complete = false;
     scope->identity = scope;
     p->bound = true;
     return 0;
@@ -423,6 +425,81 @@ wl_session_source_finance_close_owned(wl_session_t *session,
      * paired private births cannot acquire a foreign owner or extra ref. */
     out.phase = phase;
     out.protocol = phase.action_called ? phase.action_result : EINVAL;
+    return out;
+}
+
+static wl_evaluation_control_source_pair_result_t
+wl_session_source_run_pair(wl_session_t *session,
+    const wl_evaluation_control_source_pair_policy_t *policy,
+    wl_evaluation_control_source_action_fn first, void *first_payload,
+    wl_evaluation_control_source_action_fn second, void *second_payload)
+{
+    wl_session_source_scope_t *scope = wl_session_source_scope;
+    if (!session || !scope || scope->session != session
+        || scope->admission != session->operation_admission
+        || !session->owns_operation_admission
+        || (scope->lane != WL_EVALUATION_CONTROL_SOURCE_OPERATION
+        && scope->lane != WL_EVALUATION_CONTROL_SOURCE_CLOSE))
+        return (wl_evaluation_control_source_pair_result_t){EINVAL, 0, 0, false,
+                                                            false};
+    return wl_evaluation_control_source_bank_run_lexical_pair(
+        scope->admission->source_bank, scope->lane, policy,
+        first, first_payload, second, second_payload);
+}
+
+wl_session_source_finance_pair_result_t
+wl_session_source_finance_close_then_metadata(wl_session_t *session,
+    wl_session_source_finance_t *record, wl_session_source_close_scope_t *scope,
+    wl_evaluation_control_source_action_fn metadata, void *payload)
+{
+    wl_session_source_finance_pair_result_t out = {0};
+    out.protocol = wl_session_source_close_scope_prove(session, record, scope);
+    if (out.protocol) return out;
+    if (!metadata || payload == scope || payload == record) {
+        out.protocol = EINVAL; return out;
+    }
+    if (scope->result.closed) {
+        out.close = scope->result;
+        if (!scope->pair_complete) {
+            out.protocol = EINVAL; return out;
+        }
+        out.phase = scope->pair_phase;
+        return out;
+    }
+    static const wl_evaluation_control_source_pair_policy_t policy = {208, 144,
+                                                                      144, 80};
+    wl_evaluation_control_source_pair_result_t phase =
+        wl_session_source_run_pair(session,
+            &policy, wl_session_source_close_action, scope, metadata, payload);
+    if (!phase.first_called) {
+        /* No expired pair context is resumed. The original birth provenance
+        * and exact core owner authorize only mandatory financial unwind. */
+        wl_evaluation_control_lexical_finance_expectation_t e =
+            wl_session_source_close_expectation(record, scope);
+        out.protocol =
+            wl_evaluation_control_lexical_finance_prove_checked(record->control,
+                &e);
+        if (out.protocol) return out;
+        int checkpoint = record->active
+            ? wl_evaluation_control_charge_attempt(record->control, record->id,
+                0) : 0;
+        int rc = wl_session_source_close_actual(scope);
+        if (!scope->result.closed) {
+            out.protocol = rc; return out;
+        }
+        if (checkpoint) scope->result.checkpoint_result = checkpoint;
+    }
+    if (!scope->result.closed) {
+        out.phase = phase;
+        out.protocol = phase.first_called ? phase.first_result : EINVAL;
+        return out;
+    }
+    scope->result.phase = (wl_evaluation_control_source_phase_result_t){
+        phase.financial_result, phase.first_result, phase.first_called
+    };
+    scope->pair_phase = phase;
+    scope->pair_complete = true;
+    out.close = scope->result; out.phase = phase;
     return out;
 }
 

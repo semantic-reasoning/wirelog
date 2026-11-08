@@ -980,6 +980,101 @@ wl_evaluation_control_source_bank_run_lexical(
     return result;
 }
 
+#ifdef WL_SESSION_TEST_HOOKS
+void (*wl_evaluation_control_test_source_pair_checkpoint)(void);
+#endif
+
+wl_evaluation_control_source_pair_result_t
+wl_evaluation_control_source_bank_run_lexical_pair(
+    wl_evaluation_control_source_bank_t *bank,
+    wl_evaluation_control_source_lane_t index,
+    const wl_evaluation_control_source_pair_policy_t *policy,
+    wl_evaluation_control_source_action_fn first, void *first_payload,
+    wl_evaluation_control_source_action_fn second, void *second_payload)
+{
+    wl_evaluation_control_source_pair_result_t result = {EINVAL, 0, 0, false,
+                                                         false};
+    if (!bank || bank->identity != bank
+        || (unsigned)index >= WL_EVALUATION_CONTROL_SOURCE_LANES
+        || !policy || !first || !second || first_payload == bank ||
+        second_payload == bank
+        || !policy->bootstrap_work || !policy->first_work ||
+        !policy->second_work || !policy->close_work
+        || policy->bootstrap_work > WL_EVALUATION_CONTROL_QUANTUM
+        || policy->first_work > WL_EVALUATION_CONTROL_QUANTUM
+        || policy->second_work > WL_EVALUATION_CONTROL_QUANTUM
+        || policy->close_work > WL_EVALUATION_CONTROL_QUANTUM) return result;
+    /* Each validated term is at most Q. Their first three terms fit 3Q
+     * without overflow; subtraction tests the fourth before adding it. */
+    uint64_t first_three = policy->bootstrap_work + policy->first_work +
+        policy->second_work;
+    if (policy->close_work >
+        WL_EVALUATION_CONTROL_SOURCE_PHASE_CAPACITY - first_three)
+        return result;
+    int rc = wl_evaluation_control_source_bank_lock(bank);
+    if (rc) {
+        result.financial_result = rc; return result;
+    }
+    wl_evaluation_control_source_lane_state_t *lane = &bank->lanes[index];
+    if (bank->closing || lane->context || lane->running ||
+        lane->callback_active){
+        wl_evaluation_control_source_bank_unlock(bank);
+        result.financial_result = EBUSY; return result;
+    }
+    wl_evaluation_control_source_context_t context = {
+        .identity = &context, .bank = bank, .lane = (unsigned)index,
+        .thread_cookie = &wl_evaluation_control_source_thread_cookie
+    };
+    lane->context = &context;
+    rc = wl_evaluation_control_source_bank_rearm_phase(bank, (unsigned)index);
+    if (!rc) rc = wl_evaluation_control_begin(lane->control, lane);
+    if (rc) {
+        lane->context = NULL;
+        wl_evaluation_control_source_bank_unlock(bank);
+        result.financial_result = rc; return result;
+    }
+    lane->id = wl_evaluation_control_active_attempt_id(lane->control);
+    if (!lane->id) abort();
+    lane->running = true;
+    rc = wl_evaluation_control_source_bank_charge(lane, policy->bootstrap_work);
+    if (!rc) rc = wl_evaluation_control_source_bank_charge(lane,
+                policy->first_work);
+    if (!rc) {
+        lane->callback_active = true;
+        wl_evaluation_control_source_bank_unlock(bank);
+        result.first_result = first(first_payload);
+        result.first_called = true;
+        if (wl_evaluation_control_source_bank_lock(bank)) abort();
+        lane->callback_active = false;
+        /* This is an actual check on the same still-active saved BANK
+         * generation. Neither FINISH nor report/rearm stands in for it. */
+        rc = wl_evaluation_control_source_bank_charge(lane, 0);
+#ifdef WL_SESSION_TEST_HOOKS
+        if (!rc && wl_evaluation_control_test_source_pair_checkpoint)
+            wl_evaluation_control_test_source_pair_checkpoint();
+#endif
+        if (!rc && !result.first_result) {
+            rc = wl_evaluation_control_source_bank_charge(lane,
+                    policy->second_work);
+            if (!rc) {
+                lane->callback_active = true;
+                wl_evaluation_control_source_bank_unlock(bank);
+                result.second_result = second(second_payload);
+                result.second_called = true;
+                if (wl_evaluation_control_source_bank_lock(bank)) abort();
+                lane->callback_active = false;
+            }
+        }
+        if (!rc) rc = wl_evaluation_control_source_bank_charge(lane,
+                    policy->close_work);
+    }
+    int finished = wl_evaluation_control_source_bank_finish_phase(lane);
+    result.financial_result = rc ? rc : finished;
+    lane->context = NULL;
+    wl_evaluation_control_source_bank_unlock(bank);
+    return result;
+}
+
 int
 wl_evaluation_control_source_bank_destroy(
     wl_evaluation_control_source_bank_t **slot)
