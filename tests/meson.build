@@ -6759,6 +6759,19 @@ test_evaluation_source_bank_exe = executable(
 test('evaluation_source_bank', test_evaluation_source_bank_exe,
      suite: ['unit', 'tsan'], timeout: 60)
 
+# Paired lexical Source financial ownership in actual public OP/CLOSE scopes.
+test_evaluation_source_finance_exe = executable(
+  'test_evaluation_source_finance',
+  files('test_evaluation_source_finance.c'),
+  c_args: ['-DWL_SESSION_TEST_HOOKS=1'],
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
+  link_with: [testlib_prod],
+  install: false,
+)
+test('evaluation_source_finance', test_evaluation_source_finance_exe,
+     suite: ['unit', 'tsan'], timeout: 60)
+
 # Genuine generations and condition-variable ordered stale-footer histories.
 test_evaluation_attempt_identity_exe = executable(
   'test_evaluation_attempt_identity',

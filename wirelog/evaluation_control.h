@@ -10,6 +10,7 @@
 
 #include <stdint.h>
 #include <stdbool.h>
+#include <stddef.h>
 
 typedef struct wl_evaluation_control wl_evaluation_control_t;
 
@@ -117,6 +118,59 @@ int wl_evaluation_control_finish(wl_evaluation_control_t *control,
 /* ENOENT before first finish; returns the prior completed report if active. */
 int wl_evaluation_control_report(wl_evaluation_control_t *control,
     wl_evaluation_control_report_t *out);
+
+/* Financial-only validation for an actual paired lexical Source birth.
+ * The Session layer must first authenticate its original-address record,
+ * birth scope, issuer and creator thread. These expected values alone do not
+ * establish that provenance or confer Native permission. */
+typedef struct {
+    const void *owner, *scope;
+    size_t owner_bytes, scope_bytes;
+    uint64_t identity, limit, id, charged;
+    bool active;
+} wl_evaluation_control_lexical_finance_expectation_t;
+
+typedef struct {
+    int protocol, result, checkpoint_result;
+    bool closed, report_valid;
+    wl_evaluation_control_report_t report;
+} wl_evaluation_control_lexical_finance_result_t;
+
+typedef struct {
+    int protocol;
+    wl_evaluation_control_t *control;
+    uint64_t id, identity;
+} wl_evaluation_control_lexical_finance_birth_result_t;
+
+/* One immutable-identity claim, no retry loop. Establishes actual creation
+ * and owner-attachment references on a fresh private NORMAL control, then
+ * performs real BEGIN. The paired Session issuer supplies the empty record. */
+wl_evaluation_control_lexical_finance_birth_result_t
+wl_evaluation_control_lexical_finance_birth_try(uint64_t limit,
+    const void *owner);
+
+#ifdef WL_SESSION_TEST_HOOKS
+extern void (*wl_evaluation_control_test_finance_birth_claim)(void);
+/* One-shot allocator/mutex-init boundary faults, only for birth_try. */
+extern unsigned wl_evaluation_control_test_finance_birth_fail;
+#endif
+
+int wl_evaluation_control_lexical_finance_prove_checked(
+    wl_evaluation_control_t *,
+    const wl_evaluation_control_lexical_finance_expectation_t *);
+
+/* Requires the same unexposed creation+attachment pair through the entire
+ * synchronous operation. Wrong owner, aliases, stale generation or borrowed
+ * references refuse before mutation. Returns a value, never writes through a
+ * caller-supplied result pointer. Closed means both real refs were released
+ * and the financial allocation is gone; do not follow the old pointer.
+ * Authenticated active closure performs a real saved-generation financial
+ * checkpoint under its mutex before FINISH, including pending cancellation.
+ * Inactive closure verifies the prior report and never polls or finishes. */
+wl_evaluation_control_lexical_finance_result_t
+wl_evaluation_control_lexical_finance_close_checked(
+    wl_evaluation_control_t *,
+    const wl_evaluation_control_lexical_finance_expectation_t *);
 
 /* Internal financial source class; never an engine/native permission. */
 typedef struct wl_evaluation_control_source_bank

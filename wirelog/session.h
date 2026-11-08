@@ -41,6 +41,26 @@ typedef struct {
     bool attached, active;
 } wl_session_source_finance_t;
 
+typedef struct {
+    wl_evaluation_control_source_phase_result_t phase;
+    int protocol, source_result, checkpoint_result;
+    bool applied, closed;
+} wl_session_source_finance_close_result_t;
+
+/* Paired lexical birth provenance. Before start_checked initialize ONLY
+ * identity=NULL. Birth writes all other fields before publishing identity.
+ * Never copy, retain, expose to Native work, or outlive the actual record. */
+typedef struct wl_session_source_close_scope {
+    struct wl_session_source_close_scope *identity;
+    wl_session_source_finance_t *record;
+    wl_session_t *session;
+    const void *thread_cookie;
+    wl_evaluation_control_t *control;
+    uint64_t control_identity, limit;
+    wl_evaluation_control_source_phase_result_t birth_phase;
+    wl_session_source_finance_close_result_t result;
+} wl_session_source_close_scope_t;
+
 /* Internal persistent exclusion lease used by controlled attempts. Zero-init
  * before first acquire and retain at the same address through release. */
 typedef struct wl_session_exclusive_attempt {
@@ -120,6 +140,16 @@ int wl_session_source_finance_charge(wl_session_source_finance_t *, uint64_t);
 int wl_session_source_finance_finish(wl_session_source_finance_t *);
 int wl_session_source_finance_rebegin(wl_session_source_finance_t *);
 int wl_session_source_finance_dispose(wl_session_source_finance_t *);
+int wl_session_source_finance_start_checked(wl_session_t *,
+    wl_session_source_finance_t *,
+    const wl_evaluation_control_source_phase_policy_t *, uint64_t,
+    wl_session_source_close_scope_t *);
+/* Genuine own records are physically closed before return even when BANK
+ * rejects before its action; that refusal path appends no footer or commit.
+ * Strict malformed-input rejection leaves the real other owner untouched. */
+wl_session_source_finance_close_result_t
+wl_session_source_finance_close_owned(wl_session_t *,
+    wl_session_source_finance_t *, wl_session_source_close_scope_t *);
 int wl_session_source_footer(wl_session_t *);
 /* Actual admitted SOURCE scope only. Read callbacks do at most 40 scalar
  * actions and never perform Native work; errors have no direct-read fallback. */

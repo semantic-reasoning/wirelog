@@ -384,6 +384,203 @@ wl_evaluation_control_report(wl_evaluation_control_t *control,
     return rc;
 }
 
+#ifdef WL_SESSION_TEST_HOOKS
+void (*wl_evaluation_control_test_finance_birth_claim)(void);
+unsigned wl_evaluation_control_test_finance_birth_fail;
+#endif
+
+static void *
+wl_evaluation_control_lexical_finance_allocate(size_t bytes)
+{
+#ifdef WL_SESSION_TEST_HOOKS
+    if (wl_evaluation_control_test_finance_birth_fail == 1) {
+        wl_evaluation_control_test_finance_birth_fail = 0;
+        return NULL;
+    }
+#endif
+    return calloc(1, bytes);
+}
+
+static int
+wl_evaluation_control_lexical_finance_mutex_init(wl_mutex_t *mutex)
+{
+#ifdef WL_SESSION_TEST_HOOKS
+    if (wl_evaluation_control_test_finance_birth_fail == 2) {
+        wl_evaluation_control_test_finance_birth_fail = 0;
+        return ENOMEM;
+    }
+#endif
+    return wl_mutex_init(mutex);
+}
+
+wl_evaluation_control_lexical_finance_birth_result_t
+wl_evaluation_control_lexical_finance_birth_try(uint64_t limit,
+    const void *owner)
+{
+    wl_evaluation_control_lexical_finance_birth_result_t out = {0};
+    if (!limit || !owner) {
+        out.protocol = EINVAL; return out;
+    }
+    uint64_t identity =
+        atomic_load_explicit(&wl_next_evaluation_control_identity,
+            memory_order_relaxed);
+    if (!identity || identity == UINT64_MAX) {
+        out.protocol = EOVERFLOW; return out;
+    }
+#ifdef WL_SESSION_TEST_HOOKS
+    if (wl_evaluation_control_test_finance_birth_claim)
+        wl_evaluation_control_test_finance_birth_claim();
+#endif
+    if (!atomic_compare_exchange_strong_explicit(
+            &wl_next_evaluation_control_identity,
+            &identity, identity + 1, memory_order_relaxed,
+            memory_order_relaxed)) {
+        out.protocol = EAGAIN; return out;
+    }
+    wl_evaluation_control_t *control =
+        wl_evaluation_control_lexical_finance_allocate(sizeof(*control));
+    if (!control) {
+        out.protocol = ENOMEM; return out;
+    }
+    if (wl_evaluation_control_lexical_finance_mutex_init(&control->mutex)) {
+        free(control); out.protocol = ENOMEM; return out;
+    }
+    /* Both obligations are established here on this fresh allocation:
+     * creation and this exact owner's attachment. No borrowed ref is reset. */
+    atomic_init(&control->references, 2);
+    atomic_init(&control->cancelled, 0);
+    atomic_init(&control->active_attempt_id, 0);
+    control->owner = owner; control->identity = identity;
+    control->configured_limit = limit;
+    out.protocol = wl_evaluation_control_begin(control, owner);
+    if (out.protocol) {
+        /* Fresh private BEGIN cannot have a foreign owner or active attempt.
+         * No allocation or association has been published to the caller. */
+        control->owner = NULL;
+        wl_evaluation_control_release(control);
+        wl_evaluation_control_release(control);
+        return out;
+    }
+    out.control = control; out.identity = identity;
+    out.id = wl_evaluation_control_active_attempt_id(control);
+    return out;
+}
+
+static int
+wl_evaluation_control_lexical_finance_arguments(
+    wl_evaluation_control_t *control,
+    const wl_evaluation_control_lexical_finance_expectation_t *e)
+{
+    if (!control || !e) return EINVAL;
+    uintptr_t c = (uintptr_t)control, x = (uintptr_t)e;
+    if (sizeof(*control) > UINTPTR_MAX - c || sizeof(*e) > UINTPTR_MAX - x)
+        return EINVAL;
+    uintptr_t ce = c + sizeof(*control), xe = x + sizeof(*e);
+    if (c < xe && x < ce) return EINVAL;
+    if (!e->owner || !e->scope || !e->owner_bytes || !e->scope_bytes
+        || !e->identity || !e->limit || e->charged > e->limit
+        || (e->active ? !e->id : e->id != 0)) return EINVAL;
+    uintptr_t o = (uintptr_t)e->owner, s = (uintptr_t)e->scope;
+    if (e->owner_bytes > UINTPTR_MAX - o || e->scope_bytes > UINTPTR_MAX - s)
+        return EINVAL;
+    uintptr_t oe = o + e->owner_bytes, se = s + e->scope_bytes;
+    if ((c < oe && o < ce) || (c < se && s < ce)
+        || (x < oe && o < xe) || (x < se && s < xe) || (o < se && s < oe))
+        return EINVAL;
+    return 0;
+}
+
+/* The actual mutex is held. Read-only even on refusal: in particular there
+ * is no charge(0), report rewrite or detach of a different generation. */
+static int
+wl_evaluation_control_lexical_finance_prove_locked(
+    wl_evaluation_control_t *control,
+    const wl_evaluation_control_lexical_finance_expectation_t *e)
+{
+    if (control->identity != e->identity || control->source_bank_class
+        || control->owner != e->owner || control->configured_limit != e->limit
+        || control->attempt_limit != e->limit || control->consumed != e->charged
+        || control->accounting_error || !control->attempt_id
+        || (control->stop != WL_EVALUATION_CONTROL_NONE
+        && control->stop != WL_EVALUATION_CONTROL_CANCELLED
+        && control->stop != WL_EVALUATION_CONTROL_WORK_LIMIT)) return EINVAL;
+    if (atomic_fetch_add_explicit(&control->references, 0,
+        memory_order_relaxed) != 2) return EBUSY;
+    uint64_t active = (uint64_t)atomic_fetch_add_explicit(
+        &control->active_attempt_id, 0, memory_order_relaxed);
+    if (e->active)
+        return control->active && active == e->id &&
+               control->attempt_id == e->id ? 0 : EINVAL;
+    const wl_evaluation_control_report_t *report = &control->completed;
+    return !control->active && !active &&
+           report->attempt_id == control->attempt_id
+           && report->limit == e->limit && report->consumed == e->charged
+           && report->stop_reason == control->stop && !report->execution_status
+           && !report->cleanup_status &&
+           report->result == (int)control->stop ? 0 : EINVAL;
+}
+
+int
+wl_evaluation_control_lexical_finance_prove_checked(
+    wl_evaluation_control_t *control,
+    const wl_evaluation_control_lexical_finance_expectation_t *e)
+{
+    int rc = wl_evaluation_control_lexical_finance_arguments(control, e);
+    if (rc) return rc;
+    if (wl_mutex_lock(&control->mutex)) return EIO;
+    rc = wl_evaluation_control_lexical_finance_prove_locked(control, e);
+    wl_mutex_unlock(&control->mutex);
+    return rc;
+}
+
+wl_evaluation_control_lexical_finance_result_t
+wl_evaluation_control_lexical_finance_close_checked(
+    wl_evaluation_control_t *control,
+    const wl_evaluation_control_lexical_finance_expectation_t *e)
+{
+    wl_evaluation_control_lexical_finance_result_t out = {0};
+    out.protocol = wl_evaluation_control_lexical_finance_arguments(control, e);
+    if (out.protocol) return out;
+    if (wl_mutex_lock(&control->mutex)) {
+        out.protocol = EIO; return out;
+    }
+    out.protocol = wl_evaluation_control_lexical_finance_prove_locked(control,
+            e);
+    if (out.protocol) {
+        wl_mutex_unlock(&control->mutex);
+        return out;
+    }
+    if (e->active) {
+        /* Exact owner/ref/id proof above precedes this genuine checkpoint.
+         * Holding the same mutex makes the saved generation stable; use the
+         * real charge kernel directly, never recursively lock charge_attempt.
+         * A sticky stop still requires mandatory financial retirement. */
+        out.checkpoint_result = wl_evaluation_control_charge_locked(control, 0);
+        control->completed = (wl_evaluation_control_report_t){
+            .attempt_id = control->attempt_id,
+            .limit = control->attempt_limit,
+            .consumed = control->consumed,
+            .stop_reason = control->stop,
+            .execution_status = 0,
+            .cleanup_status = 0,
+            .result = (int)control->stop,
+        };
+        control->active = false;
+        (void)atomic_exchange_explicit(&control->active_attempt_id, 0,
+            memory_order_release);
+    }
+    out.report = control->completed; out.report_valid = true;
+    out.result = out.report.result;
+    control->owner = NULL;
+    wl_mutex_unlock(&control->mutex);
+    /* The proven private creation+attachment pair cannot race a borrower.
+     * These are the real two reference drops, not a replacement allocation. */
+    wl_evaluation_control_release(control);
+    wl_evaluation_control_release(control);
+    out.closed = true;
+    return out;
+}
+
 /* Sealed financial class: no controller or saved-ID accessor/loan exists.
  * The original/BODY controller APIs retain their monotone ID contract. */
 enum { WL_EVALUATION_CONTROL_SOURCE_LANES = 2 };
