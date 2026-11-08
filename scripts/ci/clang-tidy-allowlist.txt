@@ -67,6 +67,7 @@ wirelog/columnar/eval_stack.c
 wirelog/columnar/eval_tdd_channel.c
 wirelog/columnar/eval_tdd_insert.c
 wirelog/columnar/eval_tdd_plan.c
+wirelog/columnar/expr_hash.c
 wirelog/columnar/filter.c
 wirelog/columnar/frontier.c
 wirelog/columnar/frontier_epoch.c
