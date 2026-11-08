@@ -2012,7 +2012,7 @@ joins read a right delta (now recorded and refused), `lftj_integration` and
 `multi_stratum_rule_frontier`, which assert the frontier state the insert
 route leaves and fail once strict mode replaces it with a full evaluation.
 
-## 10b. Plain STEP completion recovery (#1713)
+## 10b. Governed join output admission
 
 A join output that is **heap-owned** is admitted under the session governor
 and holds a reservation covering its live capacity.  A **pool-owned** output
@@ -2127,7 +2127,7 @@ rows, since a smaller result makes the bulk reserve a no-op.
 cache-clear case proves that clearing releases exactly the output's token.
 A full report-level reconciliation for join outputs is not covered.
 
-## 10c. Plain STEP completion recovery (#1713, #2329, #2336)
+## 10c. Plain STEP completion recovery (#1713, #2329, #2336, #2348)
 
 A public `STEP` that starts with no delta callback and no delta observer can
 retain a bounded scalar completion cursor (`plain_step_completion_pending`).
@@ -2157,8 +2157,8 @@ point:
 - Finalization (`wl_columnar_eval_delta_consolidate`): `ENOSPC` with
   `wl_session_budget_denied` set when the memory budget refuses it, `ENOMEM`,
   `EBUSY`, `EINVAL`, and `ENOBUFS` or `EOVERFLOW` from frame admission.
-- A later stratum: whatever its evaluator returns. That stratum runs again on
-  retry; strata before it do not.
+- A later stratum: whatever its evaluator returns. On retry its rows are
+  discarded and it runs again; strata before it do not.
 - Compaction (`col_rel_compact_many`): `EBUSY`, `EAGAIN`, `EOVERFLOW`,
   `EINVAL`, `EFAULT`. It does not return `ENOMEM` or `ENOSPC`: a failed
   bookkeeping allocation, a denied admission and a failed buffer preparation
@@ -2187,20 +2187,76 @@ rows, but members of the batch already compacted keep their new storage.
 While the cursor is set, `col_session_insert`,
 `col_session_insert_incremental`, `col_session_remove`,
 `col_session_remove_incremental` and `col_session_make_compound` return
-`EBUSY` once their argument and sealed-input checks pass. A zero-row insert or
-remove returns 0 and changes no relation. The public `wl_session_insert` and
-`wl_session_remove` clear `wl_session_budget_denied` before the backend call,
-so a refused or zero-row call clears it too: read the flag right after `STEP`
-or `SNAPSHOT`.
+`EBUSY` once their argument and sealed-input checks pass. Only
+`col_session_remove` reaches `col_session_remove_incremental`, and it refuses
+first. A zero-row insert or remove returns 0 and changes no relation. The public
+`wl_session_insert` and `wl_session_remove` clear `wl_session_budget_denied`
+before the backend call, so a refused or zero-row call clears it too: read the
+flag right after `STEP` or `SNAPSHOT`.
+
+`wl_session_budget_denied` is true after an uncontrolled `STEP` or `SNAPSHOT`
+that returned `ENOSPC` and during which the governor refused an admission,
+wherever that happened: a denial during worker setup or on a worker that has
+retired leaves no session flag behind. Calls under evaluation control do not go
+through this rule (#2351). An internal `ENOMEM` with such a refusal is returned
+as `ENOSPC`, so the facades report `WIRELOG_ERR_MEMORY_BUDGET`. The flag is
+false after an uncontrolled call that returned 0, even if a refused admission
+was recovered from. The refusal can also be another session's on a shared
+governor, or one this evaluation recovered from, which mistypes an `ENOSPC` or
+`ENOMEM` that is not about admission. A flag set where a denial is known can
+also accompany another nonzero code.
 
 Input stays refused because the session holds an uncommitted evaluation. After
 a merge, the relation holds rows that are neither normalized nor counted as
-completed, and a first evaluation that started over would keep them. This
-protection exists only where a cursor is armed. Recursive W>=2 completion
-now has the same input exclusion after successful merge (#2336). The regression
-lowers an enforcing governor's limit at the final-normalization test hook and
-observes a real `ENOSPC`; reachability with a fixed public budget and no hook
-has not been established by this test.
+completed, and a first evaluation that started over would keep them. Recursive
+W>=2 completion has the same input exclusion after a successful merge (#2336).
+
+An evaluation can also fail with no cursor armed, for example in a `SNAPSHOT`,
+in a stratum at W>=2 that fails before its merge, or in the first stratum at
+W=1. Its heads may hold merged or partial rows, so the session records the
+failed stratum in `uncommitted_strata_extent`. The next `STEP` or `SNAPSHOT`
+that does not resume, or a `STEP` that takes a delta baseline because a callback
+was installed since, discards those strata's rows and, before a first commit,
+any rows retired from them, restores host input from the `$in$` shadows, resets
+their frontiers and derives them again. Input is open in the meantime, so the
+new evaluation uses the current input. The exception is workers the failure
+retained: `col_session_insert` and `col_session_remove` return `EBUSY` until a
+retry retires them, so a retry that retains them again keeps input closed. If a
+reader still refuses the retirement or the clear, that retry returns the code
+before evaluating anything. Otherwise a failure that repeats without a cursor is
+not a dead end, since a host can shrink its input, but each retry derives those
+strata again rather than resuming.
+
+A plain `STEP` of a committed session that fails past its entry checks, a `STEP`
+of one that stops at its iteration cap, observed or not, and an evaluating
+`SNAPSHOT` of one that fails may each have changed the committed model already,
+so the session treats that model as gone and no baseline measures a change from
+it. The `STEP` that finishes the evaluation reports nothing and finishes
+unobserved, and a callback observes from the following step;
+`wl_session_snapshot` between the two gives the host its baseline. This holds
+for a callback installed after the failure and, for a `SNAPSHOT` or a capped
+`STEP`, for one already installed: a successful `SNAPSHOT` reports no events
+either, and a capped observed `STEP` gives up its baseline, and a removal's
+retraction pre-seed with it, so input and snapshots are no longer refused while
+it caps; a retry finishes only once the evaluation fits within the cap. A
+failure in the entry checks, such as an `EBUSY` while a cleanup is pending,
+changes nothing, and a callback measures from the committed model as usual. A
+callback installed while a cursor is pending likewise sees nothing from the
+`STEP` that resumes it. An observed `STEP` that fails instead keeps its
+baseline: its refusal rolls the heads back to the committed rows, dropping a
+timestamp array too short to cover them rather than admitting a larger one, and
+the retry reports the change exactly.
+
+With a cursor from an earlier stratum, the failed strata past the cursor are
+discarded on resume in the same way, and input stays refused.
+
+A public memory governor reached the refused first `STEP`, the refused observed
+`STEP` and the refused evaluating `SNAPSHOT` without a test hook: a second
+session held the budget down, the evaluation was refused, and the second session
+then went away (`tests/test_session_budget_refusal.c`). Internally a refused
+admission returns `ENOSPC` or `ENOMEM`; an uncontrolled `STEP` or `SNAPSHOT`
+returns `ENOMEM` as `ENOSPC` when the governor refused an admission during the
+call.
 
 The cursor clears in two places only: the commit block of a `STEP`, or of the
 drain inside a `SNAPSHOT`, that succeeds, and a stratum that reaches its

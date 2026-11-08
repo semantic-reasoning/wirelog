@@ -302,9 +302,11 @@ wl_session_remove(wl_session_t *session, const char *relation,
  * to the state before the failed step -- retry rather than treat the failure
  * as a lost update. The net change is then measured from that first attempt,
  * not from the retry. Cancelling notifications before the retry completes is
- * the one case retrying cannot recover; see wl_session_set_delta_cb. Until
- * completion, snapshot and nonzero input mutation (including compound
- * construction) return EBUSY. Zero-row insert/remove remain no-ops.
+ * the one case retrying cannot recover; see wl_session_set_delta_cb. Until an
+ * observed step completes, or stops at its iteration cap, snapshot and nonzero
+ * input mutation (including compound construction) return EBUSY. A step with no
+ * callback or observer that retains a completion cursor refuses the same input,
+ * but a snapshot resumes it. Zero-row insert/remove remain no-ops.
  * Reentrant step, snapshot and input mutation from delta callbacks return EBUSY.
  *
  * Returns:
@@ -331,9 +333,17 @@ wl_session_step(wl_session_t *session);
  * applied nor any the retry newly derives. Re-read the outputs with
  * wl_session_snapshot after the retry completes to resynchronize. Cancelling
  * from inside delivery is different: that step still succeeds and only the
- * events after the cancelling one are dropped. Callback row/name pointers
- * are valid only for the callback invocation. Destruction from a callback
- * remains unsupported.
+ * events after the cancelling one are dropped. A callback registered after a
+ * plain step failed past its entry checks, or stopped at its iteration cap,
+ * reports nothing for the step that finishes that evaluation, and observes from
+ * the following step. The exception is a session's first evaluation that kept
+ * no completion cursor: that step reports the whole model. The same holds for a
+ * callback already registered when a snapshot that had to evaluate fails, or a
+ * step stops at its iteration cap, on a session that has committed. In each
+ * case the committed model a change would be measured from is gone. Read
+ * wl_session_snapshot between the two to get a baseline. Callback row/name
+ * pointers are valid only for the callback invocation. Destruction from a
+ * callback remains unsupported.
  */
 void
 wl_session_set_delta_cb(wl_session_t *session, wirelog_on_delta_fn callback,
@@ -354,6 +364,8 @@ wl_session_set_delta_cb(wl_session_t *session, wirelog_on_delta_fn callback,
  * SNAPSHOT; an unrelated retained STEP must instead be completed with STEP.
  * Tuple delivery after the prepaid cutoff is indivisible with respect to
  * control stops; callback-triggered cancellation remains for the next attempt.
+ * A snapshot never calls the delta callback, so a later step does not report
+ * the changes it evaluated.
  *
  * Returns:
  *    0 on success.
