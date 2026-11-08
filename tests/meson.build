@@ -1171,6 +1171,19 @@ test('ci_pr_sanitizer_examples_disabled', py3,
      args: [meson.project_source_root() / 'scripts/ci/test-ci-pr-sanitizer-examples.py'],
      suite: 'abi')
 
+# Sanitizer builds must keep the bundled subprojects (nanoarrow and the
+# bundled xxHash fallback) as plain builds: they need no instrumentation,
+# are covered by the plain build legs, and instrumenting them only adds
+# compile time and third-party sanitizer noise.  The plain options are
+# derived from the existing b_sanitize option in meson.build (no new
+# project option: the early binary-size gate requires a base-identical
+# production profile).  MSan (b_sanitize=memory) stays instrumented
+# because MSan requires every linked module instrumented.  Structural
+# guard, same convention as test-ci-pr-sanitizer-examples.py.
+test('ci_pr_plain_subprojects', py3,
+     args: [meson.project_source_root() / 'scripts/ci/test-ci-pr-plain-subprojects.py'],
+     suite: 'abi')
+
 # Issue #1728: every runtime POSIX TSan leg runs `meson test -t 3`, and the
 # tsan-native compile smoke deliberately does not.  The multiplier only helps
 # if no workflow drifts, so pin the literal command text and keep the number
