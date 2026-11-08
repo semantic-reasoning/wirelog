@@ -1292,8 +1292,8 @@ infer_fact_schemas(struct wirelog_program *program,
  * one caller, parse_head_arg(), so an AGGREGATE node is always a direct
  * top-level head child and counts as one argument -- `t(g, min(v))` has
  * child_count 2 and lowers to group_by_count + 1 == 2 emitted columns.  The
- * check is also position-independent, so `t(min(v), g)` (issue #980, where
- * position is ignored and the group-by is emitted first) is unaffected.
+ * check is also position-independent, so `t(min(v), g)`, whose columns are
+ * emitted in head order (issue #980), is checked the same way.
  *
  * Like the fact pass this runs after the whole collection loop, so a `.decl`
  * may legally follow its rules, and it keys off has_decl rather than
@@ -3857,8 +3857,8 @@ convert_rule(const wl_parser_ast_node_t *rule_node,
      * node directly still reaches the crash -- neither wirelog_optimize(),
      * wl_plan_from_program() nor the columnar REDUCE validates that
      * group_by_count + 1 matches the head arity.  Nor does this constrain
-     * aggregate *position*: t(min(v), g) emits group-by-first regardless of
-     * how it was written (issue #980). */
+     * aggregate *position*: t(min(v), g) emits its columns in head order
+     * (issue #980). */
     uint32_t head_agg_count = 0;
     for (uint32_t i = 0; i < head->child_count; i++) {
         if (head->children[i]->type == WL_PARSER_AST_NODE_AGGREGATE)

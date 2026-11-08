@@ -400,11 +400,9 @@ below. Their symbol and numeric values are checked as well; see [Rules must
 not mix symbol and numeric
 values](#rules-must-not-mix-symbol-and-numeric-values).
 
-The count is not the only constraint on aggregates in a head — the aggregate
-must also be written **last**. `t(min(v), g) :- val(g, v).` lowers with a
-single aggregate and the correct arity, but emits its columns group-by-first
-regardless of the order written, so the values land in the wrong columns with
-no diagnostic. That is tracked as #980 and is not affected by this check.
+The aggregate may be written at any position in the head: its columns are
+emitted in the order written (#980), so with `val(1, 3)`, `val(1, 5)` and
+`val(2, 9)`, `t(min(v), g) :- val(g, v).` derives `t(3, 1)` and `t(9, 2)`.
 
 Aggregate names are matched as exact keywords. `average` and `AVG` are
 recognized; `avg` and `AVERAGE` are not. An unrecognized name followed by `(`

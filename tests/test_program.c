@@ -3590,10 +3590,10 @@ test_head_arity_matching_accepted(void)
     }
     wl_ir_program_free(sssp);
 
-    /* Issue #980: aggregate *position* is ignored -- t(min(v), g) lowers
-     * group-by-first regardless of how it was written.  That is out of
-     * scope here, but the check must not accidentally depend on position:
-     * both spellings have the same arity and both must be accepted. */
+    /* Issue #980: an aggregate may be written at any head position, and
+     * t(min(v), g) emits its columns in head order.  The arity check must
+     * not depend on position: both spellings have the same arity and both
+     * must be accepted. */
     struct wirelog_program *swapped
         = make_program_with_rules(".decl val(g: int64, v: int64)\n"
             ".decl t(a: int64, b: int64)\n"
@@ -4546,8 +4546,9 @@ test_rule_value_domains(void)
     expect_domain_accepted("Domains: float arithmetic into a float head",
         ".decl g(x: float)\ng(1.5).\n.decl p(x: float)\n"
         "p(x * 2.0) :- g(x).\n");
-    /* An aggregate head reorders its columns (#980), so even a symbol
-     * key in an int64 column is left alone. */
+    /* Only the literal group-by keys of an aggregate head are checked
+     * (domain_check_rule(), Pass D), so a symbol variable key in an int64
+     * column is accepted. */
     expect_domain_accepted("Domains: aggregate head is not checked",
         DOMAIN_BASE ".decl c(x: int64, n: int64)\n"
         "c(x, count(y)) :- s(x), g(y).\n");
