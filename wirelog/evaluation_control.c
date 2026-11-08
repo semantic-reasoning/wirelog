@@ -107,6 +107,30 @@ wl_evaluation_control_retain(wl_evaluation_control_t *control)
     return 0;
 }
 
+#ifdef WL_SESSION_TEST_HOOKS
+void (*wl_evaluation_control_test_retain_claim)(wl_evaluation_control_t *);
+#endif
+
+int
+wl_evaluation_control_retain_try(wl_evaluation_control_t *control)
+{
+    if (!control)
+        return EINVAL;
+    uint64_t count = (uint64_t)atomic_fetch_add_explicit(
+        &control->references, 0, memory_order_relaxed);
+    if (!count)
+        return EINVAL;
+    if (count >= UINT32_MAX)
+        return EOVERFLOW;
+#ifdef WL_SESSION_TEST_HOOKS
+    if (wl_evaluation_control_test_retain_claim)
+        wl_evaluation_control_test_retain_claim(control);
+#endif
+    return atomic_compare_exchange_strong_explicit(&control->references,
+               &count, count + 1, memory_order_relaxed, memory_order_relaxed)
+        ? 0 : EAGAIN;
+}
+
 void
 wl_evaluation_control_release(wl_evaluation_control_t *control)
 {
@@ -413,12 +437,12 @@ wl_evaluation_control_lexical_finance_mutex_init(wl_mutex_t *mutex)
     return wl_mutex_init(mutex);
 }
 
-wl_evaluation_control_lexical_finance_birth_result_t
-wl_evaluation_control_lexical_finance_birth_try(uint64_t limit,
+static wl_evaluation_control_lexical_finance_birth_result_t
+wl_evaluation_control_attached_birth_try(uint64_t limit,
     const void *owner)
 {
     wl_evaluation_control_lexical_finance_birth_result_t out = {0};
-    if (!limit || !owner) {
+    if (!owner) {
         out.protocol = EINVAL; return out;
     }
     uint64_t identity =
@@ -464,6 +488,26 @@ wl_evaluation_control_lexical_finance_birth_try(uint64_t limit,
     out.control = control; out.identity = identity;
     out.id = wl_evaluation_control_active_attempt_id(control);
     return out;
+}
+
+wl_evaluation_control_lexical_finance_birth_result_t
+wl_evaluation_control_lexical_finance_birth_try(uint64_t limit,
+    const void *owner)
+{
+    if (!limit) {
+        wl_evaluation_control_lexical_finance_birth_result_t out = {
+            .protocol = EINVAL,
+        };
+        return out;
+    }
+    return wl_evaluation_control_attached_birth_try(limit, owner);
+}
+
+wl_evaluation_control_lexical_finance_birth_result_t
+wl_evaluation_control_private_financier_birth_try(uint64_t limit,
+    const void *owner)
+{
+    return wl_evaluation_control_attached_birth_try(limit, owner);
 }
 
 static int
