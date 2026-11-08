@@ -1567,6 +1567,72 @@ test_side_compound_nested_child_no_match(void)
     PASS();
 }
 
+/* #2231: the slots of an inline compound hold scalars, so a compound term in
+ * one matches no row; it used to be read as an anonymous slot. */
+static void
+test_inline_compound_nested_child_no_match(void)
+{
+    TEST("inline compound nested child pattern matches no row");
+
+    const char *src
+        = ".decl pred(a: int64, payload: f/2 inline)\n"
+        "pred(1, 10, 20).\npred(2, 10, 30).\n"
+        ".decl seen(a: int64)\n.decl first(a: int64)\n"
+        ".decl same(a: int64)\n.decl plain(a: int64)\n"
+        "seen(a) :- pred(a, f(b, g(c, _))).\n"
+        "first(a) :- pred(a, f(g(c), b)).\n"
+        "same(a) :- pred(a, f(f(x, y), b)).\n"
+        "plain(a) :- pred(a, f(b, _)).\n"
+        ".decl k(a: int64)\nk(1).\nk(2).\nk(3).\n.decl absent(a: int64)\n"
+        "absent(a) :- k(a), !pred(a, f(_, g(_, _))).\n"
+        ".decl p2(a: int64, x: f/2 inline, y: g/1 inline)\n"
+        "p2(1, 10, 20, 30).\n.decl second(a: int64)\n.decl flat(a: int64)\n"
+        "second(a) :- p2(a, f(b, c), g(h(d))).\n"
+        "flat(a) :- p2(a, f(b, c), g(d)).\n";
+
+    wirelog_easy_session_t *s = NULL;
+    if (wirelog_easy_open(src, &s) != WIRELOG_OK || !s) {
+        FAIL("open failed");
+        return;
+    }
+
+    static const char *const empty[] = { "seen", "first", "same", "second" };
+    tuple_collector_t rows;
+    for (size_t i = 0; i < sizeof(empty) / sizeof(empty[0]); i++) {
+        memset(&rows, 0, sizeof(rows));
+        if (wirelog_easy_snapshot(s, empty[i], collect_tuple, &rows)
+            != WIRELOG_OK || rows.count != 0) {
+            wirelog_easy_close(s);
+            FAIL("a nested inline pattern should match no row");
+            return;
+        }
+    }
+    memset(&rows, 0, sizeof(rows));
+    if (wirelog_easy_snapshot(s, "plain", collect_tuple, &rows)
+        != WIRELOG_OK || rows.count != 2) {
+        wirelog_easy_close(s);
+        FAIL("the pattern without a nested term should match both rows");
+        return;
+    }
+    memset(&rows, 0, sizeof(rows));
+    if (wirelog_easy_snapshot(s, "flat", collect_tuple, &rows)
+        != WIRELOG_OK || rows.count != 1) {
+        wirelog_easy_close(s);
+        FAIL("the second inline column without a nested term should match");
+        return;
+    }
+    /* Negating a pattern that matches no row keeps every k row. */
+    memset(&rows, 0, sizeof(rows));
+    if (wirelog_easy_snapshot(s, "absent", collect_tuple, &rows)
+        != WIRELOG_OK || rows.count != 3) {
+        wirelog_easy_close(s);
+        FAIL("negating a nested inline pattern should keep every row");
+        return;
+    }
+    wirelog_easy_close(s);
+    PASS();
+}
+
 static void
 test_negated_side_compound_body_pattern_rejected(void)
 {
@@ -3365,6 +3431,7 @@ main(void)
     test_side_compound_duplicate_child_variables_filter();
     test_side_compound_wrong_functor_handle_no_match();
     test_side_compound_nested_child_no_match();
+    test_inline_compound_nested_child_no_match();
     test_negated_side_compound_body_pattern_rejected();
     test_unsafe_negation_variable_rejected();
     test_safe_negation_via_projection_accepted();

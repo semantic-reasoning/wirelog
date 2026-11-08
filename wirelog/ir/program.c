@@ -2639,6 +2639,24 @@ compound_arg_functor_matches(const wl_parser_ast_node_t *arg,
     return functor_id >= 0 && (uint32_t)functor_id == col->compound_functor_id;
 }
 
+/* #2231: whether @arg, a compound term for `inline` column @col, has a
+ * compound term among its arguments.  The slots of an inline compound hold
+ * scalars (WL_COMPOUND_INLINE_MAX_DEPTH is 1), so such a pattern matches no
+ * row, as a nested pattern in a `side` column does (see
+ * build_side_compound_scan()).  It used to be read as an anonymous slot,
+ * so `pred(a, f(b, g(c, _)))` matched every row. */
+static bool
+inline_term_nests_compound(const wl_parser_ast_node_t *arg,
+    const wirelog_column_t *col)
+{
+    if (col->compound_kind != WIRELOG_COMPOUND_KIND_INLINE)
+        return false;
+    for (uint32_t c = 0; c < arg->child_count; c++)
+        if (arg->children[c]->type == WL_PARSER_AST_NODE_COMPOUND_TERM)
+            return true;
+    return false;
+}
+
 /*
  * The comparison lattice value of logical column @logical_idx, or UNKNOWN
  * when the relation was never declared, was declared with fewer columns than
@@ -3396,7 +3414,8 @@ scan_build_complete:
                     continue;
                 if (col->compound_kind == WIRELOG_COMPOUND_KIND_NONE)
                     continue;
-                if (!compound_arg_functor_matches(arg, col, prog)) {
+                if (!compound_arg_functor_matches(arg, col, prog)
+                    || inline_term_nests_compound(arg, col)) {
                     compound_mismatch = true;
                     WL_LOG(WL_LOG_SEC_COMPOUND, WL_LOG_WARN,
                         "compound pattern mismatch for relation=%s col=%u, "

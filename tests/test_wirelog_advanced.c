@@ -2091,6 +2091,56 @@ out:
     return rc;
 }
 
+/* Parity (#785): mirrors test_inline_compound_nested_child_no_match.
+ * The slots of an inline compound hold scalars, so a compound term in one
+ * matches no row (#2231). */
+static int
+test_inline_compound_nested_child_no_match(void)
+{
+    const char *src
+        = ".decl pred(a: int64, payload: f/2 inline)\n"
+        ".decl seen(a: int64)\n.decl plain(a: int64)\n"
+        "seen(a) :- pred(a, f(b, g(c, _))).\n"
+        "plain(a) :- pred(a, f(b, _)).\n";
+    wirelog_program_t *prog = parse_or_die(src, "T23");
+    if (!prog)
+        return 1;
+
+    wirelog_session_t *s = NULL;
+    if (wirelog_session_create(prog, WIRELOG_BACKEND_DEFAULT, 1, &s)
+        != WIRELOG_OK || !s) {
+        wirelog_program_free(prog);
+        return 1;
+    }
+
+    int64_t rows[6] = { 1, 10, 20, 2, 10, 30 };
+    int rc = 0;
+    if (wirelog_session_insert(s, "pred", rows, 2, 3) != WIRELOG_OK) {
+        fprintf(stderr, "T23 insert failed\n");
+        rc = 1;
+        goto out;
+    }
+    struct tuple_filter seen = { .target_relation = "seen" };
+    struct tuple_filter plain = { .target_relation = "plain" };
+    if (wirelog_session_snapshot(s, filter_tuples, &seen) != WIRELOG_OK
+        || wirelog_session_snapshot(s, filter_tuples, &plain)
+        != WIRELOG_OK) {
+        fprintf(stderr, "T23 snapshot failed\n");
+        rc = 1;
+        goto out;
+    }
+    if (seen.count != 0 || plain.count != 2) {
+        fprintf(stderr,
+            "T23: nested inline pattern derived %d rows, plain %d\n",
+            seen.count, plain.count);
+        rc = 1;
+    }
+out:
+    wirelog_session_destroy(s);
+    wirelog_program_free(prog);
+    return rc;
+}
+
 /* Parity (#785): mirrors test_negated_side_compound_body_pattern_rejected. */
 static int
 test_negated_side_compound_body_pattern_rejected(void)
@@ -3447,6 +3497,7 @@ main(void)
     failures += test_side_compound_duplicate_child_variables_filter();
     failures += test_side_compound_wrong_functor_handle_no_match();
     failures += test_side_compound_nested_child_no_match();
+    failures += test_inline_compound_nested_child_no_match();
     failures += test_negated_side_compound_body_pattern_rejected();
     failures += test_unsafe_negation_variable_rejected();
     failures += test_safe_negation_via_projection_accepted();
