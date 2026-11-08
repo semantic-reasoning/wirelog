@@ -487,6 +487,15 @@ its atoms is rejected. Atoms whose width is not checked, as above, are not
 checked by this rule either, nor are compound terms nested inside a compound
 term.
 
+The slots of an `inline` compound hold scalars, so a compound term nested
+in a pattern for an `inline` column matches no row (#2231):
+`o(a) :- pred(a, f(b, g(c, _))).` against `payload: f/2 inline` derives
+nothing. Lowering read the nested term as `_`, so that rule derived `o(a)`
+for every `pred` row. A variable that appears only inside the nested term
+gets no value from it, so using one in the rule head or a condition fails
+to plan. A nested pattern for a `side` column matches no row either (see
+[Compound Terms](COMPOUND_TERMS.md#nested-compounds)).
+
 ### Rules must not mix symbol and numeric values
 
 Symbols are stored as intern ids, so a rule that joins a `symbol` column

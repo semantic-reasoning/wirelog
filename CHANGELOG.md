@@ -248,6 +248,12 @@ All notable changes to wirelog are documented in this file.
 
 ### Fixed
 
+- **A compound term nested in an `inline` pattern matches no row** (#2231):
+  the slots of an `inline` compound hold scalars, but lowering read a
+  compound term in one as `_`, so `o(a) :- pred(a, f(b, g(c, _))).` against
+  `payload: f/2 inline` derived `o(a)` for every `pred` row. Such a pattern
+  now matches no row, as a nested pattern in a `side` column already did.
+
 - **A plan expression naming no input column fails to plan** (#2231): plan
   generation resolved a variable by name in its operator's input and emitted
   any other name unchanged, and the interpreted evaluator read an unknown

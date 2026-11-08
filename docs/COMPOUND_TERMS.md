@@ -275,6 +275,11 @@ recursively opening `metadata(...)`:
 seen(ID) :- record(ID, scope(metadata(Level, Ts, Host, Risk))).
 ```
 
+Such a pattern matches no row. A compound term nested in a pattern for an
+`inline` column matches no row either, since inline slots hold scalars:
+`o(a) :- pred(a, f(b, g(c, _))).` against `payload: f/2 inline` derives
+nothing (#2231).
+
 ---
 
 ## Inline vs Side Decision Guide
