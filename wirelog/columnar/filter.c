@@ -3837,6 +3837,66 @@ wl_columnar_filter_registered_cleanup_latch_owned(
     return 0;
 }
 
+/* One nonstream private-batch retirement action. The caller supplies a fresh,
+ * dedicated financier generation for this invocation, with no incoming SOURCE
+ * promise. Funding buys work; canonical context and writer proofs own access. */
+int
+wl_columnar_filter_batch_end_step_owned_funded(
+    wl_columnar_eval_stack_cleanup_frame_t *frame,
+    wl_columnar_filter_status_t *status, const void *owner,
+    wl_evaluation_control_t *funding, uint64_t id)
+{
+    const wl_columnar_eval_plan_numeric_attempt_t *record = owner;
+    if (!status || !record || !funding || funding == record->control || !id)
+        return EINVAL;
+    int rc = wl_evaluation_control_charge_attempt(funding, id,
+            WL_COLUMNAR_FILTER_ATTEMPT_BATCH_RETIRE_WORK);
+    if (rc) return rc;
+    wl_columnar_filter_context_t *ctx = NULL;
+    rc = wl_columnar_eval_stack_filter_context_nonstream_owned(frame, &ctx,
+            owner);
+    if (rc) return rc;
+    rc = wl_columnar_filter_attempt_context_valid(frame, ctx);
+    if (rc) return rc;
+    rc = wl_evaluation_control_charge_attempt(funding, id, 0);
+    if (rc) return rc;
+    if (ctx->stage != WL_COLUMNAR_FILTER_STAGE_BATCH
+        && ctx->stage != WL_COLUMNAR_FILTER_STAGE_JOIN_BATCH) return EBUSY;
+    if (!ctx->pin_owned || record->session != ctx->session
+        || record->control != ctx->control
+        || record->attempt_id != ctx->attempt_id) return EINVAL;
+    if (ctx->batch_initialized && (!ctx->drain_initialized
+        || ctx->batch_drain.identity != &ctx->batch_drain)) return EINVAL;
+    ctx->busy = true;
+    bool done = !ctx->batch_initialized;
+    if (!done)
+        rc = wl_columnar_relation_private_batch_drain_step_funded(
+            &ctx->batch_drain, &ctx->batch, ctx->execution_result, &done,
+            funding, id);
+    ctx->busy = false;
+    /* Refusal may follow actual release progress. Never restore a writer or
+     * interpret a stale physical release_error as a protocol result. */
+    int paid = wl_evaluation_control_charge_attempt(funding, id, 0);
+    if (rc) return rc;
+    if (paid) return paid;
+    if (ctx->batch_initialized && ctx->batch_drain.release_error) {
+        ctx->cleanup_result = ctx->batch_drain.release_error;
+        wl_columnar_filter_attempt_status(ctx, status,
+            WL_COLUMNAR_FILTER_PROGRESS_RETAINED);
+        return 0;
+    }
+    ctx->cleanup_result = 0;
+    if (done) {
+        ctx->batch_initialized = false;
+        ctx->stage = ctx->stage == WL_COLUMNAR_FILTER_STAGE_JOIN_BATCH
+            ? WL_COLUMNAR_FILTER_STAGE_JOIN_RIGHT_SOURCE
+            : WL_COLUMNAR_FILTER_STAGE_PROGRAM;
+    }
+    wl_columnar_filter_attempt_status(ctx, status,
+        WL_COLUMNAR_FILTER_PROGRESS_YIELD);
+    return 0;
+}
+
 int
 wl_columnar_filter_op_native_cleanup_latch_owned(
     wl_columnar_eval_stack_cleanup_frame_t *frame, const void *owner,

@@ -7891,6 +7891,13 @@ int wl_columnar_filter_map_attempt_start_owned(const wl_plan_op_t *,
 int wl_columnar_filter_op_attempt_step_owned(
     wl_columnar_eval_stack_cleanup_frame_t *, wl_columnar_filter_status_t *,
     const void *);
+/* Nonstream BATCH/JOIN_BATCH only; other lifecycle stages return EBUSY.
+ * One invocation per fresh dedicated financier generation, no incoming SOURCE
+ * promise. The caller owns this precondition; the helper does not inspect the
+ * remaining budget or infer resource authority from financial admission. */
+int wl_columnar_filter_batch_end_step_owned_funded(
+    wl_columnar_eval_stack_cleanup_frame_t *, wl_columnar_filter_status_t *,
+    const void *, wl_evaluation_control_t *, uint64_t);
 /* Exact owned ordinary JOIN cleanup only. Queries refuse all stream hosts;
  * actual END uses distinct supplied funding after the parent dispatch1. */
 int wl_columnar_filter_empty_end_pending_owned(
