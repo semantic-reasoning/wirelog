@@ -248,6 +248,22 @@ All notable changes to wirelog are documented in this file.
 
 ### Fixed
 
+- **A plan expression naming no input column fails to plan** (#2231): plan
+  generation resolved a variable by name in its operator's input and emitted
+  any other name unchanged, and the interpreted evaluator read an unknown
+  name as column 0. A filter, head or aggregate expression whose variable is
+  neither an input column nor an in-range `colN` now fails to plan, naming
+  the variable. From program text this is reached by a variable inside a
+  compound term of another functor nested in a matching one: with
+  `pred(1, 10, 20)` against `payload: f/2 inline`,
+  `o(c) :- pred(a, f(b, g(c, _))).` derived `o(1)` and now fails to plan. As
+  a group-by key such a variable took the column at its head position, so
+  `t(c, count(a)) :- pred(a, f(b, g(c, _))).` with a second row
+  `pred(2, 10, 30)` derived `t(1, 1)` and `t(2, 1)`; that rule is now
+  rejected at load. IR changed after parsing, such as by an internal
+  producer, could reach it too. Right-side join filters, which lowering
+  builds only from constants and repeated variables, are not checked.
+
 - **Rules with unbound head or condition variables are rejected** (#2231):
   `m(y) :- n(x).` with `n(1)` derived `m(1)`, and `m(x) :- n(x), z < 4.`
   acted as `x < 4`, because a variable that no positive body atom or body

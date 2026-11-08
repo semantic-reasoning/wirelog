@@ -302,6 +302,11 @@ int
 wl_ir_program_rename_positional_vars(struct wirelog_program *program,
     wl_parser_ast_node_t *ast);
 
+/* The spelling the user wrote for a rule variable that
+ * wl_ir_program_rename_positional_vars() renamed, for messages. */
+const char *
+wl_ir_program_user_var_name(const char *name);
+
 int
 wl_ir_program_convert_rules(struct wirelog_program *program,
     const wl_parser_ast_node_t *ast);

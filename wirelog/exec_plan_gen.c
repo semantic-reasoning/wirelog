@@ -916,6 +916,20 @@ agg_operand_from_coltype(wl_ir_coltype_t t)
     return WL_PLAN_AGG_OPERAND_UNKNOWN;
 }
 
+/* True when @name is `col` followed by decimal digits naming an index
+ * below @count, the positional form lowering and the passes emit. */
+static bool
+is_explicit_column_ref(const char *name, uint32_t count)
+{
+    if (strncmp(name, "col", 3) != 0 || name[3] == '\0')
+        return false;
+    char *end = NULL;
+    errno = 0;
+    unsigned long idx = strtoul(name + 3, &end, 10);
+    return errno == 0 && *end == '\0' && isdigit((unsigned char)name[3])
+           && idx < count;
+}
+
 /**
  * Serialize an IR expression tree into postfix (RPN) byte encoding.
  * Walks the tree recursively: children first (postfix), then operator.
@@ -943,6 +957,16 @@ serialize_expr(expr_buf_t *buf, const wl_ir_expr_t *expr,
                     break;
                 }
             }
+        }
+        /* #2231: in plan generation any other name must be an in-range
+         * positional reference.  The interpreted evaluator read an unknown
+         * name as column 0, so a name no input column has is an error. */
+        if (emit_name == expr->var_name && ctx && ctx->program
+            && !is_explicit_column_ref(expr->var_name, ctx->count)) {
+            set_plan_error(ctx->program,
+                "variable '%s' names no input column of its plan operator",
+                wl_ir_program_user_var_name(expr->var_name));
+            return -1;
         }
         uint16_t len = (uint16_t)strlen(emit_name);
         wl_ir_coltype_t var_type = col_ctx_lookup_type(ctx, expr->var_name);
