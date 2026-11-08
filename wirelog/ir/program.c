@@ -4517,11 +4517,21 @@ convert_rule(const wl_parser_ast_node_t *rule_node,
                         uint32_t col_idx = gi;
                         if (lane_names == cur_vars) {
                             /* Resolve head variable name to body column
-                             * index; fallback to head position */
+                             * index.  #2231: a key with no body column used
+                             * to take the column at its head position. */
                             col_idx = head_arg_body_column(head->children[i],
                                     cur_vars, cur_vcount);
-                            if (col_idx == UINT32_MAX)
-                                col_idx = i;
+                            if (col_idx == UINT32_MAX) {
+                                const char *key = head->children[i]->name;
+                                wl_ir_program_set_error(prog,
+                                    "group-by key '%s' of rule '%s' names no"
+                                    " column of the rule body",
+                                    key ? user_var_name(key) : "?",
+                                    head->name ? head->name : "?");
+                                wl_ir_node_free(root);
+                                root = NULL;
+                                goto conversion_failed;
+                            }
                         }
                         if (root->group_by_indices)
                             root->group_by_indices[gi++] = col_idx;
@@ -5192,6 +5202,12 @@ static const char *
 user_var_name(const char *name)
 {
     return name[0] == '$' && is_positional_name(name + 1) ? name + 1 : name;
+}
+
+const char *
+wl_ir_program_user_var_name(const char *name)
+{
+    return name ? user_var_name(name) : name;
 }
 
 static int

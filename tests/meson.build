@@ -4659,6 +4659,16 @@ test_range_restriction_exe = executable(
 
 test('range_restriction', test_range_restriction_exe)
 
+test_plan_unresolved_var_exe = executable(
+  'test_plan_unresolved_var',
+  files('test_plan_unresolved_var.c'),
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
+  link_with: [testlib_prod],
+)
+
+test('plan_unresolved_var', test_plan_unresolved_var_exe)
+
 # ============================================================================
 # Pointer Swap Tests (Issue #300)
 # ============================================================================
