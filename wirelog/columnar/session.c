@@ -649,6 +649,7 @@ void (*wl_columnar_session_test_metadata_finished)(
     const wl_col_session_t *, wl_columnar_session_metadata_purpose_t,
     wl_columnar_session_metadata_event_t, int, wl_evaluation_control_report_t);
 int wl_columnar_session_test_exhaust_after_relation;
+int wl_columnar_session_test_fail_restore_seed;
 unsigned wl_columnar_session_test_preflight_quantum = 64;
 void (*wl_columnar_session_test_before_fresh_shape)(wl_col_session_t *);
 /* Read-only borrowed financier observation; never retained by the hook. */
@@ -1191,7 +1192,7 @@ wl_columnar_session_cold_busy(const wl_col_session_t *s, const char *name)
                name) ||
            s->cold_seal_closed ||
            s->has_evaluated ||
-           s->plain_step_completion_pending || s->uncommitted_strata_done ||
+           s->plain_step_completion_pending || s->uncommitted_strata_extent ||
            s->cleanup_active || s->cleanup_pending || s->source_leases ||
            s->deferred_relations || s->retained_eval_entries ||
            s->tdd_workers || s->tdd_owner_lifetime || s->controlled_step ||
@@ -2289,6 +2290,12 @@ wl_columnar_session_restore_seed(wl_col_session_t *sess, col_rel_t *r)
 
     if (!seed || seed->nrows == 0)
         return 0;
+#ifdef WL_SESSION_TEST_HOOKS
+    if (wl_columnar_session_test_fail_restore_seed > 0) {
+        wl_columnar_session_test_fail_restore_seed--;
+        return ENOMEM;
+    }
+#endif
     if (r->ncols != 0 && r->ncols != seed->ncols)
         return EINVAL;
     if (!wl_columnar_memory_size_mul(seed->nrows, seed->ncols, &cells)
@@ -7488,18 +7495,43 @@ col_session_publication_cutoff(wl_col_session_t *sess)
 
 static int
 col_session_clear_idb_rows(const wl_plan_t *plan, wl_col_session_t *sess,
-    uint32_t strata_end);
+    uint32_t strata_begin, uint32_t strata_end);
 
-/* Issue #2092: records that strata [0, si] completed in an evaluation that
- * has not committed yet.  The snapshot runs every stratum in order from 0.
- * A plain step does too, or resumes just after the prefix an earlier attempt
- * completed, so the completed strata form a prefix. */
+/* Issue #2092, #2348: records that strata [0, si] were evaluated, successfully
+ * or not, in an evaluation that has not committed yet.  The snapshot runs every
+ * stratum in order from 0.  A plain step does too, or resumes just after the
+ * prefix an earlier attempt completed, so the extent is a prefix. */
 static void
-col_session_note_stratum_done(wl_col_session_t *sess, uint32_t si)
+col_session_note_stratum_extent(wl_col_session_t *sess, uint32_t si)
 {
-    uint32_t done = si < UINT16_MAX ? si + 1 : UINT16_MAX;
-    if (done > sess->uncommitted_strata_done)
-        sess->uncommitted_strata_done = (uint16_t)done;
+    uint32_t extent = si < UINT16_MAX ? si + 1 : UINT16_MAX;
+    if (extent > sess->uncommitted_strata_extent)
+        sess->uncommitted_strata_extent = (uint16_t)extent;
+}
+
+/* An attempt failed with strata [begin, extent) evaluated and uncommitted.
+ * Discard what they derived, keeping host input, so the next evaluation derives
+ * them from the current input alone (#2092, #2348).  Workers retained by that
+ * failure go first, since a borrow of a head refuses its clear. */
+static int
+col_session_discard_uncommitted_strata(const wl_plan_t *plan,
+    wl_col_session_t *sess, uint32_t begin)
+{
+    uint32_t extent = sess->uncommitted_strata_extent;
+    int rc = wl_columnar_eval_retire_retained_workers(sess);
+    if (rc == 0)
+        rc = col_session_clear_idb_rows(plan, sess, begin, extent);
+    if (rc != 0)
+        return rc;
+    /* Before a first commit, a retired row can only be a failed attempt's row:
+     * host input removed before any commit cancels its insert instead. */
+    if (!sess->has_evaluated)
+        session_retired_rows_clear(sess);
+    for (uint32_t si = begin; si < plan->stratum_count && si < MAX_STRATA
+        && si < extent; si++)
+        sess->frontier_ops->reset_stratum_frontier(sess, si,
+            sess->outer_epoch);
+    return 0;
 }
 
 /* Raw cap status remains zero for compatibility, but the partial model is
@@ -7507,7 +7539,7 @@ col_session_note_stratum_done(wl_col_session_t *sess, uint32_t si)
 static void
 wl_columnar_session_note_iteration_cap(wl_col_session_t *sess, uint32_t si)
 {
-    col_session_note_stratum_done(sess, si); /* extent to clear on retry */
+    col_session_note_stratum_extent(sess, si); /* extent to clear on retry */
     sess->pending_input_change = true;
     sess->pending_full_input_eval = true;
     sess->snapshot_stable_valid = false;
@@ -7558,7 +7590,13 @@ col_session_step_impl(wl_session_t *session)
     const wl_plan_t *plan = sess->plan;
     if (!sess->plain_step_completion_pending)
         sess->plain_step_completion_step_context =
-            sess->delta_observer == NULL && sess->delta_cb == NULL;
+            sess->delta_observer == NULL
+            && (sess->delta_cb == NULL
+            /* A failed plain step or snapshot of a committed session already
+             * changed the committed model, so no baseline gives correct
+             * events.  Finish it unobserved; the callback observes from the
+             * next step (#2348). */
+            || (sess->has_evaluated && sess->uncommitted_strata_extent > 0));
     uint32_t completion_start = 0;
     bool completing_plain_step = sess->plain_step_completion_pending;
     uint64_t completion_mask = UINT64_MAX;
@@ -7591,8 +7629,19 @@ col_session_step_impl(wl_session_t *session)
                     sess->plain_step_completion_stratum);
                 return 0;
             }
-            col_session_note_stratum_done(sess,
+            col_session_note_stratum_extent(sess,
                 sess->plain_step_completion_stratum);
+        }
+        /* The cursor keeps the committed prefix.  A stratum past it that failed
+         * left partial rows, and running it again over them can keep rows no
+         * current derivation accounts for (#2348). */
+        if (sess->uncommitted_strata_extent > completion_start) {
+            int discard_rc = col_session_discard_uncommitted_strata(plan, sess,
+                    completion_start);
+            if (discard_rc != 0) {
+                sess->plain_step_completion_active = false;
+                return discard_rc;
+            }
         }
     }
     sess->extension_expr_status = 0;
@@ -7658,7 +7707,17 @@ col_session_step_impl(wl_session_t *session)
              * partial, so whatever evaluates next must clear and evaluate in
              * full; only the commit below resets this. */
             sess->pending_full_input_eval = true;
-            int clear_rc = col_session_clear_idb_rows(plan, sess,
+            /* The clear below can fail after it has reset the heads, so the
+             * committed model is gone from here on, as in a snapshot that
+             * evaluates.  A callback installed before the retry must not take
+             * its baseline over what is left (#2348). */
+            if (plan->stratum_count > 0)
+                col_session_note_stratum_extent(sess,
+                    plan->stratum_count - 1);
+            int retire_rc = wl_columnar_eval_retire_retained_workers(sess);
+            if (retire_rc != 0)
+                return retire_rc;
+            int clear_rc = col_session_clear_idb_rows(plan, sess, 0,
                     plan->stratum_count);
             if (clear_rc != 0)
                 return clear_rc;
@@ -7666,26 +7725,28 @@ col_session_step_impl(wl_session_t *session)
                 si++)
                 sess->frontier_ops->reset_stratum_frontier(sess, si,
                     sess->outer_epoch);
-        } else if (sess->uncommitted_strata_done > 0) {
-            /* Issue #2092: a first evaluation failed after these strata
-             * completed.  Discard what they derived, keeping host input, so
-             * re-deriving them does not append a second copy.  The stratum
-             * that failed is re-run over its own rows, as before. */
-            uint32_t done = sess->uncommitted_strata_done;
-            int clear_rc = col_session_clear_idb_rows(plan, sess, done);
-            if (clear_rc != 0)
-                return clear_rc;
-            for (uint32_t si = 0; si < plan->stratum_count && si < MAX_STRATA
-                && si < done; si++)
-                sess->frontier_ops->reset_stratum_frontier(sess, si,
-                    sess->outer_epoch);
+        } else if (sess->uncommitted_strata_extent > 0) {
+            int discard_rc = col_session_discard_uncommitted_strata(plan,
+                    sess, 0);
+            if (discard_rc != 0)
+                return discard_rc;
         }
         sess->plain_step_completion_mask = affected_mask;
     }
 
     if (!completing_plain_step && sess->delta_observer) {
         affected_mask = wl_columnar_eval_delta_observer_mask(sess);
-    } else if (!completing_plain_step && sess->delta_cb) {
+    } else if (!completing_plain_step && sess->delta_cb
+        && !sess->plain_step_completion_step_context) {
+        /* A callback installed after a failed first plain evaluation must not
+         * take that attempt's rows as its baseline: they would never be
+         * reported as added (#2348). */
+        if (!sess->has_evaluated && sess->uncommitted_strata_extent > 0) {
+            int discard_rc = col_session_discard_uncommitted_strata(plan,
+                    sess, 0);
+            if (discard_rc != 0)
+                return discard_rc;
+        }
         int rc = wl_columnar_eval_delta_observer_begin(sess, affected_mask);
         if (rc != 0)
             return rc;
@@ -7761,6 +7822,11 @@ col_session_step_impl(wl_session_t *session)
             ? col_stratum_step_with_delta(sp, sess, si)
             : col_eval_stratum_tdd(sp, sess, si);
         if (rc != 0) {
+            /* A plain attempt leaves merged or partial rows to discard if no
+             * cursor resumes it (#2348).  An observed attempt keeps its own
+             * baseline, and the observer retries it. */
+            if (sess->plain_step_completion_step_context)
+                col_session_note_stratum_extent(sess, si);
             sess->delta_event_transaction = false;
             wl_columnar_delta_events_clear(sess);
             wl_columnar_eval_delta_observer_set_active(sess, false);
@@ -7773,7 +7839,7 @@ col_session_step_impl(wl_session_t *session)
             return 0;
         }
         if (sess->plain_step_completion_step_context) {
-            col_session_note_stratum_done(sess, si);
+            col_session_note_stratum_extent(sess, si);
             /* The stratum, including checked cleanup/finalization, committed.
              * Preserve that prefix if a later W1 stratum returns an ordinary
              * error before the final compaction continuation is armed. */
@@ -7869,7 +7935,7 @@ compact_staged_deltas:
     sess->pending_input_change = false;
     sess->pending_full_input_eval = false;
     sess->has_evaluated = true;
-    sess->uncommitted_strata_done = 0;
+    sess->uncommitted_strata_extent = 0;
     sess->plain_step_completion_pending = false;
     sess->plain_step_completion_active = false;
     sess->plain_step_completion_phase =
@@ -11845,7 +11911,7 @@ col_controlled_step_recursive_drive(wl_col_session_t *sess,
             sess->pending_input_change = false;
             sess->pending_full_input_eval = false;
             sess->has_evaluated = true;
-            sess->uncommitted_strata_done = 0;
+            sess->uncommitted_strata_extent = 0;
             sess->snapshot_stable_valid = true;
             for (uint32_t i = 0; i < sess->nrels; ++i) {
                 col_rel_t *rel = sess->rels[i];
@@ -13308,7 +13374,7 @@ wl_columnar_session_observed_action(wl_col_session_t *sess,
         sess->retraction_seeded = false;
         sess->has_evaluated = true;
         sess->snapshot_stable_valid = true;
-        sess->uncommitted_strata_done = 0;
+        sess->uncommitted_strata_extent = 0;
         tx->committed = step->published = true;
         step->observer_cleanup_pending = tx->observer_started;
         tx->index = 0; tx->phase = WL_SESSION_OBSERVED_RETIRE;
@@ -15524,7 +15590,7 @@ col_session_emit_snapshot(const wl_plan_t *plan, wl_col_session_t *sess,
 
 static int
 col_session_clear_idb_rows(const wl_plan_t *plan, wl_col_session_t *sess,
-    uint32_t strata_end)
+    uint32_t strata_begin, uint32_t strata_end)
 {
     col_rel_t **targets = NULL;
     col_rel_t **owners = NULL;
@@ -15549,7 +15615,8 @@ col_session_clear_idb_rows(const wl_plan_t *plan, wl_col_session_t *sess,
     }
 
     /* Collect each relation once and resolve all owners before mutation. */
-    for (uint32_t si = 0; si < plan->stratum_count && si < strata_end; si++) {
+    for (uint32_t si = strata_begin; si < plan->stratum_count
+        && si < strata_end; si++) {
         const wl_plan_stratum_t *sp = &plan->strata[si];
         for (uint32_t ri = 0; ri < sp->relation_count; ri++) {
             col_rel_t *r = session_find_rel(sess, sp->relations[ri].name);
@@ -15862,17 +15929,20 @@ col_session_snapshot_impl(wl_session_t *session, wirelog_on_tuple_fn callback,
         && (sess->pending_full_input_eval
         || (sess->pending_input_change
         && sess->last_inserted_relation == NULL))) {
-        int clear_rc = col_session_clear_idb_rows(plan, sess,
+        int retire_rc = wl_columnar_eval_retire_retained_workers(sess);
+        if (retire_rc != 0)
+            return retire_rc;
+        int clear_rc = col_session_clear_idb_rows(plan, sess, 0,
                 plan->stratum_count);
         if (clear_rc != 0)
             return clear_rc;
-    } else if (!sess->has_evaluated && sess->uncommitted_strata_done > 0) {
-        /* Issue #2092: as in the plain step, a failed first evaluation left
-         * these strata derived; every frontier is reset below. */
-        int clear_rc = col_session_clear_idb_rows(plan, sess,
-                sess->uncommitted_strata_done);
-        if (clear_rc != 0)
-            return clear_rc;
+    } else if (!sess->has_evaluated && sess->uncommitted_strata_extent > 0) {
+        /* Issue #2092, #2348: as in the plain step, a failed first evaluation
+         * left these strata derived. */
+        int discard_rc = col_session_discard_uncommitted_strata(plan,
+                sess, 0);
+        if (discard_rc != 0)
+            return discard_rc;
     }
 
     /* Every stratum evaluates in full from here: the incremental case left
@@ -16113,6 +16183,8 @@ col_session_snapshot_impl(wl_session_t *session, wirelog_on_tuple_fn callback,
         }
 
         if (rc != 0) {
+            /* This stratum's heads may hold partial rows (#2348). */
+            col_session_note_stratum_extent(sess, si);
             if (wl_columnar_session_has_retained_cleanup(sess)) {
                 sess->tdd_decision_tracking_active = false;
                 return rc;
@@ -16148,7 +16220,7 @@ col_session_snapshot_impl(wl_session_t *session, wirelog_on_tuple_fn callback,
             wl_columnar_session_note_iteration_cap(sess, si);
             return col_session_emit_snapshot(plan, sess, callback, user_data);
         }
-        col_session_note_stratum_done(sess, si);
+        col_session_note_stratum_extent(sess, si);
     }
     sess->tdd_decision_tracking_active = false;
 
@@ -16231,7 +16303,7 @@ evaluated:;
     sess->pending_input_change = false;
     sess->pending_full_input_eval = false;
     sess->has_evaluated = true;
-    sess->uncommitted_strata_done = 0;
+    sess->uncommitted_strata_extent = 0;
     sess->snapshot_stable_valid = true;
 
     /* Issue #83: Update base_nrows for all relations after convergence.

@@ -2767,13 +2767,13 @@ typedef struct wl_col_session_t {
     /* Framed controlled initial STEP continuation; opaque to the session
      * layout so its host protocol types remain declared below. */
     wl_columnar_controlled_step_t *controlled_step;
-    /* Issue #2092: how many leading strata completed in a plain step or a
-     * snapshot that has not committed (saturating).  Their heads hold rows
-     * no commit accounts for, so the next plain step or snapshot that does
-     * not resume clears them before re-deriving, even before has_evaluated
-     * is set.  Zero at commit.
+    /* Issue #2092, #2348: how many leading strata a plain step or a snapshot
+     * that has not committed evaluated, including one that failed (saturating).
+     * Their heads may hold rows no commit accounts for, so the next plain step,
+     * snapshot or delta baseline that does not resume clears them before
+     * re-deriving, even before has_evaluated is set.  Zero at commit.
      */
-    uint16_t uncommitted_strata_done;
+    uint16_t uncommitted_strata_extent;
     /* Issue #176: Per-iteration cache eviction for recursive strata.
      * cache_evict_threshold: target cache size (bytes) for LRU eviction
      * in recursive stratum iteration loop. When cache exceeds this threshold,
@@ -8838,6 +8838,8 @@ extern void (*wl_columnar_session_test_metadata_finished)(
     const wl_col_session_t *, wl_columnar_session_metadata_purpose_t,
     wl_columnar_session_metadata_event_t, int, wl_evaluation_control_report_t);
 extern int wl_columnar_session_test_exhaust_after_relation;
+/* Fail this many restorations of host input into a reset head. */
+extern int wl_columnar_session_test_fail_restore_seed;
 extern int wl_columnar_session_hash_test_registry_allocation;
 extern int (*wl_columnar_session_hash_test_registry_move)(
     wl_columnar_eval_serial_framed_attempt_t *, unsigned, bool);
@@ -8864,5 +8866,11 @@ extern void (*wl_columnar_eval_serial_test_framed_checkpoint)(
     wl_columnar_eval_serial_framed_attempt_t *);
 extern int wl_columnar_eval_serial_test_framed_fail_allocation;
 #endif
+
+/* Retire workers a failed attempt retained.  They can borrow coordinator heads,
+ * which refuses a clear of those heads.  Otherwise only the next stratum's
+ * worker setup, or destroying the session, would retire them. */
+int
+wl_columnar_eval_retire_retained_workers(wl_col_session_t *coord);
 
 #endif /* WL_COLUMNAR_INTERNAL_H */

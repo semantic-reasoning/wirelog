@@ -938,6 +938,13 @@ tdd_cleanup_workers(wl_col_session_t *coord)
     return 0;
 }
 
+int
+wl_columnar_eval_retire_retained_workers(wl_col_session_t *coord)
+{
+    return coord->tdd_workers_count == 0 && !coord->tdd_owner_lifetime
+           ? 0 : tdd_cleanup_workers(coord);
+}
+
 static int
 tdd_cleanup_preserve_error(wl_col_session_t *coord, int operation_rc)
 {
@@ -8640,8 +8647,9 @@ done:
     if (rc == 0 && !coord->eval_stratum_iteration_capped) {
         tdd_record_recursive_convergence(coord, sp, stratum_idx,
             rule_id_base, final_eff_iter);
-        /* Preserve completed history, but never mark refused finalization
-         * as a completed evaluation for the first-snapshot guard. */
+        /* Preserve completed history, but never count a refused finalization
+         * as a completed evaluation: the session loops discard this stratum's
+         * rows before re-deriving it (#2348). */
         coord->total_iterations += final_eff_iter;
     }
     coord->tdd_total_ns += now_ns() - tdd_total_t0;

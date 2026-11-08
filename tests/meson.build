@@ -4205,9 +4205,9 @@ test_session_exe = executable(
   dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
 )
 
-# Expanded multiworker ownership/retry coverage takes about 140s under TSan.
+# Expanded multiworker ownership/retry coverage takes about 225s under TSan.
 # Keep a bounded per-test budget with headroom for sanitizer/runner overhead.
-test('session', test_session_exe, timeout: 180)
+test('session', test_session_exe, timeout: 300)
 
 # ============================================================================
 # Rotation Strategy Vtable (Issue #600)
@@ -7070,6 +7070,19 @@ test_evaluation_iteration_cap_exe = executable(
 )
 test('evaluation_iteration_cap', test_evaluation_iteration_cap_exe,
      suite: ['unit', 'tsan'], timeout: 60)
+
+test_session_budget_refusal_exe = executable(
+  'test_session_budget_refusal', files('test_session_budget_refusal.c'),
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
+  c_args: ['-DWL_SESSION_TEST_HOOKS=1'],
+  link_with: [testlib_prod],
+)
+# 12 cells of 17 governed runs, each creating its own sessions.  meson
+# sets MALLOC_PERTURB_, which makes glibc scrub every session's 64MB arena, so
+# this runs several times slower under meson than run directly.
+test('session_budget_refusal', test_session_budget_refusal_exe,
+     suite: ['unit', 'tsan'], timeout: 300)
 
 test_evaluation_session_physical_exe = executable(
   'test_evaluation_session_physical', files('test_evaluation_session_physical.c'),

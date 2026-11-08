@@ -30,6 +30,7 @@
 #include "../wirelog/intern.h"
 #include "../wirelog/wirelog-parser.h"
 #include "../wirelog/wirelog.h"
+#include "../wirelog/session_facts.h"
 #include "../wirelog/wirelog-internal.h"
 #include "plan_fixture.h"
 
@@ -9504,12 +9505,12 @@ test_tdd_wide_worker_private_rollback(uint32_t width, unsigned fault_mode)
             wide_timestamp_after_subpass;
         wl_columnar_radix_admission_test_hook = wide_radix_transition;
     }
+    /* The retry discards the planted stamped rows, which have no input shadow,
+     * and derives every key again (#2348). */
     if (fault_mode == 8)
-        wl_columnar_eval_test_before_worker_image = wide_rollback_before_image;
+        wide_merge_check_timestamps = false;
     int retry_rc = wl_session_snapshot(session, wide_rollback_collect,
             &rows);
-    if (fault_mode == 8)
-        wl_columnar_eval_test_before_worker_image = NULL;
     if (fault_mode == 7) {
         WIDE_CHECK(retry_rc == ENOMEM && rows.count == 0
             && wide_radix_admission.prepared
@@ -10916,7 +10917,10 @@ test_global_read_publication(uint32_t workers, unsigned initial,
         GLOBAL_CHECK(wl_session_snapshot(session, collect_tuple, &tuples) == 0,
             "global exact public retry");
     } else GLOBAL_CHECK(rc == 0, "global healthy snapshot");
-    unsigned expected = initial == 2 ? 4 : 2;
+    /* A retry discards what the failed attempt left in a head, keeping only
+     * host input.  These rows were planted with no input shadow (#2348). */
+    const bool planted_survives = initial == 2 && mode == 0;
+    unsigned expected = planted_survives ? 4 : 2;
     GLOBAL_CHECK(tuples.count == expected && coord->tdd_workers_count == 0,
         "global exact tuple count and teardown");
     for (uint32_t ri = 0; ri < 2; ri++) {
@@ -10928,8 +10932,9 @@ test_global_read_publication(uint32_t workers, unsigned initial,
         if (initial != 0)
             GLOBAL_CHECK(r->column_types &&
                 r->column_types[0] == WIRELOG_TYPE_INT64
-                && r->timestamps, "global metadata and timestamps");
-        if (initial == 2)
+                && (mode != 0 || r->timestamps),
+                "global metadata and timestamps");
+        if (planted_survives)
             GLOBAL_CHECK(col_rel_get(r, 0, 0) == 7 && col_rel_get(r, 0, 1) == 7
                 && r->timestamps[0].iteration == idb_timestamp(0).iteration,
                 "global seed provenance");
@@ -11152,7 +11157,7 @@ test_global_read_prefix_retry(uint32_t workers, unsigned mode)
         "prefix failure status or callbacks");
     /* `pre` completed; mode 3 also leaves the failed stratum's workers
      * retained across the retry's clear. */
-    PREFIX_CHECK(coord->uncommitted_strata_done == 1
+    PREFIX_CHECK(coord->uncommitted_strata_extent == 2
         && coord->tdd_workers_count == (mode == 3 ? workers : 0),
         "prefix completed stratum or retained workers");
     if (mode <= 3) {
@@ -11713,12 +11718,31 @@ test_completion_repeated_failure(uint32_t workers, unsigned mode,
             sizeof(rule_frontier)) == 0
             && coord->total_iterations == iterations,
             "repeat retry changed the target");
-        REPEAT_CHECK(wl_session_insert(session, "input", &blocked, 1, 1)
-            == EBUSY && wl_session_remove(session, "input", &values[0], 1, 1)
-            == EBUSY && input->nrows == input_rows,
-            "repeat input stays refused");
+        if (attempt < 2) {
+            REPEAT_CHECK(wl_session_insert(session, "input", &blocked, 1, 1)
+                == EBUSY && wl_session_remove(session, "input", &values[0], 1,
+                1) == EBUSY && input->nrows == input_rows,
+                "repeat input stays refused");
+        } else {
+            /* A zero-row call succeeds and changes no row, but it is still an
+             * input call. */
+            REPEAT_CHECK((attempt == 2 ? wl_session_insert(session, "input",
+                &blocked, 0, 1) : wl_session_remove(session, "input",
+                &values[0], 0, 1)) == 0 && input->nrows == input_rows
+                && coord->plain_step_completion_pending,
+                "repeat zero-row input");
+        }
         REPEAT_CHECK(!wl_session_budget_denied(session),
-            "repeat refused input clears the denial flag");
+            "repeat input call clears the denial flag");
+        REPEAT_CHECK(col_session_insert_incremental(session, "input", &blocked,
+            1, 1) == EBUSY && input->nrows == input_rows,
+            "repeat incremental insert stays refused");
+        wirelog_compound_arg_t compound_arg = { WIRELOG_TYPE_INT64, 42 };
+        uint64_t compound_handle = 123;
+        REPEAT_CHECK(wl_session_make_compound(session, "guard", 1,
+            &compound_arg, &compound_handle) == EBUSY
+            && compound_handle == WIRELOG_COMPOUND_HANDLE_NULL,
+            "repeat compound stays refused");
     }
     wl_columnar_eval_test_before_final_normalize = NULL;
     idb_restore_budget(coord);
@@ -12047,8 +12071,11 @@ test_specialized_publication(uint32_t workers, unsigned initial, unsigned mode,
             "specialized public retry");
     } else SPECIAL_CHECK(rc == 0, "specialized healthy evaluation");
     target = session_find_rel(coord, "output");
+    /* A retry discards what the failed attempt left in a head, keeping only
+     * host input.  These rows were planted with no input shadow (#2348). */
+    const bool planted_survives = initial == 2 && healthy;
     uint32_t expected_rows = mode == 16 ? count + (initial == 2)
-        : mode == 17 ? (initial == 2) : 1 + (initial == 2);
+        : mode == 17 ? (initial == 2) : planted_survives ? 2u : 1u;
     SPECIAL_CHECK(target && target->nrows == expected_rows &&
         coord->tdd_workers_count == 0
         && !coord->cleanup_pending && coord->cleanup_reserved_bytes == 0,
@@ -12255,7 +12282,9 @@ merge_denial_run(uint32_t target_rows, bool target_plain, uint64_t headroom,
     wl_columnar_session_budget_denial_clear(coord);
     MERGE_CHECK(wl_session_step(session) == 0, "merge retry");
     target = session_find_rel(coord, "output");
-    MERGE_CHECK(target && target->nrows == target_rows + count
+    /* The retry discards the planted head rows, which have no input shadow
+     * (#2348). */
+    MERGE_CHECK(target && target->nrows == count
         && !coord->memory_budget_denied, "merge retry result");
 merge_cleanup:
     wl_columnar_eval_test_nonrec_boundary = NULL;
@@ -18391,6 +18420,1239 @@ test_refused_channel_reservation(uint32_t workers, const char *program)
     PASS();
 }
 
+/* Refuse the final normalization of one relation, once per attempt, on the
+ * coordinator (#2348). */
+static const char *failed_attempt_refuse_rel;
+static unsigned failed_attempt_refuse_hits;
+
+static void
+failed_attempt_refuse_finalize(wl_col_session_t *coord, col_rel_t *target)
+{
+    if (coord->coordinator
+        || strcmp(target->name, failed_attempt_refuse_rel) != 0)
+        return;
+    failed_attempt_refuse_hits++;
+    if (!idb_budget_changed)
+        idb_set_budget(coord);
+}
+
+/* Refuse on a later delta clone of `p`: the first evaluation is mid-fixpoint,
+ * with rows in the head and no cursor.  Works at any worker count on the serial
+ * path. */
+static unsigned failed_attempt_clone_hits;
+
+static void
+failed_attempt_refuse_clone(wl_col_session_t *sess, col_rel_t *target)
+{
+    if (strcmp(target->name, "p") == 0 && ++failed_attempt_clone_hits == 3
+        && !idb_budget_changed)
+        idb_set_budget(sess);
+}
+
+/* Refuse mid-fixpoint: rows from earlier iterations are in the head (#2348). */
+static void
+failed_attempt_refuse_after_iteration(wl_col_session_t *coord,
+    uint32_t iteration, bool before)
+{
+    if (!before && iteration == 1 && !idb_budget_changed)
+        idb_set_budget(coord);
+}
+
+static uint64_t failed_attempt_ignored_rows;
+
+static void
+failed_attempt_count_row(const char *relation, const int64_t *row,
+    uint32_t ncols, void *user)
+{
+    (void)relation;
+    (void)row;
+    (void)ncols;
+    (*(uint64_t *)user)++;
+}
+
+static int
+failed_attempt_verb(wl_session_t *session, bool snapshot)
+{
+    return snapshot ? wl_session_snapshot(session, failed_attempt_count_row,
+               &failed_attempt_ignored_rows) : wl_session_step(session);
+}
+
+static bool
+failed_attempt_rel_contains(const col_rel_t *rel, int64_t x, int64_t y)
+{
+    for (uint32_t i = 0; i < rel->nrows; i++) {
+        if (col_rel_get(rel, i, 0) == x && col_rel_get(rel, i, 1) == y)
+            return true;
+    }
+    return false;
+}
+
+/* Same count of two-column rows in each named relation, and the same set in
+ * both directions, so a duplicate cannot stand in for a lost row. */
+static const char *
+failed_attempt_models_match(wl_session_t *actual, wl_session_t *reference,
+    const char *const *names, unsigned name_count)
+{
+    for (unsigned n = 0; n < name_count; n++) {
+        const col_rel_t *a = session_find_rel(COL_SESSION(actual), names[n]);
+        const col_rel_t *b = session_find_rel(COL_SESSION(reference), names[n]);
+        if (!a || !b || a->ncols != 2 || b->ncols != 2)
+            return "failed attempt compare: relation shape";
+        if (a->nrows != b->nrows) {
+            printf(" (%s: %u rows vs %u)", names[n], a->nrows, b->nrows);
+            return "failed attempt compare: row count differs";
+        }
+        for (uint32_t i = 0; i < a->nrows; i++) {
+            if (!failed_attempt_rel_contains(b, col_rel_get(a, i, 0),
+                col_rel_get(a, i, 1))
+                || !failed_attempt_rel_contains(a, col_rel_get(b, i, 0),
+                col_rel_get(b, i, 1)))
+                return "failed attempt compare: row sets differ";
+        }
+    }
+    return NULL;
+}
+
+enum {
+    FAILED_ATTEMPT_THEN_NOTHING = 0,
+    FAILED_ATTEMPT_THEN_REMOVE = 1,
+    FAILED_ATTEMPT_THEN_INSERT = 2
+};
+
+static int
+failed_attempt_change_input(wl_session_t *session, unsigned change)
+{
+    static const int64_t edge[2] = { 10, 11 };
+    static const int64_t extra[2] = { 21, 22 };
+    return change == FAILED_ATTEMPT_THEN_REMOVE
+           ? wl_session_remove(session, "e", edge, 1, 2)
+           : change == FAILED_ATTEMPT_THEN_INSERT
+           ? wl_session_insert(session, "e", extra, 1, 2) : 0;
+}
+
+static const char *
+failed_attempt_check_reference(wl_session_t *session, wl_plan_t *plan,
+    uint32_t workers, unsigned change, const char *const *names,
+    unsigned name_count)
+{
+    wl_session_t *reference = NULL;
+    const char *failure = NULL;
+    if (wl_session_create(wl_backend_columnar(), plan, workers, &reference)
+        != 0)
+        return "failed attempt reference session";
+    if (failed_attempt_insert_chain(reference, 20) != 0
+        || failed_attempt_change_input(reference, change) != 0
+        || wl_session_step(reference) != 0)
+        failure = "failed attempt reference evaluation";
+    else
+        failure = failed_attempt_models_match(session, reference, names,
+                name_count);
+    wl_session_destroy(reference);
+    return failure;
+}
+
+/* A refused recursive final normalization: a STEP keeps its merged result behind
+ * a cursor and input stays refused until it completes.  A SNAPSHOT arms nothing,
+ * so input stays open and the next evaluation must derive the model from the
+ * current input alone (#2348). */
+static void
+test_failed_attempt_refused_finalize(uint32_t workers, const char *program,
+    const char *refuse_rel, const char *const *names, unsigned name_count,
+    bool fail_snapshot, bool recover_snapshot, unsigned change)
+{
+    TEST("failed recursive finalization re-derives from the current input");
+    failed_attempt_env_t env;
+    wl_session_t *session = NULL;
+    const char *failure = NULL;
+#define ATTEMPT_CHECK(c, m) do { if (!(c)) { failure = (m); \
+                                             goto attempt_cleanup; \
+                                 } } while (0)
+    failed_attempt_env_set(&env);
+    idb_budget_changed = false;
+    failed_attempt_refuse_rel = refuse_rel;
+    failed_attempt_refuse_hits = 0;
+    wl_plan_t *plan = build_plan(program);
+    ATTEMPT_CHECK(plan, "attempt plan");
+    ATTEMPT_CHECK(wl_session_create(wl_backend_columnar(), plan, workers,
+        &session) == 0, "attempt session");
+    wl_col_session_t *coord = COL_SESSION(session);
+    ATTEMPT_CHECK(failed_attempt_insert_chain(session, 20) == 0,
+        "attempt input");
+    wl_columnar_eval_test_before_final_normalize =
+        failed_attempt_refuse_finalize;
+    int rc = failed_attempt_verb(session, fail_snapshot);
+    wl_columnar_eval_test_before_final_normalize = NULL;
+    idb_restore_budget(coord);
+    ATTEMPT_CHECK(failed_attempt_refuse_hits != 0, "attempt reached the hook");
+    ATTEMPT_CHECK(rc == ENOSPC && wl_session_budget_denied(session)
+        && coord->plain_step_completion_pending == !fail_snapshot,
+        "attempt refusal");
+    if (!fail_snapshot) {
+        ATTEMPT_CHECK(change == FAILED_ATTEMPT_THEN_NOTHING
+            || failed_attempt_change_input(session, change) == EBUSY,
+            "attempt input refused behind the cursor");
+        ATTEMPT_CHECK(failed_attempt_verb(session, recover_snapshot) == 0,
+            "attempt cursor recovery");
+    }
+    ATTEMPT_CHECK(failed_attempt_change_input(session, change) == 0,
+        "attempt input open");
+    ATTEMPT_CHECK(failed_attempt_verb(session, recover_snapshot) == 0,
+        "attempt recovery");
+    failure = failed_attempt_check_reference(session, plan, workers, change,
+            names, name_count);
+    if (failure)
+        goto attempt_cleanup;
+    ATTEMPT_CHECK(coord->uncommitted_strata_extent == 0,
+        "attempt extent after the commit");
+attempt_cleanup:
+    wl_columnar_eval_test_before_final_normalize = NULL;
+    if (session)
+        idb_restore_budget(COL_SESSION(session));
+    wl_session_destroy(session);
+    wl_plan_free(plan);
+    failed_attempt_env_restore(&env);
+    if (failure) {
+        FAIL(failure); return;
+    }
+    PASS();
+#undef ATTEMPT_CHECK
+}
+
+/* A reader on a worker relation refuses worker retirement in a recursive
+ * stratum.  Only worker 0's relation is read; the caller reads these after the
+ * join (#2348). */
+static wl_columnar_source_access_reader_t failed_attempt_reader;
+static int failed_attempt_reader_rc;
+
+static void
+failed_attempt_hold_worker_input(wl_col_session_t *coord, uint32_t iteration,
+    bool before)
+{
+    (void)iteration;
+    if (before || failed_attempt_reader.owner || coord->tdd_workers_count == 0)
+        return;
+    col_rel_t *worker_input = session_find_rel(&coord->tdd_workers[0], "e");
+    failed_attempt_reader_rc = worker_input
+        ? col_rel_source_reader_acquire(worker_input, &failed_attempt_reader)
+        : ENOENT;
+}
+
+static void
+test_failed_attempt_refused_retirement(uint32_t workers, const char *program,
+    bool snapshot)
+{
+    TEST("failed recursive worker retirement recovers after the reader goes");
+    static const char *const names[] = { "p" };
+    failed_attempt_env_t env;
+    wl_session_t *session = NULL;
+    const char *failure = NULL;
+#define RETIRED_CHECK(c, m) do { if (!(c)) { failure = (m); \
+                                             goto retired_cleanup; \
+                                 } } while (0)
+    failed_attempt_env_set(&env);
+    memset(&failed_attempt_reader, 0, sizeof(failed_attempt_reader));
+    failed_attempt_reader_rc = EINVAL;
+    wl_plan_t *plan = build_plan(program);
+    RETIRED_CHECK(plan, "retired plan");
+    RETIRED_CHECK(wl_session_create(wl_backend_columnar(), plan, workers,
+        &session) == 0, "retired session");
+    wl_col_session_t *coord = COL_SESSION(session);
+    RETIRED_CHECK(failed_attempt_insert_chain(session, 20) == 0,
+        "retired input");
+    wl_columnar_eval_test_subpass_boundary = failed_attempt_hold_worker_input;
+    int rc = failed_attempt_verb(session, snapshot);
+    wl_columnar_eval_test_subpass_boundary = NULL;
+    RETIRED_CHECK(failed_attempt_reader_rc == 0, "retired reader");
+    RETIRED_CHECK(rc == EBUSY
+        && coord->plain_step_completion_pending == !snapshot
+        && coord->tdd_workers_count == workers, "retired refusal");
+    RETIRED_CHECK(failed_attempt_verb(session, snapshot) == EBUSY,
+        "retired retry with the reader held");
+    RETIRED_CHECK(col_rel_source_reader_release(&failed_attempt_reader) == 0,
+        "retired reader release");
+    /* Depending on the strategy, input can stay refused until a retry retires
+     * the retained workers. */
+    int remove_rc = failed_attempt_change_input(session,
+            FAILED_ATTEMPT_THEN_REMOVE);
+    if (remove_rc == EBUSY) {
+        RETIRED_CHECK(failed_attempt_verb(session, snapshot) == 0,
+            "retired retry that retires the workers");
+        remove_rc = failed_attempt_change_input(session,
+                FAILED_ATTEMPT_THEN_REMOVE);
+    }
+    RETIRED_CHECK(remove_rc == 0, "retired remove");
+    RETIRED_CHECK(failed_attempt_verb(session, snapshot) == 0
+        && coord->tdd_workers_count == 0, "retired recovery");
+    failure = failed_attempt_check_reference(session, plan, workers,
+            FAILED_ATTEMPT_THEN_REMOVE, names, 1);
+retired_cleanup:
+    wl_columnar_eval_test_subpass_boundary = NULL;
+    if (failed_attempt_reader.owner)
+        (void)col_rel_source_reader_release(&failed_attempt_reader);
+    wl_session_destroy(session);
+    wl_plan_free(plan);
+    failed_attempt_env_restore(&env);
+    if (failure) {
+        FAIL(failure); return;
+    }
+    PASS();
+#undef RETIRED_CHECK
+}
+
+/* An earlier stratum armed the cursor, so input stays refused.  On recovery the
+ * failed stratum's partial rows are discarded and it runs again (#2348). */
+static void
+test_failed_attempt_with_cursor(uint32_t workers)
+{
+    TEST("failed fixpoint after an armed cursor keeps input refused");
+    static const char program[] =
+        ".decl e(x: int64, y: int64)\n.decl q(x: int64, y: int64)\n"
+        ".decl p(x: int64, y: int64)\nq(x,y) :- e(x,y).\np(x,y) :- q(x,y).\n"
+        "p(x,w) :- p(x,y), p(y,w).\n";
+    static const char *const names[] = { "q", "p" };
+    static const int64_t edge[2] = { 10, 11 };
+    failed_attempt_env_t env;
+    wl_session_t *session = NULL;
+    const char *failure = NULL;
+#define ARMED_CHECK(c, m) do { if (!(c)) { failure = (m); \
+                                           goto armed_cleanup; \
+                               } } while (0)
+    failed_attempt_env_set(&env);
+    idb_budget_changed = false;
+    wl_plan_t *plan = build_plan(program);
+    ARMED_CHECK(plan, "armed plan");
+    ARMED_CHECK(wl_session_create(wl_backend_columnar(), plan, workers,
+        &session) == 0, "armed session");
+    wl_col_session_t *coord = COL_SESSION(session);
+    ARMED_CHECK(failed_attempt_insert_chain(session, 20) == 0, "armed input");
+    wl_columnar_eval_test_subpass_boundary =
+        failed_attempt_refuse_after_iteration;
+    ARMED_CHECK(wl_session_step(session) != 0, "armed refusal");
+    wl_columnar_eval_test_subpass_boundary = NULL;
+    idb_restore_budget(coord);
+    ARMED_CHECK(coord->plain_step_completion_pending
+        && coord->plain_step_completion_phase
+        == WL_COLUMNAR_PLAIN_STEP_COMPLETION_EVALUATE_REMAINING
+        && coord->plain_step_completion_stratum == 0, "armed cursor");
+    ARMED_CHECK(wl_session_remove(session, "e", edge, 1, 2) == EBUSY,
+        "armed input refused");
+    ARMED_CHECK(wl_session_step(session) == 0
+        && !coord->plain_step_completion_pending, "armed recovery");
+    failure = failed_attempt_check_reference(session, plan, workers,
+            FAILED_ATTEMPT_THEN_NOTHING, names, 2);
+armed_cleanup:
+    wl_columnar_eval_test_subpass_boundary = NULL;
+    if (session)
+        idb_restore_budget(COL_SESSION(session));
+    wl_session_destroy(session);
+    wl_plan_free(plan);
+    failed_attempt_env_restore(&env);
+    if (failure) {
+        FAIL(failure); return;
+    }
+    PASS();
+#undef ARMED_CHECK
+}
+
+/* Host facts in a rule head survive the discard; one removed after the failure
+ * stays gone (#2348). */
+static void
+test_failed_attempt_host_seed(uint32_t workers)
+{
+    TEST("failed recursive fixpoint keeps host facts in the rule head");
+    static const char text[] =
+        ".decl e(x: int64, y: int64)\n.decl p(x: int64, y: int64)\n"
+        "p(100,101).\np(101,102).\np(x,y) :- e(x,y).\n"
+        "p(x,w) :- p(x,y), p(y,w).\n";
+    static const int64_t seed[2] = { 100, 101 };
+    failed_attempt_env_t env;
+    wl_session_t *session = NULL;
+    wl_session_t *reference = NULL;
+    wirelog_program_t *program = NULL;
+    wl_plan_t *plan = NULL;
+    const char *failure = NULL;
+    static const char *const names[] = { "p" };
+    wirelog_error_t error;
+#define SEED_CHECK(c, m) do { if (!(c)) { failure = (m); \
+                                          goto seed_cleanup; \
+                              } } while (0)
+    failed_attempt_env_set(&env);
+    idb_budget_changed = false;
+    program = wirelog_parse_string(text, &error);
+    SEED_CHECK(program && wl_plan_from_program(program, &plan) == 0,
+        "seed plan");
+    SEED_CHECK(wl_session_create(wl_backend_columnar(), plan, workers,
+        &session) == 0
+        && wl_session_create(wl_backend_columnar(), plan, workers,
+        &reference) == 0, "seed sessions");
+    SEED_CHECK(wl_session_load_facts(session, program) == 0
+        && wl_session_load_facts(reference, program) == 0, "seed facts");
+    SEED_CHECK(failed_attempt_insert_chain(session, 20) == 0
+        && failed_attempt_insert_chain(reference, 20) == 0, "seed input");
+    wl_columnar_eval_test_subpass_boundary =
+        failed_attempt_refuse_after_iteration;
+    int rc = wl_session_step(session);
+    wl_columnar_eval_test_subpass_boundary = NULL;
+    idb_restore_budget(COL_SESSION(session));
+    SEED_CHECK(rc != 0 && !COL_SESSION(session)->plain_step_completion_pending,
+        "seed refusal");
+    SEED_CHECK(wl_session_remove(session, "p", seed, 1, 2) == 0
+        && wl_session_remove(reference, "p", seed, 1, 2) == 0, "seed remove");
+    SEED_CHECK(wl_session_step(session) == 0 && wl_session_step(reference) == 0,
+        "seed recovery");
+    failure = failed_attempt_models_match(session, reference, names, 1);
+seed_cleanup:
+    wl_columnar_eval_test_subpass_boundary = NULL;
+    if (session)
+        idb_restore_budget(COL_SESSION(session));
+    wl_session_destroy(session);
+    wl_session_destroy(reference);
+    wl_plan_free(plan);
+    wirelog_program_free(program);
+    failed_attempt_env_restore(&env);
+    if (failure) {
+        FAIL(failure); return;
+    }
+    PASS();
+#undef SEED_CHECK
+}
+
+typedef struct {
+    uint64_t added;
+    uint64_t removed;
+} failed_attempt_events_t;
+
+static void
+failed_attempt_count_event(const char *relation, const int64_t *row,
+    uint32_t ncols, int32_t diff, void *user)
+{
+    failed_attempt_events_t *events = user;
+    (void)row;
+    (void)ncols;
+    if (strcmp(relation, "p") != 0)
+        return;
+    if (diff > 0)
+        events->added++;
+    else
+        events->removed++;
+}
+
+/* Removals applied after the failed attempt, before or after installing the
+ * callback. */
+enum {
+    FAILED_CALLBACK_REMOVE_EDGE = 1,
+    FAILED_CALLBACK_REMOVE_HEAD_ROW = 2
+};
+
+static int
+failed_callback_remove(wl_session_t *session, unsigned removals)
+{
+    static const int64_t row[2] = { 10, 11 };
+    int rc = 0;
+    if (removals & FAILED_CALLBACK_REMOVE_HEAD_ROW)
+        rc = wl_session_remove(session, "p", row, 1, 2);
+    if (rc == 0 && (removals & FAILED_CALLBACK_REMOVE_EDGE))
+        rc = wl_session_remove(session, "e", row, 1, 2);
+    return rc;
+}
+
+static void
+failed_attempt_install_refusal(uint32_t workers)
+{
+    if (workers <= 1)
+        wl_columnar_eval_serial_test_before_delta_clone =
+            failed_attempt_refuse_clone;
+    else
+        wl_columnar_eval_test_subpass_boundary =
+            failed_attempt_refuse_after_iteration;
+}
+
+static void
+failed_attempt_clear_refusal(void)
+{
+    wl_columnar_eval_serial_test_before_delta_clone = NULL;
+    wl_columnar_eval_test_subpass_boundary = NULL;
+}
+
+/* A delta callback installed after a failed first plain evaluation must report
+ * the whole model, not take the failed attempt's rows as its baseline, and a
+ * head row removed from that attempt was never published (#2348). */
+static void
+test_failed_attempt_then_callback(uint32_t workers, unsigned removals,
+    bool remove_first)
+{
+    TEST("delta callback after a failed attempt reports the whole model");
+    failed_attempt_env_t env;
+    failed_attempt_events_t events = { 0 }, expected = { 0 };
+    wl_session_t *session = NULL, *reference = NULL;
+    const char *failure = NULL;
+#define EVENT_CHECK(c, m) do { if (!(c)) { failure = (m); \
+                                           goto event_cleanup; \
+                               } } while (0)
+    failed_attempt_env_set(&env);
+    idb_budget_changed = false;
+    failed_attempt_clone_hits = 0;
+    wl_plan_t *plan = build_plan(failed_attempt_binary);
+    EVENT_CHECK(plan, "event plan");
+    EVENT_CHECK(wl_session_create(wl_backend_columnar(), plan, workers,
+        &session) == 0 && wl_session_create(wl_backend_columnar(), plan,
+        workers, &reference) == 0, "event sessions");
+    EVENT_CHECK(failed_attempt_insert_chain(session, 20) == 0
+        && failed_attempt_insert_chain(reference, 20) == 0, "event input");
+    failed_attempt_install_refusal(workers);
+    int rc = wl_session_step(session);
+    failed_attempt_clear_refusal();
+    idb_restore_budget(COL_SESSION(session));
+    EVENT_CHECK(rc != 0 && !COL_SESSION(session)->plain_step_completion_pending,
+        "event refusal");
+    const col_rel_t *head = session_find_rel(COL_SESSION(session), "p");
+    EVENT_CHECK(head && head->nrows > 0,
+        "event failed attempt left no rows to mistake");
+    if (removals && remove_first) {
+        EVENT_CHECK(failed_callback_remove(session, removals) == 0,
+            "event remove before the callback");
+    }
+    wl_session_set_delta_cb(session, failed_attempt_count_event, &events);
+    wl_session_set_delta_cb(reference, failed_attempt_count_event, &expected);
+    if (removals && !remove_first) {
+        EVENT_CHECK(failed_callback_remove(session, removals) == 0,
+            "event remove after the callback");
+    }
+    if (removals & FAILED_CALLBACK_REMOVE_EDGE) {
+        /* Only the edge exists in a session that never derived the head row. */
+        EVENT_CHECK(failed_callback_remove(reference,
+            FAILED_CALLBACK_REMOVE_EDGE) == 0, "event reference remove");
+    }
+    EVENT_CHECK(wl_session_step(session) == 0
+        && wl_session_step(reference) == 0, "event recovery");
+    EVENT_CHECK(expected.added == (removals & FAILED_CALLBACK_REMOVE_EDGE
+        ? 100u : 210u) && expected.removed == 0, "event reference stream");
+    if (events.added != expected.added || events.removed != expected.removed) {
+        printf(" (+%llu -%llu)", (unsigned long long)events.added,
+            (unsigned long long)events.removed);
+        failure = "event stream differs from the reference";
+    }
+event_cleanup:
+    failed_attempt_clear_refusal();
+    if (session)
+        idb_restore_budget(COL_SESSION(session));
+    wl_session_destroy(session);
+    wl_session_destroy(reference);
+    wl_plan_free(plan);
+    failed_attempt_env_restore(&env);
+    if (failure) {
+        FAIL(failure); return;
+    }
+    PASS();
+#undef EVENT_CHECK
+}
+
+/* After a later plain evaluation fails, the committed model is gone, so no
+ * baseline can yield correct events.  The retry reports nothing, and the
+ * callback observes from the next step (#2348). */
+static void
+test_failed_later_attempt_then_callback(uint32_t workers, bool remove_edge)
+{
+    TEST("delta callback after a failed later attempt starts at the next step");
+    static const char *const names[] = { "p" };
+    static const int64_t added[2] = { 21, 22 };
+    static const int64_t next[2] = { 22, 23 };
+    static const int64_t edge[2] = { 10, 11 };
+    failed_attempt_env_t env;
+    failed_attempt_events_t events = { 0 }, expected = { 0 };
+    wl_session_t *session = NULL, *reference = NULL;
+    const char *failure = NULL;
+#define LATER_EVENT_CHECK(c, m) do { if (!(c)) { failure = (m); \
+                                                 goto later_event_cleanup; \
+                                     } } while (0)
+    failed_attempt_env_set(&env);
+    idb_budget_changed = false;
+    failed_attempt_clone_hits = 0;
+    wl_plan_t *plan = build_plan(failed_attempt_binary);
+    LATER_EVENT_CHECK(plan, "later event plan");
+    LATER_EVENT_CHECK(wl_session_create(wl_backend_columnar(), plan, workers,
+        &session) == 0 && wl_session_create(wl_backend_columnar(), plan,
+        workers, &reference) == 0, "later event sessions");
+    LATER_EVENT_CHECK(failed_attempt_insert_chain(session, 20) == 0
+        && failed_attempt_insert_chain(reference, 20) == 0
+        && wl_session_step(session) == 0 && wl_session_step(reference) == 0,
+        "later event commit");
+    LATER_EVENT_CHECK(wl_session_insert(session, "e", added, 1, 2) == 0
+        && wl_session_insert(reference, "e", added, 1, 2) == 0,
+        "later event input");
+    failed_attempt_install_refusal(workers);
+    int rc = wl_session_step(session);
+    failed_attempt_clear_refusal();
+    idb_restore_budget(COL_SESSION(session));
+    LATER_EVENT_CHECK(rc != 0
+        && !COL_SESSION(session)->plain_step_completion_pending,
+        "later event refusal");
+    wl_session_set_delta_cb(session, failed_attempt_count_event, &events);
+    if (remove_edge) {
+        LATER_EVENT_CHECK(wl_session_remove(session, "e", edge, 1, 2) == 0
+            && wl_session_remove(reference, "e", edge, 1, 2) == 0,
+            "later event remove");
+    }
+    LATER_EVENT_CHECK(wl_session_step(session) == 0
+        && wl_session_step(reference) == 0, "later event retry");
+    LATER_EVENT_CHECK(events.added == 0 && events.removed == 0,
+        "later event retry reported events");
+    failure = failed_attempt_models_match(session, reference, names, 1);
+    if (failure)
+        goto later_event_cleanup;
+    /* From here the callback sees exact changes from the committed model. */
+    wl_session_set_delta_cb(reference, failed_attempt_count_event, &expected);
+    LATER_EVENT_CHECK(wl_session_insert(session, "e", next, 1, 2) == 0
+        && wl_session_insert(reference, "e", next, 1, 2) == 0
+        && wl_session_step(session) == 0 && wl_session_step(reference) == 0,
+        "later event next step");
+    LATER_EVENT_CHECK(expected.added != 0, "later event reference stream");
+    LATER_EVENT_CHECK(events.added == expected.added
+        && events.removed == expected.removed,
+        "later event next step differs from the reference");
+    failure = failed_attempt_models_match(session, reference, names, 1);
+later_event_cleanup:
+    failed_attempt_clear_refusal();
+    if (session)
+        idb_restore_budget(COL_SESSION(session));
+    wl_session_destroy(session);
+    wl_session_destroy(reference);
+    wl_plan_free(plan);
+    failed_attempt_env_restore(&env);
+    if (failure) {
+        FAIL(failure); return;
+    }
+    PASS();
+#undef LATER_EVENT_CHECK
+}
+
+/* Workers retained by a failed later evaluation can borrow a head that survived
+ * its commit, which refuses the clear unless they retire first (#2348). */
+static wl_columnar_source_access_reader_t failed_later_reader;
+
+static void
+failed_later_hold_worker_head(wl_col_session_t *coord, uint32_t iteration,
+    bool before)
+{
+    /* Fail before the merge, so that no cursor keeps the attempt resumable. */
+    failed_attempt_refuse_after_iteration(coord, iteration, before);
+    if (before || failed_later_reader.owner || coord->tdd_workers_count == 0)
+        return;
+    col_rel_t *worker_head = session_find_rel(&coord->tdd_workers[0], "r");
+    if (worker_head)
+        (void)col_rel_source_reader_acquire(worker_head, &failed_later_reader);
+}
+
+static void
+test_failed_later_attempt_retained_workers(uint32_t workers, bool snapshot)
+{
+    TEST("failed later evaluation retires retained workers before clearing");
+    static const char program[] = FAILED_ATTEMPT_DECLS
+        "p(x,w) :- p(x,y), p(y,w).\n.decl r(x: int64, y: int64)\n"
+        "r(x,y) :- p(x,y).\n";
+    static const char *const names[] = { "p", "r" };
+    failed_attempt_env_t env;
+    wl_session_t *session = NULL;
+    const char *failure = NULL;
+#define RETAINED_CHECK(c, m) do { if (!(c)) { failure = (m); \
+                                              goto retained_cleanup; \
+                                  } } while (0)
+    failed_attempt_env_set(&env);
+    memset(&failed_later_reader, 0, sizeof(failed_later_reader));
+    wl_plan_t *plan = build_plan(program);
+    RETAINED_CHECK(plan, "retained plan");
+    RETAINED_CHECK(wl_session_create(wl_backend_columnar(), plan, workers,
+        &session) == 0, "retained session");
+    wl_col_session_t *coord = COL_SESSION(session);
+    RETAINED_CHECK(failed_attempt_insert_chain(session, 20) == 0
+        && wl_session_step(session) == 0, "retained commit");
+    RETAINED_CHECK(failed_attempt_change_input(session,
+        FAILED_ATTEMPT_THEN_INSERT) == 0, "retained input");
+    wl_columnar_eval_test_subpass_boundary = failed_later_hold_worker_head;
+    int rc = wl_session_step(session);
+    wl_columnar_eval_test_subpass_boundary = NULL;
+    idb_restore_budget(coord);
+    RETAINED_CHECK(failed_later_reader.owner && rc != 0
+        && !coord->plain_step_completion_pending
+        && coord->tdd_workers_count > 0, "retained refusal");
+    RETAINED_CHECK(col_rel_source_reader_release(&failed_later_reader) == 0,
+        "retained reader release");
+    if (snapshot) {
+        rc = wl_session_snapshot(session, failed_attempt_count_row,
+                &failed_attempt_ignored_rows);
+    } else {
+        rc = wl_session_step(session);
+    }
+    RETAINED_CHECK(rc == 0 && coord->tdd_workers_count == 0,
+        "retained recovery");
+    failure = failed_attempt_check_reference(session, plan, workers,
+            FAILED_ATTEMPT_THEN_INSERT, names, 2);
+retained_cleanup:
+    wl_columnar_eval_test_subpass_boundary = NULL;
+    if (session)
+        idb_restore_budget(COL_SESSION(session));
+    if (failed_later_reader.owner)
+        (void)col_rel_source_reader_release(&failed_later_reader);
+    wl_session_destroy(session);
+    wl_plan_free(plan);
+    failed_attempt_env_restore(&env);
+    if (failure) {
+        FAIL(failure); return;
+    }
+    PASS();
+#undef RETAINED_CHECK
+}
+
+#ifdef WL_TEST_ALLOC_WRAP
+static void
+failed_attempt_fail_alloc_after_iteration(wl_col_session_t *coord,
+    uint32_t iteration, bool before)
+{
+    (void)coord;
+    if (!before && iteration == 1)
+        fail_next_alloc = true;
+}
+#endif
+
+static void
+test_failed_attempt_mid_fixpoint(uint32_t workers, const char *program,
+    bool fail_alloc)
+{
+    TEST("failed recursive fixpoint re-derives from the current input");
+    static const char *const names[] = { "p" };
+    failed_attempt_env_t env;
+    wl_session_t *session = NULL;
+    const char *failure = NULL;
+#define MID_CHECK(c, m) do { if (!(c)) { failure = (m); \
+                                         goto mid_cleanup; \
+                             } } while (0)
+    failed_attempt_env_set(&env);
+    idb_budget_changed = false;
+    failed_attempt_clone_hits = 0;
+    wl_plan_t *plan = build_plan(program);
+    MID_CHECK(plan, "mid plan");
+    MID_CHECK(wl_session_create(wl_backend_columnar(), plan, workers, &session)
+        == 0, "mid session");
+    wl_col_session_t *coord = COL_SESSION(session);
+    MID_CHECK(failed_attempt_insert_chain(session, 20) == 0, "mid input");
+    failed_attempt_install_refusal(workers);
+#ifdef WL_TEST_ALLOC_WRAP
+    if (fail_alloc)
+        wl_columnar_eval_test_subpass_boundary =
+            failed_attempt_fail_alloc_after_iteration;
+#else
+    (void)fail_alloc;
+#endif
+    int rc = wl_session_step(session);
+    failed_attempt_clear_refusal();
+#ifdef WL_TEST_ALLOC_WRAP
+    fail_next_alloc = false;
+#endif
+    idb_restore_budget(coord);
+    MID_CHECK(rc != 0 && !coord->plain_step_completion_pending, "mid refusal");
+    const col_rel_t *head = session_find_rel(coord, "p");
+    MID_CHECK(head && head->nrows > 0, "mid failed attempt left no rows");
+    int remove_rc = failed_attempt_change_input(session,
+            FAILED_ATTEMPT_THEN_REMOVE);
+    MID_CHECK(remove_rc == 0, "mid input stays open");
+    MID_CHECK(wl_session_step(session) == 0, "mid recovery");
+    failure = failed_attempt_check_reference(session, plan, workers,
+            FAILED_ATTEMPT_THEN_REMOVE, names, 1);
+mid_cleanup:
+    wl_columnar_eval_serial_test_before_delta_clone = NULL;
+    wl_columnar_eval_test_subpass_boundary = NULL;
+    if (session)
+        idb_restore_budget(COL_SESSION(session));
+    wl_session_destroy(session);
+    wl_plan_free(plan);
+    failed_attempt_env_restore(&env);
+    if (failure) {
+        FAIL(failure); return;
+    }
+    PASS();
+#undef MID_CHECK
+}
+
+/* Per-relation counts of final normalizations on the coordinator (#2329). */
+static const char *replay_refuse_rel;
+static unsigned replay_counts[3];
+static const char *const replay_names[3] = { "a", "b", "c" };
+static unsigned replay_refuse_mode;
+
+static void
+replay_count_and_refuse(wl_col_session_t *coord, col_rel_t *target)
+{
+    if (coord->coordinator)
+        return;
+    for (unsigned i = 0; i < 3; i++) {
+        if (strcmp(target->name, replay_names[i]) == 0)
+            replay_counts[i]++;
+    }
+    if (strcmp(target->name, replay_refuse_rel) != 0)
+        return;
+#ifdef WL_TEST_ALLOC_WRAP
+    if (replay_refuse_mode == COMPLETION_FAIL_ALLOC) {
+        fail_next_alloc = true;
+        return;
+    }
+#endif
+    if (!idb_budget_changed)
+        idb_set_budget(coord);
+}
+
+/* Two relations in one partitioned nonrecursive stratum, the second refused.
+ * The first is not finalized again on any retry (#2329). */
+static void
+test_completion_no_finalize_replay(uint32_t workers)
+{
+    TEST("W>=2 retries do not finalize a finished relation again");
+    uint8_t predicate[] = { WL_PLAN_EXPR_BOOL, 1 };
+    uint32_t key = 0;
+    wl_plan_op_exchange_t exchange = { .num_workers = 1,
+                                       .key_col_idxs = &key,
+                                       .key_col_count = 1 };
+    wl_plan_op_t ops[] = {
+        { .op = WL_PLAN_OP_VARIABLE, .relation_name = "input" },
+        { .op = WL_PLAN_OP_FILTER, .filter_expr = { predicate, 2 } },
+        { .op = WL_PLAN_OP_CONSOLIDATE },
+        { .op = WL_PLAN_OP_EXCHANGE, .opaque_data = &exchange }
+    };
+    wl_plan_relation_t relations[] = {
+        { .name = "a", .delta_name = "$d$a", .ops = ops, .op_count = 4 },
+        { .name = "b", .delta_name = "$d$b", .ops = ops, .op_count = 4 }
+    };
+    wl_plan_stratum_t stratum = { .relations = relations, .relation_count = 2,
+                                  .is_recursive = false };
+    const char *edb[] = { "input" };
+    wl_plan_t plan = { .strata = &stratum, .stratum_count = 1,
+                       .edb_relations = edb, .edb_count = 1 };
+    wl_session_t *session = NULL;
+    int64_t *values = NULL;
+    const char *failure = NULL;
+#define NO_REPLAY_CHECK(c, m) do { if (!(c)) { failure = (m); \
+                                               goto no_replay_cleanup; \
+                                   } } while (0)
+    memset(replay_counts, 0, sizeof(replay_counts));
+    replay_refuse_rel = "b";
+    replay_refuse_mode = COMPLETION_FAIL_BUDGET;
+    idb_budget_changed = false;
+    NO_REPLAY_CHECK(wl_session_create(wl_backend_columnar(), &plan, workers,
+        &session) == 0, "no-replay session");
+    wl_col_session_t *coord = COL_SESSION(session);
+    values = malloc(65536 * sizeof(*values));
+    NO_REPLAY_CHECK(values, "no-replay values");
+    for (uint32_t i = 0; i < 65536; i++)
+        values[i] = i & 1 ? 42 : 7;
+    NO_REPLAY_CHECK(wl_session_insert(session, "input", values, 65536, 1) == 0,
+        "no-replay input");
+    wl_columnar_eval_test_before_final_normalize = replay_count_and_refuse;
+    NO_REPLAY_CHECK(wl_session_step(session) == ENOSPC
+        && coord->plain_step_completion_pending
+        && coord->plain_step_completion_relation == 1
+        && replay_counts[0] == 1 && replay_counts[1] == 1, "no-replay refusal");
+    for (unsigned retry = 0; retry < 3; retry++) {
+        NO_REPLAY_CHECK(wl_session_step(session) == ENOSPC
+            && replay_counts[0] == 1 && replay_counts[1] == retry + 2,
+            "no-replay retry");
+    }
+    idb_restore_budget(coord);
+    replay_refuse_rel = "none";
+    NO_REPLAY_CHECK(wl_session_step(session) == 0 && replay_counts[0] == 1,
+        "no-replay recovery");
+    const col_rel_t *a = session_find_rel(coord, "a");
+    const col_rel_t *b = session_find_rel(coord, "b");
+    NO_REPLAY_CHECK(a && b && a->nrows == 2 && b->nrows == 2,
+        "no-replay rows");
+no_replay_cleanup:
+    wl_columnar_eval_test_before_final_normalize = NULL;
+    if (session)
+        idb_restore_budget(COL_SESSION(session));
+    free(values);
+    wl_session_destroy(session);
+    if (failure) {
+        FAIL(failure); return;
+    }
+    PASS();
+#undef NO_REPLAY_CHECK
+}
+
+static void
+replay_refuse_in_fixpoint(wl_col_session_t *coord, uint32_t iteration,
+    bool before)
+{
+    if (before || iteration != 1)
+        return;
+#ifdef WL_TEST_ALLOC_WRAP
+    if (replay_refuse_mode == COMPLETION_FAIL_ALLOC) {
+        fail_next_alloc = true;
+        return;
+    }
+#endif
+    if (!idb_budget_changed)
+        idb_set_budget(coord);
+}
+
+/* The later stratum keeps failing with the same non-EBUSY code at W>=2, past an
+ * armed cursor.  Earlier strata do not run again, input stays refused, and the
+ * failed stratum runs again on each retry (#2329). */
+static void
+test_completion_later_stratum_repeats(uint32_t workers, unsigned mode)
+{
+    TEST("W>=2 repeated later-stratum failure keeps the prefix and the cursor");
+    static const char program[] =
+        ".decl e(x: int64, y: int64)\n.decl a(x: int64, y: int64)\n"
+        ".decl b(x: int64, y: int64)\n.decl c(x: int64, y: int64)\n"
+        "a(x,y) :- e(x,y).\nb(x,y) :- a(x,y).\nc(x,y) :- b(x,y).\n"
+        "c(x,w) :- c(x,y), c(y,w).\n";
+    static const char *const names[] = { "a", "b", "c" };
+    static const int64_t edge[2] = { 10, 11 };
+    const int expected_rc = mode == COMPLETION_FAIL_BUDGET ? ENOSPC : ENOMEM;
+    failed_attempt_env_t env;
+    wl_session_t *session = NULL, *reference = NULL;
+    const char *failure = NULL;
+#define LATER_REPEAT_CHECK(c, m) do { if (!(c)) { failure = (m); \
+                                                  goto later_repeat_cleanup; \
+                                      } } while (0)
+    failed_attempt_env_set(&env);
+    memset(replay_counts, 0, sizeof(replay_counts));
+    replay_refuse_rel = "none";
+    replay_refuse_mode = mode;
+    idb_budget_changed = false;
+    wl_plan_t *plan = build_plan(program);
+    LATER_REPEAT_CHECK(plan, "later repeat plan");
+    LATER_REPEAT_CHECK(wl_session_create(wl_backend_columnar(), plan, workers,
+        &session) == 0, "later repeat session");
+    wl_col_session_t *coord = COL_SESSION(session);
+    LATER_REPEAT_CHECK(failed_attempt_insert_chain(session, 20) == 0,
+        "later repeat input");
+    wl_columnar_eval_test_before_final_normalize = replay_count_and_refuse;
+    wl_columnar_eval_test_subpass_boundary = replay_refuse_in_fixpoint;
+    LATER_REPEAT_CHECK(wl_session_step(session) == expected_rc,
+        "later repeat first refusal");
+    const uint32_t cursor_stratum = coord->plain_step_completion_stratum;
+    LATER_REPEAT_CHECK(coord->plain_step_completion_pending
+        && !coord->plain_step_completion_active
+        && coord->plain_step_completion_phase
+        == WL_COLUMNAR_PLAIN_STEP_COMPLETION_EVALUATE_REMAINING,
+        "later repeat cursor");
+    const unsigned first = replay_counts[0];
+    const unsigned second = replay_counts[1];
+    LATER_REPEAT_CHECK(first != 0, "later repeat counts");
+    for (unsigned retry = 0; retry < 3; retry++) {
+        LATER_REPEAT_CHECK(failed_attempt_verb(session, retry % 2 == 1)
+            == expected_rc, "later repeat retry code");
+        LATER_REPEAT_CHECK(replay_counts[0] == first
+            && replay_counts[1] == second, "later repeat ran the prefix again");
+        LATER_REPEAT_CHECK(coord->plain_step_completion_pending
+            && !coord->plain_step_completion_active
+            && coord->plain_step_completion_stratum == cursor_stratum,
+            "later repeat cursor moved");
+        LATER_REPEAT_CHECK(wl_session_remove(session, "e", edge, 1, 2) == EBUSY,
+            "later repeat input stays refused");
+    }
+    wl_columnar_eval_test_before_final_normalize = NULL;
+    wl_columnar_eval_test_subpass_boundary = NULL;
+#ifdef WL_TEST_ALLOC_WRAP
+    fail_next_alloc = false;
+#endif
+    idb_restore_budget(coord);
+    LATER_REPEAT_CHECK(wl_session_step(session) == 0
+        && !coord->plain_step_completion_pending, "later repeat recovery");
+    failure = failed_attempt_check_reference(session, plan, workers,
+            FAILED_ATTEMPT_THEN_NOTHING, names, 3);
+later_repeat_cleanup:
+    wl_columnar_eval_test_before_final_normalize = NULL;
+    wl_columnar_eval_test_subpass_boundary = NULL;
+#ifdef WL_TEST_ALLOC_WRAP
+    fail_next_alloc = false;
+#endif
+    if (session)
+        idb_restore_budget(COL_SESSION(session));
+    wl_session_destroy(session);
+    wl_session_destroy(reference);
+    wl_plan_free(plan);
+    failed_attempt_env_restore(&env);
+    if (failure) {
+        FAIL(failure); return;
+    }
+    PASS();
+#undef LATER_REPEAT_CHECK
+}
+
+/* A callback installed while a cursor is pending reports nothing for the step
+ * that resumes it and observes from the following step (#2348). */
+static void
+test_completion_cursor_then_callback(void)
+{
+    TEST("callback installed under a cursor starts at the next step");
+    static const char program[] =
+        ".decl e(x: int64, y: int64)\n.decl q(x: int64, y: int64)\n"
+        ".decl p(x: int64, y: int64)\nq(x,y) :- e(x,y).\np(x,y) :- q(x,y).\n"
+        "p(x,w) :- p(x,y), p(y,w).\n";
+    static const int64_t edge[2] = { 21, 22 };
+    failed_attempt_events_t events = { 0 };
+    wl_session_t *session = NULL;
+    const char *failure = NULL;
+#define CURSOR_CB_CHECK(c, m) do { if (!(c)) { failure = (m); \
+                                               goto cursor_cb_cleanup; \
+                                   } } while (0)
+    idb_budget_changed = false;
+    failed_attempt_clone_hits = 0;
+    wl_plan_t *plan = build_plan(program);
+    CURSOR_CB_CHECK(plan, "cursor callback plan");
+    CURSOR_CB_CHECK(wl_session_create(wl_backend_columnar(), plan, 1,
+        &session) == 0, "cursor callback session");
+    wl_col_session_t *coord = COL_SESSION(session);
+    CURSOR_CB_CHECK(failed_attempt_insert_chain(session, 20) == 0,
+        "cursor callback input");
+    wl_columnar_eval_serial_test_before_delta_clone =
+        failed_attempt_refuse_clone;
+    int rc = wl_session_step(session);
+    wl_columnar_eval_serial_test_before_delta_clone = NULL;
+    idb_restore_budget(coord);
+    CURSOR_CB_CHECK(rc != 0 && coord->plain_step_completion_pending,
+        "cursor callback refusal");
+    wl_session_set_delta_cb(session, failed_attempt_count_event, &events);
+    CURSOR_CB_CHECK(wl_session_step(session) == 0
+        && !coord->plain_step_completion_pending
+        && events.added == 0 && events.removed == 0,
+        "cursor callback resume reported events");
+    const col_rel_t *p = session_find_rel(coord, "p");
+    CURSOR_CB_CHECK(p && p->nrows == 210, "cursor callback model");
+    CURSOR_CB_CHECK(wl_session_insert(session, "e", edge, 1, 2) == 0
+        && wl_session_step(session) == 0, "cursor callback next step");
+    p = session_find_rel(coord, "p");
+    CURSOR_CB_CHECK(p && p->nrows == 231 && events.added == 21
+        && events.removed == 0, "cursor callback next step events");
+cursor_cb_cleanup:
+    wl_columnar_eval_serial_test_before_delta_clone = NULL;
+    if (session)
+        idb_restore_budget(COL_SESSION(session));
+    wl_session_destroy(session);
+    wl_plan_free(plan);
+    if (failure) {
+        FAIL(failure); return;
+    }
+    PASS();
+#undef CURSOR_CB_CHECK
+}
+
+/* A committed step whose clear fails after resetting the heads has lost the
+ * committed model, so a callback installed before the retry reports nothing for
+ * it and observes the next step exactly (#2348). */
+static void
+test_committed_clear_failure_then_callback(uint32_t workers)
+{
+    TEST("callback after a failed committed clear starts at the next step");
+    static const char text[] =
+        ".decl e(x: int64, y: int64)\n.decl p(x: int64, y: int64)\n"
+        "p(100,101).\np(101,102).\np(x,y) :- e(x,y).\n"
+        "p(x,w) :- p(x,y), p(y,w).\n";
+    static const int64_t first[2] = { 21, 22 }, second[2] = { 22, 23 };
+    static const char *const names[] = { "p" };
+    failed_attempt_env_t env;
+    failed_attempt_events_t events = { 0 };
+    wl_session_t *session = NULL, *reference = NULL;
+    wirelog_program_t *program = NULL;
+    wl_plan_t *plan = NULL;
+    const char *failure = NULL;
+    wirelog_error_t error;
+#define CLEAR_CB_CHECK(c, m) do { if (!(c)) { failure = (m); \
+                                              goto clear_cb_cleanup; \
+                                  } } while (0)
+    failed_attempt_env_set(&env);
+    program = wirelog_parse_string(text, &error);
+    CLEAR_CB_CHECK(program && wl_plan_from_program(program, &plan) == 0,
+        "clear callback plan");
+    CLEAR_CB_CHECK(wl_session_create(wl_backend_columnar(), plan, workers,
+        &session) == 0
+        && wl_session_create(wl_backend_columnar(), plan, workers,
+        &reference) == 0, "clear callback sessions");
+    CLEAR_CB_CHECK(wl_session_load_facts(session, program) == 0
+        && wl_session_load_facts(reference, program) == 0
+        && failed_attempt_insert_chain(session, 20) == 0
+        && failed_attempt_insert_chain(reference, 20) == 0
+        && wl_session_step(session) == 0 && wl_session_step(reference) == 0,
+        "clear callback commit");
+    CLEAR_CB_CHECK(wl_session_insert(session, "e", first, 1, 2) == 0
+        && wl_session_insert(reference, "e", first, 1, 2) == 0,
+        "clear callback input");
+    wl_columnar_session_test_fail_restore_seed = 1;
+    int rc = wl_session_step(session);
+    CLEAR_CB_CHECK(rc != 0 && wl_columnar_session_test_fail_restore_seed == 0,
+        "clear callback refusal");
+    wl_session_set_delta_cb(session, failed_attempt_count_event, &events);
+    CLEAR_CB_CHECK(wl_session_step(session) == 0 && events.added == 0
+        && events.removed == 0, "clear callback retry reported events");
+    CLEAR_CB_CHECK(wl_session_step(reference) == 0, "clear callback reference");
+    failure = failed_attempt_models_match(session, reference, names, 1);
+    if (failure)
+        goto clear_cb_cleanup;
+    const col_rel_t *p = session_find_rel(COL_SESSION(reference), "p");
+    CLEAR_CB_CHECK(p, "clear callback head");
+    const uint32_t before = p->nrows;
+    CLEAR_CB_CHECK(wl_session_insert(session, "e", second, 1, 2) == 0
+        && wl_session_insert(reference, "e", second, 1, 2) == 0
+        && wl_session_step(session) == 0 && wl_session_step(reference) == 0,
+        "clear callback next step");
+    p = session_find_rel(COL_SESSION(reference), "p");
+    CLEAR_CB_CHECK(p && p->nrows > before
+        && events.added == p->nrows - before && events.removed == 0,
+        "clear callback next step events");
+    failure = failed_attempt_models_match(session, reference, names, 1);
+clear_cb_cleanup:
+    wl_columnar_session_test_fail_restore_seed = 0;
+    wl_session_destroy(session);
+    wl_session_destroy(reference);
+    wl_plan_free(plan);
+    wirelog_program_free(program);
+    failed_attempt_env_restore(&env);
+    if (failure) {
+        FAIL(failure); return;
+    }
+    PASS();
+#undef CLEAR_CB_CHECK
+}
+
+/* The W=1 analog: the second stratum keeps failing past the cursor that the
+ * first stratum's commit armed (#2329). */
+static void
+test_completion_repeats_at_one_worker(void)
+{
+    TEST("W=1 repeated later-stratum failure keeps the prefix and the cursor");
+    static const char program[] =
+        ".decl e(x: int64, y: int64)\n.decl q(x: int64, y: int64)\n"
+        ".decl p(x: int64, y: int64)\nq(x,y) :- e(x,y).\np(x,y) :- q(x,y).\n"
+        "p(x,w) :- p(x,y), p(y,w).\n";
+    static const char *const names[] = { "q", "p" };
+    static const int64_t edge[2] = { 10, 11 };
+    wl_session_t *session = NULL;
+    const char *failure = NULL;
+#define W1_CHECK(c, m) do { if (!(c)) { failure = (m); \
+                                        goto w1_cleanup; \
+                            } } while (0)
+    idb_budget_changed = false;
+    failed_attempt_clone_hits = 0;
+    wl_plan_t *plan = build_plan(program);
+    W1_CHECK(plan, "w1 plan");
+    W1_CHECK(wl_session_create(wl_backend_columnar(), plan, 1, &session) == 0,
+        "w1 session");
+    wl_col_session_t *coord = COL_SESSION(session);
+    W1_CHECK(failed_attempt_insert_chain(session, 20) == 0, "w1 input");
+    wl_columnar_eval_serial_test_before_delta_clone =
+        failed_attempt_refuse_clone;
+    int rc = wl_session_step(session);
+    wl_columnar_eval_serial_test_before_delta_clone = NULL;
+    W1_CHECK(rc != 0 && rc != EBUSY && coord->plain_step_completion_pending
+        && coord->plain_step_completion_phase
+        == WL_COLUMNAR_PLAIN_STEP_COMPLETION_EVALUATE_REMAINING,
+        "w1 first refusal");
+    const col_rel_t *q = session_find_rel(coord, "q");
+    W1_CHECK(q, "w1 prefix relation");
+    const uint32_t q_rows = q->nrows;
+    const uint64_t q_view = q->view_generation;
+    const uint64_t q_storage = q->storage_generation;
+    const uint32_t cursor_stratum = coord->plain_step_completion_stratum;
+    for (unsigned retry = 0; retry < 4; retry++) {
+        W1_CHECK(failed_attempt_verb(session, retry % 2 == 1) == rc,
+            "w1 retry code");
+        W1_CHECK(coord->plain_step_completion_pending
+            && !coord->plain_step_completion_active
+            && coord->plain_step_completion_stratum == cursor_stratum,
+            "w1 cursor moved");
+        W1_CHECK(q->nrows == q_rows && q->view_generation == q_view
+            && q->storage_generation == q_storage, "w1 prefix ran again");
+        W1_CHECK(wl_session_remove(session, "e", edge, 1, 2) == EBUSY,
+            "w1 input stays refused");
+    }
+    idb_restore_budget(coord);
+    W1_CHECK(wl_session_step(session) == 0
+        && !coord->plain_step_completion_pending, "w1 recovery");
+    failure = failed_attempt_check_reference(session, plan, 1,
+            FAILED_ATTEMPT_THEN_NOTHING, names, 2);
+w1_cleanup:
+    wl_columnar_eval_serial_test_before_delta_clone = NULL;
+    if (session)
+        idb_restore_budget(COL_SESSION(session));
+    wl_session_destroy(session);
+    wl_plan_free(plan);
+    if (failure) {
+        FAIL(failure); return;
+    }
+    PASS();
+#undef W1_CHECK
+}
+
+/* A compaction that keeps refusing with a non-EBUSY code keeps the cursor at
+ * compaction.  Each retry jumps straight there, so no evaluation consumes the
+ * armed refusal (#2329). */
+static void
+test_completion_repeated_compaction(bool retry_snapshot)
+{
+    TEST("W=1 repeated EAGAIN at compaction keeps the cursor");
+    static const char program[] =
+        ".decl input(x: int64)\n.decl output(x: int64)\n"
+        ".decl later(x: int64)\noutput(x) :- input(x).\nlater(x) :- output(x).\n";
+    wl_session_t *session = NULL;
+    int64_t *values = NULL;
+    wl_columnar_source_access_reader_t reader;
+    const char *failure = NULL;
+#define COMPACT_REPEAT_CHECK(c, m) do { if (!(c)) { failure = (m); \
+                                                    goto compact_repeat_cleanup; \
+                                        } } while (0)
+    memset(&reader, 0, sizeof(reader));
+    wl_plan_t *plan = build_plan(program);
+    COMPACT_REPEAT_CHECK(plan, "compact repeat plan");
+    COMPACT_REPEAT_CHECK(wl_session_create(wl_backend_columnar(), plan, 1,
+        &session) == 0, "compact repeat session");
+    wl_col_session_t *coord = COL_SESSION(session);
+    values = malloc(65536 * sizeof(*values));
+    COMPACT_REPEAT_CHECK(values, "compact repeat values");
+    for (uint32_t i = 0; i < 65536; i++)
+        values[i] = i & 1 ? 42 : 7;
+    COMPACT_REPEAT_CHECK(wl_session_insert(session, "input", values, 65536, 1)
+        == 0, "compact repeat input");
+    col_rel_t *input = session_find_rel(coord, "input");
+    COMPACT_REPEAT_CHECK(input
+        && col_rel_source_reader_acquire(input, &reader) == 0,
+        "compact repeat reader");
+    COMPACT_REPEAT_CHECK(wl_session_step(session) == EBUSY
+        && coord->plain_step_completion_pending
+        && coord->plain_step_completion_phase
+        == WL_COLUMNAR_PLAIN_STEP_COMPLETION_COMPACT,
+        "compact repeat first refusal");
+    COMPACT_REPEAT_CHECK(col_rel_source_reader_release(&reader) == 0,
+        "compact repeat reader release");
+    for (unsigned retry = 0; retry < 3; retry++) {
+        wl_columnar_relation_test_fail_next_prepare_resize();
+        wl_columnar_relation_test_fail_next_compact_rollback();
+        int rc = failed_attempt_verb(session, retry_snapshot);
+        wl_columnar_relation_test_clear_prepare_resize();
+        COMPACT_REPEAT_CHECK(rc == EAGAIN, "compact repeat retry code");
+        COMPACT_REPEAT_CHECK(coord->plain_step_completion_pending
+            && !coord->plain_step_completion_active
+            && coord->plain_step_completion_phase
+            == WL_COLUMNAR_PLAIN_STEP_COMPLETION_COMPACT,
+            "compact repeat cursor moved");
+    }
+    COMPACT_REPEAT_CHECK(wl_session_step(session) == 0
+        && !coord->plain_step_completion_pending, "compact repeat recovery");
+    const col_rel_t *later = session_find_rel(coord, "later");
+    COMPACT_REPEAT_CHECK(later && later->nrows == 2, "compact repeat rows");
+compact_repeat_cleanup:
+    wl_columnar_relation_test_clear_prepare_resize();
+    if (reader.owner)
+        (void)col_rel_source_reader_release(&reader);
+    free(values);
+    wl_session_destroy(session);
+    wl_plan_free(plan);
+    if (failure) {
+        FAIL(failure); return;
+    }
+    PASS();
+#undef COMPACT_REPEAT_CHECK
+}
+
 int
 main(void)
 {
@@ -18723,6 +19985,79 @@ main(void)
     test_idb_small_input(true, false);
     test_idb_small_input(false, false);
     test_idb_small_input(false, true);
+    {
+        static const char *const p_only[] = { "p" };
+        static const char *const a_b[] = { "a", "b" };
+        static const char mutual[] =
+            ".decl e(x: int64, y: int64)\n.decl a(x: int64, y: int64)\n"
+            ".decl b(x: int64, y: int64)\na(x,y) :- e(x,y).\n"
+            "a(x,w) :- b(x,y), e(y,w).\nb(x,w) :- a(x,y), e(y,w).\n"
+            "b(x,y) :- e(x,y).\n";
+        for (uint32_t workers = 2; workers <= 8; workers += 6) {
+            for (unsigned change = 0; change < 3; change++) {
+                for (unsigned verbs = 0; verbs < 4; verbs++)
+                    test_failed_attempt_refused_finalize(workers,
+                        failed_attempt_binary, "p", p_only, 1,
+                        (verbs & 1) != 0, (verbs & 2) != 0, change);
+                test_failed_attempt_refused_finalize(workers,
+                    failed_attempt_triple, "p", p_only, 1, false, false,
+                    change);
+                test_failed_attempt_refused_finalize(workers, mutual, "b",
+                    a_b, 2, false, false, change);
+            }
+            test_failed_attempt_refused_retirement(workers,
+                failed_attempt_binary, false);
+            test_failed_attempt_refused_retirement(workers,
+                failed_attempt_binary, true);
+            test_failed_attempt_refused_retirement(workers,
+                failed_attempt_triple, false);
+            test_failed_later_attempt_retained_workers(workers, false);
+            test_failed_later_attempt_retained_workers(workers, true);
+            test_failed_attempt_with_cursor(workers);
+            test_failed_attempt_host_seed(workers);
+        }
+    }
+    {
+        static const char linear[] = FAILED_ATTEMPT_DECLS
+            "p(x,w) :- p(x,y), e(y,w).\n";
+        for (uint32_t workers = 1; workers <= 8;
+            workers = workers == 1 ? 2 : workers + 6) {
+            test_failed_attempt_mid_fixpoint(workers, failed_attempt_binary,
+                false);
+            test_failed_attempt_mid_fixpoint(workers, linear, false);
+#ifdef WL_TEST_ALLOC_WRAP
+            if (workers > 1)
+                test_failed_attempt_mid_fixpoint(workers,
+                    failed_attempt_binary, true);
+#endif
+            for (unsigned removals = 0; removals < 4; removals++) {
+                test_failed_attempt_then_callback(workers, removals, true);
+                /* With a callback installed, one step stages removals from a
+                 * single relation, so both orders exist only for one. */
+                if (removals != (FAILED_CALLBACK_REMOVE_EDGE
+                    | FAILED_CALLBACK_REMOVE_HEAD_ROW))
+                    test_failed_attempt_then_callback(workers, removals, false);
+            }
+            test_failed_later_attempt_then_callback(workers, false);
+            test_failed_later_attempt_then_callback(workers, true);
+        }
+        test_failed_attempt_mid_fixpoint(1, failed_attempt_triple, false);
+    }
+    test_completion_repeats_at_one_worker();
+    test_completion_cursor_then_callback();
+    for (uint32_t w = 1; w <= 2; w++) {
+        test_committed_clear_failure_then_callback(w);
+    }
+    for (uint32_t workers = 2; workers <= 8; workers += 6) {
+        test_completion_later_stratum_repeats(workers, COMPLETION_FAIL_BUDGET);
+#ifdef WL_TEST_ALLOC_WRAP
+        test_completion_later_stratum_repeats(workers, COMPLETION_FAIL_ALLOC);
+#endif
+    }
+    test_completion_repeated_compaction(false);
+    test_completion_repeated_compaction(true);
+    for (uint32_t workers = 2; workers <= 8; workers += 6)
+        test_completion_no_finalize_replay(workers);
     test_refused_channel_reservation(2, failed_attempt_triple);
     test_refused_channel_reservation(2, failed_attempt_binary);
     test_refused_channel_reservation(8, failed_attempt_triple);
