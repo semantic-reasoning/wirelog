@@ -134,6 +134,9 @@ tdd_reserve_channel(wl_col_session_t *coord, uint32_t workers,
     if (status == WL_COLUMNAR_MEMORY_ADMISSION_OK
         || status == WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY)
         return 0;
+    /* A refused token keeps its byte count but holds nothing, so releasing it
+     * would fail.  The caller's channel release must find it empty. */
+    wl_columnar_memory_reservation_init(&coord->tdd_channel_reservation);
     if (status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED) {
         coord->memory_budget_denied = true;
         return ENOSPC;

@@ -18227,6 +18227,112 @@ recursive_finish_cleanup:
 }
 #endif
 
+/* Programs for the failed-attempt tests (#2348).  They need the adaptive worker
+ * choice to keep every worker, hence WIRELOG_TDD_MIN_ROWS_PER_WORKER=1. */
+#define FAILED_ATTEMPT_DECLS \
+        ".decl e(x: int64, y: int64)\n.decl p(x: int64, y: int64)\n" \
+        "p(x,y) :- e(x,y).\n"
+static const char failed_attempt_triple[] = FAILED_ATTEMPT_DECLS
+    "p(x,w) :- p(x,y), p(y,z), p(z,w).\n";
+static const char failed_attempt_binary[] = FAILED_ATTEMPT_DECLS
+    "p(x,w) :- p(x,y), p(y,w).\n";
+
+typedef struct {
+    char value[64];
+    bool saved;
+} failed_attempt_env_t;
+
+static void
+failed_attempt_env_set(failed_attempt_env_t *env)
+{
+    const char *saved = getenv("WIRELOG_TDD_MIN_ROWS_PER_WORKER");
+    env->saved = saved != NULL;
+    if (saved)
+        snprintf(env->value, sizeof(env->value), "%s", saved);
+#ifdef _WIN32
+    (void)_putenv_s("WIRELOG_TDD_MIN_ROWS_PER_WORKER", "1");
+#else
+    (void)setenv("WIRELOG_TDD_MIN_ROWS_PER_WORKER", "1", 1);
+#endif
+}
+
+static void
+failed_attempt_env_restore(const failed_attempt_env_t *env)
+{
+#ifdef _WIN32
+    (void)_putenv_s("WIRELOG_TDD_MIN_ROWS_PER_WORKER",
+        env->saved ? env->value : "");
+#else
+    if (env->saved)
+        (void)setenv("WIRELOG_TDD_MIN_ROWS_PER_WORKER", env->value, 1);
+    else
+        (void)unsetenv("WIRELOG_TDD_MIN_ROWS_PER_WORKER");
+#endif
+}
+
+static int
+failed_attempt_insert_chain(wl_session_t *session, int64_t edges)
+{
+    for (int64_t i = 1; i <= edges; i++) {
+        const int64_t row[2] = { i, i + 1 };
+        int rc = wl_session_insert(session, "e", row, 1, 2);
+        if (rc != 0)
+            return rc;
+    }
+    return 0;
+}
+
+/* A budget that refuses the TDD channel reservation must fail the step, not
+ * abort the process when the channel is released (#2348). */
+static void
+test_refused_channel_reservation(uint32_t workers, const char *program)
+{
+    TEST("refused TDD channel reservation returns an error");
+    failed_attempt_env_t env;
+    const char *failure = NULL;
+    uint32_t refused = 0;
+    failed_attempt_env_set(&env);
+    wl_plan_t *plan = build_plan(program);
+    if (!plan)
+        failure = "plan";
+    for (uint64_t slack = 8192; !failure && slack <= 43008; slack += 512) {
+        wl_session_t *session = NULL;
+        if (wl_session_create(wl_backend_columnar(), plan, workers, &session)
+            != 0) {
+            failure = "session";
+            break;
+        }
+        wl_col_session_t *coord = COL_SESSION(session);
+        wl_columnar_memory_governor_t *budget =
+            wl_columnar_memory_governor_ref_get(coord->memory_governor);
+        const uint64_t limit = atomic_load_explicit(&budget->usable_bytes,
+                memory_order_relaxed);
+        const wl_columnar_memory_mode_t mode = budget->mode;
+        if (failed_attempt_insert_chain(session, 20) != 0)
+            failure = "insert";
+        budget->mode = WL_COLUMNAR_MEMORY_MODE_ENFORCING;
+        atomic_store_explicit(&budget->usable_bytes,
+            wl_columnar_memory_reserved(budget) + slack, memory_order_relaxed);
+        if (!failure && wl_session_step(session) != 0)
+            refused++;
+        budget->mode = mode;
+        atomic_store_explicit(&budget->usable_bytes, limit,
+            memory_order_relaxed);
+        if (!failure && coord->tdd_channel_reservation.bytes != 0
+            && !coord->tdd_workers_count)
+            failure = "refused channel reservation still holds bytes";
+        wl_session_destroy(session);
+    }
+    if (!failure && refused == 0)
+        failure = "no budget in the scan refused the step";
+    wl_plan_free(plan);
+    failed_attempt_env_restore(&env);
+    if (failure) {
+        FAIL(failure); return;
+    }
+    PASS();
+}
+
 int
 main(void)
 {
@@ -18557,6 +18663,9 @@ main(void)
     test_idb_small_input(true, false);
     test_idb_small_input(false, false);
     test_idb_small_input(false, true);
+    test_refused_channel_reservation(2, failed_attempt_triple);
+    test_refused_channel_reservation(2, failed_attempt_binary);
+    test_refused_channel_reservation(8, failed_attempt_triple);
     for (uint32_t workers = 2; workers <= 8; workers += 6) {
         for (unsigned verb = 0; verb < 2; verb++) {
             test_later_stratum_completion_retry(workers, verb == 0);
