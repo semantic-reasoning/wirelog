@@ -277,6 +277,14 @@ int
 wl_ir_program_collect_metadata(struct wirelog_program *program,
     const wl_parser_ast_node_t *ast);
 
+/* #2231: binds each body variable that an `=` defines from bound variables
+ * and writes the expression in place of its uses; call it before
+ * wl_ir_program_collect_metadata().  Returns -1 with an error set when a
+ * rule is rejected, or -2 when out of memory. */
+int
+wl_ir_program_resolve_eq_bindings(struct wirelog_program *program,
+    wl_parser_ast_node_t *ast);
+
 /* #2231: renames each rule variable spelled `col` followed by digits so
  * that it cannot be read as lowering's positional column references; call
  * it after wl_ir_program_collect_metadata() and before

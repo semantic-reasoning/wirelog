@@ -82,6 +82,45 @@ renamed before lowering, so these rules derive what they derive with the
 variable spelled differently. IR dumps (`wirelog_ir_node_to_string`) show
 it with a `$` prefix, as `$col1`.
 
+### Body equalities bind variables
+
+An `=` in a rule body binds a variable when one side is that variable
+alone, no positive body atom binds it, and every variable on the other side
+is bound, by a positive atom or by another such equality (#2231). The
+expression is written in place of each use of the variable, so
+
+```
+m(y) :- n(x), y = x + 1.
+```
+
+derives what `m(x + 1) :- n(x).` derives. The variable may be on either
+side (`x + 1 = y`), equalities may chain in any body order
+(`z = y * 2, y = x + 1`), and the variable may be used in the head, in an
+aggregate operand, as a group-by key, in a comparison and in a string
+predicate. Before, such a variable was read as the first body column: the
+rule above derived nothing, and `y = 2` kept only the rows whose first
+column was 2.
+
+These are rejected when the program is loaded:
+
+- an `=` with a variable that neither a positive atom nor such an equality
+  binds, such as `y = z + 1` or `y = y + 1`;
+- a variable bound by an equality and used nowhere else in the rule, such
+  as `m(x) :- n(x), y = x + 1.`; `m(x) :- n(x), y = x.` used to act as no
+  condition and is rejected too;
+- a variable bound to an expression containing `uuid4()`, which would be
+  evaluated separately at each use;
+- a variable whose expression has more than 4096 nodes once the equalities
+  it uses are substituted, and a rule whose head arguments and body
+  elements that use bound variables have more than 4096 nodes together
+  once those are substituted;
+- a bound variable in a negated atom or as an argument of a scalar
+  extension call.
+
+Substitution can nest an expression deeper than the evaluator's stack; such
+a rule fails to plan (see [Expression depth
+limit](#expression-depth-limit)).
+
 ### Limitation: one aggregate per rule head
 
 A rule head may contain **at most one** aggregate. The internal `AGGREGATE`

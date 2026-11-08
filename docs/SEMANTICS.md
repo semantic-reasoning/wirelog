@@ -648,6 +648,37 @@ generation keeps the full-stack rule under "Numeric MAP result schemas".
 either side of a comparison, aggregate operands and `str_replace`, and
 that a `count` over a deeper operand still plans.
 
+## Body equality bindings (Status: Current)
+
+A body `=` whose one side is a variable that no positive body atom binds,
+and whose other side has only bound variables, binds that variable
+(#2231). Load removes the comparison and writes the expression in place of
+each use of the variable, before the rule's arities, constants and value
+types are checked, so the rule means what it would with the expression
+written there; the syntax and the rejected forms are in `docs/SYNTAX.md`,
+"Body equalities bind variables".
+
+The expression is therefore evaluated where the variable is used, under
+the rules of "Numerical fail-closed arithmetic" for that place: a failure
+in the head or in an aggregate operand returns `ERANGE`, and one in a
+comparison drops the row. Comparisons are evaluated below the head, so
+with `m(y) :- n(x), y = x + 1, y != 0.` a row for which `x + 1` overflows
+is dropped by `y != 0` and evaluation does not return `ERANGE`, while the
+same rule without `y != 0` does. A variable bound by an equality and used
+nowhere else is rejected rather than left unevaluated. A `count` operand is
+never evaluated, though, so an expression bound to a variable used only
+there is never computed and cannot fail: with `n(1, 1)`, `n(2, 1)` and
+`n(3, 2)`, `t(g, count(v)) :- n(x, g), v = x / 0.` derives `t(1, 2)` and
+`t(2, 1)`, as `t(g, count(x / 0)) :- n(x, g).` does.
+
+Each use copies the expression, so the head arguments and body elements
+that use bound variables are rejected when they have more than 4096 nodes
+together once those are substituted, as a binding is.
+
+`tests/test_body_eq_binding.c` covers heads, comparisons, string functions,
+float expressions, aggregate operands and group-by keys, recursive rules at
+1, 4 and 8 workers, the failure placement above, and each rejection.
+
 ---
 
 ## v0.40 API audit closure (Status: Current)

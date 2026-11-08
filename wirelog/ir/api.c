@@ -132,6 +132,15 @@ wl_ir_parse_string_err(const char *program_text, wirelog_error_t *error,
      * wl_ir_program_free() is about to destroy -- so copy it out first.  Doing
      * the free first and the copy second reads identically and yields a
      * use-after-free; the ordering here is load-bearing, not stylistic. */
+    int bind_rc = wl_ir_program_resolve_eq_bindings(prog, ast);
+    if (bind_rc != 0) {
+        copy_err(errbuf, errcap, prog->parse_error);
+        wl_ir_program_free(prog);
+        if (error)
+            *error = bind_rc == -2 ? WIRELOG_ERR_MEMORY : WIRELOG_ERR_PARSE;
+        return NULL;
+    }
+
     if (wl_ir_program_collect_metadata(prog, ast) != 0) {
         copy_err(errbuf, errcap, prog->parse_error);
         wl_ir_program_free(prog);
