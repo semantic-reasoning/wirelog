@@ -38,6 +38,14 @@ typedef struct {
 /* Limit 0 is unlimited. On failure *out is NULL. */
 int wl_evaluation_control_create(uint64_t limit, wl_evaluation_control_t **out);
 int wl_evaluation_control_retain(wl_evaluation_control_t *control);
+/* The caller holds a live allocation reference. One strong CAS: EAGAIN
+ * acquires no reference. Success owns one additional lifetime reference;
+ * neither result authorizes Native work or changes the attempt. */
+int wl_evaluation_control_retain_try(wl_evaluation_control_t *control);
+#ifdef WL_SESSION_TEST_HOOKS
+extern void (*wl_evaluation_control_test_retain_claim)(
+    wl_evaluation_control_t *control);
+#endif
 void wl_evaluation_control_release(wl_evaluation_control_t *control);
 /* Stable, never-reused process identity; create returns EOVERFLOW on
  * exhaustion. The caller holds a live reference. */
@@ -147,6 +155,14 @@ typedef struct {
  * performs real BEGIN. The paired Session issuer supplies the empty record. */
 wl_evaluation_control_lexical_finance_birth_result_t
 wl_evaluation_control_lexical_finance_birth_try(uint64_t limit,
+    const void *owner);
+
+/* Same bounded private birth, allowing the legacy unlimited capacity (0).
+ * This NORMAL controller is financial ownership, never Native permission.
+ * Caller settles FINISH, detaches its actual owner and releases creation.
+ * Limit 0 does not satisfy the positive-only lexical Source close contract. */
+wl_evaluation_control_lexical_finance_birth_result_t
+wl_evaluation_control_private_financier_birth_try(uint64_t limit,
     const void *owner);
 
 #ifdef WL_SESSION_TEST_HOOKS

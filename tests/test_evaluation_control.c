@@ -585,6 +585,108 @@ lexical_finance_birth(void)
         !born.identity);
 }
 
+static void retain_peer(wl_evaluation_control_t *control) {
+    wl_evaluation_control_test_retain_claim = NULL;
+    CHECK(!wl_evaluation_control_retain(control));
+}
+
+static void bounded_references(void) {
+    uint64_t owner[8] = {0}, scope[8] = {0};
+    CHECK(wl_evaluation_control_retain_try(NULL) == EINVAL);
+    wl_evaluation_control_lexical_finance_birth_result_t born =
+        wl_evaluation_control_lexical_finance_birth_try(3, owner);
+    CHECK(!born.protocol);
+    wl_evaluation_control_lexical_finance_expectation_t e = {
+        .owner = owner,
+        .scope = scope,
+        .owner_bytes = sizeof(owner),
+        .scope_bytes = sizeof(scope),
+        .identity = born.identity,
+        .limit = 3,
+        .id = born.id,
+        .active = true,
+    };
+    CHECK(!wl_evaluation_control_charge(born.control, 1));
+    e.charged = 1;
+    wl_evaluation_control_request_cancel(born.control);
+    wl_evaluation_control_test_retain_claim = retain_peer;
+    CHECK(wl_evaluation_control_retain_try(born.control) == EAGAIN);
+    CHECK(!wl_evaluation_control_test_retain_claim);
+    CHECK(wl_evaluation_control_lexical_finance_prove_checked(born.control,
+        &e) ==
+        EBUSY);
+    wl_evaluation_control_release(born.control); /* Real peer's reference. */
+    CHECK(!wl_evaluation_control_lexical_finance_prove_checked(
+            born.control,
+            &e)); /* Exactly two refs: failed try acquired none. No cancel poll. */
+    CHECK(!wl_evaluation_control_retain_try(born.control));
+    CHECK(wl_evaluation_control_lexical_finance_prove_checked(born.control,
+        &e) ==
+        EBUSY);
+    wl_evaluation_control_release(born.control); /* Successful try's ref. */
+    CHECK(!wl_evaluation_control_lexical_finance_prove_checked(born.control,
+        &e));
+    wl_evaluation_control_lexical_finance_result_t closed =
+        wl_evaluation_control_lexical_finance_close_checked(born.control, &e);
+    CHECK(!closed.protocol && closed.closed && closed.report_valid &&
+        closed.checkpoint_result == WL_EVALUATION_CONTROL_CANCELLED &&
+        closed.report.consumed == 1);
+}
+
+static void private_financier_birth(void) {
+    int owner;
+    for (uint64_t limit = 0; limit < 2; ++limit) {
+        wl_evaluation_control_test_finance_birth_claim = finance_birth_peer;
+        wl_evaluation_control_lexical_finance_birth_result_t born =
+            wl_evaluation_control_private_financier_birth_try(limit, &owner);
+        CHECK(born.protocol == EAGAIN && !born.control && !born.id &&
+            !born.identity && !wl_evaluation_control_test_finance_birth_claim);
+        uint64_t next_identity = finance_peer_identity + 1;
+        for (unsigned fault = 0; fault < 3; ++fault) {
+            if (fault) {
+                wl_evaluation_control_test_finance_birth_fail = fault;
+                born = wl_evaluation_control_private_financier_birth_try(limit,
+                        &owner);
+                CHECK(born.protocol == ENOMEM && !born.control && !born.id &&
+                    !born.identity &&
+                    !wl_evaluation_control_test_finance_birth_fail);
+                ++next_identity;
+            }
+            born = wl_evaluation_control_private_financier_birth_try(limit,
+                    &owner);
+            CHECK(!born.protocol && born.control && born.id &&
+                born.identity == next_identity++);
+            CHECK(wl_evaluation_control_active_attempt_id(born.control) ==
+                born.id);
+            CHECK(!wl_evaluation_control_charge(born.control, 1));
+            CHECK(wl_evaluation_control_finish(born.control, &owner, 7,
+                0) == 7);
+            wl_evaluation_control_report_t report;
+            CHECK(!wl_evaluation_control_report(born.control, &report));
+            CHECK(report.attempt_id == born.id && report.limit == limit &&
+                report.consumed == 1 && report.execution_status == 7 &&
+                report.result == 7 && !report.cleanup_status &&
+                report.stop_reason == WL_EVALUATION_CONTROL_NONE);
+            CHECK(!wl_evaluation_control_retain_try(born.control));
+            wl_evaluation_control_release(born.control);
+            CHECK(!wl_evaluation_control_begin(born.control, &owner));
+            CHECK(wl_evaluation_control_active_attempt_id(born.control) !=
+                report.attempt_id);
+            wl_evaluation_control_report_t unchanged;
+            CHECK(!wl_evaluation_control_report(born.control, &unchanged));
+            CHECK(unchanged.attempt_id == report.attempt_id &&
+                unchanged.result == 7 && unchanged.consumed == 1);
+            CHECK(!wl_evaluation_control_finish(born.control, &owner, 0, 0));
+            CHECK(!wl_evaluation_control_detach(born.control, &owner));
+            wl_evaluation_control_release(born.control);
+        }
+    }
+    wl_evaluation_control_lexical_finance_birth_result_t invalid =
+        wl_evaluation_control_private_financier_birth_try(0, NULL);
+    CHECK(invalid.protocol == EINVAL && !invalid.control && !invalid.id &&
+        !invalid.identity);
+}
+
 int
 main(void)
 {
@@ -598,6 +700,8 @@ main(void)
     identity_generation();
     lexical_finance_close();
     lexical_finance_birth();
+    bounded_references();
+    private_financier_birth();
     CHECK(wl_evaluation_control_test_seed_next_identity(UINT64_MAX - 1) == 0);
     wl_evaluation_control_t *last = NULL;
     CHECK(wl_evaluation_control_create(0, &last) == 0);
@@ -609,6 +713,10 @@ main(void)
     int exhausted_owner;
     wl_evaluation_control_lexical_finance_birth_result_t no_identity =
         wl_evaluation_control_lexical_finance_birth_try(1, &exhausted_owner);
+    CHECK(no_identity.protocol == EOVERFLOW && !no_identity.control
+        && !no_identity.id && !no_identity.identity);
+    no_identity = wl_evaluation_control_private_financier_birth_try(0,
+            &exhausted_owner);
     CHECK(no_identity.protocol == EOVERFLOW && !no_identity.control
         && !no_identity.id && !no_identity.identity);
     puts("evaluation_control: OK");
