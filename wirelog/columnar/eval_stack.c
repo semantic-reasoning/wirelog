@@ -370,6 +370,8 @@ struct wl_columnar_eval_stack_cleanup_frame {
     wl_columnar_eval_stack_binary_context_t binary;
     wl_columnar_merge_concat_context_t concat;
     wl_columnar_eval_serial_framed_attempt_t framed;
+    /* Nonowning exclusive ROW borrow; caller storage remains live to DONE. */
+    wl_columnar_relation_row_debt_t *row_debt;
 };
 
 /* Native automatic receipts have a stable final address outside the logical
@@ -2480,6 +2482,7 @@ static void
 wl_columnar_eval_stack_cleanup_continuations(
     wl_columnar_eval_stack_cleanup_frame_t *frame)
 {
+    if (frame->row_debt) return;
     if (frame->result.kind == WL_COLUMNAR_EVAL_ENTRY_CONTINUATION)
         (void)eval_entry_dispose(&frame->result);
     if (frame->unary_output.kind == WL_COLUMNAR_EVAL_ENTRY_CONTINUATION)
@@ -2495,6 +2498,7 @@ static int
 wl_columnar_eval_stack_cleanup_dispose(
     wl_columnar_eval_stack_cleanup_frame_t *frame)
 {
+    if (frame->row_debt) return EBUSY;
     if (frame->prepared_unary) return EBUSY;
     if (frame->stream_host) return EBUSY;
     int result = eval_entry_dispose(&frame->result);
@@ -2520,6 +2524,7 @@ static int
 wl_columnar_eval_stack_cleanup_free(
     wl_columnar_eval_stack_cleanup_frame_t *frame)
 {
+    if (frame->row_debt) return EBUSY;
     if (frame->prepared_unary) return EBUSY;
     if (frame->stream_host) return EBUSY;
     const wl_columnar_eval_stack_auto_t *automatic =
@@ -3243,6 +3248,7 @@ wl_columnar_eval_stack_cleanup_receipt_free_target(
     wl_columnar_eval_stack_cleanup_frame_t *frame,
     wl_columnar_eval_cleanup_receipt_t *receipt)
 {
+    if (frame->row_debt) return EBUSY;
     wl_columnar_memory_reservation_t reservation;
     wl_columnar_memory_governor_ref_t *governor = frame->governor;
     wl_columnar_memory_reservation_init(&reservation);
@@ -4109,6 +4115,147 @@ wl_columnar_eval_stack_copy_ranges_disjoint(const void *a, size_t a_size,
     uintptr_t first = (uintptr_t)a, second = (uintptr_t)b;
     return second < first ? first - second >= b_size
                           : second - first >= a_size;
+}
+
+/* These new ROW siblings do not alter the legacy context getter or the tight
+ * scalar-retirement BIND contour. A returned context is not writer authority. */
+int
+wl_columnar_eval_stack_row_debt_context_owned(
+    wl_columnar_eval_stack_cleanup_frame_t *frame, const void *owner,
+    const wl_columnar_relation_row_debt_t *debt,
+    wl_columnar_filter_context_t **out)
+{
+    int rc = wl_columnar_eval_stack_filter_context_nonstream_owned(frame, out,
+            owner);
+    if (rc) return rc;
+    if (!debt || frame->row_debt != debt) return EBUSY;
+    return 0;
+}
+
+int
+wl_columnar_eval_stack_row_debt_bind_owned(
+    wl_columnar_eval_stack_cleanup_frame_t *frame, const void *owner,
+    wl_columnar_relation_row_debt_t *debt, uint64_t expected_nonce,
+    wl_columnar_filter_context_t **out)
+{
+    /* Same-call terminal bind after full context/native/range proof. Direct
+    * lineage is rechecked; no cached permission is accepted by ROW work. */
+    if (!frame || frame->identity != frame || !owner || !debt || !out
+        || frame->numeric_plan_owner != owner || frame->row_debt
+        || frame->prepared_unary || frame->stream_host) return EINVAL;
+    const wl_columnar_eval_plan_numeric_attempt_t *record = owner;
+    wl_columnar_filter_context_t *ctx = &frame->filter;
+    if (debt->identity != debt || !wl_columnar_relation_row_debt_thread(debt)
+        || debt->phase != WL_COLUMNAR_RELATION_ROW_DEBT_IDLE
+        || ctx->identity != ctx || ctx->frame != frame
+        || ctx->session != frame->session || ctx->session != record->session
+        || ctx->session->cleanup_active != frame || !ctx->pin_owned
+        || ctx->busy || (ctx->stage != WL_COLUMNAR_FILTER_STAGE_BATCH
+        && ctx->stage != WL_COLUMNAR_FILTER_STAGE_JOIN_BATCH)
+        || ctx->control != record->control
+        || ctx->attempt_id != record->attempt_id) return EINVAL;
+    col_rel_t *target = ctx->output;
+    if (!target || ctx->private_output != target
+        || frame->unary_output.rel != target || !frame->unary_output.owned
+        || frame->unary_output.kind != WL_COLUMNAR_EVAL_ENTRY_RELATION
+        || !ctx->batch_initialized
+        || !ctx->drain_initialized || ctx->batch.identity != &ctx->batch
+        || ctx->batch.raw.relation != target || ctx->batch.raw_mode
+        || ctx->batch.phase != WL_COLUMNAR_RELATION_BATCH_HELD
+        || !ctx->batch.raw.active || !expected_nonce
+        || ctx->batch.raw.single.set.acquisition_nonce != expected_nonce
+        || ctx->batch.raw.single.set.owner_count != 1
+        || ctx->batch.raw.single.set.owners_acquired != 1
+        || ctx->batch.raw.single.set.descriptors_acquired != 1) return EINVAL;
+    int rc = wl_evaluation_control_charge_attempt(ctx->control,
+            ctx->attempt_id, 0);
+    if (rc) return rc;
+    debt->frame = frame; debt->numeric_owner = owner; debt->context = ctx;
+    debt->target = target; debt->original_control = ctx->control;
+    debt->original_id = ctx->attempt_id;
+    debt->batch_nonce = expected_nonce;
+    debt->original_control_identity =
+        wl_evaluation_control_identity(ctx->control);
+    debt->origin_stage = ctx->stage;
+    debt->phase = WL_COLUMNAR_RELATION_ROW_DEBT_FORWARD;
+    frame->row_debt = debt; ctx->busy = true;
+    *out = ctx;
+    return 0;
+}
+
+int
+wl_columnar_eval_stack_row_debt_unbind_owned(
+    wl_columnar_eval_stack_cleanup_frame_t *frame, const void *owner,
+    wl_columnar_relation_row_debt_t *debt)
+{
+    if (!frame || !debt || frame->identity != frame
+        || frame->row_debt != debt || frame->numeric_plan_owner != owner
+        || debt->identity != debt || debt->frame != frame
+        || debt->numeric_owner != owner || debt->context != &frame->filter
+        || !frame->filter.busy ||
+        debt->phase != WL_COLUMNAR_RELATION_ROW_DEBT_UNBIND
+        || debt->row_ready || debt->refund_ready || debt->downsize_ready
+        || debt->image_columns || debt->image_timestamps
+        || debt->image_extent || debt->image_cursor) return EINVAL;
+    if (debt->capture_ready && (debt->capture.allocated
+        || debt->capture.credit_held || debt->capture.ref_held)) return EINVAL;
+    wl_columnar_filter_context_t *ctx = &frame->filter;
+    if (!ctx->execution_result) ctx->execution_result = debt->execution_result;
+    if (!ctx->semantic_result) ctx->semantic_result = ctx->execution_result;
+    frame->row_debt = NULL;
+    debt->frame = NULL; debt->numeric_owner = NULL; debt->context = NULL;
+    debt->target = NULL; debt->original_control = NULL;
+    debt->original_id = 0; debt->original_control_identity = 0;
+    debt->batch_nonce = 0;
+    debt->capture_ready = false; debt->intent_valid = false;
+    debt->phase = WL_COLUMNAR_RELATION_ROW_DEBT_DONE;
+    ctx->busy = false;
+    return 0;
+}
+
+/* At most two subtraction-based comparisons between actual saved checks.
+ * Supplied row values may alias protected destination columns: capture owns
+ * that case. Full object-lifetime disjointness remains the C caller contract. */
+int
+wl_columnar_eval_stack_row_debt_geometry_owned(
+    wl_columnar_eval_stack_cleanup_frame_t *frame, const void *owner,
+    const wl_columnar_relation_row_debt_t *debt, const int64_t *values,
+    uint32_t width, const wl_columnar_relation_row_debt_status_t *status,
+    wl_evaluation_control_t *control, uint64_t id, bool forward)
+{
+    if (!frame || !owner || !debt || !status || !control || !id
+        || (forward && !values)) return EINVAL;
+    uint64_t row_bytes = (uint64_t)width * sizeof(*values);
+    if (row_bytes > SIZE_MAX) return EOVERFLOW;
+    const void *objects[] = {debt, status, values, frame, owner,
+                             frame->filter.output};
+    size_t lengths[] = {sizeof(*debt), sizeof(*status), (size_t)row_bytes,
+                        sizeof(wl_columnar_eval_stack_allocation_t),
+                        sizeof(wl_columnar_eval_plan_numeric_attempt_t),
+                        sizeof(col_rel_t)};
+    for (unsigned i = 0; i < 6; ++i) {
+        int rc = wl_evaluation_control_charge_attempt(control, id, 0);
+        if (rc) return rc;
+        if ((!objects[i] && lengths[i]) || (lengths[i]
+            && lengths[i] - 1 > UINTPTR_MAX - (uintptr_t)objects[i]))
+            return EINVAL;
+    }
+    static const unsigned pairs[][2] = {
+        {0, 1}, {0, 2}, {0, 3}, {0, 4}, {0, 5},
+        {1, 2}, {1, 3}, {1, 4}, {1, 5}
+    };
+    for (unsigned i = 0; i < sizeof(pairs) / sizeof(pairs[0]); i += 2) {
+        int rc = wl_evaluation_control_charge_attempt(control, id, 0);
+        if (rc) return rc;
+        for (unsigned j = i; j < i + 2 && j < sizeof(pairs)/sizeof(pairs[0]);
+            ++j) {
+            unsigned a = pairs[j][0], b = pairs[j][1];
+            if (lengths[a] && lengths[b]
+                && !wl_columnar_eval_stack_copy_ranges_disjoint(objects[a],
+                lengths[a], objects[b], lengths[b])) return EINVAL;
+        }
+    }
+    return wl_evaluation_control_charge_attempt(control, id, 0);
 }
 
 static bool

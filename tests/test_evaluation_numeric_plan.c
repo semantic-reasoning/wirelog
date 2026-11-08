@@ -14705,6 +14705,769 @@ test_abort_scan_generated_and_saved_id(void)
     }
 }
 
+static fixture_t *row_debt_fixture;
+static unsigned row_debt_stop_event;
+static uint32_t row_debt_stop_cursor;
+static bool row_debt_stopped;
+static wl_columnar_relation_row_debt_t *row_debt_selected;
+static wl_columnar_memory_reservation_t row_debt_cas_peer;
+static unsigned row_debt_cas_hits;
+
+static void
+row_debt_credit_contention(wl_columnar_memory_governor_t *governor)
+{
+    if (row_debt_cas_hits) return;
+    CHECK(wl_columnar_memory_reserve_checked(governor, 1, &row_debt_cas_peer)
+        == WL_COLUMNAR_MEMORY_ADMISSION_OK);
+    ++row_debt_cas_hits;
+}
+
+static void
+row_debt_record_stop(wl_evaluation_control_t *control, uint64_t work)
+{
+    if (work == 63 && row_debt_selected->row_ready && !row_debt_stopped) {
+        row_debt_stopped = true;
+        wl_evaluation_control_request_cancel(control);
+    }
+}
+
+static void
+row_debt_renewed_stop(wl_columnar_relation_append_batch_t *batch)
+{
+    CHECK(batch->phase == WL_COLUMNAR_RELATION_BATCH_ENDED
+        && !batch->raw.active);
+    row_debt_stopped = true;
+    wl_evaluation_control_request_cancel(batch->control);
+}
+
+static void
+row_debt_reserved_stop(wl_evaluation_control_t *control,
+    wl_columnar_memory_reservation_t *token, unsigned phase)
+{
+    if (token == &row_debt_selected->capture.credit
+        && row_debt_selected->capture.credit_held
+        && phase == WL_COLUMNAR_MEMORY_GOVERNOR_SNAPSHOT) {
+        CHECK(atomic_load_explicit(&token->state, memory_order_acquire)
+            == WL_COLUMNAR_MEMORY_RESERVATION_RESERVED
+            && !atomic_load_explicit(&token->owner_bits, memory_order_acquire));
+        row_debt_stopped = true;
+        wl_evaluation_control_request_cancel(control);
+    }
+}
+
+static void
+row_debt_ledger_stop(wl_evaluation_control_t *control,
+    wl_columnar_mem_ledger_publication_prepared_t *ledger, unsigned phase)
+{
+    if (ledger == &row_debt_selected->row.ledger
+        && phase == WL_COLUMNAR_MEM_LEDGER_PUBLICATION_PRECAS) {
+        CHECK(ledger->phase == WL_COLUMNAR_MEM_LEDGER_PUBLICATION_READY
+            && !atomic_load_explicit(&ledger->ledger->writer_gate,
+            memory_order_acquire));
+        row_debt_stopped = true;
+        wl_evaluation_control_request_cancel(control);
+    }
+}
+
+static void
+row_debt_checkpoint(wl_columnar_relation_row_debt_t *d,
+    wl_evaluation_control_t *funding, unsigned event)
+{
+    fixture_t *f = row_debt_fixture;
+    CHECK(f && d->frame == f->frame && d->context->busy && d->active_call);
+    wl_columnar_relation_row_debt_status_t status = {.execution_result = 119};
+    CHECK(wl_columnar_filter_row_debt_step_owned(f->frame, &f->record, d,
+        f->funding, f->funding_id, &status) == EBUSY
+        && status.execution_result == 119);
+    wl_columnar_filter_status_t old = {.semantic_result = 119};
+    CHECK(wl_columnar_filter_op_attempt_step(f->frame, &old) == EBUSY
+        && old.semantic_result == 119);
+    wl_columnar_eval_stack_cleanup_frame_t *frame = f->frame;
+    CHECK(wl_columnar_eval_stack_cleanup_finish(&frame) == EBUSY
+        && frame == f->frame);
+    if (!row_debt_stopped && event == row_debt_stop_event
+        && (event != WL_COLUMNAR_FILTER_ROW_DEBT_TEST_RETIRE
+        || (d->phase == WL_COLUMNAR_RELATION_ROW_DEBT_IMAGE_LANE
+        && d->image_cursor == row_debt_stop_cursor))) {
+        row_debt_stopped = true;
+        wl_evaluation_control_request_cancel(funding);
+    }
+}
+
+/* A new dedicated one-use financier for each real retained action. */
+static int
+row_debt_turn(fixture_t *f, wl_columnar_relation_row_debt_t *d,
+    wl_columnar_relation_row_debt_status_t *status, uint64_t limit,
+    unsigned mode)
+{
+    int owner = 0;
+    wl_evaluation_control_t *funding = control_new(limit, &owner);
+    uint64_t id = wl_evaluation_control_active_attempt_id(funding);
+    if (mode == 1) wl_evaluation_control_request_cancel(funding);
+    if (mode == 2) {
+        CHECK(!wl_evaluation_control_finish(funding, &owner, 0, 0)
+            && !wl_evaluation_control_begin(funding, &owner));
+        CHECK(id != wl_evaluation_control_active_attempt_id(funding));
+    }
+    if (mode == 3) {
+        row_debt_fixture = f; row_debt_stopped = false;
+        row_debt_stop_event = WL_COLUMNAR_FILTER_ROW_DEBT_TEST_CLEANUP_RETIRED;
+        wl_columnar_filter_row_debt_test_checkpoint = row_debt_checkpoint;
+    }
+    int rc = wl_columnar_filter_row_debt_step_owned(f->frame, &f->record,
+            d, funding, id, status);
+    if (mode == 3) {
+        wl_columnar_filter_row_debt_test_checkpoint = NULL;
+        row_debt_fixture = NULL;
+        CHECK(row_debt_stopped);
+    }
+    int ended = wl_evaluation_control_finish(funding, &owner, 0, 0);
+    CHECK(ended == (mode == 1 || mode == 3 ? WL_EVALUATION_CONTROL_CANCELLED
+        : limit < 192 ? WL_EVALUATION_CONTROL_WORK_LIMIT : 0));
+    wl_evaluation_control_report_t report;
+    CHECK(!wl_evaluation_control_report(funding, &report)
+        && report.consumed == (mode == 1 || mode == 2 || mode == 4 ||
+        limit < 192
+        ? 0u : 192u));
+    CHECK(!wl_evaluation_control_detach(funding, &owner));
+    wl_evaluation_control_release(funding);
+    return rc;
+}
+
+static void *
+row_debt_wrong_thread(void *data)
+{
+    wl_columnar_relation_row_debt_t *d = data;
+    fixture_t *f = row_debt_fixture;
+    wl_columnar_relation_row_debt_status_t status = {.execution_result = 119};
+    CHECK(wl_columnar_filter_row_debt_status_owned(f->frame, &f->record, d,
+        &status) == EINVAL && status.execution_result == 119);
+    CHECK(wl_columnar_filter_row_debt_step_owned(f->frame, &f->record, d,
+        f->funding, f->funding_id, &status) == EINVAL
+        && status.execution_result == 119);
+    return NULL;
+}
+
+static void
+row_debt_authority_refusals(fixture_t *f, wl_columnar_relation_row_debt_t *d)
+{
+    wl_columnar_relation_row_debt_t *saved = malloc(sizeof(*d));
+    CHECK(saved); memcpy(saved, d, sizeof(*d));
+    wl_columnar_relation_row_debt_status_t status = {.execution_result = 119};
+    CHECK(wl_columnar_relation_row_debt_reset(d) == EBUSY);
+    CHECK(row_debt_turn(f, saved, &status, 192, 4) == EINVAL
+        && status.execution_result == 119);
+    CHECK(wl_columnar_filter_row_debt_status_owned(f->frame, &f->record, d,
+        (wl_columnar_relation_row_debt_status_t *)d) == EINVAL);
+    CHECK(wl_columnar_filter_row_debt_status_owned(f->frame, &f->record, d,
+        (wl_columnar_relation_row_debt_status_t *)&f->record) == EINVAL);
+    CHECK(row_debt_turn(f, d, (wl_columnar_relation_row_debt_status_t *)d,
+        192, 0) == EINVAL);
+    CHECK(wl_columnar_filter_row_debt_step_owned(f->frame, &f->record, d,
+        f->operation, f->operation_id, &status) == EINVAL);
+    wl_columnar_filter_status_t old = {.semantic_result = 119};
+    CHECK(unary_batch_call(f, &f->record, &old, 192, 0) == EBUSY
+        && old.semantic_result == 119);
+    CHECK(wl_columnar_eval_plan_numeric_attempt_ack(&f->record,
+        f->funding, f->funding_id) == EBUSY);
+    row_debt_fixture = f;
+    wl_thread_t thread;
+    CHECK(!wl_thread_create(&thread, row_debt_wrong_thread, d)
+        && !wl_thread_join(&thread));
+    row_debt_fixture = NULL;
+    wl_col_session_t foreign = {0};
+    wl_col_session_t *session = f->record.session;
+    f->record.session = &foreign;
+    CHECK(row_debt_turn(f, d, &status, 192, 4) == EINVAL);
+    f->record.session = session;
+    wl_evaluation_control_t *original = d->original_control;
+    d->original_control = f->funding;
+    CHECK(row_debt_turn(f, d, &status, 192, 0) == EINVAL);
+    d->original_control = original;
+    CHECK(!memcmp(saved, d, sizeof(*d)));
+    free(saved);
+}
+
+static wl_columnar_filter_context_t *
+row_debt_wait_batch(fixture_t *f)
+{
+    wl_columnar_filter_context_t *ctx = NULL;
+    for (unsigned turn = 0;; ++turn) {
+        CHECK(turn < 10000 && f->record.phase !=
+            WL_COLUMNAR_EVAL_PLAN_NUMERIC_DONE);
+        CHECK(!wl_columnar_eval_stack_filter_context_owned(f->frame, &ctx,
+            &f->record));
+        if (f->record.phase == WL_COLUMNAR_EVAL_PLAN_NUMERIC_CHILD
+            && (ctx->stage == WL_COLUMNAR_FILTER_STAGE_BATCH
+            || ctx->stage == WL_COLUMNAR_FILTER_STAGE_JOIN_BATCH)) return ctx;
+        engine_dispatch(f); ++f->witnesses;
+    }
+}
+
+static void
+test_owned_row_operator_contexts(void)
+{
+    const char *queries[] = {
+        ".decl input(x:int64)\n.decl output(x:int64)\noutput(x):-input(x),x>0.\n",
+        ".decl input(x:int64)\n.decl right(y:int64)\n.decl output(x:int64,y:int64)\noutput(x,y):-input(x),right(y).\n",
+        ".decl input(x:int64)\n.decl right(x:int64)\n.decl output(x:int64)\noutput(x):-input(x),!right(x).\n",
+        ".decl input(x:int64)\n.decl output(n:int64)\noutput(count(x)):-input(x).\n"
+    };
+    const wl_plan_op_type_t targets[] = {WL_PLAN_OP_FILTER, WL_PLAN_OP_JOIN,
+                                         WL_PLAN_OP_ANTIJOIN,
+                                         WL_PLAN_OP_REDUCE};
+    for (unsigned kind = 0; kind < 4; ++kind) {
+        wirelog_error_t error;
+        wirelog_program_t *program = wirelog_parse_string(queries[kind],
+                &error);
+        wl_plan_t *plan = NULL;
+        CHECK(program && !wl_plan_from_program(program, &plan));
+        wl_plan_relation_t body = probe_generated_body(plan);
+        fixture_t f; fixture_init(&f, 1, 3, 0);
+        col_rel_t *right = source_new(1, 2);
+        CHECK(!wl_columnar_relation_rename_checked(right, "right"));
+        col_rel_t *registry[] = {f.input, right};
+        f.session.rels = registry; f.session.nrels = 2;
+        fixture_begin(&f, &body, 1, body.op_count);
+        wl_columnar_filter_context_t *ctx = row_debt_wait_batch(&f);
+        CHECK(body.ops[f.record.cursor].op == targets[kind]);
+        CHECK(ctx->stage == (kind ? WL_COLUMNAR_FILTER_STAGE_JOIN_BATCH
+            : WL_COLUMNAR_FILTER_STAGE_BATCH));
+        uint32_t old_rows = ctx->output->nrows;
+        CHECK(old_rows == (kind == 0 ? 2u : kind == 1 ? 6u : 1u));
+        wl_columnar_relation_row_debt_t *d = malloc(sizeof(*d));
+        CHECK(d); memset(d, 0xa5, sizeof(*d));
+        wl_columnar_relation_row_debt_init(d);
+        const int64_t values[] = {117, 333};
+        wl_columnar_relation_row_debt_status_t status;
+        CHECK(!wl_columnar_filter_row_component_append_owned(f.frame,
+            &f.record, d, values, &status) && status.complete
+            && status.row_published && !status.execution_result
+            && ctx->output->nrows == old_rows + 1);
+        for (uint32_t c = 0; c < ctx->output->ncols; ++c)
+            CHECK(ctx->output->columns[c][old_rows] == values[c]);
+        run(&f); CHECK(!f.record.semantic_result);
+        fixture_close(&f);
+        CHECK(!wl_columnar_filter_row_debt_status_owned(NULL, NULL, d,
+            &status) && status.complete);
+        free(d); col_rel_destroy(right);
+        wl_plan_free(plan); wirelog_program_free(program);
+    }
+}
+
+static void
+test_owned_row_float_component(void)
+{
+    wirelog_error_t error;
+    wirelog_program_t *program = wirelog_parse_string(
+        ".decl input(x:float)\n.decl output(x:float)\n"
+        "output(x+0.0):-input(x).\n", &error);
+    wl_plan_t *plan = NULL;
+    CHECK(program && !wl_plan_from_program(program, &plan));
+    wl_plan_relation_t body = probe_generated_body(plan);
+    for (unsigned invalid = 0; invalid < 2; ++invalid) {
+        fixture_t f; fixture_init(&f, 1, 0, 0);
+        wirelog_column_type_t type = WIRELOG_TYPE_FLOAT;
+        CHECK(!col_rel_set_column_types(f.input, &type, 1));
+        for (unsigned row = 0; row < 64; ++row) {
+            int64_t value = wl_columnar_float_to_bits((double)row);
+            CHECK(!col_rel_append_row(f.input, &value));
+        }
+        fixture_begin(&f, &body, 1, body.op_count);
+        wl_columnar_filter_context_t *ctx = row_debt_wait_batch(&f);
+        CHECK(ctx->output->column_types[0] == WIRELOG_TYPE_FLOAT
+            && ctx->output->nrows == 64);
+        wl_columnar_relation_row_debt_t *d = malloc(sizeof(*d)); CHECK(d);
+        wl_columnar_relation_row_debt_init(d);
+        int64_t bits = invalid ? INT64_C(0x7ff8000000000000) : INT64_MIN;
+        wl_columnar_relation_row_debt_status_t status;
+        CHECK(!wl_columnar_filter_row_component_append_owned(f.frame,
+            &f.record, d, &bits, &status) && status.complete
+            && !status.cleanup_pending && status.row_published == !invalid
+            && status.execution_result == (invalid ? EINVAL : 0)
+            && ctx->output->nrows == (invalid ? 64u : 65u));
+        for (unsigned row = 0; row < 64; ++row)
+            CHECK(ctx->output->columns[0][row]
+                == wl_columnar_float_to_bits((double)row));
+        if (!invalid) CHECK(!ctx->output->columns[0][64]);
+        run(&f);
+        CHECK(f.record.semantic_result == (invalid ? EINVAL : 0));
+        fixture_close(&f); free(d);
+    }
+    wl_plan_free(plan); wirelog_program_free(program);
+}
+
+static void
+test_owned_row_timestamp_component(void)
+{
+    wirelog_error_t error;
+    wirelog_program_t *program = wirelog_parse_string(
+        ".decl input(x:int64)\n.decl output(x:int64)\n"
+        "output(x):-input(x),x>=0.\n", &error);
+    wl_plan_t *plan = NULL;
+    CHECK(program && !wl_plan_from_program(program, &plan));
+    wl_plan_relation_t body = probe_generated_body(plan);
+    for (unsigned fault = 0; fault < 3; ++fault) {
+        fixture_t f; fixture_init(&f, 1, 64, 0);
+        CHECK(!col_rel_enable_timestamps(f.input));
+        for (unsigned row = 0; row < 64; ++row) {
+            f.input->timestamps[row].stratum = 2;
+            f.input->timestamps[row].worker = 3;
+            f.input->timestamps[row].iteration = row;
+            f.input->timestamps[row].multiplicity = row & 1 ? -3 : 2;
+        }
+        wl_columnar_memory_governor_ref_t *g = join_governor(&f, 1u << 24);
+        fixture_begin(&f, &body, 1, body.op_count);
+        wl_columnar_filter_context_t *ctx = row_debt_wait_batch(&f);
+        CHECK(ctx->output->timestamps && ctx->output->nrows == 64
+            && ctx->output->timestamp_capacity == ctx->output->capacity
+            && ctx->output->capacity == 64);
+        ctx->output->mem_ledger = &f.session.mem_ledger;
+        ctx->output->ledger_ts_bytes =
+            col_rel_timestamp_ledger_bytes(ctx->output);
+        wl_mem_ledger_alloc(&f.session.mem_ledger, WL_MEM_SUBSYS_RELATION,
+            col_rel_owned_ledger_bytes(ctx->output));
+        wl_mem_ledger_alloc(&f.session.mem_ledger, WL_MEM_SUBSYS_TIMESTAMP,
+            ctx->output->ledger_ts_bytes);
+        wl_columnar_relation_row_debt_t *d = malloc(sizeof(*d)); CHECK(d);
+        wl_columnar_relation_row_debt_init(d);
+        if (fault == 1) wl_columnar_relation_test_growth_fail_allocation = 3;
+        if (fault == 2) {
+            row_debt_fixture = &f; row_debt_stopped = false;
+            row_debt_stop_event = WL_COLUMNAR_FILTER_ROW_DEBT_TEST_RETIRE;
+            row_debt_stop_cursor = 1;
+            wl_columnar_filter_row_debt_test_checkpoint = row_debt_checkpoint;
+        }
+        int64_t value = 117;
+        wl_columnar_relation_row_debt_status_t status;
+        CHECK(!wl_columnar_filter_row_component_append_owned(f.frame,
+            &f.record, d, &value, &status));
+        wl_columnar_relation_test_growth_fail_allocation = 0;
+        wl_columnar_filter_row_debt_test_checkpoint = NULL;
+        row_debt_fixture = NULL;
+        int expected = fault == 1 ? ENOMEM
+            : fault == 2 ? WL_EVALUATION_CONTROL_CANCELLED : 0;
+        CHECK(status.execution_result == expected
+            && status.row_published == (fault != 1)
+            && ctx->output->nrows == (fault == 1 ? 64u : 65u));
+        if (fault == 2) {
+            CHECK(row_debt_stopped && status.cleanup_pending
+                && d->image_timestamps && !d->image_columns[0]);
+            for (unsigned turn = 0;
+                d->phase != WL_COLUMNAR_RELATION_ROW_DEBT_DONE;
+                ++turn)
+                CHECK(turn < 40 && !row_debt_turn(&f, d, &status, 192, 0));
+        }
+        CHECK(status.complete && !status.cleanup_pending);
+        for (unsigned row = 0; row < 64; ++row) {
+            col_delta_timestamp_t *ts = &ctx->output->timestamps[row];
+            CHECK(ctx->output->columns[0][row] == (int64_t)row
+                && ts->stratum == 2 && ts->worker == 3 && ts->iteration == row
+                && ts->multiplicity == (row & 1 ? -3 : 2));
+        }
+        if (fault != 1) {
+            col_delta_timestamp_t *ts = &ctx->output->timestamps[64];
+            CHECK(!ts->stratum && !ts->worker && !ts->_reserved
+                && !ts->iteration && !ts->multiplicity);
+        }
+        run(&f); CHECK(f.record.semantic_result == expected);
+        fixture_close(&f); free(d);
+        CHECK(!wl_columnar_memory_reserved(wl_columnar_memory_governor_ref_get(
+                g)));
+        wl_mem_ledger_snapshot_t ledger;
+        wl_mem_ledger_snapshot(&f.session.mem_ledger, &ledger);
+        CHECK(!ledger.current_bytes);
+        wl_columnar_memory_governor_ref_release(g);
+    }
+    wl_plan_free(plan); wirelog_program_free(program);
+}
+
+static uint64_t row_debt_measured_prefix;
+
+static void
+row_debt_measure_first_lane(wl_columnar_relation_row_debt_t *d,
+    wl_evaluation_control_t *control, unsigned event)
+{
+    if (event == WL_COLUMNAR_FILTER_ROW_DEBT_TEST_RETIRE
+        && d->phase == WL_COLUMNAR_RELATION_ROW_DEBT_IMAGE_LANE
+        && !d->image_cursor) {
+        CHECK(!wl_evaluation_control_test_active_consumed(control,
+            d->original_id, &row_debt_measured_prefix));
+        wl_evaluation_control_request_cancel(control);
+    }
+}
+
+static void
+test_owned_row_retire_action_allowance(void)
+{
+    wirelog_error_t error;
+    wirelog_program_t *program = wirelog_parse_string(
+        ".decl input(x:int64)\n.decl output(x:int64)\n"
+        "output(x+1):-input(x).\n", &error);
+    wl_plan_t *plan = NULL;
+    CHECK(program && !wl_plan_from_program(program, &plan));
+    wl_plan_relation_t body = probe_generated_body(plan);
+    /* The tariff1 oracle is independent of this empirically observed setup
+     * allowance. No total-budget search derives or changes the action price. */
+    uint64_t prefix = 0;
+    for (unsigned pass = 0; pass < 3; ++pass) {
+        fixture_t f;
+        fixture_init(&f, 1, 64, pass ? prefix + pass - 1 : 0);
+        fixture_begin(&f, &body, 1, body.op_count);
+        wl_columnar_filter_context_t *ctx = row_debt_wait_batch(&f);
+        CHECK(ctx->output->nrows == 64 && ctx->output->capacity == 64);
+        wl_columnar_relation_row_debt_t *d = malloc(sizeof(*d)); CHECK(d);
+        wl_columnar_relation_row_debt_init(d);
+        if (!pass) wl_columnar_filter_row_debt_test_checkpoint =
+                row_debt_measure_first_lane;
+        int64_t value = 117;
+        wl_columnar_relation_row_debt_status_t status;
+        CHECK(!wl_columnar_filter_row_component_append_owned(f.frame,
+            &f.record, d, &value, &status));
+        wl_columnar_filter_row_debt_test_checkpoint = NULL;
+        if (!pass) {
+            prefix = row_debt_measured_prefix;
+            CHECK(prefix &&
+                status.execution_result == WL_EVALUATION_CONTROL_CANCELLED);
+        } else {
+            CHECK(status.execution_result == WL_EVALUATION_CONTROL_WORK_LIMIT
+                && d->phase == WL_COLUMNAR_RELATION_ROW_DEBT_IMAGE_LANE
+                && d->selected_phase == d->phase && d->intent_valid
+                && d->selected_cursor == pass - 1
+                && d->image_cursor == pass - 1
+                && (d->image_columns[0] == NULL) == (pass == 2));
+            uint64_t consumed = 0;
+            CHECK(!wl_evaluation_control_test_active_consumed(f.operation,
+                f.operation_id, &consumed) && consumed == prefix + pass - 1);
+        }
+        CHECK(status.row_published && status.cleanup_pending
+            && ctx->output->nrows == 65 &&
+            ctx->output->columns[0][64] == value);
+        for (unsigned turn = 0; d->phase != WL_COLUMNAR_RELATION_ROW_DEBT_DONE;
+            ++turn) {
+            CHECK(turn < 40 && !row_debt_turn(&f, d, &status, 192, 0));
+        }
+        run(&f);
+        CHECK(f.record.semantic_result ==
+            (pass ? WL_EVALUATION_CONTROL_WORK_LIMIT
+            : WL_EVALUATION_CONTROL_CANCELLED));
+        fixture_close(&f); free(d);
+    }
+    wl_plan_free(plan); wirelog_program_free(program);
+}
+
+static void
+test_owned_row_retirement_component(void)
+{
+    const uint32_t widths[] = {1, 16, 17, 257};
+    for (unsigned w = 0; w < sizeof(widths)/sizeof(widths[0]); ++w)
+        for (unsigned stop = 0; stop < 11; ++stop) {
+            uint32_t width = widths[w];
+            if ((stop == 4 || stop == 8) && width <= 16) continue;
+            char query[65536]; size_t used = 0;
+            used += (size_t)snprintf(query + used, sizeof(query) - used,
+                    ".decl input(");
+            for (uint32_t c = 0; c < width; ++c)
+                used += (size_t)snprintf(query + used, sizeof(query) - used,
+                        "%sx%u:int64", c ? "," : "", c);
+            used += (size_t)snprintf(query + used, sizeof(query) - used,
+                    ")\n.decl output(");
+            for (uint32_t c = 0; c < width; ++c)
+                used += (size_t)snprintf(query + used, sizeof(query) - used,
+                        "%sx%u:int64", c ? "," : "", c);
+            used += (size_t)snprintf(query + used, sizeof(query) - used,
+                    ")\noutput(");
+            for (uint32_t c = 0; c < width; ++c)
+                used += (size_t)snprintf(query + used, sizeof(query) - used,
+                        "%sx%u%s", c ? "," : "", c, c ? "" : "+1");
+            used += (size_t)snprintf(query + used, sizeof(query) - used,
+                    "):-input(");
+            for (uint32_t c = 0; c < width; ++c)
+                used += (size_t)snprintf(query + used, sizeof(query) - used,
+                        "%sx%u", c ? "," : "", c);
+            CHECK(used + 4 < sizeof(query));
+            snprintf(query + used, sizeof(query) - used, ").\n");
+            wirelog_error_t error;
+            wirelog_program_t *program = wirelog_parse_string(query, &error);
+            wl_plan_t *plan = NULL;
+            CHECK(program && !wl_plan_from_program(program, &plan));
+            wl_plan_relation_t body = probe_generated_body(plan);
+            fixture_t f; fixture_init(&f, width, 64, 0);
+            wl_columnar_memory_governor_ref_t *governor =
+                join_governor(&f, 1u << 24);
+            wl_columnar_memory_reservation_t peer;
+            wl_columnar_memory_reservation_init(&peer);
+            CHECK(wl_columnar_memory_reserve_checked(
+                    wl_columnar_memory_governor_ref_get(governor), 37, &peer)
+                == WL_COLUMNAR_MEMORY_ADMISSION_OK);
+            wl_columnar_memory_reservation_init(&row_debt_cas_peer);
+            row_debt_cas_hits = 0;
+            fixture_begin(&f, &body, 1, body.op_count);
+            wl_columnar_filter_context_t *ctx = NULL;
+            for (unsigned turn = 0;; ++turn) {
+                CHECK(turn < 10000 && f.record.phase !=
+                    WL_COLUMNAR_EVAL_PLAN_NUMERIC_DONE);
+                CHECK(!wl_columnar_eval_stack_filter_context_owned(f.frame,
+                    &ctx, &f.record));
+                if (f.record.phase == WL_COLUMNAR_EVAL_PLAN_NUMERIC_CHILD
+                    && ctx->stage == WL_COLUMNAR_FILTER_STAGE_BATCH) break;
+                engine_dispatch(&f); ++f.witnesses;
+            }
+            CHECK(ctx->batch_initialized && !ctx->execution_result
+                && ctx->output->nrows == 64 && ctx->output->capacity == 64);
+            /* Explicit component accounting setup on the actual privately
+             * owned output; no writer, stage or permission fields are seeded. */
+            CHECK(!ctx->output->mem_ledger);
+            ctx->output->mem_ledger = &f.session.mem_ledger;
+            wl_mem_ledger_alloc(&f.session.mem_ledger, WL_MEM_SUBSYS_RELATION,
+                11 + col_rel_owned_ledger_bytes(ctx->output));
+            wl_mem_ledger_alloc(&f.session.mem_ledger, WL_MEM_SUBSYS_TIMESTAMP,
+                13);
+            wl_columnar_relation_row_debt_t *d = malloc(sizeof(*d));
+            int64_t *values = malloc((size_t)width * sizeof(*values));
+            CHECK(d && values);
+            memset(d, 0xa5, sizeof(*d));
+            wl_columnar_relation_row_debt_init(d);
+            wl_columnar_relation_row_debt_status_t status;
+            unsigned last = !stop ? 130 : stop >= 6 ? 129 : 65;
+            unsigned stop_row = stop >= 6 ? 128 : 64;
+            for (unsigned row = 64; row < last; ++row) {
+                for (uint32_t c = 0; c < width; ++c)
+                    values[c] = (int64_t)row * 1000 + c;
+                if (row == stop_row && stop) {
+                    row_debt_fixture = &f; row_debt_stopped = false;
+                    row_debt_stop_event = stop == 1
+                        ? WL_COLUMNAR_FILTER_ROW_DEBT_TEST_FORWARD
+                        : WL_COLUMNAR_FILTER_ROW_DEBT_TEST_RETIRE;
+                    row_debt_stop_cursor = 1;
+                    if (stop <= 2)
+                        wl_columnar_filter_row_debt_test_checkpoint =
+                            row_debt_checkpoint;
+                    if (stop == 3) {
+                        row_debt_selected = d;
+                        wl_columnar_relation_test_work_checkpoint =
+                            row_debt_record_stop;
+                    }
+                    if (stop == 4 || stop == 5)
+                        wl_columnar_relation_test_growth_fail_allocation =
+                            stop == 4 ? 1 : width > 16 ? 3 : 2;
+                    if (stop == 5)
+                        wl_columnar_memory_growth_refund_test_before_credit_cas
+                            =
+                            row_debt_credit_contention;
+                    if (stop == 6)
+                        wl_columnar_relation_test_batch_renewed =
+                            row_debt_renewed_stop;
+                    if (stop == 7) {
+                        funded_drain_fail_once = true;
+                        wl_columnar_relation_test_single_release =
+                            funded_drain_release_failure;
+                    }
+                    if (stop == 8) {
+                        row_debt_selected = d;
+                        wl_columnar_memory_governor_test_checkpoint =
+                            row_debt_reserved_stop;
+                    }
+                    if (stop == 9) {
+                        row_debt_selected = d;
+                        wl_columnar_mem_ledger_publication_test_checkpoint =
+                            row_debt_ledger_stop;
+                    }
+                    if (stop == 10) {
+                        wl_columnar_memory_governor_t *g =
+                            wl_columnar_memory_governor_ref_get(governor);
+                        atomic_store_explicit(&g->usable_bytes,
+                            wl_columnar_memory_reserved(g),
+                            memory_order_release);
+                    }
+                }
+                const int64_t *supplied = !stop && row == 65 && width <= 17
+                    ? ctx->output->columns[0] : values;
+                CHECK(!wl_columnar_filter_row_component_append_owned(f.frame,
+                    &f.record, d, supplied, &status));
+                if (stop == 10 && row == stop_row) {
+                    CHECK(ctx->output->memory_budget_denial_pending);
+                    atomic_store_explicit(&wl_columnar_memory_governor_ref_get(
+                            governor)->usable_bytes, 1u << 24,
+                        memory_order_release);
+                }
+                wl_columnar_filter_row_debt_test_checkpoint = NULL;
+                wl_columnar_relation_test_work_checkpoint = NULL;
+                wl_columnar_relation_test_growth_fail_allocation = 0;
+                wl_columnar_memory_growth_refund_test_before_credit_cas = NULL;
+                wl_columnar_relation_test_batch_renewed = NULL;
+                wl_columnar_relation_test_single_release = NULL;
+                wl_columnar_memory_governor_test_checkpoint = NULL;
+                wl_columnar_mem_ledger_publication_test_checkpoint = NULL;
+                row_debt_selected = NULL;
+                row_debt_fixture = NULL;
+                if (row == stop_row && stop && (stop < 4 || stop == 6
+                    || stop == 8 || stop == 9)) {
+                    CHECK(row_debt_stopped && status.cleanup_pending
+                        && !status.complete && status.execution_result ==
+                        WL_EVALUATION_CONTROL_CANCELLED && ctx->busy
+                        && status.row_published == (stop == 2));
+                    CHECK(ctx->output->nrows ==
+                        stop_row + (stop == 2 ? 1u : 0u));
+                    if (stop == 6) CHECK(d->progress ==
+                            WL_COLUMNAR_RELATION_ROW_DEBT_CAPTURE_ONLY
+                            && ctx->batch.phase ==
+                            WL_COLUMNAR_RELATION_BATCH_ENDED);
+                    if (stop == 8) CHECK(d->capture.credit_held
+                            && !d->row_ready
+                            && atomic_load_explicit(&d->capture.credit.state,
+                            memory_order_acquire) ==
+                            WL_COLUMNAR_MEMORY_RESERVATION_RESERVED
+                            && !atomic_load_explicit(
+                                &d->capture.credit.owner_bits,
+                                memory_order_acquire));
+                    if (stop == 9) CHECK(d->row_ready
+                            && d->row.ledger.phase ==
+                            WL_COLUMNAR_MEM_LEDGER_PUBLICATION_READY
+                            && d->row.governor.phase ==
+                            WL_COLUMNAR_MEMORY_GOVERNOR_GROWTH_COMMIT_READY
+                            && !atomic_load_explicit(
+                                &f.session.mem_ledger.writer_gate,
+                                memory_order_acquire));
+                    if (stop == 2)
+                        CHECK(d->growth_published && d->image_cursor == 1
+                            && d->image_extent == width
+                            && !d->image_columns[0]);
+                    wl_columnar_relation_row_debt_t *saved = malloc(sizeof(*d));
+                    CHECK(saved);
+                    for (unsigned mode = 0; mode < 3; ++mode) {
+                        memcpy(saved, d, sizeof(*d));
+                        status.execution_result = 119;
+                        CHECK(row_debt_turn(&f, d, &status,
+                            mode ? 192 : 191, mode) == (mode == 1
+                            ? WL_EVALUATION_CONTROL_CANCELLED : mode == 2
+                            ? EINVAL : WL_EVALUATION_CONTROL_WORK_LIMIT)
+                            && status.execution_result == 119
+                            && !memcmp(saved, d, sizeof(*d)));
+                    }
+                    free(saved);
+                    row_debt_authority_refusals(&f, d);
+                    uint64_t before = 0, after = 0;
+                    CHECK(!wl_evaluation_control_test_active_consumed(
+                            f.operation, f.operation_id, &before));
+                    wl_evaluation_control_report_t frozen;
+                    uint64_t successor = 0;
+                    if (stop == 2) {
+                        CHECK(wl_evaluation_control_finish(f.operation,
+                            &f.operation_owner, 0, 0)
+                            == WL_EVALUATION_CONTROL_CANCELLED);
+                        CHECK(!wl_evaluation_control_report(f.operation,
+                            &frozen));
+                        if (width > 16) {
+                            CHECK(!wl_evaluation_control_begin(f.operation,
+                                &f.operation_owner));
+                            successor = wl_evaluation_control_active_attempt_id(
+                                f.operation);
+                            CHECK(successor != f.operation_id);
+                        }
+                        CHECK(wl_columnar_filter_row_debt_step_owned(f.frame,
+                            &f.record, d, f.operation, f.operation_id, &status)
+                            == EINVAL);
+                        wl_columnar_relation_row_debt_phase_t phase = d->phase;
+                        uint32_t cursor = d->image_cursor;
+                        status.execution_result = 119;
+                        CHECK(row_debt_turn(&f, d, &status, 192, 3)
+                            == WL_EVALUATION_CONTROL_CANCELLED
+                            && status.execution_result == 119
+                            && (d->phase != phase ||
+                            d->image_cursor != cursor));
+                        CHECK(!wl_columnar_filter_row_debt_status_owned(f.frame,
+                            &f.record, d, &status) && status.cleanup_pending);
+                        wl_columnar_memory_downsize_test_before_credit_cas =
+                            row_debt_credit_contention;
+                    }
+                    bool capture_releasing = false;
+                    for (unsigned turn = 0; d->phase !=
+                        WL_COLUMNAR_RELATION_ROW_DEBT_DONE; ++turn) {
+                        CHECK(turn < width + 40);
+                        CHECK(!row_debt_turn(&f, d, &status, 192, 0));
+                        if (d->capture_ready && d->capture.credit_held
+                            && atomic_load_explicit(&d->capture.credit.state,
+                            memory_order_acquire) ==
+                            WL_COLUMNAR_MEMORY_RESERVATION_RELEASING)
+                            capture_releasing = true;
+                    }
+                    if (stop == 8) CHECK(capture_releasing);
+                    wl_columnar_memory_downsize_test_before_credit_cas = NULL;
+                    CHECK(!ctx->busy && status.complete
+                        && !status.cleanup_pending
+                        && status.execution_result ==
+                        WL_EVALUATION_CONTROL_CANCELLED);
+                    if (stop == 2) {
+                        wl_evaluation_control_report_t current;
+                        CHECK(!wl_evaluation_control_report(f.operation,
+                            &current) && frozen.attempt_id == current.attempt_id
+                            && frozen.limit == current.limit
+                            && frozen.consumed == current.consumed
+                            && frozen.result == current.result
+                            && frozen.stop_reason == current.stop_reason
+                            && frozen.execution_status ==
+                            current.execution_status
+                            && frozen.cleanup_status == current.cleanup_status);
+                        if (successor)
+                            CHECK(!wl_evaluation_control_test_active_consumed(
+                                    f.operation, successor, &after) && !after);
+                    } else CHECK(!wl_evaluation_control_test_active_consumed(
+                                f.operation, f.operation_id,
+                                &after) && before == after);
+                } else if (row == stop_row && (stop == 4 || stop == 5
+                    || stop == 7 || stop == 10)) {
+                    CHECK(status.complete && !status.cleanup_pending
+                        && !status.row_published && !status.cleanup_result
+                        && status.execution_result ==
+                        (stop == 7 ? EAGAIN : ENOMEM)
+                        && !ctx->busy && ctx->output->nrows == stop_row);
+                    if (stop == 7) CHECK(ctx->batch.phase ==
+                            WL_COLUMNAR_RELATION_BATCH_DRAINING
+                            && !funded_drain_fail_once);
+                } else {
+                    CHECK(status.complete && !status.cleanup_pending
+                        && status.row_published && !status.execution_result
+                        && !status.cleanup_result && !ctx->busy
+                        && ctx->output->nrows == row + 1);
+                }
+                for (uint32_t r = 0; r < ctx->output->nrows; ++r)
+                    for (uint32_t c = 0; c < width; ++c)
+                        CHECK(ctx->output->columns[c][r] == (r < 64
+                            ? (int64_t)r + (c ? c : 1u)
+                            : !stop && r == 65 && width <= 17
+                            ? (int64_t)c + 1 : (int64_t)r * 1000 + c));
+                if (row + 1 < last)
+                    CHECK(!wl_columnar_relation_row_debt_reset(d));
+            }
+            run(&f);
+            CHECK(f.record.semantic_result == (stop == 7 ? EAGAIN
+                : stop == 4 || stop == 5 || stop == 10 ? ENOMEM
+                : stop ? WL_EVALUATION_CONTROL_CANCELLED : 0));
+            fixture_close(&f);
+            wl_mem_ledger_snapshot_t ledger;
+            wl_mem_ledger_snapshot(&f.session.mem_ledger, &ledger);
+            CHECK(ledger.current_bytes == 24
+                && ledger.subsys_bytes[WL_MEM_SUBSYS_RELATION] == 11
+                && ledger.subsys_bytes[WL_MEM_SUBSYS_TIMESTAMP] == 13
+                && !atomic_load_explicit(&f.session.mem_ledger.writer_gate,
+                memory_order_acquire));
+            CHECK(!wl_columnar_filter_row_debt_status_owned(NULL, NULL, d,
+                &status) && status.complete && !status.cleanup_pending);
+            CHECK(!wl_columnar_relation_row_debt_reset(d));
+            CHECK(wl_columnar_memory_reserved(
+                    wl_columnar_memory_governor_ref_get(governor)) ==
+                37u + row_debt_cas_hits);
+            CHECK(row_debt_cas_hits == (stop == 2 || stop == 5 ? 1u : 0u));
+            if (row_debt_cas_hits)
+                CHECK(wl_columnar_memory_rollback(&row_debt_cas_peer));
+            CHECK(wl_columnar_memory_rollback(&peer));
+            wl_columnar_memory_governor_ref_release(governor);
+            free(values); free(d);
+            wl_plan_free(plan); wirelog_program_free(program);
+        }
+}
+
 int
 main(void)
 {
@@ -14777,6 +15540,11 @@ main(void)
     test_lftj_owned_row_no_capture();
     test_lftj_funded_writer_drain();
     test_owned_batch_retirement_primitive();
+    test_owned_row_retirement_component();
+    test_owned_row_operator_contexts();
+    test_owned_row_float_component();
+    test_owned_row_timestamp_component();
+    test_owned_row_retire_action_allowance();
     test_composed_lftj_stopped_cleanup();
     test_composed_source_stopped_cleanup();
     test_composed_source_cleanup_abort_retry();

@@ -21,6 +21,7 @@
 #include "columnar/diff_trace.h"
 #include "columnar/delta_pool.h"
 #include "columnar/mem_ledger.h"
+#include "columnar/mem_ledger_publication.h"
 #include "columnar/source_access.h"
 #include "columnar/memory_governor.h"
 #include "columnar/lftj.h"
@@ -7307,6 +7308,189 @@ typedef struct wl_columnar_filter_context {
     wl_columnar_relation_empty_source_t source_empty_reader, join_empty_reader;
     wl_columnar_join_scratch_t join_scratch[WL_COLUMNAR_JOIN_SCRATCH_COUNT];
 } wl_columnar_filter_context_t;
+
+/* Address-bound ROW resources. Local legacy records and the selected
+ * persistent capsule use the same forward algorithm. Never move live records. */
+typedef struct {
+    wl_columnar_memory_reservation_t scratch_credit;
+    wl_columnar_memory_governor_growth_commit_prepared_t governor;
+    wl_columnar_mem_ledger_publication_prepared_t ledger;
+    wl_columnar_mem_ledger_publication_request_t requests[2];
+    int64_t inline_row[16];
+    int64_t *captured;
+    int64_t **columns;
+    col_delta_timestamp_t *timestamps;
+    uint32_t allocated_columns;
+    bool scratch_held;
+    bool scratch_owned;
+    bool growth_held;
+    bool published;
+    uint32_t capacity;
+    uint32_t timestamp_capacity;
+    uint32_t rows;
+    uint64_t storage_generation;
+    uint64_t view_generation;
+    uint64_t row_bytes;
+    uint64_t lane_bytes;
+    uint64_t table_bytes;
+    uint64_t old_lanes;
+    uint64_t new_lanes;
+    uint64_t old_ts;
+    uint64_t new_ts;
+    uint64_t incoming;
+    uint64_t old_payload;
+    uint64_t final_payload;
+    uint64_t covered;
+    unsigned request_count;
+} wl_columnar_relation_row_t;
+
+typedef struct {
+    wl_columnar_memory_reservation_t credit;
+    wl_columnar_memory_governor_ref_t *governor;
+    int64_t inline_row[16];
+    int64_t *values;
+    uint64_t bytes;
+    uint32_t width;
+    bool ref_held;
+    bool credit_held;
+    bool allocated;
+} wl_columnar_relation_batch_capture_t;
+
+/* Existing numeric prefix prices, shared by the selected component entry. */
+enum {
+    WL_COLUMNAR_RELATION_SCALAR_SOURCE_SELECTED_WORK = 192,
+    WL_COLUMNAR_RELATION_SCALAR_SOURCE_ROW_CALL_WORK = 128,
+    WL_COLUMNAR_RELATION_ROW_RETIRE_ACTION_WORK = 1
+};
+
+typedef enum {
+    WL_COLUMNAR_RELATION_ROW_DEBT_IDLE,
+    WL_COLUMNAR_RELATION_ROW_DEBT_FORWARD,
+    WL_COLUMNAR_RELATION_ROW_DEBT_CANCEL_LEDGER,
+    WL_COLUMNAR_RELATION_ROW_DEBT_CANCEL_GOVERNOR,
+    WL_COLUMNAR_RELATION_ROW_DEBT_IMAGE_LANE,
+    WL_COLUMNAR_RELATION_ROW_DEBT_IMAGE_TABLE,
+    WL_COLUMNAR_RELATION_ROW_DEBT_IMAGE_TIMESTAMPS,
+    WL_COLUMNAR_RELATION_ROW_DEBT_REFUND_BEGIN,
+    WL_COLUMNAR_RELATION_ROW_DEBT_REFUND_STEP,
+    WL_COLUMNAR_RELATION_ROW_DEBT_DOWNSIZE_BEGIN,
+    WL_COLUMNAR_RELATION_ROW_DEBT_DOWNSIZE_STEP,
+    WL_COLUMNAR_RELATION_ROW_DEBT_CAPTURE_BUFFER,
+    WL_COLUMNAR_RELATION_ROW_DEBT_CAPTURE_CREDIT,
+    WL_COLUMNAR_RELATION_ROW_DEBT_CAPTURE_REF,
+    WL_COLUMNAR_RELATION_ROW_DEBT_UNBIND,
+    WL_COLUMNAR_RELATION_ROW_DEBT_DONE
+} wl_columnar_relation_row_debt_phase_t;
+
+typedef enum {
+    WL_COLUMNAR_RELATION_ROW_DEBT_PREPUBLICATION_STAGED,
+    WL_COLUMNAR_RELATION_ROW_DEBT_POSTPUBLICATION_DISPLACED
+} wl_columnar_relation_row_debt_mode_t;
+
+typedef enum {
+    WL_COLUMNAR_RELATION_ROW_DEBT_NO_RESOURCE,
+    WL_COLUMNAR_RELATION_ROW_DEBT_CAPTURE_ONLY,
+    WL_COLUMNAR_RELATION_ROW_DEBT_ROW_RESOURCES
+} wl_columnar_relation_row_debt_progress_t;
+
+typedef struct {
+    int execution_result, cleanup_result;
+    bool row_published, cleanup_pending, complete;
+} wl_columnar_relation_row_debt_status_t;
+
+/* Caller-owned final address, from init through terminal unbind. Header only
+ * is readable before each corresponding payload-ready marker. The frame
+ * anchor is nonowning; the caller must retain this storage until DONE. */
+typedef struct wl_columnar_relation_row_debt {
+    struct wl_columnar_relation_row_debt *identity;
+#if defined(WL_HAVE_C11_THREADS)
+    thrd_t owner_thread;
+#elif defined(_WIN32) || defined(_WIN64)
+    DWORD owner_thread;
+#else
+    pthread_t owner_thread;
+#endif
+    bool thread_valid;
+    wl_columnar_relation_row_debt_phase_t phase;
+    wl_columnar_relation_row_debt_mode_t mode;
+    wl_columnar_relation_row_debt_progress_t progress;
+    wl_columnar_eval_stack_cleanup_frame_t *frame;
+    const void *numeric_owner;
+    wl_columnar_filter_context_t *context;
+    col_rel_t *target;
+    wl_evaluation_control_t *original_control;
+    uint64_t original_id, original_control_identity, batch_nonce;
+    wl_columnar_filter_stage_t origin_stage;
+    int execution_result, cleanup_result;
+    bool row_published, growth_published;
+    bool capture_ready, row_ready, refund_ready, downsize_ready, intent_valid;
+    /* Same-call reentry exclusion; never a resource permit. */
+    bool active_call;
+    int64_t **image_columns;
+    col_delta_timestamp_t *image_timestamps;
+    uint32_t image_extent, image_cursor;
+    wl_columnar_relation_row_debt_phase_t selected_phase;
+    uint32_t selected_cursor;
+    /* Retirement attempt observation (wrap allowed), never permission. */
+    unsigned action;
+    wl_columnar_relation_row_t row;
+    wl_columnar_relation_batch_capture_t capture;
+    wl_columnar_memory_growth_refund_attempt_t refund;
+    wl_columnar_memory_downsize_attempt_t downsize;
+} wl_columnar_relation_row_debt_t;
+
+void wl_columnar_relation_row_debt_init(wl_columnar_relation_row_debt_t *);
+int wl_columnar_relation_row_debt_reset(wl_columnar_relation_row_debt_t *);
+int wl_columnar_filter_row_component_append_owned(
+    wl_columnar_eval_stack_cleanup_frame_t *, const void *,
+    wl_columnar_relation_row_debt_t *, const int64_t *,
+    wl_columnar_relation_row_debt_status_t *);
+/* One fresh dedicated financier generation per invocation; no incoming
+ * assigned SOURCE promise. This caller precondition is not a native permit. */
+int wl_columnar_filter_row_debt_step_owned(
+    wl_columnar_eval_stack_cleanup_frame_t *, const void *,
+    wl_columnar_relation_row_debt_t *, wl_evaluation_control_t *, uint64_t,
+    wl_columnar_relation_row_debt_status_t *);
+/* DONE accepts NULL frame/owner and reads only fixed self/thread/status. */
+int wl_columnar_filter_row_debt_status_owned(
+    wl_columnar_eval_stack_cleanup_frame_t *, const void *,
+    const wl_columnar_relation_row_debt_t *,
+    wl_columnar_relation_row_debt_status_t *);
+int wl_columnar_eval_stack_row_debt_bind_owned(
+    wl_columnar_eval_stack_cleanup_frame_t *, const void *,
+    wl_columnar_relation_row_debt_t *, uint64_t,
+    wl_columnar_filter_context_t **);
+int wl_columnar_eval_stack_row_debt_context_owned(
+    wl_columnar_eval_stack_cleanup_frame_t *, const void *,
+    const wl_columnar_relation_row_debt_t *, wl_columnar_filter_context_t **);
+int wl_columnar_eval_stack_row_debt_unbind_owned(
+    wl_columnar_eval_stack_cleanup_frame_t *, const void *,
+    wl_columnar_relation_row_debt_t *);
+int wl_columnar_eval_stack_row_debt_geometry_owned(
+    wl_columnar_eval_stack_cleanup_frame_t *, const void *,
+    const wl_columnar_relation_row_debt_t *, const int64_t *, uint32_t,
+    const wl_columnar_relation_row_debt_status_t *, wl_evaluation_control_t *,
+    uint64_t, bool);
+int wl_columnar_relation_row_debt_prove_batch(
+    const wl_columnar_relation_append_batch_t *, wl_evaluation_control_t *,
+    uint64_t, bool *);
+int wl_columnar_relation_row_debt_append_private(
+    wl_columnar_relation_row_debt_t *, const int64_t *);
+int wl_columnar_relation_row_debt_retire_one(
+    wl_columnar_relation_row_debt_t *, wl_evaluation_control_t *, uint64_t,
+    bool *);
+bool wl_columnar_relation_row_debt_thread(
+    const wl_columnar_relation_row_debt_t *);
+#ifdef WL_SESSION_TEST_HOOKS
+extern void (*wl_columnar_filter_row_debt_test_checkpoint)(
+    wl_columnar_relation_row_debt_t *, wl_evaluation_control_t *, unsigned);
+enum {
+    WL_COLUMNAR_FILTER_ROW_DEBT_TEST_FORWARD = 1,
+    WL_COLUMNAR_FILTER_ROW_DEBT_TEST_RETIRE,
+    WL_COLUMNAR_FILTER_ROW_DEBT_TEST_CLEANUP,
+    WL_COLUMNAR_FILTER_ROW_DEBT_TEST_CLEANUP_RETIRED
+};
+#endif
 
 /* Borrow embedded original context after original frame validation. No owner
  * transfer or old-control access; callers never copy the returned record. */

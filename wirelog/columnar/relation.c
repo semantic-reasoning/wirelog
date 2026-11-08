@@ -9000,39 +9000,6 @@ typedef char wl_columnar_relation_row_regions_fit_quantum[
         WL_EVALUATION_CONTROL_QUANTUM
         && 225 <= WL_EVALUATION_CONTROL_QUANTUM) ? 1 : -1];
 
-typedef struct {
-    wl_columnar_memory_reservation_t scratch_credit;
-    wl_columnar_memory_governor_growth_commit_prepared_t governor;
-    wl_columnar_mem_ledger_publication_prepared_t ledger;
-    wl_columnar_mem_ledger_publication_request_t requests[2];
-    int64_t inline_row[16];
-    int64_t *captured;
-    int64_t **columns;
-    col_delta_timestamp_t *timestamps;
-    uint32_t allocated_columns;
-    bool scratch_held;
-    bool scratch_owned;
-    bool growth_held;
-    bool published;
-    uint32_t capacity;
-    uint32_t timestamp_capacity;
-    uint32_t rows;
-    uint64_t storage_generation;
-    uint64_t view_generation;
-    uint64_t row_bytes;
-    uint64_t lane_bytes;
-    uint64_t table_bytes;
-    uint64_t old_lanes;
-    uint64_t new_lanes;
-    uint64_t old_ts;
-    uint64_t new_ts;
-    uint64_t incoming;
-    uint64_t old_payload;
-    uint64_t final_payload;
-    uint64_t covered;
-    unsigned request_count;
-} wl_columnar_relation_row_t;
-
 /* Only meaningful inert fields are initialized. Thread representations and
  * inline values remain unread until the corresponding successful admission
  * or value capture. No hidden structure-sized memset precedes the first poll. */
@@ -9866,18 +9833,6 @@ typedef char wl_columnar_relation_batch_regions_fit_quantum[
         WL_EVALUATION_CONTROL_QUANTUM
         && WL_COLUMNAR_RELATION_BATCH_SET_WORK <=
         WL_EVALUATION_CONTROL_QUANTUM) ? 1 : -1];
-
-typedef struct {
-    wl_columnar_memory_reservation_t credit;
-    wl_columnar_memory_governor_ref_t *governor;
-    int64_t inline_row[16];
-    int64_t *values;
-    uint64_t bytes;
-    uint32_t width;
-    bool ref_held;
-    bool credit_held;
-    bool allocated;
-} wl_columnar_relation_batch_capture_t;
 
 #ifdef WL_SESSION_TEST_HOOKS
 void (*wl_columnar_relation_test_batch_renewed)(
@@ -11069,9 +11024,9 @@ wl_columnar_relation_batch_capture_dispose(
 }
 
 static int
-wl_columnar_relation_batch_capture(
+wl_columnar_relation_batch_capture_mode(
     wl_columnar_relation_append_batch_t *batch, const int64_t *input,
-    wl_columnar_relation_batch_capture_t *capture)
+    wl_columnar_relation_batch_capture_t *capture, bool retained, bool *ready)
 {
     col_rel_t *r = batch->raw.relation;
     wl_evaluation_control_t *control = batch->control;
@@ -11087,6 +11042,7 @@ wl_columnar_relation_batch_capture(
     capture->ref_held = false;
     capture->credit_held = false;
     capture->allocated = false;
+    if (ready) *ready = true;
     if (capture->bytes > SIZE_MAX
         || capture->bytes > UINTPTR_MAX - (uintptr_t)input) {
         rc = EOVERFLOW;
@@ -11216,9 +11172,18 @@ wl_columnar_relation_batch_capture(
     }
     return 0;
 done:
-    wl_columnar_relation_batch_capture_dispose(capture);
+    if (!retained) wl_columnar_relation_batch_capture_dispose(capture);
     /* Caller only disposes successfully completed capture. */
     return rc;
+}
+
+static int
+wl_columnar_relation_batch_capture(
+    wl_columnar_relation_append_batch_t *batch, const int64_t *input,
+    wl_columnar_relation_batch_capture_t *capture)
+{
+    return wl_columnar_relation_batch_capture_mode(batch, input, capture,
+               false, NULL);
 }
 
 static int
@@ -18421,10 +18386,8 @@ enum {
     WL_COLUMNAR_RELATION_SCALAR_SOURCE_RECIPE_WORK = 128,
     WL_COLUMNAR_RELATION_SCALAR_SOURCE_BUILD_CALL_WORK = 128,
     WL_COLUMNAR_RELATION_SCALAR_SOURCE_EXTERNAL_WORK = 128,
-    WL_COLUMNAR_RELATION_SCALAR_SOURCE_SELECTED_WORK = 192,
     WL_COLUMNAR_RELATION_SCALAR_SOURCE_SELECTED_PRE_WORK = 256,
     WL_COLUMNAR_RELATION_SCALAR_SOURCE_TS_READ_WORK = 128,
-    WL_COLUMNAR_RELATION_SCALAR_SOURCE_ROW_CALL_WORK = 128,
     WL_COLUMNAR_RELATION_SCALAR_SOURCE_ROW_RETURN_WORK = 256,
     WL_COLUMNAR_RELATION_SCALAR_SOURCE_TS_WRITE_WORK = 128,
 };
@@ -20238,20 +20201,28 @@ static int
 wl_columnar_relation_row_body_operator(col_rel_t *r, const int64_t *input,
     wl_evaluation_control_t *control, uint64_t attempt_id,
     wl_columnar_relation_mutation_single_t *single, bool borrowed,
-    uint32_t captured_width, bool nongrowth)
+    uint32_t captured_width, bool nongrowth,
+    wl_columnar_relation_row_debt_t *debt)
 {
-    wl_columnar_relation_row_t row;
+    wl_columnar_relation_row_t local_row;
+    wl_columnar_relation_row_t *row = debt ? &debt->row : &local_row;
     int rc;
     rc = wl_evaluation_control_charge_attempt(control, attempt_id,
             WL_COLUMNAR_RELATION_ROW_RECORD_WORK);
     if (rc)
         return rc;
-    wl_columnar_relation_row_records_init(&row);
-    row.scratch_owned = !borrowed;
+    wl_columnar_relation_row_records_init(row);
+    if (debt) {
+        debt->row_ready = true;
+        debt->progress = WL_COLUMNAR_RELATION_ROW_DEBT_ROW_RESOURCES;
+    }
+    row->scratch_owned = !borrowed;
     rc = wl_columnar_relation_attempt_tail(control, attempt_id,
             WL_COLUMNAR_RELATION_ROW_RECORD_WORK);
-    if (rc)
+    if (rc) {
+        if (debt) goto done;
         return rc;
+    }
     if (!borrowed) {
         rc = wl_columnar_relation_mutation_single_acquire_attempt_controlled(r,
                 single, control, attempt_id);
@@ -20293,22 +20264,22 @@ wl_columnar_relation_row_body_operator(col_rel_t *r, const int64_t *input,
         rc = EINVAL;
         goto done;
     }
-    row.capacity = growth
+    row->capacity = growth
         ? (r->capacity ? r->capacity * 2u : COL_REL_INIT_CAP) : r->capacity;
     if (r->nrows == UINT32_MAX
         || r->view_generation >= WL_COLUMNAR_REL_GENERATION_INVALID - 1u
-        || (growth && (row.capacity <= r->capacity
+        || (growth && (row->capacity <= r->capacity
         || r->storage_generation >= WL_COLUMNAR_REL_GENERATION_INVALID - 1u))) {
         rc = EOVERFLOW;
         goto done;
     }
-    row.rows = r->nrows + 1u;
-    row.view_generation = r->view_generation + 1u;
-    row.storage_generation = r->storage_generation + (growth ? 1u : 0u);
-    row.timestamp_capacity = r->timestamps ? row.capacity : 0;
-    row.row_bytes = (uint64_t)r->ncols * sizeof(int64_t);
-    if (row.row_bytes > SIZE_MAX
-        || row.row_bytes > UINTPTR_MAX - (uintptr_t)input) {
+    row->rows = r->nrows + 1u;
+    row->view_generation = r->view_generation + 1u;
+    row->storage_generation = r->storage_generation + (growth ? 1u : 0u);
+    row->timestamp_capacity = r->timestamps ? row->capacity : 0;
+    row->row_bytes = (uint64_t)r->ncols * sizeof(int64_t);
+    if (row->row_bytes > SIZE_MAX
+        || row->row_bytes > UINTPTR_MAX - (uintptr_t)input) {
         rc = EOVERFLOW;
         goto done;
     }
@@ -20339,7 +20310,7 @@ wl_columnar_relation_row_body_operator(col_rel_t *r, const int64_t *input,
                     WL_COLUMNAR_RELATION_ROW_CREDIT_WORK);
             if (rc)
                 goto done;
-            wl_columnar_relation_row_scratch_init(&row.scratch_credit);
+            wl_columnar_relation_row_scratch_init(&row->scratch_credit);
             rc = wl_columnar_relation_attempt_tail(control, attempt_id,
                     WL_COLUMNAR_RELATION_ROW_CREDIT_WORK);
             if (rc)
@@ -20350,17 +20321,17 @@ wl_columnar_relation_row_body_operator(col_rel_t *r, const int64_t *input,
                     wl_columnar_memory_governor_reserve_checked_attempt_controlled
                     (
                     wl_columnar_memory_governor_ref_get(r->memory_governor),
-                    row.row_bytes, &row.scratch_credit, &status, control,
+                    row->row_bytes, &row->scratch_credit, &status, control,
                     attempt_id);
                 if (rc)
                     goto done;
                 rc = wl_columnar_relation_row_admission(r, status);
                 if (rc)
                     goto done;
-                row.scratch_held = true;
+                row->scratch_held = true;
                 bool committed;
                 rc = wl_columnar_memory_governor_commit_attempt_controlled(
-                    &row.scratch_credit, &row.scratch_credit, &committed,
+                    &row->scratch_credit, &row->scratch_credit, &committed,
                     control, attempt_id);
                 if (rc)
                     goto done;
@@ -20373,26 +20344,26 @@ wl_columnar_relation_row_body_operator(col_rel_t *r, const int64_t *input,
                     WL_COLUMNAR_RELATION_ROW_ALLOC_WORK);
             if (rc)
                 goto done;
-            row.captured =
-                wl_columnar_relation_row_malloc((size_t)row.row_bytes);
+            row->captured =
+                wl_columnar_relation_row_malloc((size_t)row->row_bytes);
             rc = wl_columnar_relation_attempt_tail(control, attempt_id,
                     WL_COLUMNAR_RELATION_ROW_ALLOC_WORK);
             if (rc > 0)
                 goto done;
-            if (!row.captured)
+            if (!row->captured)
                 rc = ENOMEM;
             if (rc)
                 goto done;
         }
     } else {
-        row.captured = (int64_t *)input;
+        row->captured = (int64_t *)input;
     }
     for (uint32_t c = 0; c < r->ncols; ++c) {
         rc = wl_evaluation_control_charge_attempt(control, attempt_id,
                 WL_COLUMNAR_RELATION_ROW_CELL_WORK);
         if (rc)
             goto done;
-        row.captured[c] = r->column_types
+        row->captured[c] = r->column_types
             && r->column_types[c] == WIRELOG_TYPE_FLOAT
             && wl_columnar_float_bits_zero(input[c]) ? 0 : input[c];
         rc = wl_columnar_relation_attempt_tail(control, attempt_id,
@@ -20406,7 +20377,7 @@ wl_columnar_relation_row_body_operator(col_rel_t *r, const int64_t *input,
                     WL_COLUMNAR_RELATION_ROW_CELL_WORK);
             if (rc)
                 goto done;
-            r->columns[c][r->nrows] = row.captured[c];
+            r->columns[c][r->nrows] = row->captured[c];
             rc = wl_columnar_relation_attempt_tail(control, attempt_id,
                     WL_COLUMNAR_RELATION_ROW_CELL_WORK);
             if (rc)
@@ -20427,10 +20398,10 @@ wl_columnar_relation_row_body_operator(col_rel_t *r, const int64_t *input,
                 WL_COLUMNAR_RELATION_ROW_TERMINAL_WORK);
         if (rc)
             goto done;
-        r->nrows = row.rows;
-        r->view_generation = row.view_generation;
+        r->nrows = row->rows;
+        r->view_generation = row->view_generation;
         single->set.published = true;
-        row.published = true;
+        row->published = true;
         goto done;
     }
 
@@ -20440,24 +20411,24 @@ wl_columnar_relation_row_body_operator(col_rel_t *r, const int64_t *input,
             WL_COLUMNAR_RELATION_ROW_SIZE_WORK);
     if (rc)
         goto done;
-    row.lane_bytes = (uint64_t)row.capacity * sizeof(int64_t);
-    row.table_bytes = (uint64_t)r->ncols * sizeof(int64_t *);
-    row.old_ts = (uint64_t)r->timestamp_capacity * sizeof(*r->timestamps);
-    row.new_ts = (uint64_t)row.timestamp_capacity * sizeof(*r->timestamps);
-    if (row.lane_bytes > SIZE_MAX || row.table_bytes > SIZE_MAX
-        || row.new_ts > SIZE_MAX
-        || !wl_columnar_memory_size_mul(r->ncols, row.lane_bytes,
-        &row.new_lanes)
+    row->lane_bytes = (uint64_t)row->capacity * sizeof(int64_t);
+    row->table_bytes = (uint64_t)r->ncols * sizeof(int64_t *);
+    row->old_ts = (uint64_t)r->timestamp_capacity * sizeof(*r->timestamps);
+    row->new_ts = (uint64_t)row->timestamp_capacity * sizeof(*r->timestamps);
+    if (row->lane_bytes > SIZE_MAX || row->table_bytes > SIZE_MAX
+        || row->new_ts > SIZE_MAX
+        || !wl_columnar_memory_size_mul(r->ncols, row->lane_bytes,
+        &row->new_lanes)
         || !wl_columnar_memory_size_mul(r->ncols,
-        (uint64_t)r->capacity * sizeof(int64_t), &row.old_lanes)
-        || !wl_columnar_memory_size_add(row.new_lanes, row.table_bytes,
-        &row.incoming)
-        || !wl_columnar_memory_size_add(row.incoming, row.new_ts,
-        &row.incoming)
-        || !wl_columnar_memory_size_add(row.old_lanes, row.table_bytes,
-        &row.old_payload)
-        || !wl_columnar_memory_size_add(row.old_payload, row.old_ts,
-        &row.old_payload)) {
+        (uint64_t)r->capacity * sizeof(int64_t), &row->old_lanes)
+        || !wl_columnar_memory_size_add(row->new_lanes, row->table_bytes,
+        &row->incoming)
+        || !wl_columnar_memory_size_add(row->incoming, row->new_ts,
+        &row->incoming)
+        || !wl_columnar_memory_size_add(row->old_lanes, row->table_bytes,
+        &row->old_payload)
+        || !wl_columnar_memory_size_add(row->old_payload, row->old_ts,
+        &row->old_payload)) {
         rc = EOVERFLOW;
         goto done;
     }
@@ -20485,9 +20456,9 @@ wl_columnar_relation_row_body_operator(col_rel_t *r, const int64_t *input,
             bytes = (uint64_t)r->retract_backup_timestamp_capacity
                 * sizeof(*r->timestamps);
         else if (r->row_scratch)
-            bytes = row.row_bytes;
-        if (!valid || !wl_columnar_memory_size_add(row.old_payload, bytes,
-            &row.old_payload)) {
+            bytes = row->row_bytes;
+        if (!valid || !wl_columnar_memory_size_add(row->old_payload, bytes,
+            &row->old_payload)) {
             rc = EOVERFLOW;
             goto done;
         }
@@ -20500,16 +20471,16 @@ wl_columnar_relation_row_body_operator(col_rel_t *r, const int64_t *input,
             WL_COLUMNAR_RELATION_ROW_CREDIT_WORK);
     if (rc)
         goto done;
-    uint64_t auxiliary = row.old_payload - row.old_lanes - row.table_bytes
-        - row.old_ts;
-    if (!wl_columnar_memory_size_add(auxiliary, row.incoming,
-        &row.final_payload)) {
+    uint64_t auxiliary = row->old_payload - row->old_lanes - row->table_bytes
+        - row->old_ts;
+    if (!wl_columnar_memory_size_add(auxiliary, row->incoming,
+        &row->final_payload)) {
         rc = EOVERFLOW;
         goto done;
     }
-    if (r->memory_governor && row.incoming) {
+    if (r->memory_governor && row->incoming) {
         if (!r->retained_reserved_bytes
-            || row.old_payload > r->retained_reserved_bytes
+            || row->old_payload > r->retained_reserved_bytes
             || r->retained_reservation.identity != &r->retained_reservation
             || r->retained_reservation.bytes != r->retained_reserved_bytes
             || r->retained_reservation.governor
@@ -20525,7 +20496,7 @@ wl_columnar_relation_row_body_operator(col_rel_t *r, const int64_t *input,
             goto done;
         }
         if (!wl_columnar_memory_size_add(r->retained_reserved_bytes,
-            row.incoming, &row.covered)) {
+            row->incoming, &row->covered)) {
             rc = EOVERFLOW;
             goto done;
         }
@@ -20534,31 +20505,31 @@ wl_columnar_relation_row_body_operator(col_rel_t *r, const int64_t *input,
             WL_COLUMNAR_RELATION_ROW_CREDIT_WORK);
     if (rc)
         goto done;
-    if (r->memory_governor && row.incoming) {
+    if (r->memory_governor && row->incoming) {
         wl_columnar_memory_admission_status_t status;
         rc = wl_columnar_memory_governor_begin_growth_attempt_controlled(
-            &r->retained_reservation, row.incoming, &status, control,
+            &r->retained_reservation, row->incoming, &status, control,
             attempt_id);
         if (rc)
             goto done;
         rc = wl_columnar_relation_row_admission(r, status);
         if (rc)
             goto done;
-        row.growth_held = true;
+        row->growth_held = true;
     }
     if (r->ncols) {
         rc = wl_evaluation_control_charge_attempt(control, attempt_id,
                 WL_COLUMNAR_RELATION_ROW_ALLOC_WORK);
         if (rc)
             goto done;
-        row.columns =
+        row->columns =
             (int64_t **)wl_columnar_relation_row_malloc(
-            (size_t)row.table_bytes);
+            (size_t)row->table_bytes);
         rc = wl_columnar_relation_attempt_tail(control, attempt_id,
                 WL_COLUMNAR_RELATION_ROW_ALLOC_WORK);
         if (rc > 0)
             goto done;
-        if (!row.columns)
+        if (!row->columns)
             rc = ENOMEM;
         if (rc)
             goto done;
@@ -20568,20 +20539,20 @@ wl_columnar_relation_row_body_operator(col_rel_t *r, const int64_t *input,
                 WL_COLUMNAR_RELATION_ROW_ALLOC_WORK);
         if (rc)
             goto done;
-        row.columns[c] =
-            wl_columnar_relation_row_malloc((size_t)row.lane_bytes);
-        row.allocated_columns = c + 1u;
+        row->columns[c] =
+            wl_columnar_relation_row_malloc((size_t)row->lane_bytes);
+        row->allocated_columns = c + 1u;
         rc = wl_columnar_relation_attempt_tail(control, attempt_id,
                 WL_COLUMNAR_RELATION_ROW_ALLOC_WORK);
         if (rc > 0)
             goto done;
-        if (!row.columns[c])
+        if (!row->columns[c])
             rc = ENOMEM;
         if (rc)
             goto done;
         rc =
             wl_columnar_relation_row_bytes_operator(
-            (unsigned char *)row.columns[c],
+            (unsigned char *)row->columns[c],
             (const unsigned char *)r->columns[c],
             (size_t)r->nrows * sizeof(int64_t), control, attempt_id);
         if (rc)
@@ -20590,7 +20561,7 @@ wl_columnar_relation_row_body_operator(col_rel_t *r, const int64_t *input,
                 WL_COLUMNAR_RELATION_ROW_CELL_WORK);
         if (rc)
             goto done;
-        row.columns[c][r->nrows] = row.captured[c];
+        row->columns[c][r->nrows] = row->captured[c];
         rc = wl_columnar_relation_attempt_tail(control, attempt_id,
                 WL_COLUMNAR_RELATION_ROW_CELL_WORK);
         if (rc)
@@ -20601,25 +20572,25 @@ wl_columnar_relation_row_body_operator(col_rel_t *r, const int64_t *input,
                 WL_COLUMNAR_RELATION_ROW_ALLOC_WORK);
         if (rc)
             goto done;
-        row.timestamps = wl_columnar_relation_row_malloc((size_t)row.new_ts);
+        row->timestamps = wl_columnar_relation_row_malloc((size_t)row->new_ts);
         rc = wl_columnar_relation_attempt_tail(control, attempt_id,
                 WL_COLUMNAR_RELATION_ROW_ALLOC_WORK);
         if (rc > 0)
             goto done;
-        if (!row.timestamps)
+        if (!row->timestamps)
             rc = ENOMEM;
         if (rc)
             goto done;
         rc =
             wl_columnar_relation_row_bytes_operator(
-            (unsigned char *)row.timestamps,
-            (const unsigned char *)r->timestamps, (size_t)row.old_ts,
+            (unsigned char *)row->timestamps,
+            (const unsigned char *)r->timestamps, (size_t)row->old_ts,
             control, attempt_id);
         if (rc)
             goto done;
         rc = wl_columnar_relation_row_bytes_operator(
-            (unsigned char *)&row.timestamps[r->nrows], NULL,
-            sizeof(*row.timestamps), control, attempt_id);
+            (unsigned char *)&row->timestamps[r->nrows], NULL,
+            sizeof(*row->timestamps), control, attempt_id);
         if (rc)
             goto done;
     }
@@ -20655,28 +20626,30 @@ wl_columnar_relation_row_body_operator(col_rel_t *r, const int64_t *input,
         goto done;
     }
     if (r->mem_ledger) {
-        if (row.new_lanes != row.old_lanes) {
-            row.requests[row.request_count].subsystem = WL_MEM_SUBSYS_RELATION;
-            row.requests[row.request_count].kind
+        if (row->new_lanes != row->old_lanes) {
+            row->requests[row->request_count].subsystem =
+                WL_MEM_SUBSYS_RELATION;
+            row->requests[row->request_count].kind
                 = WL_COLUMNAR_MEM_LEDGER_PUBLICATION_ALLOC;
-            row.requests[row.request_count++].bytes
-                = row.new_lanes - row.old_lanes;
+            row->requests[row->request_count++].bytes
+                = row->new_lanes - row->old_lanes;
         }
-        if (row.new_ts != r->ledger_ts_bytes) {
-            row.requests[row.request_count].subsystem = WL_MEM_SUBSYS_TIMESTAMP;
-            row.requests[row.request_count].kind = row.new_ts >
+        if (row->new_ts != r->ledger_ts_bytes) {
+            row->requests[row->request_count].subsystem =
+                WL_MEM_SUBSYS_TIMESTAMP;
+            row->requests[row->request_count].kind = row->new_ts >
                 r->ledger_ts_bytes
                 ? WL_COLUMNAR_MEM_LEDGER_PUBLICATION_ALLOC
                 : WL_COLUMNAR_MEM_LEDGER_PUBLICATION_FREE;
-            row.requests[row.request_count++].bytes = row.new_ts >
+            row->requests[row->request_count++].bytes = row->new_ts >
                 r->ledger_ts_bytes
-                ? row.new_ts - r->ledger_ts_bytes : r->ledger_ts_bytes -
-                row.new_ts;
+                ? row->new_ts - r->ledger_ts_bytes : r->ledger_ts_bytes -
+                row->new_ts;
         }
     }
     int64_t **old_columns = r->columns;
     col_delta_timestamp_t *old_timestamps = r->timestamps;
-    bool governed = row.growth_held;
+    bool governed = row->growth_held;
     bool ledger = r->mem_ledger != NULL;
     rc = wl_columnar_relation_attempt_tail(control, attempt_id,
             WL_COLUMNAR_RELATION_ROW_RECIPE_WORK);
@@ -20707,7 +20680,7 @@ wl_columnar_relation_row_body_operator(col_rel_t *r, const int64_t *input,
         rc = wl_columnar_memory_governor_growth_commit_prepare_controlled(
             &r->retained_reservation,
             wl_columnar_memory_governor_ref_get(r->memory_governor), r,
-            &row.governor, &ready, control);
+            &row->governor, &ready, control);
         if (rc)
             goto done;
         if (!ready) {
@@ -20726,7 +20699,7 @@ wl_columnar_relation_row_body_operator(col_rel_t *r, const int64_t *input,
             goto done;
         rc =
             wl_columnar_mem_ledger_publication_prepare_controlled(r->mem_ledger,
-                row.requests, row.request_count, &row.ledger, control);
+                row->requests, row->request_count, &row->ledger, control);
         if (rc)
             goto done;
     }
@@ -20741,47 +20714,83 @@ wl_columnar_relation_row_body_operator(col_rel_t *r, const int64_t *input,
     if (rc)
         goto done;
     if (ledger) {
-        rc = wl_columnar_mem_ledger_publication_acquire_controlled(&row.ledger);
+        rc =
+            wl_columnar_mem_ledger_publication_acquire_controlled(&row->ledger);
         if (rc)
             goto done;
     }
     /* Successful ledger CAS (or the no-ledger tail) is the last cutoff.
      * This entire contiguous interval must fit the source quantum. */
     if (governed) {
-        if (wl_columnar_memory_governor_growth_commit_finish(&row.governor))
+        if (wl_columnar_memory_governor_growth_commit_finish(&row->governor))
             abort();
-        r->retained_reserved_bytes = row.covered;
-        row.growth_held = false;
+        r->retained_reserved_bytes = row->covered;
+        row->growth_held = false;
     }
-    r->columns = row.columns;
-    r->timestamps = row.timestamps;
-    r->capacity = row.capacity;
-    r->timestamp_capacity = row.timestamp_capacity;
-    r->storage_generation = row.storage_generation;
-    r->storage_owner_generation = row.storage_generation;
-    single->lease.relation_generation = row.storage_generation;
-    single->lease.owner_generation = row.storage_generation;
+    if (debt) {
+        debt->image_columns = old_columns;
+        debt->image_timestamps = old_timestamps;
+        debt->image_extent = r->ncols;
+        debt->image_cursor = 0;
+        debt->mode = WL_COLUMNAR_RELATION_ROW_DEBT_POSTPUBLICATION_DISPLACED;
+        debt->row_published = true;
+        debt->growth_published = true;
+    }
+    r->columns = row->columns;
+    r->timestamps = row->timestamps;
+    r->capacity = row->capacity;
+    r->timestamp_capacity = row->timestamp_capacity;
+    r->storage_generation = row->storage_generation;
+    r->storage_owner_generation = row->storage_generation;
+    single->lease.relation_generation = row->storage_generation;
+    single->lease.owner_generation = row->storage_generation;
     single->lease.storage_transitioned = true;
     single->set.published = true;
-    r->nrows = row.rows;
-    r->view_generation = row.view_generation;
-    row.columns = NULL;
-    row.timestamps = NULL;
-    row.published = true;
+    r->nrows = row->rows;
+    r->view_generation = row->view_generation;
+    row->columns = NULL;
+    row->timestamps = NULL;
+    row->published = true;
     if (ledger) {
-        if (wl_columnar_mem_ledger_publication_apply(&row.ledger))
+        if (wl_columnar_mem_ledger_publication_apply(&row->ledger))
             abort();
-        r->ledger_ts_bytes = row.new_ts;
-        if (wl_columnar_mem_ledger_publication_release(&row.ledger))
+        r->ledger_ts_bytes = row->new_ts;
+        if (wl_columnar_mem_ledger_publication_release(&row->ledger))
             abort();
     }
+    /* Selected retirement retains its final-address capsule after a stop.
+     * The old local/nongrowth mode keeps its exact mandatory lifetime. */
+    if (debt) goto done;
     /* Mandatory retirement starts only after the ledger gate is released. */
     col_columns_free(old_columns, r->ncols);
     free(old_timestamps);
     if (governed)
-        wl_columnar_relation_retire_payload_credit_known(r, row.final_payload);
+        wl_columnar_relation_retire_payload_credit_known(r, row->final_payload);
 done:
-    wl_columnar_relation_row_cleanup(r, &row, control);
+    if (debt) {
+        /* No returning/check seam may retain the shared ledger writer gate.
+         * READY claims stay at their final address for bounded cancellation. */
+        if (row->ledger.phase == WL_COLUMNAR_MEM_LEDGER_PUBLICATION_HELD
+            && wl_columnar_mem_ledger_publication_cancel(&row->ledger)) abort();
+        if (!debt->growth_published) {
+            debt->image_columns = row->columns;
+            debt->image_timestamps = row->timestamps;
+            debt->image_extent = row->allocated_columns;
+            debt->image_cursor = 0;
+            debt->mode = row->published
+                ? WL_COLUMNAR_RELATION_ROW_DEBT_POSTPUBLICATION_DISPLACED
+                : WL_COLUMNAR_RELATION_ROW_DEBT_PREPUBLICATION_STAGED;
+            row->columns = NULL; row->timestamps = NULL;
+            row->allocated_columns = 0;
+        }
+        debt->row_published = row->published;
+        debt->phase = WL_COLUMNAR_RELATION_ROW_DEBT_CANCEL_LEDGER;
+        /* Finish the mandatory gate/ownership handoff before the real cut.
+        * The original error remains primary over a newly observed stop. */
+        int paid = wl_evaluation_control_charge_attempt(control, attempt_id, 0);
+        return rc ? rc : paid;
+    }
+    wl_columnar_relation_row_cleanup(r, row, control);
     return rc;
 }
 
@@ -20813,7 +20822,8 @@ wl_columnar_relation_append_batch_row_operator_controlled(
     }
     rc = wl_columnar_relation_row_body_operator(r, capture.values,
             batch->control,
-            batch->attempt_id, &batch->raw.single, true, capture.width, false);
+            batch->attempt_id, &batch->raw.single, true, capture.width, false,
+            NULL);
 done:
     wl_columnar_relation_batch_capture_dispose(&capture);
     return rc;
@@ -20852,6 +20862,386 @@ wl_columnar_relation_append_batch_numeric_row_operator_controlled(
     if (rc) return rc;
     return wl_evaluation_control_charge_attempt(control, attempt_id,
                0);
+}
+
+bool
+wl_columnar_relation_row_debt_thread(const wl_columnar_relation_row_debt_t *d)
+{
+    if (!d || !d->thread_valid) return false;
+#if defined(WL_HAVE_C11_THREADS)
+    return thrd_equal(d->owner_thread, thrd_current()) != 0;
+#elif defined(_WIN32) || defined(_WIN64)
+    return d->owner_thread == GetCurrentThreadId();
+#else
+    return pthread_equal(d->owner_thread, pthread_self()) != 0;
+#endif
+}
+
+void
+wl_columnar_relation_row_debt_init(wl_columnar_relation_row_debt_t *d)
+{
+    /* Fresh storage setup only: native payload/inline values stay dormant. */
+    d->identity = NULL; d->thread_valid = false;
+    d->phase = WL_COLUMNAR_RELATION_ROW_DEBT_IDLE;
+    d->mode = WL_COLUMNAR_RELATION_ROW_DEBT_PREPUBLICATION_STAGED;
+    d->progress = WL_COLUMNAR_RELATION_ROW_DEBT_NO_RESOURCE;
+    d->frame = NULL; d->numeric_owner = NULL; d->context = NULL;
+    d->target = NULL;
+    d->original_control = NULL; d->original_id = 0;
+    d->original_control_identity = 0;
+    d->batch_nonce = 0;
+    d->origin_stage = WL_COLUMNAR_FILTER_STAGE_INERT;
+    d->execution_result = 0; d->cleanup_result = 0;
+    d->row_published = false; d->growth_published = false;
+    d->capture_ready = false; d->row_ready = false;
+    d->refund_ready = false; d->downsize_ready = false; d->intent_valid = false;
+    d->active_call = false;
+    d->image_columns = NULL; d->image_timestamps = NULL;
+    d->image_extent = 0; d->image_cursor = 0; d->action = 0;
+    d->selected_phase = WL_COLUMNAR_RELATION_ROW_DEBT_IDLE;
+    d->selected_cursor = 0;
+#if defined(WL_HAVE_C11_THREADS)
+    d->owner_thread = thrd_current();
+#elif defined(_WIN32) || defined(_WIN64)
+    d->owner_thread = GetCurrentThreadId();
+#else
+    d->owner_thread = pthread_self();
+#endif
+    d->thread_valid = true; d->identity = d;
+}
+
+int
+wl_columnar_relation_row_debt_reset(wl_columnar_relation_row_debt_t *d)
+{
+    if (!d || d->identity != d || !wl_columnar_relation_row_debt_thread(d))
+        return EINVAL;
+    if (d->active_call || d->phase != WL_COLUMNAR_RELATION_ROW_DEBT_DONE ||
+        d->frame
+        || d->numeric_owner || d->context || d->target || d->original_control
+        || d->capture_ready || d->row_ready || d->refund_ready ||
+        d->downsize_ready
+        || d->image_columns || d->image_timestamps || d->image_extent
+        || d->image_cursor) return EBUSY;
+    wl_columnar_relation_row_debt_init(d);
+    return 0;
+}
+
+/* Same-call result channel only, never stored or used as resource authority. */
+static int
+wl_columnar_relation_row_debt_check(wl_evaluation_control_t *funding,
+    uint64_t id, bool *financial)
+{
+    int rc = wl_evaluation_control_charge_attempt(funding, id, 0);
+    if (rc && financial) *financial = true;
+    return rc;
+}
+
+int
+wl_columnar_relation_row_debt_prove_batch(
+    const wl_columnar_relation_append_batch_t *batch,
+    wl_evaluation_control_t *control, uint64_t id, bool *financial)
+{
+    if (financial) *financial = false;
+    int rc = wl_columnar_relation_row_debt_check(control, id, financial);
+    if (rc) return rc;
+    if (!batch) return EINVAL;
+    rc = wl_columnar_relation_private_batch_authority(batch);
+    if (!rc && (batch->phase != WL_COLUMNAR_RELATION_BATCH_HELD
+        || !batch->raw.active || batch->raw.single.set.owner_count != 1
+        || batch->raw.single.set.owners_acquired != 1
+        || batch->raw.single.set.descriptors_acquired != 1)) rc = EINVAL;
+    int paid = wl_evaluation_control_charge_attempt(control, id, 0);
+    if (!rc && paid && financial) *financial = true;
+    return rc ? rc : paid;
+}
+
+int
+wl_columnar_relation_row_debt_append_private(
+    wl_columnar_relation_row_debt_t *d, const int64_t *values)
+{
+    wl_columnar_relation_append_batch_t *batch = &d->context->batch;
+    wl_evaluation_control_t *control = d->original_control;
+    uint64_t id = d->original_id;
+    int rc = wl_columnar_relation_batch_check(batch);
+    if (rc) goto failed;
+    d->progress = WL_COLUMNAR_RELATION_ROW_DEBT_CAPTURE_ONLY;
+    rc = wl_columnar_relation_batch_capture_mode(batch, values, &d->capture,
+            true, &d->capture_ready);
+    if (rc) goto failed;
+    if (batch->raw.single.lease.storage_transitioned
+        && d->target->nrows >= d->target->capacity) {
+        rc = wl_columnar_relation_batch_renew(batch);
+        if (rc) goto failed;
+        rc = wl_columnar_relation_batch_check(batch);
+        if (rc) goto failed;
+    }
+    d->batch_nonce = batch->raw.single.set.acquisition_nonce;
+    rc = wl_columnar_relation_row_body_operator(d->target, d->capture.values,
+            control, id, &batch->raw.single, true, d->capture.width, false, d);
+failed:
+    if (rc && !d->execution_result) d->execution_result = rc;
+    if (!d->row_ready) {
+        d->phase = d->capture_ready
+            ? WL_COLUMNAR_RELATION_ROW_DEBT_CAPTURE_BUFFER
+            : WL_COLUMNAR_RELATION_ROW_DEBT_UNBIND;
+    }
+    int paid = wl_evaluation_control_charge_attempt(control, id, 0);
+    if (!rc && paid && !d->execution_result) d->execution_result = paid;
+    return rc ? rc : paid;
+}
+
+/* A caller proves the live anchor and supplied financier first. These local
+ * proofs split native ownership from the following action with real checks. */
+static int
+wl_columnar_relation_row_debt_action_proof(
+    wl_columnar_relation_row_debt_t *d, wl_evaluation_control_t *funding,
+    uint64_t id, bool *financial)
+{
+    int rc = wl_columnar_relation_row_debt_check(funding, id, financial);
+    if (rc) return rc;
+    if (d->progress == WL_COLUMNAR_RELATION_ROW_DEBT_ROW_RESOURCES) {
+        if (!d->row_ready) return EINVAL;
+        if (d->context->batch.control != d->original_control
+            || d->context->batch.attempt_id != d->original_id
+            || d->context->batch.raw.single.set.acquisition_nonce !=
+            d->batch_nonce)
+            return EINVAL;
+        rc = wl_columnar_relation_row_debt_prove_batch(&d->context->batch,
+                funding, id, financial);
+        if (rc) return rc;
+        if (d->context->batch.raw.relation != d->target
+            || d->image_cursor > d->image_extent
+            || (d->image_extent && !d->image_columns)) return EINVAL;
+    } else {
+        const wl_columnar_relation_append_batch_t *batch = &d->context->batch;
+        if (d->row_ready || d->row_published || d->growth_published
+            || d->image_columns || d->image_timestamps || d->image_extent
+            || d->image_cursor || d->refund_ready || d->downsize_ready)
+            return EINVAL;
+        if (batch->identity != batch || batch->raw_mode
+            || batch->control != d->original_control
+            || batch->attempt_id != d->original_id
+            || batch->raw.relation != d->target
+            || (batch->phase != WL_COLUMNAR_RELATION_BATCH_HELD
+            && batch->phase != WL_COLUMNAR_RELATION_BATCH_DRAINING
+            && batch->phase != WL_COLUMNAR_RELATION_BATCH_ENDED)) return EINVAL;
+    }
+    return wl_columnar_relation_row_debt_check(funding, id, financial);
+}
+
+static void
+wl_columnar_relation_row_debt_row_drained(wl_columnar_relation_row_debt_t *d)
+{
+    d->image_extent = 0; d->image_cursor = 0;
+    d->phase = WL_COLUMNAR_RELATION_ROW_DEBT_CAPTURE_BUFFER;
+}
+
+int
+wl_columnar_relation_row_debt_retire_one(
+    wl_columnar_relation_row_debt_t *d, wl_evaluation_control_t *funding,
+    uint64_t id, bool *financial)
+{
+    if (financial) *financial = false;
+    if (!d->intent_valid || d->selected_phase != d->phase
+        || d->selected_cursor != d->image_cursor) return EINVAL;
+    int rc = wl_columnar_relation_row_debt_action_proof(d, funding, id,
+            financial);
+    if (rc) return rc;
+    wl_columnar_relation_row_t *row = &d->row;
+    col_rel_t *target = d->target;
+    d->cleanup_result = 0;
+    switch (d->phase) {
+    case WL_COLUMNAR_RELATION_ROW_DEBT_CANCEL_LEDGER:
+        if (d->row_ready && row->ledger.phase ==
+            WL_COLUMNAR_MEM_LEDGER_PUBLICATION_READY) {
+            if (row->ledger.identity != &row->ledger
+                || row->ledger.ledger != target->mem_ledger
+                || row->ledger.control != d->original_control
+                || row->ledger.attempt_id != d->original_id) return EINVAL;
+            rc = wl_columnar_relation_row_debt_check(funding, id, financial);
+            if (rc) return rc;
+            if (wl_columnar_mem_ledger_publication_cancel(
+                    &row->ledger)) abort();
+        }
+        d->phase = WL_COLUMNAR_RELATION_ROW_DEBT_CANCEL_GOVERNOR;
+        break;
+    case WL_COLUMNAR_RELATION_ROW_DEBT_CANCEL_GOVERNOR:
+        if (d->row_ready && (row->governor.phase ==
+            WL_COLUMNAR_MEMORY_GOVERNOR_GROWTH_COMMIT_CLAIMED
+            || row->governor.phase ==
+            WL_COLUMNAR_MEMORY_GOVERNOR_GROWTH_COMMIT_READY)){
+            if (row->governor.identity != &row->governor
+                || row->governor.token != &target->retained_reservation
+                || row->governor.control != d->original_control
+                || row->governor.active_attempt_id != d->original_id
+                || row->governor.owner_bits != (uintptr_t)target) return EINVAL;
+            rc = wl_columnar_relation_row_debt_check(funding, id, financial);
+            if (rc) return rc;
+            if (wl_columnar_memory_governor_growth_commit_cancel(
+                    &row->governor)) abort();
+        }
+        d->phase = WL_COLUMNAR_RELATION_ROW_DEBT_IMAGE_LANE;
+        break;
+    case WL_COLUMNAR_RELATION_ROW_DEBT_IMAGE_LANE:
+        if (d->image_cursor < d->image_extent) {
+            unsigned cursor = d->image_cursor;
+            free(d->image_columns[cursor]);
+            d->image_columns[cursor] = NULL;
+            d->image_cursor = cursor + 1;
+        } else d->phase = WL_COLUMNAR_RELATION_ROW_DEBT_IMAGE_TABLE;
+        break;
+    case WL_COLUMNAR_RELATION_ROW_DEBT_IMAGE_TABLE:
+        free((void *)d->image_columns); d->image_columns = NULL;
+        d->image_extent = 0; d->image_cursor = 0;
+        d->phase = WL_COLUMNAR_RELATION_ROW_DEBT_IMAGE_TIMESTAMPS;
+        break;
+    case WL_COLUMNAR_RELATION_ROW_DEBT_IMAGE_TIMESTAMPS:
+        free(d->image_timestamps); d->image_timestamps = NULL;
+        d->phase = WL_COLUMNAR_RELATION_ROW_DEBT_REFUND_BEGIN;
+        break;
+    case WL_COLUMNAR_RELATION_ROW_DEBT_REFUND_BEGIN:
+        if (d->row_ready && row->growth_held) {
+            d->refund.identity = NULL; d->refund.token = NULL;
+            d->refund.governor = NULL; d->refund.owner = NULL;
+            d->refund.old_bytes = 0; d->refund.overlap_bytes = 0;
+            d->refund.phase = WL_COLUMNAR_MEMORY_GROWTH_REFUND_INERT;
+            d->refund.thread_valid = false;
+            rc = wl_columnar_relation_row_debt_check(funding, id, financial);
+            if (rc) return rc;
+            rc = wl_columnar_memory_growth_refund_attempt_begin(
+                &target->retained_reservation, target, &d->refund);
+            if (rc) return rc;
+            d->refund_ready = true;
+            d->phase = WL_COLUMNAR_RELATION_ROW_DEBT_REFUND_STEP;
+        } else d->phase = WL_COLUMNAR_RELATION_ROW_DEBT_DOWNSIZE_BEGIN;
+        break;
+    case WL_COLUMNAR_RELATION_ROW_DEBT_REFUND_STEP:
+        if (!d->refund_ready || d->refund.identity != &d->refund
+            || d->refund.token != &target->retained_reservation
+            || d->refund.owner != target) return EINVAL;
+        rc = wl_columnar_relation_row_debt_check(funding, id, financial);
+        if (rc) return rc;
+        rc = wl_columnar_memory_growth_refund_attempt_advance(&d->refund);
+        if (rc == EAGAIN) {
+            d->cleanup_result = rc; break;
+        }
+        if (rc) return rc;
+        row->growth_held = false; d->refund_ready = false;
+        d->phase = WL_COLUMNAR_RELATION_ROW_DEBT_DOWNSIZE_BEGIN;
+        break;
+    case WL_COLUMNAR_RELATION_ROW_DEBT_DOWNSIZE_BEGIN:
+        if (d->growth_published && target->memory_governor
+            && target->retained_reserved_bytes > row->final_payload) {
+            if (!row->final_payload) {
+                d->phase = WL_COLUMNAR_RELATION_ROW_DEBT_DOWNSIZE_STEP;
+                break;
+            }
+            d->downsize.identity = NULL; d->downsize.token = NULL;
+            d->downsize.governor = NULL; d->downsize.owner = NULL;
+            d->downsize.old_bytes = 0; d->downsize.target_bytes = 0;
+            d->downsize.phase = WL_COLUMNAR_MEMORY_DOWNSIZE_INERT;
+            d->downsize.thread_valid = false;
+            rc = wl_columnar_relation_row_debt_check(funding, id, financial);
+            if (rc) return rc;
+            rc = wl_columnar_memory_downsize_attempt_begin(
+                &target->retained_reservation, target, row->final_payload,
+                &d->downsize);
+            if (rc) return rc;
+            d->downsize_ready = true;
+            d->phase = WL_COLUMNAR_RELATION_ROW_DEBT_DOWNSIZE_STEP;
+        } else wl_columnar_relation_row_debt_row_drained(d);
+        break;
+    case WL_COLUMNAR_RELATION_ROW_DEBT_DOWNSIZE_STEP:
+        if (!row->final_payload) {
+            bool done = false;
+            rc = wl_columnar_relation_row_debt_check(funding, id, financial);
+            if (rc) return rc;
+            rc = wl_columnar_memory_reservation_finish_step(
+                &target->retained_reservation, false, &done);
+            if (rc == EAGAIN) {
+                d->cleanup_result = rc; break;
+            }
+            if (rc) return rc;
+            if (!done) break;
+            /* The native release has completed; reset only the seven
+             * meaningful inert fields, with no sizeof-dependent clear. */
+            wl_columnar_relation_row_scratch_init(
+                &target->retained_reservation);
+        } else {
+            if (!d->downsize_ready || d->downsize.identity != &d->downsize
+                || d->downsize.token != &target->retained_reservation
+                || d->downsize.owner != target
+                || d->downsize.target_bytes !=
+                row->final_payload) return EINVAL;
+            rc = wl_columnar_relation_row_debt_check(funding, id, financial);
+            if (rc) return rc;
+            rc = wl_columnar_memory_downsize_attempt_advance(&d->downsize);
+            if (rc == EAGAIN) {
+                d->cleanup_result = rc; break;
+            }
+            if (rc) return rc;
+        }
+        target->retained_reserved_bytes = row->final_payload;
+        d->downsize_ready = false;
+        wl_columnar_relation_row_debt_row_drained(d);
+        break;
+    case WL_COLUMNAR_RELATION_ROW_DEBT_CAPTURE_BUFFER:
+        if (d->capture_ready && d->capture.allocated) {
+            free(d->capture.values);
+            d->capture.values = d->capture.inline_row;
+            d->capture.allocated = false;
+        }
+        d->phase = WL_COLUMNAR_RELATION_ROW_DEBT_CAPTURE_CREDIT;
+        break;
+    case WL_COLUMNAR_RELATION_ROW_DEBT_CAPTURE_CREDIT:
+        if (d->capture_ready && d->capture.credit_held) {
+            wl_columnar_memory_reservation_t *credit = &d->capture.credit;
+            uint64_t state = atomic_load_explicit(&credit->state,
+                    memory_order_acquire);
+            uint64_t origin = state == WL_COLUMNAR_MEMORY_RESERVATION_RELEASING
+                ? credit->release_from_state : state;
+            uintptr_t expected_owner;
+            if (origin == WL_COLUMNAR_MEMORY_RESERVATION_RESERVED)
+                expected_owner = 0;
+            else if (origin == WL_COLUMNAR_MEMORY_RESERVATION_COMMITTED)
+                expected_owner = (uintptr_t)credit;
+            else return EINVAL;
+            if (credit->identity != credit || credit->governor !=
+                wl_columnar_memory_governor_ref_get(
+                    d->capture.governor)
+                || !d->capture.ref_held
+                || d->capture.governor != target->memory_governor
+                || atomic_load_explicit(&credit->owner_bits,
+                memory_order_acquire) != expected_owner) return EINVAL;
+            rc = wl_columnar_relation_row_debt_check(funding, id, financial);
+            if (rc) return rc;
+            bool done = false;
+            rc = wl_columnar_memory_reservation_finish_step(credit, false,
+                    &done);
+            if (rc == EAGAIN) {
+                d->cleanup_result = rc; break;
+            }
+            if (rc) return rc;
+            if (!done) break;
+            d->capture.credit_held = false;
+        }
+        d->phase = WL_COLUMNAR_RELATION_ROW_DEBT_CAPTURE_REF;
+        break;
+    case WL_COLUMNAR_RELATION_ROW_DEBT_CAPTURE_REF:
+        if (d->capture_ready && d->capture.ref_held) {
+            wl_columnar_memory_governor_ref_t *ref = d->capture.governor;
+            d->capture.governor = NULL; d->capture.ref_held = false;
+            wl_columnar_memory_governor_ref_release(ref);
+        }
+        d->row_ready = false;
+        d->progress = WL_COLUMNAR_RELATION_ROW_DEBT_NO_RESOURCE;
+        d->phase = WL_COLUMNAR_RELATION_ROW_DEBT_UNBIND;
+        break;
+    case WL_COLUMNAR_RELATION_ROW_DEBT_DONE:
+        break;
+    default: return EBUSY;
+    }
+    return 0;
 }
 
 /* Actual LFTJ owns disjoint mutable scratch and protected counted capacity.
@@ -20910,7 +21300,7 @@ wl_columnar_relation_append_lftj_owned_row_operator_controlled(
         return EINVAL;
     r->memory_budget_denial_pending = false;
     rc = wl_columnar_relation_row_body_operator(r, a->row, control, id,
-            &a->writer.raw.single, true, a->total_columns, true);
+            &a->writer.raw.single, true, a->total_columns, true, NULL);
     if (rc) return rc;
     /* Private nrows may precede output_written on a refused tail. Caller
      * aborts/retire this attempt; it must not repeat the forward append. */
