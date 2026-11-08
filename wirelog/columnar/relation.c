@@ -7524,6 +7524,8 @@ wl_columnar_relation_delta_restore_flat_impl(col_rel_t *rel,
     int64_t **old_columns = NULL;
     bool *old_col_shared = NULL;
     bool old_arena_owned = false;
+    bool drop_timestamps = false;
+    uint32_t timestamp_capacity = 0;
     uint64_t bytes = 0;
     int pending_rc = 0, rc;
     if (!rel || !rows || !nrows || !ncols)
@@ -7548,7 +7550,6 @@ wl_columnar_relation_delta_restore_flat_impl(col_rel_t *rel,
     }
     if (rel->ncols != ncols
         || !col_rel_timestamp_shape_valid(rel)
-        || (rel->timestamps && rel->timestamp_capacity < nrows)
         || col_rel_storage_owner_resolve(rel, &owner) != 0 || owner != rel) {
         rc = EINVAL;
         goto done;
@@ -7560,15 +7561,22 @@ wl_columnar_relation_delta_restore_flat_impl(col_rel_t *rel,
         rc = EBUSY;
         goto done;
     }
+    /* The saved rows carry no timestamps, and an array shorter than they are
+     * cannot describe them, which a failed attempt that regrew the relation
+     * from empty leaves behind.  Drop it rather than admit a larger one on the
+     * recovery path; the sites that use timestamps create the array again
+     * (#2348). */
+    drop_timestamps = rel->timestamps && rel->timestamp_capacity < nrows;
+    timestamp_capacity = drop_timestamps ? 0 : rel->timestamp_capacity;
     if (rel->view_generation >= WL_COLUMNAR_REL_GENERATION_INVALID - 1u
         || rel->storage_generation >= WL_COLUMNAR_REL_GENERATION_INVALID - 1u
         || !col_rel_payload_private_bytes(rel, ncols, nrows,
-        rel->timestamp_capacity, ncols != 0, &bytes)) {
+        timestamp_capacity, ncols != 0, &bytes)) {
         rc = EOVERFLOW;
         goto done;
     }
     pending_rc = col_rel_reserve_retained_shape(rel, nrows,
-            rel->timestamp_capacity, true, false, false, &pending);
+            timestamp_capacity, true, false, false, &pending);
     if (pending_rc < 0) {
         rc = ENOMEM;
         goto done;
@@ -7602,7 +7610,14 @@ wl_columnar_relation_delta_restore_flat_impl(col_rel_t *rel,
     rel->sorted_nrows = nrows;
     rel->run_count = 1;
     rel->run_ends[0] = nrows;
-    wl_columnar_relation_delta_ledger_columns(rel, before);
+    if (drop_timestamps) {
+        free(rel->timestamps);
+        rel->timestamps = NULL;
+        rel->timestamp_capacity = 0;
+        col_rel_ledger_reconcile(rel, before);
+    } else {
+        wl_columnar_relation_delta_ledger_columns(rel, before);
+    }
     wl_columnar_relation_touch_replacement(rel);
     if (old_columns) {
         if (!old_arena_owned)
