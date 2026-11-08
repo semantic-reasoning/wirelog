@@ -158,6 +158,70 @@ typedef struct {
     uintptr_t identity;
 } wl_arena_compound_arena_gc_hold_t;
 
+/* Internal finite retirement requires a genuine external arena owner to stay
+ * alive throughout the receipt and its caller's result settlement.  These
+ * records do not acquire that owner reference. */
+typedef struct {
+    const void *identity;
+    wl_compound_arena_t *arena;
+    const void *parent;
+#if defined(WL_HAVE_C11_THREADS)
+    thrd_t thread;
+#elif defined(_WIN32) || defined(_WIN64)
+    DWORD thread;
+#else
+    pthread_t thread;
+#endif
+    bool thread_valid;
+} wl_arena_compound_arena_step_owner_t;
+
+typedef enum {
+    WL_ARENA_COMPOUND_ARENA_HOLD_INERT,
+    WL_ARENA_COMPOUND_ARENA_HOLD_COUNT,
+    WL_ARENA_COMPOUND_ARENA_HOLD_REFERENCE,
+    WL_ARENA_COMPOUND_ARENA_HOLD_DONE,
+} wl_arena_compound_arena_hold_release_phase_t;
+
+typedef struct {
+    wl_arena_compound_arena_step_owner_t owner;
+    const wl_arena_compound_arena_gc_hold_t *hold;
+    wl_arena_compound_arena_hold_release_phase_t phase;
+    bool reference_owed;
+} wl_arena_compound_arena_hold_release_t;
+
+typedef enum {
+    WL_ARENA_COMPOUND_ARENA_GC_INERT,
+    WL_ARENA_COMPOUND_ARENA_GC_GATE,
+    WL_ARENA_COMPOUND_ARENA_GC_SNAPSHOT,
+    WL_ARENA_COMPOUND_ARENA_GC_SCAN,
+    WL_ARENA_COMPOUND_ARENA_GC_RESET,
+    WL_ARENA_COMPOUND_ARENA_GC_LOG,
+    WL_ARENA_COMPOUND_ARENA_GC_LOG_WARNING,
+    WL_ARENA_COMPOUND_ARENA_GC_RELEASE,
+    WL_ARENA_COMPOUND_ARENA_GC_DONE,
+} wl_arena_compound_arena_gc_phase_t;
+
+typedef enum {
+    WL_ARENA_COMPOUND_ARENA_GC_PENDING,
+    WL_ARENA_COMPOUND_ARENA_GC_COLLECTED,
+    WL_ARENA_COMPOUND_ARENA_GC_HELD,
+    WL_ARENA_COMPOUND_ARENA_GC_FROZEN,
+    WL_ARENA_COMPOUND_ARENA_GC_SATURATED,
+} wl_arena_compound_arena_gc_disposition_t;
+
+typedef struct {
+    wl_arena_compound_arena_step_owner_t owner;
+    wl_compound_gen_t *generations;
+    const uint8_t *base;
+    const uint32_t *offsets;
+    const int64_t *multiplicity;
+    uint64_t live_handles;
+    uint32_t epoch, max_epochs, count, capacity, used, index, reclaimed, result;
+    wl_arena_compound_arena_gc_phase_t phase;
+    wl_arena_compound_arena_gc_disposition_t disposition;
+    bool gate_owned, reset;
+} wl_arena_compound_arena_gc_step_t;
+
 typedef enum {
     WL_COMPOUND_FAIL_NONE = 0,
     WL_COMPOUND_FAIL_PAYLOAD = 1,
@@ -304,6 +368,35 @@ wl_arena_compound_arena_gc_hold_acquire(wl_compound_arena_t *arena,
 int
 wl_arena_compound_arena_gc_hold_release(
     wl_arena_compound_arena_gc_hold_t *hold);
+
+/** One funded transition, with at most one strong CAS. Receipts must be zero
+ * initialized and remain at their original address. The caller proves the
+ * actual parent owns the nonretired current arena until all result/ref debt
+ * closes; expected_arena and parent arguments alone supply no such authority.
+ * A successful COUNT transfers the existing hold lifetime reference to the
+ * receipt. Never use the invalidated hold again. No final arena destruction
+ * is performed here. EAGAIN retains every partial obligation. */
+int wl_arena_compound_arena_gc_hold_release_step_owned(
+    wl_arena_compound_arena_gc_hold_t *hold,
+    wl_compound_arena_t *expected_arena,
+    wl_arena_compound_arena_hold_release_t *receipt, const void *parent,
+    wl_evaluation_control_t *control, uint64_t saved_id, bool *done);
+
+/** One funded GC transition or one multiplicity entry. The caller supplies
+ * the same genuine external owner lifetime as hold release above. A successful
+ * gate acquisition stays owned across returns until RELEASE, including grant
+ * refusal; do not clear/copy the receipt or retire its arena while pending.
+ * The terminal result preserves the ordinary held/frozen/saturated behavior. */
+int wl_arena_compound_arena_gc_epoch_step_owned(wl_compound_arena_t *arena,
+    wl_arena_compound_arena_gc_step_t *receipt, const void *parent,
+    wl_evaluation_control_t *control, uint64_t saved_id, bool *done,
+    uint32_t *result);
+
+#ifdef WL_SESSION_TEST_HOOKS
+/* A peer action may change the real atomic before its one-shot CAS. */
+extern void (*wl_arena_compound_arena_test_retirement_peer)(
+    wl_compound_arena_t *, unsigned);
+#endif
 
 /** Collect only when no hold, borrow, writer, or freeze prevents collection.
  * Returns EINVAL for invalid arguments, EBUSY without changing *reclaimed on
