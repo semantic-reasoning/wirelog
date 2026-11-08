@@ -248,6 +248,20 @@ All notable changes to wirelog are documented in this file.
 
 ### Fixed
 
+- **Body equalities bind an unbound variable to an expression** (#2231):
+  `m(y) :- n(x), y = x + 1.` derived nothing and `y = 2` kept only the rows
+  whose first body column was 2, because such a variable was read as the
+  first body column. The variable is now computed from the bound side, also
+  for `x + 1 = y` and for chained equalities in any order, and may be used
+  in the head, an aggregate operand, a group-by key, a comparison or a
+  string predicate. Rejected at load: an equality whose variables cannot
+  all be bound, an equality-bound variable used nowhere else (including
+  `y = x` with `y` unused, which used to act as no condition), one bound to
+  an expression containing `uuid4()` or of more than 4096 nodes, a rule
+  whose uses of bound variables come to more than 4096 nodes once
+  substituted, and a bound variable used in a negated atom or as a scalar
+  extension call argument.
+
 - **Expressions deeper than the evaluator's stack are rejected** (#2231):
   an expression whose evaluation holds more than 64 values at once, such as
   64 calls nested in the last argument of `bor(0, bor(0, ... x))`, is now a

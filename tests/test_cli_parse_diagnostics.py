@@ -140,6 +140,35 @@ CASES = [
         + 'bor(0, ' * 64 + 'x' + ')' * 64 + ' = 5.\n',
         ["stackdepthfilterrelation"],
     ),
+    # A body `=` binds a variable no positive atom binds (#2231); these
+    # forms of it are rejected at load.
+    (
+        "equality with an unbound variable on both sides",
+        '.decl n(x: int64)\n.decl equnsaferelation(x: int64)\nn(1).\n'
+        'equnsaferelation(y) :- n(x), y = eqfreevariable + 1.\n',
+        ["eqfreevariable", "equnsaferelation"],
+    ),
+    (
+        "equality binding uuid4()",
+        '.decl n(x: int64)\n.decl equuidrelation(x: int64, u: int64)\n'
+        'n(1).\nequuidrelation(x, equuidvariable) :- n(x), '
+        'equuidvariable = uuid4().\n',
+        ["equuidvariable", "equuidrelation", "uuid4()"],
+    ),
+    (
+        "equality binding a variable used nowhere",
+        '.decl n(x: int64)\n.decl equnusedrelation(x: int64)\nn(1).\n'
+        'equnusedrelation(x) :- n(x), equnusedvariable = x + 1.\n',
+        ["equnusedvariable", "equnusedrelation", "never used"],
+    ),
+    (
+        "equality-bound variable in a negated atom",
+        '.decl n(x: int64)\n.decl eqnegatedatom(x: int64)\n'
+        '.decl eqnegrelation(x: int64)\nn(1).\n'
+        'eqnegrelation(x) :- n(x), eqnegvariable = x + 1, '
+        '!eqnegatedatom(eqnegvariable).\n',
+        ["eqnegvariable", "eqnegrelation", "eqnegatedatom"],
+    ),
 ]
 
 # A syntactically malformed program.  This is the errbuf that

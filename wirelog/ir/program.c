@@ -4527,6 +4527,436 @@ conversion_cleanup:
     return root;
 }
 
+/* #2231: body equality bindings.  An `=` in a rule body with a lone
+ * variable on one side that no positive atom binds, and only bound
+ * variables on the other side, binds that variable to the expression: the
+ * comparison is removed and the expression is written in place of each use
+ * of the variable, so the rule means what it would with the expression
+ * written there.  Before this, lowering read such a variable as the first
+ * body column: `m(y) :- n(x), y = x + 1.` derived nothing, and `y = 2`
+ * kept only the rows whose first column was 2.  The pass rewrites the AST
+ * before wl_ir_program_collect_metadata(), so its checks of heads and
+ * comparisons see the substituted expressions. */
+
+#define WL_IR_EQ_BINDING_MAX_NODES 4096u
+
+typedef struct {
+    const char *name;           /* the bound variable; owned by the AST */
+    wl_parser_ast_node_t *expr; /* owned; earlier bindings substituted */
+    uint32_t nodes;             /* AST nodes in expr */
+    uint32_t body_index;        /* the consumed comparison */
+} eq_binding_t;
+
+typedef struct {
+    const char **atom_vars; /* variables of the positive body atoms */
+    uint32_t atom_count;
+    eq_binding_t *bindings;
+    uint32_t binding_count;
+} eq_scope_t;
+
+static void
+eq_collect_atom_vars(const wl_parser_ast_node_t *node, eq_scope_t *scope,
+    uint32_t cap)
+{
+    if (node->type == WL_PARSER_AST_NODE_VARIABLE && node->name
+        && scope->atom_count < cap)
+        scope->atom_vars[scope->atom_count++] = node->name;
+    for (uint32_t i = 0; i < node->child_count; i++)
+        eq_collect_atom_vars(node->children[i], scope, cap);
+}
+
+static const eq_binding_t *
+eq_find_binding(const eq_scope_t *scope, const char *name)
+{
+    for (uint32_t i = 0; i < scope->binding_count; i++)
+        if (strcmp(scope->bindings[i].name, name) == 0)
+            return &scope->bindings[i];
+    return NULL;
+}
+
+static bool
+eq_is_known(const eq_scope_t *scope, const char *name)
+{
+    for (uint32_t i = 0; i < scope->atom_count; i++)
+        if (strcmp(scope->atom_vars[i], name) == 0)
+            return true;
+    return eq_find_binding(scope, name) != NULL;
+}
+
+/* The first variable under @node that is neither in a positive atom nor
+ * bound, or NULL. */
+static const char *
+eq_first_unknown_var(const wl_parser_ast_node_t *node,
+    const eq_scope_t *scope)
+{
+    if (node->type == WL_PARSER_AST_NODE_VARIABLE && node->name)
+        return eq_is_known(scope, node->name) ? NULL : node->name;
+    for (uint32_t i = 0; i < node->child_count; i++) {
+        const char *v = eq_first_unknown_var(node->children[i], scope);
+        if (v)
+            return v;
+    }
+    return NULL;
+}
+
+static bool
+eq_mentions_var(const wl_parser_ast_node_t *node, const char *name)
+{
+    if (node->type == WL_PARSER_AST_NODE_VARIABLE && node->name)
+        return strcmp(node->name, name) == 0;
+    for (uint32_t i = 0; i < node->child_count; i++)
+        if (eq_mentions_var(node->children[i], name))
+            return true;
+    return false;
+}
+
+static bool
+eq_mentions_binding(const wl_parser_ast_node_t *node,
+    const eq_scope_t *scope)
+{
+    for (uint32_t i = 0; i < scope->binding_count; i++)
+        if (eq_mentions_var(node, scope->bindings[i].name))
+            return true;
+    return false;
+}
+
+/* The scalar extension call under @node that takes @name, or NULL. */
+static const wl_parser_ast_node_t *
+eq_call_taking(const wl_parser_ast_node_t *node, const char *name)
+{
+    if (node->type == WL_PARSER_AST_NODE_EXTENSION_CALL
+        && eq_mentions_var(node, name))
+        return node;
+    for (uint32_t i = 0; i < node->child_count; i++) {
+        const wl_parser_ast_node_t *c = eq_call_taking(node->children[i],
+                name);
+        if (c)
+            return c;
+    }
+    return NULL;
+}
+
+static bool
+eq_contains_uuid4(const wl_parser_ast_node_t *node)
+{
+    if (node->type == WL_PARSER_AST_NODE_BINARY_EXPR
+        && node->arith_op == WIRELOG_ARITH_UUID4)
+        return true;
+    for (uint32_t i = 0; i < node->child_count; i++)
+        if (eq_contains_uuid4(node->children[i]))
+            return true;
+    return false;
+}
+
+/* Nodes in @node once the bindings are substituted, or one past the cap
+ * when there are more.  It is computed before anything is copied, so a
+ * chain of doublings is rejected without being built. */
+static uint32_t
+eq_substituted_size(const wl_parser_ast_node_t *node,
+    const eq_scope_t *scope)
+{
+    if (node->type == WL_PARSER_AST_NODE_VARIABLE && node->name) {
+        const eq_binding_t *b = eq_find_binding(scope, node->name);
+        if (b)
+            return b->nodes;
+    }
+    uint32_t n = 1;
+    for (uint32_t i = 0; i < node->child_count; i++) {
+        n += eq_substituted_size(node->children[i], scope);
+        if (n > WL_IR_EQ_BINDING_MAX_NODES)
+            return WL_IR_EQ_BINDING_MAX_NODES + 1;
+    }
+    return n;
+}
+
+static bool
+eq_copy_string(char **dst, const char *src)
+{
+    if (!src)
+        return true;
+    *dst = strdup_safe(src);
+    return *dst != NULL;
+}
+
+/* A copy of @node with each bound variable replaced by its expression;
+ * NULL when out of memory. */
+static wl_parser_ast_node_t *
+eq_clone_substituted(const wl_parser_ast_node_t *node,
+    const eq_scope_t *scope)
+{
+    if (node->type == WL_PARSER_AST_NODE_VARIABLE && node->name) {
+        const eq_binding_t *b = eq_find_binding(scope, node->name);
+        if (b)
+            return eq_clone_substituted(b->expr, scope);
+    }
+    wl_parser_ast_node_t *copy = wl_parser_ast_node_create(node->type,
+            node->line, node->col);
+    if (!copy)
+        return NULL;
+    copy->int_value = node->int_value;
+    copy->float_value = node->float_value;
+    copy->bool_value = node->bool_value;
+    copy->is_planning = node->is_planning;
+    copy->cmp_op = node->cmp_op;
+    copy->arith_op = node->arith_op;
+    copy->agg_fn = node->agg_fn;
+    copy->str_fn = node->str_fn;
+    copy->query_arity = node->query_arity;
+    if (!eq_copy_string(&copy->name, node->name)
+        || !eq_copy_string(&copy->str_value, node->str_value)
+        || !eq_copy_string(&copy->type_name, node->type_name)) {
+        wl_parser_ast_node_free(copy);
+        return NULL;
+    }
+    for (uint32_t i = 0; i < node->child_count; i++) {
+        wl_parser_ast_node_t *child = eq_clone_substituted(node->children[i],
+                scope);
+        if (!child || wl_parser_ast_node_add_child(copy, child) != 0) {
+            wl_parser_ast_node_free(child);
+            wl_parser_ast_node_free(copy);
+            return NULL;
+        }
+    }
+    return copy;
+}
+
+/* Replaces *@slot by its substituted copy when it uses a binding. */
+static bool
+eq_substitute_slot(wl_parser_ast_node_t **slot, const eq_scope_t *scope)
+{
+    if (!eq_mentions_binding(*slot, scope))
+        return true;
+    wl_parser_ast_node_t *copy = eq_clone_substituted(*slot, scope);
+    if (!copy)
+        return false;
+    wl_parser_ast_node_free(*slot);
+    *slot = copy;
+    return true;
+}
+
+/* Each use of a bound variable copies its expression, so the head
+ * arguments and body elements that use bindings are capped together as a
+ * binding is.  Adds @site's substituted size to *@total; returns 0, or -1
+ * with an error set once *@total exceeds the cap. */
+static int
+eq_check_use_site(struct wirelog_program *program,
+    const wl_parser_ast_node_t *site, const eq_scope_t *scope,
+    const char *rule_name, uint32_t *total)
+{
+    if (!eq_mentions_binding(site, scope))
+        return 0;
+    *total += eq_substituted_size(site, scope);
+    if (*total <= WL_IR_EQ_BINDING_MAX_NODES)
+        return 0;
+    wl_ir_program_set_error(program,
+        "the expressions that use bound variables in rule '%s' exceed %u"
+        " nodes together once they are substituted", rule_name,
+        WL_IR_EQ_BINDING_MAX_NODES);
+    return -1;
+}
+
+/* Returns 0, -1 with an error set when the rule is rejected, or -2 when
+ * out of memory. */
+static int
+resolve_rule_eq_bindings(struct wirelog_program *program,
+    wl_parser_ast_node_t *rule)
+{
+    wl_parser_ast_node_t *head = rule->children[0];
+    const char *rule_name = head->name ? head->name : "?";
+    bool any_eq = false;
+    for (uint32_t i = 1; i < rule->child_count; i++)
+        if (rule->children[i]->type == WL_PARSER_AST_NODE_COMPARISON
+            && rule->children[i]->cmp_op == WIRELOG_CMP_EQ)
+            any_eq = true;
+    if (!any_eq)
+        return 0;
+
+    uint32_t var_cap = count_variable_nodes(rule);
+    eq_scope_t scope = { NULL, 0, NULL, 0 };
+    bool *consumed = (bool *)calloc(rule->child_count, sizeof(bool));
+    scope.atom_vars = (const char **)calloc(var_cap > 0 ? var_cap : 1,
+            sizeof(const char *));
+    scope.bindings = (eq_binding_t *)calloc(rule->child_count,
+            sizeof(eq_binding_t));
+    int rc = 0;
+    if (!consumed || !scope.atom_vars || !scope.bindings) {
+        rc = -2;
+        goto done;
+    }
+    for (uint32_t i = 1; i < rule->child_count; i++)
+        if (rule->children[i]->type == WL_PARSER_AST_NODE_ATOM)
+            eq_collect_atom_vars(rule->children[i], &scope, var_cap);
+
+    /* Bind until nothing changes, so a chain binds in any body order. */
+    for (bool changed = true; changed && rc == 0;) {
+        changed = false;
+        for (uint32_t i = 1; i < rule->child_count && rc == 0; i++) {
+            const wl_parser_ast_node_t *b = rule->children[i];
+            if (consumed[i] || b->type != WL_PARSER_AST_NODE_COMPARISON
+                || b->cmp_op != WIRELOG_CMP_EQ || b->child_count != 2)
+                continue;
+            for (int side = 0; side < 2; side++) {
+                const wl_parser_ast_node_t *var = b->children[side];
+                const wl_parser_ast_node_t *val = b->children[1 - side];
+                if (var->type != WL_PARSER_AST_NODE_VARIABLE || !var->name
+                    || eq_is_known(&scope, var->name)
+                    || eq_first_unknown_var(val, &scope))
+                    continue;
+                uint32_t nodes = eq_substituted_size(val, &scope);
+                if (nodes > WL_IR_EQ_BINDING_MAX_NODES) {
+                    wl_ir_program_set_error(program,
+                        "the expression bound to '%s' in rule '%s' exceeds"
+                        " %u nodes after substitution", var->name,
+                        rule_name, WL_IR_EQ_BINDING_MAX_NODES);
+                    rc = -1;
+                    break;
+                }
+                wl_parser_ast_node_t *expr = eq_clone_substituted(val,
+                        &scope);
+                if (!expr) {
+                    rc = -2;
+                    break;
+                }
+                if (eq_contains_uuid4(expr)) {
+                    wl_parser_ast_node_free(expr);
+                    wl_ir_program_set_error(program,
+                        "variable '%s' is bound to an expression containing"
+                        " uuid4() in rule '%s'; uuid4() would be evaluated"
+                        " separately at each use, so write uuid4() where the"
+                        " value is used", var->name, rule_name);
+                    rc = -1;
+                    break;
+                }
+                eq_binding_t *bind = &scope.bindings[scope.binding_count++];
+                bind->name = var->name;
+                bind->expr = expr;
+                bind->nodes = nodes;
+                bind->body_index = i;
+                consumed[i] = true;
+                changed = true;
+                break;
+            }
+        }
+    }
+
+    for (uint32_t i = 1; rc == 0 && i < rule->child_count; i++) {
+        const wl_parser_ast_node_t *b = rule->children[i];
+        if (consumed[i] || b->type != WL_PARSER_AST_NODE_COMPARISON
+            || b->cmp_op != WIRELOG_CMP_EQ || b->child_count != 2)
+            continue;
+        /* Name a variable of the expression side, which is what keeps a
+         * lone variable on the other side from being bound. */
+        const char *v = NULL;
+        for (int side = 0; !v && side < 2; side++)
+            if (b->children[side]->type != WL_PARSER_AST_NODE_VARIABLE)
+                v = eq_first_unknown_var(b->children[side], &scope);
+        if (!v)
+            v = eq_first_unknown_var(b, &scope);
+        if (v) {
+            wl_ir_program_set_error(program,
+                "unsafe variable '%s' in equality in rule '%s'; bind it in a"
+                " positive body atom or by an equality whose other side is"
+                " bound", v, rule_name);
+            rc = -1;
+        }
+    }
+
+    for (uint32_t k = 0; rc == 0 && k < scope.binding_count; k++) {
+        const char *name = scope.bindings[k].name;
+        bool used = eq_mentions_var(head, name);
+        const wl_parser_ast_node_t *call = eq_call_taking(head, name);
+        for (uint32_t i = 1; rc == 0 && i < rule->child_count; i++) {
+            const wl_parser_ast_node_t *b = rule->children[i];
+            if (i == scope.bindings[k].body_index
+                || !eq_mentions_var(b, name))
+                continue;
+            used = true;
+            if (!call)
+                call = eq_call_taking(b, name);
+            if (b->type == WL_PARSER_AST_NODE_NEGATION) {
+                wl_ir_program_set_error(program,
+                    "variable '%s' is bound by a body equality in rule '%s'"
+                    " and cannot key negated atom '%s' yet; derive it in a"
+                    " positive rule first", name, rule_name,
+                    b->child_count > 0 && b->children[0]->name
+                    ? b->children[0]->name : "?");
+                rc = -1;
+            }
+        }
+        if (rc == 0 && call) {
+            wl_ir_program_set_error(program,
+                "variable '%s' is bound by a body equality in rule '%s' and"
+                " cannot be passed to scalar extension call '%s' yet", name,
+                rule_name, call->name ? call->name : "?");
+            rc = -1;
+        }
+        if (rc == 0 && !used) {
+            wl_ir_program_set_error(program,
+                "variable '%s' is bound by an equality but never used in"
+                " rule '%s'", name, rule_name);
+            rc = -1;
+        }
+    }
+
+    uint32_t use_nodes = 0;
+    for (uint32_t i = 0; rc == 0 && i < head->child_count; i++)
+        rc = eq_check_use_site(program, head->children[i], &scope,
+                rule_name, &use_nodes);
+    for (uint32_t i = 1; rc == 0 && i < rule->child_count; i++)
+        if (!consumed[i])
+            rc = eq_check_use_site(program, rule->children[i], &scope,
+                    rule_name, &use_nodes);
+
+    /* Substitute, then drop the consumed comparisons, which own the bound
+     * names. */
+    for (uint32_t i = 0; rc == 0 && i < head->child_count; i++)
+        if (!eq_substitute_slot(&head->children[i], &scope))
+            rc = -2;
+    for (uint32_t i = 1; rc == 0 && i < rule->child_count; i++)
+        if (!consumed[i] && !eq_substitute_slot(&rule->children[i], &scope))
+            rc = -2;
+    if (rc == 0) {
+        uint32_t kept = 1;
+        for (uint32_t i = 1; i < rule->child_count; i++) {
+            if (consumed[i])
+                wl_parser_ast_node_free(rule->children[i]);
+            else
+                rule->children[kept++] = rule->children[i];
+        }
+        rule->child_count = kept;
+    }
+
+done:
+    if (rc == -2)
+        wl_ir_program_set_error(program,
+            "out of memory resolving body equalities in rule '%s'",
+            rule_name);
+    for (uint32_t k = 0; scope.bindings && k < scope.binding_count; k++)
+        wl_parser_ast_node_free(scope.bindings[k].expr);
+    free(scope.bindings);
+    free((void *)scope.atom_vars);
+    free(consumed);
+    return rc;
+}
+
+int
+wl_ir_program_resolve_eq_bindings(struct wirelog_program *program,
+    wl_parser_ast_node_t *ast)
+{
+    if (!program || !ast)
+        return -1;
+    for (uint32_t i = 0; i < ast->child_count; i++) {
+        wl_parser_ast_node_t *child = ast->children[i];
+        if (child->type != WL_PARSER_AST_NODE_RULE || child->child_count < 1
+            || child->children[0]->type != WL_PARSER_AST_NODE_HEAD)
+            continue;
+        int rc = resolve_rule_eq_bindings(program, child);
+        if (rc != 0)
+            return rc;
+    }
+    return 0;
+}
+
 /* #2231: lowering refers to a column by position with a synthesised
  * variable named `col` and the column's index -- the operand of an
  * aggregate (rewrite_expr_vars_to_columns()), the filter for a constant in

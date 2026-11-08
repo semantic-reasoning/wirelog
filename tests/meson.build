@@ -4639,6 +4639,16 @@ test_expr_stack_limit_exe = executable(
 
 test('expr_stack_limit', test_expr_stack_limit_exe)
 
+test_body_eq_binding_exe = executable(
+  'test_body_eq_binding',
+  files('test_body_eq_binding.c'),
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
+  link_with: [testlib_prod],
+)
+
+test('body_eq_binding', test_body_eq_binding_exe)
+
 # ============================================================================
 # Pointer Swap Tests (Issue #300)
 # ============================================================================
