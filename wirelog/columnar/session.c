@@ -15889,6 +15889,13 @@ col_session_snapshot_impl(wl_session_t *session, wirelog_on_tuple_fn callback,
         return rc;
     }
 
+    /* From here the evaluation changes the committed model, and a snapshot
+     * reports no delta events.  If it fails, whatever finishes it has no
+     * baseline to measure events from, so a step finishes it unobserved, even
+     * when it failed at admission and changed nothing (#2348). */
+    if (sess->has_evaluated && plan->stratum_count > 0)
+        col_session_note_stratum_extent(sess, plan->stratum_count - 1);
+
     /* Issue #2114: after an incremental insert, the strata it reaches are
      * brought up to date with occurrence-bound instances
      * (session_snapshot_insert).  A staged removal and an insert into a rule
@@ -15916,10 +15923,11 @@ col_session_snapshot_impl(wl_session_t *session, wirelog_on_tuple_fn callback,
             session_reset_frontiers(plan, sess);
             goto evaluated;
         }
-        /* A refusal at admission left the session as it was; any later
+        /* A refusal at admission left the rows as they were; any later
          * failure may have left heads partly updated.  Either way the
          * evaluation is redone in full, and the flag stays set until a
-         * snapshot or step commits, so a retry after an error does too. */
+         * snapshot or step commits, so a retry after an error does too.  The
+         * extent noted above makes a step that retries it unobserved. */
         sess->pending_full_input_eval = true;
         if (insert_rc != ENOTSUP && insert_rc != EINVAL)
             return insert_rc;

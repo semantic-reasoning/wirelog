@@ -35,11 +35,15 @@ typedef enum {
      * its next step refused.  The retry's events complete the stream
      * exactly. */
     SCENARIO_OBSERVED_STEP,
+    /* A committed session with a callback has an evaluating snapshot refused.
+     * The step that finishes it reports nothing, and the following step's
+     * events are exact. */
+    SCENARIO_SNAPSHOT,
     SCENARIO_COUNT
 } scenario_t;
 
 static const char *const scenario_names[SCENARIO_COUNT] = {
-    "plain step", "observed step"
+    "plain step", "observed step", "snapshot with a callback"
 };
 
 #define DECLS ".decl e(x: int64, y: int64)\n.decl p(x: int64, y: int64)\n" \
@@ -163,12 +167,22 @@ reference_model(const compiled_t *compiled, uint32_t workers, int64_t last,
 typedef struct {
     model_t plain;      /* edges [1, CHAIN_EDGES] less e(10,11) */
     model_t extended;   /* edges [1, CHAIN_EDGES + 1] */
+    model_t followup;   /* edges [1, CHAIN_EDGES + 2] */
 } references_t;
 
 typedef struct {
     uint64_t reserved_before_refusal;
     bool refused;
 } attempt_t;
+
+/* The governed call this scenario expects to be refused. */
+static int
+refused_call(wl_session_t *session, scenario_t scenario, model_t *unused)
+{
+    return scenario == SCENARIO_SNAPSHOT
+               ? wl_session_snapshot(session, collect_model, unused)
+               : wl_session_step(session);
+}
 
 /* With calibrate set, only measure what is reserved before the refused call. */
 static attempt_t
@@ -213,7 +227,9 @@ attempt(const compiled_t *compiled, scenario_t scenario, uint32_t workers,
         wl_columnar_memory_governor_ref_get(governor));
     if (calibrate)
         goto cleanup;
-    int rc = wl_session_step(session);
+    model_t ignored = { 0 };
+    const events_t before_refusal = events;
+    int rc = refused_call(session, scenario, &ignored);
     /* This scan injects no allocation failure, so a failure here is the
      * budget. */
     CHECK(rc == 0 || rc == ENOSPC || rc == ENOMEM);
@@ -223,6 +239,7 @@ attempt(const compiled_t *compiled, scenario_t scenario, uint32_t workers,
     CHECK(!wl_session_try_destroy(&ballast));
     if (scenario == SCENARIO_PLAIN)
         remove_edge(session);
+    const events_t before_retry = events;
     CHECK(!wl_session_step(session));
     model_t model = { 0 };
     CHECK(!wl_session_snapshot(session, collect_model, &model));
@@ -235,6 +252,20 @@ attempt(const compiled_t *compiled, scenario_t scenario, uint32_t workers,
         CHECK(models_equal(model, expected->extended));
         CHECK(models_equal(events.net, expected->extended));
         break;
+    case SCENARIO_SNAPSHOT: {
+        CHECK(models_equal(model, expected->extended));
+        CHECK(before_refusal.events == events.events);
+        CHECK(before_retry.events == events.events);
+        /* The snapshot is the baseline the next step's events start from. */
+        events = (events_t){ 0 };
+        insert_edges(session, CHAIN_EDGES + 2, CHAIN_EDGES + 2);
+        CHECK(!wl_session_step(session));
+        CHECK(events.net.count
+            == expected->followup.count - model.count);
+        CHECK(events.net.row_hash
+            == expected->followup.row_hash - model.row_hash);
+        break;
+    }
     default:
         CHECK(false);
     }
@@ -267,7 +298,8 @@ main(void)
             const uint32_t workers = widths[w];
             const references_t expected = {
                 reference_model(&compiled, workers, CHAIN_EDGES, true),
-                reference_model(&compiled, workers, CHAIN_EDGES + 1, false)
+                reference_model(&compiled, workers, CHAIN_EDGES + 1, false),
+                reference_model(&compiled, workers, CHAIN_EDGES + 2, false)
             };
             for (int s = 0; s < SCENARIO_COUNT; s++) {
                 const scenario_t scenario = (scenario_t)s;
