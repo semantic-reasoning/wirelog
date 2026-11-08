@@ -7469,6 +7469,37 @@ wl_columnar_session_budget_denial_clear(wl_col_session_t *sess)
                 ->memory_budget_denial_pending = false;
 }
 
+static uint64_t
+col_session_governor_denials(const wl_col_session_t *sess)
+{
+    return wl_columnar_memory_denials(sess->memory_governor
+               ? wl_columnar_memory_governor_ref_get(sess->memory_governor)
+               : NULL);
+}
+
+/* The denial flag says the most recent evaluation stopped on one, so a call
+ * that returns 0 clears it.  A denial in worker setup or on a worker that has
+ * retired has no flag left to read, so ENOSPC or ENOMEM with an advanced
+ * governor count stands in for it.  Some governed paths return ENOMEM for a
+ * denial, which this reports as the ENOSPC a denial means at this boundary.
+ * An ENOMEM with no new denial stays an allocation failure, whatever stale
+ * evidence a relation holds.  The advance can also be another session's on a
+ * shared governor, or a denial this call recovered from before failing for
+ * another reason; either mistypes that ENOSPC or ENOMEM as a denial. */
+static int
+col_session_note_budget_outcome(wl_col_session_t *sess, int rc,
+    uint64_t denials_before)
+{
+    if (rc == 0) {
+        wl_columnar_session_budget_denial_clear(sess);
+    } else if ((rc == ENOSPC || rc == ENOMEM)
+        && col_session_governor_denials(sess) != denials_before) {
+        sess->memory_budget_denied = true;
+        rc = ENOSPC;
+    }
+    return rc;
+}
+
 static void
 col_session_budget_denial_clear(void *session)
 {
@@ -15325,7 +15356,9 @@ col_session_step(wl_session_t *session)
     if (cold_rc != 0) return cold_rc;
     if (session->evaluation_control)
         return col_controlled_step(COL_SESSION(session), NULL);
-    return col_session_step_impl(session);
+    const uint64_t denials = col_session_governor_denials(sess);
+    return col_session_note_budget_outcome(sess, col_session_step_impl(session),
+               denials);
 }
 
 static wl_controlled_step_state_t
@@ -16798,7 +16831,10 @@ col_session_snapshot(wl_session_t *session, wirelog_on_tuple_fn callback,
     if (cold_rc != 0) return cold_rc;
     if (session->evaluation_control)
         return col_session_snapshot_controlled(session, callback, user_data);
-    return col_session_snapshot_impl(session, callback, user_data);
+    const uint64_t denials = col_session_governor_denials(sess);
+    return col_session_note_budget_outcome(sess,
+               col_session_snapshot_impl(session, callback, user_data),
+               denials);
 }
 
 /* Affected strata/rules detection moved to columnar/frontier.c;

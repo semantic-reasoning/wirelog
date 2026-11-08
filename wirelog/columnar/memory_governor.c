@@ -425,6 +425,14 @@ wl_columnar_memory_resolve(const char *env_value,
     return WL_COLUMNAR_MEMORY_OK;
 }
 
+static wl_columnar_memory_admission_status_t
+wl_columnar_memory_note_denial(wl_columnar_memory_governor_t *governor)
+{
+    (void)atomic_fetch_add_explicit(&governor->denied_admissions, UINT64_C(1),
+        memory_order_relaxed);
+    return WL_COLUMNAR_MEMORY_ADMISSION_DENIED;
+}
+
 wl_columnar_memory_status_t
 wl_columnar_memory_governor_init(wl_columnar_memory_governor_t *governor,
     const wl_columnar_memory_resolution_t *resolution)
@@ -440,6 +448,8 @@ wl_columnar_memory_governor_init(wl_columnar_memory_governor_t *governor,
     atomic_store_explicit(&governor->usable_bytes, resolution->usable_bytes,
         memory_order_relaxed);
     atomic_store_explicit(&governor->reserved_bytes, 0, memory_order_relaxed);
+    atomic_store_explicit(&governor->denied_admissions, 0,
+        memory_order_relaxed);
     return WL_COLUMNAR_MEMORY_OK;
 }
 
@@ -953,7 +963,7 @@ wl_columnar_memory_governor_admit(wl_columnar_memory_governor_t *governor,
                 memory_order_relaxed);
         bool overflow = bytes > UINT64_MAX - old;
         if (!overflow && old + bytes > limit) {
-            *status = WL_COLUMNAR_MEMORY_ADMISSION_DENIED;
+            *status = wl_columnar_memory_note_denial(governor);
             WL_COLUMNAR_MEMORY_GOVERNOR_TEST_POINT(control, token,
                 WL_COLUMNAR_MEMORY_GOVERNOR_VERDICT);
             rc = wl_columnar_memory_governor_tail(control, 1);
@@ -1582,7 +1592,7 @@ wl_columnar_memory_governor_attempt_admit(
                     WL_COLUMNAR_MEMORY_GOVERNOR_ATTEMPT_ROUND_WORK);
             if (rc)
                 return rc;
-            *status = WL_COLUMNAR_MEMORY_ADMISSION_DENIED;
+            *status = wl_columnar_memory_note_denial(governor);
             return 0;
         }
         uint64_t desired = overflow ? old : old + bytes;
@@ -2010,7 +2020,7 @@ reserve_internal(wl_columnar_memory_governor_t *governor,
         if (next > limit) {
             atomic_store_explicit(&reservation->state,
                 WL_COLUMNAR_MEMORY_RESERVATION_RELEASED, memory_order_release);
-            return WL_COLUMNAR_MEMORY_ADMISSION_DENIED;
+            return wl_columnar_memory_note_denial(governor);
         }
         if (atomic_compare_exchange_weak_explicit(
                 &governor->reserved_bytes, &old, next,
@@ -2695,7 +2705,7 @@ reserve_replacement_overlap(wl_columnar_memory_governor_t *governor,
         }
         next = old + bytes;
         if (next > limit)
-            return WL_COLUMNAR_MEMORY_ADMISSION_DENIED;
+            return wl_columnar_memory_note_denial(governor);
         if (atomic_compare_exchange_weak_explicit(
                 &governor->reserved_bytes, &old, next,
                 memory_order_relaxed, memory_order_relaxed)) {
@@ -3243,6 +3253,15 @@ wl_columnar_memory_retirement_acknowledge(
 }
 
 uint64_t
+wl_columnar_memory_denials(const wl_columnar_memory_governor_t *governor)
+{
+    if (!governor)
+        return 0;
+    return atomic_load_explicit(&governor->denied_admissions,
+               memory_order_relaxed);
+}
+
+uint64_t
 wl_columnar_memory_reserved(const wl_columnar_memory_governor_t *governor)
 {
     if (!governor)
@@ -3334,7 +3353,7 @@ wl_columnar_memory_governor_attempt_admit_source(
                     WL_COLUMNAR_MEMORY_GOVERNOR_ATTEMPT_ROUND_WORK);
             if (rc)
                 return rc;
-            *status = WL_COLUMNAR_MEMORY_ADMISSION_DENIED;
+            *status = wl_columnar_memory_note_denial(governor);
             return 0;
         }
         uint64_t desired = overflow ? old : old + bytes;

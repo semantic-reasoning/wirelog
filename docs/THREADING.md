@@ -228,7 +228,7 @@ These exist so struct fields can be declared portably; the audit in
 
 Every `atomic_*` call site in `wirelog/` production sources. Counted
 mechanically by `scripts/ci/check-threading-doc.sh`; row count must
-match the script's count (currently **524**).
+match the script's count (currently **527**).
 
 Format: `file:function[#N]` | field | operation | order | justification.
 
@@ -405,6 +405,9 @@ non-atomic payload reads require external synchronization.
 |---|---|---|---|---|
 | `memory_governor.c:wl_columnar_memory_governor_init` | `usable_bytes` | `atomic_store_explicit` | `relaxed` | Set-once before the governor is published |
 | `memory_governor.c:wl_columnar_memory_governor_init#2` | `reserved_bytes` | `atomic_store_explicit` | `relaxed` | Set-once before reservations are possible |
+| `memory_governor.c:wl_columnar_memory_governor_init#3` | `denied_admissions` | `atomic_store_explicit` | `relaxed` | Set-once before reservations are possible |
+| `memory_governor.c:wl_columnar_memory_note_denial` | `governor->denied_admissions` | `atomic_fetch_add_explicit` | `relaxed` | Count a refusal; a statistic that orders nothing else |
+| `memory_governor.c:wl_columnar_memory_denials` | `governor->denied_admissions` | `atomic_load_explicit` | `relaxed` | A coordinator reads it after joining its workers, so it sees their refusals; another session's may be missed or included |
 | `memory_governor.c:wl_columnar_memory_reservation_init` | `reservation->state` | `atomic_store_explicit` | `relaxed` | Publish the empty state before a caller can reserve or reuse the token |
 | `memory_governor.c:wl_columnar_memory_governor_ref_create` | `references` | `atomic_store_explicit` | `relaxed` | Publish the coordinator's initial ownership reference |
 | `memory_governor.c:wl_columnar_memory_governor_ref_retain` | `references` | `atomic_fetch_add_explicit` | `relaxed` | Retain the shared governor for a worker |
@@ -667,7 +670,7 @@ concurrent alias removals cannot underflow the count.
 | `session.c:session_pool_rel_promote#3` | `src->storage_alias_borrows` | `atomic_store_explicit` | relaxed | Leave the closed pool tombstone with no child aliases |
 
 112 + 21 + 37 = **170 atomic call sites** in the summarized groups; the full
-symbol-anchored inventory below covers 524 sites.
+symbol-anchored inventory below covers 527 sites.
 
 The `#N` suffix counts all atomic sites in a symbol, regardless of operation;
 the first site remains unsuffixed. `scripts/ci/check-threading-doc.sh` uses
@@ -1768,7 +1771,7 @@ DONE. If a stop leaves the receipt holding a claim, its caller preserves that
 receipt and resumes with a fresh live maintenance attempt; it cannot abandon or
 reinitialize the receipt/token while the claim remains held.
 
-The complete current atomic-source inventory contains 524 call sites.
+The complete current atomic-source inventory contains 527 call sites.
 
 ### Caller-attempt-bound single mutation admission
 

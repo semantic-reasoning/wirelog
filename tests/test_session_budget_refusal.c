@@ -232,9 +232,16 @@ attempt(const compiled_t *compiled, scenario_t scenario, uint32_t workers,
     model_t ignored = { 0 };
     const events_t before_refusal = events;
     int rc = refused_call(session, scenario, &ignored);
-    /* This scan injects no allocation failure, so a failure here is the
-     * budget. */
-    CHECK(rc == 0 || rc == ENOSPC || rc == ENOMEM);
+    /* This scan injects no allocation failure, so a refusal here is the
+     * budget, and a denial on any thread reports on this call as ENOSPC. */
+    CHECK(rc != ENOMEM);
+    if (rc == ENOSPC) {
+        CHECK(wl_session_budget_denied(session));
+        CHECK(wl_facade_session_error_code_with_budget(rc, 0, true)
+            == WIRELOG_ERR_MEMORY_BUDGET);
+    } else {
+        CHECK(rc != 0 || !wl_session_budget_denied(session));
+    }
     if (rc == 0)
         goto cleanup;
     result.refused = true;

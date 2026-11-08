@@ -364,7 +364,10 @@ wl_session_snapshot(wl_session_t *session, wirelog_on_tuple_fn callback,
     void *user_data);
 
 /* True when the most recent step/snapshot stopped on governed admission
- * denial.  Other ENOSPC meanings remain untyped at this internal boundary. */
+ * denial.  Other ENOSPC and ENOMEM meanings remain untyped at this internal
+ * boundary.  One can be reported as a denial when the governor refused anything
+ * during the same call: another session sharing it, or an admission this call
+ * recovered from. */
 bool
 wl_session_budget_denied(wl_session_t *session);
 

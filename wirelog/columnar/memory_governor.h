@@ -70,6 +70,8 @@ typedef struct {
 typedef struct {
     wl_atomic_u64 usable_bytes;
     wl_atomic_u64 reserved_bytes;
+    /* Admissions refused so far; see wl_columnar_memory_denials. */
+    wl_atomic_u64 denied_admissions;
     uint64_t budget_bytes;
     uint64_t headroom_bytes;
     wl_columnar_memory_mode_t mode;
@@ -713,5 +715,12 @@ int wl_columnar_memory_governor_reserve_source_attempt_controlled(
 int wl_columnar_memory_governor_commit_source_attempt_controlled(
     wl_columnar_memory_reservation_t *token, const void *owner, bool *out,
     wl_evaluation_control_t *control, uint64_t attempt_id);
+
+/* How many admissions this governor has refused.  A session compares two reads
+ * around an evaluation, because denial sites include worker setup that has no
+ * session flag to set.  A governor can be shared, so an advance may be another
+ * session's refusal. */
+uint64_t
+wl_columnar_memory_denials(const wl_columnar_memory_governor_t *governor);
 
 #endif /* WL_COLUMNAR_MEMORY_GOVERNOR_H */
