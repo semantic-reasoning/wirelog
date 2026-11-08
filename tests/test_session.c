@@ -14845,6 +14845,64 @@ cleanup:
 #undef TIMESTAMP_CHECK
 }
 
+/* A failed attempt can regrow a head from empty, leaving a timestamp array
+ * shorter than the committed rows a rollback restores.  The restore drops it
+ * rather than refuse every retry (#2348). */
+static void
+test_delta_rollback_short_timestamps(bool overwrite)
+{
+    TEST(overwrite ? "delta rollback: overwrite drops a short timestamp array"
+        : "delta rollback: restore drops a short timestamp array");
+    wl_mem_ledger_t ledger;
+    wl_mem_ledger_snapshot_t snapshot;
+    wl_mem_ledger_init(&ledger, 0);
+    col_rel_t *rel = col_rel_new_auto("short-timestamp-rollback", 1);
+    const char *failure = NULL;
+    int64_t *rows = NULL;
+    int64_t one = 1;
+    int rc;
+#define SHORT_TS_CHECK(condition, message) \
+        do { if (!(condition)) { failure = message; goto cleanup; } } while (0)
+    SHORT_TS_CHECK(rel && col_rel_append_row(rel, &one) == 0
+        && col_rel_enable_timestamps(rel) == 0 && rel->timestamps,
+        "fixture");
+    rel->mem_ledger = &ledger;
+    col_rel_ledger_reconcile(rel, 0);
+    const uint32_t nrows = rel->timestamp_capacity + 5u;
+    rows = malloc(sizeof(*rows) * nrows);
+    SHORT_TS_CHECK(rows, "rows");
+    for (uint32_t i = 0; i < nrows; i++)
+        rows[i] = (int64_t)i;
+    SHORT_TS_CHECK(wl_columnar_relation_delta_detach(rel,
+        rel->relation_identity) == 0, "detach");
+    if (overwrite)
+        rc = wl_columnar_relation_delta_restore_flat_overwrite(rel,
+                rel->relation_identity, rows, nrows, 1);
+    else
+        rc = wl_columnar_relation_delta_restore_flat(rel,
+                rel->relation_identity, rows, nrows, 1);
+    SHORT_TS_CHECK(rc == 0, "restore refused");
+    wl_mem_ledger_snapshot(&ledger, &snapshot);
+    SHORT_TS_CHECK(rel->nrows == nrows && !rel->timestamps
+        && rel->timestamp_capacity == 0 && rel->ledger_ts_bytes == 0
+        && snapshot.subsys_bytes[WL_MEM_SUBSYS_TIMESTAMP] == 0,
+        "short timestamp array kept or still charged");
+    SHORT_TS_CHECK(col_rel_get(rel, nrows - 1, 0) == (int64_t)nrows - 1,
+        "restored rows");
+cleanup:
+    free(rows);
+    col_rel_destroy(rel);
+    wl_mem_ledger_snapshot(&ledger, &snapshot);
+    if (!failure && snapshot.current_bytes != 0)
+        failure = "ledger leak";
+    if (failure) {
+        FAIL(failure);
+        return;
+    }
+    PASS();
+#undef SHORT_TS_CHECK
+}
+
 static void
 test_delta_rollback_frontier_gc(bool pinned)
 {
@@ -18469,6 +18527,8 @@ main(void)
     test_delta_rollback_frontier_gc(false);
     test_delta_rollback_frontier_gc(true);
     test_delta_rollback_timestamp_charge();
+    test_delta_rollback_short_timestamps(false);
+    test_delta_rollback_short_timestamps(true);
     test_delta_alias_rollback(false);
     test_delta_alias_rollback(true);
     test_pending_cleanup_synchronous_destroy();
