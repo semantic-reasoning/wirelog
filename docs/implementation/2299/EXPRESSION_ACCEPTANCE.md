@@ -718,3 +718,39 @@ mixed numeric columns, empty/false/positive results, cancellation before
 publication, retry, signed deletion and subsequent no-op calls.
 `unit6-replace` records this evidence. Crypto/extensions and further actual
 recursive/pipeline domain qualification remain pending.
+
+### Latest-main JOIN integration
+
+The foundation merge incorporates main `c9a1dcd9c8aa4b67f3dd58e4b7fdb1134aa14612`
+(PR2344), preserving saved-ID atomic charging in shared expression/filter
+helpers, all three attempt-bound append-batch acquisitions, SOURCE financing
+and native cleanup authority. Forward integration retains the scalar lazy
+array/initialized prefix, both program kinds in inert checks, and independent
+physical/credit retirement. The two inventory scripts retain scalar admission
+and mutation assertions while every text operation explicitly specifies UTF-8.
+
+`joined_strings` in `test_evaluation_expression_strings.c` parses a real keyed
+JOIN with a numeric FILTER prefix followed by string CONTAINS FILTER and
+REPLACE MAP. Pipeline EXCHANGED/AFTER_ACK hooks prove the numeric prefix actually
+ran; string scalar hooks prove the materialized suffix actually ran afterward.
+The existing numeric-only pipeline classifier remains a valid optimization
+boundary, with a controlled context-bearing suffix and no raw fallback.
+Both ordinary and forced-full JOIN selectors exercise empty, accepted/rejected,
+signed deletion and subsequent no-op results with exact STRING/INT64 cells and
+relation-qualified event counts. Earlier standalone suites remain separate
+regression evidence rather than proof of this intersection.
+
+Deterministic stops cover post-result interning cancellation/work exhaustion,
+scalar-owner allocation, first lazy scalar-array slot initialization, and
+post-intern Original finish plus successor creation. Stopped paths publish no
+relation/events, finish native cleanup with no active/pending frame or cleanup
+reservation, preserve the Original report and consume zero successor work.
+After closing that unused successor, reset/retry produces exactly the expected
+rows/events; session/intern destruction returns governor reservations to zero.
+An output-limit failure stays EOVERFLOW with no publication and succeeds after
+raising the limit. Strict policy deliberately refuses an unconsumed suffix;
+both raw and controlled sessions return ENOTSUP on the same generated plan,
+and disabling strict policy permits the bounded route. Dedicated upstream
+strict-eligible tests remain the positive evidence for those separate routes.
+This integration does not qualify all recursive/aggregate/timestamp or future
+crypto/extension intersections; those obligations remain explicit.

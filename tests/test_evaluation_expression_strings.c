@@ -1,5 +1,7 @@
 /* #2299 context-bearing string comparisons through genuine session hosts. */
 #include "../wirelog/columnar/internal.h"
+#include "../wirelog/columnar/join_pipeline.h"
+#include "../wirelog/session.h"
 #include "../wirelog/exec_plan_gen.h"
 #include "../wirelog/passes/fusion.h"
 #include "../wirelog/passes/jpp.h"
@@ -3087,7 +3089,198 @@ static void session_replace(void) {
         CHECK(!step_complete(f.session)); destroy(&f);
     }
 }
+
+static fixture_t *joined_active;
+static unsigned joined_route, joined_ack, joined_forward, joined_mode;
+static bool joined_stopped;
+static uint64_t joined_successor;
+static wl_evaluation_control_report_t joined_report;
+static void joined_route_hook(wl_evaluation_control_t *c, unsigned event,
+    uint64_t generation, uint32_t extent, uint64_t work) {
+    (void)generation; (void)extent; (void)work;
+    CHECK(joined_active && c == joined_active->control);
+    if (event == WL_COLUMNAR_JOIN_PIPELINE_TEST_EXCHANGED) ++joined_route;
+    if (event == WL_COLUMNAR_JOIN_PIPELINE_TEST_AFTER_ACK) ++joined_ack;
+    if (joined_stopped && joined_mode >= 2 &&
+        (event == WL_COLUMNAR_JOIN_PIPELINE_TEST_PRODUCE ||
+        event == WL_COLUMNAR_JOIN_PIPELINE_TEST_AFTER_ACK)) ++joined_forward;
+}
+static void joined_scalar_hook(wl_evaluation_control_t *c, unsigned phase,
+    uint64_t progress, bool failed) {
+    (void)progress; (void)failed;
+    if (!c || joined_stopped || phase != (joined_mode == 2?76:137)) return;
+    CHECK(joined_route && joined_ack);
+    joined_stopped = true;
+    if (joined_mode < 2) {
+        if (joined_mode) CHECK(wl_evaluation_control_charge(c, UINT64_MAX) ==
+                WL_EVALUATION_CONTROL_WORK_LIMIT);
+        else wl_evaluation_control_request_cancel(c);
+        return;
+    }
+    uint64_t id = wl_evaluation_control_active_attempt_id(c);
+    wl_evaluation_control_attempt_finish_result_t end =
+        wl_evaluation_control_finish_attempt(c,
+            joined_active->session->operation_admission, id, 0, 0);
+    CHECK(!end.protocol && end.report_valid &&
+        end.kind == WL_EVALUATION_CONTROL_ATTEMPT_FINISH_OWN_FINISHED &&
+        !end.report.result && end.report.consumed);
+    joined_report = end.report;
+    CHECK(!wl_evaluation_control_reset(c));
+    wl_evaluation_control_attempt_begin_result_t next =
+        wl_evaluation_control_begin_attempt(c,
+            joined_active->session->operation_admission);
+    CHECK(!next.protocol && next.attempt_id != id);
+    joined_successor = next.attempt_id;
+}
+static void joined_array_hook(wl_evaluation_control_t *c, unsigned phase,
+    uint64_t progress) {
+    if (joined_mode == 4 && phase == 142 && !progress)
+        joined_scalar_hook(c, 137, 0, false);
+}
+static void joined_delta(const char *relation, const int64_t *row,
+    uint32_t cols, int32_t diff, void *arg) {
+    fixture_t *f = arg;
+    CHECK(!strcmp(relation, "out") && cols == 3 && (diff == 1 || diff == -1));
+    const char *x = wl_intern_reverse(f->plan->intern, row[0]),
+        *y = wl_intern_reverse(f->plan->intern, row[1]);
+    CHECK(x && y && row[2] == 1);
+    CHECK((!strcmp(x, "aaaa") && !strcmp(y, "zz")) ||
+        (!strcmp(x, "ba") && !strcmp(y, "ba")));
+    ++events; positives += diff == 1; negatives += diff == -1;
+}
+static void joined_contents(fixture_t *f, unsigned count) {
+    col_rel_t *out = session_find_rel(COL_SESSION(f->session), "out");
+    CHECK(out && out->nrows == count && out->ncols == 3 &&
+        out->column_types[0] == WIRELOG_TYPE_STRING &&
+        out->column_types[1] == WIRELOG_TYPE_STRING &&
+        out->column_types[2] == WIRELOG_TYPE_INT64);
+    bool seen[2] = {false, false};
+    for (uint32_t r = 0; r < out->nrows; ++r) {
+        const char *x = wl_intern_reverse(f->plan->intern, out->columns[0][r]),
+            *y = wl_intern_reverse(f->plan->intern, out->columns[1][r]);
+        CHECK(x && y && out->columns[2][r] == 1);
+        unsigned i = !strcmp(x, "aaaa")?0:1;
+        CHECK(!seen[i] && !strcmp(x, i?"ba":"aaaa") &&
+            !strcmp(y, i?"ba":"zz")); seen[i] = true;
+    }
+}
+static void joined_strings(void) {
+    const char *source =
+        ".decl a(k:int64,x:string)\n.decl b(k:int64,n:int64)\n"
+        ".decl out(x:string,y:string,n:int64)\n"
+        "out(x,str_replace(x,\"aa\",\"z\"),n) :- a(k,x),b(k,n),n>0,contains(x,\"a\").\n";
+    for (unsigned full = 0; full < 2; ++full)
+        for (unsigned mode = 0; mode < 6; ++mode) {
+            fixture_t f = create(source, false);
+            COL_SESSION(f.session)->join_batch_bytes = 128;
+            if (full) for (uint32_t st = 0; st < f.plan->stratum_count; ++st)
+                    for (uint32_t r = 0; r < f.plan->strata[st].relation_count;
+                        ++r) {
+                        const wl_plan_relation_t *rel =
+                            &f.plan->strata[st].relations[r];
+                        for (uint32_t op = 0; op < rel->op_count; ++op)
+                            if (rel->ops[op].op == WL_PLAN_OP_JOIN)
+                                ((wl_plan_op_t *)rel->ops)[op].delta_mode =
+                                    WL_DELTA_FORCE_FULL;
+                    }
+            joined_active = &f; joined_route = joined_ack = joined_forward = 0;
+            joined_stopped = false; joined_successor = 0; joined_mode = mode;
+            events = positives = negatives = 0;
+            wl_session_set_delta_cb(f.session, joined_delta, &f);
+            wl_columnar_join_pipeline_test_numeric_checkpoint =
+                joined_route_hook;
+            CHECK(!step_complete(f.session)); joined_contents(&f, 0);
+            CHECK(!events);
+            const char *words[] = {"aaaa", "ba", "zzzz"};
+            for (unsigned i = 0; i < 3; ++i) {
+                int64_t row[] = {1, wl_intern_put(f.plan->intern, words[i])};
+                CHECK(row[1] >= 0 && !wl_session_insert(f.session, "a", row, 1,
+                    2));
+            }
+            int64_t rhs[] = {1, 1};
+            CHECK(!wl_session_insert(f.session, "b", rhs, 1, 2));
+            if (full && !mode) {
+                /* Raw strict policy forbids this unconsumed string suffix.
+                 * Keep its refusal rather than broaden optimization policy. */
+                COL_SESSION(f.session)->join_batch_strict = true;
+                CHECK(step_complete(f.session) == ENOTSUP && !events);
+                joined_contents(&f, 0);
+                wl_session_t *raw = NULL;
+                CHECK(!wl_session_create(wl_backend_columnar(), f.plan, 1,
+                    &raw));
+                COL_SESSION(raw)->join_batch_bytes = 128;
+                COL_SESSION(raw)->join_batch_strict = true;
+                for (unsigned i = 0; i < 3; ++i) {
+                    int64_t row[] = {1,
+                                     wl_intern_get(f.plan->intern, words[i])};
+                    CHECK(!wl_session_insert(raw, "a", row, 1, 2));
+                }
+                CHECK(!wl_session_insert(raw, "b", rhs, 1, 2));
+                CHECK(step_complete(raw) == ENOTSUP);
+                wl_session_destroy(raw);
+                CHECK(!wl_evaluation_control_reset(f.control));
+                COL_SESSION(f.session)->join_batch_strict = false;
+            }
+            if (mode == 1) CHECK(!wl_evaluation_control_configure(f.control,
+                    UINT64_MAX-1));
+            if (mode == 5) COL_SESSION(f.session)->join_output_limit = 1;
+            wl_columnar_filter_test_attempt_checkpoint = mode ==
+                4?joined_array_hook:NULL;
+            wl_columnar_expr_test_checkpoint = mode ==
+                5?NULL:joined_scalar_hook;
+            int rc = step_complete(f.session);
+            wl_columnar_expr_test_checkpoint = NULL;
+            wl_columnar_filter_test_attempt_checkpoint = NULL;
+            int expected = mode == 5?EOVERFLOW:mode >= 2?EINVAL:mode?
+                WL_EVALUATION_CONTROL_WORK_LIMIT:
+                WL_EVALUATION_CONTROL_CANCELLED;
+            if (rc != expected || (mode < 5 && !joined_stopped))
+                fprintf(stderr,
+                    "joined full=%u mode=%u rc=%d expected=%d stopped=%u route=%u ack=%u\n",
+                    full, mode, rc, expected, joined_stopped, joined_route,
+                    joined_ack);
+            CHECK(rc == expected && (mode == 5 || joined_stopped));
+            joined_contents(&f, 0); CHECK(!events && !joined_forward);
+            CHECK(!COL_SESSION(f.session)->cleanup_active &&
+                !COL_SESSION(f.session)->cleanup_pending &&
+                !COL_SESSION(f.session)->cleanup_reserved_bytes);
+            if (mode >= 2 && mode < 5) {
+                uint64_t used = 999;
+                CHECK(!wl_evaluation_control_test_active_consumed(f.control,
+                    joined_successor, &used) && !used);
+                wl_evaluation_control_report_t report;
+                CHECK(!wl_evaluation_control_report(f.control, &report));
+                CHECK(report.attempt_id == joined_report.attempt_id &&
+                    report.consumed == joined_report.consumed &&
+                    !report.result);
+                wl_evaluation_control_attempt_finish_result_t end =
+                    wl_evaluation_control_finish_attempt(f.control,
+                        f.session->operation_admission, joined_successor, 0, 0);
+                CHECK(!end.protocol && end.report_valid &&
+                    !end.report.consumed);
+            }
+            CHECK(!wl_evaluation_control_reset(f.control));
+            COL_SESSION(f.session)->join_output_limit = 0;
+            CHECK(!step_complete(f.session)); joined_contents(&f, 2);
+            CHECK(joined_route && joined_ack && events == 2 && positives == 2 &&
+                !negatives);
+            int64_t removed[] = {1, wl_intern_get(f.plan->intern, "aaaa")};
+            CHECK(!wl_session_remove(f.session, "a", removed, 1, 2));
+            CHECK(!step_complete(f.session)); joined_contents(&f, 1);
+            CHECK(events == 3 && negatives == 1);
+            CHECK(!step_complete(f.session) && events == 3);
+            wl_columnar_join_pipeline_test_numeric_checkpoint = NULL;
+            joined_active = NULL;
+            wl_columnar_memory_governor_ref_t *g =
+                COL_SESSION(f.session)->memory_governor;
+            wl_columnar_memory_governor_ref_retain(g); destroy(&f);
+            CHECK(!wl_columnar_memory_reserved(
+                    wl_columnar_memory_governor_ref_get(g)));
+            wl_columnar_memory_governor_ref_release(g);
+        }
+}
 int main(void) {
+    joined_strings();
     replace_sizes(); replace_parity(); replace_resources(); replace_budget();
     session_replace();
     selector_extra_resources();
