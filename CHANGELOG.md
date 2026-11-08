@@ -451,11 +451,11 @@ All notable changes to wirelog are documented in this file.
   only for relations typed by a `.decl`, with no compound column and used at
   their declared width; a comparison is checked when both operand types are
   known from a column, a literal, a string function, arithmetic or an `=`
-  binding. Inline facts, host inserts, the aggregate and the variable or
-  expression keys of an aggregate head, the operands of string and
-  arithmetic functions, the results of scalar extension calls, an integer in
-  a `float` head column, and a `float` against a number in a body comparison
-  or join are not.
+  binding. Inline facts, host inserts, the aggregate column of an aggregate
+  head, the operands of string and arithmetic functions, the results of
+  scalar extension calls, an integer in a `float` head column, and a `float`
+  against a number in a body comparison or join are not; the group-by keys
+  of an aggregate head are checked like any head argument.
 
 - **`wirelog_easy_print_delta` no longer aborts on a symbol id it cannot
   resolve** (#2231): a row whose `symbol` or `string` column held an id
