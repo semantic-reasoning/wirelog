@@ -3897,6 +3897,323 @@ wl_columnar_filter_batch_end_step_owned_funded(
     return 0;
 }
 
+#ifdef WL_SESSION_TEST_HOOKS
+void (*wl_columnar_filter_row_debt_test_checkpoint)(
+    wl_columnar_relation_row_debt_t *, wl_evaluation_control_t *, unsigned);
+#define WL_COLUMNAR_FILTER_ROW_DEBT_HOOK(d, c, event) do { \
+            if (wl_columnar_filter_row_debt_test_checkpoint) \
+            wl_columnar_filter_row_debt_test_checkpoint(d, c, event); \
+} while (0)
+#else
+#define WL_COLUMNAR_FILTER_ROW_DEBT_HOOK(d, c, event) ((void)0)
+#endif
+
+static void
+wl_columnar_filter_row_debt_status(const wl_columnar_relation_row_debt_t *d,
+    wl_columnar_relation_row_debt_status_t *status)
+{
+    status->execution_result = d->execution_result;
+    status->cleanup_result = d->cleanup_result;
+    status->row_published = d->row_published;
+    status->complete = d->phase == WL_COLUMNAR_RELATION_ROW_DEBT_DONE;
+    status->cleanup_pending = !status->complete
+        && d->phase != WL_COLUMNAR_RELATION_ROW_DEBT_IDLE;
+}
+
+static bool
+wl_columnar_filter_row_debt_status_disjoint(
+    const wl_columnar_relation_row_debt_t *d,
+    const wl_columnar_relation_row_debt_status_t *out)
+{
+    return out && sizeof(*d) - 1 <= UINTPTR_MAX - (uintptr_t)d
+           && sizeof(*out) - 1 <= UINTPTR_MAX - (uintptr_t)out
+           && wl_columnar_eval_stack_copy_ranges_disjoint(d, sizeof(*d),
+               out, sizeof(*out));
+}
+
+/* Context/thread proof with a real, exclusively owned busy borrow. */
+static int
+wl_columnar_filter_row_debt_live(
+    wl_columnar_eval_stack_cleanup_frame_t *frame, const void *owner,
+    const wl_columnar_relation_row_debt_t *d,
+    wl_columnar_filter_context_t **out)
+{
+    int rc = wl_columnar_eval_stack_row_debt_context_owned(frame, owner, d,
+            out);
+    if (rc) return rc;
+    const wl_columnar_filter_context_t *ctx = *out;
+    const wl_columnar_eval_plan_numeric_attempt_t *record = owner;
+    if (ctx->identity != ctx || ctx->frame != frame || !ctx->session
+        || ctx->session->cleanup_active != frame
+        || !wl_columnar_filter_attempt_thread(ctx) || !ctx->busy
+        || !ctx->pin_owned || (ctx->stage != WL_COLUMNAR_FILTER_STAGE_BATCH
+        && ctx->stage != WL_COLUMNAR_FILTER_STAGE_JOIN_BATCH)
+        || record->session != ctx->session || record->control != ctx->control
+        || record->attempt_id != ctx->attempt_id) return EINVAL;
+    return 0;
+}
+
+static int
+wl_columnar_filter_row_debt_tuple_fields(
+    const wl_columnar_relation_row_debt_t *d,
+    wl_columnar_eval_stack_cleanup_frame_t *frame, const void *owner,
+    const wl_columnar_filter_context_t *ctx)
+{
+    if (d->frame != frame || d->numeric_owner != owner || d->context != ctx
+        || d->phase <= WL_COLUMNAR_RELATION_ROW_DEBT_IDLE
+        || d->phase >= WL_COLUMNAR_RELATION_ROW_DEBT_DONE
+        || d->origin_stage != ctx->stage || d->target != ctx->output
+        || d->target != ctx->private_output || !d->target
+        || d->original_control != ctx->control
+        || d->original_id != ctx->attempt_id) return EINVAL;
+    return 0;
+}
+
+static int
+wl_columnar_filter_row_debt_tuple(const wl_columnar_relation_row_debt_t *d,
+    wl_columnar_eval_stack_cleanup_frame_t *frame, const void *owner,
+    const wl_columnar_filter_context_t *ctx)
+{
+    if (d->identity != d ||
+        !wl_columnar_relation_row_debt_thread(d)) return EINVAL;
+    return wl_columnar_filter_row_debt_tuple_fields(d, frame, owner, ctx);
+}
+
+int
+wl_columnar_filter_row_debt_status_owned(
+    wl_columnar_eval_stack_cleanup_frame_t *frame, const void *owner,
+    const wl_columnar_relation_row_debt_t *d,
+    wl_columnar_relation_row_debt_status_t *status)
+{
+    if (!d || d->identity != d || !wl_columnar_relation_row_debt_thread(d)
+        || !wl_columnar_filter_row_debt_status_disjoint(d,
+        status)) return EINVAL;
+    if (d->phase == WL_COLUMNAR_RELATION_ROW_DEBT_DONE) {
+        wl_columnar_filter_row_debt_status(d, status);
+        return 0;
+    }
+    wl_columnar_filter_context_t *ctx = NULL;
+    int rc = wl_columnar_filter_row_debt_live(frame, owner, d, &ctx);
+    if (rc) return rc;
+    /* Self/thread were proved above; all intervening calls are callback-free. */
+    rc = wl_columnar_filter_row_debt_tuple_fields(d, frame, owner, ctx);
+    if (rc) return rc;
+    if (!wl_columnar_eval_stack_protocol_copy_output(frame, status,
+        sizeof(*status)) || !wl_columnar_eval_stack_copy_ranges_disjoint(
+            ctx->output, sizeof(*ctx->output), status,
+            sizeof(*status))) return EINVAL;
+    wl_columnar_filter_row_debt_status(d, status);
+    return 0;
+}
+
+static int
+wl_columnar_filter_row_debt_leave(wl_columnar_relation_row_debt_t *d, int rc)
+{
+    d->active_call = false;
+    return rc;
+}
+
+/* The selected intent is fresh bookkeeping for every actual attempt,
+ * including a retry of the same CAS phase. It never authorizes resources. */
+static void
+wl_columnar_filter_row_debt_intent(wl_columnar_relation_row_debt_t *d)
+{
+    d->selected_phase = d->phase;
+    d->selected_cursor = d->image_cursor;
+    ++d->action;
+    d->intent_valid = true;
+}
+
+static int
+wl_columnar_filter_row_debt_forward_drain(wl_columnar_relation_row_debt_t *d,
+    wl_columnar_relation_row_debt_status_t *status)
+{
+    for (;;) {
+        WL_COLUMNAR_FILTER_ROW_DEBT_HOOK(d, d->original_control,
+            WL_COLUMNAR_FILTER_ROW_DEBT_TEST_RETIRE);
+        wl_columnar_filter_context_t *ctx = NULL;
+        int rc = wl_columnar_filter_row_debt_live(d->frame, d->numeric_owner,
+                d, &ctx);
+        if (rc) return wl_columnar_filter_row_debt_leave(d, rc);
+        rc = wl_evaluation_control_charge_attempt(ctx->control,
+                ctx->attempt_id, 0);
+        if (rc) {
+            if (!d->execution_result) d->execution_result = rc;
+            wl_columnar_filter_row_debt_status(d, status);
+            return wl_columnar_filter_row_debt_leave(d, 0);
+        }
+        rc = wl_columnar_filter_row_debt_tuple(d, d->frame,
+                d->numeric_owner, ctx);
+        if (rc) return wl_columnar_filter_row_debt_leave(d, rc);
+        wl_columnar_filter_row_debt_intent(d);
+        rc = wl_evaluation_control_charge_attempt(d->original_control,
+                d->original_id, WL_COLUMNAR_RELATION_ROW_RETIRE_ACTION_WORK);
+        if (rc) {
+            if (!d->execution_result) d->execution_result = rc;
+            wl_columnar_filter_row_debt_status(d, status);
+            return wl_columnar_filter_row_debt_leave(d, 0);
+        }
+        if (d->phase == WL_COLUMNAR_RELATION_ROW_DEBT_UNBIND) {
+            rc = wl_evaluation_control_charge_attempt(d->original_control,
+                    d->original_id, 0);
+            if (rc) {
+                if (!d->execution_result) d->execution_result = rc;
+                wl_columnar_filter_row_debt_status(d, status);
+                return wl_columnar_filter_row_debt_leave(d, 0);
+            }
+            rc = wl_columnar_eval_stack_row_debt_unbind_owned(d->frame,
+                    d->numeric_owner, d);
+            if (rc) return wl_columnar_filter_row_debt_leave(d, rc);
+            wl_columnar_filter_row_debt_status(d, status);
+            return wl_columnar_filter_row_debt_leave(d, 0);
+        }
+        bool financial = false;
+        int previous_cleanup = d->cleanup_result;
+        rc = wl_columnar_relation_row_debt_retire_one(d, d->original_control,
+                d->original_id, &financial);
+        if (rc) {
+            if (!financial) {
+                d->cleanup_result = rc;
+                return wl_columnar_filter_row_debt_leave(d, rc);
+            }
+            d->cleanup_result = previous_cleanup;
+            if (!d->execution_result) d->execution_result = rc;
+            wl_columnar_filter_row_debt_status(d, status);
+            return wl_columnar_filter_row_debt_leave(d, 0);
+        }
+        rc = wl_evaluation_control_charge_attempt(d->original_control,
+                d->original_id, 0);
+        if (rc) {
+            if (!d->execution_result) d->execution_result = rc;
+            wl_columnar_filter_row_debt_status(d, status);
+            return wl_columnar_filter_row_debt_leave(d, 0);
+        }
+    }
+}
+
+int
+wl_columnar_filter_row_component_append_owned(
+    wl_columnar_eval_stack_cleanup_frame_t *frame, const void *owner,
+    wl_columnar_relation_row_debt_t *d, const int64_t *values,
+    wl_columnar_relation_row_debt_status_t *status)
+{
+    if (!d || !status || !values || !owner) return EINVAL;
+    wl_columnar_filter_context_t *ctx = NULL;
+    int rc = wl_columnar_eval_stack_filter_context_nonstream_owned(frame, &ctx,
+            owner);
+    if (rc) return rc;
+    rc = wl_columnar_filter_attempt_context_valid(frame, ctx);
+    if (rc) return rc;
+    const wl_columnar_eval_plan_numeric_attempt_t *record = owner;
+    if (!ctx->pin_owned || (ctx->stage != WL_COLUMNAR_FILTER_STAGE_BATCH
+        && ctx->stage != WL_COLUMNAR_FILTER_STAGE_JOIN_BATCH)
+        || ctx->session != record->session || ctx->control != record->control
+        || ctx->attempt_id != record->attempt_id || !ctx->batch_initialized
+        || !ctx->drain_initialized || !ctx->output
+        || ctx->private_output != ctx->output
+        || ctx->batch.control != ctx->control
+        || ctx->batch.attempt_id != ctx->attempt_id) return EINVAL;
+    if (ctx->execution_result || ctx->semantic_result) return EBUSY;
+    wl_evaluation_control_t *control = ctx->control;
+    uint64_t id = ctx->attempt_id;
+    rc = wl_evaluation_control_charge_attempt(control, id, 0);
+    if (rc) return rc;
+    rc = wl_evaluation_control_charge_attempt(control, id,
+            WL_COLUMNAR_RELATION_SCALAR_SOURCE_SELECTED_WORK);
+    if (rc) return rc;
+    rc = wl_columnar_relation_row_debt_prove_batch(&ctx->batch, control, id,
+            NULL);
+    if (rc) return rc;
+    uint64_t nonce = ctx->batch.raw.single.set.acquisition_nonce;
+    rc = wl_columnar_eval_stack_row_debt_geometry_owned(frame, owner, d, values,
+            ctx->output->ncols, status, control, id, true);
+    if (rc) return rc;
+    if (d->identity != d ||
+        !wl_columnar_relation_row_debt_thread(d)) return EINVAL;
+    if (d->active_call || d->phase != WL_COLUMNAR_RELATION_ROW_DEBT_IDLE
+        || d->frame || d->numeric_owner || d->context || d->target
+        || d->capture_ready || d->row_ready || d->refund_ready ||
+        d->downsize_ready
+        || d->image_columns || d->image_timestamps || d->image_extent
+        || d->image_cursor) return EBUSY;
+    rc = wl_evaluation_control_charge_attempt(control, id, 0);
+    if (rc) return rc;
+    rc = wl_columnar_eval_stack_row_debt_bind_owned(frame, owner, d, nonce,
+            &ctx);
+    if (rc) return rc;
+    d->active_call = true;
+    rc = wl_evaluation_control_charge_attempt(control, id, 0);
+    if (!rc) rc = wl_evaluation_control_charge_attempt(control, id,
+                WL_COLUMNAR_RELATION_SCALAR_SOURCE_ROW_CALL_WORK);
+    if (rc) {
+        d->execution_result = rc;
+        d->phase = WL_COLUMNAR_RELATION_ROW_DEBT_UNBIND;
+        wl_columnar_filter_row_debt_status(d, status);
+        return wl_columnar_filter_row_debt_leave(d, 0);
+    }
+    WL_COLUMNAR_FILTER_ROW_DEBT_HOOK(d, control,
+        WL_COLUMNAR_FILTER_ROW_DEBT_TEST_FORWARD);
+    (void)wl_columnar_relation_row_debt_append_private(d, values);
+    return wl_columnar_filter_row_debt_forward_drain(d, status);
+}
+
+int
+wl_columnar_filter_row_debt_step_owned(
+    wl_columnar_eval_stack_cleanup_frame_t *frame, const void *owner,
+    wl_columnar_relation_row_debt_t *d, wl_evaluation_control_t *funding,
+    uint64_t id, wl_columnar_relation_row_debt_status_t *status)
+{
+    if (!d || !funding || !id || !status || d->identity != d
+        || !wl_columnar_relation_row_debt_thread(d)) return EINVAL;
+    if (d->active_call || d->phase == WL_COLUMNAR_RELATION_ROW_DEBT_FORWARD
+        || d->phase == WL_COLUMNAR_RELATION_ROW_DEBT_IDLE
+        || d->phase == WL_COLUMNAR_RELATION_ROW_DEBT_DONE) return EBUSY;
+    wl_columnar_filter_context_t *ctx = NULL;
+    int rc = wl_columnar_filter_row_debt_live(frame, owner, d, &ctx);
+    if (rc) return rc;
+    if (funding == ctx->control) return EINVAL;
+    rc = wl_evaluation_control_charge_attempt(funding, id, 0);
+    if (rc) return rc;
+    rc = wl_evaluation_control_charge_attempt(funding, id,
+            WL_COLUMNAR_FILTER_ATTEMPT_BATCH_RETIRE_WORK);
+    if (rc) return rc;
+    rc = wl_columnar_filter_row_debt_tuple(d, frame, owner, ctx);
+    if (rc) return rc;
+    rc = wl_evaluation_control_charge_attempt(funding, id, 0);
+    if (rc) return rc;
+    rc = wl_columnar_eval_stack_row_debt_geometry_owned(frame, owner, d, NULL,
+            0, status, funding, id, false);
+    if (rc) return rc;
+    d->active_call = true;
+    /* Observer precedes fresh proof of all resource lineage in retire_one. */
+    WL_COLUMNAR_FILTER_ROW_DEBT_HOOK(d, funding,
+        WL_COLUMNAR_FILTER_ROW_DEBT_TEST_CLEANUP);
+    rc = wl_columnar_filter_row_debt_live(frame, owner, d, &ctx);
+    if (!rc) rc = wl_evaluation_control_charge_attempt(funding, id, 0);
+    if (!rc) rc = wl_columnar_filter_row_debt_tuple(d, frame, owner, ctx);
+    if (!rc) rc = wl_evaluation_control_charge_attempt(funding, id, 0);
+    if (rc) return wl_columnar_filter_row_debt_leave(d, rc);
+    wl_columnar_filter_row_debt_intent(d);
+    if (d->phase == WL_COLUMNAR_RELATION_ROW_DEBT_UNBIND) {
+        rc = wl_evaluation_control_charge_attempt(funding, id, 0);
+        if (!rc) rc = wl_columnar_eval_stack_row_debt_unbind_owned(frame, owner,
+                    d);
+    } else {
+        bool financial = false;
+        int previous_cleanup = d->cleanup_result;
+        rc = wl_columnar_relation_row_debt_retire_one(d, funding, id,
+                &financial);
+        if (rc && financial) d->cleanup_result = previous_cleanup;
+        else if (rc) d->cleanup_result = rc;
+        WL_COLUMNAR_FILTER_ROW_DEBT_HOOK(d, funding,
+            WL_COLUMNAR_FILTER_ROW_DEBT_TEST_CLEANUP_RETIRED);
+        int paid = wl_evaluation_control_charge_attempt(funding, id, 0);
+        if (!rc) rc = paid;
+    }
+    if (!rc) wl_columnar_filter_row_debt_status(d, status);
+    return wl_columnar_filter_row_debt_leave(d, rc);
+}
+
 int
 wl_columnar_filter_op_native_cleanup_latch_owned(
     wl_columnar_eval_stack_cleanup_frame_t *frame, const void *owner,

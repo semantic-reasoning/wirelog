@@ -1,7 +1,7 @@
 /* #1821: bounded real scalar materialization, before engine integration. */
 #define WL_TEST_RELATION_RESIZE_HOOK 1
-#include "../wirelog/columnar/internal.h"
 #define WL_COLUMNAR_MEM_LEDGER_PUBLICATION_TEST_HOOKS 1
+#include "../wirelog/columnar/internal.h"
 #include "../wirelog/columnar/mem_ledger_publication.h"
 #include <stdio.h>
 #ifndef _WIN32
