@@ -190,12 +190,29 @@ if ipc_option == 'enabled'
 endif
 
 #Phase 2A : nanoarrow for columnar backend(via meson wrap)
-nanoarrow_proj = subproject('nanoarrow', default_options: ['tests=disabled', 'apps=disabled', 'ipc=disabled', 'device=disabled', 'testing=disabled'])
+#
+# Sanitizer builds (b_sanitize set to anything other than none or memory)
+# build the bundled third-party subprojects (nanoarrow and the xxHash
+# fallback) as plain (b_sanitize=none) builds: they are already covered by
+# the plain build legs, and instrumenting them only adds compile time and
+# sanitizer noise from code we do not maintain.  The plain options are
+# derived from the existing b_sanitize option so no new project option is
+# introduced and the default production recipe (b_sanitize=none) evaluates
+# to the identical subproject options.  MSan (b_sanitize=memory) is
+# excluded on purpose: it requires every linked module to be instrumented
+# and reports false positives over uninstrumented ones.
+_b_sanitize = get_option('b_sanitize')
+if _b_sanitize != 'none' and not _b_sanitize.contains('memory')
+  _plain_subproject_options = ['b_sanitize=none']
+else
+  _plain_subproject_options = []
+endif
+nanoarrow_proj = subproject('nanoarrow', default_options: ['tests=disabled', 'apps=disabled', 'ipc=disabled', 'device=disabled', 'testing=disabled'] + _plain_subproject_options)
 nanoarrow_dep = nanoarrow_proj.get_variable('nanoarrow_dep')
 fs = import('fs')
 
 #Built-in functions : xxHash3 for hash() function
-xxhash_proj = subproject('xxhash', default_options: [])
+xxhash_proj = subproject('xxhash', default_options: _plain_subproject_options)
 
 #Optional : mbedTLS for cryptographic functions (Issue #73)
 mbedtls_option = get_option('mbedTLS')
