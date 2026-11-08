@@ -1,5 +1,6 @@
 /* #1821 production numeric plan composition, original authority and host turns. */
 #include "../wirelog/columnar/internal.h"
+#include "../wirelog/columnar/join_pipeline.h"
 #include "../wirelog/columnar/mem_ledger_publication.h"
 #include "../wirelog/exec_plan_gen.h"
 #include "../wirelog/passes/sip.h"
@@ -6351,6 +6352,348 @@ test_lftj_funded_writer_drain(void)
     wl_evaluation_control_release(original); col_rel_destroy(output);
 }
 
+static wl_evaluation_control_t *unary_batch_lane;
+static unsigned unary_batch_release_calls;
+static int unary_batch_release_result;
+
+static int
+unary_batch_release_stop(wl_columnar_relation_mutation_single_t *single,
+    unsigned slot)
+{
+    CHECK(single && slot <= 1 && unary_batch_lane);
+    ++unary_batch_release_calls;
+    wl_evaluation_control_request_cancel(unary_batch_lane);
+    return unary_batch_release_result;
+}
+
+/* Actual dedicated single-use financier. No host384 debit or SOURCE promise
+ * enters this component driver. Freshness is a caller contract, not an API
+ * authority flag. Mode1/2 stop before admission;3 uses an actually stale ID;
+ * mode4/5 stop after native release success/failure. */
+static int
+unary_batch_call(fixture_t *f, const void *owner,
+    wl_columnar_filter_status_t *status, uint64_t limit, unsigned mode)
+{
+    int lane_owner = 0;
+    wl_evaluation_control_t *lane = control_new(limit, &lane_owner);
+    uint64_t id = wl_evaluation_control_active_attempt_id(lane);
+    if (mode == 1) wl_evaluation_control_request_cancel(lane);
+    if (mode == 2) CHECK(wl_evaluation_control_charge_attempt(lane, id,
+            limit + 1) == WL_EVALUATION_CONTROL_WORK_LIMIT);
+    if (mode == 3) {
+        CHECK(!wl_evaluation_control_finish(lane, &lane_owner, 0, 0)
+            && !wl_evaluation_control_begin(lane, &lane_owner));
+        CHECK(wl_evaluation_control_active_attempt_id(lane) != id);
+    }
+    if (mode >= 4) {
+        unary_batch_lane = lane; unary_batch_release_calls = 0;
+        unary_batch_release_result = mode == 5 ? EAGAIN : 0;
+        wl_columnar_relation_test_single_release = unary_batch_release_stop;
+    }
+    int rc = wl_columnar_filter_batch_end_step_owned_funded(f->frame, status,
+            owner, lane, id);
+    if (mode >= 4) {
+        wl_columnar_relation_test_single_release = NULL;
+        unary_batch_lane = NULL;
+        CHECK(unary_batch_release_calls == 1);
+    }
+    int result = wl_evaluation_control_finish(lane, &lane_owner, 0, 0);
+    CHECK(result == (mode == 1 || mode >= 4
+        ? WL_EVALUATION_CONTROL_CANCELLED
+        : mode == 2 || limit < 192 ? WL_EVALUATION_CONTROL_WORK_LIMIT : 0));
+    wl_evaluation_control_report_t report;
+    CHECK(!wl_evaluation_control_report(lane, &report)
+        && report.consumed == (mode == 1 || mode == 2 || mode == 3
+        || limit < 192 ? 0u : 192u));
+    CHECK(!wl_evaluation_control_detach(lane, &lane_owner));
+    wl_evaluation_control_release(lane);
+    return rc;
+}
+
+static void *
+unary_batch_wrong_thread(void *data)
+{
+    fixture_t *f = data;
+    wl_columnar_filter_status_t status = {.semantic_result = 119};
+    CHECK(unary_batch_call(f, &f->record, &status, 192, 0) == EINVAL
+        && status.semantic_result == 119);
+    return NULL;
+}
+
+static fixture_t *unary_batch_stream_fixture;
+static unsigned unary_batch_stream_refusals;
+
+static void
+unary_batch_cancel_start(wl_evaluation_control_t *control, unsigned phase,
+    uint64_t progress)
+{
+    (void)progress;
+    if (phase == 1) wl_evaluation_control_request_cancel(control);
+}
+
+static void
+unary_batch_stream_check(wl_evaluation_control_t *control, unsigned event,
+    uint64_t generation, uint32_t extent, uint64_t work)
+{
+    (void)generation; (void)extent; (void)work;
+    if (event != WL_COLUMNAR_JOIN_PIPELINE_TEST_CONSUMER) return;
+    fixture_t *f = unary_batch_stream_fixture;
+    CHECK(f && control == f->operation);
+    wl_columnar_filter_status_t status = {.semantic_result = 119};
+    CHECK(unary_batch_call(f, &f->record, &status, 192, 0) == EBUSY
+        && status.semantic_result == 119);
+    ++unary_batch_stream_refusals;
+}
+
+static void
+test_owned_batch_retirement_primitive(void)
+{
+    const char *queries[] = {
+        ".decl input(x:int64)\n.decl output(x:int64)\noutput(x+1):-input(x).\n",
+        ".decl input(x:int64)\n.decl output(x:int64)\noutput(x):-input(x),x>0.\n",
+        ".decl input(x:int64)\n.decl right(y:int64)\n.decl output(x:int64,y:int64)\noutput(x,y):-input(x),right(y).\n",
+        ".decl input(x:int64)\n.decl right(x:int64)\n.decl output(x:int64)\noutput(x):-input(x),!right(x).\n",
+        ".decl input(x:int64)\n.decl output(n:int64)\noutput(count(x)):-input(x).\n"
+    };
+    const wl_plan_op_type_t targets[] = {WL_PLAN_OP_MAP, WL_PLAN_OP_FILTER,
+                                         WL_PLAN_OP_JOIN, WL_PLAN_OP_ANTIJOIN,
+                                         WL_PLAN_OP_REDUCE};
+    for (unsigned kind = 0; kind < 5; ++kind) {
+        wirelog_error_t error;
+        wirelog_program_t *program = wirelog_parse_string(queries[kind],
+                &error);
+        wl_plan_t *plan = NULL;
+        CHECK(program && !wl_plan_from_program(program, &plan));
+        wl_plan_relation_t body = probe_generated_body(plan);
+        uint32_t target = 1;
+        while (target < body.op_count && body.ops[target].op != targets[kind])
+            ++target;
+        CHECK(target < body.op_count && body.ops[0].op == WL_PLAN_OP_VARIABLE);
+        for (unsigned fault = 0; fault < 2; ++fault)
+            for (unsigned lifetime = 0; lifetime < 3; ++lifetime) {
+                fixture_t f; fixture_init(&f, 1, 3, 0);
+                CHECK(!wl_columnar_relation_rename_checked(f.input, "input"));
+                col_rel_t *right = source_new(1, 2);
+                CHECK(!wl_columnar_relation_rename_checked(right, "right"));
+                wirelog_column_type_t type = WIRELOG_TYPE_INT64;
+                CHECK(!col_rel_set_column_types(f.input, &type, 1)
+                    && !col_rel_set_column_types(right, &type, 1));
+                col_rel_t *registry[] = {f.input, right};
+                f.session.rels = registry; f.session.nrels = 2;
+                wl_columnar_memory_governor_ref_t *governor =
+                    join_governor(&f, 1u << 20);
+                wl_columnar_memory_reservation_t peer;
+                wl_columnar_memory_reservation_init(&peer);
+                CHECK(wl_columnar_memory_reserve_checked(
+                        wl_columnar_memory_governor_ref_get(governor), 37,
+                        &peer)
+                    == WL_COLUMNAR_MEMORY_ADMISSION_OK);
+                fixture_begin(&f, &body, 1, body.op_count);
+                wl_columnar_filter_context_t *ctx = NULL;
+                wl_columnar_filter_stage_t expected_stage = kind >= 2
+                    ? WL_COLUMNAR_FILTER_STAGE_JOIN_BATCH :
+                    WL_COLUMNAR_FILTER_STAGE_BATCH;
+                for (unsigned turn = 0;; ++turn) {
+                    CHECK(turn < 10000 && f.record.phase !=
+                        WL_COLUMNAR_EVAL_PLAN_NUMERIC_DONE);
+                    CHECK(!wl_columnar_eval_stack_filter_context_owned(f.frame,
+                        &ctx, &f.record));
+                    if (f.record.phase == WL_COLUMNAR_EVAL_PLAN_NUMERIC_CHILD
+                        && f.record.cursor == target
+                        && ctx->stage == expected_stage) break;
+                    engine_dispatch(&f); ++f.witnesses;
+                }
+                CHECK(ctx->batch_initialized && !ctx->execution_result);
+                col_rel_t *entry = wl_columnar_eval_stack_cleanup_stack(f.frame)
+                    ->items[0].rel;
+                wl_columnar_filter_status_t status = {.semantic_result = 119};
+                wl_columnar_eval_plan_numeric_attempt_t copy = f.record;
+                CHECK(unary_batch_call(&f, &copy, &status, 192, 0) == EBUSY);
+                wl_thread_t thread;
+                CHECK(!wl_thread_create(&thread, unary_batch_wrong_thread, &f)
+                    && !wl_thread_join(&thread));
+                wl_columnar_eval_stack_cleanup_frame_t *original_frame =
+                    f.frame;
+                wl_columnar_eval_stack_cleanup_frame_t *nested = NULL;
+                CHECK(!wl_columnar_eval_stack_cleanup_begin(&f.session,
+                    &nested));
+                f.frame = nested;
+                CHECK(unary_batch_call(&f, &f.record, &status, 192,
+                    0) == EBUSY);
+                f.frame = original_frame;
+                CHECK(!wl_columnar_eval_stack_cleanup_finish(&nested));
+                wl_col_session_t *saved_session = f.record.session;
+                wl_col_session_t foreign = {0};
+                f.record.session = &foreign;
+                CHECK(unary_batch_call(&f, &f.record, &status, 192,
+                    0) == EINVAL);
+                f.record.session = saved_session;
+                wl_evaluation_control_t *saved_control = f.record.control;
+                f.record.control = f.funding;
+                CHECK(unary_batch_call(&f, &f.record, &status, 192,
+                    0) == EINVAL);
+                f.record.control = saved_control;
+                ++f.record.attempt_id;
+                CHECK(unary_batch_call(&f, &f.record, &status, 192,
+                    0) == EINVAL);
+                --f.record.attempt_id;
+                CHECK(wl_columnar_filter_batch_end_step_owned_funded(f.frame,
+                    &status, &f.record, f.operation, f.operation_id) == EINVAL);
+                CHECK(status.semantic_result == 119 && !ctx->busy);
+                wl_evaluation_control_report_t frozen = {0};
+                uint64_t successor = 0;
+                if (lifetime) {
+                    CHECK(wl_evaluation_control_finish(f.operation,
+                        &f.operation_owner, ERANGE, 0) == ERANGE);
+                    CHECK(!wl_evaluation_control_report(f.operation, &frozen));
+                    if (lifetime == 2) {
+                        CHECK(!wl_evaluation_control_begin(f.operation,
+                            &f.operation_owner));
+                        successor = wl_evaluation_control_active_attempt_id(
+                            f.operation);
+                        CHECK(successor && successor != f.operation_id);
+                    }
+                }
+                unsigned phases = 0;
+                while (ctx->batch_initialized) {
+                    unsigned phase = ctx->batch_drain.phase;
+                    CHECK(phase <= WL_COLUMNAR_RELATION_PRIVATE_BATCH_FINAL);
+                    phases |= 1u << phase;
+                    wl_columnar_relation_private_batch_drain_t saved =
+                        ctx->batch_drain;
+                    wl_columnar_relation_append_batch_t saved_batch =
+                        ctx->batch;
+                    for (unsigned mode = 0; mode < 4; ++mode) {
+                        status =
+                            (wl_columnar_filter_status_t){.semantic_result =
+                                                              119};
+                        int rc = unary_batch_call(&f, &f.record, &status,
+                                mode ? 192 : 191, mode);
+                        CHECK(rc == (mode == 1 ? WL_EVALUATION_CONTROL_CANCELLED
+                            : mode ==
+                            3 ? EINVAL : WL_EVALUATION_CONTROL_WORK_LIMIT)
+                            && !ctx->busy && status.semantic_result == 119
+                            && !memcmp(&saved, &ctx->batch_drain, sizeof(saved))
+                            && !memcmp(&saved_batch, &ctx->batch,
+                            sizeof(saved_batch)));
+                    }
+                    if (phase == WL_COLUMNAR_RELATION_PRIVATE_BATCH_OWNER) {
+                        funded_drain_fail_once = true;
+                        wl_columnar_relation_test_single_release =
+                            funded_drain_release_failure;
+                        CHECK(!unary_batch_call(&f, &f.record, &status, 192,
+                            0));
+                        wl_columnar_relation_test_single_release = NULL;
+                        CHECK(status.progress ==
+                            WL_COLUMNAR_FILTER_PROGRESS_RETAINED
+                            && status.cleanup_result == EAGAIN
+                            && ctx->batch_drain.phase == phase && !ctx->busy);
+                        ++ctx->batch_drain.bound_nonce;
+                        CHECK(unary_batch_call(&f, &f.record, &status, 192, 0)
+                            == EINVAL &&
+                            ctx->batch_drain.release_error == EAGAIN);
+                        --ctx->batch_drain.bound_nonce;
+                        status =
+                            (wl_columnar_filter_status_t){.semantic_result =
+                                                              119};
+                        CHECK(unary_batch_call(&f, &f.record, &status, 192,
+                            fault ? 5 : 4) == WL_EVALUATION_CONTROL_CANCELLED);
+                        CHECK(status.semantic_result == 119 && !ctx->busy
+                            && ctx->batch_drain.phase == (fault
+                            ? WL_COLUMNAR_RELATION_PRIVATE_BATCH_OWNER
+                            : WL_COLUMNAR_RELATION_PRIVATE_BATCH_DESCRIPTOR));
+                        if (!fault) continue;
+                    }
+                    CHECK(!unary_batch_call(&f, &f.record, &status, 192, 0));
+                    CHECK(status.progress == WL_COLUMNAR_FILTER_PROGRESS_YIELD
+                        && !status.semantic_result && !ctx->busy);
+                }
+                CHECK(phases == 31 && f.record.phase ==
+                    WL_COLUMNAR_EVAL_PLAN_NUMERIC_CHILD);
+                CHECK(unary_batch_call(&f, &f.record, &status, 192,
+                    0) == EBUSY);
+                run(&f);
+                CHECK(f.record.semantic_result == (lifetime ? EINVAL : 0)
+                    && f.record.completed ==
+                    (lifetime ? target - 1 : body.op_count - 1));
+                if (lifetime) {
+                    wl_evaluation_control_report_t after;
+                    CHECK(!wl_evaluation_control_report(f.operation, &after)
+                        && frozen.attempt_id == after.attempt_id
+                        && frozen.limit == after.limit &&
+                        frozen.consumed == after.consumed
+                        && frozen.result == after.result &&
+                        frozen.stop_reason == after.stop_reason
+                        && frozen.execution_status == after.execution_status
+                        && frozen.cleanup_status == after.cleanup_status);
+                    uint64_t spent = UINT64_MAX;
+                    if (successor) CHECK(
+                            wl_evaluation_control_active_attempt_id(f.operation)
+                            == successor &&
+                            !wl_evaluation_control_test_active_consumed(
+                                f.operation, successor, &spent) && !spent);
+                    CHECK(wl_columnar_eval_stack_cleanup_stack(
+                            f.frame)->items[0].rel == entry);
+                } else {
+                    col_rel_t *out =
+                        wl_columnar_eval_stack_cleanup_stack(
+                        f.frame)->items[0].rel;
+                    const uint32_t rows[] = {3, 2, 6, 1, 1};
+                    CHECK(out->nrows == rows[kind] &&
+                        out->ncols == (kind == 2 ? 2u : 1u)
+                        && out->column_types &&
+                        out->column_types[0] == WIRELOG_TYPE_INT64);
+                    for (uint32_t row = 0; row < out->nrows; ++row) {
+                        int64_t value = kind < 2 ? (int64_t)row + 1
+                            : kind == 2 ? (int64_t)(row / 2) : kind ==
+                            3 ? 2 : 3;
+                        CHECK(out->columns[0][row] == value);
+                        if (kind ==
+                            2) CHECK(out->columns[1][row] ==
+                                (int64_t)(row % 2));
+                    }
+                    join_raw_parity(&f, &body, true);
+                }
+                fixture_close(&f); col_rel_destroy(right);
+                CHECK(wl_columnar_memory_reserved(
+                        wl_columnar_memory_governor_ref_get(governor)) == 37
+                    && wl_columnar_memory_rollback(&peer)
+                    && !wl_columnar_memory_reserved(
+                        wl_columnar_memory_governor_ref_get(governor)));
+                wl_columnar_memory_governor_ref_release(governor);
+            }
+        if (!kind) {
+            fixture_t f; fixture_init(&f, 1, 3, 0);
+            fixture_begin(&f, &body, 1, body.op_count);
+            wl_columnar_filter_context_t *ctx = NULL;
+            wl_columnar_filter_test_attempt_checkpoint =
+                unary_batch_cancel_start;
+            for (unsigned turn = 0;; ++turn) {
+                CHECK(turn < 10000 && f.record.phase !=
+                    WL_COLUMNAR_EVAL_PLAN_NUMERIC_DONE);
+                CHECK(!wl_columnar_eval_stack_filter_context_owned(f.frame,
+                    &ctx, &f.record));
+                if (f.record.phase == WL_COLUMNAR_EVAL_PLAN_NUMERIC_CHILD
+                    && ctx->stage == WL_COLUMNAR_FILTER_STAGE_BATCH) break;
+                engine_dispatch(&f); ++f.witnesses;
+            }
+            wl_columnar_filter_test_attempt_checkpoint = NULL;
+            CHECK(!ctx->batch_initialized && ctx->execution_result ==
+                WL_EVALUATION_CONTROL_CANCELLED);
+            wl_columnar_filter_status_t status;
+            CHECK(!unary_batch_call(&f, &f.record, &status, 192, 0)
+                && status.semantic_result == WL_EVALUATION_CONTROL_CANCELLED
+                && status.progress == WL_COLUMNAR_FILTER_PROGRESS_YIELD
+                && ctx->stage == WL_COLUMNAR_FILTER_STAGE_PROGRAM);
+            run(&f);
+            CHECK(f.record.semantic_result == WL_EVALUATION_CONTROL_CANCELLED
+                && !f.record.completed);
+            fixture_close(&f);
+        }
+        wl_plan_free(plan); wirelog_program_free(program);
+    }
+}
+
 static bool owned_row_fault_armed;
 
 static void
@@ -7498,7 +7841,14 @@ test_composed_controlled_batch_fallback_owner(void)
             &copied, f.frame, &f.session, f.operation, f.operation_id));
     CHECK(!wl_columnar_eval_plan_numeric_batch_fallback_authorized(
             &f.record, f.frame, &f.session, f.operation, f.operation_id + 1));
+    unary_batch_stream_fixture = &f;
+    unary_batch_stream_refusals = 0;
+    wl_columnar_join_pipeline_test_numeric_checkpoint =
+        unary_batch_stream_check;
     composed_run(&f);
+    wl_columnar_join_pipeline_test_numeric_checkpoint = NULL;
+    unary_batch_stream_fixture = NULL;
+    CHECK(unary_batch_stream_refusals);
     CHECK(!f.record.semantic_result
         && f.record.completed == body->op_count);
     composed_raw_parity(&f, body, 0);
@@ -14426,6 +14776,7 @@ main(void)
     test_lftj_ack_clear_funding();
     test_lftj_owned_row_no_capture();
     test_lftj_funded_writer_drain();
+    test_owned_batch_retirement_primitive();
     test_composed_lftj_stopped_cleanup();
     test_composed_source_stopped_cleanup();
     test_composed_source_cleanup_abort_retry();
