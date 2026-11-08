@@ -2799,7 +2799,9 @@ col_rel_grow_owned_transition_publish_impl(col_rel_t *r, uint32_t new_cap,
         : (r ? r->storage_generation : 0);
     wl_columnar_memory_reservation_init(&previous);
 
-    if (!r || (r->ncols && !r->columns) || new_cap < r->nrows)
+    /* A delta detach frees the columns and keeps the timestamp array, so an
+     * empty relation with no column storage is a valid source (#2348). */
+    if (!r || (r->ncols && !r->columns && r->nrows) || new_cap < r->nrows)
         return EINVAL;
     pending_rc = col_rel_reserve_transition(r, new_cap,
             r->timestamps ? new_cap : 0, r->timestamps != NULL, &pending,
@@ -2816,7 +2818,7 @@ col_rel_grow_owned_transition_publish_impl(col_rel_t *r, uint32_t new_cap,
         new_columns = col_columns_alloc(r->ncols, new_cap);
     if (r->ncols && !new_columns)
         goto fail;
-    for (uint32_t c = 0; c < r->ncols; c++)
+    for (uint32_t c = 0; r->columns && c < r->ncols; c++)
         memcpy(new_columns[c], r->columns[c],
             (size_t)r->nrows * sizeof(int64_t));
     if (r->timestamps) {
@@ -2845,7 +2847,7 @@ col_rel_grow_owned_transition_publish_impl(col_rel_t *r, uint32_t new_cap,
     r->col_shared = NULL;
     if (old_arena) {
         free((void *)old_columns);
-    } else {
+    } else if (old_columns) {
         for (uint32_t c = 0; c < r->ncols; c++)
             if (!old_shared_flags || !old_shared_flags[c])
                 free(old_columns[c]);

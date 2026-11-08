@@ -18343,6 +18343,22 @@ failed_attempt_env_set(failed_attempt_env_t *env)
 #endif
 }
 
+/* Unset the knob instead, so a W>=2 step picks its workers the way a default
+ * session does. */
+static void
+failed_attempt_env_clear(failed_attempt_env_t *env)
+{
+    const char *saved = getenv("WIRELOG_TDD_MIN_ROWS_PER_WORKER");
+    env->saved = saved != NULL;
+    if (saved)
+        snprintf(env->value, sizeof(env->value), "%s", saved);
+#ifdef _WIN32
+    (void)_putenv_s("WIRELOG_TDD_MIN_ROWS_PER_WORKER", "");
+#else
+    (void)unsetenv("WIRELOG_TDD_MIN_ROWS_PER_WORKER");
+#endif
+}
+
 static void
 failed_attempt_env_restore(const failed_attempt_env_t *env)
 {
@@ -19514,6 +19530,63 @@ clear_cb_cleanup:
 #undef CLEAR_CB_CHECK
 }
 
+/* An observed step detaches the head's columns but keeps its timestamp array.
+ * A re-derivation whose first append outgrows that array must grow from no
+ * column storage instead of refusing with EINVAL on every retry (#2348).  The
+ * TDD worker knob stays unset so that W=2 reaches that append too. */
+static void
+test_observed_regrow_from_detached_head(uint32_t workers)
+{
+    TEST("observed step regrows a detached head past its timestamp array");
+    static const char program[] =
+        ".decl s(x: int64)\n.decl p(x: int64)\np(x) :- s(x).\n"
+        "p(x + 1) :- p(x), x < 10.\n";
+    static const int64_t base[] = { 9, 20 }, more[] = { 11, 12 }, last = 13;
+    static const int64_t want[] = { 9, 10, 11, 12, 13, 20 };
+    failed_attempt_env_t env;
+    failed_attempt_events_t events = { 0 };
+    wl_session_t *session = NULL;
+    const char *failure = NULL;
+#define REGROW_CHECK(c, m) do { if (!(c)) { failure = (m); \
+                                            goto regrow_cleanup; \
+                                } } while (0)
+    failed_attempt_env_clear(&env);
+    wl_plan_t *plan = build_plan(program);
+    REGROW_CHECK(plan, "regrow plan");
+    REGROW_CHECK(wl_session_create(wl_backend_columnar(), plan, workers,
+        &session) == 0, "regrow session");
+    REGROW_CHECK(wl_session_insert(session, "s", base, 2, 1) == 0
+        && wl_session_step(session) == 0, "regrow commit");
+    wl_session_set_delta_cb(session, failed_attempt_count_event, &events);
+    REGROW_CHECK(wl_session_insert(session, "s", more, 2, 1) == 0,
+        "regrow input");
+    REGROW_CHECK(wl_session_step(session) == 0, "regrow observed step");
+    REGROW_CHECK(events.added == 2 && events.removed == 0,
+        "regrow observed events");
+    events = (failed_attempt_events_t){ 0 };
+    REGROW_CHECK(wl_session_insert(session, "s", &last, 1, 1) == 0
+        && wl_session_step(session) == 0 && events.added == 1
+        && events.removed == 0, "regrow next step");
+    const col_rel_t *p = session_find_rel(COL_SESSION(session), "p");
+    REGROW_CHECK(p && p->nrows == sizeof(want) / sizeof(want[0]),
+        "regrow row count");
+    for (size_t i = 0; i < sizeof(want) / sizeof(want[0]); i++) {
+        bool found = false;
+        for (uint32_t r = 0; r < p->nrows && !found; r++)
+            found = col_rel_get(p, r, 0) == want[i];
+        REGROW_CHECK(found, "regrow model");
+    }
+regrow_cleanup:
+    wl_session_destroy(session);
+    wl_plan_free(plan);
+    failed_attempt_env_restore(&env);
+    if (failure) {
+        FAIL(failure); return;
+    }
+    PASS();
+#undef REGROW_CHECK
+}
+
 /* The W=1 analog: the second stratum keeps failing past the cursor that the
  * first stratum's commit armed (#2329). */
 static void
@@ -20047,6 +20120,7 @@ main(void)
     test_completion_cursor_then_callback();
     for (uint32_t w = 1; w <= 2; w++) {
         test_committed_clear_failure_then_callback(w);
+        test_observed_regrow_from_detached_head(w);
     }
     for (uint32_t workers = 2; workers <= 8; workers += 6) {
         test_completion_later_stratum_repeats(workers, COMPLETION_FAIL_BUDGET);
