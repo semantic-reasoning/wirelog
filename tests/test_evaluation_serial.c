@@ -15928,6 +15928,69 @@ test_entry_bound_automatic_turnover(void)
     }
 }
 
+static void
+test_operator_finish_excludes_real_framed_child(void)
+{
+    wirelog_error_t error;
+    wirelog_program_t *program = wirelog_parse_string(
+        ".decl a(x:int64)\n.decl output(x:int64)\noutput(x+1):-a(x).\n",
+        &error);
+    wl_plan_t *compiled = NULL;
+    CHECK(program && !wl_plan_from_program(program, &compiled));
+    const wl_plan_relation_t *body = NULL;
+    for (uint32_t s = 0; s < compiled->stratum_count; ++s)
+        for (uint32_t r = 0; r < compiled->strata[s].relation_count; ++r)
+            if (!strcmp(compiled->strata[s].relations[r].name, "output"))
+                body = &compiled->strata[s].relations[r];
+    CHECK(body);
+    fixture_t f; fixture_init(&f, 1, 3, false, true, 0); begin(&f, body);
+    bool reached = false;
+    for (unsigned turns = 0; !reached; ++turns) {
+        CHECK(turns < 10000 &&
+            f.ctx->phase != WL_COLUMNAR_EVAL_SERIAL_FRAMED_DONE);
+        if (f.ctx->child_bound) {
+            wl_columnar_filter_context_t *child = NULL;
+            if (!wl_columnar_eval_stack_filter_context_nonstream_owned(f.frame,
+                &child,
+                &f.ctx->child) &&
+                child->stage == WL_COLUMNAR_FILTER_STAGE_FINISH
+                && !child->busy && child->unary_started
+                && !wl_columnar_eval_stack_frame_mutation_blocked(f.frame)) {
+                CHECK(!f.ctx->native_cleanup
+                    && !wl_columnar_eval_stack_numeric_owner(f.frame,
+                    &f.ctx->child));
+                wl_columnar_eval_serial_framed_attempt_t *saved =
+                    malloc(sizeof(*saved));
+                CHECK(saved); memcpy(saved, f.ctx, sizeof(*saved));
+                wl_columnar_eval_stack_unary_prepared_t receipt = {0},
+                    inert = receipt;
+                int owner = 0;
+                wl_evaluation_control_t *funding = control_new(0, &owner);
+                CHECK(!wl_evaluation_control_begin(funding, &owner));
+                uint64_t id = wl_evaluation_control_active_attempt_id(funding),
+                    spent;
+                CHECK(
+                    wl_columnar_eval_stack_unary_prepared_operator_finish_begin(
+                        &receipt, f.frame, &f.ctx->child, funding, id) == EBUSY
+                    && !memcmp(&inert, &receipt, sizeof(receipt))
+                    && !memcmp(saved, f.ctx, sizeof(*saved))
+                    && !wl_evaluation_control_test_active_consumed(funding, id,
+                    &spent)
+                    && !spent);
+                CHECK(!wl_evaluation_control_finish(funding, &owner, 0, 0)
+                    && !wl_evaluation_control_detach(funding, &owner));
+                wl_evaluation_control_release(funding); free(saved);
+                reached = true;
+            }
+        }
+        if (!reached) turn(&f);
+    }
+    run(&f); CHECK(f.ctx->phase == WL_COLUMNAR_EVAL_SERIAL_FRAMED_READY);
+    compare_raw(&f, body);
+    discard(&f); run(&f); CHECK(!close_frame(&f)); fixture_destroy(&f);
+    wl_plan_free(compiled); wirelog_program_free(program);
+}
+
 int
 main(void)
 {
@@ -16048,6 +16111,7 @@ main(void)
     test_entry_generated_lftj_allocation_precharge();
     test_entry_generated_filter_work_boundary();
 
+    test_operator_finish_excludes_real_framed_child();
     test_shapes(); test_generated_union();
     test_generated_abort_scan_captures(); test_abort_scan_framed_error_order();
     test_refusal_and_identity();

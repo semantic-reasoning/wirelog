@@ -8740,6 +8740,22 @@ int wl_columnar_eval_stack_unary_prepared_join_finish_step(
 int wl_columnar_eval_stack_unary_prepared_join_finish_decline(
     wl_columnar_eval_stack_unary_prepared_t *, wl_evaluation_control_t *,
     uint64_t);
+/* Quiet FINISH of an independent direct/composed numeric owner. All embedded
+ * framed/native child owners are excluded before funding. Fresh zero setup or
+ * genuine ACKED storage stays at its final address through existing ACK.
+ * One actual distinct fresh financier per call; no Original polling. This
+ * component does not automatically select a production parent/stream route. */
+int wl_columnar_eval_stack_unary_prepared_operator_finish_begin(
+    wl_columnar_eval_stack_unary_prepared_t *,
+    wl_columnar_eval_stack_cleanup_frame_t *,
+    const wl_columnar_eval_plan_numeric_attempt_t *,
+    wl_evaluation_control_t *, uint64_t);
+int wl_columnar_eval_stack_unary_prepared_operator_finish_step(
+    wl_columnar_eval_stack_unary_prepared_t *, wl_evaluation_control_t *,
+    uint64_t);
+int wl_columnar_eval_stack_unary_prepared_operator_finish_decline(
+    wl_columnar_eval_stack_unary_prepared_t *, wl_evaluation_control_t *,
+    uint64_t);
 int wl_columnar_eval_stack_unary_prepared_step(
     wl_columnar_eval_stack_unary_prepared_t *);
 int wl_columnar_eval_stack_unary_prepared_cancel(
