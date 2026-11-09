@@ -69,28 +69,40 @@ typedef struct wl_session_source_scope {
 static WL_SESSION_THREAD_LOCAL wl_session_source_scope_t *
     wl_session_source_scope;
 
+#ifdef WL_SESSION_TEST_HOOKS
+void (*wl_session_test_source_birth_entered)(void);
+#endif
+
 static int
 wl_session_source_finance_birth(void *payload)
 {
     wl_session_source_finance_t *record = payload;
-    int rc = wl_evaluation_control_create(record->limit, &record->control);
-    if (rc) return rc;
-    rc = wl_evaluation_control_attach(record->control, record);
-    if (rc) {
-        wl_evaluation_control_release(record->control); record->control = NULL;
-        return rc;
-    }
-    record->attached = true;
-    rc = wl_evaluation_control_begin(record->control, record);
-    if (rc) {
-        if (wl_evaluation_control_detach(record->control, record)) abort();
-        wl_evaluation_control_release(record->control);
-        record->control = NULL; record->attached = false;
-        return rc;
-    }
-    record->active = true;
-    record->id = wl_evaluation_control_active_attempt_id(record->control);
-    return record->id ? 0 : EINVAL;
+    /* The actual TLS/BANK CURRENT issuer dominates this private callback.
+     * Birth completes before this nonrefusing publication; no control is
+     * exposed to a Native/user callback during construction. */
+#ifdef WL_SESSION_TEST_HOOKS
+    if (wl_session_test_source_birth_entered)
+        wl_session_test_source_birth_entered();
+#endif
+    wl_evaluation_control_lexical_finance_birth_result_t born =
+        wl_evaluation_control_lexical_finance_birth_try(record->limit, record);
+    if (born.protocol) return born.protocol;
+    record->control = born.control; record->id = born.id;
+    record->attached = true; record->active = true;
+    return 0;
+}
+
+bool
+wl_session_source_operation_scope_owned(const wl_session_t *session)
+{
+    const wl_session_source_scope_t *scope = wl_session_source_scope;
+    return session && scope && scope->session == session
+           && session->owns_operation_admission &&
+           session->owns_evaluation_control
+           && session->evaluation_control
+           && session->operation_admission &&
+           scope->admission == session->operation_admission
+           && scope->lane == WL_EVALUATION_CONTROL_SOURCE_OPERATION;
 }
 
 static wl_evaluation_control_source_phase_result_t
@@ -107,6 +119,24 @@ wl_session_source_run(wl_session_t *session,
         && scope->lane != WL_EVALUATION_CONTROL_SOURCE_CLOSE))
         return (wl_evaluation_control_source_phase_result_t){EINVAL, 0, false};
     return wl_evaluation_control_source_bank_run_lexical(
+        scope->admission->source_bank,
+        scope->lane, policy, action, payload);
+}
+
+static wl_evaluation_control_source_phase_result_t
+wl_session_source_run_birth(wl_session_t *session,
+    const wl_evaluation_control_source_phase_policy_t *policy,
+    wl_evaluation_control_source_action_fn action, void *payload)
+{
+    wl_session_source_scope_t *scope = wl_session_source_scope;
+    if (!scope || scope->session != session || !session
+        || !session->owns_operation_admission || !session->evaluation_control
+        || scope->admission != session->operation_admission
+        || !scope->admission
+        || (scope->lane != WL_EVALUATION_CONTROL_SOURCE_OPERATION
+        && scope->lane != WL_EVALUATION_CONTROL_SOURCE_CLOSE))
+        return (wl_evaluation_control_source_phase_result_t){EINVAL, 0, false};
+    return wl_evaluation_control_source_bank_run_lexical_constructor(
         scope->admission->source_bank,
         scope->lane, policy, action, payload);
 }
@@ -174,7 +204,8 @@ wl_session_source_finance_start(wl_session_t *session,
         || record->attached || !limit) return EINVAL;
     record->limit = limit;
     wl_evaluation_control_source_phase_result_t result =
-        wl_session_source_run(session, policy, wl_session_source_finance_birth,
+        wl_session_source_run_birth(session, policy,
+            wl_session_source_finance_birth,
             record);
     int rc = result.financial_result ? result.financial_result
         : !result.action_called ? EINVAL : result.action_result;
@@ -200,17 +231,42 @@ wl_session_source_finance_charge(wl_session_source_finance_t *record,
 int
 wl_session_source_finance_finish(wl_session_source_finance_t *record)
 {
-    if (!record || !record->control || !record->active ||
-        !record->id) return EINVAL;
-    int rc = wl_evaluation_control_finish(record->control, record, 0, 0);
-    wl_evaluation_control_report_t report;
-    if (wl_evaluation_control_active_attempt_id(record->control)
-        || wl_evaluation_control_report(record->control, &report)
-        || report.attempt_id != record->id || report.result != rc
-        || report.consumed != record->charged || report.execution_status
-        || report.cleanup_status) abort();
+    if (!record || !record->control || !record->active || !record->attached
+        || !record->id || !record->limit || record->charged > record->limit)
+        return EINVAL;
+    wl_evaluation_control_lexical_finance_finish_result_t finished =
+        wl_evaluation_control_lexical_finance_finish_owned(record->control,
+            record, sizeof(*record), record->id, record->limit,
+            record->charged);
+    if (!finished.finished) return finished.protocol ? finished.protocol :
+               EINVAL;
+    uint64_t id = record->id;
     record->active = false; record->id = 0;
-    return rc;
+    if (finished.protocol || finished.report.attempt_id != id
+        || finished.report.limit != record->limit
+        || finished.report.consumed != record->charged
+        || finished.report.result != finished.result
+        || finished.report.execution_status ||
+        finished.report.cleanup_status) abort();
+    return finished.result;
+}
+
+int
+wl_session_source_finance_retire_active_owned(
+    wl_session_source_finance_t *record)
+{
+    if (!record || !record->control || !record->active || !record->attached
+        || !record->id || !record->limit || record->charged > record->limit)
+        return EINVAL;
+    wl_evaluation_control_lexical_finance_result_t retired =
+        wl_evaluation_control_lexical_finance_retire_active_owned(
+        record->control,
+        record, sizeof(*record), record->id, record->limit,
+        record->charged);
+    if (!retired.closed) return retired.protocol ? retired.protocol : EINVAL;
+    record->control = NULL; record->attached = false;
+    record->active = false; record->id = 0;
+    return retired.result;
 }
 
 int
@@ -231,10 +287,14 @@ wl_session_source_finance_dispose(wl_session_source_finance_t *record)
 {
     if (!record || !record->control) return 0;
     int rc = record->active ? wl_session_source_finance_finish(record) : 0;
-    if (record->attached && wl_evaluation_control_detach(record->control,
-        record)) abort();
+    if (record->active) return rc ? rc : EINVAL;
+    if (record->attached) {
+        int detached = wl_evaluation_control_detach(record->control, record);
+        if (detached) return detached;
+        record->attached = false;
+    }
     wl_evaluation_control_release(record->control);
-    record->control = NULL; record->attached = false;
+    record->control = NULL;
     return rc;
 }
 
@@ -319,6 +379,105 @@ wl_session_source_finance_start_checked(wl_session_t *session,
     if (payload.bound) scope->birth_phase = phase;
     return phase.financial_result ? phase.financial_result
         : phase.action_called ? phase.action_result : EINVAL;
+}
+
+typedef struct {
+    wl_session_source_checked_birth_t checked;
+    int result;
+    bool attempted;
+} wl_session_source_checked_birth_early_t;
+
+static int
+wl_session_source_checked_birth_early(void *payload)
+{
+    wl_session_source_checked_birth_early_t *envelope = payload;
+    wl_session_source_checked_birth_t *p = &envelope->checked;
+    envelope->attempted = true;
+    int rc = EINVAL;
+    wl_session_source_finance_t *record = p->record;
+    wl_session_source_close_scope_t *scope = p->scope;
+    if (!p->session || !record || !scope || !p->policy) goto done;
+    uintptr_t r = (uintptr_t)record, s = (uintptr_t)scope;
+    uintptr_t b = (uintptr_t)p->session, q = (uintptr_t)p->policy;
+    if (sizeof(*record) > UINTPTR_MAX - r || sizeof(*scope) > UINTPTR_MAX - s
+        || sizeof(*p->session) > UINTPTR_MAX - b ||
+        sizeof(*p->policy) > UINTPTR_MAX - q)
+        goto done;
+    uintptr_t re = r + sizeof(*record), se = s + sizeof(*scope);
+    uintptr_t be = b + sizeof(*p->session), qe = q + sizeof(*p->policy);
+    if ((r < se && s < re) || (r < be && b < re) || (s < be && b < se)
+        || (r < qe && q < re) || (s < qe && q < se)) goto done;
+    if (scope->identity) goto done;
+    if (record->control || record->id || record->active || record->attached
+        || record->limit || record->charged || !p->limit) goto done;
+    wl_evaluation_control_lexical_finance_birth_result_t born =
+        wl_evaluation_control_lexical_finance_fresh_birth_try(p->limit, record);
+    if (born.protocol) {
+        rc = born.protocol; goto done;
+    }
+    record->control = born.control; record->id = born.id;
+    record->limit = p->limit; record->charged = 0;
+    record->attached = record->active = true;
+    scope->record = record; scope->session = p->session;
+    scope->thread_cookie = &wl_session_thread_cookie;
+    scope->control = record->control;
+    scope->control_identity = born.identity;
+    scope->limit = p->limit;
+    scope->birth_phase = (wl_evaluation_control_source_phase_result_t){0};
+    scope->result = (wl_session_source_finance_close_result_t){0};
+    scope->pair_phase = (wl_evaluation_control_source_pair_result_t){0};
+    scope->pair_complete = false;
+    scope->identity = scope;
+    p->bound = true;
+    rc = 0;
+done:
+    envelope->result = rc;
+    return rc;
+}
+
+static wl_evaluation_control_source_early_result_t
+wl_session_source_run_birth_early(wl_session_t *session,
+    const wl_evaluation_control_source_phase_policy_t *policy,
+    wl_evaluation_control_source_action_fn action, void *payload)
+{
+    wl_session_source_scope_t *scope = wl_session_source_scope;
+    if (!scope || scope->session != session || !session
+        || !session->owns_operation_admission || !session->evaluation_control
+        || scope->admission != session->operation_admission
+        || !scope->admission
+        || (scope->lane != WL_EVALUATION_CONTROL_SOURCE_OPERATION
+        && scope->lane != WL_EVALUATION_CONTROL_SOURCE_CLOSE))
+        return (wl_evaluation_control_source_early_result_t){
+                   .protocol = EINVAL, .financial_result = EINVAL
+        };
+    return wl_evaluation_control_source_bank_run_lexical_constructor_early(
+        scope->admission->source_bank, scope->lane, policy, action, payload);
+}
+
+wl_session_source_checked_birth_outcome_t
+wl_session_source_finance_start_checked_early(wl_session_t *session,
+    wl_session_source_finance_t *record,
+    const wl_evaluation_control_source_phase_policy_t *policy, uint64_t limit,
+    wl_session_source_close_scope_t *scope)
+{
+    wl_session_source_checked_birth_outcome_t result = {
+        .phase = {.protocol = EINVAL, .financial_result = EINVAL}
+    };
+    if (!record || !scope || !limit) return result;
+    wl_session_source_checked_birth_early_t payload = {
+        .checked = {session, record, scope, policy, limit, false}
+    };
+    result.phase = wl_session_source_run_birth_early(session, policy,
+            wl_session_source_checked_birth_early, &payload);
+    result.birth_attempted = payload.attempted;
+    result.birth_result = payload.result;
+    result.bound = payload.checked.bound;
+    if (result.bound) scope->birth_phase =
+            (wl_evaluation_control_source_phase_result_t){
+            result.phase.financial_result, result.phase.first_result,
+            result.phase.first_called
+        };
+    return result;
 }
 
 static int
@@ -501,6 +660,144 @@ wl_session_source_finance_close_then_metadata(wl_session_t *session,
     scope->pair_complete = true;
     out.close = scope->result; out.phase = phase;
     return out;
+}
+
+static bool
+wl_session_source_final_issuer(wl_session_t *session)
+{
+    const wl_session_source_scope_t *issuer = wl_session_source_scope;
+    return session && issuer && issuer->session == session
+           && issuer->admission &&
+           issuer->admission == session->operation_admission
+           && session->owns_operation_admission && session->evaluation_control
+           && (issuer->lane == WL_EVALUATION_CONTROL_SOURCE_OPERATION
+           || issuer->lane == WL_EVALUATION_CONTROL_SOURCE_CLOSE);
+}
+
+#ifdef WL_SESSION_TEST_HOOKS
+int
+wl_session_test_source_early_report(wl_session_t *session,
+    wl_evaluation_control_report_t *out)
+{
+    wl_session_source_scope_t *scope = wl_session_source_scope;
+    if (!scope || !session || scope->session != session ||
+        !session->owns_operation_admission
+        || !session->evaluation_control || !scope->admission
+        || scope->admission != session->operation_admission
+        || (scope->lane != WL_EVALUATION_CONTROL_SOURCE_OPERATION
+        && scope->lane != WL_EVALUATION_CONTROL_SOURCE_CLOSE)) return EINVAL;
+    return wl_evaluation_control_test_source_early_report(
+        scope->admission->source_bank,
+        scope->lane, out);
+}
+
+int
+wl_session_test_source_final_reset_cancel(wl_session_t *session)
+{
+    if (!wl_session_source_final_issuer(session)) return EINVAL;
+    const wl_session_source_scope_t *issuer = wl_session_source_scope;
+    return wl_evaluation_control_test_source_final_reset_cancel(
+        issuer->admission->source_bank, issuer->lane);
+}
+#endif
+
+static wl_session_source_final_close_value_t
+wl_session_source_final_close_value(
+    wl_session_source_finance_close_result_t closed)
+{
+    return (wl_session_source_final_close_value_t){
+               closed.protocol, closed.source_result, closed.checkpoint_result,
+               closed.applied, closed.closed
+    };
+}
+
+wl_session_source_final_pair_result_t
+wl_session_source_finance_close_then_final_metadata(wl_session_t *session,
+    wl_session_source_finance_t *record, wl_session_source_close_scope_t *scope,
+    wl_evaluation_control_source_action_fn metadata, void *payload,
+    size_t payload_bytes,
+    void *journal, size_t journal_bytes)
+{
+    wl_session_source_final_pair_result_t out = {0};
+    if (!wl_session_source_final_issuer(session)) {
+        out.protocol = EINVAL; return out;
+    }
+    out.protocol = wl_session_source_close_scope_prove(session, record, scope);
+    if (out.protocol) return out;
+    if (scope->result.closed) {
+        out.protocol = EALREADY; return out;
+    }
+    if (!metadata || !payload || !payload_bytes || !journal || !journal_bytes) {
+        out.protocol = EINVAL; return out;
+    }
+    static const wl_evaluation_control_source_pair_policy_t policy = {208, 144,
+                                                                      144, 80};
+    wl_evaluation_control_source_final_pair_geometry_t geometry = {
+        .session = {session, sizeof(*session)},
+        .record = {record, sizeof(*record)}, .scope = {scope, sizeof(*scope)},
+        .payload = {payload, payload_bytes},
+        .journal = {journal, journal_bytes},
+        .source_control = record->control,
+        .source_expectation = wl_session_source_close_expectation(record, scope)
+    };
+    wl_session_source_scope_t *issuer = wl_session_source_scope;
+    out.phase = wl_evaluation_control_source_bank_run_lexical_pair_final(
+        issuer->admission->source_bank, issuer->lane, &policy, &geometry,
+        wl_session_source_close_action, metadata);
+    if (!out.phase.first_called) {
+        /* This distinct event closes only the genuine original financial
+         * owner. It never rewrites the original pair's call or phase bits. */
+        wl_evaluation_control_lexical_finance_expectation_t expected =
+            wl_session_source_close_expectation(record, scope);
+        out.protocol =
+            wl_evaluation_control_lexical_finance_prove_checked(record->control,
+                &expected);
+        if (out.protocol) return out;
+        int checkpoint = record->active
+            ? wl_evaluation_control_charge_attempt(record->control, record->id,
+                0) : 0;
+        out.mandatory_unwind_called = true;
+        int closed = wl_session_source_close_actual(scope);
+        if (scope->result.closed) {
+            if (checkpoint) scope->result.checkpoint_result = checkpoint;
+            out.mandatory_unwind =
+                wl_session_source_final_close_value(scope->result);
+        } else {
+            out.mandatory_unwind.protocol = closed ? closed : EINVAL;
+            out.protocol = out.mandatory_unwind.protocol;
+            return out;
+        }
+        if (out.phase.first_result) out.protocol = out.phase.first_result;
+    }
+    if (!scope->result.closed || record->control || record->id || record->active
+        || record->attached || scope->control) {
+        out.protocol = out.phase.first_called && out.phase.first_result
+            ? out.phase.first_result : EINVAL;
+        return out;
+    }
+    out.close = wl_session_source_final_close_value(scope->result);
+    return out;
+}
+
+wl_evaluation_control_source_final_result_t
+wl_session_source_final_metadata(wl_session_t *session,
+    const wl_evaluation_control_source_phase_policy_t *policy,
+    wl_evaluation_control_source_action_fn metadata, void *payload,
+    size_t payload_bytes,
+    void *journal, size_t journal_bytes)
+{
+    if (!wl_session_source_final_issuer(session) || !policy || !metadata
+        || !payload || !payload_bytes || !journal || !journal_bytes)
+        return (wl_evaluation_control_source_final_result_t){.financial_result =
+                                                                 EINVAL};
+    const wl_evaluation_control_source_final_geometry_t geometry = {
+        .session = {session, sizeof(*session)},
+        .payload = {payload, payload_bytes}, .journal = {journal, journal_bytes}
+    };
+    wl_session_source_scope_t *issuer = wl_session_source_scope;
+    return wl_evaluation_control_source_bank_run_lexical_final(
+        issuer->admission->source_bank, issuer->lane, policy, &geometry,
+        metadata);
 }
 
 #undef WL_SESSION_THREAD_LOCAL

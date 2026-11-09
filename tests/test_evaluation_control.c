@@ -687,6 +687,224 @@ static void private_financier_birth(void) {
         !invalid.identity);
 }
 
+static void
+financial_finish_refused(
+    wl_evaluation_control_lexical_finance_finish_result_t result,
+    int protocol)
+{
+    CHECK(result.protocol == protocol && !result.finished
+        && !result.result && !result.checkpoint_result &&
+        !result.report.attempt_id);
+}
+
+static void
+lexical_finance_finish(void)
+{
+    for (unsigned mode = 0; mode < 4; ++mode) {
+        uint64_t owner[2] = {0}, foreign[2] = {0};
+        wl_evaluation_control_lexical_finance_birth_result_t born =
+            wl_evaluation_control_lexical_finance_birth_try(8, owner);
+        CHECK(!born.protocol && born.control && born.id);
+        wl_evaluation_control_t *control = born.control;
+        uint64_t used = mode == 2 ? 8 : 5, id = born.id;
+        CHECK(!wl_evaluation_control_charge_attempt(control, id, used));
+        if (mode == 2) CHECK(wl_evaluation_control_charge_attempt(control, id,
+                1)
+                == WL_EVALUATION_CONTROL_WORK_LIMIT);
+        if (mode == 1 ||
+            mode == 3) wl_evaluation_control_request_cancel(control);
+        financial_finish_refused(
+            wl_evaluation_control_lexical_finance_finish_owned(
+                control, owner, 0, id, 8, used), EINVAL);
+        financial_finish_refused(
+            wl_evaluation_control_lexical_finance_finish_owned(
+                control, foreign, sizeof(foreign), id, 8, used), EINVAL);
+        financial_finish_refused(
+            wl_evaluation_control_lexical_finance_finish_owned(
+                control, control, sizeof(owner), id, 8, used), EINVAL);
+        financial_finish_refused(
+            wl_evaluation_control_lexical_finance_finish_owned(
+                control, owner, SIZE_MAX, id, 8, used), EINVAL);
+        financial_finish_refused(
+            wl_evaluation_control_lexical_finance_finish_owned(
+                control, owner, sizeof(owner), id + 1, 8, used), EINVAL);
+        financial_finish_refused(
+            wl_evaluation_control_lexical_finance_finish_owned(
+                control, owner, sizeof(owner), id, 9, used), EINVAL);
+        financial_finish_refused(
+            wl_evaluation_control_lexical_finance_finish_owned(
+                control, owner, sizeof(owner), id, 8, used - 1), EINVAL);
+        CHECK(!wl_evaluation_control_retain(control));
+        financial_finish_refused(
+            wl_evaluation_control_lexical_finance_finish_owned(
+                control, owner, sizeof(owner), id, 8, used), EBUSY);
+        wl_evaluation_control_release(control);
+        uint64_t observed = UINT64_MAX;
+        CHECK(wl_evaluation_control_active_attempt_id(control) == id
+            && !wl_evaluation_control_test_active_consumed(control, id,
+            &observed) && observed == used);
+        wl_evaluation_control_report_t previous;
+        CHECK(wl_evaluation_control_report(control, &previous) == ENOENT);
+        if (mode == 3) {
+            /* Independent no-poll oracle: raw FINISH itself does not observe
+             * pending cancellation after all these rejected financial calls. */
+            CHECK(wl_evaluation_control_finish(control, owner, 7, 0) == 7);
+            CHECK(!wl_evaluation_control_report(control, &previous)
+                && previous.result == 7 && previous.execution_status == 7
+                && !previous.stop_reason && previous.consumed == used);
+            CHECK(!wl_evaluation_control_begin(control, owner));
+            id = wl_evaluation_control_active_attempt_id(control); used = 0;
+            wl_evaluation_control_report_t frozen;
+            CHECK(!wl_evaluation_control_report(control, &frozen)
+                && frozen.attempt_id == previous.attempt_id &&
+                frozen.result == 7
+                && frozen.consumed == previous.consumed && !frozen.stop_reason);
+        }
+        wl_evaluation_control_lexical_finance_finish_result_t finished =
+            wl_evaluation_control_lexical_finance_finish_owned(control, owner,
+                sizeof(owner), id, 8, used);
+        int expected = mode == 1 || mode == 3 ? WL_EVALUATION_CONTROL_CANCELLED
+            : mode == 2 ? WL_EVALUATION_CONTROL_WORK_LIMIT : 0;
+        CHECK(!finished.protocol && finished.finished &&
+            finished.result == expected
+            && finished.checkpoint_result == expected &&
+            finished.report.attempt_id == id
+            && finished.report.limit == 8 && finished.report.consumed == used
+            && (int)finished.report.stop_reason == expected &&
+            finished.report.result == expected
+            && !finished.report.execution_status &&
+            !finished.report.cleanup_status
+            && !wl_evaluation_control_active_attempt_id(control));
+        if (mode == 0 || mode == 2) {
+            CHECK(!wl_evaluation_control_begin(control, owner));
+            uint64_t successor =
+                wl_evaluation_control_active_attempt_id(control);
+            CHECK(successor != id && !wl_evaluation_control_report(control,
+                &previous)
+                && previous.attempt_id == id && previous.result == expected
+                && previous.consumed == used);
+            financial_finish_refused(
+                wl_evaluation_control_lexical_finance_finish_owned(
+                    control, owner, sizeof(owner), id, 8, 0), EINVAL);
+            CHECK(wl_evaluation_control_active_attempt_id(control) == successor
+                && !wl_evaluation_control_test_active_consumed(control,
+                successor, &observed)
+                && !observed && !wl_evaluation_control_charge_attempt(control,
+                successor, 1));
+            finished =
+                wl_evaluation_control_lexical_finance_finish_owned(control,
+                    owner, sizeof(owner), successor, 8, 1);
+            CHECK(!finished.protocol && finished.finished && !finished.result
+                && finished.report.consumed == 1);
+        }
+        CHECK(!wl_evaluation_control_detach(control, owner));
+        wl_evaluation_control_release(control);
+    }
+}
+
+static void
+financial_retire_refused(wl_evaluation_control_lexical_finance_result_t result,
+    int protocol)
+{
+    CHECK(result.protocol == protocol && !result.closed && !result.report_valid
+        && !result.result && !result.checkpoint_result &&
+        !result.report.attempt_id);
+}
+
+static void
+lexical_finance_retire(void)
+{
+    for (unsigned mode = 0; mode < 4; ++mode) {
+        uint64_t owner[2] = {0}, foreign[2] = {0};
+        wl_evaluation_control_lexical_finance_birth_result_t born =
+            wl_evaluation_control_lexical_finance_birth_try(8, owner);
+        CHECK(!born.protocol && born.control && born.id);
+        wl_evaluation_control_t *control = born.control;
+        uint64_t used = mode == 2 ? 8 : 5, id = born.id;
+        CHECK(!wl_evaluation_control_charge_attempt(control, id, used));
+        if (mode == 2) CHECK(wl_evaluation_control_charge_attempt(control, id,
+                1)
+                == WL_EVALUATION_CONTROL_WORK_LIMIT);
+        if (mode == 1 ||
+            mode == 3) wl_evaluation_control_request_cancel(control);
+        financial_retire_refused(
+            wl_evaluation_control_lexical_finance_retire_active_owned(
+                control, owner, 0, id, 8, used), EINVAL);
+        financial_retire_refused(
+            wl_evaluation_control_lexical_finance_retire_active_owned(
+                control, foreign, sizeof(foreign), id, 8, used), EINVAL);
+        financial_retire_refused(
+            wl_evaluation_control_lexical_finance_retire_active_owned(
+                control, control, sizeof(owner), id, 8, used), EINVAL);
+        financial_retire_refused(
+            wl_evaluation_control_lexical_finance_retire_active_owned(
+                control, owner, SIZE_MAX, id, 8, used), EINVAL);
+        financial_retire_refused(
+            wl_evaluation_control_lexical_finance_retire_active_owned(
+                control, owner, sizeof(owner), id + 1, 8, used), EINVAL);
+        financial_retire_refused(
+            wl_evaluation_control_lexical_finance_retire_active_owned(
+                control, owner, sizeof(owner), id, 9, used), EINVAL);
+        financial_retire_refused(
+            wl_evaluation_control_lexical_finance_retire_active_owned(
+                control, owner, sizeof(owner), id, 8, used - 1), EINVAL);
+        CHECK(!wl_evaluation_control_retain(control));
+        financial_retire_refused(
+            wl_evaluation_control_lexical_finance_retire_active_owned(
+                control, owner, sizeof(owner), id, 8, used), EBUSY);
+        wl_evaluation_control_release(control);
+        uint64_t observed = UINT64_MAX;
+        CHECK(wl_evaluation_control_active_attempt_id(control) == id
+            && !wl_evaluation_control_test_active_consumed(control, id,
+            &observed) && observed == used);
+        wl_evaluation_control_report_t previous;
+        CHECK(wl_evaluation_control_report(control, &previous) == ENOENT);
+        if (mode == 3) {
+            /* Independent no-poll oracle: raw FINISH itself does not observe
+             * pending cancellation after all these rejected financial calls. */
+            CHECK(wl_evaluation_control_finish(control, owner, 7, 0) == 7);
+            CHECK(!wl_evaluation_control_report(control, &previous)
+                && previous.result == 7 && previous.execution_status == 7
+                && !previous.stop_reason && previous.consumed == used);
+            CHECK(!wl_evaluation_control_begin(control, owner));
+            id = wl_evaluation_control_active_attempt_id(control); used = 0;
+            wl_evaluation_control_report_t frozen;
+            CHECK(!wl_evaluation_control_report(control, &frozen)
+                && frozen.attempt_id == previous.attempt_id &&
+                frozen.result == 7
+                && frozen.consumed == previous.consumed && !frozen.stop_reason);
+        }
+        if (mode == 3) {
+            financial_retire_refused(
+                wl_evaluation_control_lexical_finance_retire_active_owned(
+                    control, owner, sizeof(owner), previous.attempt_id, 8, 0),
+                EINVAL);
+            CHECK(wl_evaluation_control_active_attempt_id(control) == id);
+            wl_evaluation_control_report_t frozen;
+            CHECK(!wl_evaluation_control_report(control, &frozen)
+                && frozen.attempt_id == previous.attempt_id &&
+                frozen.result == 7
+                && !frozen.stop_reason && frozen.consumed == previous.consumed);
+        }
+        wl_evaluation_control_lexical_finance_result_t retired =
+            wl_evaluation_control_lexical_finance_retire_active_owned(control,
+                owner,
+                sizeof(owner), id, 8, used);
+        /* The actual controller is freed. Only copied values remain. */
+        int expected = mode == 1 || mode == 3 ? WL_EVALUATION_CONTROL_CANCELLED
+            : mode == 2 ? WL_EVALUATION_CONTROL_WORK_LIMIT : 0;
+        CHECK(!retired.protocol && retired.closed && retired.report_valid
+            && retired.result == expected &&
+            retired.checkpoint_result == expected
+            && retired.report.attempt_id == id && retired.report.limit == 8
+            && retired.report.consumed == used &&
+            retired.report.result == expected
+            && (int)retired.report.stop_reason == expected
+            && !retired.report.execution_status &&
+            !retired.report.cleanup_status);
+    }
+}
+
 int
 main(void)
 {
@@ -702,6 +920,8 @@ main(void)
     lexical_finance_birth();
     bounded_references();
     private_financier_birth();
+    lexical_finance_finish();
+    lexical_finance_retire();
     CHECK(wl_evaluation_control_test_seed_next_identity(UINT64_MAX - 1) == 0);
     wl_evaluation_control_t *last = NULL;
     CHECK(wl_evaluation_control_create(0, &last) == 0);
