@@ -1034,6 +1034,15 @@ contributes its own bytes, so `hmac_sha256(sym, 42)` and
 would leave every mixed call digesting an interned id, which is the
 defect the digest functions were fixed for.
 
+A rule body element that starts with a string function must be a
+comparison or a `contains`, `str_prefix` or `str_suffix` call on its own;
+anything else is a parse error (#2231), as an expression starting with a
+variable or a number and not followed by a comparison already was.
+`m(x) :- s(x), strlen(x) * 0.` was accepted and the expression dropped, so
+the rule kept every row, and a lone `strlen(x)` or `to_upper(x)` kept only
+the rows whose result, a length or an intern id, was nonzero. Write the
+comparison: `strlen(x) > 0`.
+
 ### Scalar Addon Calls
 
 Scalar addons use the explicit `@call` marker so their syntax cannot be
