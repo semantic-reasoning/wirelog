@@ -7551,10 +7551,10 @@ wl_columnar_relation_delta_restore_flat_impl(col_rel_t *rel,
         goto done;
     }
     if (ncols == 0) {
-        /* A zero-width row has no payload: restoring it restores the count. */
+        /* A zero-width row has no payload: restoring it restores the count.
+         * A timestamp array shorter than the rows is dropped, as below. */
         if (rel->ncols != 0
             || !col_rel_timestamp_shape_valid(rel)
-            || (rel->timestamps && rel->timestamp_capacity < nrows)
             || col_rel_storage_owner_resolve(rel, &owner) != 0
             || owner != rel) {
             rc = EINVAL;
@@ -7573,6 +7573,14 @@ wl_columnar_relation_delta_restore_flat_impl(col_rel_t *rel,
             >= WL_COLUMNAR_REL_GENERATION_INVALID - 1u) {
             rc = EOVERFLOW;
             goto done;
+        }
+        if (rel->timestamps && rel->timestamp_capacity < nrows) {
+            uint64_t before = col_rel_owned_ledger_bytes(rel);
+            free(rel->timestamps);
+            rel->timestamps = NULL;
+            rel->timestamp_capacity = 0;
+            col_rel_ledger_reconcile(rel, before);
+            col_rel_retire_payload_credit(rel);
         }
         rel->nrows = nrows;
         if (rel->capacity < nrows)
