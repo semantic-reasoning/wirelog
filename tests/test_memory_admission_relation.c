@@ -3997,6 +3997,44 @@ cleanup:
     }
 }
 
+/* #2231: restoring a zero-width head past a short timestamp array drops the
+ * array and gives its retained charge back. */
+static void
+test_governed_zero_width_restore_drops_short_timestamps(void)
+{
+    wl_columnar_memory_resolution_t resolution;
+    make_resolution(&resolution, 1024 * 1024);
+    wl_columnar_memory_governor_ref_t *ref =
+        wl_columnar_memory_governor_ref_create(&resolution);
+    col_rel_t *rel = col_rel_new_auto("restore-zero-width-timestamps", 0);
+    CHECK(ref && rel, "zero-width restore fixture setup");
+    if (!ref || !rel) goto cleanup;
+    CHECK(col_rel_attach_memory_governor(rel, ref) == 0
+        && col_rel_enable_timestamps(rel) == 0 && rel->timestamps
+        && rel->retained_reserved_bytes
+        == private_payload_bytes(0, 0, rel->timestamp_capacity),
+        "zero-width timestamps admitted");
+    uint32_t nrows = rel->timestamp_capacity + 5u;
+    CHECK(wl_columnar_relation_delta_restore_flat(rel,
+        rel->relation_identity, NULL, nrows, 0) == 0
+        && rel->nrows == nrows && !rel->timestamps
+        && rel->timestamp_capacity == 0,
+        "zero-width restore drops the short timestamp array");
+    CHECK(rel->retained_reserved_bytes == 0
+        && wl_columnar_memory_reserved(
+            wl_columnar_memory_governor_ref_get(ref))
+        == rel->descriptor_reserved_bytes + rel->metadata_reserved_bytes,
+        "zero-width restore releases the timestamp charge");
+cleanup:
+    col_rel_destroy(rel);
+    if (ref) {
+        CHECK(wl_columnar_memory_reserved(
+                wl_columnar_memory_governor_ref_get(ref)) == 0,
+            "zero-width restore teardown balanced");
+        wl_columnar_memory_governor_ref_release(ref);
+    }
+}
+
 static void
 test_resize_allocation_cleanup_precedes_rollback(void)
 {
@@ -4955,6 +4993,7 @@ main(void)
     test_timestamp_only_retained_admission();
     test_governed_pool_clone_fallback();
     test_governed_delta_restore_overwrite_order();
+    test_governed_zero_width_restore_drops_short_timestamps();
     test_resize_allocation_cleanup_precedes_rollback();
     test_cow_private_cleanup_precedes_rollback();
 #ifndef _WIN32
