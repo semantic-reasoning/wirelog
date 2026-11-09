@@ -7303,9 +7303,12 @@ test_evaluation_join_host_lifecycle_exe = executable(
   link_with: [testlib_prod],
 )
 foreach join_lifecycle_case : ['successors', 'snapshots', 'recovery', 'funding', 'snapshot-recovery', 'appends', 'strict', 'native-end', 'snapshot-end', 'bootstrap-end', 'snapshot-finance-birth', 'snapshot-exhaust-evaluating-end', 'snapshot-exhaust-evaluating-successor', 'snapshot-exhaust-completed-end', 'snapshot-exhaust-completed-successor', 'admission-strata-step', 'admission-strata-snapshot', 'admission-strata-refusal', 'admission-read-failure', 'private-cap']
+  # With the former 60 s the strict case took 224-227 s of the 240 s it had
+  # on the gcc TSan leg (60 s x 4), on main e5b753fb and on PR #2352.
   test('evaluation_join_host_lifecycle_' + join_lifecycle_case,
        test_evaluation_join_host_lifecycle_exe, args: [join_lifecycle_case],
-       suite: ['unit', 'tsan', 'evaluation_join_hosts'], timeout: 60)
+       suite: ['unit', 'tsan', 'evaluation_join_hosts'],
+       timeout: join_lifecycle_case == 'strict' ? 120 : 60)
 endforeach
 
 # #2298 actual composed aggregate admission under configured JOIN batches.
