@@ -6760,6 +6760,9 @@ test('evaluation_source_bank', test_evaluation_source_bank_exe,
      suite: ['unit', 'tsan'], timeout: 60)
 
 # Paired lexical Source financial ownership in actual public OP/CLOSE scopes.
+test('evaluation_source_fresh_birth_exhaustion', test_evaluation_source_bank_exe,
+     args: ['--fresh-exhaustion'], suite: ['unit', 'tsan'], timeout: 30)
+
 test_evaluation_source_finance_exe = executable(
   'test_evaluation_source_finance',
   files('test_evaluation_source_finance.c'),

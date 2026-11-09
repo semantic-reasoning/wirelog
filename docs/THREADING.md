@@ -228,7 +228,7 @@ These exist so struct fields can be declared portably; the audit in
 
 Every `atomic_*` call site in `wirelog/` production sources. Counted
 mechanically by `scripts/ci/check-threading-doc.sh`; row count must
-match the script's count (currently **527**).
+match the script's count (currently **557**).
 
 Format: `file:function[#N]` | field | operation | order | justification.
 
@@ -670,7 +670,7 @@ concurrent alias removals cannot underflow the count.
 | `session.c:session_pool_rel_promote#3` | `src->storage_alias_borrows` | `atomic_store_explicit` | relaxed | Leave the closed pool tombstone with no child aliases |
 
 112 + 21 + 37 = **170 atomic call sites** in the summarized groups; the full
-symbol-anchored inventory below covers 527 sites.
+symbol-anchored inventory below covers 557 sites.
 
 The `#N` suffix counts all atomic sites in a symbol, regardless of operation;
 the first site remains unsuffixed. `scripts/ci/check-threading-doc.sh` uses
@@ -1778,7 +1778,7 @@ DONE. If a stop leaves the receipt holding a claim, its caller preserves that
 receipt and resumes with a fresh live maintenance attempt; it cannot abandon or
 reinitialize the receipt/token while the claim remains held.
 
-The complete current atomic-source inventory contains 527 call sites.
+The complete current atomic-source inventory contains 557 call sites.
 
 ### Caller-attempt-bound single mutation admission
 
@@ -2730,8 +2730,6 @@ optional test counters. They add no session/worker field or installed API.
 | `relation.c:wl_columnar_relation_batch_single_acquire_source#9` | `owner writer gate.state` | `atomic_compare_exchange_weak_explicit` | release/relaxed | Release the original owner writer before decrementing its acquired count |
 | `relation.c:wl_columnar_relation_batch_single_acquire_source#10` | `descriptor writer gate.state` | `atomic_load_explicit` | acquire | Revalidate descriptor gate state after its actual release callback |
 | `relation.c:wl_columnar_relation_batch_single_acquire_source#11` | `descriptor writer gate.state` | `atomic_compare_exchange_weak_explicit` | release/relaxed | Release the original descriptor writer before clearing the original prefix |
-| `relation.c:wl_columnar_relation_batch_capture` | `capture.credit.owner_bits` | `atomic_init` | initialization | Initialize the final-address scratch reservation owner before any admission |
-| `relation.c:wl_columnar_relation_batch_capture#2` | `capture.credit.state` | `atomic_init` | initialization | Initialize the final-address scratch reservation to EMPTY before any admission |
 
 ### Private scalar-copy construction and independent retirement
 
@@ -2830,3 +2828,46 @@ retain controller/owner storage and drain workers. These transitions grant no
 session/native mutation authority and do not expand exact-nine qualification.
 The genuine thread tests use condition-variable handshakes to order all three
 outcomes; elapsed time is only the existing test watchdog.
+
+
+### Explicit lexical financial phase lifecycle
+
+Fresh initialization occurs before pointer publication. Published updates
+retain their actual controller/BANK locks and saved-generation checks. No
+reference observation grants resource access. The exact inventory has554
+sites, including the following financial lifecycle observations. Obsolete
+scalar-capture anchors are removed because that earlier handoff no longer
+performs those atomic operations.
+
+| `compound_arena.c:wl_arena_compound_arena_gc_hold_release_step_owned` | `expected_arena->gc_hold_count` | `atomic_compare_exchange_strong_explicit` | release / relaxed | Attempt one hold-count decrement, then one owed lifetime-reference decrement; a partial receipt retains ownership and the real current-session owner prevents final destruction |
+| `compound_arena.c:wl_arena_compound_arena_gc_hold_release_step_owned#2` | `expected_arena->lifetime_state` | `atomic_compare_exchange_strong_explicit` | acq_rel / acquire | Attempt one hold-count decrement, then one owed lifetime-reference decrement; a partial receipt retains ownership and the real current-session owner prevents final destruction |
+| `compound_arena.c:wl_arena_compound_arena_gc_epoch_step_owned` | `arena->access_gate` | `atomic_compare_exchange_strong_explicit` | acquire / relaxed | Attempt the actual exclusive GC writer gate once; journal successful ownership across retained scan turns |
+| `relation.c:wl_columnar_relation_batch_capture_mode` | `capture.credit.owner_bits` | `atomic_init` | initialization | Initialize the final-address scratch reservation owner before any admission |
+| `relation.c:wl_columnar_relation_batch_capture_mode#2` | `capture.credit.state` | `atomic_init` | initialization | Initialize the final-address scratch reservation to EMPTY before any admission |
+| `relation.c:wl_columnar_relation_row_debt_retire_one` | `credit->state` | `atomic_load_explicit` | acquire | Observe the original capture credit state and owner before one finite rollback or release; keep retained progress distinct from physical free |
+| `relation.c:wl_columnar_relation_row_debt_retire_one#2` | `credit->owner_bits` | `atomic_load_explicit` | acquire | Observe the original capture credit state and owner before one finite rollback or release; keep retained progress distinct from physical free |
+| `evaluation_control.c:wl_evaluation_control_retain_try` | `control->references` | `atomic_fetch_add_explicit` | relaxed | Observe the live reference count and attempt one additional reference; contention acquires none and does not change the attempt |
+| `evaluation_control.c:wl_evaluation_control_retain_try#2` | `control->references` | `atomic_compare_exchange_strong_explicit` | relaxed / relaxed | Observe the live reference count and attempt one additional reference; contention acquires none and does not change the attempt |
+| `evaluation_control.c:wl_evaluation_control_attached_birth_try` | `wl_next_evaluation_control_identity` | `atomic_load_explicit` | relaxed | Claim a fresh immutable identity once, then initialize actual creation and attachment references, cancellation and inactive attempt before BEGIN and publication |
+| `evaluation_control.c:wl_evaluation_control_attached_birth_try#2` | `wl_next_evaluation_control_identity` | `atomic_compare_exchange_strong_explicit` | relaxed / relaxed | Claim a fresh immutable identity once, then initialize actual creation and attachment references, cancellation and inactive attempt before BEGIN and publication |
+| `evaluation_control.c:wl_evaluation_control_attached_birth_try#3` | `control->references` | `atomic_init` | initialization | Claim a fresh immutable identity once, then initialize actual creation and attachment references, cancellation and inactive attempt before BEGIN and publication |
+| `evaluation_control.c:wl_evaluation_control_attached_birth_try#4` | `control->cancelled` | `atomic_init` | initialization | Claim a fresh immutable identity once, then initialize actual creation and attachment references, cancellation and inactive attempt before BEGIN and publication |
+| `evaluation_control.c:wl_evaluation_control_attached_birth_try#5` | `control->active_attempt_id` | `atomic_init` | initialization | Claim a fresh immutable identity once, then initialize actual creation and attachment references, cancellation and inactive attempt before BEGIN and publication |
+| `evaluation_control.c:wl_evaluation_control_lexical_finance_fresh_birth_try` | `wl_next_evaluation_control_identity` | `atomic_load_explicit` | relaxed | Claim one unique identity and initialize the actual first positive financial Source generation on a fresh unpublished allocation; no existing owner, report or cancellation is reset and pointer publication remains the caller synchronization contract |
+| `evaluation_control.c:wl_evaluation_control_lexical_finance_fresh_birth_try#2` | `wl_next_evaluation_control_identity` | `atomic_compare_exchange_strong_explicit` | relaxed / relaxed | Claim one unique identity and initialize the actual first positive financial Source generation on a fresh unpublished allocation; no existing owner, report or cancellation is reset and pointer publication remains the caller synchronization contract |
+| `evaluation_control.c:wl_evaluation_control_lexical_finance_fresh_birth_try#3` | `control->references` | `atomic_init` | initialization | Claim one unique identity and initialize the actual first positive financial Source generation on a fresh unpublished allocation; no existing owner, report or cancellation is reset and pointer publication remains the caller synchronization contract |
+| `evaluation_control.c:wl_evaluation_control_lexical_finance_fresh_birth_try#4` | `control->cancelled` | `atomic_init` | initialization | Claim one unique identity and initialize the actual first positive financial Source generation on a fresh unpublished allocation; no existing owner, report or cancellation is reset and pointer publication remains the caller synchronization contract |
+| `evaluation_control.c:wl_evaluation_control_lexical_finance_fresh_birth_try#5` | `control->active_attempt_id` | `atomic_init` | initialization | Claim one unique identity and initialize the actual first positive financial Source generation on a fresh unpublished allocation; no existing owner, report or cancellation is reset and pointer publication remains the caller synchronization contract |
+| `evaluation_control.c:wl_evaluation_control_lexical_finance_finish_owned` | `control->references` | `atomic_fetch_add_explicit` | relaxed | Under the controller mutex require the actual creation and attachment references before the saved-generation financial checkpoint; refusal preserves the owner and report |
+| `evaluation_control.c:wl_evaluation_control_lexical_finance_finish_owned#2` | `control->active_attempt_id` | `atomic_exchange_explicit` | release | Publish the actual completed financial generation after its final checkpoint and report; retain both references and attachment for a genuine rebegin or later disposal |
+| `evaluation_control.c:wl_evaluation_control_lexical_finance_retire_active_owned` | `control->references` | `atomic_fetch_add_explicit` | relaxed | Under the controller mutex require the actual exclusive unexposed creation and attachment pair before final financial completion and both physical releases |
+| `evaluation_control.c:wl_evaluation_control_lexical_finance_retire_active_owned#2` | `control->active_attempt_id` | `atomic_exchange_explicit` | release | Publish the saved generation's real completed report and inactive identity before clearing its owner and dropping the private pair; copied report survives physical free |
+| `evaluation_control.c:wl_evaluation_control_lexical_finance_prove_locked` | `control->references` | `atomic_fetch_add_explicit` | relaxed | Under the actual controller mutex verify exclusive two-reference ownership and saved active or completed generation; neutral reads grant no Native authority |
+| `evaluation_control.c:wl_evaluation_control_lexical_finance_prove_locked#2` | `control->active_attempt_id` | `atomic_fetch_add_explicit` | relaxed | Under the actual controller mutex verify exclusive two-reference ownership and saved active or completed generation; neutral reads grant no Native authority |
+| `evaluation_control.c:wl_evaluation_control_lexical_finance_close_checked` | `control->active_attempt_id` | `atomic_exchange_explicit` | release | Publish inactive identity only for the authenticated active financial generation after its genuine final checkpoint and completed report |
+| `evaluation_control.c:wl_evaluation_control_source_bank_finish_constructor_phase` | `control->references` | `atomic_fetch_add_explicit` | relaxed | Under the actual BANK and controller locks verify exclusive two-reference financial ownership before the final checkpoint; no Native access follows from this count |
+| `evaluation_control.c:wl_evaluation_control_source_bank_finish_constructor_phase#2` | `control->active_attempt_id` | `atomic_exchange_explicit` | release | Publish actual constructor financial completion under the same controller lock as checkpoint and report readback; verify the exchanged saved generation before lane reuse |
+| `evaluation_control.c:wl_evaluation_control_source_final_test_closed` | `control->references` | `atomic_fetch_add_explicit` | relaxed | Test-only neutral read under BANK and controller locks requires the genuine quiescent private owner pair before and after an explicit real cancellation reset; no controller loan or Native permission |
+| `evaluation_control.c:wl_evaluation_control_source_final_test_closed#2` | `control->cancelled` | `atomic_fetch_add_explicit` | relaxed | Test-only neutral read verifies the injected cancellation before reset and its removal afterward while completed report, owner, generation and accounting remain unchanged |
+| `evaluation_control.c:wl_evaluation_control_test_source_early_report` | `control->references` | `atomic_fetch_add_explicit` | relaxed | Test-only neutral observation under BANK and control locks requires the canonical inactive two-reference financial owner before copying its genuine completed report; no state mutation, cancellation poll or handle loan |
+| `evaluation_control.c:wl_evaluation_control_source_bank_begin_checkpoint` | `control->active_attempt_id` | `atomic_exchange_explicit` | release | Publish the actual sealed private BANK generation before its same-lock zero observation; retain begun-and-stopped ownership until genuine FINISH/report, without a controller loan or Native permission |

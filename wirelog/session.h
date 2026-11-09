@@ -33,6 +33,12 @@ extern "C" {
 
 typedef struct wl_session_admission wl_session_admission_t;
 
+#ifdef WL_SESSION_TEST_HOOKS
+/* Observe actual private Source construction without loaning its record,
+ * BANK, controller or saved generation. */
+extern void (*wl_session_test_source_birth_entered)(void);
+#endif
+
 /* Lexical SOURCE financial record. Zero-init at its final address, never copy,
 * retain in a session/frame/receipt, or use as a BODY funding/native permit. */
 typedef struct {
@@ -146,12 +152,28 @@ int wl_session_source_finance_start(wl_session_t *,
     const wl_evaluation_control_source_phase_policy_t *, uint64_t);
 int wl_session_source_finance_charge(wl_session_source_finance_t *, uint64_t);
 int wl_session_source_finance_finish(wl_session_source_finance_t *);
+/* Only final locally owned, unexposed active Source destruction. */
+int wl_session_source_finance_retire_active_owned(
+    wl_session_source_finance_t *);
 int wl_session_source_finance_rebegin(wl_session_source_finance_t *);
 int wl_session_source_finance_dispose(wl_session_source_finance_t *);
 int wl_session_source_finance_start_checked(wl_session_t *,
     wl_session_source_finance_t *,
     const wl_evaluation_control_source_phase_policy_t *, uint64_t,
     wl_session_source_close_scope_t *);
+
+typedef struct {
+    wl_evaluation_control_source_early_result_t phase;
+    int birth_result;
+    bool birth_attempted, bound;
+} wl_session_source_checked_birth_outcome_t;
+
+wl_session_source_checked_birth_outcome_t
+    wl_session_source_finance_start_checked_early(wl_session_t *,
+    wl_session_source_finance_t *,
+    const wl_evaluation_control_source_phase_policy_t *, uint64_t,
+    wl_session_source_close_scope_t *);
+
 /* Genuine own records are physically closed before return even when BANK
  * rejects before its action; that refusal path appends no footer or commit.
  * Strict malformed-input rejection leaves the real other owner untouched. */
@@ -167,6 +189,46 @@ wl_session_source_finance_pair_result_t
     wl_session_source_finance_close_then_metadata(wl_session_t *,
     wl_session_source_finance_t *, wl_session_source_close_scope_t *,
     wl_evaluation_control_source_action_fn, void *);
+/* FINAL close is one-shot. The typed caller stores the complete first
+ * result before its automatic scope expires, then uses fresh metadata phases
+ * for publication/acknowledgment retries. No lexical owner is retained. */
+typedef struct {
+    int protocol, source_result, checkpoint_result;
+    bool applied, closed;
+} wl_session_source_final_close_value_t;
+
+typedef struct {
+    wl_evaluation_control_source_final_pair_result_t phase;
+    wl_session_source_final_close_value_t close, mandatory_unwind;
+    int protocol;
+    bool mandatory_unwind_called;
+} wl_session_source_final_pair_result_t;
+
+_Static_assert(sizeof(wl_session_source_final_close_value_t) == 16,
+    "final close value layout");
+_Static_assert(sizeof(wl_session_source_final_pair_result_t) == 56,
+    "final Session result layout");
+
+wl_session_source_final_pair_result_t
+    wl_session_source_finance_close_then_final_metadata(wl_session_t *,
+    wl_session_source_finance_t *, wl_session_source_close_scope_t *,
+    wl_evaluation_control_source_action_fn, void *, size_t, void *, size_t);
+
+#ifdef WL_SESSION_TEST_HOOKS
+int wl_session_test_source_final_reset_cancel(wl_session_t *);
+int wl_session_test_source_early_report(wl_session_t *,
+    wl_evaluation_control_report_t *);
+#endif
+
+/* Caller supplies actual full typed payload/journal extents and a qualified
+ * immutable policy. Geometry is financial validation, not Native authority. */
+wl_evaluation_control_source_final_result_t
+    wl_session_source_final_metadata(wl_session_t *,
+    const wl_evaluation_control_source_phase_policy_t *,
+    wl_evaluation_control_source_action_fn, void *, size_t, void *, size_t);
+
+/* Financial placement observation only; conveys no Native authority. */
+bool wl_session_source_operation_scope_owned(const wl_session_t *session);
 int wl_session_source_footer(wl_session_t *);
 /* Actual admitted SOURCE scope only. Read callbacks do at most 40 scalar
  * actions and never perform Native work; errors have no direct-read fallback. */

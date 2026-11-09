@@ -490,6 +490,62 @@ wl_evaluation_control_attached_birth_try(uint64_t limit,
     return out;
 }
 
+/* Positive-only fresh Source generation. No existing controller or prior
+ * cancellation/report can enter: the pointer stays private until fully born. */
+wl_evaluation_control_lexical_finance_birth_result_t
+wl_evaluation_control_lexical_finance_fresh_birth_try(uint64_t limit,
+    const void *owner)
+{
+    wl_evaluation_control_lexical_finance_birth_result_t out = {0};
+    if (!owner || !limit) {
+        out.protocol = EINVAL; return out;
+    }
+    uint64_t identity =
+        atomic_load_explicit(&wl_next_evaluation_control_identity,
+            memory_order_relaxed);
+    if (!identity || identity == UINT64_MAX) {
+        out.protocol = EOVERFLOW; return out;
+    }
+#ifdef WL_SESSION_TEST_HOOKS
+    if (wl_evaluation_control_test_finance_birth_claim)
+        wl_evaluation_control_test_finance_birth_claim();
+#endif
+    if (!atomic_compare_exchange_strong_explicit(
+            &wl_next_evaluation_control_identity,
+            &identity, identity + 1, memory_order_relaxed,
+            memory_order_relaxed)){
+        out.protocol = EAGAIN; return out;
+    }
+    wl_evaluation_control_t *control =
+        wl_evaluation_control_lexical_finance_allocate(sizeof(*control));
+    if (!control) {
+        out.protocol = ENOMEM; return out;
+    }
+    if (wl_evaluation_control_lexical_finance_mutex_init(&control->mutex)) {
+        free(control); out.protocol = ENOMEM; return out;
+    }
+    atomic_init(&control->references, 2);
+    atomic_init(&control->cancelled, 0);
+    control->owner = owner;
+    control->identity = identity;
+    control->configured_limit = limit;
+    control->attempt_id = 1;
+    control->attempt_limit = limit;
+    control->consumed = 0;
+    control->stop = WL_EVALUATION_CONTROL_NONE;
+    control->accounting_error = 0;
+    control->active = true;
+    control->source_bank_class = NULL;
+    control->completed = (wl_evaluation_control_report_t){
+        .attempt_id = 0, .limit = 0, .consumed = 0,
+        .stop_reason = WL_EVALUATION_CONTROL_NONE,
+        .execution_status = 0, .cleanup_status = 0, .result = 0
+    };
+    atomic_init(&control->active_attempt_id, 1);
+    out.control = control; out.identity = identity; out.id = 1;
+    return out;
+}
+
 wl_evaluation_control_lexical_finance_birth_result_t
 wl_evaluation_control_lexical_finance_birth_try(uint64_t limit,
     const void *owner)
@@ -508,6 +564,116 @@ wl_evaluation_control_private_financier_birth_try(uint64_t limit,
     const void *owner)
 {
     return wl_evaluation_control_attached_birth_try(limit, owner);
+}
+
+wl_evaluation_control_lexical_finance_finish_result_t
+wl_evaluation_control_lexical_finance_finish_owned(
+    wl_evaluation_control_t *control, const void *owner, size_t owner_bytes,
+    uint64_t saved_id, uint64_t limit, uint64_t charged)
+{
+    wl_evaluation_control_lexical_finance_finish_result_t out = {0};
+    out.protocol = EINVAL;
+    if (!control || !owner || !owner_bytes || !saved_id || !limit
+        || charged > limit) return out;
+    uintptr_t c = (uintptr_t)control, o = (uintptr_t)owner;
+    if (sizeof(*control) > UINTPTR_MAX - c || owner_bytes > UINTPTR_MAX - o)
+        return out;
+    if (c < o + owner_bytes && o < c + sizeof(*control)) return out;
+    if (wl_mutex_lock(&control->mutex)) {
+        out.protocol = EIO; return out;
+    }
+    uint64_t references = (uint64_t)atomic_fetch_add_explicit(
+        &control->references, 0, memory_order_relaxed);
+    if (control->source_bank_class || control->owner != owner
+        || control->configured_limit != limit || control->attempt_limit != limit
+        || control->consumed != charged || control->accounting_error
+        || !control->active || control->attempt_id != saved_id
+        || wl_evaluation_control_active_attempt_id(control) != saved_id
+        || (control->stop != WL_EVALUATION_CONTROL_NONE
+        && control->stop != WL_EVALUATION_CONTROL_CANCELLED
+        && control->stop != WL_EVALUATION_CONTROL_WORK_LIMIT)) goto refused;
+    if (references != 2) {
+        out.protocol = EBUSY; goto refused;
+    }
+    /* This is the actual financial commit authorization. No callback,
+     * unlock, new controller or ref handoff separates it from completion. */
+    out.checkpoint_result = wl_evaluation_control_charge_locked(control, 0);
+    out.result = (int)control->stop;
+    control->completed = (wl_evaluation_control_report_t){
+        .attempt_id = control->attempt_id, .limit = control->attempt_limit,
+        .consumed = control->consumed, .stop_reason = control->stop,
+        .execution_status = 0, .cleanup_status = 0, .result = out.result,
+    };
+    control->active = false;
+    uint64_t previous = (uint64_t)atomic_exchange_explicit(
+        &control->active_attempt_id, 0, memory_order_release);
+    if (previous != saved_id || control->completed.attempt_id != saved_id
+        || control->completed.limit != limit ||
+        control->completed.consumed != charged
+        || control->completed.execution_status ||
+        control->completed.cleanup_status
+        || control->completed.stop_reason != out.result
+        || control->completed.result != out.result
+        || out.checkpoint_result != out.result) abort();
+    out.report = control->completed; out.finished = true; out.protocol = 0;
+refused:
+    if (wl_mutex_unlock(&control->mutex)) abort();
+    return out;
+}
+
+wl_evaluation_control_lexical_finance_result_t
+wl_evaluation_control_lexical_finance_retire_active_owned(
+    wl_evaluation_control_t *control, const void *owner, size_t owner_bytes,
+    uint64_t saved_id, uint64_t limit, uint64_t charged)
+{
+    wl_evaluation_control_lexical_finance_result_t out = {0};
+    out.protocol = EINVAL;
+    if (!control || !owner || !owner_bytes || !saved_id || !limit
+        || charged > limit) return out;
+    uintptr_t c = (uintptr_t)control, o = (uintptr_t)owner;
+    if (sizeof(*control) > UINTPTR_MAX - c || owner_bytes > UINTPTR_MAX - o)
+        return out;
+    if (c < o + owner_bytes && o < c + sizeof(*control)) return out;
+    if (wl_mutex_lock(&control->mutex)) {
+        out.protocol = EIO; return out;
+    }
+    uint64_t references = (uint64_t)atomic_fetch_add_explicit(
+        &control->references, 0, memory_order_relaxed);
+    if (control->source_bank_class || control->owner != owner
+        || control->configured_limit != limit || control->attempt_limit != limit
+        || control->consumed != charged || control->accounting_error
+        || !control->active || control->attempt_id != saved_id
+        || wl_evaluation_control_active_attempt_id(control) != saved_id
+        || (control->stop != WL_EVALUATION_CONTROL_NONE
+        && control->stop != WL_EVALUATION_CONTROL_CANCELLED
+        && control->stop != WL_EVALUATION_CONTROL_WORK_LIMIT)) goto refused;
+    if (references != 2) {
+        out.protocol = EBUSY; goto refused;
+    }
+    /* The private caller keeps the creation/attachment pair unexposed
+     * through both drops. This is final financial retirement, never a
+     * Native handoff or a transferable two-reference permit. */
+    out.checkpoint_result = wl_evaluation_control_charge_locked(control, 0);
+    out.result = (int)control->stop;
+    control->completed = (wl_evaluation_control_report_t){
+        .attempt_id = control->attempt_id, .limit = control->attempt_limit,
+        .consumed = control->consumed, .stop_reason = control->stop,
+        .execution_status = 0, .cleanup_status = 0, .result = out.result,
+    };
+    control->active = false;
+    uint64_t previous = (uint64_t)atomic_exchange_explicit(
+        &control->active_attempt_id, 0, memory_order_release);
+    if (previous != saved_id) abort();
+    out.report = control->completed; out.report_valid = true;
+    control->owner = NULL;
+    if (wl_mutex_unlock(&control->mutex)) abort();
+    wl_evaluation_control_release(control);
+    wl_evaluation_control_release(control);
+    out.closed = true; out.protocol = 0;
+    return out;
+refused:
+    if (wl_mutex_unlock(&control->mutex)) abort();
+    return out;
 }
 
 static int
@@ -713,6 +879,31 @@ wl_evaluation_control_source_bank_rearm_phase(
     return rc;
 }
 
+#ifdef WL_SESSION_TEST_HOOKS
+bool wl_evaluation_control_test_source_early_rearm_ref_once;
+
+static int
+wl_evaluation_control_source_bank_test_early_rearm(
+    wl_evaluation_control_source_bank_t *bank, unsigned index)
+{
+    bool extra = wl_evaluation_control_test_source_early_rearm_ref_once;
+    wl_evaluation_control_test_source_early_rearm_ref_once = false;
+    wl_evaluation_control_t *control = bank->lanes[index].control;
+    if (extra) {
+        int rc = wl_evaluation_control_retain(control);
+        if (rc) return rc;
+    }
+    int rc = wl_evaluation_control_source_bank_rearm_phase(bank, index);
+    if (extra) wl_evaluation_control_release(control);
+    return rc;
+}
+#define WL_SOURCE_EARLY_REARM(bank, index) \
+        wl_evaluation_control_source_bank_test_early_rearm((bank), (index))
+#else
+#define WL_SOURCE_EARLY_REARM(bank, index) \
+        wl_evaluation_control_source_bank_rearm_phase((bank), (index))
+#endif
+
 /* BANK mutex held. Each successful actual charge is recorded exactly once. */
 static int
 wl_evaluation_control_source_bank_charge(
@@ -743,6 +934,71 @@ wl_evaluation_control_source_bank_finish_phase(
         abort();
     lane->report_verified = true;
     lane->running = false;
+    return finished;
+}
+
+/* Constructor-only financial commit. The canonical BANK mutex is held;
+ * neither this lane nor its control is a Native loan. Keep its actual
+ * checkpoint, publication and report readback under one control lock. */
+static int
+wl_evaluation_control_source_bank_finish_constructor_phase(
+    wl_evaluation_control_source_bank_t *bank, unsigned index,
+    const wl_evaluation_control_source_context_t *context)
+{
+    if (!bank || bank->identity != bank
+        || index >= WL_EVALUATION_CONTROL_SOURCE_LANES || !context
+        || context->identity != context || context->bank != bank
+        || context->lane != index
+        || context->thread_cookie !=
+        &wl_evaluation_control_source_thread_cookie)
+        abort();
+    wl_evaluation_control_source_lane_state_t *lane = &bank->lanes[index];
+    wl_evaluation_control_t *control = lane->control;
+    if (lane->context != context || !lane->running || lane->callback_active
+        || !lane->id || !control) abort();
+    if (wl_mutex_lock(&control->mutex)) abort();
+    uint64_t references = (uint64_t)atomic_fetch_add_explicit(
+        &control->references, 0, memory_order_relaxed);
+    if (control->source_bank_class != bank || control->owner != lane
+        || !control->active || control->attempt_id != lane->id
+        || wl_evaluation_control_active_attempt_id(control) != lane->id
+        || control->configured_limit !=
+        WL_EVALUATION_CONTROL_SOURCE_PHASE_CAPACITY
+        || control->attempt_limit != WL_EVALUATION_CONTROL_SOURCE_PHASE_CAPACITY
+        || control->consumed != lane->charged_total
+        || control->consumed > control->attempt_limit || references != 2
+        || control->accounting_error
+        || (control->stop != WL_EVALUATION_CONTROL_NONE
+        && control->stop != WL_EVALUATION_CONTROL_CANCELLED
+        && control->stop != WL_EVALUATION_CONTROL_WORK_LIMIT)) abort();
+    /* Same lock order and real saved-generation observation as the old
+     * phase, without a second FINISH/report lock or inactive-ID read. */
+    (void)wl_evaluation_control_charge_locked(control, 0);
+    int execution_status = control->accounting_error;
+    int finished = execution_status ? execution_status : (int)control->stop;
+    control->completed = (wl_evaluation_control_report_t){
+        .attempt_id = control->attempt_id,
+        .limit = control->attempt_limit,
+        .consumed = control->consumed,
+        .stop_reason = control->stop,
+        .execution_status = execution_status,
+        .cleanup_status = 0,
+        .result = finished,
+    };
+    control->active = false;
+    uint64_t previous = (uint64_t)atomic_exchange_explicit(
+        &control->active_attempt_id, 0, memory_order_release);
+    if (previous != lane->id
+        || control->completed.attempt_id != lane->id
+        || control->completed.limit !=
+        WL_EVALUATION_CONTROL_SOURCE_PHASE_CAPACITY
+        || control->completed.consumed != lane->charged_total
+        || control->completed.execution_status ||
+        control->completed.cleanup_status
+        || control->completed.stop_reason != finished
+        || control->completed.result != finished) abort();
+    lane->report_verified = true; lane->running = false;
+    if (wl_mutex_unlock(&control->mutex)) abort();
     return finished;
 }
 
@@ -984,6 +1240,72 @@ wl_evaluation_control_source_bank_run_lexical(
 void (*wl_evaluation_control_test_source_pair_checkpoint)(void);
 #endif
 
+/* Private Source construction uses this additive issuer; the general
+ * lexical and pair kernels retain their literal lifecycle. */
+wl_evaluation_control_source_phase_result_t
+wl_evaluation_control_source_bank_run_lexical_constructor(
+    wl_evaluation_control_source_bank_t *bank,
+    wl_evaluation_control_source_lane_t index,
+    const wl_evaluation_control_source_phase_policy_t *policy,
+    wl_evaluation_control_source_action_fn action, void *payload)
+{
+    wl_evaluation_control_source_phase_result_t result = {EINVAL, 0, false};
+    if (!bank || bank->identity != bank
+        || (unsigned)index >= WL_EVALUATION_CONTROL_SOURCE_LANES
+        || !policy || !action || payload == bank
+        || !policy->bootstrap_work || !policy->current_work
+        || !policy->close_work
+        || policy->bootstrap_work > WL_EVALUATION_CONTROL_QUANTUM
+        || policy->current_work > WL_EVALUATION_CONTROL_QUANTUM
+        || policy->close_work > WL_EVALUATION_CONTROL_QUANTUM)
+        return result;
+    int rc = wl_evaluation_control_source_bank_lock(bank);
+    if (rc) {
+        result.financial_result = rc; return result;
+    }
+    wl_evaluation_control_source_lane_state_t *lane = &bank->lanes[index];
+    if (bank->closing || lane->context || lane->running
+        || lane->callback_active) {
+        wl_evaluation_control_source_bank_unlock(bank);
+        result.financial_result = EBUSY;
+        return result;
+    }
+    wl_evaluation_control_source_context_t context = {
+        .identity = &context, .bank = bank, .lane = (unsigned)index,
+        .thread_cookie = &wl_evaluation_control_source_thread_cookie
+    };
+    lane->context = &context;
+    rc = wl_evaluation_control_source_bank_rearm_phase(bank, (unsigned)index);
+    if (!rc) rc = wl_evaluation_control_begin(lane->control, lane);
+    if (rc) {
+        lane->context = NULL;
+        wl_evaluation_control_source_bank_unlock(bank);
+        result.financial_result = rc;
+        return result;
+    }
+    lane->id = wl_evaluation_control_active_attempt_id(lane->control);
+    if (!lane->id) abort();
+    lane->running = true;
+    rc = wl_evaluation_control_source_bank_charge(lane, policy->bootstrap_work);
+    if (!rc) rc = wl_evaluation_control_source_bank_charge(lane,
+                policy->current_work);
+    if (!rc) {
+        lane->callback_active = true;
+        wl_evaluation_control_source_bank_unlock(bank);
+        result.action_result = action(payload);
+        result.action_called = true;
+        if (wl_evaluation_control_source_bank_lock(bank)) abort();
+        lane->callback_active = false;
+        rc = wl_evaluation_control_source_bank_charge(lane, policy->close_work);
+    }
+    int finished = wl_evaluation_control_source_bank_finish_constructor_phase(
+        bank, (unsigned)index, &context);
+    result.financial_result = rc ? rc : finished;
+    lane->context = NULL;
+    wl_evaluation_control_source_bank_unlock(bank);
+    return result;
+}
+
 wl_evaluation_control_source_pair_result_t
 wl_evaluation_control_source_bank_run_lexical_pair(
     wl_evaluation_control_source_bank_t *bank,
@@ -1071,6 +1393,1038 @@ wl_evaluation_control_source_bank_run_lexical_pair(
     int finished = wl_evaluation_control_source_bank_finish_phase(lane);
     result.financial_result = rc ? rc : finished;
     lane->context = NULL;
+    wl_evaluation_control_source_bank_unlock(bank);
+    return result;
+}
+
+#ifdef WL_SESSION_TEST_HOOKS
+unsigned wl_evaluation_control_test_source_final_cancel_at;
+unsigned wl_evaluation_control_test_source_final_geometry_fault;
+
+static void
+wl_evaluation_control_source_final_test_geometry(
+    const wl_evaluation_control_source_bank_t *bank,
+    wl_evaluation_control_source_extent_t *payload)
+{
+    unsigned fault = wl_evaluation_control_test_source_final_geometry_fault;
+    if (fault && fault <= WL_EVALUATION_CONTROL_SOURCE_LANES) {
+        wl_evaluation_control_test_source_final_geometry_fault = 0;
+        payload->base = (const unsigned char *)bank->lanes[fault - 1].control +
+            1;
+        payload->bytes = 1;
+    }
+}
+#define WL_SOURCE_FINAL_GEOMETRY(type, name, input, bank) \
+        type name = *(input); \
+        (wl_evaluation_control_source_final_test_geometry)((bank), \
+        &name.payload)
+static bool
+wl_evaluation_control_source_final_test_closed(
+    const wl_evaluation_control_source_bank_t *bank,
+    const wl_evaluation_control_source_lane_state_t *lane,
+    unsigned cancelled)
+{
+    wl_evaluation_control_t *control = lane->control;
+    const wl_evaluation_control_report_t *r = &control->completed;
+    return control->source_bank_class == bank && control->owner == lane
+           && !control->active &&
+           !wl_evaluation_control_active_attempt_id(control)
+           && control->identity && control->attempt_id == lane->id
+           && control->configured_limit ==
+           WL_EVALUATION_CONTROL_SOURCE_PHASE_CAPACITY
+           && control->attempt_limit ==
+           WL_EVALUATION_CONTROL_SOURCE_PHASE_CAPACITY
+           && control->consumed == lane->charged_total &&
+           !control->accounting_error
+           && control->stop == WL_EVALUATION_CONTROL_CANCELLED
+           && atomic_fetch_add_explicit(&control->references, 0,
+               memory_order_relaxed) == 2
+           && atomic_fetch_add_explicit(&control->cancelled, 0,
+               memory_order_relaxed) == cancelled
+           && r->attempt_id == lane->id && r->limit == control->attempt_limit
+           && r->consumed == lane->charged_total && !r->execution_status &&
+           !r->cleanup_status
+           && r->stop_reason == WL_EVALUATION_CONTROL_CANCELLED
+           && r->result == WL_EVALUATION_CONTROL_CANCELLED;
+}
+
+unsigned wl_evaluation_control_test_source_early_report_fault;
+
+int
+wl_evaluation_control_test_source_early_report(
+    wl_evaluation_control_source_bank_t *bank,
+    wl_evaluation_control_source_lane_t index,
+    wl_evaluation_control_report_t *out)
+{
+    if (!bank || bank->identity != bank || !out
+        || (unsigned)index >= WL_EVALUATION_CONTROL_SOURCE_LANES) return EINVAL;
+    int rc = wl_evaluation_control_source_bank_lock(bank);
+    if (rc) return rc;
+    unsigned fault = wl_evaluation_control_test_source_early_report_fault;
+    wl_evaluation_control_test_source_early_report_fault = 0;
+    if (fault == 1 || fault == 2)
+        out =
+            (wl_evaluation_control_report_t *)((unsigned char *)bank->lanes[
+                fault - 1].control + 1);
+    uintptr_t begin = (uintptr_t)out;
+    if (sizeof(*out) > UINTPTR_MAX - begin) {
+        wl_evaluation_control_source_bank_unlock(bank); return EINVAL;
+    }
+    uintptr_t end = begin + sizeof(*out);
+    const void *allocations[3] = {bank, bank->lanes[0].control,
+                                  bank->lanes[1].control};
+    const size_t sizes[3] = {sizeof(*bank), sizeof(wl_evaluation_control_t),
+                             sizeof(wl_evaluation_control_t)};
+    for (unsigned i = 0; i < 3; ++i) {
+        uintptr_t address = (uintptr_t)allocations[i];
+        if (!address || sizes[i] > UINTPTR_MAX - address
+            || (begin < address + sizes[i] && address < end)) {
+            wl_evaluation_control_source_bank_unlock(bank); return EINVAL;
+        }
+    }
+    wl_evaluation_control_source_lane_state_t *lane = &bank->lanes[index];
+    if (bank->closing || lane->context || lane->running || lane->callback_active
+        || !lane->control || !lane->id || !lane->report_verified) {
+        wl_evaluation_control_source_bank_unlock(bank); return EBUSY;
+    }
+    wl_evaluation_control_t *control = lane->control;
+    if (wl_mutex_lock(&control->mutex)) {
+        wl_evaluation_control_source_bank_unlock(bank); return EIO;
+    }
+    bool extra_ref = false;
+    if (fault == 3) {
+        rc = wl_evaluation_control_retain(control);
+        if (rc) {
+            if (wl_mutex_unlock(&control->mutex)) abort();
+            wl_evaluation_control_source_bank_unlock(bank); return rc;
+        }
+        extra_ref = true;
+    }
+    const wl_evaluation_control_report_t *r = &control->completed;
+    bool valid = control->source_bank_class == bank && control->owner == lane
+        && atomic_fetch_add_explicit(&control->references, 0,
+            memory_order_relaxed) == 2
+        && !control->active && !wl_evaluation_control_active_attempt_id(control)
+        && control->identity && control->attempt_id == lane->id
+        && control->configured_limit ==
+        WL_EVALUATION_CONTROL_SOURCE_PHASE_CAPACITY
+        && control->attempt_limit == WL_EVALUATION_CONTROL_SOURCE_PHASE_CAPACITY
+        && control->consumed == lane->charged_total &&
+        control->consumed <= control->attempt_limit
+        && !control->accounting_error
+        && (control->stop == WL_EVALUATION_CONTROL_NONE
+        || control->stop == WL_EVALUATION_CONTROL_CANCELLED
+        || control->stop == WL_EVALUATION_CONTROL_WORK_LIMIT)
+        && r->attempt_id == lane->id && r->limit == control->attempt_limit
+        && r->consumed == control->consumed && !r->execution_status &&
+        !r->cleanup_status
+        && r->stop_reason == control->stop && r->result == (int)control->stop;
+    if (valid) *out = *r;
+    if (wl_mutex_unlock(&control->mutex)) abort();
+    if (extra_ref) wl_evaluation_control_release(control);
+    wl_evaluation_control_source_bank_unlock(bank);
+    return valid ? 0 : EINVAL;
+}
+
+int
+wl_evaluation_control_test_source_final_reset_cancel(
+    wl_evaluation_control_source_bank_t *bank,
+    wl_evaluation_control_source_lane_t index)
+{
+    if (!bank || bank->identity != bank
+        || (unsigned)index >= WL_EVALUATION_CONTROL_SOURCE_LANES) return EINVAL;
+    int rc = wl_evaluation_control_source_bank_lock(bank);
+    if (rc) return rc;
+    wl_evaluation_control_source_lane_state_t *lane = &bank->lanes[index];
+    if (bank->closing || lane->context || lane->running || lane->callback_active
+        || !lane->control || !lane->id || !lane->report_verified) {
+        wl_evaluation_control_source_bank_unlock(bank); return EBUSY;
+    }
+    wl_evaluation_control_t *control = lane->control;
+    if (wl_mutex_lock(&control->mutex)) {
+        wl_evaluation_control_source_bank_unlock(bank); return EIO;
+    }
+    bool valid = wl_evaluation_control_source_final_test_closed(bank, lane, 1);
+    uint64_t identity = control->identity;
+    wl_evaluation_control_report_t frozen = control->completed;
+    if (wl_mutex_unlock(&control->mutex)) abort();
+    /* reset acquires the control mutex itself. BANK remains locked, so no
+     * other phase can start between actual validation, reset and readback. */
+    rc = valid ? wl_evaluation_control_reset(control) : EINVAL;
+    if (!rc) {
+        if (wl_mutex_lock(&control->mutex)) abort();
+        const wl_evaluation_control_report_t *r = &control->completed;
+        if (!wl_evaluation_control_source_final_test_closed(bank, lane, 0)
+            || control->identity != identity ||
+            r->attempt_id != frozen.attempt_id
+            || r->limit != frozen.limit || r->consumed != frozen.consumed
+            || r->stop_reason != frozen.stop_reason ||
+            r->result != frozen.result
+            || r->execution_status != frozen.execution_status
+            || r->cleanup_status != frozen.cleanup_status) abort();
+        if (wl_mutex_unlock(&control->mutex)) abort();
+    }
+    wl_evaluation_control_source_bank_unlock(bank);
+    return rc;
+}
+
+static void
+wl_evaluation_control_source_final_test_event(
+    wl_evaluation_control_source_lane_state_t *lane,
+    unsigned event)
+{
+    if (wl_evaluation_control_test_source_final_cancel_at == event) {
+        wl_evaluation_control_test_source_final_cancel_at = 0;
+        wl_evaluation_control_request_cancel(lane->control);
+    }
+}
+#define WL_SOURCE_FINAL_TEST_EVENT(lane, event) \
+        wl_evaluation_control_source_final_test_event(lane, event)
+#else
+#define WL_SOURCE_FINAL_TEST_EVENT(lane, event) ((void)0)
+#define WL_SOURCE_FINAL_GEOMETRY(type, name, input, \
+            bank) const type name = *(input)
+#endif
+
+/* FINAL geometry is fixed financial metadata, not Native authority.  Each
+ * group is followed by the real saved BANK checkpoint before the next group.
+ * Inputs are accessible immutable typed objects throughout this call. */
+static bool
+wl_evaluation_control_source_extent_valid(
+    wl_evaluation_control_source_extent_t e)
+{
+    return e.base && e.bytes && e.bytes <= UINTPTR_MAX - (uintptr_t)e.base;
+}
+
+static bool
+wl_evaluation_control_source_extent_overlap(
+    wl_evaluation_control_source_extent_t a,
+    wl_evaluation_control_source_extent_t b)
+{
+    uintptr_t x = (uintptr_t)a.base, y = (uintptr_t)b.base;
+    return x < y + b.bytes && y < x + a.bytes;
+}
+
+static int
+wl_evaluation_control_source_final_cut(
+    wl_evaluation_control_source_lane_state_t *lane,
+    int *financial)
+{
+    int rc = wl_evaluation_control_source_bank_charge(lane, 0);
+    if (rc) *financial = rc;
+    return rc;
+}
+
+static int
+wl_evaluation_control_source_final_geometry(
+    wl_evaluation_control_source_bank_t *bank,
+    wl_evaluation_control_source_lane_state_t *lane,
+    const wl_evaluation_control_source_extent_t *objects, unsigned count,
+    wl_evaluation_control_source_extent_t geometry,
+    wl_evaluation_control_source_extent_t policy,
+    wl_evaluation_control_t *normal_source,
+    const wl_evaluation_control_lexical_finance_expectation_t *expectation,
+    int *financial)
+{
+    if (!wl_evaluation_control_source_extent_valid(geometry)
+        || !wl_evaluation_control_source_extent_valid(policy)) return EINVAL;
+    for (unsigned i = 0; i < count; ++i) {
+        if (!wl_evaluation_control_source_extent_valid(
+                objects[i])) return EINVAL;
+        int rc = wl_evaluation_control_source_final_cut(lane, financial);
+        if (rc) return rc;
+    }
+    /* Snapshot storage and immutable input policy must not alias writable
+     * objects. Their complete values are copied before any callback too. */
+    for (unsigned i = 0; i < count; ++i) {
+        if (wl_evaluation_control_source_extent_overlap(objects[i], geometry)
+            || wl_evaluation_control_source_extent_overlap(objects[i],
+            policy)) return EINVAL;
+        for (unsigned j = 0; j < i; ++j)
+            if (wl_evaluation_control_source_extent_overlap(objects[i],
+                objects[j])) return EINVAL;
+        int rc = wl_evaluation_control_source_final_cut(lane, financial);
+        if (rc) return rc;
+    }
+    wl_evaluation_control_source_extent_t private_objects[4] = {
+        {bank, sizeof(*bank)},
+        {bank->lanes[0].control, sizeof(wl_evaluation_control_t)},
+        {bank->lanes[1].control, sizeof(wl_evaluation_control_t)},
+        {normal_source, normal_source ? sizeof(*normal_source) : 0}
+    };
+    unsigned private_count = normal_source ? 4u : 3u;
+    for (unsigned i = 0; i < private_count; ++i) {
+        if (!wl_evaluation_control_source_extent_valid(
+                private_objects[i])) return EINVAL;
+        if (wl_evaluation_control_source_extent_overlap(private_objects[i],
+            geometry)
+            || wl_evaluation_control_source_extent_overlap(private_objects[i],
+            policy)) return EINVAL;
+        for (unsigned j = 0; j < count; ++j)
+            if (wl_evaluation_control_source_extent_overlap(private_objects[i],
+                objects[j])) return EINVAL;
+        int rc = wl_evaluation_control_source_final_cut(lane, financial);
+        if (rc) return rc;
+    }
+    if (normal_source) {
+        int rc =
+            wl_evaluation_control_lexical_finance_prove_checked(normal_source,
+                expectation);
+        if (rc) return rc;
+        return wl_evaluation_control_source_final_cut(lane, financial);
+    }
+    return 0;
+}
+
+wl_evaluation_control_source_final_pair_result_t
+wl_evaluation_control_source_bank_run_lexical_pair_final(
+    wl_evaluation_control_source_bank_t *bank,
+    wl_evaluation_control_source_lane_t index,
+    const wl_evaluation_control_source_pair_policy_t *policy,
+    const wl_evaluation_control_source_final_pair_geometry_t *geometry,
+    wl_evaluation_control_source_action_fn first,
+    wl_evaluation_control_source_action_fn second)
+{
+    wl_evaluation_control_source_final_pair_result_t result =
+    {.financial_result = EINVAL};
+    if (!bank || bank->identity != bank
+        || (unsigned)index >= WL_EVALUATION_CONTROL_SOURCE_LANES
+        || !policy || !geometry || !first || !second
+        || !policy->bootstrap_work || !policy->first_work
+        || !policy->second_work || !policy->close_work
+        || policy->bootstrap_work > WL_EVALUATION_CONTROL_QUANTUM
+        || policy->first_work > WL_EVALUATION_CONTROL_QUANTUM
+        || policy->second_work > WL_EVALUATION_CONTROL_QUANTUM
+        || policy->close_work > WL_EVALUATION_CONTROL_QUANTUM) return result;
+    uint64_t first_three = policy->bootstrap_work + policy->first_work +
+        policy->second_work;
+    if (policy->close_work >
+        WL_EVALUATION_CONTROL_SOURCE_PHASE_CAPACITY - first_three)
+        return result;
+    int rc = wl_evaluation_control_source_bank_lock(bank);
+    if (rc) {
+        result.financial_result = rc; return result;
+    }
+    wl_evaluation_control_source_lane_state_t *lane = &bank->lanes[index];
+    if (bank->closing || lane->context || lane->running ||
+        lane->callback_active){
+        wl_evaluation_control_source_bank_unlock(bank);
+        result.financial_result = EBUSY; return result;
+    }
+    wl_evaluation_control_source_context_t context = {
+        .identity = &context, .bank = bank, .lane = (unsigned)index,
+        .thread_cookie = &wl_evaluation_control_source_thread_cookie
+    };
+    lane->context = &context;
+    rc = wl_evaluation_control_source_bank_rearm_phase(bank, (unsigned)index);
+    if (!rc) rc = wl_evaluation_control_begin(lane->control, lane);
+    if (rc) {
+        lane->context = NULL;
+        wl_evaluation_control_source_bank_unlock(bank);
+        result.financial_result = rc; return result;
+    }
+    result.phase_started = true;
+    lane->id = wl_evaluation_control_active_attempt_id(lane->control);
+    if (!lane->id) abort();
+    lane->running = true;
+    WL_SOURCE_FINAL_TEST_EVENT(lane,
+        WL_EVALUATION_CONTROL_TEST_SOURCE_FINAL_AFTER_BEGIN);
+    rc = wl_evaluation_control_source_bank_charge(lane, policy->bootstrap_work);
+    if (!rc) rc = wl_evaluation_control_source_bank_charge(lane,
+                policy->first_work);
+    if (!rc) {
+        WL_SOURCE_FINAL_GEOMETRY(
+            wl_evaluation_control_source_final_pair_geometry_t, g, geometry,
+            bank);
+        const wl_evaluation_control_source_pair_policy_t paid = *policy;
+        const wl_evaluation_control_source_extent_t objects[5] = {
+            g.session, g.record, g.scope, g.payload, g.journal
+        };
+        int check = !g.source_control
+            || g.source_expectation.owner != g.record.base
+            || g.source_expectation.owner_bytes != g.record.bytes
+            || g.source_expectation.scope != g.scope.base
+            || g.source_expectation.scope_bytes != g.scope.bytes ? EINVAL : 0;
+        if (!check) check = wl_evaluation_control_source_final_geometry(bank,
+                    lane,
+                    objects, 5,
+                    (wl_evaluation_control_source_extent_t){geometry,
+                                                            sizeof(*geometry)},
+                    (wl_evaluation_control_source_extent_t){policy,
+                                                            sizeof(*policy)},
+                    g.source_control, &g.source_expectation, &rc);
+        if (check) result.first_result = check;
+        else {
+            lane->callback_active = true;
+            wl_evaluation_control_source_bank_unlock(bank);
+            result.first_result = first((void *)g.scope.base);
+            result.first_called = true;
+            if (wl_evaluation_control_source_bank_lock(bank)) abort();
+            lane->callback_active = false;
+            WL_SOURCE_FINAL_TEST_EVENT(lane,
+                WL_EVALUATION_CONTROL_TEST_SOURCE_FINAL_AFTER_FIRST);
+            /* A may have freed the normal Source. Never follow that saved
+             * control again. Only BANK owns this real bridge checkpoint. */
+            rc = wl_evaluation_control_source_bank_charge(lane, 0);
+#ifdef WL_SESSION_TEST_HOOKS
+            if (!rc && wl_evaluation_control_test_source_pair_checkpoint)
+                wl_evaluation_control_test_source_pair_checkpoint();
+#endif
+            if (!rc && !result.first_result) {
+                rc = wl_evaluation_control_source_bank_charge(lane,
+                        paid.second_work);
+                if (!rc) {
+                    lane->callback_active = true;
+                    wl_evaluation_control_source_bank_unlock(bank);
+                    result.second_result = second((void *)g.payload.base);
+                    result.second_called = true;
+                    if (wl_evaluation_control_source_bank_lock(bank)) abort();
+                    lane->callback_active = false;
+                    WL_SOURCE_FINAL_TEST_EVENT(lane,
+                        WL_EVALUATION_CONTROL_TEST_SOURCE_FINAL_AFTER_SECOND);
+                }
+            }
+            if (!rc) rc = wl_evaluation_control_source_bank_charge(lane,
+                        paid.close_work);
+        }
+    }
+    int finished =
+        wl_evaluation_control_source_bank_finish_constructor_phase(bank,
+            (unsigned)index, &context);
+    result.financial_result = rc ? rc : finished;
+    lane->context = NULL;
+    result.phase_finished = true;
+    wl_evaluation_control_source_bank_unlock(bank);
+    return result;
+}
+
+wl_evaluation_control_source_final_result_t
+wl_evaluation_control_source_bank_run_lexical_final(
+    wl_evaluation_control_source_bank_t *bank,
+    wl_evaluation_control_source_lane_t index,
+    const wl_evaluation_control_source_phase_policy_t *policy,
+    const wl_evaluation_control_source_final_geometry_t *geometry,
+    wl_evaluation_control_source_action_fn action)
+{
+    wl_evaluation_control_source_final_result_t result =
+    {.financial_result = EINVAL};
+    if (!bank || bank->identity != bank
+        || (unsigned)index >= WL_EVALUATION_CONTROL_SOURCE_LANES
+        || !policy || !geometry || !action
+        || !policy->bootstrap_work || !policy->current_work ||
+        !policy->close_work
+        || policy->bootstrap_work > WL_EVALUATION_CONTROL_QUANTUM
+        || policy->current_work > WL_EVALUATION_CONTROL_QUANTUM
+        || policy->close_work > WL_EVALUATION_CONTROL_QUANTUM) return result;
+    int rc = wl_evaluation_control_source_bank_lock(bank);
+    if (rc) {
+        result.financial_result = rc; return result;
+    }
+    wl_evaluation_control_source_lane_state_t *lane = &bank->lanes[index];
+    if (bank->closing || lane->context || lane->running ||
+        lane->callback_active){
+        wl_evaluation_control_source_bank_unlock(bank);
+        result.financial_result = EBUSY; return result;
+    }
+    wl_evaluation_control_source_context_t context = {
+        .identity = &context, .bank = bank, .lane = (unsigned)index,
+        .thread_cookie = &wl_evaluation_control_source_thread_cookie
+    };
+    lane->context = &context;
+    rc = wl_evaluation_control_source_bank_rearm_phase(bank, (unsigned)index);
+    if (!rc) rc = wl_evaluation_control_begin(lane->control, lane);
+    if (rc) {
+        lane->context = NULL;
+        wl_evaluation_control_source_bank_unlock(bank);
+        result.financial_result = rc; return result;
+    }
+    result.phase_started = true;
+    lane->id = wl_evaluation_control_active_attempt_id(lane->control);
+    if (!lane->id) abort();
+    lane->running = true;
+    WL_SOURCE_FINAL_TEST_EVENT(lane,
+        WL_EVALUATION_CONTROL_TEST_SOURCE_FINAL_AFTER_BEGIN);
+    rc = wl_evaluation_control_source_bank_charge(lane, policy->bootstrap_work);
+    if (!rc) rc = wl_evaluation_control_source_bank_charge(lane,
+                policy->current_work);
+    if (!rc) {
+        WL_SOURCE_FINAL_GEOMETRY(wl_evaluation_control_source_final_geometry_t,
+            g, geometry, bank);
+        const wl_evaluation_control_source_phase_policy_t paid = *policy;
+        const wl_evaluation_control_source_extent_t objects[3] = {g.session,
+                                                                  g.payload,
+                                                                  g.journal};
+        int check = wl_evaluation_control_source_final_geometry(bank, lane,
+                objects, 3,
+                (wl_evaluation_control_source_extent_t){geometry,
+                                                        sizeof(*geometry)},
+                (wl_evaluation_control_source_extent_t){policy,
+                                                        sizeof(*policy)}, NULL,
+                NULL, &rc);
+        if (check) result.action_result = check;
+        else {
+            lane->callback_active = true;
+            wl_evaluation_control_source_bank_unlock(bank);
+            result.action_result = action((void *)g.payload.base);
+            result.action_called = true;
+            if (wl_evaluation_control_source_bank_lock(bank)) abort();
+            lane->callback_active = false;
+            WL_SOURCE_FINAL_TEST_EVENT(lane,
+                WL_EVALUATION_CONTROL_TEST_SOURCE_FINAL_AFTER_ACTION);
+            rc = wl_evaluation_control_source_bank_charge(lane,
+                    paid.close_work);
+        }
+    }
+    int finished =
+        wl_evaluation_control_source_bank_finish_constructor_phase(bank,
+            (unsigned)index, &context);
+    result.financial_result = rc ? rc : finished;
+    lane->context = NULL;
+    result.phase_finished = true;
+    wl_evaluation_control_source_bank_unlock(bank);
+    return result;
+}
+
+/* Additive sealed issuer. Rearm has proved this actual private lane while
+ * the BANK mutex remains held. The new check observes its own real BEGIN. */
+typedef struct {
+    int protocol, checkpoint;
+    bool started;
+} wl_evaluation_control_source_early_begin_t;
+
+#ifdef WL_SESSION_TEST_HOOKS
+bool wl_evaluation_control_test_source_early_cancel_once;
+#endif
+
+static wl_evaluation_control_source_early_begin_t
+wl_evaluation_control_source_bank_begin_checkpoint(
+    wl_evaluation_control_source_lane_state_t *lane)
+{
+    wl_evaluation_control_source_early_begin_t result = {0};
+    wl_evaluation_control_t *control = lane->control;
+    wl_mutex_lock(&control->mutex);
+    int rc = control->owner != lane ? EINVAL : control->active ? EBUSY : 0;
+    if (!rc && control->attempt_id == UINT64_MAX) rc = EOVERFLOW;
+    if (!rc) {
+        control->active = true;
+        ++control->attempt_id;
+        control->attempt_limit = control->configured_limit;
+        control->consumed = 0;
+        control->stop = WL_EVALUATION_CONTROL_NONE;
+        control->accounting_error = 0;
+        (void)atomic_exchange_explicit(&control->active_attempt_id,
+            control->attempt_id, memory_order_release);
+#ifdef WL_SESSION_TEST_HOOKS
+        if (wl_evaluation_control_test_source_early_cancel_once) {
+            wl_evaluation_control_test_source_early_cancel_once = false;
+            wl_evaluation_control_request_cancel(control);
+        }
+#endif
+        result.checkpoint = wl_evaluation_control_charge_locked(control, 0);
+        lane->id = control->attempt_id;
+        lane->running = true;
+        result.started = true;
+    }
+    result.protocol = rc;
+    wl_mutex_unlock(&control->mutex);
+    return result;
+}
+
+wl_evaluation_control_source_early_result_t
+wl_evaluation_control_source_bank_run_lexical_early(
+    wl_evaluation_control_source_bank_t *bank,
+    wl_evaluation_control_source_lane_t index,
+    const wl_evaluation_control_source_phase_policy_t *policy,
+    wl_evaluation_control_source_action_fn action, void *payload)
+{
+    wl_evaluation_control_source_early_result_t result = {
+        .protocol = EINVAL, .financial_result = EINVAL
+    };
+    if (!bank || bank->identity != bank
+        || (unsigned)index >= WL_EVALUATION_CONTROL_SOURCE_LANES
+        || !policy || !action || payload == bank
+        || !policy->bootstrap_work || !policy->current_work
+        || !policy->close_work
+        || policy->bootstrap_work > WL_EVALUATION_CONTROL_QUANTUM
+        || policy->current_work > WL_EVALUATION_CONTROL_QUANTUM
+        || policy->close_work > WL_EVALUATION_CONTROL_QUANTUM)
+        return result;
+    result.protocol = 0;
+    int rc = wl_evaluation_control_source_bank_lock(bank);
+    if (rc) {
+        result.protocol = rc; result.financial_result = rc; return result;
+    }
+    wl_evaluation_control_source_lane_state_t *lane = &bank->lanes[index];
+    if (bank->closing || lane->context || lane->running
+        || lane->callback_active) {
+        wl_evaluation_control_source_bank_unlock(bank);
+        result.protocol = EBUSY; result.financial_result = EBUSY;
+        return result;
+    }
+    wl_evaluation_control_source_context_t context = {
+        .identity = &context, .bank = bank, .lane = (unsigned)index,
+        .thread_cookie = &wl_evaluation_control_source_thread_cookie
+    };
+    lane->context = &context;
+    rc = WL_SOURCE_EARLY_REARM(bank, (unsigned)index);
+    if (rc) {
+        lane->context = NULL;
+        wl_evaluation_control_source_bank_unlock(bank);
+        result.protocol = rc; result.financial_result = rc;
+        return result;
+    }
+    wl_evaluation_control_source_early_begin_t begun =
+        wl_evaluation_control_source_bank_begin_checkpoint(lane);
+    result.begin_protocol = begun.protocol;
+    result.checkpoint_result = begun.checkpoint;
+    if (!begun.started) {
+        lane->context = NULL;
+        wl_evaluation_control_source_bank_unlock(bank);
+        result.protocol = begun.protocol;
+        result.financial_result = begun.protocol;
+        return result;
+    }
+    result.phase_started = true;
+    rc = begun.checkpoint;
+    if (!rc) rc = wl_evaluation_control_source_bank_charge(lane,
+                policy->bootstrap_work);
+    if (!rc) rc = wl_evaluation_control_source_bank_charge(lane,
+                policy->current_work);
+    if (!rc) {
+        lane->callback_active = true;
+        wl_evaluation_control_source_bank_unlock(bank);
+        result.first_result = action(payload);
+        result.first_called = true;
+        if (wl_evaluation_control_source_bank_lock(bank)) abort();
+        lane->callback_active = false;
+        WL_SOURCE_FINAL_TEST_EVENT(lane,
+            WL_EVALUATION_CONTROL_TEST_SOURCE_FINAL_AFTER_ACTION);
+        rc = wl_evaluation_control_source_bank_charge(lane, policy->close_work);
+    }
+    int finished = wl_evaluation_control_source_bank_finish_phase(lane);
+    result.financial_result = rc ? rc : finished;
+    lane->context = NULL;
+    result.phase_finished = true;
+    wl_evaluation_control_source_bank_unlock(bank);
+    return result;
+}
+
+wl_evaluation_control_source_early_result_t
+wl_evaluation_control_source_bank_run_lexical_constructor_early(
+    wl_evaluation_control_source_bank_t *bank,
+    wl_evaluation_control_source_lane_t index,
+    const wl_evaluation_control_source_phase_policy_t *policy,
+    wl_evaluation_control_source_action_fn action, void *payload)
+{
+    wl_evaluation_control_source_early_result_t result = {
+        .protocol = EINVAL, .financial_result = EINVAL
+    };
+    if (!bank || bank->identity != bank
+        || (unsigned)index >= WL_EVALUATION_CONTROL_SOURCE_LANES
+        || !policy || !action || payload == bank
+        || !policy->bootstrap_work || !policy->current_work
+        || !policy->close_work
+        || policy->bootstrap_work > WL_EVALUATION_CONTROL_QUANTUM
+        || policy->current_work > WL_EVALUATION_CONTROL_QUANTUM
+        || policy->close_work > WL_EVALUATION_CONTROL_QUANTUM)
+        return result;
+    result.protocol = 0;
+    int rc = wl_evaluation_control_source_bank_lock(bank);
+    if (rc) {
+        result.protocol = rc; result.financial_result = rc; return result;
+    }
+    wl_evaluation_control_source_lane_state_t *lane = &bank->lanes[index];
+    if (bank->closing || lane->context || lane->running
+        || lane->callback_active) {
+        wl_evaluation_control_source_bank_unlock(bank);
+        result.protocol = EBUSY; result.financial_result = EBUSY;
+        return result;
+    }
+    wl_evaluation_control_source_context_t context = {
+        .identity = &context, .bank = bank, .lane = (unsigned)index,
+        .thread_cookie = &wl_evaluation_control_source_thread_cookie
+    };
+    lane->context = &context;
+    rc = WL_SOURCE_EARLY_REARM(bank, (unsigned)index);
+    if (rc) {
+        lane->context = NULL;
+        wl_evaluation_control_source_bank_unlock(bank);
+        result.protocol = rc; result.financial_result = rc;
+        return result;
+    }
+    wl_evaluation_control_source_early_begin_t begun =
+        wl_evaluation_control_source_bank_begin_checkpoint(lane);
+    result.begin_protocol = begun.protocol;
+    result.checkpoint_result = begun.checkpoint;
+    if (!begun.started) {
+        lane->context = NULL;
+        wl_evaluation_control_source_bank_unlock(bank);
+        result.protocol = begun.protocol;
+        result.financial_result = begun.protocol;
+        return result;
+    }
+    result.phase_started = true;
+    rc = begun.checkpoint;
+    if (!rc) rc = wl_evaluation_control_source_bank_charge(lane,
+                policy->bootstrap_work);
+    if (!rc) rc = wl_evaluation_control_source_bank_charge(lane,
+                policy->current_work);
+    if (!rc) {
+        lane->callback_active = true;
+        wl_evaluation_control_source_bank_unlock(bank);
+        result.first_result = action(payload);
+        result.first_called = true;
+        if (wl_evaluation_control_source_bank_lock(bank)) abort();
+        lane->callback_active = false;
+        WL_SOURCE_FINAL_TEST_EVENT(lane,
+            WL_EVALUATION_CONTROL_TEST_SOURCE_FINAL_AFTER_ACTION);
+        rc = wl_evaluation_control_source_bank_charge(lane, policy->close_work);
+    }
+    int finished = wl_evaluation_control_source_bank_finish_constructor_phase(
+        bank, (unsigned)index, &context);
+    result.financial_result = rc ? rc : finished;
+    lane->context = NULL;
+    result.phase_finished = true;
+    wl_evaluation_control_source_bank_unlock(bank);
+    return result;
+}
+
+wl_evaluation_control_source_early_result_t
+wl_evaluation_control_source_bank_run_lexical_pair_early(
+    wl_evaluation_control_source_bank_t *bank,
+    wl_evaluation_control_source_lane_t index,
+    const wl_evaluation_control_source_pair_policy_t *policy,
+    wl_evaluation_control_source_action_fn first, void *first_payload,
+    wl_evaluation_control_source_action_fn second, void *second_payload)
+{
+    wl_evaluation_control_source_early_result_t result = {
+        .protocol = EINVAL, .financial_result = EINVAL
+    };
+    if (!bank || bank->identity != bank
+        || (unsigned)index >= WL_EVALUATION_CONTROL_SOURCE_LANES
+        || !policy || !first || !second || first_payload == bank ||
+        second_payload == bank
+        || !policy->bootstrap_work || !policy->first_work ||
+        !policy->second_work || !policy->close_work
+        || policy->bootstrap_work > WL_EVALUATION_CONTROL_QUANTUM
+        || policy->first_work > WL_EVALUATION_CONTROL_QUANTUM
+        || policy->second_work > WL_EVALUATION_CONTROL_QUANTUM
+        || policy->close_work > WL_EVALUATION_CONTROL_QUANTUM) return result;
+    /* Each validated term is at most Q. Their first three terms fit 3Q
+     * without overflow; subtraction tests the fourth before adding it. */
+    uint64_t first_three = policy->bootstrap_work + policy->first_work +
+        policy->second_work;
+    if (policy->close_work >
+        WL_EVALUATION_CONTROL_SOURCE_PHASE_CAPACITY - first_three)
+        return result;
+    result.protocol = 0;
+    int rc = wl_evaluation_control_source_bank_lock(bank);
+    if (rc) {
+        result.protocol = rc; result.financial_result = rc; return result;
+    }
+    wl_evaluation_control_source_lane_state_t *lane = &bank->lanes[index];
+    if (bank->closing || lane->context || lane->running ||
+        lane->callback_active){
+        wl_evaluation_control_source_bank_unlock(bank);
+        result.protocol = EBUSY; result.financial_result = EBUSY; return result;
+    }
+    wl_evaluation_control_source_context_t context = {
+        .identity = &context, .bank = bank, .lane = (unsigned)index,
+        .thread_cookie = &wl_evaluation_control_source_thread_cookie
+    };
+    lane->context = &context;
+    rc = WL_SOURCE_EARLY_REARM(bank, (unsigned)index);
+    if (rc) {
+        lane->context = NULL;
+        wl_evaluation_control_source_bank_unlock(bank);
+        result.protocol = rc; result.financial_result = rc;
+        return result;
+    }
+    wl_evaluation_control_source_early_begin_t begun =
+        wl_evaluation_control_source_bank_begin_checkpoint(lane);
+    result.begin_protocol = begun.protocol;
+    result.checkpoint_result = begun.checkpoint;
+    if (!begun.started) {
+        lane->context = NULL;
+        wl_evaluation_control_source_bank_unlock(bank);
+        result.protocol = begun.protocol;
+        result.financial_result = begun.protocol;
+        return result;
+    }
+    result.phase_started = true;
+    rc = begun.checkpoint;
+    if (!rc) rc = wl_evaluation_control_source_bank_charge(lane,
+                policy->bootstrap_work);
+    if (!rc) rc = wl_evaluation_control_source_bank_charge(lane,
+                policy->first_work);
+    if (!rc) {
+        lane->callback_active = true;
+        wl_evaluation_control_source_bank_unlock(bank);
+        result.first_result = first(first_payload);
+        result.first_called = true;
+        if (wl_evaluation_control_source_bank_lock(bank)) abort();
+        lane->callback_active = false;
+        WL_SOURCE_FINAL_TEST_EVENT(lane,
+            WL_EVALUATION_CONTROL_TEST_SOURCE_FINAL_AFTER_FIRST);
+        /* This is an actual check on the same still-active saved BANK
+         * generation. Neither FINISH nor report/rearm stands in for it. */
+        rc = wl_evaluation_control_source_bank_charge(lane, 0);
+#ifdef WL_SESSION_TEST_HOOKS
+        if (!rc && wl_evaluation_control_test_source_pair_checkpoint)
+            wl_evaluation_control_test_source_pair_checkpoint();
+#endif
+        if (!rc && !result.first_result) {
+            rc = wl_evaluation_control_source_bank_charge(lane,
+                    policy->second_work);
+            if (!rc) {
+                lane->callback_active = true;
+                wl_evaluation_control_source_bank_unlock(bank);
+                result.second_result = second(second_payload);
+                result.second_called = true;
+                if (wl_evaluation_control_source_bank_lock(bank)) abort();
+                lane->callback_active = false;
+            }
+        }
+        if (!rc) rc = wl_evaluation_control_source_bank_charge(lane,
+                    policy->close_work);
+    }
+    int finished = wl_evaluation_control_source_bank_finish_phase(lane);
+    result.financial_result = rc ? rc : finished;
+    lane->context = NULL;
+    result.phase_finished = true;
+    wl_evaluation_control_source_bank_unlock(bank);
+    return result;
+}
+
+wl_evaluation_control_source_early_result_t
+wl_evaluation_control_source_bank_run_lexical_final_early(
+    wl_evaluation_control_source_bank_t *bank,
+    wl_evaluation_control_source_lane_t index,
+    const wl_evaluation_control_source_phase_policy_t *policy,
+    const wl_evaluation_control_source_final_geometry_t *geometry,
+    wl_evaluation_control_source_action_fn action)
+{
+    wl_evaluation_control_source_early_result_t result = {
+        .protocol = EINVAL, .financial_result = EINVAL
+    };
+    if (!bank || bank->identity != bank
+        || (unsigned)index >= WL_EVALUATION_CONTROL_SOURCE_LANES
+        || !policy || !geometry || !action
+        || !policy->bootstrap_work || !policy->current_work ||
+        !policy->close_work
+        || policy->bootstrap_work > WL_EVALUATION_CONTROL_QUANTUM
+        || policy->current_work > WL_EVALUATION_CONTROL_QUANTUM
+        || policy->close_work > WL_EVALUATION_CONTROL_QUANTUM) return result;
+    result.protocol = 0;
+    int rc = wl_evaluation_control_source_bank_lock(bank);
+    if (rc) {
+        result.protocol = rc; result.financial_result = rc; return result;
+    }
+    wl_evaluation_control_source_lane_state_t *lane = &bank->lanes[index];
+    if (bank->closing || lane->context || lane->running ||
+        lane->callback_active){
+        wl_evaluation_control_source_bank_unlock(bank);
+        result.protocol = EBUSY; result.financial_result = EBUSY; return result;
+    }
+    wl_evaluation_control_source_context_t context = {
+        .identity = &context, .bank = bank, .lane = (unsigned)index,
+        .thread_cookie = &wl_evaluation_control_source_thread_cookie
+    };
+    lane->context = &context;
+    rc = WL_SOURCE_EARLY_REARM(bank, (unsigned)index);
+    if (rc) {
+        lane->context = NULL;
+        wl_evaluation_control_source_bank_unlock(bank);
+        result.protocol = rc; result.financial_result = rc;
+        return result;
+    }
+    wl_evaluation_control_source_early_begin_t begun =
+        wl_evaluation_control_source_bank_begin_checkpoint(lane);
+    result.begin_protocol = begun.protocol;
+    result.checkpoint_result = begun.checkpoint;
+    if (!begun.started) {
+        lane->context = NULL;
+        wl_evaluation_control_source_bank_unlock(bank);
+        result.protocol = begun.protocol;
+        result.financial_result = begun.protocol;
+        return result;
+    }
+    result.phase_started = true;
+    rc = begun.checkpoint;
+    WL_SOURCE_FINAL_TEST_EVENT(lane,
+        WL_EVALUATION_CONTROL_TEST_SOURCE_FINAL_AFTER_BEGIN);
+    if (!rc) rc = wl_evaluation_control_source_bank_charge(lane,
+                policy->bootstrap_work);
+    if (!rc) rc = wl_evaluation_control_source_bank_charge(lane,
+                policy->current_work);
+    if (!rc) {
+        WL_SOURCE_FINAL_GEOMETRY(wl_evaluation_control_source_final_geometry_t,
+            g, geometry, bank);
+        const wl_evaluation_control_source_phase_policy_t paid = *policy;
+        const wl_evaluation_control_source_extent_t objects[3] = {g.session,
+                                                                  g.payload,
+                                                                  g.journal};
+        int check = wl_evaluation_control_source_final_geometry(bank, lane,
+                objects, 3,
+                (wl_evaluation_control_source_extent_t){geometry,
+                                                        sizeof(*geometry)},
+                (wl_evaluation_control_source_extent_t){policy,
+                                                        sizeof(*policy)}, NULL,
+                NULL, &rc);
+        if (check) result.first_result = check;
+        else {
+            lane->callback_active = true;
+            wl_evaluation_control_source_bank_unlock(bank);
+            result.first_result = action((void *)g.payload.base);
+            result.first_called = true;
+            if (wl_evaluation_control_source_bank_lock(bank)) abort();
+            lane->callback_active = false;
+            WL_SOURCE_FINAL_TEST_EVENT(lane,
+                WL_EVALUATION_CONTROL_TEST_SOURCE_FINAL_AFTER_ACTION);
+            rc = wl_evaluation_control_source_bank_charge(lane,
+                    paid.close_work);
+        }
+    }
+    int finished =
+        wl_evaluation_control_source_bank_finish_constructor_phase(bank,
+            (unsigned)index, &context);
+    result.financial_result = rc ? rc : finished;
+    lane->context = NULL;
+    result.phase_finished = true;
+    wl_evaluation_control_source_bank_unlock(bank);
+    return result;
+}
+
+wl_evaluation_control_source_early_result_t
+wl_evaluation_control_source_bank_run_lexical_pair_final_early(
+    wl_evaluation_control_source_bank_t *bank,
+    wl_evaluation_control_source_lane_t index,
+    const wl_evaluation_control_source_pair_policy_t *policy,
+    const wl_evaluation_control_source_final_pair_geometry_t *geometry,
+    wl_evaluation_control_source_action_fn first,
+    wl_evaluation_control_source_action_fn second)
+{
+    wl_evaluation_control_source_early_result_t result = {
+        .protocol = EINVAL, .financial_result = EINVAL
+    };
+    if (!bank || bank->identity != bank
+        || (unsigned)index >= WL_EVALUATION_CONTROL_SOURCE_LANES
+        || !policy || !geometry || !first || !second
+        || !policy->bootstrap_work || !policy->first_work
+        || !policy->second_work || !policy->close_work
+        || policy->bootstrap_work > WL_EVALUATION_CONTROL_QUANTUM
+        || policy->first_work > WL_EVALUATION_CONTROL_QUANTUM
+        || policy->second_work > WL_EVALUATION_CONTROL_QUANTUM
+        || policy->close_work > WL_EVALUATION_CONTROL_QUANTUM) return result;
+    uint64_t first_three = policy->bootstrap_work + policy->first_work +
+        policy->second_work;
+    if (policy->close_work >
+        WL_EVALUATION_CONTROL_SOURCE_PHASE_CAPACITY - first_three)
+        return result;
+    result.protocol = 0;
+    int rc = wl_evaluation_control_source_bank_lock(bank);
+    if (rc) {
+        result.protocol = rc; result.financial_result = rc; return result;
+    }
+    wl_evaluation_control_source_lane_state_t *lane = &bank->lanes[index];
+    if (bank->closing || lane->context || lane->running ||
+        lane->callback_active){
+        wl_evaluation_control_source_bank_unlock(bank);
+        result.protocol = EBUSY; result.financial_result = EBUSY; return result;
+    }
+    wl_evaluation_control_source_context_t context = {
+        .identity = &context, .bank = bank, .lane = (unsigned)index,
+        .thread_cookie = &wl_evaluation_control_source_thread_cookie
+    };
+    lane->context = &context;
+    rc = WL_SOURCE_EARLY_REARM(bank, (unsigned)index);
+    if (rc) {
+        lane->context = NULL;
+        wl_evaluation_control_source_bank_unlock(bank);
+        result.protocol = rc; result.financial_result = rc;
+        return result;
+    }
+    wl_evaluation_control_source_early_begin_t begun =
+        wl_evaluation_control_source_bank_begin_checkpoint(lane);
+    result.begin_protocol = begun.protocol;
+    result.checkpoint_result = begun.checkpoint;
+    if (!begun.started) {
+        lane->context = NULL;
+        wl_evaluation_control_source_bank_unlock(bank);
+        result.protocol = begun.protocol;
+        result.financial_result = begun.protocol;
+        return result;
+    }
+    result.phase_started = true;
+    rc = begun.checkpoint;
+    WL_SOURCE_FINAL_TEST_EVENT(lane,
+        WL_EVALUATION_CONTROL_TEST_SOURCE_FINAL_AFTER_BEGIN);
+    if (!rc) rc = wl_evaluation_control_source_bank_charge(lane,
+                policy->bootstrap_work);
+    if (!rc) rc = wl_evaluation_control_source_bank_charge(lane,
+                policy->first_work);
+    if (!rc) {
+        WL_SOURCE_FINAL_GEOMETRY(
+            wl_evaluation_control_source_final_pair_geometry_t, g, geometry,
+            bank);
+        const wl_evaluation_control_source_pair_policy_t paid = *policy;
+        const wl_evaluation_control_source_extent_t objects[5] = {
+            g.session, g.record, g.scope, g.payload, g.journal
+        };
+        int check = !g.source_control
+            || g.source_expectation.owner != g.record.base
+            || g.source_expectation.owner_bytes != g.record.bytes
+            || g.source_expectation.scope != g.scope.base
+            || g.source_expectation.scope_bytes != g.scope.bytes ? EINVAL : 0;
+        if (!check) check = wl_evaluation_control_source_final_geometry(bank,
+                    lane,
+                    objects, 5,
+                    (wl_evaluation_control_source_extent_t){geometry,
+                                                            sizeof(*geometry)},
+                    (wl_evaluation_control_source_extent_t){policy,
+                                                            sizeof(*policy)},
+                    g.source_control, &g.source_expectation, &rc);
+        if (check) result.first_result = check;
+        else {
+            lane->callback_active = true;
+            wl_evaluation_control_source_bank_unlock(bank);
+            result.first_result = first((void *)g.scope.base);
+            result.first_called = true;
+            if (wl_evaluation_control_source_bank_lock(bank)) abort();
+            lane->callback_active = false;
+            WL_SOURCE_FINAL_TEST_EVENT(lane,
+                WL_EVALUATION_CONTROL_TEST_SOURCE_FINAL_AFTER_FIRST);
+            /* A may have freed the normal Source. Never follow that saved
+             * control again. Only BANK owns this real bridge checkpoint. */
+            rc = wl_evaluation_control_source_bank_charge(lane, 0);
+#ifdef WL_SESSION_TEST_HOOKS
+            if (!rc && wl_evaluation_control_test_source_pair_checkpoint)
+                wl_evaluation_control_test_source_pair_checkpoint();
+#endif
+            if (!rc && !result.first_result) {
+                rc = wl_evaluation_control_source_bank_charge(lane,
+                        paid.second_work);
+                if (!rc) {
+                    lane->callback_active = true;
+                    wl_evaluation_control_source_bank_unlock(bank);
+                    result.second_result = second((void *)g.payload.base);
+                    result.second_called = true;
+                    if (wl_evaluation_control_source_bank_lock(bank)) abort();
+                    lane->callback_active = false;
+                    WL_SOURCE_FINAL_TEST_EVENT(lane,
+                        WL_EVALUATION_CONTROL_TEST_SOURCE_FINAL_AFTER_SECOND);
+                }
+            }
+            if (!rc) rc = wl_evaluation_control_source_bank_charge(lane,
+                        paid.close_work);
+        }
+    }
+    int finished =
+        wl_evaluation_control_source_bank_finish_constructor_phase(bank,
+            (unsigned)index, &context);
+    result.financial_result = rc ? rc : finished;
+    lane->context = NULL;
+    result.phase_finished = true;
     wl_evaluation_control_source_bank_unlock(bank);
     return result;
 }

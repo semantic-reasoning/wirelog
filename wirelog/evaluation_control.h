@@ -150,6 +150,28 @@ typedef struct {
     uint64_t id, identity;
 } wl_evaluation_control_lexical_finance_birth_result_t;
 
+/* Financial completion keeps both real references and owner attachment.
+ * Caller proves a genuine live financial record/issuer; these expected values
+ * alone confer neither Source provenance nor Native permission. */
+typedef struct {
+    int protocol, result, checkpoint_result;
+    bool finished;
+    wl_evaluation_control_report_t report;
+} wl_evaluation_control_lexical_finance_finish_result_t;
+wl_evaluation_control_lexical_finance_finish_result_t
+wl_evaluation_control_lexical_finance_finish_owned(
+    wl_evaluation_control_t *control, const void *owner, size_t owner_bytes,
+    uint64_t saved_id, uint64_t limit, uint64_t charged);
+
+/* Final retirement of a private, unexposed creation/attachment pair. Caller
+ * guarantees exclusive lifetime through both real releases, not merely a
+ * momentary ref2 observation. The actual completed report survives free by
+ * value; this financial-only API supplies no issuer or Native authority. */
+wl_evaluation_control_lexical_finance_result_t
+wl_evaluation_control_lexical_finance_retire_active_owned(
+    wl_evaluation_control_t *control, const void *owner, size_t owner_bytes,
+    uint64_t saved_id, uint64_t limit, uint64_t charged);
+
 /* One immutable-identity claim, no retry loop. Establishes actual creation
  * and owner-attachment references on a fresh private NORMAL control, then
  * performs real BEGIN. The paired Session issuer supplies the empty record. */
@@ -164,6 +186,12 @@ wl_evaluation_control_lexical_finance_birth_try(uint64_t limit,
 wl_evaluation_control_lexical_finance_birth_result_t
 wl_evaluation_control_private_financier_birth_try(uint64_t limit,
     const void *owner);
+
+/* Fresh unpublished positive Source only; initializes its actual first
+ * generation before returning any pointer. Never resets an existing owner. */
+wl_evaluation_control_lexical_finance_birth_result_t
+    wl_evaluation_control_lexical_finance_fresh_birth_try(uint64_t,
+    const void *);
 
 #ifdef WL_SESSION_TEST_HOOKS
 extern void (*wl_evaluation_control_test_finance_birth_claim)(void);
@@ -257,6 +285,16 @@ wl_evaluation_control_source_bank_run_lexical(
     const wl_evaluation_control_source_phase_policy_t *policy,
     wl_evaluation_control_source_action_fn action, void *payload);
 
+/* Constructor-only SOURCE callback sibling. BANK/control/context remain
+ * private to this synchronous financial activation; completion uses one
+ * actual locked checkpoint and validated report publication. */
+wl_evaluation_control_source_phase_result_t
+wl_evaluation_control_source_bank_run_lexical_constructor(
+    wl_evaluation_control_source_bank_t *bank,
+    wl_evaluation_control_source_lane_t lane,
+    const wl_evaluation_control_source_phase_policy_t *policy,
+    wl_evaluation_control_source_action_fn action, void *payload);
+
 typedef struct {
     uint64_t bootstrap_work, first_work, second_work, close_work;
 } wl_evaluation_control_source_pair_policy_t;
@@ -278,9 +316,132 @@ wl_evaluation_control_source_pair_result_t
     wl_evaluation_control_source_action_fn, void *,
     wl_evaluation_control_source_action_fn, void *);
 
+/* Sealed FINAL financial siblings. Geometry authenticates only financial
+ * storage; the typed caller proves the actual metadata journal and callback.
+ * No Source/context/control/ID is lent to either synchronous action. */
+typedef struct {
+    int financial_result, first_result, second_result;
+    bool first_called, second_called, phase_started, phase_finished;
+} wl_evaluation_control_source_final_pair_result_t;
+
+typedef struct {
+    int financial_result, action_result;
+    bool action_called, phase_started, phase_finished;
+} wl_evaluation_control_source_final_result_t;
+
+typedef struct {
+    const void *base;
+    size_t bytes;
+} wl_evaluation_control_source_extent_t;
+
+typedef struct {
+    wl_evaluation_control_source_extent_t session, record, scope, payload,
+        journal;
+    wl_evaluation_control_t *source_control;
+    wl_evaluation_control_lexical_finance_expectation_t source_expectation;
+} wl_evaluation_control_source_final_pair_geometry_t;
+
+typedef struct {
+    wl_evaluation_control_source_extent_t session, payload, journal;
+} wl_evaluation_control_source_final_geometry_t;
+
+_Static_assert(sizeof(int) == 4 && sizeof(bool) == 1,
+    "financial scalar layout");
+_Static_assert(sizeof(wl_evaluation_control_source_final_pair_result_t) == 16,
+    "final pair result layout");
+_Static_assert(sizeof(wl_evaluation_control_source_final_result_t) == 12,
+    "final result layout");
+_Static_assert(offsetof(wl_evaluation_control_source_final_pair_result_t,
+    phase_finished) == 15,
+    "final pair lifecycle offsets");
+_Static_assert(offsetof(wl_evaluation_control_source_final_result_t,
+    phase_finished) == 10,
+    "final lifecycle offsets");
+
+wl_evaluation_control_source_final_pair_result_t
+    wl_evaluation_control_source_bank_run_lexical_pair_final(
+    wl_evaluation_control_source_bank_t *, wl_evaluation_control_source_lane_t,
+    const wl_evaluation_control_source_pair_policy_t *,
+    const wl_evaluation_control_source_final_pair_geometry_t *,
+    wl_evaluation_control_source_action_fn,
+    wl_evaluation_control_source_action_fn);
+
+wl_evaluation_control_source_final_result_t
+    wl_evaluation_control_source_bank_run_lexical_final(
+    wl_evaluation_control_source_bank_t *, wl_evaluation_control_source_lane_t,
+    const wl_evaluation_control_source_phase_policy_t *,
+    const wl_evaluation_control_source_final_geometry_t *,
+    wl_evaluation_control_source_action_fn);
+
+/* A real early saved-generation observation with separate ownership facts. */
+typedef struct {
+    int protocol, begin_protocol, checkpoint_result, financial_result;
+    int first_result, second_result;
+    bool phase_started, phase_finished, first_called, second_called;
+} wl_evaluation_control_source_early_result_t;
+
+wl_evaluation_control_source_early_result_t
+wl_evaluation_control_source_bank_run_lexical_early(
+    wl_evaluation_control_source_bank_t *bank,
+    wl_evaluation_control_source_lane_t lane,
+    const wl_evaluation_control_source_phase_policy_t *policy,
+    wl_evaluation_control_source_action_fn action, void *payload);
+
+wl_evaluation_control_source_early_result_t
+wl_evaluation_control_source_bank_run_lexical_constructor_early(
+    wl_evaluation_control_source_bank_t *bank,
+    wl_evaluation_control_source_lane_t lane,
+    const wl_evaluation_control_source_phase_policy_t *policy,
+    wl_evaluation_control_source_action_fn action, void *payload);
+
+wl_evaluation_control_source_early_result_t
+    wl_evaluation_control_source_bank_run_lexical_pair_early(
+    wl_evaluation_control_source_bank_t *, wl_evaluation_control_source_lane_t,
+    const wl_evaluation_control_source_pair_policy_t *,
+    wl_evaluation_control_source_action_fn, void *,
+    wl_evaluation_control_source_action_fn, void *);
+
+wl_evaluation_control_source_early_result_t
+    wl_evaluation_control_source_bank_run_lexical_final_early(
+    wl_evaluation_control_source_bank_t *, wl_evaluation_control_source_lane_t,
+    const wl_evaluation_control_source_phase_policy_t *,
+    const wl_evaluation_control_source_final_geometry_t *,
+    wl_evaluation_control_source_action_fn);
+
+wl_evaluation_control_source_early_result_t
+    wl_evaluation_control_source_bank_run_lexical_pair_final_early(
+    wl_evaluation_control_source_bank_t *, wl_evaluation_control_source_lane_t,
+    const wl_evaluation_control_source_pair_policy_t *,
+    const wl_evaluation_control_source_final_pair_geometry_t *,
+    wl_evaluation_control_source_action_fn,
+    wl_evaluation_control_source_action_fn);
+
+#ifdef WL_SESSION_TEST_HOOKS
+extern bool wl_evaluation_control_test_source_early_cancel_once;
+extern bool wl_evaluation_control_test_source_early_rearm_ref_once;
+extern unsigned wl_evaluation_control_test_source_early_report_fault;
+int wl_evaluation_control_test_source_early_report(
+    wl_evaluation_control_source_bank_t *, wl_evaluation_control_source_lane_t,
+    wl_evaluation_control_report_t *);
+#endif
+
 #ifdef WL_SESSION_TEST_HOOKS
 /* Observation after the real successful between-actions saved0; no loan. */
 extern void (*wl_evaluation_control_test_source_pair_checkpoint)(void);
+/* Isolated financial component injection: cancel the actual private BANK
+ * generation at the named event, without exposing its controller or ID. */
+enum {
+    WL_EVALUATION_CONTROL_TEST_SOURCE_FINAL_AFTER_BEGIN = 1,
+    WL_EVALUATION_CONTROL_TEST_SOURCE_FINAL_AFTER_FIRST,
+    WL_EVALUATION_CONTROL_TEST_SOURCE_FINAL_AFTER_SECOND,
+    WL_EVALUATION_CONTROL_TEST_SOURCE_FINAL_AFTER_ACTION
+};
+extern unsigned wl_evaluation_control_test_source_final_cancel_at;
+/*1/2 substitutes that real private lane's interior as invalid payload range. */
+extern unsigned wl_evaluation_control_test_source_final_geometry_fault;
+/* Genuine quiescent issuer reset after a completed injected CANCEL only. */
+int wl_evaluation_control_test_source_final_reset_cancel(
+    wl_evaluation_control_source_bank_t *, wl_evaluation_control_source_lane_t);
 #endif
 
 /* Atomic identity siblings for hosts holding a live controller reference and
