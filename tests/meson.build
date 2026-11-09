@@ -7026,13 +7026,18 @@ foreach join_host_case : [
     join_host_suites += ['evaluation_join_host_domains']
   endif
   # Complete wide histories need an exclusive scheduler slot under TSan.
+  # Even with one, each took 119-239s in 16 recent PR TSan jobs, against a
+  # 240s budget (60s at --timeout-multiplier 4).
   join_host_parallel = true
+  join_host_timeout = 60
   if join_host_case in ['domains-wide-plain', 'domains-wide-timestamped']
     join_host_parallel = false
+    join_host_timeout = 120
   endif
   test('evaluation_join_hosts_' + join_host_case,
        test_evaluation_join_hosts_exe, args: [join_host_case],
-       suite: join_host_suites, timeout: 60, is_parallel: join_host_parallel)
+       suite: join_host_suites, timeout: join_host_timeout,
+       is_parallel: join_host_parallel)
 endforeach
 
 # #2298: real generated LFTJ session admission, metadata and recovery.
