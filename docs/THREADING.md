@@ -1393,6 +1393,13 @@ Raising one test's budget only moves the failure to the next test: a
 per-test bump for `session` landed immediately before this policy and the
 next run still timed out at the new 180 s ceiling.
 
+The multiplier does not cover a test that runs at or near its scaled budget
+on every run. `tests/meson.build` gives the two
+`evaluation_join_hosts_domains-wide-*` cases 120 s: with 60 s (240 s under
+TSan) they took 119-239 s in PR TSan jobs and the gcc leg killed both at
+240 s. It gives `evaluation_join_host_lifecycle_strict` 120 s too: with 60 s
+it took 224-227 s on the gcc leg.
+
 **Why 4.** The dominant factor is run-to-run variance on identical hardware
 and compiler, not compiler choice. `cspa_correctness` took 111.83 s and
 200.12 s in two gcc runs on the same runner image, a spread of 1.79x, while
