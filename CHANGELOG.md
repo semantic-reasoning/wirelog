@@ -477,14 +477,15 @@ All notable changes to wirelog are documented in this file.
   a `float` column, or a float constant in another column, counts as the
   other kind), or a head column receives a value of the other kind or a
   `float` value it is not declared to hold. Relation columns are checked
-  only for relations typed by a `.decl`, with no compound column and used at
-  their declared width; a comparison is checked when both operand types are
-  known from a column, a literal, a string function, arithmetic or an `=`
-  binding. Inline facts, host inserts, a `min()`, `max()` or `sum()` whose
-  operand's kind is not known, the operands of string and arithmetic
-  functions, the results of scalar extension calls, and a `float` against a
-  number in a body comparison or join are not; the group-by keys of an
-  aggregate head are checked like any head argument.
+  only for relations typed by a `.decl` or by the inline facts of an
+  undeclared relation, with no compound column and used at their declared
+  width; a comparison is checked when both operand types are known from a
+  column, a literal, a string function, arithmetic or an `=` binding. Inline
+  facts, host inserts, a `min()`, `max()` or `sum()` whose operand's kind is
+  not known, the operands of string and arithmetic functions, the results of
+  scalar extension calls, and a `float` against a number in a body
+  comparison or join are not; the group-by keys of an aggregate head are
+  checked like any head argument.
 
 - **`wirelog_easy_print_delta` no longer aborts on a symbol id it cannot
   resolve** (#2231): a row whose `symbol` or `string` column held an id
