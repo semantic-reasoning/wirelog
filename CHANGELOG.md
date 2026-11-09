@@ -248,6 +248,15 @@ All notable changes to wirelog are documented in this file.
 
 ### Fixed
 
+- **A bare string-function expression in a rule body is a parse error**
+  (#2231): a body element starting with a string function and not followed
+  by a comparison was accepted, so `m(x) :- s(x), strlen(x) * 0.` dropped
+  the expression and kept every row, and a lone `strlen(x)` or
+  `to_upper(x)` kept only the rows whose result, a length or an intern id,
+  was nonzero. Such an element now needs a comparison unless it is a
+  `contains`, `str_prefix` or `str_suffix` call, as an expression starting
+  with a variable or a number already did.
+
 - **A compound term nested in an `inline` pattern matches no row** (#2231):
   the slots of an `inline` compound hold scalars, but lowering read a
   compound term in one as `_`, so `o(a) :- pred(a, f(b, g(c, _))).` against

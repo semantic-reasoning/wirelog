@@ -1609,7 +1609,22 @@ parse_predicate(wl_parser_t *parser)
             return cmp;
         }
 
-        /* Standalone boolean string predicate: contains(x, y), str_prefix(x, y), etc. */
+        /* Standalone boolean string predicate: contains(x, y), str_prefix(x, y)
+         * or str_suffix(x, y).  #2231: any other expression needs a
+         * comparison, as one starting with a variable or a number does;
+         * lowering dropped `strlen(x) * 0`, and a lone `strlen(x)` or
+         * `to_upper(x)` kept only the rows whose result, a length or an
+         * intern id, was nonzero. */
+        if (left->type != WL_PARSER_AST_NODE_STR_FUNCTION
+            || (left->str_fn != WIRELOG_STR_FN_CONTAINS
+            && left->str_fn != WIRELOG_STR_FN_STR_PREFIX
+            && left->str_fn != WIRELOG_STR_FN_STR_SUFFIX)) {
+            parser_error(parser, "expected comparison operator: only a bare"
+                " contains, str_prefix or str_suffix call may stand without"
+                " one");
+            wl_parser_ast_node_free(left);
+            return NULL;
+        }
         return left;
     }
 

@@ -307,6 +307,37 @@ test_parse_error_cat_missing_closing_paren(void)
     assert_parse_fails("cat missing closing paren is a parse error", src);
 }
 
+/* #2231: a body element starting with a string function needs a
+ * comparison unless it is a contains, str_prefix or str_suffix call. */
+static void
+test_parse_bare_string_expressions(void)
+{
+    static const char *const rejected[] = {
+        "strlen(x) * 0", "strlen(x) - 1", "strlen(x)", "to_upper(x)",
+        "str_ord(x)", "contains(x, \"a\") + 1",
+    };
+    static const char *const accepted[] = {
+        "strlen(x) * 0 = 0", "strlen(x) > 0", "contains(x, \"a\")",
+        "str_prefix(x, \"a\")", "str_suffix(x, \"a\")",
+        "contains(to_upper(x), \"A\")",
+    };
+    char src[256];
+    char name[128];
+    for (size_t i = 0; i < sizeof(rejected) / sizeof(rejected[0]); i++) {
+        snprintf(src, sizeof(src), ".decl s(x: symbol)\n"
+            ".decl m(x: symbol)\nm(x) :- s(x), %s.\n", rejected[i]);
+        snprintf(name, sizeof(name), "bare body element %s is a parse error",
+            rejected[i]);
+        assert_parse_fails(name, src);
+    }
+    for (size_t i = 0; i < sizeof(accepted) / sizeof(accepted[0]); i++) {
+        snprintf(src, sizeof(src), ".decl s(x: symbol)\n"
+            ".decl m(x: symbol)\nm(x) :- s(x), %s.\n", accepted[i]);
+        snprintf(name, sizeof(name), "body element %s parses", accepted[i]);
+        assert_parses(name, src);
+    }
+}
+
 /* ======================================================================== */
 /* Main                                                                     */
 /* ======================================================================== */
@@ -343,6 +374,7 @@ main(void)
     test_parse_error_strlen_missing_paren();
     test_parse_error_substr_missing_comma();
     test_parse_error_cat_missing_closing_paren();
+    test_parse_bare_string_expressions();
 
     printf("\nResults: %d/%d passed, %d failed\n",
         tests_passed, tests_run, tests_failed);
