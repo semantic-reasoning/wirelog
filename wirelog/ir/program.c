@@ -1367,7 +1367,9 @@ validate_head_arities(struct wirelog_program *program,
  *       filter; `g(2, k)` and a single-atom body failed at plan time;
  *   E4  a head column receives a value of the other kind, or a float
  *       value lands in a column that is not `float`, whose bits it would
- *       be stored as.
+ *       be stored as, or an integer other than a literal lands in a
+ *       `float` column, which would hold its bits the same way; an
+ *       aggregate's column is checked by its result's kind.
  *
  * Relation columns are checked only for relations typed by a `.decl` or
  * by inline facts (schema_from_facts), with no compound column and used at
@@ -1376,12 +1378,11 @@ validate_head_arities(struct wirelog_program *program,
  * literal, a string function, arithmetic or an `=` binding.  A variable
  * whose only binding is an `=` with a typed expression takes that
  * expression's type, which is the binding U4 gives it.  Not checked:
- * inline facts and host inserts (#963), the aggregate column of an
- * aggregate head (its group-by keys are checked like any head argument),
- * the operands of string and arithmetic functions, the results of scalar
- * extension calls, which a plan may route into a string column
- * (test_plan_gen's `text.keep`), an integer value in a `float` head
- * column, and a float against a number in a body comparison or join. */
+ * inline facts and host inserts (#963), a min(), max() or sum() whose
+ * operand's kind is not known, the operands of string and arithmetic
+ * functions, the results of scalar extension calls, which a plan may route
+ * into a string column (test_plan_gen's `text.keep`), and a float against a
+ * number in a body comparison or join. */
 
 typedef struct {
     const char *name;
@@ -1464,11 +1465,16 @@ domains_mix_symbol(wl_ir_coltype_t a, wl_ir_coltype_t b)
     return (a == WL_IR_COLTYPE_STRING) != (b == WL_IR_COLTYPE_STRING);
 }
 
-/* True when @value cannot be stored in a column of @column's domain. */
+/* True when @value cannot be stored in a column of @column's domain.  An
+ * integer is stored in a float column as its int64 bits, so only an integer
+ * literal, which lowering converts to its binary64 value, may go there; the
+ * caller lets that one through. */
 static bool
 domain_head_conflict(wl_ir_coltype_t value, wl_ir_coltype_t column)
 {
     if (domains_mix_symbol(value, column))
+        return true;
+    if (value == WL_IR_COLTYPE_SCALAR && column == WL_IR_COLTYPE_FLOAT)
         return true;
     return value == WL_IR_COLTYPE_FLOAT && column != WL_IR_COLTYPE_FLOAT
            && column != WL_IR_COLTYPE_UNKNOWN;
@@ -1571,6 +1577,32 @@ domain_of_value(const wl_parser_ast_node_t *node, domain_env_t *env)
             return WL_IR_COLTYPE_SCALAR;
         }
         return WL_IR_COLTYPE_UNKNOWN;
+    case WL_PARSER_AST_NODE_AGGREGATE: {
+        /* #2231: count is an integer; min and max yield a value of their
+         * operand's kind; sum adds its operand's values, binary64 for a
+         * float operand and int64 otherwise (a symbol's ids); average is a
+         * binary64 mean of a float operand, and lowering rejects any other
+         * operand, so that one is left to it. */
+        wl_ir_coltype_t operand = node->child_count > 0
+            ? domain_of_value(node->children[0], env)
+            : WL_IR_COLTYPE_UNKNOWN;
+        switch (node->agg_fn) {
+        case WIRELOG_AGG_COUNT:
+            return WL_IR_COLTYPE_SCALAR;
+        case WIRELOG_AGG_MIN:
+        case WIRELOG_AGG_MAX:
+            return operand;
+        case WIRELOG_AGG_SUM:
+            if (operand == WL_IR_COLTYPE_UNKNOWN
+                || operand == WL_IR_COLTYPE_FLOAT)
+                return operand;
+            return WL_IR_COLTYPE_SCALAR;
+        case WIRELOG_AGG_AVG:
+            return operand == WL_IR_COLTYPE_FLOAT
+                   ? WL_IR_COLTYPE_FLOAT : WL_IR_COLTYPE_UNKNOWN;
+        }
+        return WL_IR_COLTYPE_UNKNOWN;
+    }
     default:
         return WL_IR_COLTYPE_UNKNOWN;
     }
@@ -1719,26 +1751,34 @@ domain_check_rule(struct wirelog_program *program,
 
     /* Pass D: the head.  REDUCE emits its columns in head order, so a
      * group-by key's head position is its column and keys are checked like
-     * any head argument; an aggregate has no known domain
-     * (domain_of_value()), so its column is not checked. */
+     * any head argument, and so is an aggregate whose result kind
+     * domain_of_value() knows.  An integer literal in a float column is
+     * converted to its binary64 value (validate_head_constants() checks it
+     * is exact), so it is the one integer such a column accepts. */
     const wl_ir_relation_info_t *rel = rc == 0
         ? domain_checked_relation(program, head) : NULL;
     for (uint32_t c = 0; rel && rc == 0 && c < head->child_count; c++) {
         const wl_parser_ast_node_t *arg = head->children[c];
         wirelog_column_type_t type = rel->columns[c].type;
+        wl_ir_coltype_t column = wl_ir_coltype_from_column_type(type);
         wl_ir_coltype_t value = domain_of_value(arg, &env);
-        if (!domain_head_conflict(value,
-            wl_ir_coltype_from_column_type(type)))
+        if (arg->type == WL_PARSER_AST_NODE_INTEGER
+            && column == WL_IR_COLTYPE_FLOAT)
             continue;
+        if (!domain_head_conflict(value, column))
+            continue;
+        const char *word = value == WL_IR_COLTYPE_SCALAR
+            && column == WL_IR_COLTYPE_FLOAT
+            ? "non-float (integer or mixed-arithmetic)" : domain_word(value);
         if (node_is_constant(arg))
             wl_ir_program_set_error(program,
                 "%s constant in column %u of '%s', which is declared %s,"
-                " in a rule for '%s' (line %u)", domain_word(value), c,
+                " in a rule for '%s' (line %u)", word, c,
                 rel->name, column_type_word(type), head_name, head->line);
         else
             wl_ir_program_set_error(program,
                 "rule head for '%s' puts a %s value into column %u, which"
-                " is declared %s (line %u)", rel->name, domain_word(value),
+                " is declared %s (line %u)", rel->name, word,
                 c, column_type_word(type), head->line);
         rc = -1;
     }

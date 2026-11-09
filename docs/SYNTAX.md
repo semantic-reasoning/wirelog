@@ -226,9 +226,9 @@ binary64 value and `t(2.5, count(x))` against an `int64` key column is
 rejected. A variable or expression key is checked like any head argument (see
 [Rules must not mix symbol and numeric
 values](#rules-must-not-mix-symbol-and-numeric-values)), so a `symbol` or
-`float` key in an `int64` column is rejected. A scalar extension call in a
-key is rejected with `WIRELOG_ERR_PARSE`; compute it in a separate rule
-first.
+`float` key in an `int64` column, or an integer one in a `float` column, is
+rejected. A scalar extension call in a key is rejected with
+`WIRELOG_ERR_PARSE`; compute it in a separate rule first.
 
 ### `average()`
 
@@ -519,7 +519,19 @@ and gave no diagnostic, so loading now rejects them with
   and a single-atom body failed at plan time;
 - a head column must not receive a value of the other kind, nor a
   `float` value when it is not declared `float`: `g(x) :- n(x).` with `g`
-  `symbol` and `n` `int64`.
+  `symbol` and `n` `int64`;
+- a `float` head column must not receive an integer that is not a literal,
+  which it would hold as the integer's bits: `p(x) :- n(x).` with `p`
+  declared `float` and `n` `int64` derived `p(4.9406564584124654e-324)` for
+  `n(1)`. An integer literal is converted to its binary64 value, so
+  `p(2) :- n(1).` derives `p(2)`.
+
+The column of an aggregate is checked by the kind of its result: `count()`
+is an integer, `min()` and `max()` have their operand's kind, `sum()` is a
+`float` for a `float` operand and an integer otherwise, and `average()` of a
+`float` operand is a `float` (lowering rejects any other operand). So
+`p(count(x)) :- n(x).` and `q(sum(f)) :- h(f).` are rejected with `p`
+declared `float`, `q` `int64` and `h` `float`.
 
 A variable bound only by an `=` takes the type of the expression it is
 equal to, so `p(c) :- s(x), c = to_upper(x).` puts a string into `p`.
@@ -529,11 +541,10 @@ the inline facts of an undeclared relation, with no compound column and at
 their declared width; a comparison is checked when both of its operand types
 are known from a column, a literal, a string function, arithmetic or an `=`
 binding. Not checked: inline facts and host inserts (#963), the columns of
-relations with neither a `.decl` nor inline facts, the aggregate column of
-an aggregate head (its group-by keys are checked like any head argument),
-the operands of string and arithmetic functions, the results of scalar
-extension calls, an integer in a `float` head column, and a `float` against
-a number in a body comparison or join.
+relations with neither a `.decl` nor inline facts, a `min()`, `max()` or
+`sum()` whose operand's kind is not known, the operands of string and
+arithmetic functions, the results of scalar extension calls, and a `float`
+against a number in a body comparison or join.
 
 ---
 
