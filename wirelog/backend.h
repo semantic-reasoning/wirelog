@@ -69,6 +69,24 @@ typedef enum {
     WL_CONTROLLED_STEP_NATIVE_ERROR_CLEANUP_PENDING,
 } wl_controlled_step_state_t;
 
+/* Internal public-call handoff. Values carry terminal history only; no
+ * Native resource, controller or Step address crosses the backend boundary. */
+typedef enum {
+    WL_BACKEND_CONTROLLED_COMPLETION_STEP = 1,
+    WL_BACKEND_CONTROLLED_COMPLETION_SNAPSHOT,
+    WL_BACKEND_CONTROLLED_COMPLETION_CLOSE
+} wl_backend_controlled_completion_kind_t;
+typedef struct {
+    uint64_t operation_identity, ticket;
+    wl_backend_controlled_completion_kind_t kind;
+    wl_controlled_step_state_t state;
+    int result;
+    bool selected;
+} wl_backend_controlled_completion_t;
+
+/* Distinct from every logical STEP state; never a public state value. */
+enum { WL_BACKEND_CONTROLLED_OBSERVATION_COMPLETION_READY = -1 };
+
 /* Host source inspection request (Issue #2321).  ADMIT checks only the
  * session state; VALIDATE also selects and checks the relation's source
  * storage without reading rows; COUNT counts the rows equal to all @ncols
@@ -165,6 +183,17 @@ typedef struct {
      * closed between stopped attempts; COMPLETE rejects later mutations. */
     wl_controlled_step_state_t (*session_controlled_step_state)(
         const wl_session_t *session);
+    /* Optional paired handoff. Observe returns a truthful logical state and
+     * leaves selected_out untouched, OR returns COMPLETION_READY and writes
+     * the entire matching receipt. Selection requires dispatched=true.
+     * Neither ordinary callers nor observers may read selected_out.
+     * Commit consumes the matching ticket under admission lock before its
+     * lifetime reservation is dropped; no allocation, callback or failure. */
+    int (*session_controlled_step_observe)(const wl_session_t *,
+        wl_backend_controlled_completion_kind_t, bool dispatched,
+        wl_backend_controlled_completion_t *selected_out);
+    void (*session_controlled_completion_commit)(wl_session_t *,
+        const wl_backend_controlled_completion_t *);
     /* Pure preauthorization for the narrowly supported input append that can
      * follow a completed controlled STEP. Called with a public operation
      * reservation active and without the admission mutex held. */

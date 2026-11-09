@@ -15991,9 +15991,275 @@ test_operator_finish_excludes_real_framed_child(void)
     wl_plan_free(compiled); wirelog_program_free(program);
 }
 
-int
-main(void)
+/* A real custom backend tests the generic admission handoff contract only.
+ * It is not a fabricated Columnar Root, resource journal or Native proof. */
+typedef struct {
+    wl_session_t base;
+    wl_backend_controlled_completion_t request;
+    uint64_t sequence;
+    unsigned reads, commits, state_reads;
+    bool select;
+    wl_controlled_step_state_t state;
+    int step_result;
+    unsigned fault;
+} completion_contract_session_t;
+
+static unsigned completion_contract_creates, completion_contract_destroys;
+
+static int
+completion_contract_create(const wl_plan_t *plan, uint32_t workers,
+    wl_session_t **out)
 {
+    (void)plan; (void)workers;
+    ++completion_contract_creates;
+    completion_contract_session_t *s = calloc(1, sizeof(*s));
+    if (!s) return ENOMEM;
+    *out = &s->base;
+    return 0;
+}
+
+static int
+completion_contract_create_options(const wl_plan_t *plan, uint32_t workers,
+    const wl_session_options_t *options, wl_session_t **out)
+{
+    (void)options;
+    return completion_contract_create(plan, workers, out);
+}
+
+static void
+completion_contract_destroy(wl_session_t *session)
+{
+    ++completion_contract_destroys;
+    free(session);
+}
+
+static int
+completion_contract_step(wl_session_t *session)
+{
+    completion_contract_session_t *s = (void *)session;
+    if (!s->select) return s->step_result;
+    CHECK(!s->request.selected && !s->commits);
+    uint64_t ticket = ++s->sequence;
+    s->request = (wl_backend_controlled_completion_t){
+        .operation_identity = ticket, .ticket = ticket,
+        .kind = WL_BACKEND_CONTROLLED_COMPLETION_STEP,
+        .state = WL_CONTROLLED_STEP_COMPLETE, .result = 0, .selected = true
+    };
+    return EAGAIN;
+}
+
+static wl_controlled_step_state_t
+completion_contract_state(const wl_session_t *session)
+{
+    completion_contract_session_t *s = (void *)session;
+    ++s->state_reads;
+    return s->state;
+}
+
+static int
+completion_contract_observe(const wl_session_t *session,
+    wl_backend_controlled_completion_kind_t kind, bool dispatched,
+    wl_backend_controlled_completion_t *selected_out)
+{
+    completion_contract_session_t *s = (void *)session;
+    CHECK(kind == WL_BACKEND_CONTROLLED_COMPLETION_STEP);
+    ++s->reads;
+    if (s->fault == 1) return -2;
+    if (s->fault == 2) return 100;
+    if ((dispatched && s->request.selected) || s->fault == 3) {
+        *selected_out = s->request;
+        if (s->fault ==
+            4) selected_out->state = (wl_controlled_step_state_t)100;
+        if (s->fault == 5) selected_out->ticket = 0;
+        if (s->fault == 6) selected_out->operation_identity = 0;
+        if (s->fault ==
+            7) selected_out->kind = WL_BACKEND_CONTROLLED_COMPLETION_CLOSE;
+        if (s->fault == 8) selected_out->selected = false;
+        return WL_BACKEND_CONTROLLED_OBSERVATION_COMPLETION_READY;
+    }
+    return s->state;
+}
+
+static void
+completion_contract_commit(wl_session_t *session,
+    const wl_backend_controlled_completion_t *completion)
+{
+    completion_contract_session_t *s = (void *)session;
+    CHECK(s->request.selected && completion->selected && !s->commits
+        && completion->kind == s->request.kind
+        && completion->ticket == s->request.ticket
+        && completion->operation_identity == s->request.operation_identity
+        && completion->state == s->request.state &&
+        completion->result == s->request.result);
+    s->request.selected = false;
+    ++s->commits;
+}
+
+static void
+test_completion_backend_contract(void)
+{
+    wl_compute_backend_t backend = {
+        .name = "completion-contract",
+        .session_create = completion_contract_create,
+        .session_create_with_options = completion_contract_create_options,
+        .session_destroy = completion_contract_destroy,
+        .session_step = completion_contract_step,
+        .session_controlled_step_state = completion_contract_state
+    };
+    wl_evaluation_control_t *control = NULL;
+    CHECK(!wl_evaluation_control_create(512, &control));
+    wl_session_options_t options; wl_session_options_init(&options);
+    options.evaluation_control = control;
+    unsigned creates = completion_contract_creates,
+        destroys = completion_contract_destroys;
+    for (unsigned partial = 0; partial < 2; ++partial) {
+        backend.session_controlled_step_observe =
+            partial ? NULL : completion_contract_observe;
+        backend.session_controlled_completion_commit =
+            partial ? completion_contract_commit : NULL;
+        wl_session_t *session = NULL;
+        CHECK(wl_session_create_with_options(&backend, NULL, 1, &options,
+            &session) == EINVAL
+            && !session && completion_contract_creates == creates
+            && completion_contract_destroys == destroys);
+    }
+    /* Options errors precede rejection of a partial hook pair. */
+    wl_session_options_t malformed = options;
+    malformed.spill_quota_bytes = 1;
+    wl_session_t *rejected = NULL;
+    CHECK(wl_session_create_with_options(&backend, NULL, 1, &malformed,
+        &rejected) == EINVAL && !rejected
+        && completion_contract_creates == creates);
+    /* Missing controlled creation support is ENOTSUP before partial-pair
+     * EINVAL, making the precedence distinguishable by its public result. */
+    backend.session_create_with_options = NULL;
+    CHECK(wl_session_create_with_options(&backend, NULL, 1, &options,
+        &rejected) == ENOTSUP && !rejected
+        && completion_contract_creates == creates);
+    backend.session_create_with_options = completion_contract_create_options;
+    for (unsigned mode = 0; mode < 3; ++mode) {
+        backend.session_controlled_step_observe =
+            mode ? completion_contract_observe : NULL;
+        backend.session_controlled_completion_commit =
+            mode ? completion_contract_commit : NULL;
+        wl_session_t *session = NULL;
+        CHECK(!wl_session_create_with_options(&backend, NULL, 1, &options,
+            &session));
+        completion_contract_session_t *s = (void *)session;
+        s->select = mode == 2;
+        s->step_result = EAGAIN;
+        CHECK(wl_session_step(session) == (mode == 2 ? 0 : EIO));
+        CHECK(s->reads == (mode ? 1u : 0u) &&
+            s->commits == (mode == 2 ? 1u : 0u)
+            && s->state_reads == (mode ? 0u : 1u)
+            && !s->request.selected &&
+            !wl_evaluation_control_active_attempt_id(control));
+        if (mode == 2) {
+            int64_t row = 1;
+            CHECK(wl_session_insert(session, "input", &row, 1, 1) == EBUSY);
+        }
+        CHECK(!wl_session_try_destroy(&session) && !session);
+    }
+    CHECK(completion_contract_creates == creates + 3
+        && completion_contract_destroys == destroys + 3);
+    /* Every ordinary state is supplied by the observer exactly once. The
+     * poisoned out parameter must remain byte-identical on that branch. */
+    backend.session_controlled_step_observe = completion_contract_observe;
+    backend.session_controlled_completion_commit = completion_contract_commit;
+    for (int state = WL_CONTROLLED_STEP_IDLE;
+        state <= WL_CONTROLLED_STEP_NATIVE_ERROR_CLEANUP_PENDING; ++state){
+        wl_session_t *session = NULL;
+        CHECK(!wl_session_create_with_options(&backend, NULL, 1, &options,
+            &session));
+        completion_contract_session_t *s = (void *)session;
+        s->state = (wl_controlled_step_state_t)state;
+        s->step_result = WL_EVALUATION_CONTROL_WORK_LIMIT;
+        wl_backend_controlled_completion_t poison, saved;
+        memset(&poison, 0xa5, sizeof(poison));
+        memcpy(&saved, &poison, sizeof(saved));
+        CHECK(completion_contract_observe(session,
+            WL_BACKEND_CONTROLLED_COMPLETION_STEP, true, &poison) == state
+            && !memcmp(&poison, &saved, sizeof(poison)));
+        s->reads = 0;
+        CHECK(wl_session_step(session) == WL_EVALUATION_CONTROL_WORK_LIMIT
+            && s->reads == 1 && s->state_reads == 0 && !s->commits);
+        int64_t row = 1;
+        if (state == WL_CONTROLLED_STEP_PENDING
+            || state == WL_CONTROLLED_STEP_NATIVE_ERROR_CLEANUP_PENDING) {
+            CHECK(wl_session_insert(session, "input", &row, 1, 1) == EBUSY);
+            /* A genuine subsequent backend observation discharges this custom
+             * backend's pending state; no public admission fields are edited. */
+            s->state = WL_CONTROLLED_STEP_IDLE;
+            s->step_result = 0;
+            CHECK(!wl_session_step(session));
+        }
+        CHECK(!wl_session_try_destroy(&session) && !session);
+    }
+    /* An old prepared request must survive a call which did not dispatch,
+    * including both input-load failure and a missing backend callback. */
+    for (unsigned failure = 0; failure < 2; ++failure) {
+        wl_session_t *session = NULL;
+        CHECK(!wl_session_create_with_options(&backend, NULL, 1, &options,
+            &session));
+        completion_contract_session_t *s = (void *)session;
+        s->request = (wl_backend_controlled_completion_t){
+            .operation_identity = 17, .ticket = 19,
+            .kind = WL_BACKEND_CONTROLLED_COMPLETION_STEP,
+            .state = WL_CONTROLLED_STEP_COMPLETE, .result = EDOM,
+            .selected = true
+        };
+        if (failure) backend.session_step = NULL;
+        else session->input_load_failed = true;
+        CHECK(wl_session_step(session) == -1 && s->reads == 1
+            && !s->state_reads && !s->commits && s->request.selected);
+        backend.session_step = completion_contract_step;
+        session->input_load_failed = false;
+        /* This dispatch returns the prepared genuine request, then commits
+        * exactly once while generic admission still excludes mutations. */
+        CHECK(wl_session_step(session) == EDOM && s->commits == 1
+            && s->reads == 2 && !s->request.selected);
+        CHECK(!wl_session_try_destroy(&session) && !session);
+    }
+#if !defined(_WIN32)
+    for (unsigned fault = 1; fault <= 8; ++fault) {
+        pid_t child = fork();
+        CHECK(child >= 0);
+        if (!child) {
+            wl_session_t *session = NULL;
+            if (wl_session_create_with_options(&backend, NULL, 1, &options,
+                &session))
+                _exit(3);
+            completion_contract_session_t *s = (void *)session;
+            s->fault = fault;
+            s->select = true;
+            if (fault == 3) {
+                session->input_load_failed = true;
+                s->request = (wl_backend_controlled_completion_t){
+                    .operation_identity = 1, .ticket = 1,
+                    .kind = WL_BACKEND_CONTROLLED_COMPLETION_STEP,
+                    .state = WL_CONTROLLED_STEP_COMPLETE, .selected = true
+                };
+            }
+            wl_session_step(session);
+            _exit(4);
+        }
+        int status = 0;
+        CHECK(waitpid(child, &status, 0) == child);
+        CHECK(WIFSIGNALED(status) && WTERMSIG(status) == SIGABRT);
+    }
+#endif
+    wl_evaluation_control_release(control);
+}
+
+int
+main(int argc, char **argv)
+{
+    if (argc == 2 && !strcmp(argv[1], "--completion-contract")) {
+        test_completion_backend_contract();
+        return 0;
+    }
+    if (argc != 1) return 2;
+
     test_program_append_bounds();
     /* Issue #2262: session.c reads WIRELOG_JOIN_BATCH_BYTES and _STRICT when
      * a session is created, and controlled STEP refuses strict mode and the
