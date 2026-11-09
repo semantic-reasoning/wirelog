@@ -204,8 +204,12 @@ pred_blocked_since(const wl_tdd_channel_stats_t *stats, void *ctx)
 static bool
 pred_heavy_blocked(const wl_tdd_channel_stats_t *stats, void *ctx)
 {
-    (void)ctx;
-    return stats->space_waiters >= 1 || stats->lanes_open == 0;
+    bool *witness = ctx;
+    /* This snapshot is supplied under the channel mutex. Latch it before
+     * admission can resume and clear the waiter after the wait unlocks. */
+    if (stats->space_waiters >= 1 && stats->lanes_open == 1)
+        *witness = true;
+    return *witness || stats->lanes_open == 0;
 }
 
 /* Every producer that can run waits for space: as many wait as there are
@@ -354,10 +358,8 @@ pump_hook(wl_tdd_channel_t *ch)
         if (stats.lanes_open != 1)
             return 0;
         skew_paused = true;
-        wait_on(ch, pred_heavy_blocked, NULL, &pump_timeouts);
-        wl_tdd_channel_stats(ch, &stats);
-        skew_heavy_blocked = stats.space_waiters >= 1
-            && stats.lanes_open == 1;
+        wait_on(ch, pred_heavy_blocked, &skew_heavy_blocked,
+            &pump_timeouts);
         return 0;
     case PUMP_CANCEL_BLOCKED:
         /* The first pump reports pump_fail_rc once every producer that can
@@ -1400,6 +1402,33 @@ test_worker_error_outranks_cancel(uint32_t workers)
     collect_reset(&serial);
 }
 
+/* Later producer progress must not revoke a real locked observation, and
+ * bounded escape after all lanes close must never fabricate that witness. */
+static void
+test_skew_witness(void)
+{
+    bool witness = false;
+    wl_tdd_channel_stats_t stats = { 0 };
+    CHECK(pred_heavy_blocked(&stats, &witness) && !witness,
+        "closed-only escape fabricated a waiter");
+    stats.lanes_open = 1;
+    CHECK(!pred_heavy_blocked(&stats, &witness) && !witness,
+        "open lane without a waiter fabricated a witness");
+    stats.lanes_open = 2;
+    stats.space_waiters = 1;
+    CHECK(!pred_heavy_blocked(&stats, &witness) && !witness,
+        "other open lanes fabricated a sole-heavy witness");
+    stats.lanes_open = 1;
+    CHECK(pred_heavy_blocked(&stats, &witness) && witness,
+        "sole-lane waiter was not captured");
+    stats.space_waiters = 0;
+    CHECK(pred_heavy_blocked(&stats, &witness) && witness,
+        "resumed admission revoked the captured witness");
+    stats.lanes_open = 0;
+    CHECK(pred_heavy_blocked(&stats, &witness) && witness,
+        "closed lane revoked the captured witness");
+}
+
 int
 main(void)
 {
@@ -1415,6 +1444,7 @@ main(void)
     test_pump_error_selects_channel_rc(&two_sided, 4);
     test_abandoned_round_is_cancelled(2);
 
+    test_skew_witness();
     test_channel_capacity();
     static const uint32_t widths[] = { 2, 8 };
     for (size_t i = 0; i < sizeof(widths) / sizeof(widths[0]); i++) {
