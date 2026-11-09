@@ -228,7 +228,7 @@ These exist so struct fields can be declared portably; the audit in
 
 Every `atomic_*` call site in `wirelog/` production sources. Counted
 mechanically by `scripts/ci/check-threading-doc.sh`; row count must
-match the script's count (currently **557**).
+match the script's count (currently **558**).
 
 Format: `file:function[#N]` | field | operation | order | justification.
 
@@ -670,7 +670,7 @@ concurrent alias removals cannot underflow the count.
 | `session.c:session_pool_rel_promote#3` | `src->storage_alias_borrows` | `atomic_store_explicit` | relaxed | Leave the closed pool tombstone with no child aliases |
 
 112 + 21 + 37 = **170 atomic call sites** in the summarized groups; the full
-symbol-anchored inventory below covers 557 sites.
+symbol-anchored inventory below covers 558 sites.
 
 The `#N` suffix counts all atomic sites in a symbol, regardless of operation;
 the first site remains unsuffixed. `scripts/ci/check-threading-doc.sh` uses
@@ -1778,7 +1778,7 @@ DONE. If a stop leaves the receipt holding a claim, its caller preserves that
 receipt and resumes with a fresh live maintenance attempt; it cannot abandon or
 reinitialize the receipt/token while the claim remains held.
 
-The complete current atomic-source inventory contains 557 call sites.
+The complete current atomic-source inventory contains 558 call sites.
 
 ### Caller-attempt-bound single mutation admission
 
@@ -2871,3 +2871,4 @@ performs those atomic operations.
 | `evaluation_control.c:wl_evaluation_control_source_final_test_closed#2` | `control->cancelled` | `atomic_fetch_add_explicit` | relaxed | Test-only neutral read verifies the injected cancellation before reset and its removal afterward while completed report, owner, generation and accounting remain unchanged |
 | `evaluation_control.c:wl_evaluation_control_test_source_early_report` | `control->references` | `atomic_fetch_add_explicit` | relaxed | Test-only neutral observation under BANK and control locks requires the canonical inactive two-reference financial owner before copying its genuine completed report; no state mutation, cancellation poll or handle loan |
 | `evaluation_control.c:wl_evaluation_control_source_bank_begin_checkpoint` | `control->active_attempt_id` | `atomic_exchange_explicit` | release | Publish the actual sealed private BANK generation before its same-lock zero observation; retain begun-and-stopped ownership until genuine FINISH/report, without a controller loan or Native permission |
+| `evaluation_control.c:wl_evaluation_control_lexical_finance_checkpoint_owned` | `control->references` | `atomic_fetch_add_explicit` | relaxed | Under the actual mutex require the exclusive creation and attachment pair before the same-lock financial checkpoint; no report, release or Native permission |

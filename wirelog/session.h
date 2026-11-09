@@ -180,6 +180,21 @@ wl_session_source_checked_birth_outcome_t
 wl_session_source_finance_close_result_t
 wl_session_source_finance_close_owned(wl_session_t *,
     wl_session_source_finance_t *, wl_session_source_close_scope_t *);
+/* Active-only additive close. The checked private pair remains exclusive
+ * through this synchronous activation; no Source/controller is lent out.
+ * An A-called strict refusal retains the caller's original lexical owner.
+ * Keep that record/scope alive and retire through a correct owning path. */
+typedef struct {
+    wl_evaluation_control_source_close_early_result_t phase;
+    wl_session_source_finance_close_result_t close;
+    int protocol, authorizer_result, completion_result;
+    bool owner_checked, completion_called, mandatory_unwind_called;
+} wl_session_source_finance_close_early_result_t;
+
+wl_session_source_finance_close_early_result_t
+wl_session_source_finance_close_early_owned(wl_session_t *,
+    wl_session_source_finance_t *, wl_session_source_close_scope_t *);
+
 /* Same actual financial close, then synchronous SOURCE-only metadata under
  * a genuine intervening BANK check. Payload stays valid through return and
  * is disjoint from the retiring Source allocation and lexical pair. Never

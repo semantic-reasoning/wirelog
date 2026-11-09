@@ -800,6 +800,111 @@ wl_session_source_final_metadata(wl_session_t *session,
         metadata);
 }
 
+typedef struct {
+    wl_session_source_finance_t *record;
+    wl_session_source_close_scope_t *scope;
+    wl_evaluation_control_t *control;
+    wl_evaluation_control_lexical_finance_expectation_t expected;
+    int protocol;
+} wl_session_source_early_close_context_t;
+
+static int
+wl_session_source_early_close_action(void *payload)
+{
+    wl_session_source_early_close_context_t *p = payload;
+#ifdef WL_SESSION_TEST_HOOKS
+    if (wl_evaluation_control_test_source_close_cancel_at ==
+        WL_EVALUATION_CONTROL_TEST_SOURCE_CLOSE_PHYSICAL) {
+        wl_evaluation_control_test_source_close_cancel_at = 0;
+        wl_evaluation_control_request_cancel(p->control);
+    }
+#endif
+    wl_evaluation_control_lexical_finance_result_t closed =
+        wl_evaluation_control_lexical_finance_close_checked(p->control,
+            &p->expected);
+    p->protocol = closed.protocol;
+    if (closed.protocol) return closed.protocol;
+    if (!closed.closed || !closed.report_valid) {
+        p->protocol = EINVAL; return EINVAL;
+    }
+    /* Physical financial free -> original-address invalidation, no refusal. */
+    p->record->control = NULL; p->record->id = 0;
+    p->record->active = p->record->attached = false;
+    p->scope->control = NULL;
+    p->scope->result.source_result = closed.result;
+    p->scope->result.checkpoint_result = closed.checkpoint_result;
+    p->scope->result.applied = p->scope->result.closed = true;
+    return closed.result;
+}
+
+wl_session_source_finance_close_early_result_t
+wl_session_source_finance_close_early_owned(wl_session_t *session,
+    wl_session_source_finance_t *record, wl_session_source_close_scope_t *scope)
+{
+    wl_session_source_finance_close_early_result_t out = {0};
+    if (!wl_session_source_final_issuer(session)) {
+        out.protocol = EINVAL; return out;
+    }
+    out.protocol = wl_session_source_close_scope_prove(session, record, scope);
+    if (out.protocol) return out;
+    if (scope->result.closed) {
+        out.close = scope->result; return out;
+    }
+    if (!record->active || !record->id ||
+        record->control == session->evaluation_control){
+        out.protocol = EINVAL; return out;
+    }
+    wl_evaluation_control_lexical_finance_checkpoint_result_t checked =
+        wl_evaluation_control_lexical_finance_checkpoint_owned(record->control,
+            record, sizeof(*record), scope->control_identity, record->id,
+            record->limit, record->charged);
+    out.protocol = checked.protocol; out.owner_checked = checked.checked;
+    out.authorizer_result = checked.checkpoint_result;
+    if (checked.protocol || !checked.checked) return out;
+    wl_session_source_early_close_context_t context = {
+        .record = record, .scope = scope, .control = record->control,
+        .expected = wl_session_source_close_expectation(record, scope)
+    };
+    wl_evaluation_control_source_close_borrow_t borrow = {
+        context.control, context.expected.id, context.expected.identity
+    };
+    const wl_session_source_scope_t *issuer = wl_session_source_scope;
+    static const wl_evaluation_control_source_phase_policy_t policy = {208, 144,
+                                                                       80};
+    out.phase = wl_evaluation_control_source_bank_run_lexical_close_early(
+        issuer->admission->source_bank, issuer->lane, &policy, &borrow,
+        wl_session_source_early_close_action, &context);
+    out.protocol = out.phase.protocol;
+    if (!out.phase.phase.first_called) {
+        /* The authentic private pair was never lent or mutated. This second
+         * actual completion handoff precedes strict physical retirement. */
+#ifdef WL_SESSION_TEST_HOOKS
+        if (wl_evaluation_control_test_source_close_cancel_at ==
+            WL_EVALUATION_CONTROL_TEST_SOURCE_CLOSE_COMPLETION) {
+            wl_evaluation_control_test_source_close_cancel_at = 0;
+            wl_evaluation_control_request_cancel(context.control);
+        }
+#endif
+        out.completion_called = true;
+        out.completion_result = wl_evaluation_control_charge_attempt(
+            context.control, context.expected.id, 0);
+        out.mandatory_unwind_called = true;
+        (void)wl_session_source_early_close_action(&context);
+    }
+    if (!scope->result.closed) {
+        out.protocol = context.protocol ? context.protocol : EINVAL;
+        out.close = scope->result;
+        out.close.protocol = out.protocol;
+        return out;
+    }
+    scope->result.phase = (wl_evaluation_control_source_phase_result_t){
+        out.phase.phase.financial_result, out.phase.phase.first_result,
+        out.phase.phase.first_called
+    };
+    out.close = scope->result;
+    return out;
+}
+
 #undef WL_SESSION_THREAD_LOCAL
 
 static void

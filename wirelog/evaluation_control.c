@@ -2588,3 +2588,165 @@ wl_evaluation_control_begin_attempt(wl_evaluation_control_t *control,
     wl_mutex_unlock(&control->mutex);
     return out;
 }
+
+wl_evaluation_control_lexical_finance_checkpoint_result_t
+wl_evaluation_control_lexical_finance_checkpoint_owned(
+    wl_evaluation_control_t *control, const void *owner, size_t owner_bytes,
+    uint64_t identity, uint64_t id, uint64_t limit, uint64_t charged)
+{
+    wl_evaluation_control_lexical_finance_checkpoint_result_t out = {
+        .protocol = EINVAL
+    };
+    if (!control || !owner || !owner_bytes || !identity || !id || !limit
+        || charged > limit) return out;
+    uintptr_t c = (uintptr_t)control, o = (uintptr_t)owner;
+    if (sizeof(*control) > UINTPTR_MAX - c || owner_bytes > UINTPTR_MAX - o
+        || (c < o + owner_bytes && o < c + sizeof(*control))) return out;
+    if (wl_mutex_lock(&control->mutex)) {
+        out.protocol = EIO; return out;
+    }
+    if (control->identity != identity || control->source_bank_class
+        || control->owner != owner || control->configured_limit != limit
+        || control->attempt_limit != limit || control->consumed != charged
+        || control->accounting_error || !control->active
+        || control->attempt_id != id
+        || wl_evaluation_control_active_attempt_id(control) != id
+        || (control->stop != WL_EVALUATION_CONTROL_NONE
+        && control->stop != WL_EVALUATION_CONTROL_CANCELLED
+        && control->stop != WL_EVALUATION_CONTROL_WORK_LIMIT)) goto done;
+    if (atomic_fetch_add_explicit(&control->references, 0,
+        memory_order_relaxed) != 2){
+        out.protocol = EBUSY; goto done;
+    }
+    out.checkpoint_result = wl_evaluation_control_charge_locked(control, 0);
+    out.checked = true; out.protocol = 0;
+done:
+    if (wl_mutex_unlock(&control->mutex)) abort();
+    return out;
+}
+
+#ifdef WL_SESSION_TEST_HOOKS
+unsigned wl_evaluation_control_test_source_close_cancel_at;
+
+static void
+wl_evaluation_control_source_close_test_cancel(
+    const wl_evaluation_control_source_close_borrow_t *borrow, unsigned event)
+{
+    if (wl_evaluation_control_test_source_close_cancel_at == event) {
+        wl_evaluation_control_test_source_close_cancel_at = 0;
+        wl_evaluation_control_request_cancel(borrow->control);
+    }
+}
+#endif
+
+wl_evaluation_control_source_close_early_result_t
+wl_evaluation_control_source_bank_run_lexical_close_early(
+    wl_evaluation_control_source_bank_t *bank,
+    wl_evaluation_control_source_lane_t index,
+    const wl_evaluation_control_source_phase_policy_t *policy,
+    const wl_evaluation_control_source_close_borrow_t *borrow,
+    wl_evaluation_control_source_action_fn action, void *payload)
+{
+    wl_evaluation_control_source_close_early_result_t out = {0};
+    out.protocol = EINVAL;
+    if (!bank || bank->identity != bank
+        || (unsigned)index >= WL_EVALUATION_CONTROL_SOURCE_LANES
+        || !policy || !borrow || !action || payload == bank
+        || !borrow->control || !borrow->id || !borrow->identity
+        || (const void *)borrow->control == (const void *)bank
+        || borrow->control->source_bank_class
+        || wl_evaluation_control_identity(borrow->control) != borrow->identity
+        || !policy->bootstrap_work || !policy->current_work ||
+        !policy->close_work
+        || policy->bootstrap_work > WL_EVALUATION_CONTROL_QUANTUM
+        || policy->current_work > WL_EVALUATION_CONTROL_QUANTUM
+        || policy->close_work > WL_EVALUATION_CONTROL_QUANTUM) return out;
+    out.protocol = 0;
+    int rc = wl_evaluation_control_source_bank_lock(bank);
+    if (rc) {
+        out.protocol = rc; out.phase.protocol = rc;
+        out.phase.financial_result = rc; return out;
+    }
+    wl_evaluation_control_source_lane_state_t *lane = &bank->lanes[index];
+    if (bank->closing || lane->context || lane->running ||
+        lane->callback_active){
+        wl_evaluation_control_source_bank_unlock(bank);
+        out.protocol = EBUSY; out.phase.protocol = EBUSY;
+        out.phase.financial_result = EBUSY; return out;
+    }
+    wl_evaluation_control_source_context_t context = {
+        .identity = &context, .bank = bank, .lane = (unsigned)index,
+        .thread_cookie = &wl_evaluation_control_source_thread_cookie
+    };
+    lane->context = &context;
+    /* This same-activation borrow remains private and exclusively owned.
+     * A source stop never creates a BANK BEGIN or work permission. */
+#ifdef WL_SESSION_TEST_HOOKS
+    wl_evaluation_control_source_close_test_cancel(borrow,
+        WL_EVALUATION_CONTROL_TEST_SOURCE_CLOSE_ACQUIRE);
+#endif
+    out.acquisition_called = true;
+    out.acquisition_result = wl_evaluation_control_charge_attempt(
+        borrow->control, borrow->id, 0);
+    if (out.acquisition_result) goto unlock;
+    rc = WL_SOURCE_EARLY_REARM(bank, (unsigned)index);
+    if (rc) {
+        out.protocol = rc; out.phase.protocol = rc;
+        out.phase.financial_result = rc; goto unbegun_handoff;
+    }
+    wl_evaluation_control_source_early_begin_t begun =
+        wl_evaluation_control_source_bank_begin_checkpoint(lane);
+    out.phase.begin_protocol = begun.protocol;
+    out.phase.checkpoint_result = begun.checkpoint;
+    if (!begun.started) {
+        out.protocol = begun.protocol; out.phase.protocol = begun.protocol;
+        out.phase.financial_result = begun.protocol; goto unbegun_handoff;
+    }
+    out.phase.phase_started = true;
+    rc = begun.checkpoint;
+    if (!rc) rc = wl_evaluation_control_source_bank_charge(lane,
+                policy->bootstrap_work);
+    if (!rc) rc = wl_evaluation_control_source_bank_charge(lane,
+                policy->current_work);
+    if (!rc) {
+        lane->callback_active = true;
+        wl_evaluation_control_source_bank_unlock(bank);
+        out.phase.first_result = action(payload);
+        out.phase.first_called = true;
+        if (wl_evaluation_control_source_bank_lock(bank)) abort();
+        lane->callback_active = false;
+        /* A may already have freed Source. Never follow its borrowed pointer
+         * after entry, including a strict A refusal with ownership retained. */
+        WL_SOURCE_FINAL_TEST_EVENT(lane,
+            WL_EVALUATION_CONTROL_TEST_SOURCE_FINAL_AFTER_ACTION);
+        rc = wl_evaluation_control_source_bank_charge(lane, policy->close_work);
+    } else {
+#ifdef WL_SESSION_TEST_HOOKS
+        wl_evaluation_control_source_close_test_cancel(borrow,
+            WL_EVALUATION_CONTROL_TEST_SOURCE_CLOSE_PREFINISH);
+#endif
+        out.unwind_handoff_called = true;
+        out.unwind_handoff_result = wl_evaluation_control_charge_attempt(
+            borrow->control, borrow->id, 0);
+    }
+    {
+        int finished =
+            wl_evaluation_control_source_bank_finish_constructor_phase(
+            bank, (unsigned)index, &context);
+        out.phase.financial_result = rc ? rc : finished;
+        out.phase.phase_finished = true;
+    }
+    goto unlock;
+unbegun_handoff:
+#ifdef WL_SESSION_TEST_HOOKS
+    wl_evaluation_control_source_close_test_cancel(borrow,
+        WL_EVALUATION_CONTROL_TEST_SOURCE_CLOSE_PREFINISH);
+#endif
+    out.unwind_handoff_called = true;
+    out.unwind_handoff_result = wl_evaluation_control_charge_attempt(
+        borrow->control, borrow->id, 0);
+unlock:
+    lane->context = NULL;
+    wl_evaluation_control_source_bank_unlock(bank);
+    return out;
+}

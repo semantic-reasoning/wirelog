@@ -905,6 +905,82 @@ lexical_finance_retire(void)
     }
 }
 
+static void
+lexical_finance_checkpoint(void)
+{
+    int owner = 0, other = 0, scope = 0;
+    CHECK(wl_evaluation_control_lexical_finance_checkpoint_owned(NULL,
+        &owner, sizeof(owner), 1, 1, 64, 0).protocol == EINVAL);
+    for (unsigned bad = 0; bad < 10; ++bad) {
+        wl_evaluation_control_lexical_finance_birth_result_t born =
+            wl_evaluation_control_private_financier_birth_try(64, &owner);
+        CHECK(!born.protocol && born.control && born.id && born.identity);
+        CHECK(!wl_evaluation_control_charge_attempt(born.control, born.id, 7));
+        wl_evaluation_control_request_cancel(born.control);
+        if (bad == 9) CHECK(!wl_evaluation_control_retain(born.control));
+        wl_evaluation_control_lexical_finance_checkpoint_result_t checked =
+            wl_evaluation_control_lexical_finance_checkpoint_owned(born.control,
+                bad == 0 ? &other : bad ==
+                1 ? (const void *)born.control : &owner,
+                bad == 2 ? 0 : bad == 3 ? SIZE_MAX : sizeof(owner),
+                bad == 4 ? born.identity + 1 : bad == 8 ? 0 : born.identity,
+                bad == 5 ? born.id + 1 : born.id,
+                bad == 6 ? 65 : 64, bad == 7 ? 8 : 7);
+        CHECK(!checked.checked && !checked.checkpoint_result
+            && checked.protocol == (bad == 9 ? EBUSY : EINVAL));
+        if (bad == 9) wl_evaluation_control_release(born.control);
+        /* Ordinary FINISH does not observe the pending cancel. A NONE report
+         * independently proves every strict refusal stayed before its poll. */
+        wl_evaluation_control_attempt_finish_result_t ended =
+            wl_evaluation_control_finish_attempt(born.control, &owner, born.id,
+                0, 0);
+        CHECK(!ended.protocol && ended.report_valid && !ended.report.stop_reason
+            && !ended.report.result && ended.report.consumed == 7);
+        wl_evaluation_control_lexical_finance_expectation_t expected = {
+            .owner = &owner, .scope = &scope,
+            .owner_bytes = sizeof(owner), .scope_bytes = sizeof(scope),
+            .identity = born.identity, .limit = 64, .charged = 7
+        };
+        wl_evaluation_control_lexical_finance_result_t closed =
+            wl_evaluation_control_lexical_finance_close_checked(born.control,
+                &expected);
+        CHECK(!closed.protocol && closed.closed && closed.report_valid &&
+            !closed.result);
+    }
+    for (unsigned stop = 0; stop < 3; ++stop) {
+        wl_evaluation_control_lexical_finance_birth_result_t born =
+            wl_evaluation_control_private_financier_birth_try(64, &owner);
+        CHECK(!born.protocol);
+        if (stop == 1) wl_evaluation_control_request_cancel(born.control);
+        if (stop == 2) CHECK(wl_evaluation_control_charge_attempt(born.control,
+                born.id, 65)
+                == WL_EVALUATION_CONTROL_WORK_LIMIT);
+        int result = stop == 1 ? WL_EVALUATION_CONTROL_CANCELLED
+            : stop == 2 ? WL_EVALUATION_CONTROL_WORK_LIMIT : 0;
+        wl_evaluation_control_lexical_finance_checkpoint_result_t checked =
+            wl_evaluation_control_lexical_finance_checkpoint_owned(born.control,
+                &owner, sizeof(owner), born.identity, born.id, 64, 0);
+        CHECK(!checked.protocol && checked.checked &&
+            checked.checkpoint_result == result
+            && wl_evaluation_control_active_attempt_id(born.control) ==
+            born.id);
+        wl_evaluation_control_report_t absent;
+        CHECK(wl_evaluation_control_report(born.control, &absent) == ENOENT);
+        wl_evaluation_control_lexical_finance_expectation_t expected = {
+            .owner = &owner, .scope = &scope,
+            .owner_bytes = sizeof(owner), .scope_bytes = sizeof(scope),
+            .identity = born.identity, .limit = 64, .id = born.id,
+            .active = true
+        };
+        wl_evaluation_control_lexical_finance_result_t closed =
+            wl_evaluation_control_lexical_finance_close_checked(born.control,
+                &expected);
+        CHECK(!closed.protocol && closed.closed && closed.report_valid
+            && closed.result == result && closed.report.stop_reason == result
+            && !closed.report.consumed);
+    }
+}
+
 int
 main(void)
 {
@@ -922,6 +998,7 @@ main(void)
     private_financier_birth();
     lexical_finance_finish();
     lexical_finance_retire();
+    lexical_finance_checkpoint();
     CHECK(wl_evaluation_control_test_seed_next_identity(UINT64_MAX - 1) == 0);
     wl_evaluation_control_t *last = NULL;
     CHECK(wl_evaluation_control_create(0, &last) == 0);

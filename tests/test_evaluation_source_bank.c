@@ -1089,6 +1089,86 @@ fresh_source_birth_exhaustion(void)
     wl_evaluation_control_release(last.control);
 }
 
+typedef struct {
+    wl_evaluation_control_t *source;
+    wl_evaluation_control_lexical_finance_expectation_t expected;
+    unsigned calls;
+} early_close_refusal_t;
+
+static int
+early_close_strict_refusal(void *payload)
+{
+    early_close_refusal_t *p = payload;
+    ++p->calls;
+    wl_evaluation_control_request_cancel(p->source);
+    wl_evaluation_control_lexical_finance_expectation_t stale = p->expected;
+    ++stale.id;
+    wl_evaluation_control_lexical_finance_result_t refused =
+        wl_evaluation_control_lexical_finance_close_checked(p->source, &stale);
+    CHECK(refused.protocol == EINVAL && !refused.closed);
+    return refused.protocol;
+}
+
+static void
+early_close_refusal_cases(void)
+{
+    wl_evaluation_control_source_bank_t *bank = NULL;
+    CHECK(!wl_evaluation_control_source_bank_create(&bank));
+    static const wl_evaluation_control_source_phase_policy_t policy = {208, 144,
+                                                                       80};
+    int owner = 0, scope = 0;
+    for (unsigned mode = 0; mode < 3; ++mode) {
+        wl_evaluation_control_lexical_finance_birth_result_t born =
+            wl_evaluation_control_private_financier_birth_try(64, &owner);
+        CHECK(!born.protocol);
+        wl_evaluation_control_lexical_finance_checkpoint_result_t checked =
+            wl_evaluation_control_lexical_finance_checkpoint_owned(born.control,
+                &owner, sizeof(owner), born.identity, born.id, 64, 0);
+        CHECK(checked.checked && !checked.protocol &&
+            !checked.checkpoint_result);
+        early_close_refusal_t p = {
+            .source = born.control,
+            .expected = {.owner = &owner, .scope = &scope,
+                         .owner_bytes = sizeof(owner),
+                         .scope_bytes = sizeof(scope),
+                         .identity = born.identity, .limit = 64, .id = born.id,
+                         .active = true}
+        };
+        wl_evaluation_control_source_close_borrow_t borrow = {
+            born.control, mode == 0 ? 0 : born.id,
+            mode == 1 ? born.identity + 1 : born.identity
+        };
+        if (mode < 2) wl_evaluation_control_request_cancel(born.control);
+        wl_evaluation_control_source_close_early_result_t result =
+            wl_evaluation_control_source_bank_run_lexical_close_early(bank,
+                WL_EVALUATION_CONTROL_SOURCE_OPERATION, &policy, &borrow,
+                early_close_strict_refusal, &p);
+        if (mode < 2) CHECK(result.protocol == EINVAL && !p.calls
+                && !result.phase.phase_started && !result.phase.first_called
+                && !result.acquisition_called && !result.unwind_handoff_called);
+        else CHECK(!result.protocol && p.calls == 1 &&
+                result.phase.phase_started
+                && result.phase.phase_finished && result.phase.first_called
+                && result.phase.first_result == EINVAL &&
+                !result.phase.financial_result
+                && result.acquisition_called && !result.unwind_handoff_called);
+        /* The callback refused; ownership is still live. In particular no
+         * saved Source poll is permitted after entering A, even on refusal. */
+        CHECK(wl_evaluation_control_active_attempt_id(born.control) == born.id);
+        wl_evaluation_control_attempt_finish_result_t ended =
+            wl_evaluation_control_finish_attempt(born.control, &owner, born.id,
+                0, 0);
+        CHECK(!ended.protocol && ended.report_valid && !ended.report.stop_reason
+            && !ended.report.result);
+        p.expected.active = false; p.expected.id = 0;
+        wl_evaluation_control_lexical_finance_result_t closed =
+            wl_evaluation_control_lexical_finance_close_checked(born.control,
+                &p.expected);
+        CHECK(!closed.protocol && closed.closed && !closed.result);
+    }
+    CHECK(!wl_evaluation_control_source_bank_destroy(&bank) && !bank);
+}
+
 int
 main(int argc, char **argv)
 {
@@ -1097,6 +1177,7 @@ main(int argc, char **argv)
         return 0;
     }
     fresh_source_birth_cases();
+    early_close_refusal_cases();
     early_phase_cases();
     early_invalid_cases();
     final_metadata_geometry();

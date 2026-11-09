@@ -1003,6 +1003,201 @@ early_finance_cases(wl_session_t *session)
     }
 }
 
+typedef struct {
+    wl_session_t *session;
+    wl_session_source_finance_t *record;
+    wl_session_source_close_scope_t *scope;
+    wl_session_source_finance_close_early_result_t result;
+} early_close_call_t;
+
+static void *
+early_foreign_close(void *payload)
+{
+    early_close_call_t *p = payload;
+    p->result = wl_session_source_finance_close_early_owned(p->session,
+            p->record, p->scope);
+    return NULL;
+}
+
+static int
+early_nested_close(void *payload)
+{
+    early_close_call_t *p = payload;
+    p->result = wl_session_source_finance_close_early_owned(p->session,
+            p->record, p->scope);
+    return 0;
+}
+
+static void
+early_close_cases(wl_session_t *session)
+{
+    static const wl_evaluation_control_source_phase_policy_t policy = {208, 128,
+                                                                       80};
+    for (unsigned mode = 0; mode <= 10; ++mode) {
+        wl_session_source_finance_t record = {0};
+        wl_session_source_close_scope_t scope;
+        scope.identity = NULL;
+        wl_session_source_checked_birth_outcome_t birth =
+            wl_session_source_finance_start_checked_early(session, &record,
+                &policy, mode == 2 ? 4 : 672, &scope);
+        CHECK(birth.bound && !birth.birth_result &&
+            !birth.phase.financial_result);
+        wl_evaluation_control_report_t before, after;
+        CHECK(!wl_session_test_source_early_report(session, &before));
+        if (mode == 1) wl_evaluation_control_request_cancel(record.control);
+        if (mode == 2) CHECK(wl_session_source_finance_charge(&record, 5)
+                == WL_EVALUATION_CONTROL_WORK_LIMIT && !record.charged);
+        if (mode == 3 ||
+            mode ==
+            8) wl_evaluation_control_test_source_early_cancel_once = true;
+        if (mode == 4) wl_evaluation_control_test_source_final_cancel_at =
+                WL_EVALUATION_CONTROL_TEST_SOURCE_FINAL_AFTER_ACTION;
+        if (mode == 5 ||
+            mode ==
+            9) wl_evaluation_control_test_source_early_rearm_ref_once = true;
+        if (mode == 7) wl_evaluation_control_test_source_close_cancel_at =
+                WL_EVALUATION_CONTROL_TEST_SOURCE_CLOSE_ACQUIRE;
+        if (mode == 8) wl_evaluation_control_test_source_close_cancel_at =
+                WL_EVALUATION_CONTROL_TEST_SOURCE_CLOSE_PREFINISH;
+        if (mode == 9) wl_evaluation_control_test_source_close_cancel_at =
+                WL_EVALUATION_CONTROL_TEST_SOURCE_CLOSE_COMPLETION;
+        if (mode == 10) wl_evaluation_control_test_source_close_cancel_at =
+                WL_EVALUATION_CONTROL_TEST_SOURCE_CLOSE_PHYSICAL;
+        wl_session_source_finance_close_early_result_t closed;
+        if (mode == 6) {
+            early_close_call_t nested = {.session = session, .record = &record,
+                                         .scope = &scope};
+            wl_evaluation_control_source_phase_result_t phase =
+                wl_session_source_snapshot_metadata(session, early_nested_close,
+                    &nested);
+            CHECK(phase.action_called && !phase.action_result &&
+                !phase.financial_result);
+            closed = nested.result;
+        } else closed = wl_session_source_finance_close_early_owned(session,
+                    &record, &scope);
+        CHECK(closed.owner_checked && closed.close.closed &&
+            closed.close.applied
+            && !record.control && !record.active && !record.attached &&
+            !record.id
+            && !scope.control && scope.result.closed);
+        bool no_start = mode == 1 || mode == 2 || mode == 5 || mode == 6 ||
+            mode == 7 || mode == 9;
+        bool bank_cancel = mode == 3 || mode == 4 || mode == 8;
+        bool source_cancel = mode == 1 || mode == 7 || mode == 8 || mode == 9 ||
+            mode == 10;
+        bool no_a = no_start || mode == 3 || mode == 8;
+        CHECK(closed.phase.phase.phase_started == !no_start
+            && closed.phase.phase.phase_finished == !no_start
+            && closed.phase.phase.first_called == !no_a
+            && closed.completion_called == no_a
+            && closed.mandatory_unwind_called == no_a);
+        CHECK(closed.protocol == ((mode == 5 || mode == 6 ||
+            mode == 9) ? EBUSY : 0));
+        CHECK(closed.close.source_result ==
+            (source_cancel ? WL_EVALUATION_CONTROL_CANCELLED
+            : mode == 2 ? WL_EVALUATION_CONTROL_WORK_LIMIT : 0));
+        CHECK(closed.phase.acquisition_called == (mode != 6));
+        CHECK(closed.phase.acquisition_result == (mode == 1 || mode == 7
+            ? WL_EVALUATION_CONTROL_CANCELLED : mode ==
+            2 ? WL_EVALUATION_CONTROL_WORK_LIMIT : 0));
+        CHECK(closed.phase.unwind_handoff_called ==
+            (mode == 3 || mode == 5 || mode == 8 || mode == 9));
+        CHECK(closed.phase.unwind_handoff_result ==
+            (mode == 8 ? WL_EVALUATION_CONTROL_CANCELLED : 0));
+        CHECK(closed.authorizer_result ==
+            (mode == 1 ? WL_EVALUATION_CONTROL_CANCELLED
+            : mode == 2 ? WL_EVALUATION_CONTROL_WORK_LIMIT : 0));
+        if (no_a) CHECK(closed.completion_result == (source_cancel
+            ? WL_EVALUATION_CONTROL_CANCELLED : mode ==
+                2 ? WL_EVALUATION_CONTROL_WORK_LIMIT : 0));
+        CHECK(closed.phase.phase.financial_result == ((mode == 5 || mode == 6 ||
+            mode == 9)
+            ? EBUSY : bank_cancel ? WL_EVALUATION_CONTROL_CANCELLED : 0));
+        if (no_start && mode != 6) {
+            CHECK(!wl_session_test_source_early_report(session, &after));
+            report_same(before, after); /* No fictitious BEGIN/report. */
+        }
+        if (bank_cancel) CHECK(!wl_session_test_source_final_reset_cancel(
+                    session));
+        CHECK(!wl_evaluation_control_test_source_close_cancel_at
+            && !wl_evaluation_control_test_source_early_cancel_once
+            && !wl_evaluation_control_test_source_early_rearm_ref_once
+            && !wl_evaluation_control_test_source_final_cancel_at);
+        CHECK(!wl_session_test_source_early_report(session, &before));
+        wl_session_source_finance_close_early_result_t cached =
+            wl_session_source_finance_close_early_owned(session, &record,
+                &scope);
+        CHECK(!cached.protocol && cached.close.closed && !cached.owner_checked
+            && !cached.phase.phase.phase_started && !cached.completion_called
+            && !cached.mandatory_unwind_called);
+        CHECK(!wl_session_test_source_early_report(session, &after));
+        report_same(before, after);
+    }
+    /* A pending cancellation plus ordinary FINISH (which does not poll)
+     * makes refusal-without-poll observable independently of the new helper. */
+    wl_session_source_finance_t record = {0};
+    wl_session_source_close_scope_t scope;
+    scope.identity = NULL;
+    wl_session_source_checked_birth_outcome_t birth =
+        wl_session_source_finance_start_checked_early(session, &record, &policy,
+            672, &scope);
+    CHECK(birth.bound && !birth.birth_result && !birth.phase.financial_result);
+    wl_evaluation_control_request_cancel(record.control);
+    wl_session_t copied_session = *session;
+    wl_session_source_finance_t copied_record = record;
+    wl_session_source_close_scope_t copied_scope = scope;
+    CHECK(wl_session_source_finance_close_early_owned(&copied_session, &record,
+        &scope).protocol == EINVAL);
+    CHECK(wl_session_source_finance_close_early_owned(session, &copied_record,
+        &scope).protocol == EINVAL);
+    CHECK(wl_session_source_finance_close_early_owned(session, &record,
+        &copied_scope).protocol == EINVAL);
+    CHECK(wl_session_source_finance_close_early_owned(session, &record,
+        (wl_session_source_close_scope_t *)&record).protocol == EINVAL);
+    early_close_call_t foreign = {.session = session, .record = &record,
+                                  .scope = &scope};
+    wl_thread_t thread;
+    CHECK(!wl_thread_create(&thread, early_foreign_close, &foreign));
+    CHECK(!wl_thread_join(&thread) && foreign.result.protocol == EINVAL);
+    const void *saved_cookie = scope.thread_cookie;
+    scope.thread_cookie = NULL;
+    CHECK(wl_session_source_finance_close_early_owned(session, &record,
+        &scope).protocol == EBUSY);
+    scope.thread_cookie = saved_cookie;
+    uint64_t saved_identity = scope.control_identity, saved_id = record.id;
+    wl_evaluation_control_t *saved_control = record.control;
+    record.control = scope.control = session->evaluation_control;
+    scope.control_identity =
+        wl_evaluation_control_identity(session->evaluation_control);
+    CHECK(wl_session_source_finance_close_early_owned(session, &record,
+        &scope).protocol == EINVAL);
+    record.control = scope.control = saved_control;
+    scope.control_identity = saved_identity;
+    ++scope.control_identity;
+    CHECK(wl_session_source_finance_close_early_owned(session, &record,
+        &scope).protocol == EINVAL);
+    scope.control_identity = saved_identity;
+    ++record.id;
+    CHECK(wl_session_source_finance_close_early_owned(session, &record,
+        &scope).protocol == EINVAL);
+    record.id = saved_id;
+    CHECK(!wl_evaluation_control_retain(record.control));
+    CHECK(wl_session_source_finance_close_early_owned(session, &record,
+        &scope).protocol == EBUSY);
+    wl_evaluation_control_release(record.control);
+    wl_evaluation_control_attempt_finish_result_t ended =
+        wl_evaluation_control_finish_attempt(record.control, &record, saved_id,
+            0, 0);
+    CHECK(!ended.protocol && ended.report_valid && !ended.report.stop_reason &&
+        !ended.report.result);
+    record.active = false; record.id = 0; /* Actual owner FINISH receipt. */
+    CHECK(wl_session_source_finance_close_early_owned(session, &record,
+        &scope).protocol == EINVAL);
+    wl_session_source_finance_close_result_t old =
+        wl_session_source_finance_close_owned(session, &record, &scope);
+    CHECK(!old.protocol && old.closed); /* Old inactive positive remains valid. */
+}
+
 static void
 finance_cases(wl_session_t *session)
 {
@@ -1010,6 +1205,7 @@ finance_cases(wl_session_t *session)
         (close_calls == 0));
     wl_session_t placement_copy = *session;
     CHECK(!wl_session_source_operation_scope_owned(&placement_copy));
+    early_close_cases(session);
     early_finance_cases(session);
     early_birth_rejections(session);
     finance_final_cases(session);
@@ -1187,6 +1383,8 @@ finance_step(wl_session_t *session)
     begin = wl_evaluation_control_begin_attempt(original,
             session->operation_admission);
     CHECK(!begin.protocol && begin.attempt_id != saved.attempt_id);
+    /* None of these financial paths may observe or consume Original. */
+    wl_evaluation_control_request_cancel(original);
     finance_cases(session);
     uint64_t used = UINT64_MAX;
     wl_evaluation_control_report_t frozen;
