@@ -408,6 +408,26 @@ wl_evaluation_control_report(wl_evaluation_control_t *control,
     return rc;
 }
 
+wl_evaluation_control_completion_generation_t
+wl_evaluation_control_completion_generation_observe(
+    wl_evaluation_control_t *control,
+    uint64_t expected_allocation_identity)
+{
+    wl_evaluation_control_completion_generation_t out = {.protocol = EINVAL};
+    if (!control || !expected_allocation_identity) return out;
+    if (wl_mutex_lock(&control->mutex)) {
+        out.protocol = EIO;
+        return out;
+    }
+    if (control->identity == expected_allocation_identity) {
+        out.active_id = control->active ? control->attempt_id : 0;
+        out.completed_id = control->completed.attempt_id;
+        out.protocol = out.completed_id ? 0 : ENOENT;
+    }
+    wl_mutex_unlock(&control->mutex);
+    return out;
+}
+
 #ifdef WL_SESSION_TEST_HOOKS
 void (*wl_evaluation_control_test_finance_birth_claim)(void);
 unsigned wl_evaluation_control_test_finance_birth_fail;

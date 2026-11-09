@@ -35,6 +35,19 @@ typedef struct {
     int result;
 } wl_evaluation_control_report_t;
 
+/* One readonly, mutex-serialized generation view of a live allocation.
+ * This is completion history, not permission to run or finish Native work.
+ * Caller holds a live reference and serializes owner lifecycle transitions.
+ * EINVAL leaves both IDs zero. With ENOENT, active_id is valid and there is
+ * no completed generation. Existing reports and cancellation are untouched. */
+typedef struct {
+    uint64_t active_id, completed_id;
+    int protocol;
+} wl_evaluation_control_completion_generation_t;
+wl_evaluation_control_completion_generation_t
+wl_evaluation_control_completion_generation_observe(wl_evaluation_control_t *,
+    uint64_t expected_allocation_identity);
+
 /* Limit 0 is unlimited. On failure *out is NULL. */
 int wl_evaluation_control_create(uint64_t limit, wl_evaluation_control_t **out);
 int wl_evaluation_control_retain(wl_evaluation_control_t *control);
