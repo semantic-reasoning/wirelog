@@ -91,3 +91,67 @@ preserves history; production rearm does not reset cancellation.
 This isolated candidate is verified independently of the unfinished Root and
 operator working tree. Full operator/native cleanup, caller Source/carry,
 full serial TSan performance and MSVC execution remain closing-PR requirements.
+
+
+## Checked early close under qualification
+
+An additive active-only close authenticates the original Session/record/scope,
+creator thread, allocation identity and actual Normal owner/ref2/saved generation
+before its first same-lock financial checkpoint. A checked cancellation or work
+stop still owns the two references and requires physical retirement. A copied,
+stale, aliased or extra-reference input refuses before that checkpoint.
+
+The synchronous caller keeps this financial pair unexposed and exclusive;
+only cancellation may change. Its short borrowed tuple is not an ownership
+certificate for arbitrary callers and grants no Native progress. The new BANK
+sibling checkpoints that Source before acquiring a closing phase. If A is not
+called, a distinct Source handoff precedes BANK completion, and another real
+Source checkpoint precedes strict physical retirement after return. A-called
+strict refusal leaves the actual lexical owner live; it never becomes no-A.
+After any A entry the issuer never follows the borrowed Source pointer.
+
+The returned values separate protocol, authorizer/acquisition/completion checks,
+actual BANK BEGIN/checkpoint/finish, A-called/raw result, mandatory unwind and
+physical closure. Already-closed scopes retrieve actual cached closure without
+a new phase or reference drop. The existing close APIs and their inactive
+positives retain their original bodies and behavior.
+
+Native component tests cover these outcomes in actual OP and CLOSE scopes,
+including every Source cancellation seam, real BANK cancellation, genuine
+rearm ref3 and nested-issuer refusal. Ordinary FINISH with a pending cancel
+independently proves strict refusals and called-but-not-closed A do not poll
+Source afterward. Source interval/lower/carry qualification and Root selection
+remain pending; passing functional tests does not establish those bounds.
+
+
+The emitted canonical close packets have these local expanded Source envelopes:
+
+| Interval | Linux | MSVC |
+|---|---:|---:|
+| Prior Root Source0 tail through checked authorizer (stop union) |172|202|
+| Authorizer0 through acquisition0 |162|167|
+| Acquisition0 through BANK BEGIN0 |118|152|
+| BANK CURRENT through strict Source physical0 |148|175|
+| No-A prefinish Source0 through BANK final0 |85|115|
+| BANK final0 through no-A completion Source0 |97|108|
+| Completion Source0 through strict physical0 |132|161|
+| Final BANK0 through direct 88-byte Session return |96|100|
+| No-A final Source0 through free and direct Session return |113|154|
+
+These rows include the actual 44-byte Core result, 88-byte Session result and
+72-byte expected tuple where executed. They exclude future Root result receipt,
+reset and public return ancestry, instrumented callbacks and universal negative
+input profiles. Old close APIs retain their overfull caller contours; adding
+this sibling does not qualify or migrate those callers.
+
+A separate conservative financial worksheet assigns disjoint actual metadata
+lower bounds170 before close BOOT,12 between BOOT and CURRENT,90 through
+successful physical close and60 through the direct returned suffix. Conditional
+on authentic combined incoming promise at most86, the unchanged208/144/80
+coupons peak at256 and leave at most186 to carry onward. Incoming72 gives peak242
+and returned172. Neither incoming condition is established for Root. A direct
+Core stale-A fixture does not execute the Session preflight and instead uses
+its own weaker pre-BOOT124/later40 profile; only fresh incoming0 is certified by
+that worksheet (peak256, returned196). An arbitrary callback cannot borrow the
+successful close lower. No-A cases tested here admit no BANK coupons and never
+refund old promise by zero checks, FINISH or free.

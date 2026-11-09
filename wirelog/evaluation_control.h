@@ -150,6 +150,19 @@ typedef struct {
     uint64_t id, identity;
 } wl_evaluation_control_lexical_finance_birth_result_t;
 
+/* Check only a genuine exclusively owned active financial pair. A checked
+ * cancellation/work stop still owns both obligations and must be retired.
+ * Wrong provenance/owner/ref/id refuses before the controller is polled. */
+typedef struct {
+    int protocol, checkpoint_result;
+    bool checked;
+} wl_evaluation_control_lexical_finance_checkpoint_result_t;
+
+wl_evaluation_control_lexical_finance_checkpoint_result_t
+    wl_evaluation_control_lexical_finance_checkpoint_owned(
+    wl_evaluation_control_t *, const void *, size_t, uint64_t, uint64_t,
+    uint64_t, uint64_t);
+
 /* Financial completion keeps both real references and owner attachment.
  * Caller proves a genuine live financial record/issuer; these expected values
  * alone confer neither Source provenance nor Native permission. */
@@ -379,6 +392,38 @@ typedef struct {
     int first_result, second_result;
     bool phase_started, phase_finished, first_called, second_called;
 } wl_evaluation_control_source_early_result_t;
+
+#ifdef WL_SESSION_TEST_HOOKS
+enum {
+    WL_EVALUATION_CONTROL_TEST_SOURCE_CLOSE_ACQUIRE = 1,
+    WL_EVALUATION_CONTROL_TEST_SOURCE_CLOSE_PREFINISH,
+    WL_EVALUATION_CONTROL_TEST_SOURCE_CLOSE_COMPLETION,
+    WL_EVALUATION_CONTROL_TEST_SOURCE_CLOSE_PHYSICAL
+};
+extern unsigned wl_evaluation_control_test_source_close_cancel_at;
+#endif
+
+/* Synchronous financial borrow only. The Session authorizer has proved the
+ * original lexical pair, identity/owner/ref2/saved generation, and keeps it
+ * unexposed and exclusive until return. Only cancellation may change. These
+ * scalar values alone authenticate no arbitrary caller or Native operation. */
+typedef struct {
+    wl_evaluation_control_t *control;
+    uint64_t id, identity;
+} wl_evaluation_control_source_close_borrow_t;
+
+typedef struct {
+    wl_evaluation_control_source_early_result_t phase;
+    int protocol, acquisition_result, unwind_handoff_result;
+    bool acquisition_called, unwind_handoff_called;
+} wl_evaluation_control_source_close_early_result_t;
+
+wl_evaluation_control_source_close_early_result_t
+    wl_evaluation_control_source_bank_run_lexical_close_early(
+    wl_evaluation_control_source_bank_t *, wl_evaluation_control_source_lane_t,
+    const wl_evaluation_control_source_phase_policy_t *,
+    const wl_evaluation_control_source_close_borrow_t *,
+    wl_evaluation_control_source_action_fn, void *);
 
 wl_evaluation_control_source_early_result_t
 wl_evaluation_control_source_bank_run_lexical_early(
