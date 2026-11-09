@@ -70,6 +70,81 @@ active_consumed_observation(void)
 }
 
 static void
+completion_generation_observation(void)
+{
+    int owner;
+    wl_evaluation_control_t *control = NULL, *other = NULL;
+    CHECK(!wl_evaluation_control_create(7, &control));
+    CHECK(!wl_evaluation_control_create(0, &other));
+    CHECK(!wl_evaluation_control_attach(control, &owner));
+    uint64_t identity = wl_evaluation_control_identity(control);
+    uint64_t wrong_identity = wl_evaluation_control_identity(other);
+    CHECK(identity && wrong_identity && identity != wrong_identity);
+    CHECK(!wl_evaluation_control_retain(control));
+    for (unsigned invalid = 0; invalid < 3; ++invalid) {
+        wl_evaluation_control_completion_generation_t seen =
+            wl_evaluation_control_completion_generation_observe(invalid ==
+                0 ? NULL : control,
+                invalid == 1 ? 0 : invalid == 2 ? wrong_identity : identity);
+        CHECK(seen.protocol == EINVAL && !seen.active_id && !seen.completed_id);
+    }
+    wl_evaluation_control_completion_generation_t seen =
+        wl_evaluation_control_completion_generation_observe(control, identity);
+    CHECK(seen.protocol == ENOENT && !seen.active_id && !seen.completed_id);
+    CHECK(!wl_evaluation_control_begin(control, &owner));
+    CHECK(!wl_evaluation_control_charge(control, 3));
+    seen = wl_evaluation_control_completion_generation_observe(control,
+            identity);
+    CHECK(seen.protocol == ENOENT && seen.active_id == 1 && !seen.completed_id);
+    uint64_t consumed;
+    CHECK(!wl_evaluation_control_test_active_consumed(control, 1,
+        &consumed) && consumed == 3);
+    wl_evaluation_control_request_cancel(control);
+    seen = wl_evaluation_control_completion_generation_observe(control,
+            identity);
+    CHECK(seen.protocol == ENOENT && seen.active_id == 1 && !seen.completed_id);
+    /* Observing pending cancellation does not latch it into the report. */
+    CHECK(!wl_evaluation_control_finish(control, &owner, 0, 0));
+    wl_evaluation_control_report_t before, after;
+    CHECK(!wl_evaluation_control_report(control, &before)
+        && before.attempt_id == 1 && before.consumed == 3 && !before.result
+        && before.stop_reason == WL_EVALUATION_CONTROL_NONE);
+    seen = wl_evaluation_control_completion_generation_observe(control,
+            identity);
+    CHECK(!seen.protocol && !seen.active_id && seen.completed_id == 1);
+    CHECK(!wl_evaluation_control_reset(control));
+    CHECK(!wl_evaluation_control_begin(control, &owner));
+    CHECK(!wl_evaluation_control_charge(control, 2));
+    seen = wl_evaluation_control_completion_generation_observe(control,
+            wrong_identity);
+    CHECK(seen.protocol == EINVAL && !seen.active_id && !seen.completed_id);
+    seen = wl_evaluation_control_completion_generation_observe(control,
+            identity);
+    CHECK(!seen.protocol && seen.active_id == 2 && seen.completed_id == 1);
+    CHECK(!wl_evaluation_control_test_active_consumed(control, 2,
+        &consumed) && consumed == 2);
+    CHECK(!wl_evaluation_control_report(control, &after)
+        && after.attempt_id == before.attempt_id && after.limit == before.limit
+        && after.consumed == before.consumed &&
+        after.stop_reason == before.stop_reason
+        && after.result == before.result &&
+        after.execution_status == before.execution_status
+        && after.cleanup_status == before.cleanup_status);
+    CHECK(wl_evaluation_control_finish(control, &owner, EDOM, 0) == EDOM);
+    seen = wl_evaluation_control_completion_generation_observe(control,
+            identity);
+    CHECK(!seen.protocol && !seen.active_id && seen.completed_id == 2);
+    CHECK(!wl_evaluation_control_report(control, &after)
+        && after.attempt_id == 2 && after.consumed == 2 && after.result == EDOM
+        && after.execution_status == EDOM && !after.cleanup_status
+        && after.stop_reason == WL_EVALUATION_CONTROL_NONE);
+    CHECK(!wl_evaluation_control_detach(control, &owner));
+    wl_evaluation_control_release(control);
+    wl_evaluation_control_release(control);
+    wl_evaluation_control_release(other);
+}
+
+static void
 boundaries(void)
 {
     int owner, other;
@@ -984,6 +1059,7 @@ lexical_finance_checkpoint(void)
 int
 main(void)
 {
+    completion_generation_observation();
     active_consumed_observation();
     boundaries();
     limits_and_errors();
