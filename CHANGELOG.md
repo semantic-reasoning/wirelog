@@ -248,6 +248,20 @@ All notable changes to wirelog are documented in this file.
 
 ### Fixed
 
+- **An integer reaching a `float` head column, and an aggregate result its
+  column cannot hold, are rejected** (#2231): a head column declared
+  `float` stored an integer that is not a literal as its int64 bits, so
+  `p(x) :- n(x).` with `n(1)` and `n` declared `int64` derived
+  `p(4.9406564584124654e-324)`, and an aggregate's column was not checked
+  at all, so `count()` into a `float` column, `sum()` of a `float` column
+  into an `int64` one and `min()` of an `int64` column into a `symbol` one
+  stored ids or bits. Loading now fails with `WIRELOG_ERR_PARSE` in those
+  cases. An integer literal in a `float` column is still converted to its
+  binary64 value, and an aggregate is checked by the kind of its result:
+  `count()` an integer, `min()` and `max()` their operand's kind, `sum()` a
+  `float` for a `float` operand and an integer otherwise, and `average()`
+  of a `float` operand a `float`.
+
 - **A bare string-function expression in a rule body is a parse error**
   (#2231): a body element starting with a string function and not followed
   by a comparison was accepted, so `m(x) :- s(x), strlen(x) * 0.` dropped
@@ -466,11 +480,11 @@ All notable changes to wirelog are documented in this file.
   only for relations typed by a `.decl`, with no compound column and used at
   their declared width; a comparison is checked when both operand types are
   known from a column, a literal, a string function, arithmetic or an `=`
-  binding. Inline facts, host inserts, the aggregate column of an aggregate
-  head, the operands of string and arithmetic functions, the results of
-  scalar extension calls, an integer in a `float` head column, and a `float`
-  against a number in a body comparison or join are not; the group-by keys
-  of an aggregate head are checked like any head argument.
+  binding. Inline facts, host inserts, a `min()`, `max()` or `sum()` whose
+  operand's kind is not known, the operands of string and arithmetic
+  functions, the results of scalar extension calls, and a `float` against a
+  number in a body comparison or join are not; the group-by keys of an
+  aggregate head are checked like any head argument.
 
 - **`wirelog_easy_print_delta` no longer aborts on a symbol id it cannot
   resolve** (#2231): a row whose `symbol` or `string` column held an id

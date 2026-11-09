@@ -4571,6 +4571,63 @@ test_rule_value_domains(void)
     expect_domain_accepted("Domains: aggregate keys of their columns' kinds",
         DOMAIN_BASE ".decl c(x: symbol, y: int64, n: int64)\n"
         "c(x, y, count(y)) :- s(x), g(y).\n");
+
+    /* #2231: an integer that is not a literal reaches a float column as its
+     * int64 bits, and an aggregate's column takes its result's kind. */
+#define FLOAT_BASE \
+        DOMAIN_BASE ".decl f(x: float)\nf(1.5).\nf(2.5).\n" \
+        ".decl a(x: float)\n.decl n(x: int64)\n.decl y(x: symbol)\n"
+    static const struct {
+        const char *name;
+        const char *rule;
+        const char *needle;
+    } rejected[] = {
+        { "Domains: int64 variable into a float head", "a(x) :- g(x).\n",
+          "rule head for 'a' puts a non-float (integer or mixed-arithmetic)"
+          " value into column 0, which is declared float" },
+        { "Domains: integer arithmetic into a float head",
+          "a(x + 1) :- g(x).\n", "puts a non-float (integer or mixed" },
+        { "Domains: mixed arithmetic into a float head",
+          "a(x + 1) :- f(x).\n", "puts a non-float (integer or mixed" },
+        { "Domains: strlen() into a float head", "a(strlen(x)) :- s(x).\n",
+          "puts a non-float (integer or mixed" },
+        { "Domains: count() into a float head", "a(count(x)) :- g(x).\n",
+          "puts a non-float (integer or mixed" },
+        { "Domains: sum() of int64 into a float head",
+          "a(sum(x)) :- g(x).\n", "puts a non-float (integer or mixed" },
+        { "Domains: sum() of float into an int64 head",
+          "n(sum(x)) :- f(x).\n",
+          "rule head for 'n' puts a float value into column 0" },
+        { "Domains: average() into an int64 head",
+          "n(average(x)) :- f(x).\n", "puts a float value" },
+        { "Domains: min() of int64 into a symbol head",
+          "y(min(x)) :- g(x).\n", "puts a numeric value" },
+        { "Domains: count() into a symbol head", "y(count(x)) :- g(x).\n",
+          "puts a numeric value" },
+    };
+    static const struct {
+        const char *name;
+        const char *rule;
+    } accepted[] = {
+        { "Domains: float variable into a float head", "a(x) :- f(x).\n" },
+        { "Domains: sum() of float into a float head",
+          "a(sum(x)) :- f(x).\n" },
+        { "Domains: average() of float into a float head",
+          "a(average(x)) :- f(x).\n" },
+        { "Domains: count() into an int64 head", "n(count(x)) :- f(x).\n" },
+        { "Domains: min() of symbol into a symbol head",
+          "y(min(x)) :- s(x).\n" },
+    };
+    char src[1024];
+    for (size_t i = 0; i < sizeof(rejected) / sizeof(rejected[0]); i++) {
+        snprintf(src, sizeof(src), FLOAT_BASE "%s", rejected[i].rule);
+        expect_domain_rejected(rejected[i].name, src, rejected[i].needle);
+    }
+    for (size_t i = 0; i < sizeof(accepted) / sizeof(accepted[0]); i++) {
+        snprintf(src, sizeof(src), FLOAT_BASE "%s", accepted[i].rule);
+        expect_domain_accepted(accepted[i].name, src);
+    }
+#undef FLOAT_BASE
 }
 
 /* ======================================================================== */

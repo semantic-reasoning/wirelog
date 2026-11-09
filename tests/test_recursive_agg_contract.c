@@ -866,11 +866,11 @@ test_operand_type_is_order_independent(void)
  * code -- confirmed by mutation, deleting it left the other nine cases
  * green.
  *
- * The mixed output itself is not pretty, and is not made prettier here: a
- * column declared `symbol` shows a raw 5 because the numeric rule wrote one.
- * That is the pre-existing consequence of a program whose rules disagree
- * about what the column holds, and diagnosing it is #979's channel, not this
- * change's business.
+ * Label is left undeclared.  Declared `symbol`, the numeric rule would put
+ * a number into a symbol column, which loading rejects since #2231; the
+ * operand domains that decide the veto come from the body relations' own
+ * declarations either way.  The mixed output is not pretty: column 1 holds
+ * a raw 5 from the numeric rule beside the symbol ids.
  */
 static void
 test_operand_domain_conflict_is_vetoed(void)
@@ -881,13 +881,22 @@ test_operand_domain_conflict_is_vetoed(void)
         ".decl Edge(x: int64, y: int64)\n"
         ".decl Sym(x: int64, v: symbol)\n"
         ".decl Num(x: int64, v: int64)\n"
-        ".decl Label(x: int64, l: symbol)\n"
         "Sym(1,\"zz\"). Sym(1,\"aa\"). Num(1, 5). Num(1, 9).\n"
         "Edge(1,2).\n"
         "Label(x, min(v)) :- Sym(x, v).\n"
         "Label(x, min(v)) :- Num(x, v).\n"
         "Label(x, min(v)) :- Label(y, v), Edge(y, x).\n";
     static const char *const want[] = { "1|5", "1|aa", "2|aa", NULL };
+
+    wirelog_error_t err = WIRELOG_OK;
+    char declared[1024];
+    snprintf(declared, sizeof(declared), ".decl Label(x: int64, l: symbol)\n%s",
+        src);
+    wirelog_program_t *prog = wirelog_parse_string(declared, &err);
+    if (prog)
+        wirelog_program_free(prog);
+    ASSERT(!prog && err == WIRELOG_ERR_PARSE,
+        "a numeric min() into a declared symbol column must not load");
 
     for (size_t w = 0; w < N_WORKER_COUNTS; w++) {
         collect_t c;
