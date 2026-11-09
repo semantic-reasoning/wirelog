@@ -1493,7 +1493,8 @@ body_constant_conflict(wl_ir_coltype_t value, wl_ir_coltype_t column)
 }
 
 /* The relation @atom names when its columns can be checked: typed by a
- * `.decl`, no compound column, used at its declared width. */
+ * `.decl` or by its inline facts (schema_from_facts), no compound column,
+ * used at its declared width. */
 static const wl_ir_relation_info_t *
 domain_checked_relation(const struct wirelog_program *program,
     const wl_parser_ast_node_t *atom)
