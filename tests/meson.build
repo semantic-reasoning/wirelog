@@ -1149,25 +1149,13 @@ test('ci_pr_build_timeout_contract', py3,
      args: [meson.project_source_root() / 'scripts/ci/test-ci-pr-build-timeouts.py'],
      suite: 'abi')
 
-# sccache v0.19.0 keeps ALL cache statistics in an auto-spawned in-memory
-# daemon that exits after a 600s idle timeout; the sanitizer legs run a
-# ~20-minute test phase after their last compile, so the daemon is dead when
-# the sccache-action post step runs `--show-stats` and it reports the
-# all-zero summary `0% - 0 hits, 0 misses, 0 errors` instead of the real hit
-# rate.  SCCACHE_IDLE_TIMEOUT=0 disables idle shutdown, so the sanitizer
-# legs' real hit rate is reported (inert in the plain build legs, which do
-# not invoke sccache).
-test('ci_pr_sccache_stats_daemon', py3,
-     args: [meson.project_source_root() / 'scripts/ci/test-ci-pr-sccache-stats-daemon.py'],
-     suite: 'abi')
-
 # Sanitizer legs must not build the examples/ demos: each one re-compiles the
 # full wirelog_sources under instrumentation, and the example suites (golden
 # diff + demo smoke) are already covered by the non-sanitized build legs.  The
 # sanitizer `meson setup` blocks therefore pass -Dexamples=false (the
 # `examples` meson option, default true); plain legs must keep examples on.
 # Bidirectional structural guard, same convention as
-# test-ci-pr-sccache-stats-daemon.py.
+# test-ci-pr-build-timeouts.py (ci_pr_build_timeout_contract).
 test('ci_pr_sanitizer_examples_disabled', py3,
      args: [meson.project_source_root() / 'scripts/ci/test-ci-pr-sanitizer-examples.py'],
      suite: 'abi')

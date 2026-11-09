@@ -102,7 +102,6 @@ docker/setup-qemu-action@v4.3.0:NOASSERTION
 docker/setup-qemu-action@v4.3.0:NOASSERTION
 github/codeql-action/upload-sarif@v2.14.5:NOASSERTION
 ilammy/msvc-dev-cmd@v1:NOASSERTION
-mozilla-actions/sccache-action@v0.0.11:NOASSERTION
 msys2/setup-msys2@v2.32.0:NOASSERTION
 mymindstorm/setup-emsdk@v16:NOASSERTION
 nanoarrow@0.9.0.9000:Apache
