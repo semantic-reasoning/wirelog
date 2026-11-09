@@ -6984,6 +6984,9 @@ test('evaluation_join_prepared_auto_domains', test_evaluation_join_prepared_auto
 
 test('evaluation_serial', test_evaluation_serial_exe,
      suite: ['unit', 'tsan'], timeout: 120)
+test('evaluation_completion_backend_contract', test_evaluation_serial_exe,
+     args: ['--completion-contract'],
+     suite: ['unit', 'tsan'], timeout: 120)
 # #2262: the fixtures must not inherit the bounded join knob.
 test('evaluation_serial_join_batch_env', test_evaluation_serial_exe,
      env: ['WIRELOG_JOIN_BATCH_BYTES=224'],

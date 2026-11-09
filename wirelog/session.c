@@ -1177,6 +1177,25 @@ wl_session_operation_begin_controlled_snapshot(wl_session_t *session)
     return rc;
 }
 
+/* Observation tags are not logical states. Validate before enum conversion. */
+static bool
+wl_session_controlled_state_valid(int state)
+{
+    switch (state) {
+    case WL_CONTROLLED_STEP_IDLE:
+    case WL_CONTROLLED_STEP_PENDING:
+    case WL_CONTROLLED_STEP_COMPLETE:
+    case WL_CONTROLLED_STEP_RETRYABLE:
+    case WL_CONTROLLED_STEP_INVALIDATED:
+    case WL_CONTROLLED_STEP_DIRTY:
+    case WL_CONTROLLED_STEP_SNAPSHOT_RETRYABLE:
+    case WL_CONTROLLED_STEP_NATIVE_ERROR_CLEANUP_PENDING:
+        return true;
+    default:
+        return false;
+    }
+}
+
 static void
 wl_session_operation_end_step(wl_session_t *session,
     wl_controlled_step_state_t state, bool continuation_pending)
@@ -1207,6 +1226,36 @@ wl_session_operation_end_step(wl_session_t *session,
     wl_session_checked_unlock(admission);
 }
 
+static void
+wl_session_controlled_completion_end(wl_session_t *session,
+    const wl_backend_controlled_completion_t *completion)
+{
+    wl_session_admission_t *admission = session->operation_admission;
+    wl_controlled_step_state_t state = completion->state;
+    if (!admission || !completion->selected || !completion->operation_identity
+        || !completion->ticket || !session->backend
+        || !session->backend->session_controlled_completion_commit)
+        wl_session_gate_fatal();
+    if (wl_session_admission_lock(admission) != 0)
+        wl_session_gate_fatal();
+    if (admission->active_operations != 1)
+        wl_session_gate_fatal();
+    session->backend->session_controlled_completion_commit(session, completion);
+    admission->active_operations--;
+    admission->controlled_step_pending = false;
+    if (state == WL_CONTROLLED_STEP_COMPLETE
+        || state == WL_CONTROLLED_STEP_RETRYABLE
+        || state == WL_CONTROLLED_STEP_INVALIDATED
+        || state == WL_CONTROLLED_STEP_DIRTY
+        || state == WL_CONTROLLED_STEP_SNAPSHOT_RETRYABLE)
+        admission->controlled_step_complete = true;
+    else if (state == WL_CONTROLLED_STEP_IDLE)
+        admission->controlled_step_complete = false;
+    if (admission->closing && admission->active_operations == 0)
+        if (wl_cond_signal(&admission->idle) != 0)
+            wl_session_gate_fatal();
+    wl_session_checked_unlock(admission);
+}
 static void
 wl_session_operation_end(wl_session_t *session)
 {
@@ -1574,6 +1623,10 @@ wl_session_create_with_snapshot_options(const wl_compute_backend_t *backend,
         && !backend->session_create_with_options)
         return ENOTSUP;
 
+    if ((backend->session_controlled_step_observe != NULL)
+        != (backend->session_controlled_completion_commit != NULL))
+        return EINVAL;
+
     admission = wl_session_admission_create();
     if (!admission)
         return ENOMEM;
@@ -1804,6 +1857,7 @@ int
 wl_session_step(wl_session_t *session)
 {
     int rc;
+    bool dispatched = false;
     if (!session)
         return -1;
     bool controlled = session->evaluation_control != NULL;
@@ -1828,15 +1882,39 @@ wl_session_step(wl_session_t *session)
     if (!session->backend || !session->backend->session_step
         || session->input_load_failed)
         rc = -1;
-    else
+    else {
+        dispatched = true;
         rc = session->backend->session_step(session);
+    }
     if (controlled) wl_session_source_scope = scope.previous;
     if (controlled) {
-        wl_controlled_step_state_t state =
-            session->backend
-            && session->backend->session_controlled_step_state
-            ? session->backend->session_controlled_step_state(session)
-            : WL_CONTROLLED_STEP_IDLE;
+        wl_controlled_step_state_t state;
+        if (session->backend
+            && session->backend->session_controlled_step_observe) {
+            wl_backend_controlled_completion_t completion;
+            int observed = session->backend->session_controlled_step_observe(
+                session, WL_BACKEND_CONTROLLED_COMPLETION_STEP, dispatched,
+                &completion);
+            if (observed ==
+                WL_BACKEND_CONTROLLED_OBSERVATION_COMPLETION_READY) {
+                if (!dispatched || !completion.selected
+                    || completion.kind != WL_BACKEND_CONTROLLED_COMPLETION_STEP
+                    || !completion.operation_identity || !completion.ticket
+                    || !wl_session_controlled_state_valid(completion.state))
+                    wl_session_gate_fatal();
+                int result = completion.result;
+                wl_session_controlled_completion_end(session, &completion);
+                return result;
+            }
+            if (!wl_session_controlled_state_valid(observed))
+                wl_session_gate_fatal();
+            state = (wl_controlled_step_state_t)observed;
+        } else {
+            state = session->backend
+                && session->backend->session_controlled_step_state
+                ? session->backend->session_controlled_step_state(session)
+                : WL_CONTROLLED_STEP_IDLE;
+        }
         bool pending = state == WL_CONTROLLED_STEP_NATIVE_ERROR_CLEANUP_PENDING
             || (rc == EAGAIN
             && wl_evaluation_control_active_attempt_id(
