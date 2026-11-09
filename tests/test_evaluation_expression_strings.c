@@ -13,6 +13,12 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+#if defined(_MSC_VER) && !defined(__clang__)
+#  define TEST_ALIGNAS(n) __declspec(align(n))
+#else
+#  define TEST_ALIGNAS(n) _Alignas(n)
+#endif
 #define CHECK(x)                                                               \
         do {                                                                         \
             if (!(x)) {                                                                \
@@ -1356,7 +1362,7 @@ static void session_decimal(void) {
 }
 
 static void hash_unaligned_spans(void) {
-    _Alignas(16) uint8_t bytes[4096 + 15];
+    TEST_ALIGNAS(16) uint8_t bytes[4096 + 15];
     for (size_t i = 0; i < sizeof(bytes); ++i)
         bytes[i] = (uint8_t)(i * 37u + 11u);
     const size_t sizes[] = {0, 1, 63, 64, 65, 240, 241, 255, 256, 257,
