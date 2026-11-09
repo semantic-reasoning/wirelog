@@ -7,6 +7,13 @@
  * bytes; the vendor can also process its fixed256-byte buffer/retained stripes.
  * Engine tariffs cover caller work, not a SIMD instruction-count claim. */
 #define XXH_INLINE_ALL
+/* GCC/AArch64 NEON dereferences a 16-byte vector at 8-byte secret offsets.
+ * Choose defined scalar accesses for this inline consumer in every profile,
+ * overriding external vector selection without suppressing alignment checks. */
+#if defined(__aarch64__) && defined(__GNUC__) && !defined(__clang__)
+# undef XXH_VECTOR
+# define XXH_VECTOR XXH_SCALAR
+#endif
 #include <xxhash.h>
 #include "internal.h"
 #include <errno.h>

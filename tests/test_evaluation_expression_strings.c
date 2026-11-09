@@ -1355,6 +1355,31 @@ static void session_decimal(void) {
     CHECK(a && b); destroy(&f);
 }
 
+static void hash_unaligned_spans(void) {
+    _Alignas(16) uint8_t bytes[4096 + 15];
+    for (size_t i = 0; i < sizeof(bytes); ++i)
+        bytes[i] = (uint8_t)(i * 37u + 11u);
+    const size_t sizes[] = {0, 1, 63, 64, 65, 240, 241, 255, 256, 257,
+                            1024, 4096};
+    for (size_t offset = 0; offset < 16; ++offset) {
+        for (size_t k = 0; k < sizeof(sizes) / sizeof(*sizes); ++k) {
+            size_t n = sizes[k];
+            for (unsigned below = 0; below < 2; ++below) {
+                wl_evaluation_control_t *c = begin(
+                    224 * (4 + (n + 63) / 64) - below);
+                int64_t value = 999;
+                int rc = wl_columnar_expr_hash_bytes_attempt_controlled(
+                    bytes + offset, n, &value, c,
+                    wl_evaluation_control_active_attempt_id(c));
+                CHECK(rc == (below ? WL_EVALUATION_CONTROL_WORK_LIMIT : 0));
+                CHECK(value == (below ? 999 :
+                    (int64_t)XXH3_64bits(bytes + offset, n)));
+                finish(c, rc);
+            }
+        }
+    }
+}
+
 static void hash_crc_primitives(void) {
     uint8_t bytes[4096];
     for (size_t i = 0; i < sizeof(bytes);
@@ -3295,6 +3320,7 @@ int main(void) {
     builder_memory();
     builder_stack_format();
     builder_errors_and_stops();
+    hash_unaligned_spans();
     hash_crc_primitives();
     direct_string_digests();
     session_string_digests();

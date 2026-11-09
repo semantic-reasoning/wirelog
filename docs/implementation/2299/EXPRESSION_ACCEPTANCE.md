@@ -500,6 +500,16 @@ as engine source actions funded by224. An update may also process the fixed
 input-sized whole-span update or one-shot fallback and no cancellation claim
 inside a synchronous vendor routine.
 
+The inline helper deliberately selects the scalar backend on GCC/AArch64 in
+all build profiles, overriding an external XXH_VECTOR selection there. The
+pinned NEON implementation directly dereferences a 16-byte vector at secret
+offsets that can be only 8-byte aligned. Dependency-target compiler options do
+not protect this inline consumer. Scalar access keeps alignment checks enabled
+and preserves exact XXH3 digests, stack ownership, 64-byte updates and caller
+tariffs. Other compiler/architecture pairs retain the default vendor backend.
+Offset spans 0 through 15 cover long inputs and streaming boundaries against
+the linked one-shot oracle, with exact and one-short budgets.
+
 XXH3 engine work is224*(4+ceil(n/64)): entry120, INITSTATE/reset caller121,
 each update caller123, digest caller125 and final cutoff127. Zero-cost guarded
 post-call checkpoints122/124/126 immediately observe stops and saved-ID changes.
