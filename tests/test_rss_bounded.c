@@ -54,6 +54,10 @@
 #include <stdlib.h>
 #include <string.h>
 
+#if defined(__linux__)
+#include <sys/prctl.h>
+#endif
+
 /* Clang exposes __has_feature; GCC does not.  Polyfill so the
  * conditional below tokenizes cleanly under both compilers (mirrors
  * test_stress_harness.c's daemon-soak skip). */
@@ -220,6 +224,18 @@ main(void)
     int strict = env_flag_enabled("WL_RSS_BOUNDED_STRICT");
 
     printf("  [R=%u strict=%d K=%u]\n", R, strict, WL_RSS_BOUNDED_K_HANDLES);
+
+#if defined(__linux__) && defined(PR_SET_THP_DISABLE)
+    /* A transparent huge page faulted into the heap adds 2 MB of VmRSS in
+     * one step, which exceeds the 1 MB floor below although the workload
+     * did not grow.  On x86_64 with THP enabled and
+     * GLIBC_TUNABLES=glibc.malloc.hugetlb=1, about 1 run in 10 failed
+     * this way, with AnonHugePages at 2048 kB, and none with THP
+     * disabled.  CI's ARM build leg has failed with the same ~2 MB step
+     * and no tunable set.  The RSS signal measures the workload, so take
+     * the process out of THP. */
+    (void)prctl(PR_SET_THP_DISABLE, 1, 0, 0, 0);
+#endif
 
     /* Build the mock session + a real wl_mem_ledger embedded in the
      * session.  See file docstring for why we don't go through
