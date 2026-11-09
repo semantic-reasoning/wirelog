@@ -10,7 +10,7 @@ by the non-sanitized build legs.  The sanitizer legs therefore configure with
 This is intentionally a small structural check rather than a general YAML
 parser.  Each sanitizer leg's `meson setup` block has a stable layout, and
 checking that layout without a third-party dependency keeps the contract
-portable (the same reason as test-ci-pr-sccache-stats-daemon.py).
+portable (the same reason as test-ci-pr-build-timeouts.py).
 
 The check is bidirectional:
   * every `meson setup` that enables a sanitizer (b_sanitize != none/auto)
