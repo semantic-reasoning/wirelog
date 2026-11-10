@@ -41,6 +41,9 @@
 #include "wirelog/backend.h"
 #include "wirelog/columnar/internal.h"
 #include "wirelog/session.h"
+#include "wirelog/session_options.h"
+#include "wirelog/columnar/memory_governor.h"
+#include <errno.h>
 #include "wirelog/wirelog-easy.h"
 
 #include <stdbool.h>
@@ -416,6 +419,149 @@ test_direct_emission(void)
     report(&c);
 }
 
+/* Admission occurs after real evaluation, with a genuine peer reservation
+* leaving exactly the bytes the following raw event append may acquire. */
+typedef struct {
+    ctx_t *test;
+    wl_col_session_t *session;
+    wl_columnar_memory_governor_t *governor;
+    wl_columnar_memory_reservation_t peer;
+    uint64_t headroom, baseline, rollback_bytes, event_bytes, denied_before;
+    unsigned heads, callbacks, hook_calls;
+    bool unary, peer_live;
+} event_cap_probe_t;
+
+static event_cap_probe_t *event_cap_current;
+
+static void
+event_cap_before_event(wl_col_session_t *sess, uint32_t ncols)
+{
+    event_cap_probe_t *p = event_cap_current;
+    CHECK(p->test, sess == p->session && !p->hook_calls++, "unexpected hook");
+    CHECK(p->test, ncols == (p->unary ? 1u : 0u) && !sess->delta_observer
+        && !sess->delta_event_count && !sess->delta_event_capacity
+        && !sess->delta_event_reserved_bytes,
+        "not initial actual event admission");
+    uint64_t usable = (uint64_t)atomic_fetch_add_explicit(
+        &p->governor->usable_bytes, 0, memory_order_relaxed);
+    uint64_t reserved = wl_columnar_memory_reserved(p->governor);
+    CHECK(p->test, usable >= reserved && usable - reserved >= p->headroom,
+        "insufficient setup headroom");
+    if (!p->test->ok) return;
+    uint64_t peer_bytes = usable - reserved - p->headroom;
+    CHECK(p->test, wl_columnar_memory_reserve_checked(p->governor,
+        peer_bytes, &p->peer) == WL_COLUMNAR_MEMORY_ADMISSION_OK,
+        "peer reserve");
+    if (!p->test->ok) return;
+    p->peer_live = true;
+    CHECK(p->test, wl_columnar_memory_commit(&p->peer, p), "peer commit");
+    p->baseline = wl_columnar_memory_reserved(p->governor);
+    p->rollback_bytes = sess->delta_rollback_reserved_bytes;
+    p->denied_before = wl_columnar_memory_denials(p->governor);
+    CHECK(p->test, p->baseline == usable - p->headroom,
+        "peer did not leave exact headroom");
+}
+
+static void
+event_cap_callback(const char *relation, const int64_t *row, uint32_t ncols,
+    int32_t diff, void *argument)
+{
+    event_cap_probe_t *p = argument;
+    ++p->callbacks;
+    CHECK(p->test, row && diff == 1 && ncols == (p->unary ? 1u : 0u)
+        && (!p->unary || row[0] == 42)
+        && (!strcmp(relation,
+        "a") || (p->heads == 2 && !strcmp(relation, "b"))),
+        "wrong event contents");
+    CHECK(p->test, p->session->delta_event_count == p->heads
+        && p->session->delta_event_capacity == 16
+        && p->session->delta_event_reserved_bytes == p->event_bytes,
+        "physical event allocation was not fully reserved");
+    CHECK(p->test, wl_columnar_memory_reserved(p->governor)
+        == p->baseline - p->rollback_bytes + p->event_bytes,
+        "callback reservation excludes physical rows");
+}
+
+static void
+test_event_physical_cap(bool one_short, bool unary)
+{
+    ctx_t c = { one_short ? "event physical allocation one-short"
+        : "event physical allocation exact cap", 1, true, {0}, false };
+    const unsigned heads = 1;
+    wl_plan_op_t ops[] = {
+        {.op = WL_PLAN_OP_VARIABLE, .relation_name = "input"},
+        {.op = WL_PLAN_OP_MAP, .project_count = 0}
+    };
+    wl_plan_relation_t rels[] = {
+        {.name = "a", .ops = ops, .op_count = unary ? 1u : 2u},
+        {.name = "b", .ops = ops, .op_count = 2}
+    };
+    wl_plan_stratum_t st = {.relations = rels, .relation_count = heads};
+    const char *edb[] = {"input"};
+    wl_plan_t plan = {.strata = &st, .stratum_count = 1,
+                      .edb_relations = edb, .edb_count = 1};
+    wl_columnar_memory_resolution_t resolution = {
+        .budget_bytes = UINT64_C(64) * 1024 * 1024,
+        .usable_bytes = UINT64_C(64) * 1024 * 1024,
+        .mode = WL_COLUMNAR_MEMORY_MODE_ENFORCING,
+        .source = WL_COLUMNAR_MEMORY_SOURCE_ENV,
+        .status = WL_COLUMNAR_MEMORY_OK
+    };
+    wl_columnar_memory_governor_ref_t *ref =
+        wl_columnar_memory_governor_ref_create(&resolution);
+    wl_session_t *session = NULL;
+    wl_session_options_t options;
+    wl_session_options_init(&options);
+    options.memory_governor = ref;
+    CHECK(&c, ref && !wl_session_create_with_options(wl_backend_columnar(),
+        &plan, 1, &options, &session), "governed session create");
+    if (!session) {
+        if (ref) wl_columnar_memory_governor_ref_release(ref);
+        report(&c); return;
+    }
+    event_cap_probe_t p = {
+        .test = &c, .session = COL_SESSION(session),
+        .governor = wl_columnar_memory_governor_ref_get(ref),
+        .heads = heads, .unary = unary
+    };
+    wl_columnar_memory_reservation_init(&p.peer);
+    uint64_t array = 0;
+    CHECK(&c,
+        wl_columnar_memory_size_mul(16, sizeof(wl_col_delta_event_t), &array)
+        && wl_columnar_memory_size_add(array, sizeof(int64_t), &p.event_bytes),
+        "event extent overflow");
+    p.headroom = p.event_bytes - (one_short ? 1u : 0u);
+    int64_t value = 42;
+    wl_session_set_delta_cb(session, event_cap_callback, &p);
+    CHECK(&c, !p.session->delta_observer
+        && !wl_session_insert(session, "input", &value, 1, 1), "setup input");
+    void (*saved_hook)(wl_col_session_t *, uint32_t) =
+        wl_columnar_eval_delta_test_before_direct_event;
+    event_cap_probe_t *saved_probe = event_cap_current;
+    event_cap_current = &p;
+    wl_columnar_eval_delta_test_before_direct_event = event_cap_before_event;
+    int rc = col_stratum_step_with_delta(&st, p.session, 0);
+    wl_columnar_eval_delta_test_before_direct_event = saved_hook;
+    event_cap_current = saved_probe;
+    CHECK(&c, p.hook_calls == 1 && rc == (one_short ? ENOMEM : 0)
+        && p.callbacks == (one_short ? 0u : heads),
+        "cap result rc=%d callbacks=%u", rc, p.callbacks);
+    CHECK(&c, wl_columnar_memory_denials(p.governor)
+        == p.denied_before + (one_short ? 1u : 0u), "denial count");
+    CHECK(&c, !p.session->delta_events && !p.session->delta_event_count
+        && !p.session->delta_event_capacity &&
+        !p.session->delta_event_reserved_bytes,
+        "actual caller did not clear event ownership");
+    CHECK(&c, wl_columnar_memory_reserved(p.governor)
+        == p.baseline - p.rollback_bytes, "event reservation not released");
+    if (p.peer_live) wl_columnar_memory_release(&p.peer);
+    wl_session_destroy(session);
+    CHECK(&c, !wl_columnar_memory_reserved(p.governor),
+        "teardown retained credit");
+    wl_columnar_memory_governor_ref_release(ref);
+    report(&c);
+}
+
 /* Heads a (zero-width) and b (a copy of input) in one stratum.  The step
  * after a baseline fails on b by reading a relation that does not exist;
  * the rollback must leave both heads as they were before the step, whether
@@ -509,6 +655,10 @@ main(void)
         }
     }
     test_direct_emission();
+    for (unsigned short_cap = 0; short_cap < 2; ++short_cap) {
+        test_event_physical_cap(short_cap != 0, false);
+        test_event_physical_cap(short_cap != 0, true);
+    }
     test_failed_step_rollback(false);
     test_failed_step_rollback(true);
     printf("%d run, %d passed, %d failed\n", tests_run, tests_passed,

@@ -17,6 +17,11 @@
 #include <stdlib.h>
 #include <string.h>
 
+#ifdef WL_SESSION_TEST_HOOKS
+void (*wl_columnar_eval_delta_test_before_direct_event)(wl_col_session_t *,
+    uint32_t);
+#endif
+
 static int
 wl_delta_event_append(wl_col_session_t *sess, const char *relation,
     const int64_t *row, uint32_t ncols, int32_t diff)
@@ -25,13 +30,19 @@ wl_delta_event_append(wl_col_session_t *sess, const char *relation,
     int64_t *copy;
     size_t next = sess->delta_event_capacity;
     uint64_t row_bytes = 0;
+    uint64_t allocated_row_bytes;
     uint64_t array_bytes = 0;
     uint64_t new_reserved = sess->delta_event_reserved_bytes;
     wl_columnar_memory_reservation_t replacement;
     bool replacement_active = false;
 
+#ifdef WL_SESSION_TEST_HOOKS
+    if (wl_columnar_eval_delta_test_before_direct_event)
+        wl_columnar_eval_delta_test_before_direct_event(sess, ncols);
+#endif
     if (!wl_columnar_memory_size_mul(ncols, sizeof(*copy), &row_bytes))
         return EOVERFLOW;
+    allocated_row_bytes = row_bytes ? row_bytes : sizeof(*copy);
     if (sess->delta_event_count == sess->delta_event_capacity) {
         next = next ? next * 2 : 16;
         if (next < sess->delta_event_capacity
@@ -42,7 +53,7 @@ wl_delta_event_append(wl_col_session_t *sess, const char *relation,
     if (sess->delta_event_count == sess->delta_event_capacity)
         new_reserved = sess->delta_event_reserved_bytes
             + (array_bytes - sess->delta_event_capacity * sizeof(*grown));
-    if (!wl_columnar_memory_size_add(new_reserved, row_bytes,
+    if (!wl_columnar_memory_size_add(new_reserved, allocated_row_bytes,
         &new_reserved))
         return EOVERFLOW;
     if (sess->memory_governor && new_reserved > 0) {
@@ -70,13 +81,13 @@ wl_delta_event_append(wl_col_session_t *sess, const char *relation,
         sess->delta_event_capacity = next;
     }
     /* A zero-width row still needs a distinct, non-null address. */
-    copy = (int64_t *)malloc(row_bytes ? (size_t)row_bytes : sizeof(*copy));
+    copy = (int64_t *)malloc((size_t)allocated_row_bytes);
     if (!copy) {
         if (replacement_active)
             wl_columnar_memory_rollback(&replacement);
         return ENOMEM;
     }
-    memcpy(copy, row, (size_t)row_bytes);
+    if (row_bytes) memcpy(copy, row, (size_t)row_bytes);
     if (replacement_active) {
         if (!wl_columnar_memory_commit(&replacement, sess)) {
             free(copy);
