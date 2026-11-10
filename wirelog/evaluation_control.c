@@ -145,6 +145,22 @@ wl_evaluation_control_release(wl_evaluation_control_t *control)
     }
 }
 
+void
+wl_evaluation_control_release_nonfinal(wl_evaluation_control_t *control)
+{
+    if (!control) abort();
+#ifdef _MSC_VER
+    uint64_t previous = (uint64_t)_InterlockedExchangeAdd64(
+        (volatile __int64 *)&control->references, -1);
+#else
+    uint64_t previous = atomic_fetch_sub_explicit(&control->references, 1,
+            memory_order_release);
+#endif
+    /* Caller relinquishes its own ref while an independently owned live
+     * attachment pins the allocation. Only the returned scalar is read. */
+    if (previous < UINT64_C(2)) abort();
+}
+
 int
 wl_evaluation_control_attach(wl_evaluation_control_t *control,
     const void *owner)

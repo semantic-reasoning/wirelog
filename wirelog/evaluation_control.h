@@ -60,6 +60,11 @@ extern void (*wl_evaluation_control_test_retain_claim)(
     wl_evaluation_control_t *control);
 #endif
 void wl_evaluation_control_release(wl_evaluation_control_t *control);
+/* Relinquish exactly one owned reference while another independent live
+ * attachment/reference pins this allocation through the operation. This never
+ * performs final destruction. A count invariant violation is fatal after the
+ * decrement, not a recoverable refusal. */
+void wl_evaluation_control_release_nonfinal(wl_evaluation_control_t *);
 /* Stable, never-reused process identity; create returns EOVERFLOW on
  * exhaustion. The caller holds a live reference. */
 uint64_t wl_evaluation_control_identity(
