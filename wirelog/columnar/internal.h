@@ -5924,6 +5924,14 @@ int wl_columnar_expr_decimal_attempt_controlled(const char *, int64_t *,
  * XXH3: 224*(4+ceil(length/64)) engine work, narrow vendor reset/update/digest
  * cooperation boundaries, each update<=64. CRC: 224*(2*length+2), distinct
  * byte LOAD and immutable-table update, zero-extended complemented CRC. */
+/* Original PSA compute compatibility: value/failed remain unchanged on rc.
+ * Success costs9*224; init failure3*224, compute/length failure4*224,
+ * disabled2*224. Engine operand scans are separate; provider bodies cooperate
+ * only at their synchronous return and may have input-sized latency. */
+int wl_columnar_expr_crypto_digest_attempt_controlled(uint8_t,
+    const uint8_t *, size_t, int64_t *, bool *, wl_evaluation_control_t *,
+    uint64_t);
+
 int wl_columnar_expr_hash_bytes_attempt_controlled(const uint8_t *, size_t,
     int64_t *, wl_evaluation_control_t *, uint64_t);
 int wl_columnar_expr_crc_bytes_attempt_controlled(const uint8_t *, size_t,

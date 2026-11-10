@@ -3509,6 +3509,23 @@ wl_columnar_expr_replace_size_attempt_controlled(size_t source_length,
     return 0;
 }
 
+static bool
+wl_columnar_expr_scalar_crypto_tag(uint8_t tag)
+{
+    switch ((wl_plan_expr_tag_t)tag) {
+    case WL_PLAN_EXPR_ARITH_MD5:
+    case WL_PLAN_EXPR_ARITH_MD5_S:
+    case WL_PLAN_EXPR_ARITH_SHA1:
+    case WL_PLAN_EXPR_ARITH_SHA1_S:
+    case WL_PLAN_EXPR_ARITH_SHA256:
+    case WL_PLAN_EXPR_ARITH_SHA256_S:
+    case WL_PLAN_EXPR_ARITH_SHA512:
+    case WL_PLAN_EXPR_ARITH_SHA512_S:
+        return true;
+    default: return false;
+    }
+}
+
 static int
 wl_columnar_expr_scalar_decode(const uint8_t *bytes, uint32_t size,
     uint32_t *pos, expr_instr_t *instruction, wl_evaluation_control_t *control,
@@ -3556,6 +3573,14 @@ wl_columnar_expr_scalar_decode(const uint8_t *bytes, uint32_t size,
         *pos += length;
         break;
     }
+    case WL_PLAN_EXPR_ARITH_MD5:
+    case WL_PLAN_EXPR_ARITH_MD5_S:
+    case WL_PLAN_EXPR_ARITH_SHA1:
+    case WL_PLAN_EXPR_ARITH_SHA1_S:
+    case WL_PLAN_EXPR_ARITH_SHA256:
+    case WL_PLAN_EXPR_ARITH_SHA256_S:
+    case WL_PLAN_EXPR_ARITH_SHA512:
+    case WL_PLAN_EXPR_ARITH_SHA512_S:
     case WL_PLAN_EXPR_STR_FN_STR_REPLACE:
     case WL_PLAN_EXPR_STR_FN_SUBSTR: case WL_PLAN_EXPR_STR_FN_TRIM:
     case WL_PLAN_EXPR_STR_FN_CAT: case WL_PLAN_EXPR_STR_FN_TO_UPPER:
@@ -3652,6 +3677,14 @@ wl_columnar_expr_compile_scalar_attempt_controlled(const uint8_t *bytes,
         case WL_PLAN_EXPR_STR_FN_TRIM:
         case WL_PLAN_EXPR_STR_FN_TO_UPPER: case WL_PLAN_EXPR_STR_FN_TO_LOWER:
         case WL_PLAN_EXPR_STR_FN_TO_STRING:
+        case WL_PLAN_EXPR_ARITH_MD5:
+        case WL_PLAN_EXPR_ARITH_MD5_S:
+        case WL_PLAN_EXPR_ARITH_SHA1:
+        case WL_PLAN_EXPR_ARITH_SHA1_S:
+        case WL_PLAN_EXPR_ARITH_SHA256:
+        case WL_PLAN_EXPR_ARITH_SHA256_S:
+        case WL_PLAN_EXPR_ARITH_SHA512:
+        case WL_PLAN_EXPR_ARITH_SHA512_S:
         case WL_PLAN_EXPR_ARITH_HASH_S:
         case WL_PLAN_EXPR_ARITH_CRC32_ETH_S: case
             WL_PLAN_EXPR_ARITH_CRC32_CAST_S:
@@ -3748,7 +3781,8 @@ wl_columnar_expr_scalar_result_type_attempt_controlled(
         owner->producer.op == WL_PLAN_EXPR_VAR_STRING
         || owner->producer.op ==
         WL_PLAN_EXPR_CONST_STR) result = WIRELOG_TYPE_STRING;
-    else if (owner->producer.op == WL_PLAN_EXPR_ARITH_HASH_S ||
+    else if (wl_columnar_expr_scalar_crypto_tag(owner->producer.op) ||
+        owner->producer.op == WL_PLAN_EXPR_ARITH_HASH_S ||
         owner->producer.op == WL_PLAN_EXPR_ARITH_CRC32_ETH_S ||
         owner->producer.op == WL_PLAN_EXPR_ARITH_CRC32_CAST_S ||
         owner->producer.op == WL_PLAN_EXPR_STR_FN_TO_NUMBER ||
@@ -4196,6 +4230,51 @@ wl_columnar_expr_eval_scalar_attempt_controlled(
             if (rc) return rc;
             expr_push_string(&stack, v, owner->bytes + in.iarg,
                 (uint32_t)in.larg);
+        } else if (wl_columnar_expr_scalar_crypto_tag(in.op)) {
+            rc = wl_columnar_expr_scalar_region(control, id, 206, in.op);
+            if (rc) return rc;
+            int64_t operand = expr_pop(&stack), result = 0;
+            bool digest_failed = false;
+#ifdef WL_MBEDTLS_ENABLED
+            bool symbol = in.op == WL_PLAN_EXPR_ARITH_MD5_S ||
+                in.op == WL_PLAN_EXPR_ARITH_SHA1_S ||
+                in.op == WL_PLAN_EXPR_ARITH_SHA256_S ||
+                in.op == WL_PLAN_EXPR_ARITH_SHA512_S;
+            const char *text = symbol && intern
+                ? wl_intern_reverse(intern, operand) : NULL;
+            uint8_t native[sizeof(operand)];
+            const uint8_t *data;
+            size_t length;
+            if (text) {
+                data = (const uint8_t *)text;
+                rc = wl_columnar_expr_cstr_length_attempt_controlled(text,
+                        &length, control, id);
+                if (rc) return rc;
+            } else {
+                if (symbol) WL_LOG(WL_LOG_SEC_EVAL, WL_LOG_DEBUG,
+                        "digest operand %" PRId64
+                        " is declared symbol but names no "
+                        "interned string: digesting its int64 representation",
+                        operand);
+                memcpy(native, &operand, sizeof(operand));
+                data = native; length = sizeof(operand);
+            }
+            rc = wl_columnar_expr_scalar_region(control, id, 207, length);
+            if (rc) return rc;
+            rc = wl_columnar_expr_crypto_digest_attempt_controlled(in.op,
+                    data, length, &result, &digest_failed, control, id);
+#else
+            (void)operand;
+            rc = wl_columnar_expr_crypto_digest_attempt_controlled(in.op,
+                    NULL, 0, &result, &digest_failed, control, id);
+#endif
+            if (rc) return rc;
+            rc = wl_columnar_expr_scalar_region(control, id, 208, in.op);
+            if (rc) return rc;
+            if (digest_failed) {
+                semantic = true; break;
+            }
+            expr_push(&stack, result);
         } else if (in.op == WL_PLAN_EXPR_ARITH_HASH_S ||
             in.op == WL_PLAN_EXPR_ARITH_CRC32_ETH_S ||
             in.op == WL_PLAN_EXPR_ARITH_CRC32_CAST_S) {

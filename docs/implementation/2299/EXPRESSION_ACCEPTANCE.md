@@ -53,10 +53,10 @@ ledger explicitly.
 | `WL_PLAN_EXPR_ARITH_HASH` | existing-numeric | admitted | baseline-numeric |
 | `WL_PLAN_EXPR_ARITH_CRC32_ETH` | existing-numeric | admitted | baseline-numeric |
 | `WL_PLAN_EXPR_ARITH_CRC32_CAST` | existing-numeric | admitted | baseline-numeric |
-| `WL_PLAN_EXPR_ARITH_MD5` | open | open | open |
-| `WL_PLAN_EXPR_ARITH_SHA1` | open | open | open |
-| `WL_PLAN_EXPR_ARITH_SHA256` | open | open | open |
-| `WL_PLAN_EXPR_ARITH_SHA512` | open | open | open |
+| `WL_PLAN_EXPR_ARITH_MD5` | open | admitted | unit7-digests |
+| `WL_PLAN_EXPR_ARITH_SHA1` | open | admitted | unit7-digests |
+| `WL_PLAN_EXPR_ARITH_SHA256` | open | admitted | unit7-digests |
+| `WL_PLAN_EXPR_ARITH_SHA512` | open | admitted | unit7-digests |
 | `WL_PLAN_EXPR_ARITH_HMAC_SHA256` | open | open | open |
 | `WL_PLAN_EXPR_ARITH_UUID4` | open | open | open |
 | `WL_PLAN_EXPR_ARITH_UUID5` | open | open | open |
@@ -100,10 +100,10 @@ ledger explicitly.
 | `WL_PLAN_EXPR_ARITH_HASH_S` | open | admitted | unit5-digests |
 | `WL_PLAN_EXPR_ARITH_CRC32_ETH_S` | open | admitted | unit5-digests |
 | `WL_PLAN_EXPR_ARITH_CRC32_CAST_S` | open | admitted | unit5-digests |
-| `WL_PLAN_EXPR_ARITH_MD5_S` | open | open | open |
-| `WL_PLAN_EXPR_ARITH_SHA1_S` | open | open | open |
-| `WL_PLAN_EXPR_ARITH_SHA256_S` | open | open | open |
-| `WL_PLAN_EXPR_ARITH_SHA512_S` | open | open | open |
+| `WL_PLAN_EXPR_ARITH_MD5_S` | open | admitted | unit7-digests |
+| `WL_PLAN_EXPR_ARITH_SHA1_S` | open | admitted | unit7-digests |
+| `WL_PLAN_EXPR_ARITH_SHA256_S` | open | admitted | unit7-digests |
+| `WL_PLAN_EXPR_ARITH_SHA512_S` | open | admitted | unit7-digests |
 | `WL_PLAN_EXPR_ARITH_HMAC_SHA256_SS` | open | open | open |
 | `WL_PLAN_EXPR_ARITH_HMAC_SHA256_SI` | open | open | open |
 | `WL_PLAN_EXPR_ARITH_HMAC_SHA256_IS` | open | open | open |
@@ -176,9 +176,14 @@ owner retirement. Existing raw interning keeps its own compatibility path.
 
 ## Library, extension and qualification boundaries
 
-Use incremental library update APIs for variable-size digest/HMAC/UUID inputs.
-Charge engine framing and buffer preparation and document bounded init/update/
-finalize calls separately. Do not claim cancellation inside a library call.
+Preserve the original library call route and refusal semantics. Prefer bounded
+updates only after provider equivalence is qualified: compute and multipart
+providers may support or reject different operations. MD5/SHA use original
+PSA hash_compute; HMAC preserves original import/mac_compute; UUID5 preserves
+its original multipart sequence. Charge engine framing and buffer preparation
+separately. Named synchronous provider bodies may be input-sized and
+uninterruptible, including provider-owned allocations; they are outside the
+engine quantum, not funded engine loops. Never claim cancellation inside them.
 For callbacks, finish mandatory callback/session-stack release even after a
 stop or control rebind, poll immediately after return, then validate/copy the
 result under the correct attempt. Preserve genuine callback error versus stop
@@ -882,3 +887,66 @@ SOURCE256/255/223 and native384/383 cases exercise real allocated/retired receip
 owners, with public indexed-hook and SOURCE-tail END/rebind integration controls.
 The integrated financial map is in LFTJ_SOURCE_ACCOUNTING.md; earlier financial
 capacity and logical fees are never treated as engine progress or native proof.
+
+
+## Unit7a: original PSA digest compatibility
+
+The eight native-int64 and symbol MD5/SHA1/SHA256/SHA512 opcodes use the
+original per-evaluation `psa_crypto_init` and exactly one `psa_hash_compute`.
+Algorithm, input pointer/length and output capacity16/20/32/64 match raw; the
+actual length starts0 and must exactly match. Init, compute and wrong-length
+failures remain semantic failures with value0. No multipart operation, fallback,
+provider acceptance normalization or engine allocation is introduced. Integer
+opcodes digest native int64 bytes even when the integer names an existing
+symbol. Symbol opcodes resolve the pinned context string and meter its length
+up to first NUL; invalid IDs/null context keep raw native-byte fallback.
+Disabled builds fail the instruction before operand resolution/scanning, while
+earlier bytecode instructions retain their original behavior.
+
+The source proof partitions fixed engine framing from synchronous provider
+bodies. Init/compute and provider-owned allocation are explicit uninterruptible
+cooperation boundaries, potentially input-sized. Engine scanning and hash-fold
+work remain separately bounded; no raw engine expression fallback exists.
+The helper allocates no retained state and publishes outputs only after a final
+saved-attempt guard. Tests wrap the original API calls to check arguments,
+compute-only acceptance, refusal without multipart fallback, provider-memory
+refusal and both shorter/longer reported lengths.
+
+Let T=224. ENTRY200, INIT201, COMPUTE203 and FINAL205 are distinct positive
+admissions; POST_INIT202 and POST_COMPUTE204 poll the saved Original immediately
+after the synchronous call. Existing guard/checkpoint wrappers G9+C13+T29 plus
+at most157 fixed caller/branch actions bound each helper region by208<=224<=256;
+bootstrap tag/argument selection is at most64. Child hash folding admits its
+own byte work. All four digest sizes fit one64-byte hash block, so successful
+helper work is4T+5T=9T=2016. Init failure is3T=672; compute failure or wrong
+length is4T=896; disabled semantics are2T=448. Tests assert literal exact and
+one-short limits and separate call history; a one-short result can occur after
+the provider has already completed. These fees never claim provider latency
+is bounded by the engine quantum.
+
+Scalar regions206/207/208 separately admit operand preparation, provider entry
+and returned-result interpretation. Each fixed region uses the same224 packet
+and conservative source208 envelope: scalar wrapper51 plus caller/stack/tag/
+lookup/fixed-native-copy fronts at most157. Symbol-length traversal has its
+own existing per-byte packets; digest folding has its existing hash packets.
+The scalar decoder adds only explicit eight unary tags and INT64 producer
+metadata. It preserves existing compiler type/arity checks and the current
+GCC/AArch64 scalar XXH3 guard.
+
+`test_evaluation_expression_crypto.c` keeps the original hot MAP failure and
+correction fixtures, and checks enabled/disabled helper/raw parity, known digest
+vectors, all8 compiler-selected FILTER/MAP opcodes, empty/false/accepted rows,
+signed deletion events and typed projected cells. Deterministic pre/post-call
+cancel/work/END+successor controls require no publication, frozen Original,
+successor0, actual cleanup closure and reset/retry. A populated mixed unary
+MAP/independent LFTJ plan additionally checks real exclusive owner registration
+at provider return, resource closure, unchanged prior rows, retry and deletion.
+The independent SOURCE and native ownership mechanism is the preceding R1/R2
+bundle; a provider callback never supplies its own cleanup permission.
+
+The helper is registered in production, bench and both test backend lists, and
+in the clean LLVM22 partition. A presence-macro undefined alternate uses `-U`,
+not `-D...=0`; real enabled and disabled production builds are each analyzed.
+The disabled build never gains a mandatory PSA header dependency for linting.
+Unit7a does not qualify HMAC, UUID, extensions or the remaining recursive,
+pipeline and worker host intersections.

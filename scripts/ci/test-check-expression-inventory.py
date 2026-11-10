@@ -43,6 +43,20 @@ with tempfile.TemporaryDirectory(prefix='expression-inventory-') as folder:
     assert row in ledger
     ledger_path.write_text(ledger.replace('unit6-replace', 'unreviewed-domain'), encoding='utf-8')
     assert gate.check(fixture)[0], 'unknown qualification must fail'
+    # Digest qualification is exclusive to the eight original digest tags.
+    unrelated = next(line for line in ledger.splitlines()
+                     if line.startswith('| `WL_PLAN_EXPR_')
+                     and 'unit6-replace' in line)
+    forged = unrelated.replace(
+        'unit6-replace', 'unit7-digests')
+    ledger_path.write_text(ledger.replace(unrelated, forged), encoding='utf-8')
+    assert gate.check(fixture)[0], 'digest qualification cannot close another tag'
+    scalar_digest = original.index('case WL_PLAN_EXPR_ARITH_MD5:', scalar_start)
+    source_path.write_text(original[:scalar_digest] + original[scalar_digest:].replace(
+        'case WL_PLAN_EXPR_ARITH_MD5:', '', 1), encoding='utf-8')
+    ledger_path.write_text(ledger, encoding='utf-8')
+    assert gate.check(fixture)[0], 'removed digest admission must fail'
+    source_path.write_text(original, encoding='utf-8')
     ledger_path.write_text(ledger + row, encoding='utf-8')
     assert gate.check(fixture)[0], 'duplicate rows must fail'
     ledger_path.write_text(ledger.replace(row, ''), encoding='utf-8')

@@ -129,6 +129,7 @@ testlib_prod_src = files(
     '../wirelog/columnar/eval_tdd_channel.c',
     '../wirelog/columnar/expr.c',
     '../wirelog/columnar/expr_hash.c',
+    '../wirelog/columnar/expr_crypto.c',
     '../wirelog/intern_control.c',
     '../wirelog/columnar/filter.c',
     '../wirelog/columnar/frontier.c',
@@ -2165,6 +2166,7 @@ backend_src = files(
   '../wirelog/columnar/arithmetic.c',
   '../wirelog/columnar/expr.c',
   '../wirelog/columnar/expr_hash.c',
+    '../wirelog/columnar/expr_crypto.c',
     '../wirelog/intern_control.c',
   '../wirelog/columnar/filter.c',
   '../wirelog/columnar/join.c',
@@ -7381,5 +7383,16 @@ map_recovery_exe = executable('test_evaluation_map_recovery',
   link_with: [testlib_prod],
 )
 test('evaluation_map_recovery_terminal', map_recovery_exe,
+  suite: ['unit', 'tsan'], timeout: 120,
+)
+
+expression_crypto_exe = executable('test_evaluation_expression_crypto',
+  files('test_evaluation_expression_crypto.c'),
+  c_args: ['-DWL_SESSION_TEST_HOOKS=1'],
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
+  link_with: [testlib_prod],
+)
+test('evaluation_expression_crypto', expression_crypto_exe,
   suite: ['unit', 'tsan'], timeout: 120,
 )

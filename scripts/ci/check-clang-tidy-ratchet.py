@@ -601,10 +601,13 @@ ALTERNATE_CONFIGS = {
         ("ENABLE_K_FUSION=0", "ENABLE_K_FUSION", "0"),
     "wirelog/columnar/relation.c":
         ("WL_RADIX_BENCH=1", "WL_RADIX_BENCH", "1"),
+    # Presence macro: a value of zero would still select the PSA body.
+    "wirelog/columnar/expr_crypto.c":
+        ("WL_MBEDTLS_ENABLED undefined", "WL_MBEDTLS_ENABLED", None),
 }
 
 
-def replace_macro(tokens: list[str], macro: str, value: str) -> list[str]:
+def replace_macro(tokens: list[str], macro: str, value: str | None) -> list[str]:
     """Replace all command-line definitions of *macro* with one value."""
     result: list[str] = []
     index = 0
@@ -622,11 +625,11 @@ def replace_macro(tokens: list[str], macro: str, value: str) -> list[str]:
                 continue
         result.append(token)
         index += 1
-    result.append(f"-D{macro}={value}")
+    result.append(f"-U{macro}" if value is None else f"-D{macro}={value}")
     return result
 
 
-def alternate_entry(entry: dict, macro: str, value: str,
+def alternate_entry(entry: dict, macro: str, value: str | None,
                     stem: str) -> dict:
     """Clone one canonical entry for one isolated alternate scan."""
     tokens = replace_macro(entry_command(entry), macro, value)
