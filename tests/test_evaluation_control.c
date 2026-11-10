@@ -1056,9 +1056,65 @@ lexical_finance_checkpoint(void)
     }
 }
 
+static void *
+nonfinal_release_peer(void *payload)
+{
+    /* The actual reference was retained before this thread was started. */
+    wl_evaluation_control_release_nonfinal(payload);
+    return NULL;
+}
+
+static void
+nonfinal_release_attachment(void)
+{
+    for (unsigned round = 0; round < 8; ++round) {
+        unsigned owner = 0;
+        wl_evaluation_control_t *control = NULL;
+        CHECK(!wl_evaluation_control_create(256, &control));
+        CHECK(!wl_evaluation_control_attach(control, &owner));
+        CHECK(!wl_evaluation_control_retain(control));
+        wl_evaluation_control_release_nonfinal(control);
+        wl_thread_t peers[4];
+        for (unsigned i = 0; i < 4; ++i) {
+            CHECK(!wl_evaluation_control_retain(control));
+            CHECK(!wl_thread_create(&peers[i], nonfinal_release_peer, control));
+        }
+        for (unsigned i = 0; i < 4; ++i) CHECK(!wl_thread_join(&peers[i]));
+        CHECK(!wl_evaluation_control_begin(control, &owner));
+        uint64_t id = wl_evaluation_control_active_attempt_id(control);
+        CHECK(id && !wl_evaluation_control_charge_attempt(control, id, 128));
+        CHECK(!wl_evaluation_control_finish(control, &owner, 0, 0));
+        wl_evaluation_control_report_t report;
+        CHECK(!wl_evaluation_control_report(control, &report)
+            && report.attempt_id == id && report.limit == 256 &&
+            report.consumed == 128
+            && !report.stop_reason && !report.execution_status &&
+            !report.cleanup_status && !report.result);
+        CHECK(!wl_evaluation_control_detach(control, &owner));
+        wl_evaluation_control_release(control);
+        /* Exact previous-count2: drop the creator ref while the real
+         * attachment alone pins the allocation, then detach that final ref. */
+        control = NULL;
+        CHECK(!wl_evaluation_control_create(256, &control));
+        CHECK(!wl_evaluation_control_attach(control, &owner));
+        wl_evaluation_control_release_nonfinal(control);
+        CHECK(!wl_evaluation_control_begin(control, &owner));
+        id = wl_evaluation_control_active_attempt_id(control);
+        CHECK(id && !wl_evaluation_control_finish(control, &owner, 0, 0));
+        CHECK(!wl_evaluation_control_report(control, &report)
+            && report.attempt_id == id && report.limit == 256 &&
+            !report.consumed
+            && !report.stop_reason && !report.execution_status &&
+            !report.cleanup_status && !report.result);
+        CHECK(!wl_evaluation_control_detach(control, &owner));
+        /* The real final detach freed control; no further read or release. */
+    }
+}
+
 int
 main(void)
 {
+    nonfinal_release_attachment();
     completion_generation_observation();
     active_consumed_observation();
     boundaries();
