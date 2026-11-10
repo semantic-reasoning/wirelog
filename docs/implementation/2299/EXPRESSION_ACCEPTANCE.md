@@ -1141,3 +1141,61 @@ input APIs, mixed populated LFTJ exclusive owners, real resource closure,
 frozen Original/successor0 and retry. Disabled MAP retains ERANGE and public
 correction; FILTER rejects without provider work. Existing digest/HMAC/numeric
 UUID qualifications and fees are unchanged.
+
+## Unit8a: bounded extension lookup and indexed callback lease foundation
+
+Both extension expression tags remain open. This unit supplies internal
+preparation helpers, without invoking extensions or changing scalar admission.
+Exact registry representations move to a private noninstalled header; the raw
+standalone registry target retains its original registry+thread linkage.
+Production, benchmark and both backend test source lists include the separate
+controlled translation unit, registered clean in the LLVM22 ratchet.
+
+The caller retains an authentic immutable snapshot during lookup/acquisition.
+Encoded name span is at most255 bytes with a readable terminator at the bound;
+a larger span is EINVAL before reading or charging. Earlier NUL ignores the
+encoded suffix. NULL snapshot/name is a guarded raw semantic miss. The helper
+preserves case and trims only space/TAB/LF/CR. It preserves the raw temporary
+malloc(length+1), failure-as-invalid-name/missing semantics, and free; there is
+no new governor refusal or allocation-free substitution.
+
+With T224, lookup admits ENTRY400, each actual first-NUL READ401, FRONT402,
+BACK403, ALLOC404, each COPY_LOAD405 and COPY_STORE406, NUL407, RECORD408,
+each compared byte PAIR409 and FINAL410. R=N+1 includes first NUL. Empty has
+F=B=0; alltrim has F=N,B=0; otherwise F=leadingtrim+1,B=trailingtrim+1.
+Stopping nontrim bytes are deliberately reinspected by each loop. Success or
+missing-after-search is(4+R+F+B+2L+E+P)T; invalid empty/trim is(2+R+F+B)T;
+allocation failure(3+R+F+B)T; NULL2T. P includes mismatch/terminating pairs.
+For entries a/ab/abc, literal schedules a13T,ab20T,abc28T,abd27T are independent
+of observed accounting. One255-byte matching name costs1029T. Every nonzero
+return preserves outputs/TLS diagnostic and frees local normalization scratch.
+
+Diagnostics publish only after final saved-ID guard. A fixed known-literal
+bridge writes the same raw TLS storage without strncpy's255-byte padding:
+max28-byte memcpy includingNUL costs56 read/write actions, dispatch24,guard51,
+caller/output40=171<=224<256. Raw public diagnostic setter is unchanged.
+Other byte/record intervals conservatively fit120+51+40=211<=224.
+
+Indexed lease is5T: ENTRY420,RELEASE_PREPAY421,LOCK_CALLER422,
+VALIDATE_COMMIT423,FINAL425. First4 admissions occur before registry mutex;
+postunlock424 is zero-poll only. No hook/control call executes under that mutex.
+Complete fixed validation/commit/unlock interval including refusal and next
+admission fronts is196 actions (51+8+20+24+12+12+12+5+20+32). Both counters
+are checked before either increment; a local receipt is recorded immediately
+then unlocked. Wrong index/exact descriptor is semantic miss; refcount or active
+lease saturation stagesEOVERFLOW, with no mutation. Final saved-ID guard takes
+precedence over staged errors. Nonzero outputs remain unchanged.
+
+Postacquire/final stop consumes the local receipt and calls raw lease release
+once, prepaid, without successor hooks/debit; no snapshot dereference follows
+rollback because destructor code may release it. On success caller owns one
+raw lease release. Legal unregister and final snapshot release cannot destroy
+the leased entry until that release. Mutex/allocator/user destructor bodies are
+narrow synchronous boundaries; engine normalization/comparison is not opaque.
+Tests exercise literal exact/prefix-one-short tariffs, real raw parity and
+diagnostics, trim/embeddedNUL/case/maximum names and allocator failure; each
+read/trim/copy/record/pair/final and lease phase under cancel/work/Original-END
+successor/overflow, frozen reports/successor0/reset retry, both saturation
+counters, foreign authentic descriptor, exactly-once resource retirement and
+actual unregister/final-snapshot-with-lease lifetime. Raw registry lifecycle
+regressions and standalone linkage remain separate controls.

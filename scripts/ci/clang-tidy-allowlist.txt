@@ -100,6 +100,7 @@ wirelog/crc32.c
 wirelog/evaluation_control.c
 wirelog/exec_plan_gen.c
 wirelog/exec_plan_scalar_view.c
+wirelog/extension_control.c
 wirelog/extension_registry.c
 wirelog/intern.c
 wirelog/intern_control.c

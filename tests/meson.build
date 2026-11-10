@@ -130,6 +130,7 @@ testlib_prod_src = files(
     '../wirelog/columnar/expr.c',
     '../wirelog/columnar/expr_hash.c',
     '../wirelog/columnar/expr_crypto.c',
+    '../wirelog/extension_control.c',
     '../wirelog/intern_control.c',
     '../wirelog/columnar/filter.c',
     '../wirelog/columnar/frontier.c',
@@ -2167,6 +2168,7 @@ backend_src = files(
   '../wirelog/columnar/expr.c',
   '../wirelog/columnar/expr_hash.c',
     '../wirelog/columnar/expr_crypto.c',
+    '../wirelog/extension_control.c',
     '../wirelog/intern_control.c',
   '../wirelog/columnar/filter.c',
   '../wirelog/columnar/join.c',
@@ -7396,3 +7398,17 @@ expression_crypto_exe = executable('test_evaluation_expression_crypto',
 test('evaluation_expression_crypto', expression_crypto_exe,
   suite: ['unit', 'tsan'], timeout: 120,
 )
+
+# #2299 bounded registry lookup/lease foundation; raw registry target above
+# deliberately still links without any evaluation-control implementation.
+test_evaluation_extension_lookup_exe = executable(
+  'test_evaluation_extension_lookup',
+  files('test_evaluation_extension_lookup.c', '../wirelog/extension_control.c',
+        '../wirelog/extension_registry.c', '../wirelog/evaluation_control.c'),
+  thread_src,
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  c_args: ['-DWIRELOG_BUILDING', '-DWL_SESSION_TEST_HOOKS=1'],
+  dependencies: [threads_dep], install: false,
+)
+test('evaluation_extension_lookup', test_evaluation_extension_lookup_exe,
+     suite: ['unit', 'tsan'])

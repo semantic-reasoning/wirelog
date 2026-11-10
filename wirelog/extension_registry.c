@@ -18,33 +18,7 @@ static _Thread_local char wl_extension_error[WL_EXTENSION_ERROR_SIZE];
 static __thread char wl_extension_error[WL_EXTENSION_ERROR_SIZE];
 #endif
 
-typedef struct wl_extension_entry {
-    wirelog_extension_descriptor_t descriptor;
-    char *name;
-    uint32_t *argument_types;
-    size_t references;
-    size_t pins;
-    bool registered;
-    wirelog_extension_registry_t *registry;
-} wl_extension_entry_t;
-
-struct wirelog_extension_registry {
-    wl_mutex_t mutex;
-    wl_extension_entry_t **entries;
-    size_t count;
-    size_t capacity;
-    size_t active_snapshots;
-    size_t active_leases;
-};
-
-struct wirelog_extension_snapshot {
-    wirelog_extension_registry_t *registry;
-    size_t references;
-    wl_extension_entry_t **entries;
-    size_t count;
-    size_t *pins;
-    bool *destroy_entries;
-};
+#include "extension_registry_private.h"
 
 void
 wl_extension_error_set(const char *message)
@@ -52,6 +26,27 @@ wl_extension_error_set(const char *message)
     if (!message) message = "";
     strncpy(wl_extension_error, message, sizeof(wl_extension_error) - 1);
     wl_extension_error[sizeof(wl_extension_error) - 1] = '\0';
+}
+
+/* Fixed literal copies include NUL, never strncpy's unobservable padding.
+* At most28 bytes:56 read/write actions+24 dispatch+51 guard+40 caller=171.
+* Called only after the controlled helper's final saved-identity guard. */
+void
+wl_extension_registry_lookup_error(
+    wl_extension_registry_lookup_outcome_t outcome)
+{
+    switch (outcome) {
+    case WL_EXTENSION_REGISTRY_LOOKUP_NULL:
+        memcpy(wl_extension_error, "snapshot or name is NULL",
+            sizeof("snapshot or name is NULL")); break;
+    case WL_EXTENSION_REGISTRY_LOOKUP_INVALID:
+        memcpy(wl_extension_error, "invalid extension name",
+            sizeof("invalid extension name")); break;
+    case WL_EXTENSION_REGISTRY_LOOKUP_MISSING:
+        memcpy(wl_extension_error, "extension not found",
+            sizeof("extension not found")); break;
+    case WL_EXTENSION_REGISTRY_LOOKUP_OK: wl_extension_error[0] = 0; break;
+    }
 }
 
 void
