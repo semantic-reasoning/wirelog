@@ -11,6 +11,8 @@
 #ifndef WIRELOG_INTERNAL_H
 #define WIRELOG_INTERNAL_H
 
+#include "wirelog-extension.h"
+#include "evaluation_control.h"
 #include <stddef.h>
 #include <stdbool.h>
 #include <stdlib.h>
@@ -55,6 +57,24 @@ wl_extension_callback_lease_acquire(
     const wirelog_extension_descriptor_t *descriptor);
 void
 wl_extension_callback_lease_release(void *lease);
+
+/* Caller keeps the immutable authentic snapshot alive through each call.
+ * name[0..name_bytes] is readable, name_bytes<=255, with a terminating NUL
+ * at the bound; an earlier NUL ignores the remaining encoded bytes.
+ * Nonzero preserves every output and TLS diagnostic. A successful miss sets
+ * descriptor=NULL,index=SIZE_MAX,found=false. The index is snapshot-specific. */
+int wl_extension_control_lookup_attempt(
+    const wirelog_extension_snapshot_t *snapshot,
+    const char *name, size_t name_bytes,
+    const wirelog_extension_descriptor_t **descriptor,
+    size_t *index, bool *found, wl_evaluation_control_t *control, uint64_t id);
+/* Fixed indexed membership, not a second scan. A successful lease transfers
+ * exactly one raw callback lease release to caller. Misses set NULL/false.
+ * Counter saturation is EOVERFLOW, after the final saved-identity guard. */
+int wl_extension_control_lease_index_attempt(
+    const wirelog_extension_snapshot_t *snapshot,
+    size_t index, const wirelog_extension_descriptor_t *expected, void **lease,
+    bool *found, wl_evaluation_control_t *control, uint64_t id);
 
 /* Issue #2122: true when every extension in @snapshot declares a
  * thread-safe callback, and for a NULL or empty snapshot. */
