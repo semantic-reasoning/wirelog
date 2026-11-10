@@ -6690,6 +6690,8 @@ bool wl_columnar_eval_delta_rollback_active(const wl_col_session_t *sess);
 bool wl_columnar_eval_delta_defer_gc(wl_col_session_t *sess);
 #ifdef WL_SESSION_TEST_HOOKS
 extern void (*wl_columnar_eval_delta_test_after_eval)(wl_col_session_t *sess);
+extern void (*wl_columnar_eval_delta_test_before_direct_event)(
+    wl_col_session_t *, uint32_t);
 extern int (*wl_columnar_eval_delta_test_retraction_eval)(
     const wl_plan_stratum_t *, wl_col_session_t *, uint32_t);
 int wl_columnar_eval_delta_test_retraction_step(const wl_plan_stratum_t *,
