@@ -94,6 +94,8 @@ def check(root: Path) -> tuple[list[str], int]:
                                scalar_expected == 'admitted' or
                                qualification == 'unit7-uuid-numeric' and tag in NUMERIC_UUID_TAGS and
                                scalar_expected == 'admitted' or
+                               qualification == 'unit7-uuid-rfc' and tag == 'WL_PLAN_EXPR_STR_FN_UUID5_RFC' and
+                               scalar_expected == 'admitted' or
                                qualification == 'legacy-rejected' and tag not in raw_tags)
         if not valid_qualification:
             errors.append(f'{tag}: invalid host qualification {qualification}')

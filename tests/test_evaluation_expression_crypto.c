@@ -2571,12 +2571,674 @@ static void uuid_empty_updates(void) {
 #endif
 }
 
+static const char *r_namespace = "6ba7b810-9dad-11d1-80b4-00c04fd430c8";
+static void rfc_parse_probe(const char *text, unsigned packets,
+    bool expected_valid,
+    const uint8_t *expected) {
+    for (unsigned below = 0; below < 2; ++below) {
+        wl_evaluation_control_t *c = begin(UINT64_C(224)*packets-below);
+        uint8_t output[16]; memset(output, 0xee, sizeof(output));
+        bool valid = true;
+        int rc = wl_columnar_expr_crypto_uuid_parse_attempt_controlled(text,
+                output, &valid, c,
+                wl_evaluation_control_active_attempt_id(c));
+        CHECK(rc == (below ? WL_EVALUATION_CONTROL_WORK_LIMIT : 0) &&
+            valid == (below || expected_valid));
+        for (unsigned i = 0; i < 16; ++i)
+            CHECK(output[i] == (!below && expected_valid ? expected[i] : 0xee));
+        finish(c, rc);
+    }
+}
+static void rfc_helper_oracles(void) {
+    uint8_t expected[16];
+    u_from_hex("6ba7b8109dad11d180b400c04fd430c8", expected, 16);
+    rfc_parse_probe(r_namespace, 75, true, expected);
+    rfc_parse_probe("6BA7B810-9DAD-11D1-80B4-00C04FD430C8", 75, true, expected);
+    uint8_t zeros[16] = {0};
+    rfc_parse_probe("00000000-0000-0000-0000-000000000000", 75, true, zeros);
+    rfc_parse_probe(NULL, 2, false, NULL);
+    char invalid[4097];
+    for (unsigned length = 0; length <= 37; ++length) {
+        memset(invalid, 'a', length); invalid[length] = 0;
+        unsigned packets = length < 36 ? length+3 : length == 36 ? 48 : 39;
+        rfc_parse_probe(invalid, packets, false, NULL);
+    }
+    memset(invalid, 'a', 4096); invalid[4096] = 0;
+    rfc_parse_probe(invalid, 39, false, NULL);
+    for (unsigned bad = 0; bad < 36; ++bad) {
+        memcpy(invalid, r_namespace, 37); invalid[bad] = '!';
+        rfc_parse_probe(invalid, 40+bad, false, NULL);
+    }
+    for (unsigned below = 0; below < 2; ++below) {
+        wl_evaluation_control_t *c = begin(UINT64_C(224)*39-below);
+        char output[37]; memset(output, 0xee, sizeof(output));
+        int rc =
+            wl_columnar_expr_crypto_uuid_format_attempt_controlled(expected,
+                output, c,
+                wl_evaluation_control_active_attempt_id(c));
+        CHECK(rc == (below ? WL_EVALUATION_CONTROL_WORK_LIMIT : 0));
+        for (unsigned i = 0; i < 37;
+            ++i) CHECK((uint8_t)output[i] ==
+                (below ? 0xee : (uint8_t)r_namespace[i]));
+        finish(c, rc);
+    }
+    for (unsigned prefix = 1; prefix <= 75; ++prefix) {
+        wl_evaluation_control_t *c = begin(UINT64_C(224)*prefix-1);
+        uint8_t output[16]; memset(output, 0xee, sizeof(output));
+        bool valid = false;
+        CHECK(wl_columnar_expr_crypto_uuid_parse_attempt_controlled(r_namespace,
+            output, &valid, c,
+            wl_evaluation_control_active_attempt_id(c)) ==
+            WL_EVALUATION_CONTROL_WORK_LIMIT && !valid);
+        for (unsigned i = 0; i < 16; ++i) CHECK(output[i] == 0xee);
+        finish(c, WL_EVALUATION_CONTROL_WORK_LIMIT);
+    }
+    for (unsigned prefix = 1; prefix <= 39; ++prefix) {
+        wl_evaluation_control_t *c = begin(UINT64_C(224)*prefix-1);
+        char output[37]; memset(output, 0xee, sizeof(output));
+        CHECK(wl_columnar_expr_crypto_uuid_format_attempt_controlled(expected,
+            output, c,
+            wl_evaluation_control_active_attempt_id(c)) ==
+            WL_EVALUATION_CONTROL_WORK_LIMIT);
+        for (unsigned i = 0; i < 37; ++i) CHECK((uint8_t)output[i] == 0xee);
+        finish(c, WL_EVALUATION_CONTROL_WORK_LIMIT);
+    }
+}
+
+static void rfc_helper_stops(void) {
+    uint8_t expected[16];
+    u_from_hex("6ba7b8109dad11d180b400c04fd430c8", expected, 16);
+    for (unsigned format = 0; format < 2; ++format)
+        for (unsigned cut = 0; cut < (format ? 39u : 75u); ++cut)
+            for (h_stop_action = 0; h_stop_action < 4; ++h_stop_action) {
+                if (format) {
+                    h_stop_phase = !cut ? 360 : cut == 38 ? 362 : 361;
+                    u_stop_progress = cut && cut < 38 ? cut-1 : UINT64_MAX;
+                } else {
+                    h_stop_phase = !cut ? 350 : cut < 38 ? 351 : cut <
+                        74 ? 352 : 353;
+                    u_stop_progress = !cut ||
+                        cut == 74 ? UINT64_MAX : cut < 38 ? cut-1 : cut-38;
+                }
+                h_stopped = false; h_successor = 0;
+                wl_evaluation_control_t *c = begin(h_stop_action ==
+                        1 ? UINT64_MAX-1 : 0);
+                uint8_t bytes[16]; char text[37];
+                memset(bytes, 0xee, sizeof(bytes));
+                memset(text, 0xee, sizeof(text));
+                bool valid = true; wl_columnar_expr_test_checkpoint = u_stop;
+                int rc =
+                    format ?
+                    wl_columnar_expr_crypto_uuid_format_attempt_controlled(
+                    expected, text, c,
+                    wl_evaluation_control_active_attempt_id(c)) :
+                    wl_columnar_expr_crypto_uuid_parse_attempt_controlled(
+                    r_namespace, bytes, &valid, c,
+                    wl_evaluation_control_active_attempt_id(c));
+                wl_columnar_expr_test_checkpoint = NULL;
+                CHECK(h_stopped && valid &&
+                    rc ==
+                    (h_stop_action == 0 ? WL_EVALUATION_CONTROL_CANCELLED :
+                    h_stop_action ==
+                    1 ? WL_EVALUATION_CONTROL_WORK_LIMIT : h_stop_action ==
+                    3 ? EOVERFLOW : EINVAL));
+                for (unsigned i = 0; i < 16; ++i) CHECK(bytes[i] == 0xee);
+                for (unsigned i = 0; i < 37;
+                    ++i) CHECK((uint8_t)text[i] == 0xee);
+                u_retire(c, rc);
+                if (format) CHECK(
+                        !wl_columnar_expr_crypto_uuid_format_attempt_controlled(
+                            expected, text, c,
+                            wl_evaluation_control_active_attempt_id(c)) &&
+                        !memcmp(text, r_namespace, 37));
+                else CHECK(
+                        !wl_columnar_expr_crypto_uuid_parse_attempt_controlled(
+                            r_namespace, bytes, &valid, c,
+                            wl_evaluation_control_active_attempt_id(c)) &&
+                        valid &&
+                        !memcmp(bytes, expected, 16));
+                finish(c, 0);
+            }
+}
+
+extern void (*wl_columnar_expr_test_uuid_rfc_push)(uint32_t, int64_t);
+static unsigned r_pushes, r_parses, r_reads, r_name_scans, r_put_calls;
+static int64_t r_push_expected;
+static void r_observe_push(uint32_t kind, int64_t value) {
+    CHECK(kind == WIRELOG_EXTENSION_VALUE_INT64 && value == r_push_expected);
+    ++r_pushes;
+}
+static void r_observe_eval(wl_evaluation_control_t *c, unsigned phase,
+    uint64_t progress, bool failed) {
+    (void)c; (void)progress; (void)failed;
+    r_parses += phase == 350; r_reads += phase == 351;
+    r_name_scans += phase == 41;
+}
+static void r_observe_put(wl_evaluation_control_t *c, unsigned phase,
+    uint64_t progress) {
+    (void)c; (void)phase; (void)progress; ++r_put_calls;
+}
+static void rfc_scalar_parity(void) {
+    wl_intern_t *intern = wl_intern_create(); CHECK(intern);
+    char long_namespace[4097]; memset(long_namespace, 'a', 4096);
+    long_namespace[4096] = 0;
+    int64_t namespaces[] = {wl_intern_put(intern, r_namespace),
+                            wl_intern_put(intern,
+                                "6BA7B810-9DAD-11D1-80B4-00C04FD430C8"),
+                            wl_intern_put(intern,
+                                "00000000-0000-0000-0000-000000000000"),
+                            wl_intern_put(intern, "not-a-uuid"),
+                            wl_intern_put(intern, long_namespace), -1,
+                            INT64_MAX};
+    int64_t names[] = {wl_intern_put(intern, "www.example.com"),
+                       wl_intern_put(intern, ""),
+                       wl_intern_put(intern, "\xe2\x98\x83"),
+                       wl_intern_put(intern, "\x80\xff"), -1, INT64_MAX};
+    for (unsigned ns = 0; ns < sizeof(namespaces)/sizeof(*namespaces); ++ns)
+        for (unsigned name = 0; name < sizeof(names)/sizeof(*names); ++name)
+            for (unsigned null = 0; null < 2; ++null) {
+                uint8_t bytes[24];
+                uint32_t n = hmac_bytecode(bytes, namespaces[ns], names[name],
+                        WL_PLAN_EXPR_STR_FN_UUID5_RFC);
+                wl_columnar_expr_context_t context =
+                {.intern = null?NULL:intern};
+                int64_t raw = 999, value = 999;
+                wl_columnar_expr_status_t raw_status, status;
+                int raw_rc = wl_columnar_expr_eval_run_ctx(bytes, n, NULL, 0,
+                        &raw, &context, &raw_status);
+                wl_evaluation_control_t *c = begin(0);
+                bool supported = false, failed = false;
+                wl_columnar_expr_attempt_scalar_t *program = NULL;
+                CHECK(!wl_columnar_expr_compile_scalar_attempt_controlled(bytes,
+                    n, NULL, &program, &supported, c,
+                    wl_evaluation_control_active_attempt_id(c)) && supported);
+                wirelog_column_type_t type = WIRELOG_TYPE_BOOL;
+                CHECK(!wl_columnar_expr_scalar_result_type_attempt_controlled(
+                        program, NULL, 0, &type, &supported, c,
+                        wl_evaluation_control_active_attempt_id(c)) &&
+                    supported &&
+                    type == WIRELOG_TYPE_STRING);
+                r_pushes = r_parses = r_reads = r_name_scans = r_put_calls = 0;
+                r_push_expected = raw;
+                wl_columnar_expr_test_uuid_rfc_push = r_observe_push;
+                wl_columnar_expr_test_checkpoint = r_observe_eval;
+                wl_intern_control_test_checkpoint = r_observe_put;
+                CHECK(!wl_columnar_expr_eval_scalar_attempt_controlled(program,
+                    NULL, 0, &context, &value, &failed, &status, c,
+                    wl_evaluation_control_active_attempt_id(c)));
+                wl_columnar_expr_test_uuid_rfc_push = NULL;
+                wl_columnar_expr_test_checkpoint = NULL;
+                wl_intern_control_test_checkpoint = NULL;
+                CHECK(value == raw && status == raw_status &&
+                    failed == (raw_rc != 0) && r_pushes == (!raw_rc));
+#ifdef WL_MBEDTLS_ENABLED
+                if (!null && wl_intern_reverse(intern, names[name])) {
+                    CHECK(r_parses == 1 && r_reads <= 37);
+                    if (raw_rc) CHECK(!r_name_scans && !r_put_calls);
+                    else CHECK(r_name_scans && r_put_calls);
+                } else CHECK(!r_parses && !r_reads && !r_name_scans &&
+                        !r_put_calls);
+                if (!null && ns == 0 &&
+                    name == 0) CHECK(!strcmp(wl_intern_reverse(intern, value),
+                        "2ed6657d-e927-568b-95e1-2665a8aea6a2"));
+#else
+                CHECK(!r_parses && !r_reads && !r_name_scans && !r_put_calls);
+#endif
+                wl_columnar_expr_attempt_scalar_free(program); finish(c, 0);
+            }
+    wl_intern_free(intern);
+}
+
+static void rfc_scalar_stops(void) {
+    const unsigned phases[] = {370, 371, 372, 350, 351, 352, 353, 373, 41, 374,
+                               318, 303, 305, 317, 310, 314, 375, 376, 360, 361,
+                               362, 377, 378, 379, 88};
+    for (unsigned p = 0; p < sizeof(phases)/sizeof(*phases); ++p)
+        for (h_stop_action = 0; h_stop_action < 4; ++h_stop_action) {
+#ifndef WL_MBEDTLS_ENABLED
+            if (phases[p] != 370 && phases[p] != 379) continue;
+#endif
+            wl_intern_t *intern = wl_intern_create(); CHECK(intern);
+            int64_t namespace_id = wl_intern_put(intern, r_namespace),
+                name = wl_intern_put(intern, "www.example.com");
+            uint8_t bytes[24];
+            uint32_t n = hmac_bytecode(bytes, namespace_id, name,
+                    WL_PLAN_EXPR_STR_FN_UUID5_RFC);
+            wl_evaluation_control_t *c = begin(h_stop_action ==
+                    1?UINT64_MAX-1:0);
+            bool supported = false, failed = false;
+            wl_columnar_expr_attempt_scalar_t *program = NULL;
+            CHECK(!wl_columnar_expr_compile_scalar_attempt_controlled(bytes, n,
+                NULL, &program, &supported, c,
+                wl_evaluation_control_active_attempt_id(c)) && supported);
+            wl_columnar_expr_context_t context = {.intern = intern};
+            uint32_t before = wl_intern_count(intern); int64_t value = 999;
+            wl_columnar_expr_status_t status = WL_COLUMNAR_EXPR_OK;
+            h_stop_phase = phases[p]; h_stopped = false; h_successor = 0;
+            u_stop_progress = phases[p] == 88?n:UINT64_MAX;
+            wl_columnar_expr_test_checkpoint = u_stop;
+            int rc = wl_columnar_expr_eval_scalar_attempt_controlled(program,
+                    NULL, 0, &context, &value, &failed, &status, c,
+                    wl_evaluation_control_active_attempt_id(c));
+            wl_columnar_expr_test_checkpoint = NULL;
+            CHECK(h_stopped && value == 999 && !failed &&
+                rc == (h_stop_action == 0?WL_EVALUATION_CONTROL_CANCELLED:
+                h_stop_action ==
+                1?WL_EVALUATION_CONTROL_WORK_LIMIT:h_stop_action ==
+                3?EOVERFLOW:EINVAL));
+#ifdef WL_MBEDTLS_ENABLED
+            bool published = phases[p] == 378 || phases[p] == 379 ||
+                phases[p] == 88;
+            CHECK(wl_intern_count(intern) == before+published);
+#else
+            CHECK(wl_intern_count(intern) == before);
+#endif
+            if (rc) u_retire(c, rc);
+            CHECK(!wl_columnar_expr_eval_scalar_attempt_controlled(program,
+                NULL, 0, &context, &value, &failed, &status, c,
+                wl_evaluation_control_active_attempt_id(c)));
+#ifdef WL_MBEDTLS_ENABLED
+            CHECK(!failed && status == WL_COLUMNAR_EXPR_OK &&
+                wl_intern_count(intern) == before+1 &&
+                !strcmp(wl_intern_reverse(intern, value),
+                "2ed6657d-e927-568b-95e1-2665a8aea6a2"));
+#else
+            CHECK(failed && status == WL_COLUMNAR_EXPR_MALFORMED && !value);
+#endif
+            wl_columnar_expr_attempt_scalar_free(program); finish(c, 0);
+            wl_intern_free(intern);
+        }
+}
+
+#ifdef WL_MBEDTLS_ENABLED
+static wl_intern_t *r_probe_intern;
+static uint32_t r_probe_type;
+static unsigned r_probe_calls;
+static int r_probe(const wirelog_extension_value_t *args, uint32_t count,
+    wirelog_extension_value_t *result, void *data) {
+    (void)data; CHECK(count == 1 && args[0].type == r_probe_type);
+    const char *text = r_probe_type == WIRELOG_EXTENSION_VALUE_INT64?
+        wl_intern_reverse(r_probe_intern,
+            args[0].as.int64_value):args[0].as.string_value.data;
+    CHECK(text && !memcmp(text, "2ed6657d-e927-568b-95e1-2665a8aea6a2", 36));
+    if (r_probe_type ==
+        WIRELOG_EXTENSION_VALUE_STRING) CHECK(args[0].as.string_value.length ==
+            36);
+    ++r_probe_calls; result->type = WIRELOG_EXTENSION_VALUE_INT64;
+    result->size = sizeof(int64_t); result->as.int64_value = 42; return 0;
+}
+static void rfc_raw_provenance(void) {
+    wl_intern_t *intern = wl_intern_create(); CHECK(intern);
+    r_probe_intern = intern;
+    int64_t ns = wl_intern_put(intern, r_namespace),
+        name = wl_intern_put(intern, "www.example.com");
+    const char *expected = "2ed6657d-e927-568b-95e1-2665a8aea6a2";
+    int64_t sid = wl_intern_put(intern, expected);
+    wirelog_extension_registry_t *registry =
+        wirelog_extension_registry_create(); CHECK(registry);
+    uint32_t types[] = {WIRELOG_EXTENSION_VALUE_INT64,
+                        WIRELOG_EXTENSION_VALUE_STRING};
+    for (unsigned i = 0; i < 2; ++i) {
+        wirelog_extension_descriptor_t d =
+        {.abi_version = WIRELOG_EXTENSION_ABI_VERSION,
+         .size = sizeof(d),
+         .name = i?"rfc.string":"rfc.id", .arity = 1,
+         .argument_types = &types[i],
+         .result_type =
+             WIRELOG_EXTENSION_VALUE_INT64, .invoke = r_probe};
+        CHECK(!wirelog_extension_register(registry, &d));
+    }
+    wirelog_extension_snapshot_t *snapshot =
+        wirelog_extension_snapshot_acquire(registry); CHECK(snapshot);
+    wl_columnar_expr_context_t context = {.intern = intern,
+                                          .extensions = snapshot,
+                                          .allow_extension_scalar_result = true,
+                                          .configured_worker_count = 1,
+                                          .active_worker_count = 1};
+    for (unsigned i = 0; i < 3; ++i) {
+        uint8_t bytes[128]; uint32_t n = 0;
+        if (!i)n = hmac_bytecode(bytes, ns, name,
+                    WL_PLAN_EXPR_STR_FN_UUID5_RFC);
+        else if (i == 1) {
+            bytes[n++] = WL_PLAN_EXPR_CONST_STR; bytes[n++] = 36;
+            bytes[n++] = 0;
+            memcpy(bytes+n, expected, 36); n += 36;
+        }else {
+            bytes[n++] = WL_PLAN_EXPR_VAR_STRING; bytes[n++] = 4;
+            bytes[n++] = 0; memcpy(bytes+n, "col0", 4); n += 4;
+        }
+        const char *call = i?"rfc.string":"rfc.id";
+        uint16_t len = (uint16_t)strlen(call); uint32_t nargs = 1;
+        bytes[n++] = WL_PLAN_EXPR_EXTENSION_CALL; bytes[n++] = (uint8_t)len;
+        bytes[n++] = 0;
+        memcpy(bytes+n, call, len); n += len; memcpy(bytes+n, &nargs, 4);
+        n += 4;
+        r_probe_type = types[i != 0]; r_probe_calls = 0; int64_t value = 999;
+        wl_columnar_expr_status_t status;
+        CHECK(!wl_columnar_expr_eval_run_ctx(bytes, n, &sid, 1, &value,
+            &context, &status));
+        CHECK(value == 42 && status == WL_COLUMNAR_EXPR_OK &&
+            r_probe_calls == 1);
+    }
+    wirelog_extension_snapshot_release(snapshot);
+    CHECK(!wirelog_extension_unregister(registry, "rfc.id"));
+    CHECK(!wirelog_extension_unregister(registry, "rfc.string"));
+    CHECK(!wirelog_extension_registry_destroy(registry));
+    wl_intern_free(intern); r_probe_intern = NULL;
+}
+static void rfc_intern_failures(void) {
+    for (unsigned duplicate = 0; duplicate < 2; ++duplicate)
+        for (unsigned denied = 0; denied < 2; ++denied) {
+            wl_intern_t *intern = wl_intern_create(); CHECK(intern);
+            int64_t ns = wl_intern_put(intern, r_namespace),
+                name = wl_intern_put(intern, "www.example.com");
+            if (duplicate) CHECK(wl_intern_put(intern,
+                    "2ed6657d-e927-568b-95e1-2665a8aea6a2") >= 0);
+            wl_columnar_memory_resolution_t resolution =
+            {.budget_bytes = WL_COLUMNAR_MEMORY_MIN_BUDGET,
+             .usable_bytes =
+                 10000000, .mode = WL_COLUMNAR_MEMORY_MODE_ENFORCING};
+            wl_columnar_memory_governor_ref_t *ref =
+                wl_columnar_memory_governor_ref_create(&resolution); CHECK(ref);
+            CHECK(!wl_intern_attach_memory_governor(intern, ref));
+            wl_columnar_memory_governor_t *g =
+                wl_columnar_memory_governor_ref_get(ref);
+            uint64_t before = wl_columnar_memory_reserved(g);
+            uint32_t count = wl_intern_count(intern);
+            const char *pointer = wl_intern_reverse(intern, ns);
+            wl_columnar_memory_reservation_t filler;
+            wl_columnar_memory_reservation_init(&filler);
+            if (denied) CHECK(wl_columnar_memory_reserve_checked(g,
+                    10000000-before,
+                    &filler) == WL_COLUMNAR_MEMORY_ADMISSION_OK);
+            uint8_t bytes[24];
+            uint32_t n = hmac_bytecode(bytes, ns, name,
+                    WL_PLAN_EXPR_STR_FN_UUID5_RFC);
+            wl_evaluation_control_t *c = begin(0);
+            bool supported = false, failed = false;
+            wl_columnar_expr_attempt_scalar_t *program = NULL;
+            CHECK(!wl_columnar_expr_compile_scalar_attempt_controlled(bytes, n,
+                NULL, &program, &supported, c,
+                wl_evaluation_control_active_attempt_id(c)) && supported);
+            wl_columnar_expr_context_t context = {.intern = intern};
+            int64_t value = 999;
+            wl_columnar_expr_status_t status = WL_COLUMNAR_EXPR_OK;
+            if (!denied) wl_intern_control_test_fail_allocation = 0;
+            int rc = wl_columnar_expr_eval_scalar_attempt_controlled(program,
+                    NULL, 0, &context, &value, &failed, &status, c,
+                    wl_evaluation_control_active_attempt_id(c));
+            wl_intern_control_test_fail_allocation = -1;
+            CHECK((duplicate && denied?rc == 0 && value == 2:rc == ENOMEM &&
+                value == 999) && !failed && status == WL_COLUMNAR_EXPR_OK);
+            CHECK(wl_intern_count(intern) == count && wl_intern_reverse(intern,
+                ns) == pointer);
+            CHECK(wl_columnar_memory_reserved(g) == (denied?10000000:before));
+            if (denied) wl_columnar_memory_rollback(&filler);
+            CHECK(wl_columnar_memory_reserved(g) == before);
+            if (rc) u_retire(c, rc);
+            CHECK(!wl_columnar_expr_eval_scalar_attempt_controlled(program,
+                NULL, 0, &context, &value, &failed, &status, c,
+                wl_evaluation_control_active_attempt_id(c)) && !failed);
+            CHECK(!strcmp(wl_intern_reverse(intern, value),
+                "2ed6657d-e927-568b-95e1-2665a8aea6a2") &&
+                wl_intern_count(intern) == count+!duplicate);
+            wl_columnar_expr_attempt_scalar_free(program); finish(c, 0);
+            wl_intern_free(intern);
+            CHECK(!wl_columnar_memory_reserved(g));
+            wl_columnar_memory_governor_ref_release(ref);
+        }
+}
+#endif
+
+static unsigned r_host_calls;
+static void r_capture(const char *name, const int64_t *row, uint32_t width,
+    int32_t diff, void *arg) {
+    fixture_t *f = arg;
+    if (!strcmp(name, "side")) {
+        CHECK(width == 1 && row[0] == 1 && diff == 1); return;
+    }
+    CHECK(!strcmp(name,
+        "out") && row[0] >= 1 && row[0] <= 3 && (diff == 1 || diff == -1));
+    unsigned r = (unsigned)(row[0]-1);
+    CHECK(width == (f->filter?2:3) && row[1] == f->input[r][1]);
+    if (!f->filter)CHECK(row[2] == f->expected[r][0]);
+    f->balance[r] += diff; CHECK(f->balance[r] >= 0 && f->balance[r] <= 1);
+    ++f->events; f->positives += diff == 1; f->negatives += diff == -1;
+}
+static void r_contents(fixture_t *f, unsigned count) {
+    col_rel_t *out = session_find_rel(COL_SESSION(f->session), "out");
+    CHECK(out && out->nrows == count && out->ncols == (f->filter?2:3));
+    CHECK(out->column_types[0] == WIRELOG_TYPE_INT64 &&
+        out->column_types[1] == WIRELOG_TYPE_STRING);
+    if (!f->filter)CHECK(out->column_types[2] == WIRELOG_TYPE_STRING);
+    bool seen_rows[3] = {false, false, false};
+    for (uint32_t i = 0; i < out->nrows; ++i) {
+        int64_t id = out->columns[0][i];
+        CHECK(id >= 1 && id <= 3 && !seen_rows[id-1]);
+        seen_rows[id-1] = true; CHECK(out->columns[1][i] == f->input[id-1][1]);
+        if (!f->filter)CHECK(out->columns[2][i] == f->expected[id-1][0]);
+    }
+}
+static fixture_t r_create(const char *source) {
+    fixture_t f = create(source);
+    int64_t ns = wl_intern_put(f.plan->intern, r_namespace);
+    for (unsigned r = 0; r < 3; ++r) {
+        uint8_t bytes[24];
+        uint32_t n = hmac_bytecode(bytes, ns, f.input[r][1],
+                WL_PLAN_EXPR_STR_FN_UUID5_RFC);
+        wl_columnar_expr_context_t context = {.intern = f.plan->intern};
+        wl_columnar_expr_status_t status;
+        int rc = wl_columnar_expr_eval_run_ctx(bytes, n, NULL, 0,
+                &f.expected[r][0], &context, &status);
+#ifdef WL_MBEDTLS_ENABLED
+        CHECK(!rc && status == WL_COLUMNAR_EXPR_OK);
+#else
+        CHECK(rc == WL_COLUMNAR_EXPR_MALFORMED);
+#endif
+    }
+    return f;
+}
+static void r_host_hook(wl_evaluation_control_t *c, unsigned phase,
+    uint64_t progress, bool failed) {
+    (void)progress; (void)failed; if (phase == 370)++r_host_calls;
+#ifdef WL_MBEDTLS_ENABLED
+    if (!active || session_stopped || phase != u_host_target ||
+        r_host_calls < 2) return;
+    CHECK(wl_columnar_session_test_cleanup_owners(COL_SESSION(
+            active->session)) == 2);
+    session_stopped = true;
+    if (session_action == 0)wl_evaluation_control_request_cancel(c);
+    else if (session_action == 1)CHECK(wl_evaluation_control_charge(c,
+            UINT64_MAX) == WL_EVALUATION_CONTROL_WORK_LIMIT);
+    else {
+        wl_evaluation_control_attempt_finish_result_t end =
+            wl_evaluation_control_finish_attempt(c,
+                active->session->operation_admission,
+                wl_evaluation_control_active_attempt_id(c), 0, 0);
+        CHECK(!end.protocol && end.report_valid && !end.report.result &&
+            end.report.consumed);
+        session_report = end.report; CHECK(!wl_evaluation_control_reset(c));
+        wl_evaluation_control_attempt_begin_result_t next =
+            wl_evaluation_control_begin_attempt(c,
+                active->session->operation_admission);
+        CHECK(!next.protocol && next.attempt_id != end.report.attempt_id);
+        session_successor = next.attempt_id;
+    }
+#else
+    (void)c;
+#endif
+}
+static const char *r_source =
+    ".decl input(i:int64,s:string)\n.decl out(i:int64,s:string,u:string)\n"
+    "out(i,s,uuid5_rfc(\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\",s)) :- input(i,s).\n";
+static void rfc_session_maps(void) {
+#ifdef WL_MBEDTLS_ENABLED
+    const unsigned targets[] = {352, 41, 310, 361, 377, 378};
+    for (unsigned mixed = 0; mixed < 2; ++mixed)
+        for (unsigned target = 0; target < sizeof(targets)/sizeof(*targets);
+            ++target)
+            for (session_action = 0; session_action < 3; ++session_action) {
+                char source[1024];
+                snprintf(source, sizeof(source), "%s%s", r_source, mixed?
+                    ".decl a(x:int64)\n.decl b(x:int64)\n.decl c(x:int64)\n.decl side(x:int64)\nside(x) :- a(x),b(x),c(x).\n"
+                    :"");
+                fixture_t f = r_create(source);
+                wl_session_set_delta_cb(f.session, r_capture, &f);
+                if (mixed) {
+                    int64_t one = 1; const char *names[] = {"a", "b", "c"};
+                    for (unsigned i = 0; i < 3; ++i)
+                        CHECK(!wl_session_insert(f.session, names[i], &one, 1,
+                            1));
+                }
+                CHECK(!wl_session_insert(f.session, "input", f.input[0], 1,
+                    2) && !complete(f.session)); r_contents(&f, 1);
+                col_rel_t *prior = session_find_rel(COL_SESSION(f.session),
+                        "out");
+                col_relation_snapshot_t generation =
+                    wl_columnar_relation_snapshot(prior);
+                for (unsigned r = 1; r < 3;
+                    ++r) CHECK(!wl_session_insert(f.session, "input",
+                        f.input[r], 1, 2));
+                active = &f; session_stopped = false; r_host_calls = 0;
+                session_successor = 0; mixed_owner_reads = 0;
+                u_host_target = targets[target];
+                if (session_action ==
+                    1) CHECK(!wl_evaluation_control_configure(f.control,
+                        UINT64_MAX-1));
+                wl_columnar_expr_test_checkpoint = r_host_hook;
+                wl_columnar_session_test_source_tail = mixed_source_tail;
+                int rc = complete(f.session);
+                wl_columnar_expr_test_checkpoint = NULL;
+                wl_columnar_session_test_source_tail = NULL;
+                CHECK(session_stopped && mixed_owner_reads &&
+                    rc == (session_action == 0?WL_EVALUATION_CONTROL_CANCELLED:
+                    session_action ==
+                    1?WL_EVALUATION_CONTROL_WORK_LIMIT:EINVAL));
+                r_contents(&f, 1);
+                CHECK(f.events == 1 &&
+                    prior == session_find_rel(COL_SESSION(f.session), "out") &&
+                    wl_columnar_relation_snapshot_equal(generation,
+                    wl_columnar_relation_snapshot(prior)));
+                CHECK(!COL_SESSION(f.session)->cleanup_active &&
+                    !COL_SESSION(f.session)->cleanup_pending &&
+                    !COL_SESSION(f.session)->cleanup_reserved_bytes);
+                if (session_action == 2) {
+                    wl_evaluation_control_report_t report; uint64_t used = 999;
+                    CHECK(!wl_evaluation_control_report(f.control,
+                        &report) &&
+                        report.attempt_id == session_report.attempt_id &&
+                        report.consumed == session_report.consumed &&
+                        report.result == session_report.result &&
+                        report.cleanup_status == session_report.cleanup_status);
+                    CHECK(!wl_evaluation_control_test_active_consumed(f.control,
+                        session_successor, &used) && !used);
+                    wl_evaluation_control_attempt_finish_result_t end =
+                        wl_evaluation_control_finish_attempt(f.control,
+                            f.session->operation_admission, session_successor,
+                            0, 0);
+                    CHECK(!end.protocol && end.report_valid &&
+                        !end.report.consumed);
+                }
+                active = NULL;
+                CHECK(!wl_evaluation_control_reset(f.control) &&
+                    !complete(f.session)); r_contents(&f, 3);
+                CHECK(f.events == 3 && f.positives == 3 && !f.negatives);
+                CHECK(!wl_session_remove(f.session, "input", f.input[0], 1,
+                    2) && !complete(f.session)); r_contents(&f, 2);
+                CHECK(f.events == 4 && f.negatives == 1 && !f.balance[0]);
+                CHECK(!wl_session_insert(f.session, "input", f.input[0], 1,
+                    2) && !complete(f.session)); r_contents(&f, 3);
+                CHECK(f.events == 5 && f.positives == 4 &&
+                    !complete(f.session) && f.events == 5); destroy(&f);
+            }
+#else
+    fixture_t f = r_create(r_source); CHECK(!complete(f.session)); inputs(&f);
+    CHECK(complete(f.session) == ERANGE);
+    r_contents(&f, 0);
+    for (unsigned r = 0; r < 3;
+        ++r) CHECK(!wl_session_remove(f.session, "input", f.input[r], 1, 2));
+    CHECK(!wl_evaluation_control_reset(f.control) && !complete(f.session));
+    destroy(&f);
+#endif
+}
+static void rfc_session_filters(void) {
+    for (unsigned reject = 0; reject < 2; ++reject) {
+        char source[1024]; snprintf(source, sizeof(source),
+            ".decl input(i:int64,s:string)\n.decl out(i:int64,s:string)\nout(i,s) :- input(i,s), "
+            "uuid5_rfc(\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\",s)=uuid5_rfc(\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\",\"%s\").\n",
+            reject?"missing":"abc");
+        fixture_t f = r_create(source); f.filter = true;
+        wl_session_set_delta_cb(f.session, r_capture, &f);
+        CHECK(!complete(f.session)); r_contents(&f, 0); inputs(&f);
+        r_host_calls = 0;
+        wl_columnar_expr_test_checkpoint = r_host_hook;
+        CHECK(!complete(f.session)); wl_columnar_expr_test_checkpoint = NULL;
+        CHECK(r_host_calls >= 3);
+#ifdef WL_MBEDTLS_ENABLED
+        unsigned count = !reject; r_contents(&f, count);
+        CHECK(f.events == count);
+        if (count) {
+            CHECK(f.balance[0] == 1 && !f.balance[1] && !f.balance[2]);
+            CHECK(!wl_session_remove(f.session, "input", f.input[0], 1,
+                2) && !complete(f.session)); r_contents(&f, 0);
+            CHECK(f.events == 2 && f.negatives == 1);
+        }
+#else
+        r_contents(&f, 0); CHECK(!f.events);
+#endif
+        unsigned events = f.events;
+        CHECK(!complete(f.session) && f.events == events); destroy(&f);
+    }
+}
+
+#ifdef WL_MBEDTLS_ENABLED
+static void rfc_bad_namespace_retry(void) {
+    const char *source =
+        ".decl input(i:int64,s:string)\n.decl out(i:int64,s:string,u:string)\n"
+        "out(i,s,uuid5_rfc(s,\"www.example.com\")) :- input(i,s).\n";
+    fixture_t f = create(source);
+    wl_session_set_delta_cb(f.session, r_capture, &f);
+    int64_t ns = wl_intern_put(f.plan->intern, r_namespace),
+        bad = wl_intern_put(f.plan->intern, "not-a-namespace");
+    int64_t uuid = wl_intern_put(f.plan->intern,
+            "2ed6657d-e927-568b-95e1-2665a8aea6a2");
+    for (unsigned i = 0; i < 3; ++i) {
+        f.input[i][1] = ns; f.expected[i][0] = uuid;
+    }
+    CHECK(!wl_session_insert(f.session, "input", f.input[0], 1,
+        2) && !complete(f.session)); r_contents(&f, 1);
+    col_rel_t *prior = session_find_rel(COL_SESSION(f.session), "out");
+    col_relation_snapshot_t generation = wl_columnar_relation_snapshot(prior);
+    int64_t malformed[2] = {3, bad};
+    CHECK(!wl_session_insert(f.session, "input", f.input[1], 1,
+        2) && !wl_session_insert(f.session, "input", malformed, 1, 2));
+    CHECK(complete(f.session) == ERANGE); r_contents(&f, 1);
+    CHECK(f.events == 1 && prior == session_find_rel(COL_SESSION(f.session),
+        "out") &&
+        wl_columnar_relation_snapshot_equal(generation,
+        wl_columnar_relation_snapshot(prior)));
+    CHECK(!COL_SESSION(f.session)->cleanup_active &&
+        !COL_SESSION(f.session)->cleanup_pending &&
+        !COL_SESSION(f.session)->cleanup_reserved_bytes);
+    CHECK(!wl_session_remove(f.session, "input", malformed, 1,
+        2) && !wl_session_insert(f.session, "input", f.input[2], 1, 2));
+    CHECK(!wl_evaluation_control_reset(f.control) && !complete(f.session));
+    r_contents(&f, 3);
+    CHECK(f.events == 3 && f.positives == 3 && !f.negatives &&
+        !complete(f.session) && f.events == 3); destroy(&f);
+}
+#endif
+
 int main(void) {
 #ifdef WL_MBEDTLS_ENABLED
-    prepare_known();
+    prepare_known(); rfc_bad_namespace_retry(); rfc_raw_provenance();
+    rfc_intern_failures();
 #endif
+    rfc_session_maps(); rfc_session_filters();
     helper_oracles(); helper_stops(); scalar_parity(); session_maps();
-    uuid_empty_updates(); uuid_compiler_policy(); uuid_state_stops();
+    rfc_scalar_stops(); rfc_scalar_parity(); rfc_helper_oracles();
+    rfc_helper_stops(); uuid_empty_updates(); uuid_compiler_policy();
+    uuid_state_stops();
     uuid_pair_oracles();
     uuid4_oracles();
     uuid_pair_stops(); uuid_prefixes(); uuid4_stops(); uuid_numeric_parity();

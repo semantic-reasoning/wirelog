@@ -514,3 +514,86 @@ complete:
 #endif
     *failed = semantic; return 0;
 }
+
+/* Bounded canonical namespace classification/parse. Fixed private snapshots
+ * make partial work invisible. Per character <=120+guard51+caller40=211;
+ * final16-byte copy contributes32 byte actions inside its own packet. */
+int
+wl_columnar_expr_crypto_uuid_parse_attempt_controlled(const char *text,
+    uint8_t *output, bool *valid, wl_evaluation_control_t *control, uint64_t id)
+{
+    if (!output || !valid) return EINVAL;
+    int rc = wl_columnar_expr_crypto_region(control, id, 350, 0);
+    if (rc) return rc;
+    uint8_t characters[37], parsed[16];
+    bool good = false, terminated = false; size_t length = 0;
+    if (text) {
+        for (size_t i = 0; i < 37; ++i) {
+            rc = wl_columnar_expr_crypto_region(control, id, 351, i);
+            if (rc) return rc;
+            uint8_t c = (uint8_t)text[i]; characters[i] = c;
+            if (!c) {
+                length = i; terminated = true; break;
+            }
+        }
+        if (terminated && length == 36) {
+            good = true; unsigned digit = 0;
+            for (unsigned i = 0; i < 36; ++i) {
+                rc = wl_columnar_expr_crypto_region(control, id, 352, i);
+                if (rc) return rc;
+                uint8_t c = characters[i];
+                if (i == 8 || i == 13 || i == 18 || i == 23) {
+                    if (c != (uint8_t)'-') {
+                        good = false; break;
+                    }
+                    continue;
+                }
+                uint8_t nibble;
+                if (c >= (uint8_t)'0' &&
+                    c <= (uint8_t)'9') nibble = (uint8_t)(c-'0');
+                else if (c >= (uint8_t)'a' &&
+                    c <= (uint8_t)'f') nibble = (uint8_t)(c-'a'+10);
+                else if (c >= (uint8_t)'A' &&
+                    c <= (uint8_t)'F') nibble = (uint8_t)(c-'A'+10);
+                else {
+                    good = false; break;
+                }
+                if (!(digit & 1u)) parsed[digit/2] = (uint8_t)(nibble << 4);
+                else parsed[digit/2] |= nibble;
+                ++digit;
+            }
+        }
+    }
+    rc = wl_columnar_expr_crypto_region(control, id, 353, 0);
+    if (rc) return rc;
+    if (good) memcpy(output, parsed, 16);
+    *valid = good; return 0;
+}
+
+/* ENTRY +37 separately admitted output stores +FINAL =39T. The37-byte
+ * final read/write copy74 + guard51 + complete fixed caller40=165<=224.
+ * No per-call bulk fill or input-sized formatter precedes these cuts. */
+int
+wl_columnar_expr_crypto_uuid_format_attempt_controlled(const uint8_t *bytes,
+    char *output, wl_evaluation_control_t *control, uint64_t id)
+{
+    if (!bytes || !output) return EINVAL;
+    int rc = wl_columnar_expr_crypto_region(control, id, 360, 0);
+    if (rc) return rc;
+    static const char hex[] = "0123456789abcdef";
+    char text[37]; unsigned digit = 0;
+    for (unsigned i = 0; i < 37; ++i) {
+        rc = wl_columnar_expr_crypto_region(control, id, 361, i);
+        if (rc) return rc;
+        if (i == 36) text[i] = '\0';
+        else if (i == 8 || i == 13 || i == 18 || i == 23) text[i] = '-';
+        else {
+            unsigned nibble = (digit & 1u) ? bytes[digit/2] &
+                0x0fu : bytes[digit/2] >> 4;
+            text[i] = hex[nibble]; ++digit;
+        }
+    }
+    rc = wl_columnar_expr_crypto_region(control, id, 362, 0);
+    if (rc) return rc;
+    memcpy(output, text, 37); return 0;
+}
