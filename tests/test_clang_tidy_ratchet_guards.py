@@ -19,6 +19,35 @@ SPEC.loader.exec_module(RATCHET)
 
 
 class RatchetGuardTests(unittest.TestCase):
+    def test_presence_macro_alternate_preserves_optional_dependency(self):
+        macro = "WL_MBEDTLS_ENABLED"
+        for flags in ([], ["-D" + macro], ["-D", macro + "=1"],
+                      ["-U", macro, "-D" + macro + "=0", "-U" + macro]):
+            original = ["cc", "-DOTHER=2", *flags, "-c", "expr_crypto.c"]
+            expected = ["cc", "-DOTHER=2", "-c", "expr_crypto.c"]
+            self.assertEqual(RATCHET.replace_macro(original, macro, None),
+                             expected + ["-U" + macro])
+            self.assertEqual(RATCHET.replace_macro(original, macro, "0"),
+                             expected + ["-D" + macro + "=0"])
+            self.assertEqual(RATCHET.replace_macro(original, macro, "1"),
+                             expected + ["-D" + macro + "=1"])
+        entry = {"directory": "/build", "file": "/src/expr_crypto.c",
+                 "command": "cc -DWL_MBEDTLS_ENABLED=1 -o old.o -MQ old.o "
+                            "-MF old.d -c /src/expr_crypto.c", "output": "old.o"}
+        before = dict(entry)
+        alternate = RATCHET.alternate_entry(entry, macro, None, "alternate")
+        self.assertEqual(entry, before)
+        self.assertEqual(alternate["directory"], entry["directory"])
+        self.assertEqual(alternate["file"], entry["file"])
+        self.assertEqual(alternate["output"], "alternate.o")
+        self.assertIn("-U" + macro, alternate["command"])
+        self.assertNotIn("-D" + macro, alternate["command"])
+        self.assertIn("-MF alternate.d", alternate["command"])
+        self.assertIsNone(RATCHET.ALTERNATE_CONFIGS[
+            "wirelog/columnar/expr_crypto.c"][2])
+        self.assertEqual(RATCHET.ALTERNATE_CONFIGS["wirelog/exec_plan_gen.c"][2], "0")
+        self.assertEqual(RATCHET.ALTERNATE_CONFIGS["wirelog/columnar/relation.c"][2], "1")
+
     def partition_lists(self):
         allow = RATCHET.read_list(ROOT / "scripts/ci/clang-tidy-allowlist.txt")
         backlog = RATCHET.read_list(ROOT / "scripts/ci/clang-tidy-backlog.txt")
