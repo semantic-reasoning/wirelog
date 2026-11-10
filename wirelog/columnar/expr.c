@@ -3190,7 +3190,7 @@ struct wl_columnar_expr_attempt_scalar {
     expr_instr_t producer;
     wl_columnar_memory_governor_ref_t *governor;
     wl_columnar_memory_reservation_t credit;
-    bool held, committed;
+    bool held, committed, schema_unknown;
 };
 #ifdef WL_SESSION_TEST_HOOKS
 size_t wl_columnar_expr_test_scalar_owner_size(void)
@@ -3553,6 +3553,87 @@ wl_columnar_expr_scalar_hmac_tag(uint8_t tag)
     }
 }
 
+/* Additional decoder schedule: five fixed packets plus2+N+4(+12) bytes.
+ * Scalar routing70, owner copy and runtime payload materialization are separate.
+ * READ <=48+guard51+caller40=139; D1<=160; FINAL packed publish<=112.
+ * Recognized malformed payload is a row-time marker, never eager rejection. */
+static int wl_columnar_expr_extension_decode(const uint8_t *bytes,
+    uint32_t size,
+    uint32_t *pos, expr_instr_t *out, wl_evaluation_control_t *control,
+    uint64_t id){
+    int rc = wl_columnar_expr_scalar_region(control, id, 450, *pos);
+    if (rc) return rc;
+    uint32_t cursor = *pos+1, start = UINT32_MAX;
+    uint64_t name_length = 0, nargs = 0;
+    bool malformed = false; uint8_t tag = out->op;
+    rc = wl_columnar_expr_scalar_region(control, id, 451, cursor);
+    if (rc) return rc;
+    if (cursor > size || size-cursor < 2) {
+        malformed = true; goto final;
+    }
+    for (unsigned byte = 0; byte < 2; ++byte) {
+        rc = wl_columnar_expr_scalar_region(control, id, 452, cursor);
+        if (rc) return rc;
+        name_length |= (uint64_t)bytes[cursor++]<<(8*byte);
+    }
+    rc = wl_columnar_expr_scalar_region(control, id, 453, cursor);
+    if (rc) return rc;
+    if (!name_length || name_length > 255 || cursor > size ||
+        name_length > size-cursor ||
+        size-cursor-(uint32_t)name_length < 4) {
+        malformed = true; goto final;
+    }
+    start = cursor;
+    for (uint32_t byte = 0; byte < (uint32_t)name_length; ++byte) {
+        rc = wl_columnar_expr_scalar_region(control, id, 452, cursor);
+        if (rc) return rc;
+        /* Names have no decode-time interpretation; runtime copies raw bytes. */
+        ++cursor;
+    }
+    for (unsigned byte = 0; byte < 4; ++byte) {
+        rc = wl_columnar_expr_scalar_region(control, id, 452, cursor);
+        if (rc) return rc;
+        nargs |= (uint64_t)bytes[cursor++]<<(8*byte);
+    }
+    rc = wl_columnar_expr_scalar_region(control, id, 454, cursor);
+    if (rc) return rc;
+    if (tag == WL_PLAN_EXPR_EXTENSION_CALL_ABI) {
+        if (cursor > size || size-cursor < 12) {
+            malformed = true; goto final;
+        }
+        for (unsigned byte = 0; byte < 12; ++byte) {
+            rc = wl_columnar_expr_scalar_region(control, id, 452, cursor);
+            if (rc) return rc;
+            ++cursor;
+        }
+    }
+final:
+    rc = wl_columnar_expr_scalar_region(control, id, 455, cursor);
+    if (rc) return rc;
+    out->iarg = malformed?UINT32_MAX:start;
+    out->larg = malformed?0:(int64_t)((nargs<<16)|name_length);
+    *pos = malformed?size:cursor; return 0;
+}
+#ifdef WL_SESSION_TEST_HOOKS
+/* Component oracle excludes unchanged scalar70 and owner construction. */
+int wl_columnar_expr_test_extension_decode(const uint8_t *bytes, uint32_t size,
+    uint32_t *end,
+    uint32_t *start, uint64_t *packed, wl_evaluation_control_t *control,
+    uint64_t id){
+    if (!bytes || !size || !end || !start || !packed)return EINVAL;
+    expr_instr_t instruction = {.op = bytes[0]}; uint32_t pos = 0;
+    if (instruction.op != WL_PLAN_EXPR_EXTENSION_CALL &&
+        instruction.op != WL_PLAN_EXPR_EXTENSION_CALL_ABI) return EINVAL;
+    int rc = wl_columnar_expr_extension_decode(bytes, size, &pos, &instruction,
+            control, id);
+    if (rc) {
+        return rc;
+    }
+    *end = pos; *start = instruction.iarg;
+    *packed = (uint64_t)instruction.larg; return 0;
+}
+#endif
+
 static int
 wl_columnar_expr_scalar_decode(const uint8_t *bytes, uint32_t size,
     uint32_t *pos, expr_instr_t *instruction, wl_evaluation_control_t *control,
@@ -3564,6 +3645,10 @@ wl_columnar_expr_scalar_decode(const uint8_t *bytes, uint32_t size,
     uint8_t tag = bytes[*pos];
     instruction->op = tag; instruction->iarg = 0; instruction->larg = 0;
     switch ((wl_plan_expr_tag_t)tag) {
+    case WL_PLAN_EXPR_EXTENSION_CALL:
+    case WL_PLAN_EXPR_EXTENSION_CALL_ABI:
+        return wl_columnar_expr_extension_decode(bytes, size, pos, instruction,
+                   control, id);
     case WL_PLAN_EXPR_VAR_STRING: {
         ++*pos;
         uint8_t encoded[2], name[12]; uint16_t length;
@@ -3734,7 +3819,7 @@ wl_columnar_expr_compile_scalar_attempt_controlled(const uint8_t *bytes,
     if (rc) return rc;
     if (!bytes && size) return EINVAL;
     if (!size) return 0;
-    uint32_t pos = 0, depth = 0;
+    uint32_t pos = 0, depth = 0; bool schema_unknown = false;
     expr_instr_t producer = { .op = WL_PLAN_EXPR_CONST_INT };
     while (pos < size) {
         expr_instr_t instruction;
@@ -3745,6 +3830,13 @@ wl_columnar_expr_compile_scalar_attempt_controlled(const uint8_t *bytes,
         rc = wl_columnar_expr_scalar_region(control, id, 74, pos);
         if (rc) return rc;
         switch ((wl_plan_expr_tag_t)instruction.op) {
+        case WL_PLAN_EXPR_EXTENSION_CALL:
+        case WL_PLAN_EXPR_EXTENSION_CALL_ABI: {
+            schema_unknown = true;
+            uint32_t nargs = (uint32_t)((uint64_t)instruction.larg>>16);
+            depth = depth > nargs?depth-nargs:0;
+            break;
+        }
         case WL_PLAN_EXPR_AGG_COUNT: case WL_PLAN_EXPR_AGG_SUM:
         case WL_PLAN_EXPR_AGG_MIN: case WL_PLAN_EXPR_AGG_MAX:
             continue;
@@ -3809,6 +3901,7 @@ wl_columnar_expr_compile_scalar_attempt_controlled(const uint8_t *bytes,
     owner->held = false; owner->committed = false;
     wl_columnar_memory_reservation_init(&owner->credit);
     owner->size = size; owner->producer = producer;
+    owner->schema_unknown = schema_unknown;
     rc = wl_columnar_expr_scalar_region(control, id, 76, 1);
     if (rc) goto fail;
     owner->bytes = wl_columnar_expr_allocate(size);
@@ -3841,6 +3934,12 @@ fail:
     if (held && !wl_columnar_memory_rollback(&credit)) abort();
     if (governor) wl_columnar_memory_governor_ref_release(governor);
     return rc;
+}
+
+/* Called inside the existing MAP metadata packet; fixed read, no lookup. */
+bool wl_columnar_expr_scalar_schema_unknown(
+    const wl_columnar_expr_attempt_scalar_t *owner){
+    return owner && owner->schema_unknown;
 }
 
 int
@@ -3884,6 +3983,7 @@ wl_columnar_expr_scalar_result_type_attempt_controlled(
                 width, &result);
     rc = wl_columnar_expr_scalar_region(control, id, 79, 0);
     if (rc) return rc;
+    valid = valid && !owner->schema_unknown;
     if (valid) *type = result;
     *supported = valid;
     return 0;
@@ -4325,6 +4425,240 @@ wl_columnar_expr_scalar_uuid_span(int64_t operand, bool symbol,
 void (*wl_columnar_expr_test_uuid_rfc_push)(uint32_t, int64_t);
 #endif
 
+/* Existing extension calls only. Sixteen named fixed regions500..515 plus
+ * visited depth520/argument521 slots and independently qualified children.
+ * Lookup TLS effects commit at its own cutoff, observable inside callback;
+ * parent engine failure preserves value/failed/status, not arbitrary prior
+ * intern/lookup/callback effects. Facade semantic status is guarded separately.
+ * Expanded controller/guard/caller transition123; argument slot187,
+ * result<=32 plus invoke/mandatory-release/pop219, final host return198.
+ * These complete source envelopes fit the224 component price; the old
+ * guard51 convention alone does not count both controller calls here.
+ * No aggregate initialization of the argument array or 256-byte name buffer. */
+typedef char wl_columnar_expr_extension_result_fits[(sizeof(
+            wirelog_extension_value_t) <= 32)?1:-1];
+static int wl_columnar_expr_scalar_extension(
+    const wl_columnar_expr_attempt_scalar_t *owner,
+    const expr_instr_t *in, expr_stack_t *stack,
+    const wl_columnar_expr_context_t *context,
+    wl_columnar_expr_status_t *status, wl_evaluation_control_t *control,
+    uint64_t id){
+    int rc = wl_columnar_expr_scalar_region(control, id, 500, in->op);
+    if (rc) return rc;
+    wl_columnar_expr_status_t semantic = WL_COLUMNAR_EXPR_OK;
+    const wirelog_extension_descriptor_t *descriptor = NULL;
+    size_t index = SIZE_MAX;
+    void *lease = NULL; bool found = false, pushed = false;
+    uint64_t identity = 0; uint32_t version = 0;
+    char name[256]; wirelog_extension_value_t args[COL_FILTER_STACK], result;
+    const void *key = NULL; bool allow_scalar = false;
+    wirelog_extension_scalar_fn invoke = NULL; void *user_data = NULL;
+    if (in->iarg == UINT32_MAX) {
+        semantic = WL_COLUMNAR_EXPR_EXTENSION_MALFORMED; goto final;
+    }
+    uint32_t length = (uint16_t)(uint64_t)in->larg,
+        nargs = (uint32_t)((uint64_t)in->larg>>16);
+    /* Trust only checked immutable-owner metadata, with subtraction before
+     * pointer/index additions. This also protects private component fixtures. */
+    if (!length || length > 255 || in->iarg > owner->size ||
+        length > owner->size-in->iarg ||
+        owner->size-in->iarg-length < 4)return EINVAL;
+    uint32_t abi_start = in->iarg+length+4;
+    if (in->op == WL_PLAN_EXPR_EXTENSION_CALL_ABI &&
+        owner->size-abi_start < 12) return EINVAL;
+    for (uint32_t byte = 0; byte < length; ++byte) {
+        rc = wl_columnar_expr_scalar_region(control, id, 456, byte);
+        if (rc) return rc;
+        name[byte] = (char)owner->bytes[in->iarg+byte];
+    }
+    rc = wl_columnar_expr_scalar_region(control, id, 457, length);
+    if (rc) {
+        return rc;
+    }
+    name[length] = 0;
+    if (in->op == WL_PLAN_EXPR_EXTENSION_CALL_ABI) {
+        for (unsigned byte = 0; byte < 12; ++byte) {
+            rc = wl_columnar_expr_scalar_region(control, id, 458, byte);
+            if (rc) return rc;
+            uint8_t value = owner->bytes[abi_start+byte];
+            if (byte < 8)identity |= (uint64_t)value<<(8*byte);
+            else version |= (uint32_t)value<<(8*(byte-8));
+        }
+    }
+    rc = wl_columnar_expr_scalar_region(control, id, 501, 0); if (rc)return rc;
+    if (!context || !context->extensions) {
+        semantic = WL_COLUMNAR_EXPR_MISSING_EXTENSION; goto final;
+    }
+    const wirelog_extension_snapshot_t *snapshot = context->extensions;
+    key = context->session_key;
+    allow_scalar = context->allow_extension_scalar_result;
+    bool parallel = context->parallel_execution;
+    uint32_t workers = context->active_worker_count;
+    rc = wl_extension_control_lookup_attempt(snapshot, name, length,
+            &descriptor, &index, &found, control, id); if (rc) return rc;
+    if (!found) {
+        semantic = WL_COLUMNAR_EXPR_MISSING_EXTENSION; goto final;
+    }
+    rc = wl_columnar_expr_scalar_region(control, id, 502, 0); if (rc)return rc;
+    if (in->op == WL_PLAN_EXPR_EXTENSION_CALL_ABI &&
+        (identity != descriptor->addon_abi_identity ||
+        version != descriptor->addon_abi_version)){
+        semantic = WL_COLUMNAR_EXPR_EXTENSION_ABI_MISMATCH; goto final;
+    }
+    rc = wl_columnar_expr_scalar_region(control, id, 503, 0); if (rc)return rc;
+    if (parallel && workers > 1 &&
+        !(descriptor->callback_policy&WIRELOG_EXTENSION_CALLBACK_THREAD_SAFE)){
+        semantic = WL_COLUMNAR_EXPR_CALLBACK_POLICY; goto final;
+    }
+    rc = wl_columnar_expr_scalar_region(control, id, 504, 0); if (rc)return rc;
+    if (key &&
+        !(descriptor->callback_policy&WIRELOG_EXTENSION_CALLBACK_REENTRANT)){
+        for (uint32_t depth = 0; depth < wl_callback_session_depth; ++depth) {
+            rc = wl_columnar_expr_scalar_region(control, id, 520, depth);
+            if (rc) return rc;
+            if (wl_callback_session_stack[depth] == key) {
+                semantic = WL_COLUMNAR_EXPR_CALLBACK_REENTRANT; goto final;
+            }
+        }
+    }
+    rc = wl_columnar_expr_scalar_region(control, id, 505, 0); if (rc)return rc;
+    if (nargs != descriptor->arity || nargs > stack->top ||
+        nargs > COL_FILTER_STACK){
+        semantic = WL_COLUMNAR_EXPR_ARITY_MISMATCH; goto final;
+    }
+    rc = wl_columnar_expr_scalar_region(control, id, 506, 0); if (rc)return rc;
+    if (descriptor->result_type != WIRELOG_EXTENSION_VALUE_BOOL &&
+        (!allow_scalar ||
+        descriptor->result_type != WIRELOG_EXTENSION_VALUE_INT64)){
+        semantic = WL_COLUMNAR_EXPR_INVALID_RESULT; goto final;
+    }
+    rc = wl_columnar_expr_scalar_region(control, id, 507, 0); if (rc)return rc;
+    for (uint32_t arg = 0; arg < nargs; ++arg) {
+        rc = wl_columnar_expr_scalar_region(control, id, 521, arg);
+        if (rc) return rc;
+        uint32_t slot = stack->top-nargs+arg, actual = stack->types[slot];
+        uint32_t expected =
+            descriptor->argument_types?descriptor->argument_types[arg]:0;
+        if (expected && actual != expected) {
+            semantic = WL_COLUMNAR_EXPR_TYPE_MISMATCH; goto final;
+        }
+        args[arg].type = actual;
+        args[arg].size = actual == WIRELOG_EXTENSION_VALUE_BOOL?sizeof(uint8_t):
+            actual ==
+            WIRELOG_EXTENSION_VALUE_STRING?stack->string_lengths[slot]:
+            sizeof(int64_t);
+        if (actual ==
+            WIRELOG_EXTENSION_VALUE_BOOL) args[arg].as.bool_value =
+                stack->vals[slot] != 0;
+        else if (actual == WIRELOG_EXTENSION_VALUE_STRING) {
+            args[arg].as.string_value.data =
+                (const char *)stack->string_data[slot];
+            args[arg].as.string_value.length = stack->string_lengths[slot];
+        }else args[arg].as.int64_value = stack->vals[slot];
+    }
+    stack->top -= nargs;
+    rc = wl_columnar_expr_scalar_region(control, id, 508, 0); if (rc)return rc;
+    if (key && wl_callback_session_depth >= WL_CALLBACK_SESSION_STACK_MAX) {
+        semantic = WL_COLUMNAR_EXPR_CALLBACK_REENTRANT; goto final;
+    }
+    rc = wl_columnar_expr_scalar_region(control, id, 509, 0); if (rc)return rc;
+    /* Receipt covers mandatory release-before-TLS-pop on every subsequent
+     * return, including failed acquisition and preinvoke control refusal. */
+    rc = wl_columnar_expr_scalar_region(control, id, 510, 0); if (rc)return rc;
+    if (key) {
+        wl_callback_session_stack[wl_callback_session_depth++] = key;
+        pushed = true;
+    }
+    rc = wl_columnar_expr_scalar_region(control, id, 511, 0);
+    if (rc) goto cleanup;
+    rc = wl_extension_control_lease_index_attempt(snapshot, index, descriptor,
+            &lease, &found, control, id); if (rc) goto cleanup;
+    if (!found) {
+        semantic = WL_COLUMNAR_EXPR_MISSING_EXTENSION; goto cleanup;
+    }
+    /* Capture every descriptor/context field before any legal callback can
+     * release its snapshot, unregister itself, or replace the attempt. */
+    invoke = descriptor->invoke; user_data = descriptor->user_data;
+    rc = wl_columnar_expr_scalar_region(control, id, 512, 0);
+    if (rc) goto cleanup;
+    memset(&result, 0, sizeof(result));
+    int callback_rc = invoke?invoke(args, nargs, &result, user_data):-1;
+    /* No engine checkpoint between invoke return and mandatory cleanup. */
+    {void *owned = lease; lease = NULL;
+     wl_extension_callback_lease_release(owned);}
+    if (pushed) {
+        --wl_callback_session_depth;
+    }
+    rc = wl_columnar_expr_scalar_region(control, id, 513, 0); if (rc)return rc;
+    if (callback_rc) {
+        semantic = WL_COLUMNAR_EXPR_CALLBACK_FAILURE; goto final;
+    }
+    rc = wl_columnar_expr_scalar_region(control, id, 514, 0); if (rc)return rc;
+    if (result.type == WIRELOG_EXTENSION_VALUE_BOOL) {
+        if (result.size !=
+            sizeof(uint8_t)) semantic = WL_COLUMNAR_EXPR_INVALID_RESULT;
+    }else if (!allow_scalar || result.type != WIRELOG_EXTENSION_VALUE_INT64 ||
+        result.size !=
+        sizeof(int64_t)) semantic = WL_COLUMNAR_EXPR_INVALID_RESULT;
+    rc = wl_columnar_expr_scalar_region(control, id, 515, 0); if (rc)return rc;
+    if (semantic == WL_COLUMNAR_EXPR_OK) {
+        if (result.type == WIRELOG_EXTENSION_VALUE_BOOL)expr_push_typed(stack,
+                result.as.bool_value != 0, WIRELOG_EXTENSION_VALUE_BOOL);
+        else expr_push_typed(stack, result.as.int64_value,
+                WIRELOG_EXTENSION_VALUE_INT64);
+    }
+    *status = semantic; return 0;
+cleanup:
+    if (lease) {
+        void *owned = lease; lease = NULL;
+        wl_extension_callback_lease_release(owned);
+    }
+    if (pushed) {
+        --wl_callback_session_depth;
+    }
+    if (rc)return rc;
+final:
+    rc = wl_columnar_expr_scalar_region(control, id, 515, 0); if (rc)return rc;
+    *status = semantic; return 0;
+}
+#ifdef WL_SESSION_TEST_HOOKS
+uint32_t wl_columnar_expr_test_callback_depth(void){
+    return wl_callback_session_depth;
+}
+
+/* Test-only component boundary: fixture stack construction is instrumentation,
+ * while the genuine invocation helper below carries every production payment. */
+int wl_columnar_expr_test_extension_invoke(const uint8_t *bytes, uint32_t size,
+    uint32_t start, uint64_t packed,
+    uint8_t tag, const wirelog_extension_value_t *args, uint32_t count,
+    const wl_columnar_expr_context_t *context,
+    int64_t *value, bool *failed, wl_columnar_expr_status_t *status,
+    wl_evaluation_control_t *control, uint64_t id){
+    if (count > COL_FILTER_STACK || !value || !failed || !status)return EINVAL;
+    wl_columnar_expr_attempt_scalar_t owner; owner.bytes = (uint8_t *)bytes;
+    owner.size = size;
+    expr_instr_t instruction = {.op = tag, .iarg = start,
+                                .larg = (int64_t)packed}; expr_stack_t stack;
+    stack.top = 0;
+    for (uint32_t arg = 0; arg < count; ++arg) {
+        if (args[arg].type ==
+            WIRELOG_EXTENSION_VALUE_STRING) expr_push_string(&stack, 0,
+                (const uint8_t *)args[arg].as.string_value.data,
+                (uint32_t)args[arg].as.string_value.length);
+        else expr_push_typed(&stack,
+                args[arg].type ==
+                WIRELOG_EXTENSION_VALUE_BOOL?args[arg].as.bool_value:
+                args[arg].as.int64_value, args[arg].type);
+    }
+    wl_columnar_expr_status_t semantic = WL_COLUMNAR_EXPR_OK;
+    int rc = wl_columnar_expr_scalar_extension(&owner, &instruction, &stack,
+            context, &semantic, control, id); if (rc) return rc;
+    *value = semantic == WL_COLUMNAR_EXPR_OK &&
+        stack.top?stack.vals[stack.top-1]:0;
+    *failed = semantic != WL_COLUMNAR_EXPR_OK; *status = semantic; return 0;
+}
+#endif
+
 int
 wl_columnar_expr_eval_scalar_attempt_controlled(
     const wl_columnar_expr_attempt_scalar_t *owner, const int64_t *row,
@@ -4338,6 +4672,7 @@ wl_columnar_expr_eval_scalar_attempt_controlled(
     wl_intern_t *intern = context ? context->intern : NULL;
     expr_stack_t stack; stack.top = 0;
     uint32_t pos = 0; bool semantic = false;
+    wl_columnar_expr_status_t semantic_status = WL_COLUMNAR_EXPR_MALFORMED;
     while (pos < owner->size) {
         expr_instr_t in;
         rc = wl_columnar_expr_scalar_decode(owner->bytes, owner->size, &pos,
@@ -4345,7 +4680,18 @@ wl_columnar_expr_eval_scalar_attempt_controlled(
         if (rc) return rc;
         rc = wl_columnar_expr_scalar_region(control, id, 84, pos);
         if (rc) return rc;
-        if (in.op == WL_PLAN_EXPR_VAR_STRING) {
+        if (in.op == WL_PLAN_EXPR_EXTENSION_CALL ||
+            in.op == WL_PLAN_EXPR_EXTENSION_CALL_ABI) {
+            wl_columnar_expr_status_t extension_status = WL_COLUMNAR_EXPR_OK;
+            rc = wl_columnar_expr_scalar_extension(owner, &in, &stack, context,
+                    &extension_status, control, id);
+            if (rc)return rc;
+            if (extension_status != WL_COLUMNAR_EXPR_OK) {
+                semantic = true; semantic_status = extension_status; break;
+            }
+        } else if (in.op == WL_PLAN_EXPR_BOOL) {
+            expr_push_typed(&stack, in.larg != 0, WIRELOG_EXTENSION_VALUE_BOOL);
+        } else if (in.op == WL_PLAN_EXPR_VAR_STRING) {
             if (!intern || in.iarg >= width) {
                 semantic = true; break;
             }
@@ -4737,7 +5083,7 @@ wl_columnar_expr_eval_scalar_attempt_controlled(
     *value = !semantic && stack.top ? stack.vals[stack.top - 1] : 0;
     *failed = semantic;
     if (status) *status =
-            semantic ? WL_COLUMNAR_EXPR_MALFORMED : WL_COLUMNAR_EXPR_OK;
+            semantic ? semantic_status : WL_COLUMNAR_EXPR_OK;
     return 0;
 }
 

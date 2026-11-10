@@ -21,6 +21,8 @@ NUMERIC_UUID_TAGS = {'WL_PLAN_EXPR_ARITH_UUID4'} | {
     'WL_PLAN_EXPR_ARITH_UUID5' + suffix for suffix in ('', '_SS', '_SI', '_IS')}
 
 
+EXTENSION_TAGS = {'WL_PLAN_EXPR_EXTENSION_CALL', 'WL_PLAN_EXPR_EXTENSION_CALL_ABI'}
+
 def function_body(source: str, name: str) -> str:
     """Use the existing C masker so helper cases/comments cannot add support."""
     path = Path(__file__).with_name('ownership_doc_anchors.py')
@@ -95,6 +97,8 @@ def check(root: Path) -> tuple[list[str], int]:
                                qualification == 'unit7-uuid-numeric' and tag in NUMERIC_UUID_TAGS and
                                scalar_expected == 'admitted' or
                                qualification == 'unit7-uuid-rfc' and tag == 'WL_PLAN_EXPR_STR_FN_UUID5_RFC' and
+                               scalar_expected == 'admitted' or
+                               qualification == 'unit8-extensions' and tag in EXTENSION_TAGS and
                                scalar_expected == 'admitted' or
                                qualification == 'legacy-rejected' and tag not in raw_tags)
         if not valid_qualification:

@@ -33,8 +33,8 @@ ledger explicitly.
 | `WL_PLAN_EXPR_VAR_FLOAT` | existing-numeric | admitted | baseline-numeric |
 | `WL_PLAN_EXPR_CONST_FLOAT` | existing-numeric | admitted | baseline-numeric |
 | `WL_PLAN_EXPR_VAR_STRING` | open | admitted | unit4-sessions |
-| `WL_PLAN_EXPR_EXTENSION_CALL` | open | open | open |
-| `WL_PLAN_EXPR_EXTENSION_CALL_ABI` | open | open | open |
+| `WL_PLAN_EXPR_EXTENSION_CALL` | open | admitted | unit8-extensions |
+| `WL_PLAN_EXPR_EXTENSION_CALL_ABI` | open | admitted | unit8-extensions |
 | `WL_PLAN_EXPR_ARITH_ADD` | existing-numeric | admitted | baseline-numeric |
 | `WL_PLAN_EXPR_ARITH_SUB` | existing-numeric | admitted | baseline-numeric |
 | `WL_PLAN_EXPR_ARITH_MUL` | existing-numeric | admitted | baseline-numeric |
@@ -1376,3 +1376,100 @@ occurs. Fixtures use an enforcing64MiB governor; zero spare admission budget
 refuses private work without publication, then raised-budget retry produces the
 exact model. Session/program/control teardown returns governed reservations0.
 This adapter does not close extension admission or the remaining legal-host rows.
+
+## Unit8b: the two existing scalar extension call tags
+
+This unit admits only `EXTENSION_CALL` and `EXTENSION_CALL_ABI` through the
+bounded scalar compiler/evaluator. It adds no function, descriptor permission,
+result type or public API. Qualification belongs to the tested FILTER/MAP
+hosts below; it does not certify the remaining right-filter, REDUCE input,
+recursive/SCC, inline or worker intersections merely because decoding succeeds.
+
+Payload decoding and evaluation are separate paid traversals. With `T=224`
+and a name of `N` bytes, phases450..455 cost `(11+N)T` for the legacy tag or
+`(23+N)T` for ABI. The phase452 position traversal does not claim to copy name
+or ABI bytes: runtime separately copies `N` name bytes at456, adds NUL at457,
+and rereads12 ABI bytes at458. Those runtime costs are `(N+1)T` or `(N+13)T`.
+Immutable owner allocation/copy and the existing scalar70 front are separate.
+Malformed D0/D1/D2 prefixes cost3T/6T/(11+N)T respectively. A malformed marker
+is published only at decoder FINAL; it becomes a row-time semantic error,
+retaining earlier literal/callback effects and preventing trailing execution.
+
+The invocation helper uses16 fixed regions500..515, plus one520 payment for
+each actual session-key depth comparison and one521 payment per actual
+argument slot. Thus successful helper work is `(16+D+A)T`, with runtime
+payload, qualified8a lookup and its five-region indexed lease added separately.
+Failure prefixes are2T malformed,3T missing context,3T+lookup missing name,
+4T+lookup ABI mismatch,5T+lookup worker policy, `(6+D)T+lookup` reentry,
+`(7+D)T+lookup` arity, `(8+D)T+lookup` result declaration,
+`(9+D+a)T+lookup` argument mismatch, `(10+D+A)T+lookup` TLS depth cap,
+`(13+D+A)T+lookup+lease` lease disappearance, and
+`(15+D+A)T+lookup+lease` callback failure. Actual invalid result and success
+use all16 regions. Parent evaluator FINAL88 remains an additional payment.
+
+Source accounting includes both saved-ID controller calls and their engine
+branches:84 controller actions,27 wrapper guards and12 transition/caller
+fronts give123. The legacy guard51 convention alone is insufficient for this
+complete expanded claim. Decoder decisions fit203, per-position work147,
+name/ABI runtime155, and argument-slot preparation187, all within224.
+Result initialization writes at most32 constant-zero bytes under the static
+size assertion. Including invoke fronts and55 mandatory release/pop actions,
+the critical interval is `96+123=219 <=224 <256`. Final FILTER/MAP return,
+status routing and publication fit198. These are source action ceilings, not
+machine instruction counts. The219 interval leaves five actions of slack;
+changes to controller, initialization, release or caller shape require recount.
+
+No argument-array or256-byte name-buffer aggregate initialization occurs.
+Arguments borrow full string spans under actual intern/context lifetime;
+BOOL literals remain BOOL, while string-producing builtins and RFC UUID5
+produce the raw evaluator's INT64 intern IDs. Whole MAP schema remains unknown
+and untyped when an extension is structurally reached, including ignored/capped
+results. Empty MAP setup neither looks up nor invokes an extension. The
+qualified auto constructor preserves that raw schema mode without raw fallback.
+
+All required context fields and invoke/userdata are captured before invoking
+user code. A real indexed entry lease survives legal unregister/final snapshot
+release. Mandatory cleanup consumes the local lease exactly once, releases it
+before popping the TLS session key, and performs no checkpoint between invoke
+return and that cleanup. User invoke/destroy, mutex/atomic primitives and
+allocator/free bodies retain their named synchronous cooperation boundaries;
+engine policy, arguments, counters, loop work and call fronts are counted.
+No snapshot/descriptor/context read follows callback release. The next saved
+Original check detects callback/destructor END or rebinding without polling or
+debiting its successor. Value/failed/status publication is guarded separately.
+
+Lookup diagnostics commit at their own child cutoff and are observable inside
+the callback. Parent control errors preserve value/failed/status, not arbitrary
+prior TLS, intern, callback or destructor effects. Raw callback/error/type/
+policy ordering and facade mappings remain authoritative. An engine owner
+allocation ENOMEM is distinct from callback/semantic allocation failure.
+
+Actual compiler/session fixtures cover both tags, FILTER/MAP, ordinary unary,
+ordinary JOIN and a unary head with an LFTJ side head. Live host observations
+prove exact unary owner2 or JOIN owner1, frame/receipt authentication and real
+cleanup/ACK; no owner3 or dangling context stands in for that proof. Nine
+named seams cover name/ABI/policy/arguments/preinvoke/postcleanup/final plus
+host body/final copy, with cancellation, work denial, END+successor and overflow.
+Exact fee oracles are literal schedules; host allowances remain empirical.
+Positive/false/empty, embedded NUL/full spans, malformed precedence, whole-MAP
+schema, stack caps, depth64, worker/reentry policy and callback/destructor
+lifetime are separately tested. Public facade cases retain actual STEP and
+SNAPSHOT, error texts/codes, immutable committed images, frozen reports,
+correction before reset, signed deletion/reinsertion/noop and final resources.
+
+This qualification relies on the independently committed observed JOIN and
+one-column FILTER recovery prerequisites. Scalar FILTER avoids the numeric
+append/CONCAT optimization before COPY/PLAN; numeric FILTER retains its real
+six-op append control. No extension permission is granted to intern-only
+right-filter contexts. Remaining legal-host rows stay open for later units.
+
+The public controlled allocation cases inject failure immediately before actual
+phase76 owner/immutable-byte allocations, each repeated on a new attempt. They
+expect engine ENOMEM/MEMORY, statusOK and unchanged seed diagnostics, with no
+callback after arming. A prior successful transaction can legitimately retain
+metadata credit until the next STEP. A test-only readonly getter authenticates
+its actual RESERVED token, identity, governor and absence of other old credits;
+the failed terminal must equal the sampled reservation minus that exact credit.
+The second terminal must remain equal, and complete destruction must return the
+retained governor to zero. No hardcoded byte allowance, extra drain or mutable
+receipt is substituted for genuine retirement and R1 correction admission.

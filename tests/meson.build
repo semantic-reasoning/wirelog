@@ -7446,3 +7446,15 @@ observed_filter_recovery_exe = executable('test_evaluation_observed_filter_recov
 test('evaluation_observed_filter_recovery', observed_filter_recovery_exe,
   suite: ['unit', 'tsan'], timeout: 120,
 )
+
+# #2299 actual bounded extension expression and callback lifetime hosts.
+test_evaluation_expression_extensions_exe = executable(
+  'test_evaluation_expression_extensions',
+  files('test_evaluation_expression_extensions.c'),
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  c_args: ['-DWL_SESSION_TEST_HOOKS=1'],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
+  link_with: [testlib_prod],
+)
+test('evaluation_expression_extensions', test_evaluation_expression_extensions_exe,
+     suite: ['unit', 'tsan'], timeout: 120)

@@ -84,6 +84,17 @@ with tempfile.TemporaryDirectory(prefix='expression-inventory-') as folder:
     ledger_path.write_text(ledger, encoding='utf-8')
     assert gate.check(fixture)[0], 'removed RFC UUID admission must fail'
     source_path.write_text(original, encoding='utf-8')
+    ledger_path.write_text(ledger.replace(unrelated, unrelated.replace(
+        'unit6-replace', 'unit8-extensions')), encoding='utf-8')
+    assert gate.check(fixture)[0], 'extension qualification cannot close another tag'
+    # Each of the two original extension tags needs its own decoder admission.
+    for tag in sorted(gate.EXTENSION_TAGS):
+        scalar_extension = original.index('case ' + tag + ':', scalar_start)
+        source_path.write_text(original[:scalar_extension] + original[scalar_extension:].replace(
+            'case ' + tag + ':', '', 1), encoding='utf-8')
+        ledger_path.write_text(ledger, encoding='utf-8')
+        assert gate.check(fixture)[0], 'removed extension admission must fail: ' + tag
+    source_path.write_text(original, encoding='utf-8')
     ledger_path.write_text(ledger + row, encoding='utf-8')
     assert gate.check(fixture)[0], 'duplicate rows must fail'
     ledger_path.write_text(ledger.replace(row, ''), encoding='utf-8')

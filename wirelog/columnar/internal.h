@@ -6020,6 +6020,8 @@ int wl_columnar_expr_eval_scalar_attempt_controlled(
     const wl_columnar_expr_attempt_scalar_t *, const int64_t *, uint32_t,
     const wl_columnar_expr_context_t *, int64_t *, bool *,
     wl_columnar_expr_status_t *, wl_evaluation_control_t *, uint64_t);
+bool wl_columnar_expr_scalar_schema_unknown(
+    const wl_columnar_expr_attempt_scalar_t *owner);
 int wl_columnar_expr_scalar_result_type_attempt_controlled(
     const wl_columnar_expr_attempt_scalar_t *, const wirelog_column_type_t *,
     uint32_t, wirelog_column_type_t *, bool *, wl_evaluation_control_t *,
