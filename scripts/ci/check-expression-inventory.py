@@ -13,6 +13,10 @@ DIGEST_TAGS = {
 }
 
 
+HMAC_TAGS = {'WL_PLAN_EXPR_ARITH_HMAC_SHA256' + suffix
+             for suffix in ('', '_SS', '_SI', '_IS')}
+
+
 def function_body(source: str, name: str) -> str:
     """Use the existing C masker so helper cases/comments cannot add support."""
     path = Path(__file__).with_name('ownership_doc_anchors.py')
@@ -81,6 +85,8 @@ def check(root: Path) -> tuple[list[str], int]:
                                qualification in {'unit4-sessions', 'unit5-sessions', 'unit5-decimal', 'unit5-digests', 'unit6-builders', 'unit6-selectors', 'unit6-replace'} and
                                tag in scalar_tags and scalar_expected == 'admitted' or
                                qualification == 'unit7-digests' and tag in DIGEST_TAGS and
+                               scalar_expected == 'admitted' or
+                               qualification == 'unit7-hmac' and tag in HMAC_TAGS and
                                scalar_expected == 'admitted' or
                                qualification == 'legacy-rejected' and tag not in raw_tags)
         if not valid_qualification:

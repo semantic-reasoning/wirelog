@@ -3526,6 +3526,19 @@ wl_columnar_expr_scalar_crypto_tag(uint8_t tag)
     }
 }
 
+static bool
+wl_columnar_expr_scalar_hmac_tag(uint8_t tag)
+{
+    switch ((wl_plan_expr_tag_t)tag) {
+    case WL_PLAN_EXPR_ARITH_HMAC_SHA256:
+    case WL_PLAN_EXPR_ARITH_HMAC_SHA256_SS:
+    case WL_PLAN_EXPR_ARITH_HMAC_SHA256_SI:
+    case WL_PLAN_EXPR_ARITH_HMAC_SHA256_IS:
+        return true;
+    default: return false;
+    }
+}
+
 static int
 wl_columnar_expr_scalar_decode(const uint8_t *bytes, uint32_t size,
     uint32_t *pos, expr_instr_t *instruction, wl_evaluation_control_t *control,
@@ -3573,6 +3586,10 @@ wl_columnar_expr_scalar_decode(const uint8_t *bytes, uint32_t size,
         *pos += length;
         break;
     }
+    case WL_PLAN_EXPR_ARITH_HMAC_SHA256:
+    case WL_PLAN_EXPR_ARITH_HMAC_SHA256_SS:
+    case WL_PLAN_EXPR_ARITH_HMAC_SHA256_SI:
+    case WL_PLAN_EXPR_ARITH_HMAC_SHA256_IS:
     case WL_PLAN_EXPR_ARITH_MD5:
     case WL_PLAN_EXPR_ARITH_MD5_S:
     case WL_PLAN_EXPR_ARITH_SHA1:
@@ -3781,7 +3798,8 @@ wl_columnar_expr_scalar_result_type_attempt_controlled(
         owner->producer.op == WL_PLAN_EXPR_VAR_STRING
         || owner->producer.op ==
         WL_PLAN_EXPR_CONST_STR) result = WIRELOG_TYPE_STRING;
-    else if (wl_columnar_expr_scalar_crypto_tag(owner->producer.op) ||
+    else if (wl_columnar_expr_scalar_hmac_tag(owner->producer.op) ||
+        wl_columnar_expr_scalar_crypto_tag(owner->producer.op) ||
         owner->producer.op == WL_PLAN_EXPR_ARITH_HASH_S ||
         owner->producer.op == WL_PLAN_EXPR_ARITH_CRC32_ETH_S ||
         owner->producer.op == WL_PLAN_EXPR_ARITH_CRC32_CAST_S ||
@@ -4185,6 +4203,32 @@ done:
     return 0;
 }
 
+#ifdef WL_MBEDTLS_ENABLED
+/* Each separately resolved span owns an admission. Never copy a filled
+ * self-pointing raw filt_bytes_t: native storage stays in its caller. */
+static int
+wl_columnar_expr_scalar_hmac_span(int64_t operand, bool symbol,
+    wl_intern_t *intern, uint8_t *native, const uint8_t **data, size_t *length,
+    wl_evaluation_control_t *control, uint64_t id)
+{
+    int rc = wl_columnar_expr_scalar_region(control, id, 243, 0);
+    if (rc) return rc;
+    const char *text = symbol && intern ? wl_intern_reverse(intern,
+            operand) : NULL;
+    if (text) {
+        *data = (const uint8_t *)text;
+        return wl_columnar_expr_cstr_length_attempt_controlled(text, length,
+                   control, id);
+    }
+    if (symbol) WL_LOG(WL_LOG_SEC_EVAL, WL_LOG_DEBUG,
+            "digest operand %" PRId64 " is declared symbol but names no "
+            "interned string: digesting its int64 representation", operand);
+    memcpy(native, &operand, sizeof(operand));
+    *data = native; *length = sizeof(operand);
+    return 0;
+}
+#endif
+
 int
 wl_columnar_expr_eval_scalar_attempt_controlled(
     const wl_columnar_expr_attempt_scalar_t *owner, const int64_t *row,
@@ -4230,6 +4274,45 @@ wl_columnar_expr_eval_scalar_attempt_controlled(
             if (rc) return rc;
             expr_push_string(&stack, v, owner->bytes + in.iarg,
                 (uint32_t)in.larg);
+        } else if (wl_columnar_expr_scalar_hmac_tag(in.op)) {
+            rc = wl_columnar_expr_scalar_region(control, id, 242, in.op);
+            if (rc) return rc;
+            int64_t key = expr_pop(&stack), message = expr_pop(&stack),
+                result = 0;
+            bool hmac_failed = false;
+#ifdef WL_MBEDTLS_ENABLED
+            bool message_symbol = in.op == WL_PLAN_EXPR_ARITH_HMAC_SHA256_SS
+                || in.op == WL_PLAN_EXPR_ARITH_HMAC_SHA256_SI;
+            bool key_symbol = in.op == WL_PLAN_EXPR_ARITH_HMAC_SHA256_SS
+                || in.op == WL_PLAN_EXPR_ARITH_HMAC_SHA256_IS;
+            uint8_t message_native[sizeof(message)], key_native[sizeof(key)];
+            const uint8_t *message_data, *key_data;
+            size_t message_length, key_length;
+            rc = wl_columnar_expr_scalar_hmac_span(message, message_symbol,
+                    intern, message_native, &message_data, &message_length,
+                    control, id);
+            if (rc) return rc;
+            rc = wl_columnar_expr_scalar_region(control, id, 244, in.op);
+            if (rc) return rc;
+            rc = wl_columnar_expr_scalar_hmac_span(key, key_symbol, intern,
+                    key_native, &key_data, &key_length, control, id);
+            if (rc) return rc;
+            rc = wl_columnar_expr_crypto_hmac_attempt_controlled(message_data,
+                    message_length, key_data, key_length, &result, &hmac_failed,
+                    control, id);
+#else
+            (void)key; (void)message;
+            rc = wl_columnar_expr_crypto_hmac_attempt_controlled(NULL, 0, NULL,
+                    0,
+                    &result, &hmac_failed, control, id);
+#endif
+            if (rc) return rc;
+            rc = wl_columnar_expr_scalar_region(control, id, 245, in.op);
+            if (rc) return rc;
+            if (hmac_failed) {
+                semantic = true; break;
+            }
+            expr_push(&stack, result);
         } else if (wl_columnar_expr_scalar_crypto_tag(in.op)) {
             rc = wl_columnar_expr_scalar_region(control, id, 206, in.op);
             if (rc) return rc;
