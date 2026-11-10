@@ -176,6 +176,8 @@ typedef struct {
     uint32_t stratum, width;
     bool recursive;
     uint32_t delta_reads;
+    uint64_t scalar_generation;
+    bool scalar_classified, requires_scalar;
 } wl_columnar_session_observed_head_t;
 
 typedef struct {
@@ -287,9 +289,9 @@ typedef struct {
     wl_columnar_session_observed_transaction_t *transaction;
     const wl_columnar_eval_private_dynamic_binding_t *entries;
     uint64_t generation;
-    uint32_t head, count;
+    uint32_t head, count, receipt_index;
     int result;
-    bool busy, thread_valid, receipt_acknowledged;
+    bool busy, thread_valid, receipt_acknowledged, receipt_index_valid;
 #if defined(WL_HAVE_C11_THREADS)
     thrd_t thread;
 #elif defined(_WIN32) || defined(_WIN64)
@@ -684,6 +686,11 @@ void (*wl_columnar_session_test_observed_preflight_checkpoint)(
     wl_evaluation_control_t *, unsigned, uint64_t);
 int wl_columnar_session_test_fail_framed_funding_before_stop;
 int wl_columnar_session_test_fail_framed_funding_after_stop;
+void (*wl_columnar_session_test_head_scalar_checkpoint)(
+    wl_evaluation_control_t *, unsigned, uint32_t);
+void (*wl_columnar_session_test_join_birth_checkpoint)(
+    wl_columnar_eval_serial_framed_attempt_t *, wl_evaluation_control_t *,
+    uint64_t, unsigned, uint32_t, bool);
 uint64_t (*wl_columnar_session_test_framed_grant_limit)(
     const wl_col_session_t *, wl_columnar_eval_serial_framed_host_action_t,
     uint64_t);
@@ -9231,16 +9238,17 @@ col_controlled_step_grant_begin(wl_col_session_t *sess,
             + WL_COLUMNAR_JOIN_PIPELINE_SETUP_MAX_WORK;
         if (limit < pipeline_limit) limit = pipeline_limit;
     }
-    /* Birth scans the actual immutable head once, with a192 admission per op.
-    * Capacity covers that pass; each executed record still pays its own fee.
-    * uint32 op_count *192 +8128 fits uint64 without a variable-size debit. */
+    /* Fresh birth may scan unary prefix and then the ordinary JOIN shape.
+     * Capacity only:6400 lookup+768 hostfronts+1536 unary+1536 JOIN=10240,
+     * plus two actual256 per-op passes. Every executed record still pays independently;
+     * uint32 op_count*512+10240 fits uint64, never one variable-size debit. */
     const wl_columnar_session_observed_transaction_t *tx = step->transaction;
     if (action == WL_COLUMNAR_EVAL_SERIAL_FRAMED_ADVANCE &&
         !sess->cleanup_active
         && step->general_observed && tx && tx->child_active && tx->heads
         && tx->head < tx->head_count) {
-        uint64_t birth_limit = UINT64_C(8128)
-            + (uint64_t)tx->heads[tx->head].plan.op_count * UINT64_C(192);
+        uint64_t birth_limit = UINT64_C(10240)
+            + (uint64_t)tx->heads[tx->head].plan.op_count * UINT64_C(512);
         if (limit < birth_limit) limit = birth_limit;
     }
 #ifdef WL_SESSION_TEST_HOOKS
@@ -9333,8 +9341,9 @@ wl_columnar_session_join_cleanup_binding(const wl_col_session_t *sess,
 }
 
 /* Financial checks split the real read-only native proof. They never grant
- * native permission. Genuine owning C1 allocation/ACK keeps the matching
- * receipt in slot0; standalone component receipt APIs retain their full domain.
+ * native permission. Fresh observed JOIN birth binds its actual indexed
+ * receipt; existing C1 registration retains its separately qualified fallback.
+ * Standalone component receipt APIs retain their full domain.
  * Root, frame, binding and receipt remain separately funded proof blocks. */
 static int
 wl_columnar_session_join_cleanup_proof_charge(
@@ -9390,8 +9399,11 @@ wl_columnar_session_join_cleanup_prove_internal(
             protected_key ? source ? 128 : 112 : source ? 80 : 72);
     if (rc) return rc;
     wl_columnar_eval_cleanup_receipt_key_t key;
-    if (wl_columnar_eval_stack_cleanup_receipt_key_for_frame(p->frame, &key)
-        || !wl_columnar_session_join_cleanup_key_equal(&p->key,
+    int key_rc = p->receipt_index_valid
+        ? wl_columnar_eval_stack_cleanup_receipt_index_key_for_frame(p->frame,
+            p->receipt_index, &key)
+        : wl_columnar_eval_stack_cleanup_receipt_key_for_frame(p->frame, &key);
+    if (key_rc || !wl_columnar_session_join_cleanup_key_equal(&p->key,
         &key)) return EINVAL;
     *cause = origin ? ctx->primary_result ? ctx->primary_result
         : ctx->child.semantic_result ? ctx->child.semantic_result : EINVAL :
@@ -9597,6 +9609,54 @@ wl_columnar_session_unary_cleanup_frame_prove(const wl_col_session_t *sess,
                funding, id, source, cause);
 }
 
+/* Fixed transaction-local location/finance fact. No owner permission.
+ * Full added selector32: FIRST188+32=220, BOOT213+32=245,
+ * repeatedSTATUS221+32=253 <=quantum256. LogicalBANK248/88/104 unchanged. */
+typedef char wl_columnar_session_scalar_selector_source_fits_t[
+        (221+32 <= WL_EVALUATION_CONTROL_QUANTUM) ? 1 : -1];
+static bool
+wl_columnar_session_scalar_head_selected(const wl_col_session_t *sess,
+    const wl_columnar_controlled_step_t *step, const wl_plan_relation_t *plan)
+{
+    if (!step || !step->general_observed || step->recursive_route ||
+        sess->base.source_c1_admission || sess->join_batch_bytes) return false;
+    const wl_columnar_session_observed_transaction_t *tx = step->transaction;
+    if (!tx || !step->transaction_initialized || tx->committed ||
+        tx->phase != WL_SESSION_OBSERVED_EVALUATE || !tx->child_active ||
+        !tx->heads || tx->head >= tx->head_count) return false;
+    const wl_columnar_session_observed_head_t *head = &tx->heads[tx->head];
+    return &head->plan == plan && head->scalar_classified &&
+           head->scalar_generation == tx->generation && head->requires_scalar;
+}
+
+/* Only fresh forward birth: funding refusal precedes Original observation.
+ * charge_attempt18+charge_locked24=42 each, including controller engine logic.
+ * Test barriers run before funding and before Original, never after the final
+ * publication poll. Caller has already checked genuine ctx/funding identities. */
+static int
+wl_columnar_session_fresh_birth_region(
+    wl_columnar_eval_serial_framed_attempt_t *ctx,
+    wl_evaluation_control_t *funding, uint64_t id,
+    unsigned stage, uint32_t progress)
+{
+#ifdef WL_SESSION_TEST_HOOKS
+    if (wl_columnar_session_test_join_birth_checkpoint)
+        wl_columnar_session_test_join_birth_checkpoint(ctx, funding, id,
+            stage, progress, false);
+#else
+    (void)stage; (void)progress;
+#endif
+    int rc = wl_evaluation_control_charge_attempt(funding, id, 256);
+    if (rc) return rc;
+#ifdef WL_SESSION_TEST_HOOKS
+    if (wl_columnar_session_test_join_birth_checkpoint)
+        wl_columnar_session_test_join_birth_checkpoint(ctx, funding, id,
+            stage, progress, true);
+#endif
+    return wl_evaluation_control_charge_attempt(ctx->control, ctx->attempt_id,
+               0);
+}
+
 /* No child can run before this call. Failed registration leaves no record;
  * framed bootstrap rolls its genuinely fresh owner back, including its pin.
  * Every fixed region is independently prepaid; the shape scan pays per op. */
@@ -9608,7 +9668,7 @@ wl_columnar_session_unary_cleanup_register(wl_col_session_t *sess,
 {
     if (!sess || !ctx || !funding || funding == ctx->control || !id)
         return EINVAL;
-    int rc = wl_evaluation_control_charge_attempt(funding, id, 128);
+    int rc = wl_columnar_session_fresh_birth_region(ctx, funding, id, 100, 0);
     if (rc) return rc;
     if (!ctx->capture_only || !ctx->private_bindings
         || !ctx->private_bindings->dynamic_entries
@@ -9619,7 +9679,7 @@ wl_columnar_session_unary_cleanup_register(wl_col_session_t *sess,
     const wl_plan_relation_t *plan = ctx->plan;
     bool eligible = plan && plan->ops && plan->op_count;
     for (uint32_t i = 0; eligible && i < plan->op_count; ++i) {
-        rc = wl_evaluation_control_charge_attempt(funding, id, 192);
+        rc = wl_columnar_session_fresh_birth_region(ctx, funding, id, 101, i);
         if (rc) return rc;
         switch (plan->ops[i].op) {
         case WL_PLAN_OP_VARIABLE: case WL_PLAN_OP_FILTER: case WL_PLAN_OP_MAP:
@@ -9628,7 +9688,7 @@ wl_columnar_session_unary_cleanup_register(wl_col_session_t *sess,
         }
     }
     if (!eligible) return 0; /* Other routes keep their existing real owner. */
-    rc = wl_evaluation_control_charge_attempt(funding, id, 192);
+    rc = wl_columnar_session_fresh_birth_region(ctx, funding, id, 102, 0);
     if (rc) return rc;
     wl_columnar_controlled_step_t *step = sess->controlled_step;
     if (!step || !step->general_observed || step->recursive_route
@@ -9638,18 +9698,20 @@ wl_columnar_session_unary_cleanup_register(wl_col_session_t *sess,
         || ctx->control != sess->base.evaluation_control
         || ctx->attempt_id != step->operation_id
         || ctx->operation_identity != step->operation_identity) return EINVAL;
-    rc = wl_evaluation_control_charge_attempt(funding, id, 192);
+    rc = wl_columnar_session_fresh_birth_region(ctx, funding, id, 103, 0);
     if (rc) return rc;
     wl_columnar_session_observed_transaction_t *tx = step->transaction;
     if (!tx || tx->committed || tx->phase != WL_SESSION_OBSERVED_EVALUATE
         || !tx->child_active || !tx->heads || tx->head >= tx->head_count
         || &tx->heads[tx->head].plan != plan
+        || (tx->heads[tx->head].scalar_classified &&
+        tx->heads[tx->head].scalar_generation != tx->generation)
         || ctx->private_bindings != &tx->bindings
         || ctx->capture_out != &tx->heads[tx->head].candidate
         || !wl_columnar_session_observed_bindings_cleanup_authorized(sess,
         &tx->bindings, plan, ctx->control, ctx->attempt_id, tx->generation))
         return EINVAL;
-    rc = wl_evaluation_control_charge_attempt(funding, id, 192);
+    rc = wl_columnar_session_fresh_birth_region(ctx, funding, id, 104, 0);
     if (rc) return rc;
     wl_columnar_eval_cleanup_receipt_key_t key;
     if (wl_columnar_eval_stack_framed_authenticate(ctx->frame, sess, ctx)
@@ -9665,13 +9727,13 @@ wl_columnar_session_unary_cleanup_register(wl_col_session_t *sess,
                && p->generation == tx->generation && p->head == tx->head
                && wl_columnar_session_unary_cleanup_key_equal(&p->key, &key)
         ? 0 : EBUSY;
-    rc = wl_evaluation_control_charge_attempt(funding, id, 128);
+    rc = wl_columnar_session_fresh_birth_region(ctx, funding, id, 105, 0);
     if (rc) return rc;
     int bind_rc =
         wl_columnar_eval_stack_cleanup_receipt_frame_index_bind(ctx->frame,
             receipt_index, &key);
     if (bind_rc) return bind_rc;
-    rc = wl_evaluation_control_charge_attempt(funding, id, 128);
+    rc = wl_columnar_session_fresh_birth_region(ctx, funding, id, 106, 0);
     if (rc) return rc;
     p->frame = ctx->frame; p->context = ctx; p->plan = plan;
     p->control = ctx->control;
@@ -9686,6 +9748,119 @@ wl_columnar_session_unary_cleanup_register(wl_col_session_t *sess,
     p->receipt_acknowledged = false; p->ack_journal_valid = false;
     p->registered = true;
     ctx->unary_native_cleanup = true;
+    return 0;
+}
+
+/* Fresh observed ordinary JOIN birth, before callback-capable child advance.
+ * Fresh-only256 packets: ENTRY, each actual OP, ROOT/BINDING/KEY, INDEX and
+ * PUBLISH =256*(N+6). Each paid packet observes savedOriginal atomically.
+ * Both charge engine bodies84 + helper glue22 + stage body at most144
+ * =250 <=256. Mutex/atomic primitive bodies alone are cooperative boundaries.
+ * Ineligible scans pay actual prefix only; registered retirement never polls.
+ * Independent parent finance is never Original/successor or native authority.
+ * No registration is visible until final publication; fresh bootstrap owns
+ * the actual control pin rollback on every earlier refusal. */
+int
+wl_columnar_session_join_cleanup_register(wl_col_session_t *sess,
+    wl_columnar_eval_serial_framed_attempt_t *ctx,
+    wl_evaluation_control_t *funding,
+    uint64_t id, uint32_t receipt_index, bool indexed)
+{
+    if (!sess || !ctx || !funding || funding == ctx->control ||
+        !id) return EINVAL;
+    int rc = wl_columnar_session_fresh_birth_region(ctx, funding, id, 0,
+            0);
+    if (rc) return rc;
+    if (!ctx->capture_only || !ctx->private_bindings ||
+        !ctx->private_bindings->dynamic_entries ||
+        ctx->controlled_materialized_batch_fallback)return 0;
+    if (!indexed ||
+        receipt_index >=
+        WL_COLUMNAR_EVAL_STACK_CLEANUP_MAX_FRAMES) return EINVAL;
+    if (!wl_columnar_session_scalar_head_selected(sess, sess->controlled_step,
+        ctx->plan)) {
+        /* A stale private description is a protected mismatch, not a request
+         * to select an unregistered scalar fallback. ENTRY remains fixed. */
+        const wl_columnar_controlled_step_t *saved = sess->controlled_step;
+        const wl_columnar_session_observed_transaction_t *owner =
+            saved ? saved->transaction : NULL;
+        if (owner && owner->heads && owner->head < owner->head_count &&
+            owner->heads[owner->head].scalar_classified &&
+            owner->heads[owner->head].scalar_generation != owner->generation)
+            return EINVAL;
+        return 0;
+    }
+    const wl_plan_relation_t *plan = ctx->plan;
+    bool eligible = ctx->abort_supported && plan && plan->ops && plan->op_count,
+        joined = false;
+    for (uint32_t op = 0; eligible && op < plan->op_count; ++op) {
+        rc = wl_columnar_session_fresh_birth_region(ctx, funding, id, 1,
+                op);
+        if (rc) return rc;
+        switch (plan->ops[op].op) {
+        case WL_PLAN_OP_VARIABLE: case WL_PLAN_OP_FILTER: case WL_PLAN_OP_MAP:
+        case WL_PLAN_OP_CONCAT: break;
+        case WL_PLAN_OP_JOIN: joined = true; break;
+        case WL_PLAN_OP_CONSOLIDATE: eligible = op == plan->op_count-1; break;
+        default: eligible = false; break;
+        }
+    }
+    if (!eligible || !joined)return 0;
+    rc = wl_columnar_session_fresh_birth_region(ctx, funding, id, 2, 0);
+    if (rc) return rc;
+    wl_columnar_controlled_step_t *step = sess->controlled_step;
+    if (!step || !step->general_observed || step->recursive_route ||
+        step->join_cleanup.kind ||
+        step->unary_cleanup.registered || ctx->unary_native_cleanup ||
+        !step->operation_active ||
+        !step->transaction_initialized || ctx->session != sess ||
+        ctx->frame != sess->cleanup_active ||
+        ctx->control != sess->base.evaluation_control ||
+        ctx->attempt_id != step->operation_id ||
+        ctx->operation_identity != step->operation_identity)return EINVAL;
+    rc = wl_columnar_session_fresh_birth_region(ctx, funding, id, 3, 0);
+    if (rc) return rc;
+    wl_columnar_session_observed_transaction_t *tx = step->transaction;
+    if (!tx || tx->committed || tx->phase != WL_SESSION_OBSERVED_EVALUATE ||
+        !tx->child_active ||
+        !tx->heads || tx->head >= tx->head_count ||
+        &tx->heads[tx->head].plan != plan ||
+        ctx->private_bindings != &tx->bindings ||
+        ctx->capture_out != &tx->heads[tx->head].candidate ||
+        !wl_columnar_session_observed_bindings_cleanup_authorized(sess,
+        &tx->bindings, plan,
+        ctx->control, ctx->attempt_id, tx->generation)) return EINVAL;
+    rc = wl_columnar_session_fresh_birth_region(ctx, funding, id, 4, 0);
+    if (rc) return rc;
+    wl_columnar_eval_cleanup_receipt_key_t key;
+    if (wl_columnar_eval_stack_framed_authenticate(ctx->frame, sess, ctx) ||
+        wl_columnar_eval_stack_cleanup_receipt_index_key_for_frame(ctx->frame,
+        receipt_index, &key) ||
+        !key.session_generation || !key.receipt_id || !key.plan_epoch ||
+        key.operation_attempt_id != step->operation_id ||
+        key.operation_id != step->operation_identity ||
+        !wl_columnar_session_join_cleanup_key_equal(&key,
+        &ctx->cleanup_receipt_key)) return EINVAL;
+    rc = wl_columnar_session_fresh_birth_region(ctx, funding, id, 5, 0);
+    if (rc) return rc;
+    rc = wl_columnar_eval_stack_cleanup_receipt_frame_index_bind(ctx->frame,
+            receipt_index, &key); if (rc) return rc;
+    rc = wl_columnar_session_fresh_birth_region(ctx, funding, id, 6, 0);
+    if (rc) return rc;
+    wl_columnar_session_join_cleanup_t *p = &step->join_cleanup;
+    p->frame = ctx->frame; p->context = ctx; p->plan = plan;
+    p->control = ctx->control;
+    p->control_identity = wl_evaluation_control_identity(ctx->control);
+    p->attempt_id = ctx->attempt_id;
+    p->operation_identity = ctx->operation_identity; p->key = key;
+    p->transaction = tx; p->entries = tx->entries;
+    p->generation = tx->generation; p->head = tx->head; p->count = tx->count;
+    p->thread = ctx->owner_thread;
+    p->thread_valid = true; p->phase = WL_COLUMNAR_SESSION_NATIVE_ERROR_INERT;
+    p->result = 0;
+    p->receipt_index = receipt_index; p->receipt_index_valid = true;
+    p->receipt_acknowledged = false;
+    p->kind = WL_COLUMNAR_SESSION_JOIN_DYNAMIC;
     return 0;
 }
 
@@ -9733,6 +9908,23 @@ wl_columnar_session_unary_birth_match(wl_col_session_t *sess,
 }
 
 #ifdef WL_SESSION_TEST_HOOKS
+/* Read actual private cache; fault injection invalidates provenance only,
+ * never creates a descriptor, owner record, receipt or permission. */
+int
+wl_columnar_session_test_head_scalar_state(wl_col_session_t *sess,
+    uint64_t out[4], bool invalidate)
+{
+    wl_columnar_controlled_step_t *step = sess ? sess->controlled_step : NULL;
+    wl_columnar_session_observed_transaction_t *tx =
+        step ? step->transaction : NULL;
+    if (!out || !tx || !tx->heads || tx->head >= tx->head_count) return EINVAL;
+    wl_columnar_session_observed_head_t *head = &tx->heads[tx->head];
+    out[0] = tx->generation; out[1] = head->scalar_generation;
+    out[2] = head->scalar_classified; out[3] = head->requires_scalar;
+    if (invalidate) head->scalar_generation ^= UINT64_C(1)<<63;
+    return 0;
+}
+
 unsigned
 wl_columnar_session_test_cleanup_owners(const wl_col_session_t *sess)
 {
@@ -9768,7 +9960,8 @@ col_controlled_step_join_birth_register(wl_col_session_t *sess,
 {
     wl_columnar_eval_stack_cleanup_frame_t *frame = sess->cleanup_active;
     if (!frame) return 0;
-    if ((!sess->join_batch_bytes && !sess->base.source_c1_admission)
+    if ((!sess->join_batch_bytes && !sess->base.source_c1_admission &&
+        !step->join_cleanup.kind)
         || step->recursive_route || (sess->join_batch_bytes
         && !request->controlled_materialized_batch_fallback)) return 0;
     wl_columnar_eval_serial_framed_attempt_t *ctx = NULL;
@@ -10149,8 +10342,10 @@ col_controlled_step_host_action(wl_col_session_t *sess,
     wl_columnar_controlled_step_t *step, const wl_plan_relation_t *relation,
     wl_columnar_eval_serial_framed_host_action_t action)
 {
+    bool scalar_head = wl_columnar_session_scalar_head_selected(sess, step,
+            relation);
     if ((!sess->join_batch_bytes && !sess->base.source_c1_admission
-        && !step->unary_cleanup.registered)
+        && !step->unary_cleanup.registered && !scalar_head)
         || step->recursive_route)
         return col_controlled_step_host_action_financed(sess, step, relation,
                    action, NULL);
@@ -10159,7 +10354,8 @@ col_controlled_step_host_action(wl_col_session_t *sess,
     };
     wl_session_source_finance_t source = {0};
     int rc = wl_session_source_finance_start(&sess->base, &source, &policy,
-            step->unary_cleanup.registered ? 2048 : 672);
+            step->unary_cleanup.registered ||
+            scalar_head ? 2048 : 672);
     if (rc) {
         (void)wl_session_source_footer(&sess->base);
         return EAGAIN;
@@ -13119,6 +13315,81 @@ wl_columnar_session_observed_child_result(wl_col_session_t *sess,
     return EAGAIN;
 }
 
+/* Two explicit controller paths84 + fixed body<=120 + fronts<=20 fit224.
+ * Each OP and expression slot is separately admitted. No financial grant or
+ * callback-capable frame exists here; cancellation uses ordinary tx disposal. */
+static int
+wl_columnar_session_head_scalar_region(wl_evaluation_control_t *control,
+    uint64_t id, unsigned phase, uint32_t progress)
+{
+    int rc = wl_evaluation_control_charge_attempt(control, id, 224);
+    if (rc) return rc;
+#ifdef WL_SESSION_TEST_HOOKS
+    if (wl_columnar_session_test_head_scalar_checkpoint)
+        wl_columnar_session_test_head_scalar_checkpoint(control, phase,
+            progress);
+#else
+    (void)phase; (void)progress;
+#endif
+    return wl_evaluation_control_charge_attempt(control, id, 0);
+}
+
+static int
+wl_columnar_session_head_scalar_classify(wl_col_session_t *sess,
+    wl_columnar_controlled_step_t *step,
+    wl_columnar_session_observed_transaction_t *tx,
+    wl_columnar_session_observed_head_t *head, uint64_t generation)
+{
+    wl_evaluation_control_t *control = sess->base.evaluation_control;
+    uint64_t id = step->operation_id;
+    int rc = wl_columnar_session_head_scalar_region(control, id, 560, 0);
+    if (rc) return rc;
+    if (step != sess->controlled_step || !step->operation_active ||
+        !step->general_observed || !step->transaction_initialized ||
+        step->transaction != tx || tx->committed || tx->child_active ||
+        tx->phase != WL_SESSION_OBSERVED_EVALUATE || !tx->heads ||
+        tx->head >= tx->head_count || head != &tx->heads[tx->head] ||
+        tx->generation == UINT64_MAX || generation != tx->generation+1)
+        return EINVAL;
+    /* A new child generation cannot reuse a previous round's description. */
+    head->scalar_classified = false; head->requires_scalar = false;
+    head->scalar_generation = 0;
+    bool scalar = false;
+    const wl_plan_relation_t *plan = &head->plan;
+    if (!plan->ops && plan->op_count) return EINVAL;
+    for (uint32_t i = 0; !scalar && i < plan->op_count; ++i) {
+        rc = wl_columnar_session_head_scalar_region(control, id, 561, i);
+        if (rc) return rc;
+        const wl_plan_op_t *op = &plan->ops[i];
+        if (op->op == WL_PLAN_OP_FILTER && op->filter_expr.size) {
+            rc = wl_columnar_expr_requires_scalar_attempt_controlled(
+                op->filter_expr.data, op->filter_expr.size, &scalar, control,
+                id);
+            if (rc) return rc;
+        } else if (op->op == WL_PLAN_OP_MAP && op->map_expr_count) {
+            rc = wl_columnar_session_head_scalar_region(control, id, 562, i);
+            if (rc) return rc;
+            if (!op->map_exprs) continue; /* Preserve runtime malformed outcome. */
+            for (uint32_t e = 0; !scalar && e < op->map_expr_count; ++e) {
+                rc = wl_columnar_session_head_scalar_region(control, id, 563,
+                        e);
+                if (rc) return rc;
+                if (op->map_exprs[e].size) {
+                    rc = wl_columnar_expr_requires_scalar_attempt_controlled(
+                        op->map_exprs[e].data, op->map_exprs[e].size, &scalar,
+                        control, id);
+                    if (rc) return rc;
+                }
+            }
+        }
+    }
+    rc = wl_columnar_session_head_scalar_region(control, id, 564, 0);
+    if (rc) return rc;
+    head->scalar_generation = generation; head->requires_scalar = scalar;
+    head->scalar_classified = true;
+    return 0;
+}
+
 static int
 wl_columnar_session_observed_child(wl_col_session_t *sess,
     wl_columnar_controlled_step_t *step)
@@ -13127,6 +13398,12 @@ wl_columnar_session_observed_child(wl_col_session_t *sess,
     wl_columnar_session_observed_head_t *head = &tx->heads[tx->head];
     if (!tx->child_active) {
         if (tx->generation == UINT64_MAX) return EOVERFLOW;
+        if (!step->recursive_route && !sess->base.source_c1_admission &&
+            !sess->join_batch_bytes) {
+            int classification = wl_columnar_session_head_scalar_classify(sess,
+                    step, tx, head, tx->generation+1);
+            if (classification) return classification;
+        }
         tx->generation++;
         tx->bindings.identity = (uintptr_t)&tx->bindings;
         tx->bindings.session = sess;
@@ -13139,6 +13416,8 @@ wl_columnar_session_observed_child(wl_col_session_t *sess,
         tx->child_active = true;
         tx->child_result = 0;
     }
+    if (head->scalar_classified && head->scalar_generation != tx->generation)
+        return EINVAL;
     wl_columnar_eval_serial_framed_host_action_t action = tx->receipt_pending
         ? (tx->receipt_ack ? WL_COLUMNAR_EVAL_SERIAL_FRAMED_RECEIPT_ACK
             : WL_COLUMNAR_EVAL_SERIAL_FRAMED_RECEIPT_RETRY)
@@ -15192,6 +15471,7 @@ wl_columnar_session_join_birth_clear(wl_columnar_controlled_step_t *step,
     p->frame = NULL; p->context = NULL; p->plan = NULL;
     p->control = NULL; p->transaction = NULL; p->entries = NULL;
     p->thread_valid = false; p->receipt_acknowledged = false;
+    p->receipt_index = 0; p->receipt_index_valid = false;
     p->key = (wl_columnar_eval_cleanup_receipt_key_t){0};
     p->phase = phase;
 }
@@ -15456,26 +15736,32 @@ done:
 /* Registered debt protects admission even when an inner proof is refused.
  * This read-only observation never grants native mutation permission. */
 int
-wl_columnar_session_unary_cleanup_receipt_index(const wl_col_session_t *sess,
+wl_columnar_session_native_cleanup_receipt_index(const wl_col_session_t *sess,
     const wl_columnar_eval_cleanup_receipt_key_t *key, uint32_t *out)
 {
-    if (!sess || !key || !out) return EINVAL;
+    if (!sess || !key || !out)return EINVAL;
     const wl_columnar_controlled_step_t *step = sess->controlled_step;
-    if (!step || !step->unary_cleanup.registered
-        || !wl_columnar_session_unary_cleanup_key_equal(key,
-        &step->unary_cleanup.key))
-        return ENOENT;
-    const wl_columnar_session_unary_cleanup_t *p = &step->unary_cleanup;
-    /* A location accelerator only: native permission still requires the
-     * complete route-specific root/thread/frame/binding proof at the caller.
-     * Generic component key lookup had no such permission before this change. */
-    if (p->receipt_index >= WL_COLUMNAR_EVAL_STACK_CLEANUP_MAX_FRAMES
-        || sess->cleanup_receipts[p->receipt_index].state ==
-        WL_COLUMNAR_EVAL_CLEANUP_RECEIPT_FREE
-        || !wl_columnar_session_unary_cleanup_key_equal(key,
-        &sess->cleanup_receipts[p->receipt_index].key)) return EINVAL;
-    *out = p->receipt_index;
-    return 0;
+    if (!step) return ENOENT;
+    if (step->join_cleanup.kind && step->unary_cleanup.registered)return EINVAL;
+    const wl_columnar_eval_cleanup_receipt_key_t *registered = NULL;
+    uint32_t index = 0;
+    if (step->join_cleanup.kind && step->join_cleanup.receipt_index_valid) {
+        registered = &step->join_cleanup.key;
+        index = step->join_cleanup.receipt_index;
+    }else if (step->unary_cleanup.registered) {
+        registered = &step->unary_cleanup.key;
+        index = step->unary_cleanup.receipt_index;
+    }else return ENOENT;
+    if (!wl_columnar_session_join_cleanup_key_equal(key,
+        registered)) return ENOENT;
+    /* Location only, never native permission. A protected matching key cannot
+    * fall back to legacy scanning on an invalid slot/full-key observation. */
+    if (index >= WL_COLUMNAR_EVAL_STACK_CLEANUP_MAX_FRAMES ||
+        sess->cleanup_receipts[index].state ==
+        WL_COLUMNAR_EVAL_CLEANUP_RECEIPT_FREE ||
+        !wl_columnar_session_join_cleanup_key_equal(key,
+        &sess->cleanup_receipts[index].key)) return EINVAL;
+    *out = index; return 0;
 }
 
 static bool

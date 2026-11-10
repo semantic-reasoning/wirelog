@@ -63,6 +63,17 @@ STATUS retirement19 + caller9 + next call5 + FIRST188 is 221. Ordinary
 ADVANCE/observed caller variants are at most 217/218. FINISH and REPORT are
 not substituted for work checks.
 
+For the new scalar-required ordinary head, the transaction-local selector adds
+at most32 complete fixed source actions (16 leaf predicates, three decision/
+return fronts, three metadata locals and at most10 helper/caller fronts).
+It performs no expression scan, controller call or native proof. Conservatively
+adding all32, including work replacing the old selector, gives FIRST220,
+BOOT-to-next245, repeated STATUS253, ordinary ADVANCE249 and observed250.
+Each is at most quantum256; repeated STATUS253 is explicitly a different
+interval from BOOT245. Logical248/88/104 fees are unchanged and are not source
+uppers. The existing processed lower197 remains conservative; neither capacity
+nor imagined refunds are used. C1/batch guards return before the new head walk.
+
 ## Registration, short returns and real phase settlement
 
 The frame-null guard precedes the financial route filter. No-frame LATE has
@@ -621,13 +632,18 @@ processed lower0. No missing receipt or invalid funding return bypasses32 or
 the subsequent actual FINISH; Native HOST384 starts only after that settlement.
 The outer gateway therefore cannot append UNUSED81 to this lookup generation.
 
-Before32, the complete fixed source envelope is generic guards/arguments24,
-indexed-class/full-key discrimination40,32 receipt-ID filter slots96, the one
-full candidate/state/key completion24, local receipt/funding/status decisions24
-and the next check front15:223<=224<256. IDs are unique within an allocator-owned
-session generation; the ID check is only a rejection filter and the matching
-candidate still needs the complete key. A protected indexed mismatch never
-falls back to a scan. After32, checked FINISH33 and staged result/return or
+Before32, the legacy-fallback source envelope is generic guards/arguments24,
+ENOENT indexed discrimination40,32 receipt-ID filter slots96, at most one full
+candidate/state/key completion24, caller decisions24 and next front15:
+223<=224<256. Exclusive JOIN/unary selection misses cost at most33 plus7 slack:
+call4, argument guards4, step3, dual-owner3, locals2, selection4, stores2,
+registered-key call/equality/decision10 and return1. Indexed success/protected
+refusal performs the fuller actual slot/state/key check (conservatively64),
+but never executes the32 filters:24+64+24+15=127. These paths are mutually
+exclusive; the hit's complete validation is not charged to the legacy path.
+IDs remain unique within an allocator-owned session generation, so only one
+legacy candidate can reach its full key/state completion. A matching protected
+key with displaced index/state refuses without a fallback scan. After32, checked FINISH33 and staged result/return or
 Native384 admission fronts form a separate short interval below256. No
 controller interior or test-hook work supplies a processed lower here.
 
@@ -702,3 +718,23 @@ at least672, so its237/240 generations cannot encounter a numeric160/80 refusal;
 the159/160 tests isolate the comparison boundary without falsely claiming that
 a whole bank-issued host can run with a159 limit. No test hook lowers a bank
 limit below its existing construction contract.
+
+### Ordinary observed JOIN/scalar birth (#2299 integration)
+
+The existing globalC1/batching selection did not cover every abort-capable
+ordinary observed scalar-required nonC1/nonbatch JOIN frame. An Original-funded
+readonly decoder pass binds a descriptive transaction-head/generation fact
+before any host finance/child activation. Fresh framed begin publishes genuine
+JOIN_DYNAMIC ownership for the explicitly metered composed shape before child
+advance, using the actual discovered receipt index/full key. This does not
+enable globalC1, change LFTJ eligibility, broaden pure-unary permission, or treat
+AUTO debt as authority. The new scalar-head financial wrapper selects2048 before a record is published;
+numeric AUTO and existing C1/batch routes retain their genuine prior owners
+and672/407 source histories. Each ENTRY/OP/ROOT/BINDING/KEY/INDEX/PUBLICATION packet pays256,
+then atomically observes the saved Original with zero debit, for256*(N+6).
+Both controller engine bodies are counted:42 each, plus22 helper glue and
+at most144 stage source actions, total250<=256. Registered/native cleanup
+never runs the fresh-only poll. Fresh ADVANCE capacity10240+512*N covers bounded lookup, two host fronts and both possible shape
+passes; unused capacity is not charged work. Registered key selection is fixed
+and exclusive, with protected mismatch refusing instead of legacy rescan.
+Checked SOURCE epochs and real native/receipt ACK remain distinct financiers.

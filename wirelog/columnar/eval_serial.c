@@ -237,6 +237,10 @@ wl_columnar_eval_serial_framed_attempt_begin_internal(
     if (ordinary_capture) {
         rc = wl_columnar_session_unary_cleanup_register(session, ctx, funding,
                 funding_id, receipt_index, indexed);
+        if (!rc && !ctx->unary_native_cleanup)
+            rc = wl_columnar_session_join_cleanup_register(session, ctx,
+                    funding,
+                    funding_id, receipt_index, indexed);
         if (rc) {
             /* No child/callback ever ran. Registration publishes only after
              * its final admission; bootstrap owns this exact empty rollback. */

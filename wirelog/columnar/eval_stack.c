@@ -2635,7 +2635,7 @@ wl_columnar_eval_cleanup_receipt_find(wl_col_session_t *session,
         session->cleanup_receipt_session_generation)
         return NULL;
     uint32_t index = 0;
-    int indexed = wl_columnar_session_unary_cleanup_receipt_index(session, key,
+    int indexed = wl_columnar_session_native_cleanup_receipt_index(session, key,
             &index);
     if (!indexed) return &session->cleanup_receipts[index];
     if (indexed != ENOENT) return NULL; /* Protected owner never rescans on refusal. */

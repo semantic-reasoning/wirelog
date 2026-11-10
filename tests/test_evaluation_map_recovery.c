@@ -571,12 +571,13 @@ static void registration_forward(wl_evaluation_control_t *c, unsigned phase,
     }
 }
 static void registration_denials(void) {
-    /* Outer384, lookup128/192/128, inner384, registration128, three actual
-     * op scans192, root192, binding192, key192, index bind128, publication128. */
-    const uint64_t caps[] = {511, 703, 831, 1215, 1343, 1535, 1727, 1919, 2111,
-                             2303, 2495, 2623, 2751};
-    const uint64_t consumed[] = {384, 512, 704, 832, 1216, 1344, 1536, 1728,
-                                 1920, 2112, 2304, 2496, 2624};
+    /* Outer384, lookup128/192/128, inner384; fresh registration now has
+     * ENTRY,threeOP,ROOT,BINDING,KEY,INDEX,PUBLISH at256 each, including
+     * saved-Original observation. Existing lookup/bootstrap prices unchanged. */
+    const uint64_t caps[] = {511, 703, 831, 1215, 1471, 1727, 1983, 2239, 2495,
+                             2751, 3007, 3263, 3519};
+    const uint64_t consumed[] = {384, 512, 704, 832, 1216, 1472, 1728, 1984,
+                                 2240, 2496, 2752, 3008, 3264};
     for (unsigned i = 0; i < sizeof(caps)/sizeof(caps[0]); ++i) {
         fixture_t f = create(); wl_session_set_delta_cb(f.session, capture, &f);
         CHECK(!complete(f.session)); insert(&f, "12tail"); insert(&f, " -3 ");
