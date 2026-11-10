@@ -171,7 +171,12 @@ wl_columnar_eval_serial_framed_attempt_begin_internal(
     wl_columnar_eval_serial_framed_attempt_t *ctx = NULL;
     int rc = wl_columnar_eval_stack_framed_context(frame, session, &ctx);
     if (rc) return rc;
-    rc = wl_columnar_eval_stack_cleanup_receipt_key_for_frame(frame,
+    uint32_t receipt_index = 0;
+    bool indexed = ordinary_capture && !controlled_materialized_batch_fallback;
+    rc = indexed
+        ? wl_columnar_eval_stack_cleanup_receipt_find_frame_attempt(frame,
+            &receipt_index, &ctx->cleanup_receipt_key, funding, funding_id)
+        : wl_columnar_eval_stack_cleanup_receipt_key_for_frame(frame,
             &ctx->cleanup_receipt_key);
     if (rc) return rc;
     if (ctx->cleanup_receipt_key.operation_attempt_id != id
@@ -229,6 +234,23 @@ wl_columnar_eval_serial_framed_attempt_begin_internal(
     ctx->thread_valid = true;
     ctx->phase = WL_COLUMNAR_EVAL_SERIAL_FRAMED_LOOKUP;
     ctx->identity = ctx;
+    if (ordinary_capture) {
+        rc = wl_columnar_session_unary_cleanup_register(session, ctx, funding,
+                funding_id, receipt_index, indexed);
+        if (rc) {
+            /* No child/callback ever ran. Registration publishes only after
+             * its final admission; bootstrap owns this exact empty rollback. */
+            ctx->identity = NULL; ctx->pin_owned = false;
+            ctx->thread_valid = false;
+            ctx->frame = NULL; ctx->session = NULL; ctx->plan = NULL;
+            ctx->control = NULL; ctx->private_bindings = NULL;
+            ctx->capture_out = NULL; ctx->capture_only = false;
+            ctx->attempt_id = ctx->operation_identity = 0;
+            ctx->phase = WL_COLUMNAR_EVAL_SERIAL_FRAMED_INERT;
+            wl_evaluation_control_release(control);
+            return rc;
+        }
+    }
     return 0;
 }
 
@@ -423,6 +445,12 @@ wl_columnar_eval_serial_framed_attempt_step(
             WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_PENDING;
         wl_columnar_eval_serial_framed_pending(ctx, ctx->phase, funding,
             funding_id);
+        if (ctx->native_cleanup && ctx->unary_native_cleanup)
+            return ctx->pending_inner_consume
+                ? wl_columnar_eval_plan_unary_native_cleanup_consume(ctx,
+                       ctx->inner_protocol, funding, funding_id)
+                : wl_columnar_eval_plan_unary_native_cleanup_step(ctx, funding,
+                       funding_id);
         if (ctx->native_cleanup)
             return ctx->pending_inner_consume
                 ? wl_columnar_eval_plan_numeric_join_cleanup_consume(ctx,
@@ -639,6 +667,9 @@ wl_columnar_eval_serial_framed_attempt_step(
         }
         wl_columnar_eval_serial_framed_pending(ctx, ctx->phase, funding,
             funding_id);
+        if (ctx->native_cleanup && ctx->unary_native_cleanup)
+            return wl_columnar_eval_plan_unary_native_cleanup_ack(ctx, funding,
+                       funding_id);
         if (ctx->native_cleanup)
             return wl_columnar_eval_plan_numeric_join_cleanup_ack(ctx, funding,
                        funding_id);
@@ -1601,7 +1632,12 @@ wl_columnar_eval_serial_framed_relation_internal(const wl_plan_relation_t *rp,
                     if (wl_session_source_finance_rebegin(source)) abort();
                 }
                 int cause = 0;
-                protocol = wl_columnar_session_join_cleanup_prove(ctx,
+                protocol = ctx->unary_native_cleanup
+                    ? wl_columnar_session_unary_cleanup_prove(ctx,
+                        source ? source->control : request->funding,
+                        source ? source->id : request->funding_id, source,
+                        &cause)
+                    : wl_columnar_session_join_cleanup_prove(ctx,
                         source ? source->control : request->funding,
                         source ? source->id : request->funding_id, source,
                         &cause);

@@ -4222,13 +4222,16 @@ wl_columnar_eval_plan_native_lftj_metadata_owner(
 }
 
 static int
-wl_columnar_eval_plan_join_cleanup_admit(
+wl_columnar_eval_plan_registered_cleanup_admit(
     wl_columnar_eval_serial_framed_attempt_t *ctx,
-    wl_evaluation_control_t *funding, uint64_t id)
+    wl_evaluation_control_t *funding, uint64_t id, bool unary)
 {
     if (!ctx) return EINVAL;
     int cause = 0;
-    int rc = wl_columnar_session_join_cleanup_prove(ctx, funding, id, NULL,
+    int rc = unary
+        ? wl_columnar_session_unary_cleanup_prove(ctx, funding, id, NULL,
+            &cause)
+        : wl_columnar_session_join_cleanup_prove(ctx, funding, id, NULL,
             &cause);
     if (rc) return rc;
     wl_columnar_eval_plan_numeric_attempt_t *n = &ctx->child;
@@ -4269,6 +4272,18 @@ wl_columnar_eval_plan_join_cleanup_admit(
         rc = wl_evaluation_control_charge_attempt(funding, id, 0);
         if (rc) return rc;
     }
+    /* Unary authority never selects either live or neverborn LFTJ state.
+     * This chain follows the existing LFTJ 32/8/zero packet boundaries. */
+    if (unary && (n->lftj.identity || n->join_host || n->join_host_admitted
+        || n->join_host_governor
+        || n->phase == WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_PREFLIGHT_LFTJ
+        || n->phase == WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_LFTJ_BEGIN
+        || n->phase == WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_LFTJ_CHILD
+        || n->phase == WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_JOIN_BATCH
+        || n->phase == WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_CONCAT_CHILD
+        || n->phase == WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_CONCAT_ACK
+        || n->phase == WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_CONCAT_ADVANCE))
+        return EINVAL;
     rc = wl_columnar_eval_stack_numeric_owner(n->frame, n);
     if (rc) return rc;
     if (!ctx->primary_result) ctx->primary_result = cause;
@@ -4313,12 +4328,13 @@ wl_columnar_eval_plan_join_cleanup_redirect(
         n->phase = WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_JOIN_BATCH;
 }
 
-int
-wl_columnar_eval_plan_numeric_join_cleanup_step(
+static int
+wl_columnar_eval_plan_registered_cleanup_step(
     wl_columnar_eval_serial_framed_attempt_t *ctx,
-    wl_evaluation_control_t *funding, uint64_t id)
+    wl_evaluation_control_t *funding, uint64_t id, bool unary)
 {
-    int rc = wl_columnar_eval_plan_join_cleanup_admit(ctx, funding, id);
+    int rc = wl_columnar_eval_plan_registered_cleanup_admit(ctx, funding, id,
+            unary);
     if (rc) return rc;
     wl_columnar_eval_plan_numeric_attempt_t *n = &ctx->child;
     if (n->phase == WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_PENDING) return EBUSY;
@@ -4336,7 +4352,11 @@ wl_columnar_eval_plan_numeric_join_cleanup_step(
     }
     case WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_UNARY_CHILD: {
         bool bare;
-        rc = wl_columnar_filter_op_native_cleanup_latch_owned(n->frame, n,
+        rc =
+            unary ?
+            wl_columnar_filter_unary_native_cleanup_latch_owned(n->frame,
+                n, funding, id, &bare)
+            : wl_columnar_filter_op_native_cleanup_latch_owned(n->frame, n,
                 funding, id, &bare);
         if (rc) break;
         rc = wl_evaluation_control_charge_attempt(funding, id, bare ? 56 : 32);
@@ -4422,11 +4442,30 @@ wl_columnar_eval_plan_numeric_join_cleanup_step(
 }
 
 int
-wl_columnar_eval_plan_numeric_join_cleanup_consume(
-    wl_columnar_eval_serial_framed_attempt_t *ctx, int protocol,
+wl_columnar_eval_plan_numeric_join_cleanup_step(
+    wl_columnar_eval_serial_framed_attempt_t *ctx,
     wl_evaluation_control_t *funding, uint64_t id)
 {
-    int rc = wl_columnar_eval_plan_join_cleanup_admit(ctx, funding, id);
+    return wl_columnar_eval_plan_registered_cleanup_step(ctx, funding, id,
+               false);
+}
+
+int
+wl_columnar_eval_plan_unary_native_cleanup_step(
+    wl_columnar_eval_serial_framed_attempt_t *ctx,
+    wl_evaluation_control_t *funding, uint64_t id)
+{
+    return wl_columnar_eval_plan_registered_cleanup_step(ctx, funding, id,
+               true);
+}
+
+static int
+wl_columnar_eval_plan_registered_cleanup_consume(
+    wl_columnar_eval_serial_framed_attempt_t *ctx, int protocol,
+    wl_evaluation_control_t *funding, uint64_t id, bool unary)
+{
+    int rc = wl_columnar_eval_plan_registered_cleanup_admit(ctx, funding, id,
+            unary);
     if (rc) return rc;
     wl_columnar_eval_plan_numeric_attempt_t *n = &ctx->child;
     if (n->phase != WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_PENDING) return EBUSY;
@@ -4440,11 +4479,30 @@ wl_columnar_eval_plan_numeric_join_cleanup_consume(
 }
 
 int
-wl_columnar_eval_plan_numeric_join_cleanup_ack(
-    wl_columnar_eval_serial_framed_attempt_t *ctx,
+wl_columnar_eval_plan_numeric_join_cleanup_consume(
+    wl_columnar_eval_serial_framed_attempt_t *ctx, int protocol,
     wl_evaluation_control_t *funding, uint64_t id)
 {
-    int rc = wl_columnar_eval_plan_join_cleanup_admit(ctx, funding, id);
+    return wl_columnar_eval_plan_registered_cleanup_consume(ctx, protocol,
+               funding, id, false);
+}
+
+int
+wl_columnar_eval_plan_unary_native_cleanup_consume(
+    wl_columnar_eval_serial_framed_attempt_t *ctx, int protocol,
+    wl_evaluation_control_t *funding, uint64_t id)
+{
+    return wl_columnar_eval_plan_registered_cleanup_consume(ctx, protocol,
+               funding, id, true);
+}
+
+static int
+wl_columnar_eval_plan_registered_cleanup_ack(
+    wl_columnar_eval_serial_framed_attempt_t *ctx,
+    wl_evaluation_control_t *funding, uint64_t id, bool unary)
+{
+    int rc = wl_columnar_eval_plan_registered_cleanup_admit(ctx, funding, id,
+            unary);
     if (rc) return rc;
     wl_columnar_eval_plan_numeric_attempt_t *n = &ctx->child;
     if (n->phase != WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_DONE
@@ -4454,8 +4512,25 @@ wl_columnar_eval_plan_numeric_join_cleanup_ack(
     rc = wl_columnar_eval_plan_composed_fund(funding, id, n->control);
     if (rc) return rc;
     rc = wl_columnar_eval_plan_composed_ack_body(n, funding, id);
-    if (!rc) wl_columnar_eval_stack_auto_child_acked(ctx);
+    if (!rc && !unary) wl_columnar_eval_stack_auto_child_acked(ctx);
     return rc;
+}
+
+int
+wl_columnar_eval_plan_numeric_join_cleanup_ack(
+    wl_columnar_eval_serial_framed_attempt_t *ctx,
+    wl_evaluation_control_t *funding, uint64_t id)
+{
+    return wl_columnar_eval_plan_registered_cleanup_ack(ctx, funding, id,
+               false);
+}
+
+int
+wl_columnar_eval_plan_unary_native_cleanup_ack(
+    wl_columnar_eval_serial_framed_attempt_t *ctx,
+    wl_evaluation_control_t *funding, uint64_t id)
+{
+    return wl_columnar_eval_plan_registered_cleanup_ack(ctx, funding, id, true);
 }
 
 int

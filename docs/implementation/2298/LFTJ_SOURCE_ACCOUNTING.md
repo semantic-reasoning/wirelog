@@ -139,7 +139,8 @@ The actual gateway already compares false/false semantic flags by equality.
 It is unchanged; cold false skips batch authorization only after the last
 admission and does not shorten earlier processed proof. Its compatible ledgers
 are ordinary672/peak251, STATUS544/214, prepared544/214, cold328/224 and
-receipt232/109. Existing first-refusal peaks220/249/245/255 remain separate;
+receipt prefix232/109 before the separate lookup generation documented below.
+Existing first-refusal peaks220/249/245/255 remain separate;
 the actual active-source UNUSED81 return is settled before fresh LATE.
 
 | Existing public packet reached by this route | Complete source bound / fee |
@@ -566,3 +567,138 @@ FINISH/reset/successor behavior. C is explicitly empirical host-prefix credit;
 stop propagation only. `evaluation_numeric_operators` adds standalone and
 noncomposed batch refusal and pre-entry CANCEL/WORK without source ownership;
 its independent exact191/192 and existing inner finite oracles remain intact.
+
+
+## Unary integration tail (#2299)
+
+Registered unary cleanup shares the authentic host-finance mechanism, not LFTJ
+ownership. The existing CLOSE80, checked FINISH/rebegin and source-tail hook
+remain. After rebegin a registered unary tail pays96; other routes retain72.
+The host's final CLOSE176 is unchanged. These are logical fees; source upper
+bounds and guaranteed processed lower bounds remain distinct.
+
+| Fresh tail | Fees | Guaranteed processed lower before final close | Outstanding upper |
+| --- | --- | ---: | ---: |
+| Existing non-unary | 72,176 | conservatively0 | 248 |
+| Registered unary | 96,176 | 16 | 256 |
+
+Every paid96 suffix either releases a nonnull local grant or transfers that
+genuine grant into an authentic saved tuple. STATUS/PREPARED_MORE/REJECTED and
+full consume/error returns take the first alternative. The tuple alternative
+requires previous_valid and actually stores previous_funding then clears the
+local grant. There is no legitimate direct return between96 and these paths.
+The read-only source-tail hook cannot replace protected grant/tuple pointers;
+neither hook work nor old registration work is counted as progress.
+
+The nonnull release lower16 consists of its caller's two arguments/call3,
+callee grant predicates2, active-ID argument/call/test3, detach arguments/call3,
+release argument/call2, NULL store1, callee return1 and financed-function return1.
+Controller interiors and optional active FINISH contribute nothing to this
+lower. The transfer-only alternative has conservative lower19: entering
+condition1, previous-release arguments/call3 and guard/return at least2,
+four tuple stores4, previous_valid condition1, two actual transfer stores2,
+null-local release arguments/call3 and guard/return at least2, and financed
+return1. No right-hand-side read is counted separately from a scalar store.
+Therefore96+176-16=256; capacity, refunds or imaginary cleanup cannot supply it.
+
+The registered cleanup helper preserves the exact existing LFTJ numeric32,
+child8 and metadata zero-payment boundaries. Its long unary-only exclusion
+follows those boundaries, so it adds no predicates to the numeric32 interval.
+LFTJ proof remains distinct and the funded composed ACK signature is preserved.
+The fixed proof selector precedes admission; after the child/metadata proof,
+the added false-unary discriminator is two fixed source actions. Genuine unary
+validation uses the existing ordinary128 action and rejects LFTJ/JOIN/CONCAT.
+
+
+## Indexed-compatible receipt gateway generation (#2299)
+
+The receipt gateway keeps its original48/72/80 prefix payments. At the old80
+site, checked FINISH33 plus checked rebegin25 and the next admission front15
+use73 fixed source actions, with7 for local result/branch scaffolding. The old
+lookup is not also charged to that cell. A fresh generation then pays224 before
+lookup and32 after lookup. Its compatible outstanding is256 with a conservative
+processed lower0. No missing receipt or invalid funding return bypasses32 or
+the subsequent actual FINISH; Native HOST384 starts only after that settlement.
+The outer gateway therefore cannot append UNUSED81 to this lookup generation.
+
+Before32, the complete fixed source envelope is generic guards/arguments24,
+indexed-class/full-key discrimination40,32 receipt-ID filter slots96, the one
+full candidate/state/key completion24, local receipt/funding/status decisions24
+and the next check front15:223<=224<256. IDs are unique within an allocator-owned
+session generation; the ID check is only a rejection filter and the matching
+candidate still needs the complete key. A protected indexed mismatch never
+falls back to a scan. After32, checked FINISH33 and staged result/return or
+Native384 admission fronts form a separate short interval below256. No
+controller interior or test-hook work supplies a processed lower here.
+
+An initial224 or following32 refusal settles its actual failed source generation
+and returns that financial cause, without receipt/native mutation. A successful
+financial lookup with a missing key or invalid native funding still consumes256
+and finishes before returning the semantic lookup error. Source and native
+funding are distinct; native384 refusal cannot debit Original or acknowledge a
+receipt. Public callers retain their real outer rebegin/LATE and TUPLE flows.
+Receipt histories now have one additional genuine private generation; private
+capacity stays a configuration maximum, not work or permission.
+
+Component tests use real final-address attach/begin financial records and actual
+frame-produced FREED receipts: SOURCE256 is exact,255 refuses32 after224,223
+refuses224 at0. Four status/abort/retry/ACK actions combine with valid/missing
+and malformed keys, absent/wrong/ended native funding, and native383 one-short
+controls. Only fully admitted ACK changes the real receipt; other refusals leave
+it byte-identical. A bank-issued public unary SOURCE-tail hook also probes the
+actual indexed FREED receipt with those financial boundaries before its genuine
+caller ACK. Normal and tail-END/rebind histories retain exact typed results,
+no premature events, frozen Original reports, zero successor work and real
+resource closure. The component financier itself is not evidence of bank
+issuance; the separate public-hook histories establish that integration.
+
+## Exclusive unary and JOIN birth in mixed plans (#2299)
+
+C1 admission belongs to the session and can be true for an ordinary unary head
+when another head uses LFTJ. It cannot authorize a second JOIN owner for that
+unary frame. After the existing frame getter, frame authentication and canonical
+request checks, either real unary claim selects read-only lifetime arbitration.
+Both the registry and context marker must agree: actual root/thread, transaction
+and head binding, frame/context/plan/control/attempt/operation, full receipt key
+and its retained live index. A competing JOIN record or any mismatch is protected
+EINVAL. Equality only skips JOIN birth; it grants no native action and clears no
+owner. Unary publication independently refuses an existing JOIN owner. The
+false-claim route preserves genuine JOIN/LFTJ behavior and payments. No active
+frame returns before accessing any retired context; getter EBUSY stays protected
+unless the existing genuine JOIN proof applies.
+
+The selected arbitration uses actual financial generation boundaries:
+
+| Generation | Logical fees | Processed lower used | Outstanding upper |
+| --- | --- | ---: | ---: |
+| Existing live-frame LATE plus settlement | 157+80 | 0 | 237 |
+| Fresh read-only arbitration plus existing post-birth CLOSE | 160+80 | 0 | 240 |
+| Fresh unary tuple/return tail and final host close | 96+176 | 16 | 256 |
+
+The added80 pays checked FINISH33, checked rebegin25 and the next admission
+front15, leaving7 for fixed glue. No comparison runs in that old generation.
+The readonly helper's complete expansion fits144: root24, binding43 (including
+cleanup authorization), thread8, indexed/full-key35, pointer/claim10 and call/
+return fronts15 total135, leaving9. Its following journal selector, real grant
+FINISH and hook fronts plus the incoming CLOSE80 front fit the remaining112 of
+the256 source interval. This comparison gives no cleanup permission; genuine
+native funding and receipt journals remain separate. Both successful and short
+mismatch returns flow through the actual owning post80 settlement. No completed
+comparison progress is borrowed to cover a short refusal.
+
+Component tests attach/begin independent SOURCE at its final address against a
+real public frame:160 succeeds,159 refuses with consumed0; missing marker and
+wrong key refuse without creating JOIN ownership. These are component financial
+boundaries, not bank-issued global limits. Public populated mixed numeric and
+string plans exercise normal, Original END, END plus successor and cancellation
+histories, exact typed cells and relation-qualified signed events, true resource
+closure and retry. The preceding SOURCE generation is240 when arbitration runs.
+An empty mixed-plan initial evaluation is an inherited unsupported case and is
+not claimed as fixed by these histories.
+The later hot LFTJ head is also exercised after unary retirement, including its
+own Original END and retry. Marker, key and capture-target corruption are
+restored after protected component refusal. Production host SOURCE limits are
+at least672, so its237/240 generations cannot encounter a numeric160/80 refusal;
+the159/160 tests isolate the comparison boundary without falsely claiming that
+a whole bank-issued host can run with a159 limit. No test hook lowers a bank
+limit below its existing construction contract.

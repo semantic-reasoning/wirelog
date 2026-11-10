@@ -772,7 +772,7 @@ Existing TO_NUMBER on clean5fae reproduces a shared hot-MAP defect independently
 of crypto: after a successful empty step, a later ERANGE rolls back all private
 storage but leaves the backend PENDING, so declared-input correction returns
 EBUSY. A separate TO_NUMBER Original-END fixture also exposes retained native
-child cleanup; that second obligation is a separate recovery unit.
+child cleanup; that independent recovery unit is specified below.
 
 A failed successor now retains a terminal retry receipt only after genuine
 child ACK (or authenticated no-frame rejection), complete uncommitted private
@@ -802,4 +802,83 @@ sticky accounting EOVERFLOW with cancellation, exact relation generations and
 signed events, wrong/zero mutations, repeated correction/remove-reinsert,
 frozen reports, unused successor protection, evaluating snapshot after
 correction, subsequent no-op and governor retirement. Native Original-END
-retained-child authority remains separately tracked until its own repair.
+retained-child authority is qualified by the separate repair below.
+
+
+### Authentic ordinary unary cleanup prerequisite
+
+The unchanged existing-TO_NUMBER reproducer on clean5fae ends Original during a
+later row and starts a successor: EINVAL previously retained TABLE_PROGRAM and
+12040 cleanup bytes. The independent unary birth/cleanup record now covers this
+actual observed VARIABLE/FILTER/MAP/CONSOLIDATE composition. It does not copy
+JOIN/AUTO permission or broaden scheduler/operator eligibility. Registration
+occurs before child callbacks; failed registration rolls back the genuine fresh
+bootstrap rather than leaving an unregistered callback-capable frame.
+
+The regression extends `test_evaluation_map_recovery.c` with60 actual host cuts:
+decimal midrow; scalar-owner allocation/commit/publication; post-result intern;
+lazy scalar-array allocation and first initialized slot; two nested literal
+intern boundaries; and a witnessed actual FILTER runtime. Each runs END alone,
+END plus successor, sticky accounting failure before END (with/without
+successor), and evaluating snapshot END (with/without successor). Independent
+native metadata exhaustion resumes. Matching Original positive errors survive
+later identity failure, frozen reports remain exact, unused successors consume
+zero, no callbacks/public rows/events occur after native selection, and private
+cleanup/reservations reach real terminal ACK. Retry yields exact values/types,
+insert/delete/reinsert signed events and no duplicate no-op events; destruction
+returns governor reservations to zero.
+
+Negative tests use a copied context, Original/successor as attempted finance,
+a different native thread, and displaced actual indexed receipt while the frame
+is active and after physical retirement but before receipt ACK. All preserve
+public mutation/snapshot exclusion and actual remaining ownership. Restoring
+the test-only corruption permits genuine ACK. Repeated owning histories verify
+actual indexed provenance. Thirteen
+literal one-short funding histories cover lookup, framed funding, every
+registration admission, indexed binding and actual plan-op scan; exact consumed fees are asserted, no child runs before
+successful birth, and the fresh rollback releases its real pin/frame/receipt.
+
+The financial/state map is in [MEMORY](../../MEMORY.md). Native grants and SOURCE
+allowances remain separate; expression/provider work is not financed by them.
+This prerequisite adds no crypto or extension opcode and does not discharge
+remaining tag or legal-host qualification rows.
+
+The independent receipt-index qualification uses actual component reservations
+and fresh frame allocation at indices0,1,31: literal fees448/640/6400, one-short
+refusal, a full missing scan6272, and cancellation/rebinding at entry, slot and
+final publication. Outputs and Original consumption remain unchanged on stops;
+new financial successors consume zero. Real cancel-begin/frame close and exact
+reserved-key release retire all owned resources. A separate authentic public
+history performs cold empty hash FILTER without a callback, then installs its
+callback and runs an observed hot successor in index1. END+successor cleanup and
+retry preserve the older committed FREED0 receipt byte-for-byte, publish the
+correct one-row typed result and signed deletion/no-op events, and retire only
+the actual new owner. Existing string digest FILTER tests also cover that legal
+history unchanged. A wider projection list sizes birth capacity from its actual
+head op count; per-op and per-slot work remains individually admitted.
+
+
+ACK-completed boundary qualification ends Original in the actual successful
+receipt-ACK financial-finish hook. The native caller prepays192 before ACK and
+retains its genuine key/index/result/generation/serial journal across that hook.
+Four independent SOURCE192 proofs plus128 publication authenticate the ACKED
+transfer into private disposal without another ACK or freed-context access.
+Five literal SOURCE limits411/603/795/987/1115 refuse each boundary with consumed
+work220/412/604/796/988. Every history observes exactly one genuine ACK, no result
+or signed events before failure, zero active/pending cleanup reservations after
+retirement, an unchanged Original report and an unused successor with zero work.
+Closing that successor and resetting retries the actual input successfully with
+exact typed results and no duplicate no-op events. Native-grant ACK denial and
+all six grant-finish END cuts remain separate from these SOURCE proof denials.
+
+
+Current-main integration retains LFTJ native and metadata owners, their32/8/zero
+packet boundaries and the funded composed ACK. Unary proof rejects LFTJ/JOIN/
+CONCAT and never falls back to their authority. Existing SOURCE80 close/rebegin
+precedes host tails72/non-unary or96/unary; the latter has real processed lower16
+before CLOSE176, bounding outstanding at256. Receipt lookup has a separate actual
+224+32 generation settled before native384 or any lookup-result return. Exact
+SOURCE256/255/223 and native384/383 cases exercise real allocated/retired receipt
+owners, with public indexed-hook and SOURCE-tail END/rebind integration controls.
+The integrated financial map is in LFTJ_SOURCE_ACCOUNTING.md; earlier financial
+capacity and logical fees are never treated as engine progress or native proof.

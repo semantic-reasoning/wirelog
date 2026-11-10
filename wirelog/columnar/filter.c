@@ -3788,10 +3788,10 @@ wl_columnar_filter_empty_end_step_owned(
     return rc == EAGAIN ? 0 : rc;
 }
 
-int
-wl_columnar_filter_op_native_cleanup_latch_owned(
+static int
+wl_columnar_filter_registered_cleanup_latch_owned(
     wl_columnar_eval_stack_cleanup_frame_t *frame, const void *owner,
-    wl_evaluation_control_t *funding, uint64_t id, bool *bare_end)
+    wl_evaluation_control_t *funding, uint64_t id, bool *bare_end, bool unary)
 {
     const wl_columnar_eval_plan_numeric_attempt_t *r = owner;
     if (!r || !funding || funding == r->control || !id) return EINVAL;
@@ -3804,7 +3804,10 @@ wl_columnar_filter_op_native_cleanup_latch_owned(
     int rc = wl_columnar_eval_stack_framed_context(frame, r->session, &parent);
     if (rc) return rc;
     int cause = 0;
-    rc = wl_columnar_session_join_cleanup_prove(parent, funding, id, NULL,
+    rc = unary
+        ? wl_columnar_session_unary_cleanup_prove(parent, funding, id, NULL,
+            &cause)
+        : wl_columnar_session_join_cleanup_prove(parent, funding, id, NULL,
             &cause);
     if (rc) return rc;
     if (&parent->child != r) return EINVAL;
@@ -3816,6 +3819,11 @@ wl_columnar_filter_op_native_cleanup_latch_owned(
     rc = wl_columnar_filter_attempt_context_valid(frame, ctx);
     if (rc) return rc;
     if (ctx->stage == WL_COLUMNAR_FILTER_STAGE_RUNNING) return EBUSY;
+    if (unary && (ctx->join_initialized || ctx->join_right_initialized
+        || ctx->join_decision_pending || ctx->source_bare
+        || r->cursor >= r->end || r->cursor >= r->plan->op_count
+        || (r->plan->ops[r->cursor].op != WL_PLAN_OP_FILTER
+        && r->plan->ops[r->cursor].op != WL_PLAN_OP_MAP))) return EINVAL;
     /* Same-call routing only. The selected End callee still proves its real
      * source, cursor, owner and generation before any resource mutation. */
     if (bare_end) *bare_end =
@@ -3827,6 +3835,24 @@ wl_columnar_filter_op_native_cleanup_latch_owned(
     if (!ctx->execution_result) ctx->execution_result = cause;
     if (!ctx->semantic_result) ctx->semantic_result = ctx->execution_result;
     return 0;
+}
+
+int
+wl_columnar_filter_op_native_cleanup_latch_owned(
+    wl_columnar_eval_stack_cleanup_frame_t *frame, const void *owner,
+    wl_evaluation_control_t *funding, uint64_t id, bool *bare_end)
+{
+    return wl_columnar_filter_registered_cleanup_latch_owned(frame, owner,
+               funding, id, bare_end, false);
+}
+
+int
+wl_columnar_filter_unary_native_cleanup_latch_owned(
+    wl_columnar_eval_stack_cleanup_frame_t *frame, const void *owner,
+    wl_evaluation_control_t *funding, uint64_t id, bool *bare_end)
+{
+    return wl_columnar_filter_registered_cleanup_latch_owned(frame, owner,
+               funding, id, bare_end, true);
 }
 
 int

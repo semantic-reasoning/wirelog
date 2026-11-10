@@ -2521,3 +2521,33 @@ successor controller, discard frozen error/denial reports, or release retained
 cleanup obligations. A fresh accepted attempt consumes it. Exact committed values,
 generations and required signed events remain authoritative through correction,
 retry, evaluating snapshot and subsequent calls.
+
+
+#### Ordinary unary Original-END cleanup (#2299)
+
+An ordinary observed SOURCE/FILTER/MAP/CONSOLIDATE composition registers its
+actual native owner before any expression callback can end Original. Ending
+Original, with or without creating a successor, selects authenticated cleanup
+of the retained child rather than forward evaluation. The real pending action
+is consumed once; scalar/program/table/source owners, child ACK, frame receipt
+ACK and private transaction disposal must all finish before admission reopens.
+A mismatching frame/key/binding or creator thread preserves protection.
+
+The previous committed relation, generation and signed-notification baseline
+remain unchanged through failed private work. Independent maintenance/SOURCE
+funds cleanup. Original's frozen report remains unchanged and a live successor
+consumes zero work. A matching Original report's positive execution error takes
+precedence over later identity loss; a report overwritten by another attempt
+does not reconstruct missing history. Repeated cleanup cannot revise its latched
+cause. After genuine closure, STEP can rebuild real current input; an interrupted
+evaluating snapshot retains its existing snapshot-retry entry. JOIN/AUTO and
+other operator recovery domains retain their own authority.
+
+
+If Original ends in the financial-finish hook after genuine receipt ACK, unary
+cleanup retains the authenticated ACK journal instead of interpreting an empty
+frame as completion. Independent SOURCE proof transfers the already acknowledged
+child into private disposal exactly once. Public protection remains until real
+closure, the frozen Original report remains authoritative, and an unused
+successor consumes zero. Funding denial at that boundary resumes cleanup rather
+than repeating ACK or publishing the private result.
