@@ -9873,6 +9873,36 @@ wl_columnar_session_test_head_scalar_state(wl_col_session_t *sess,
     return 0;
 }
 
+/* Quiescent, read-only test observation of the prior committed metadata.
+ * No token pointer, cleanup receipt, mutation or authority escapes. Invalid
+ * authentication differs from a valid absence of committed metadata. */
+int
+wl_columnar_session_test_committed_metadata_bytes(const wl_col_session_t *sess,
+    uint64_t *bytes)
+{
+    if (!sess || !bytes) return EINVAL;
+    *bytes = 0;
+    const wl_columnar_controlled_step_t *step = sess->controlled_step;
+    const wl_columnar_session_observed_transaction_t *tx =
+        step ? step->transaction : NULL;
+    if (!step || !step->transaction_initialized || !tx ||
+        !tx->committed) return 0;
+    const wl_columnar_memory_reservation_t *token = &tx->metadata_credit;
+    if (!sess->memory_governor || !tx->metadata_admitted
+        || token->identity != token
+        || token->governor !=
+        wl_columnar_memory_governor_ref_get(sess->memory_governor)
+        || atomic_load_explicit(&token->state, memory_order_acquire)
+        != WL_COLUMNAR_MEMORY_RESERVATION_RESERVED
+        || !token->bytes || tx->image_credit.bytes ||
+        tx->old_registry_credit.bytes
+        || tx->old_hash_credit.bytes || tx->old_registry_held ||
+        tx->old_hash_held)
+        return EINVAL;
+    *bytes = token->bytes;
+    return 0;
+}
+
 unsigned
 wl_columnar_session_test_cleanup_owners(const wl_col_session_t *sess)
 {

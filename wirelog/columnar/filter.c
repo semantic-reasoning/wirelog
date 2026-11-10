@@ -1777,6 +1777,14 @@ wl_columnar_filter_attempt_guard(wl_evaluation_control_t *control, uint64_t id)
         ? EINVAL : 0;
 }
 
+#ifdef WL_SESSION_TEST_HOOKS
+/* Read-only observation of the actual constructed MAP schema. */
+void (*wl_columnar_filter_test_map_schema)(const col_rel_t *, bool);
+/* Dynamic read-only interval; native context/program remain caller-owned. */
+void (*wl_columnar_filter_test_scalar_host)(const wl_col_session_t *,
+    const wl_columnar_filter_context_t *, bool, bool);
+#endif
+
 static int
 wl_columnar_filter_attempt_charge(wl_evaluation_control_t *control,
     uint64_t id, uint64_t work)
@@ -2372,9 +2380,25 @@ wl_columnar_filter_op_attempt_start_owned(const wl_plan_op_t *op,
                     wl_columnar_filter_scalar_context(sess, false);
                 wl_columnar_expr_status_t expression_status =
                     WL_COLUMNAR_EXPR_OK;
+#ifdef WL_SESSION_TEST_HOOKS
+                if (wl_columnar_filter_test_scalar_host)
+                    wl_columnar_filter_test_scalar_host(sess, ctx, false, true);
+#endif
                 rc = wl_columnar_expr_eval_scalar_attempt_controlled(
                     ctx->scalar_program, ctx->values, width, &context, &value,
                     &failed, &expression_status, control, attempt_id);
+#ifdef WL_SESSION_TEST_HOOKS
+                if (wl_columnar_filter_test_scalar_host)
+                    wl_columnar_filter_test_scalar_host(sess, ctx, false,
+                        false);
+#endif
+                if (!rc && failed &&
+                    expression_status != WL_COLUMNAR_EXPR_MALFORMED){
+                    sess->extension_expr_status = expression_status;
+                    rc = expression_status ==
+                        WL_COLUMNAR_EXPR_ALLOCATION_FAILURE?ENOMEM:
+                        (int)expression_status;
+                }
             }
             rc = wl_columnar_filter_attempt_return(control, attempt_id, rc);
             if (rc)
@@ -3502,6 +3526,7 @@ wl_columnar_filter_map_attempt_start_owned(const wl_plan_op_t *op,
         if (rc)
             goto done;
     }
+    bool schema_known = true;
     /* The output region of already-owned int64 scratch temporarily holds
      * type codes. The constructor consumes them synchronously before any row
      * overwrites this region. Source metadata stays under its original lease. */
@@ -3516,7 +3541,7 @@ wl_columnar_filter_map_attempt_start_owned(const wl_plan_op_t *op,
             ctx->table.programs[column];
         wl_columnar_expr_attempt_scalar_t *scalar = ctx->table.scalars
             ? ctx->table.scalars[column] : NULL;
-        if (program || scalar) {
+        if ((program || scalar) && schema_known) {
             bool supported = false;
             if (program)
                 rc = wl_columnar_expr_result_type_attempt_controlled(program,
@@ -3529,9 +3554,14 @@ wl_columnar_filter_map_attempt_start_owned(const wl_plan_op_t *op,
             rc = wl_columnar_filter_attempt_return(control, attempt_id, rc);
             if (rc) goto done;
             if (!supported) {
-                rc = ENOTSUP; goto done;
+                if (scalar &&
+                    wl_columnar_expr_scalar_schema_unknown(
+                        scalar)) schema_known = false;
+                else {
+                    rc = ENOTSUP; goto done;
+                }
             }
-        } else {
+        } else if (!program && !scalar) {
             uint32_t source_column = op->project_indices
                 ? op->project_indices[column] : column;
             if (ctx->source.types && source_column < width)
@@ -3557,16 +3587,28 @@ wl_columnar_filter_map_attempt_start_owned(const wl_plan_op_t *op,
             WL_COLUMNAR_FILTER_ATTEMPT_NEWLIKE_WORK);
     if (rc)
         goto done;
-    rc = wl_columnar_relation_new_typed_codes_operator_attempt_controlled(
-        "$map", output_width, ctx->governor ? rows : COL_REL_INIT_CAP,
-        output_width ? ctx->values + width : NULL,
-        ctx->governor, out_slot, control, attempt_id);
+    /* The typed entry requires real codes at nonzero width. Unknown legacy
+     * schema selects the already qualified untyped operator recipe directly,
+     * at the same call depth/capacity, with no wrapper or raw construction. */
+    if (schema_known)
+        rc = wl_columnar_relation_new_typed_codes_operator_attempt_controlled(
+            "$map", output_width, ctx->governor ? rows : COL_REL_INIT_CAP,
+            output_width ? ctx->values + width : NULL,
+            ctx->governor, out_slot, control, attempt_id);
+    else
+        rc = wl_columnar_relation_new_auto_operator_attempt_controlled(
+            "$map", output_width, ctx->governor?rows:COL_REL_INIT_CAP,
+            ctx->governor, out_slot, control, attempt_id);
     /* Original frame slot ownership bookkeeping precedes stale-ID arbitration. */
     ctx->output = *out_slot;
     ctx->private_output = *out_slot;
     rc = wl_columnar_filter_attempt_return(control, attempt_id, rc);
     if (rc)
         goto done;
+#ifdef WL_SESSION_TEST_HOOKS
+    if (wl_columnar_filter_test_map_schema)wl_columnar_filter_test_map_schema(
+            *out_slot, schema_known);
+#endif
     rc = wl_columnar_filter_attempt_charge(control, attempt_id,
             WL_COLUMNAR_FILTER_ATTEMPT_BATCH_INIT_WORK);
     if (rc)
@@ -3634,9 +3676,26 @@ wl_columnar_filter_map_attempt_start_owned(const wl_plan_op_t *op,
                         wl_columnar_filter_scalar_context(sess, true);
                     wl_columnar_expr_status_t expression_status =
                         WL_COLUMNAR_EXPR_OK;
+#ifdef WL_SESSION_TEST_HOOKS
+                    if (wl_columnar_filter_test_scalar_host)
+                        wl_columnar_filter_test_scalar_host(sess, ctx, true,
+                            true);
+#endif
                     rc = wl_columnar_expr_eval_scalar_attempt_controlled(
                         scalar, ctx->values, width, &context, &value, &failed,
                         &expression_status, control, attempt_id);
+#ifdef WL_SESSION_TEST_HOOKS
+                    if (wl_columnar_filter_test_scalar_host)
+                        wl_columnar_filter_test_scalar_host(sess, ctx, true,
+                            false);
+#endif
+                    if (!rc && failed &&
+                        expression_status != WL_COLUMNAR_EXPR_MALFORMED) {
+                        sess->extension_expr_status = expression_status;
+                        rc = expression_status ==
+                            WL_COLUMNAR_EXPR_ALLOCATION_FAILURE?ENOMEM:
+                            (int)expression_status;
+                    }
                 }
                 rc = wl_columnar_filter_attempt_return(control, attempt_id, rc);
                 if (rc) goto done;
