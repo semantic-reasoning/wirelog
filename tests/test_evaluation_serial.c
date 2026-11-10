@@ -6579,10 +6579,22 @@ controlled_observed_filter_compare(wl_session_t *controlled,
     }
 }
 
+static wl_evaluation_control_t *controlled_filter_cutoff_control;
+static unsigned controlled_filter_cutoff_hits;
+
 static void
-controlled_staging_cancel(wl_evaluation_control_t *control)
+controlled_filter_cutoff_cancel(wl_evaluation_control_t *control,
+    unsigned phase, uint32_t index,
+    const wl_columnar_eval_private_bindings_t *bindings)
 {
-    wl_columnar_session_test_staging_prepared = NULL;
+    (void)index;
+    (void)bindings;
+    /* General transaction CUTOFF: before its charge and publication. */
+    if (control != controlled_filter_cutoff_control || phase != 14) return;
+    CHECK(!controlled_filter_cutoff_hits
+        && wl_evaluation_control_active_attempt_id(control));
+    ++controlled_filter_cutoff_hits;
+    wl_columnar_session_test_observed_transaction_checkpoint = NULL;
     wl_evaluation_control_request_cancel(control);
 }
 
@@ -6663,12 +6675,23 @@ test_controlled_observed_filter_successors(void)
             CHECK(!mutate(reference, "input", &later, 1, 1));
             CHECK(!wl_evaluation_control_reset(control));
             if (cycle == 1) {
-                wl_columnar_session_test_staging_prepared =
-                    controlled_staging_cancel;
+                const col_rel_t *before_head = session_find_rel(
+                    (wl_col_session_t *)session, "output");
+                col_relation_snapshot_t before_image =
+                    wl_columnar_relation_snapshot(before_head);
+                controlled_filter_cutoff_control = control;
+                controlled_filter_cutoff_hits = 0;
+                wl_columnar_session_test_observed_transaction_checkpoint =
+                    controlled_filter_cutoff_cancel;
                 CHECK(controlled_recursive_run(session,
                     control) == WL_EVALUATION_CONTROL_CANCELLED);
-                CHECK(!wl_columnar_session_test_staging_prepared &&
-                    !capture.count);
+                controlled_filter_cutoff_control = NULL;
+                CHECK(!wl_columnar_session_test_observed_transaction_checkpoint
+                    && controlled_filter_cutoff_hits == 1 && !capture.count);
+                CHECK(session_find_rel((wl_col_session_t *)session, "output")
+                    == before_head && wl_columnar_relation_snapshot_equal(
+                        before_image,
+                        wl_columnar_relation_snapshot(before_head)));
                 CHECK(controlled_observed_filter_has(session_find_rel(
                         (wl_col_session_t *)session, "output"), 17));
                 CHECK(!wl_evaluation_control_reset(control));
@@ -6713,16 +6736,82 @@ static wl_evaluation_control_t *controlled_observed_filter_control;
 static uint64_t controlled_observed_filter_visits;
 static bool controlled_observed_filter_cancel;
 static wl_col_session_t *controlled_observed_filter_session;
-static const void *controlled_observed_filter_baseline;
+static const col_rel_t *controlled_filter_retry_head;
+static col_relation_snapshot_t controlled_filter_retry_image;
+static controlled_observer_capture_t *controlled_filter_retry_capture;
+static const void *controlled_filter_retry_observer;
+static uint64_t controlled_filter_retry_attempt,
+    controlled_filter_retry_generation;
+static bool controlled_filter_retry_baseline, controlled_filter_retry_events,
+    controlled_filter_retry_cutoff;
+
+static void
+controlled_filter_observer_closed(const wl_col_session_t *session)
+{
+    CHECK(!session->delta_observer && !session->delta_observer_build
+        && !session->delta_observer_prepare
+        && !session->delta_observer_reserved_bytes &&
+        !session->delta_publish_active);
+}
+
+static void
+controlled_filter_retry_public_unchanged(void)
+{
+    const col_rel_t *head = session_find_rel(controlled_observed_filter_session,
+            "output");
+    CHECK(head == controlled_filter_retry_head &&
+        !controlled_filter_retry_capture->count);
+    if (head) CHECK(wl_columnar_relation_snapshot_equal(
+                controlled_filter_retry_image,
+                wl_columnar_relation_snapshot(head)));
+}
+
+static void
+controlled_filter_retry_checkpoint(wl_evaluation_control_t *control,
+    unsigned phase, uint32_t index,
+    const wl_columnar_eval_private_bindings_t *bindings)
+{
+    (void)index;
+    CHECK(control == controlled_observed_filter_control);
+    uint64_t id = wl_evaluation_control_active_attempt_id(control);
+    CHECK(id);
+    if (!controlled_filter_retry_attempt) controlled_filter_retry_attempt = id;
+    CHECK(id == controlled_filter_retry_attempt);
+    if (phase <= 14) controlled_filter_retry_public_unchanged();
+    if (phase == 8 && bindings) {
+        CHECK(bindings->session == controlled_observed_filter_session
+            && bindings->control == control && bindings->attempt_id == id
+            && bindings->generation &&
+            wl_columnar_session_observed_bindings_authorized(
+                controlled_observed_filter_session, bindings));
+        controlled_filter_retry_generation = bindings->generation;
+    }
+    if (phase == 9) {
+        CHECK(controlled_filter_retry_generation);
+        controlled_filter_retry_baseline = true;
+    }
+    if (phase >= 10 && phase <= 14) {
+        CHECK(controlled_filter_retry_baseline
+            && controlled_observed_filter_session->delta_observer);
+        if (!controlled_filter_retry_observer)
+            controlled_filter_retry_observer =
+                controlled_observed_filter_session->delta_observer;
+        CHECK(controlled_observed_filter_session->delta_observer
+            == controlled_filter_retry_observer);
+        controlled_filter_retry_events = true;
+        if (phase == 14) controlled_filter_retry_cutoff = true;
+    }
+}
 
 static void
 controlled_observed_filter_checkpoint(wl_evaluation_control_t *control,
     unsigned phase, uint64_t progress)
 {
     if (control != controlled_observed_filter_control || phase != 13) return;
-    if (controlled_observed_filter_baseline)
-        CHECK(controlled_observed_filter_session->delta_observer
-            == controlled_observed_filter_baseline);
+    if (controlled_observed_filter_session) {
+        CHECK(wl_evaluation_control_active_attempt_id(control));
+        controlled_filter_retry_public_unchanged();
+    }
     CHECK(progress == controlled_observed_filter_visits);
     controlled_observed_filter_visits++;
     if (controlled_observed_filter_cancel && progress == 127)
@@ -6763,8 +6852,27 @@ test_controlled_observed_filter_stops(void)
                 old = session_find_rel((wl_col_session_t *)session, "output");
                 CHECK(old && !old->nrows && !capture.count);
                 old_identity = old->relation_identity;
+                col_relation_snapshot_t old_image =
+                    wl_columnar_relation_snapshot(old);
+                /* A real removal selects full-input evaluation. Reinsert the
+                 * last rejected row before9 to preserve the prefix and order. */
+                int64_t rejected = rows[ROWS - 1];
+                CHECK(!wl_session_remove(session, "input", &rejected, 1, 1));
+                CHECK(session_find_rel((wl_col_session_t *)session,
+                    "output") == old
+                    && wl_columnar_relation_snapshot_equal(old_image,
+                    wl_columnar_relation_snapshot(old)) && !capture.count);
+                CHECK(!wl_session_insert(session, "input", &rejected, 1, 1));
+                CHECK(session_find_rel((wl_col_session_t *)session,
+                    "output") == old
+                    && wl_columnar_relation_snapshot_equal(old_image,
+                    wl_columnar_relation_snapshot(old)) && !capture.count);
                 int64_t value = 9;
                 CHECK(!wl_session_insert(session, "input", &value, 1, 1));
+                CHECK(session_find_rel((wl_col_session_t *)session,
+                    "output") == old
+                    && wl_columnar_relation_snapshot_equal(old_image,
+                    wl_columnar_relation_snapshot(old)) && !capture.count);
                 CHECK(!wl_evaluation_control_reset(control));
             }
             CHECK(!wl_evaluation_control_configure(control,
@@ -6795,6 +6903,7 @@ test_controlled_observed_filter_stops(void)
              * independent exact-cost oracle: cancellation includes cleanup. */
             if (!limited) calibrated_limit = report.consumed;
             CHECK(calibrated_limit > 0);
+            controlled_filter_observer_closed((wl_col_session_t *)session);
             if (destroy_stopped) {
                 controlled_observed_filter_control = control;
                 controlled_observed_filter_cancel = false;
@@ -6822,9 +6931,19 @@ test_controlled_observed_filter_stops(void)
             CHECK(!wl_evaluation_control_reset(control));
             CHECK(!wl_evaluation_control_configure(control, 0));
             controlled_observed_filter_session = (wl_col_session_t *)session;
-            controlled_observed_filter_baseline =
-                controlled_observed_filter_session->delta_observer;
-            CHECK(controlled_observed_filter_baseline);
+            controlled_filter_observer_closed(
+                controlled_observed_filter_session);
+            controlled_filter_retry_head = head;
+            if (head) controlled_filter_retry_image =
+                    wl_columnar_relation_snapshot(head);
+            controlled_filter_retry_capture = &capture;
+            controlled_filter_retry_observer = NULL;
+            controlled_filter_retry_attempt =
+                controlled_filter_retry_generation = 0;
+            controlled_filter_retry_baseline = controlled_filter_retry_events =
+                controlled_filter_retry_cutoff = false;
+            wl_columnar_session_test_observed_transaction_checkpoint =
+                controlled_filter_retry_checkpoint;
             controlled_observed_filter_control = control;
             controlled_observed_filter_cancel = false;
             controlled_observed_filter_visits = 0;
@@ -6832,9 +6951,19 @@ test_controlled_observed_filter_stops(void)
                 controlled_observed_filter_checkpoint;
             CHECK(!controlled_recursive_run(session, control));
             CHECK(controlled_observed_filter_visits == ROWS + successor);
+            CHECK(controlled_filter_retry_attempt != report.attempt_id
+                && controlled_filter_retry_generation &&
+                controlled_filter_retry_baseline
+                && controlled_filter_retry_events &&
+                controlled_filter_retry_cutoff);
+            controlled_filter_observer_closed(
+                controlled_observed_filter_session);
             wl_columnar_filter_test_attempt_checkpoint = NULL;
+            wl_columnar_session_test_observed_transaction_checkpoint = NULL;
             controlled_observed_filter_control = NULL;
-            controlled_observed_filter_baseline = NULL;
+            controlled_filter_retry_head = NULL;
+            controlled_filter_retry_capture = NULL;
+            controlled_filter_retry_observer = NULL;
             controlled_observed_filter_session = NULL;
             head = session_find_rel((wl_col_session_t *)session, "output");
             CHECK(head && head->nrows == successor &&
@@ -6854,10 +6983,108 @@ test_controlled_observed_filter_stops(void)
     }
 }
 
+typedef struct {
+    unsigned mask, count;
+} controlled_projected_snapshot_t;
+
+static void
+controlled_projected_snapshot(const char *name, const int64_t *row,
+    uint32_t width, void *data)
+{
+    controlled_projected_snapshot_t *snapshot = data;
+    CHECK(!strcmp(name, "output") && width == 1 && row
+        && (row[0] == 2 || row[0] == 4));
+    unsigned bit = 1u << (unsigned)row[0];
+    CHECK(!(snapshot->mask & bit));
+    snapshot->mask |= bit;
+    ++snapshot->count;
+}
+
+static void
+controlled_projected_positive(wl_session_t *session, wl_plan_t *plan,
+    wl_evaluation_control_t *control, controlled_observer_capture_t *capture)
+{
+    const wl_plan_relation_t *r = &plan->strata[0].relations[0];
+    CHECK(plan->stratum_count == 1 && plan->strata[0].relation_count == 1
+        && r->op_count == 4 && r->ops[0].op == WL_PLAN_OP_VARIABLE
+        && r->ops[1].op == WL_PLAN_OP_FILTER && r->ops[1].filter_expr.size
+        && r->ops[2].op == WL_PLAN_OP_MAP && r->ops[2].map_expr_count == 1
+        && r->ops[3].op == WL_PLAN_OP_CONSOLIDATE);
+    /* Walk exact instruction boundaries: VAR col0, CONST_INT1, ADD. */
+    const wl_plan_expr_buffer_t *expr = &r->ops[2].map_exprs[0];
+    CHECK(expr->size == 17 && expr->data[0] == WL_PLAN_EXPR_VAR
+        && expr->data[1] == 4 && !expr->data[2]
+        && !memcmp(expr->data + 3, "col0", 4)
+        && expr->data[7] == WL_PLAN_EXPR_CONST_INT && expr->data[8] == 1);
+    for (unsigned i = 9; i < 16; ++i) CHECK(!expr->data[i]);
+    CHECK(expr->data[16] == WL_PLAN_EXPR_ARITH_ADD);
+    wl_session_t *reference = NULL;
+    CHECK(!wl_session_create(wl_backend_columnar(), plan, 1, &reference));
+    int64_t initial = 1;
+    CHECK(!wl_session_insert(reference, "input", &initial, 1, 1));
+    const int64_t changes[] = {3, -1, 1, 3, -1};
+    const bool inserts[] = {true, true, false, false, false};
+    const unsigned masks[] = {4, 20, 20, 16, 0, 0};
+    const unsigned counts[] = {1, 2, 2, 1, 0, 0};
+    const unsigned events[] = {1, 2, 2, 3, 4, 4};
+    const int64_t event_rows[] = {2, 4, 2, 4};
+    const int event_diffs[] = {1, 1, -1, -1};
+    for (unsigned phase = 0; phase < 6; ++phase) {
+        if (phase) {
+            const col_rel_t *old = session_find_rel((wl_col_session_t *)session,
+                    "output");
+            col_relation_snapshot_t image = wl_columnar_relation_snapshot(old);
+            unsigned before_events = capture->count;
+            int (*mutate)(wl_session_t *, const char *, const int64_t *,
+                uint32_t,
+                uint32_t) = inserts[phase -
+                    1] ? wl_session_insert : wl_session_remove;
+            CHECK(!mutate(session, "input", &changes[phase - 1], 1, 1));
+            CHECK(!mutate(reference, "input", &changes[phase - 1], 1, 1));
+            CHECK(session_find_rel((wl_col_session_t *)session, "output") == old
+                && wl_columnar_relation_snapshot_equal(image,
+                wl_columnar_relation_snapshot(old)) &&
+                capture->count == before_events);
+            CHECK(!wl_evaluation_control_reset(control));
+        }
+        CHECK(!observed_multi_step(session) && !wl_session_step(reference));
+        controlled_observed_filter_compare(session, reference);
+        const col_rel_t *out = session_find_rel((wl_col_session_t *)session,
+                "output");
+        CHECK(out && out->ncols == 1 && out->nrows == counts[phase]
+            && out->column_types && out->column_types[0] == WIRELOG_TYPE_INT64);
+        unsigned mask = 0;
+        for (uint32_t row = 0; row < out->nrows; ++row) {
+            CHECK(out->columns[0][row] == 2 || out->columns[0][row] == 4);
+            mask |= 1u << (unsigned)out->columns[0][row];
+        }
+        CHECK(mask == masks[phase] && capture->count == events[phase]);
+        for (unsigned event = 0; event < capture->count; ++event)
+            CHECK(capture->rows[event] == event_rows[event]
+                && capture->diffs[event] == event_diffs[event]);
+        wl_evaluation_control_report_t report;
+        CHECK(!wl_evaluation_control_report(control, &report)
+            && !report.result && !report.cleanup_status && report.consumed
+            && !wl_evaluation_control_active_attempt_id(control));
+        controlled_filter_observer_closed((wl_col_session_t *)session);
+        CHECK(!((wl_col_session_t *)session)->cleanup_active
+            && !((wl_col_session_t *)session)->cleanup_pending
+            && !((wl_col_session_t *)session)->cleanup_reserved_bytes);
+        controlled_projected_snapshot_t snapshot = {0};
+        CHECK(!wl_session_snapshot(session, controlled_projected_snapshot,
+            &snapshot)
+            && snapshot.mask == masks[phase] &&
+            snapshot.count == counts[phase]);
+        CHECK(!wl_session_step(session) && capture->count == events[phase]);
+        controlled_observed_filter_compare(session, reference);
+    }
+    wl_session_destroy(reference);
+}
+
 static void
 test_controlled_observed_preflight_rejections(void)
 {
-    static const char unsupported[] =
+    static const char projected[] =
         ".decl input(x:int64)\n"
         ".decl output(x:int64)\n"
         "output(x+1) :- input(x), x > 0.\n";
@@ -6869,7 +7096,7 @@ test_controlled_observed_preflight_rejections(void)
         ".decl input(x:int64)\n"
         ".decl output(x:int64)\n"
         "output(x) :- input(x).\n";
-    const char *sources[] = { unsupported, wrong_type, valid, valid };
+    const char *sources[] = { projected, wrong_type, valid, valid };
     for (unsigned i = 0; i < 4; ++i) {
         wirelog_error_t error;
         wirelog_program_t *program = wirelog_parse_string(sources[i], &error);
@@ -6904,6 +7131,14 @@ test_controlled_observed_preflight_rejections(void)
         if (i == 1) {
             CHECK(!observed_multi_step(session));
             CHECK(capture.count == 0);
+            wl_session_destroy(session);
+            wl_evaluation_control_release(control);
+            wl_plan_free(plan);
+            wirelog_program_free(program);
+            continue;
+        }
+        if (i == 0) {
+            controlled_projected_positive(session, plan, control, &capture);
             wl_session_destroy(session);
             wl_evaluation_control_release(control);
             wl_plan_free(plan);
@@ -13949,6 +14184,30 @@ retirement_run_peer(wl_session_t *session, wl_evaluation_control_t *control,
     CHECK(p.session == (expected ? session : NULL));
 }
 
+/* These tests qualify the retained narrow staging protocol. Four-op FILTER
+ * heads use the general transaction; all rows here are positive, so the
+ * identity fixture preserves their concrete mutation/event histories. */
+static wl_plan_t *
+staging_identity_plan(wirelog_program_t **program)
+{
+    wirelog_error_t error;
+    *program = wirelog_parse_string(
+        ".decl input(x:int64)\n"
+        ".decl output(x:int64)\n"
+        "output(x) :- input(x).\n", &error);
+    CHECK(*program);
+    wl_plan_t *plan = NULL;
+    CHECK(!wl_plan_from_program(*program, &plan));
+    CHECK(plan->stratum_count == 1 && plan->strata[0].relation_count == 1);
+    const wl_plan_relation_t *r = &plan->strata[0].relations[0];
+    CHECK(r->op_count == 3 && r->ops[0].op == WL_PLAN_OP_VARIABLE
+        && r->ops[1].op == WL_PLAN_OP_MAP
+        && r->ops[1].project_count == 1 && r->ops[1].project_indices
+        && r->ops[1].project_indices[0] == 0
+        && r->ops[2].op == WL_PLAN_OP_CONSOLIDATE);
+    return plan;
+}
+
 static void
 test_session_retirement_initialization_stops(void)
 {
@@ -13967,13 +14226,16 @@ test_session_retirement_initialization_stops(void)
             bool peer_case = kind && trial == (kind == 2 ? 3u : 6u);
             unsigned stage = peer_case ? (kind == 2 ? 10u : 1u)
                 : kind == 2 ? managed_stages[trial] : stages[trial];
-            const char *source = kind == 0 ? controlled_observed_filter_source
-                : kind == 1 ? general : kind ==
+            const char *source = kind == 1 ? general : kind ==
                 2 ? binary : recursive_transaction_source;
             wirelog_error_t error;
-            wirelog_program_t *program = wirelog_parse_string(source, &error);
+            wirelog_program_t *program = NULL;
             wl_plan_t *plan = NULL;
-            CHECK(program && !wl_plan_from_program(program, &plan));
+            if (!kind) plan = staging_identity_plan(&program);
+            else {
+                program = wirelog_parse_string(source, &error);
+                CHECK(program && !wl_plan_from_program(program, &plan));
+            }
             wl_columnar_memory_resolution_t resolution = {
                 .budget_bytes = WL_COLUMNAR_MEMORY_MIN_BUDGET,
                 .usable_bytes = WL_COLUMNAR_MEMORY_MIN_BUDGET,
@@ -14467,7 +14729,7 @@ test_staging_native_pending_admission(void)
         for (unsigned trial = 0; trial < 7; ++trial) {
             if (work && trial == 6) continue;
             wirelog_program_t *program = NULL;
-            wl_plan_t *plan = controlled_observed_filter_plan(&program);
+            wl_plan_t *plan = staging_identity_plan(&program);
             wl_evaluation_control_t *control = NULL;
             CHECK(!wl_evaluation_control_create(0, &control));
             wl_columnar_memory_resolution_t resolution = {

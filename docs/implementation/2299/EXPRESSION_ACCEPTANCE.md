@@ -1312,3 +1312,67 @@ Negative probes reject wrong full keys/index binding, protected stored-key
 mismatch, use of Original as financier and duplicate published registration,
 without Original debit or ownership changes. Extension invocation and the
 remaining legal expression-host matrix are still separate qualifications.
+
+## One-column observed FILTER recovery adapter
+
+The special one-column INT64 observed FILTER route left its real delta observer
+held after an already-admitted scalar-owner ENOMEM, while Original was finished
+and the backend reported IDLE. A following declared-input removal correctly
+returned EBUSY. The independent `strlen(to_string(x)) > 0` reproduction has the
+same result with and without a preceding successful SNAPSHOT; this is not a
+snapshot-field repair or a new extension-only defect.
+
+Structurally valid four-op VARIABLE/FILTER/MAP/CONSOLIDATE heads now select the
+qualified general private transaction. Numeric FILTER also takes that recovery
+protocol; its numeric expression primitives and append optimization remain.
+Three-op identity projection keeps its old narrow route, including the protected
+multi-row mutation refusal and successful individual appends. No observer pointer
+is cleared to create permission. Genuine transaction disposal, receipt closure
+and the existing R1 terminal record authorize correction after a positive error.
+
+The changed preflight relation predicate adds at most six fixed source actions;
+the complete payload has a conservative26-action bound. SOURCE mode still uses
+the existing admission-reader208/96/80 contract; DIRECT mode still calls the
+fixed payload directly. FILTER `done` skips the later general-map read. These
+are callback/delta bounds, not newly invented full BANK FIRST/bootstrap bounds
+or a claim that every preflight read is BANK-financed. There is no payload scan,
+allocation, provider, lookup or native permission in this structural choice.
+
+General APPEND_AUDIT previously treated every FILTER as append-compatible and
+later rewrote its plan with an old-head VARIABLE/CONCAT. A scalar FILTER now
+uses the existing allocation-free, Original-funded numeric/scalar descriptor
+classifier before APPEND_COPY/PLAN. A scalar requirement takes the existing
+canonical full-general fallback; no CONCAT/native authority is fabricated or
+added to the unary grammar. Numeric FILTER retains the actual append plan and
+its independent positive/linearity proof. Unknown/malformed descriptions remain
+runtime decisions. Earlier audit frontier writes are inactive after fallback
+and are disposed or rebuilt by the actual transaction owner.
+
+The descriptive append helper pays PRE128, the existing classifier child fees,
+and POST128, publishing eligibility only after POST. Each new parent interval
+has a conservative complete bound42 controller +56 fixed helper/caller +24
+next-front =122 <=128 <=256. The scalar fallback reset/return and numeric FILTER
+continuation are separate paths. Numeric continuation includes only FILTER's
+fixed predicates, degree/cursor checks and resets, not VARIABLE/JOIN name-byte
+or MAP projection loops. Invalid arguments/pre-PRE fronts belong to the existing
+incoming fixed frontier; no later payment retroactively finances them. Failed
+PRE/child/POST leaves the eligibility output unchanged. No parent capacity pays
+for a whole expression traversal; child decoder regions retain their own fees.
+
+`evaluation_observed_filter_recovery` uses actual compiled one-column plans.
+It covers raw/control numeric, scalar, semantic-rejection and unchanged identity
+controls; populated/empty baselines; successful snapshots before error; repeated
+real owner ENOMEM; wrong/zero mutation admission and legal remove/reinsert after
+R1; old committed pointer/generation, report, exact signed events and no-op retry.
+Canonical scalar execution has actual authenticated unary owner2. All cancellation,
+work, END-alone/successor and sticky-overflow histories close real observers,
+frames, receipts and memory, with frozen Original reports and successor0.
+
+Independent literal oracles cover every PRE128/classifier224/POST128 payment
+and one-short prefix. Stops inside the audit classifier occur after actual
+frontier writes and before APPEND_COPY/PLAN, with rollback/retry checked. A
+separate numeric positive proves the runtime six-op append/CONCAT plan still
+occurs. Fixtures use an enforcing64MiB governor; zero spare admission budget
+refuses private work without publication, then raised-budget retry produces the
+exact model. Session/program/control teardown returns governed reservations0.
+This adapter does not close extension admission or the remaining legal-host rows.

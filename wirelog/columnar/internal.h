@@ -9044,6 +9044,8 @@ int wl_columnar_eval_stack_cleanup_receipt_index_key_for_frame(
     wl_columnar_eval_cleanup_receipt_key_t *);
 int wl_columnar_session_native_cleanup_receipt_index(const wl_col_session_t *,
     const wl_columnar_eval_cleanup_receipt_key_t *, uint32_t *);
+int wl_columnar_session_filter_append_supported_attempt_controlled(
+    const wl_plan_expr_buffer_t *, bool *, wl_evaluation_control_t *, uint64_t);
 int wl_columnar_expr_requires_scalar_attempt_controlled(const uint8_t *,
     uint32_t, bool *, wl_evaluation_control_t *, uint64_t);
 int wl_columnar_session_join_cleanup_register(wl_col_session_t *,
@@ -9207,6 +9209,8 @@ extern int wl_columnar_session_test_fail_framed_funding_after_stop;
 /* Fresh forward registration only; before funding and before Original poll. */
 int wl_columnar_session_test_head_scalar_state(wl_col_session_t *,
     uint64_t [4], bool);
+extern void (*wl_columnar_session_test_filter_append_checkpoint)(
+    wl_evaluation_control_t *, unsigned, bool);
 extern void (*wl_columnar_session_test_head_scalar_checkpoint)(
     wl_evaluation_control_t *, unsigned, uint32_t);
 extern void (*wl_columnar_session_test_join_birth_checkpoint)(

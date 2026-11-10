@@ -738,3 +738,21 @@ never runs the fresh-only poll. Fresh ADVANCE capacity10240+512*N covers bounded
 passes; unused capacity is not charged work. Registered key selection is fixed
 and exclusive, with protected mismatch refusing instead of legacy rescan.
 Checked SOURCE epochs and real native/receipt ACK remain distinct financiers.
+
+## Scalar FILTER append-domain exclusion (#2299)
+
+The existing per-record APPEND_AUDIT now asks the qualified readonly classifier
+about actual nonempty FILTER expressions. Parent PRE128 and POST128 surround
+its existing Original-funded child regions. Scalar-required FILTERs take the
+existing full-general fallback before APPEND_COPY/PLAN, keeping the canonical
+plan eligible for its genuine unary owner. Numeric FILTER keeps append/CONCAT
+and its prior linearity proof; JOIN/MAP/VARIABLE audit loops are unchanged.
+
+Complete parent bounds are42 charge engine +56 fixed helper/caller +24 next
+front =122. For scalar=true, the fixed tail disables append and resets degree,
+indices and phase. For numeric=false, the mutually exclusive FILTER tail checks
+name/type/degree/terminal predicates and cursor resets, never executes name-byte,
+row, column or projection loops. Child errors skip POST; POST refusal preserves
+output. Existing256 source quantum and actual ownership remain separate from
+these logical128 prices. The six-action preflight FILTER route choice uses the
+existing SOURCE reader only in SOURCE mode; DIRECT has no invented BANK charge.
