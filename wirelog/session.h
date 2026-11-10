@@ -219,10 +219,18 @@ typedef struct {
     bool mandatory_unwind_called;
 } wl_session_source_final_pair_result_t;
 
+/* Preserve these checks in MSVC's default C mode as well as C11. */
+#if defined(_MSC_VER)
+typedef char wl_session_source_final_close_layout_check_
+    [(sizeof(wl_session_source_final_close_value_t) == 16) ? 1 : -1];
+typedef char wl_session_source_final_pair_layout_check_
+    [(sizeof(wl_session_source_final_pair_result_t) == 56) ? 1 : -1];
+#else
 _Static_assert(sizeof(wl_session_source_final_close_value_t) == 16,
     "final close value layout");
 _Static_assert(sizeof(wl_session_source_final_pair_result_t) == 56,
     "final Session result layout");
+#endif
 
 wl_session_source_final_pair_result_t
     wl_session_source_finance_close_then_final_metadata(wl_session_t *,

@@ -376,6 +376,22 @@ typedef struct {
     wl_evaluation_control_source_extent_t session, payload, journal;
 } wl_evaluation_control_source_final_geometry_t;
 
+/* MSVC's default C mode has no _Static_assert. Keep the same layout
+ * constraints using constant-expression array bounds. */
+#if defined(_MSC_VER)
+typedef char wl_evaluation_control_financial_scalar_layout_check_
+    [(sizeof(int) == 4 && sizeof(bool) == 1) ? 1 : -1];
+typedef char wl_evaluation_control_final_pair_layout_check_
+    [(sizeof(wl_evaluation_control_source_final_pair_result_t) == 16) ? 1 : -1];
+typedef char wl_evaluation_control_final_layout_check_
+    [(sizeof(wl_evaluation_control_source_final_result_t) == 12) ? 1 : -1];
+typedef char wl_evaluation_control_final_pair_offset_check_
+    [(offsetof(wl_evaluation_control_source_final_pair_result_t,
+        phase_finished) == 15) ? 1 : -1];
+typedef char wl_evaluation_control_final_offset_check_
+    [(offsetof(wl_evaluation_control_source_final_result_t,
+        phase_finished) == 10) ? 1 : -1];
+#else
 _Static_assert(sizeof(int) == 4 && sizeof(bool) == 1,
     "financial scalar layout");
 _Static_assert(sizeof(wl_evaluation_control_source_final_pair_result_t) == 16,
@@ -388,6 +404,7 @@ _Static_assert(offsetof(wl_evaluation_control_source_final_pair_result_t,
 _Static_assert(offsetof(wl_evaluation_control_source_final_result_t,
     phase_finished) == 10,
     "final lifecycle offsets");
+#endif
 
 wl_evaluation_control_source_final_pair_result_t
     wl_evaluation_control_source_bank_run_lexical_pair_final(
