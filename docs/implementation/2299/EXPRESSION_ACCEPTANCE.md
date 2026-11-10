@@ -764,3 +764,42 @@ and disabling strict policy permits the bounded route. Dedicated upstream
 strict-eligible tests remain the positive evidence for those separate routes.
 This integration does not qualify all recursive/aggregate/timestamp or future
 crypto/extension intersections; those obligations remain explicit.
+
+
+### Failed hot scalar successors: terminal correction boundary
+
+Existing TO_NUMBER on clean5fae reproduces a shared hot-MAP defect independently
+of crypto: after a successful empty step, a later ERANGE rolls back all private
+storage but leaves the backend PENDING, so declared-input correction returns
+EBUSY. A separate TO_NUMBER Original-END fixture also exposes retained native
+child cleanup; that second obligation is a separate recovery unit.
+
+A failed successor now retains a terminal retry receipt only after genuine
+child ACK (or authenticated no-frame rejection), complete uncommitted private
+transaction disposal, and the matching Original FINISH receipt. The receipt
+binds the real session/step identity, immutable plan, public registry/count,
+Original control identity and attempt ID, and the child's closed generation.
+A 192-unit maintenance prepayment funds registration before freeing transaction
+finance. The existing independent SOURCE FINISH wrapper is also selected for
+this ordinary non-JOIN boundary: its real224/240 admissions separate Original
+FINISH from terminal publication, without polling a sticky or ended Original.
+New registration work fits176<=192<=quantum256; final publication uses the
+existing SOURCE240 terminal metadata stage. Terminal-proof queries are fixed metadata and add no input-sized scan. Existing
+public admission selection and declared-EDB mutation validation are unchanged.
+
+A quiescent authentic receipt exposes RETRYABLE, allowing only declared EDB
+correction at the existing facade gate. Wrong names/widths, failed or zero-row
+requests do not promote it. Only a real successful admitted mutation exposes
+DIRTY; its trusted commit notification refreshes registry metadata because an
+incremental removal can create a retraction relation. Read-only admission never
+performs that refresh. A real new attempt consumes the receipt, reuses the
+existing bounded private-successor reset/rebuild path, and revalidates inputs.
+No successful result is fabricated: retry without correcting bad input fails
+again, preserving the prior committed image and notification baseline.
+
+The regression covers empty/nonempty previous commits, ERANGE/ENOMEM and
+sticky accounting EOVERFLOW with cancellation, exact relation generations and
+signed events, wrong/zero mutations, repeated correction/remove-reinsert,
+frozen reports, unused successor protection, evaluating snapshot after
+correction, subsequent no-op and governor retirement. Native Original-END
+retained-child authority remains separately tracked until its own repair.

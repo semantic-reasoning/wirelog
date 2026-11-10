@@ -228,7 +228,7 @@ typedef struct {
     int rollback_result;
     uint32_t image_cap, image_count;
     wl_evaluation_control_t *maintenance;
-    uint64_t maintenance_id, generation;
+    uint64_t maintenance_id, generation, closed_generation;
     uint32_t head_count, op_count, count, old_count;
     uint32_t si, ri, index, other, op, head, filled_heads, filled_ops;
     size_t byte;
@@ -386,6 +386,15 @@ struct wl_columnar_controlled_step {
     uint64_t append_identity;
     uint32_t append_begin;
     bool successor_attempt;
+    /* A discarded failed successor keeps a bounded terminal receipt, not a
+     * fictitious successful closure or a private resource capability. */
+    wl_col_session_t *failed_retry_session;
+    const wl_plan_t *failed_retry_plan;
+    col_rel_t **failed_retry_registry;
+    uint64_t failed_retry_identity, failed_retry_control;
+    uint64_t failed_retry_source_id, failed_retry_generation;
+    uint32_t failed_retry_count;
+    bool failed_retry_paid, failed_retry_ready, failed_retry_mutated;
     bool successor_candidate_detached;
     bool successor_candidate_renamed;
     bool baseline_ready;
@@ -9823,6 +9832,98 @@ wl_columnar_session_ended_result(
     return finish->report_valid ? finish->report.result : 0;
 }
 
+/* Failed successor metadata: registration adds at most176 fixed actions,
+ * prepaid192 by real transaction maintenance before that owner is retired.
+ * Existing SOURCE FINISH stages separately fund Original completion and
+ * terminal publication (224 then240 for this additional quiescence proof).
+ * No input-sized plan/registry scan is introduced. Public admission selection
+ * stays unchanged; the new proof is fixed metadata, never native authority.
+ * Actual child ACK/no-frame refusal and disposal establish the receipt;
+ * empty pointers alone never authorize mutation or a successful result. */
+#define WL_COLUMNAR_SESSION_FAILED_RETRY_WORK UINT64_C(192)
+typedef char wl_columnar_session_failed_retry_fits_quantum[
+        WL_COLUMNAR_SESSION_FAILED_RETRY_WORK <=
+        WL_EVALUATION_CONTROL_QUANTUM ? 1 : -1];
+
+static bool
+wl_columnar_session_failed_retry_quiescent(const wl_col_session_t *sess,
+    const wl_columnar_controlled_step_t *step, bool ready)
+{
+    return sess && step && sess->controlled_step == step &&
+           step->failed_retry_paid && (!ready || step->failed_retry_ready) &&
+           step->failed_retry_session == sess &&
+           step->failed_retry_plan == sess->plan &&
+           step->failed_retry_identity == step->operation_identity &&
+           step->failed_retry_source_id &&
+           step->failed_retry_control ==
+           wl_evaluation_control_identity(sess->base.evaluation_control) &&
+           !wl_evaluation_control_active_attempt_id(
+        sess->base.evaluation_control) &&
+           step->general_observed && step->successor_attempt &&
+           !step->complete &&
+           !step->operation_active && !step->operation_id &&
+           !step->relation_active &&
+           !step->transaction && !step->transaction_initialized &&
+           !step->transaction_discard &&
+           !sess->cleanup_active && !sess->cleanup_pending &&
+           !sess->cleanup_reserved_bytes &&
+           !step->previous_valid && !step->previous_funding &&
+           !step->join_cleanup.kind &&
+           !step->retirement_native_count &&
+           !step->retirement_begin_failure_pending &&
+           !step->staging_cancel_pending && !step->staging_progress.identity &&
+           !step->successor_input_reader.owner &&
+           !step->observer_cleanup_pending &&
+           !sess->delta_observer && !sess->delta_publish_active;
+}
+
+static bool
+wl_columnar_session_failed_retry_valid(const wl_col_session_t *sess,
+    const wl_columnar_controlled_step_t *step, bool ready)
+{
+    if (!sess || !step) return false;
+    return wl_columnar_session_failed_retry_quiescent(sess, step, ready) &&
+           step->failed_retry_registry == sess->rels &&
+           step->failed_retry_count == sess->nrels;
+}
+
+static int
+wl_columnar_session_failed_retry_prepare(wl_col_session_t *sess,
+    wl_columnar_controlled_step_t *step,
+    const wl_columnar_session_observed_transaction_t *tx)
+{
+    if (!sess->base.owns_operation_admission ||
+        !sess->base.operation_admission ||
+        !sess->base.evaluation_control || !step->general_observed ||
+        !step->successor_attempt || step->snapshot_owned || step->published ||
+        tx->committed ||
+        !step->transaction_discard || step->primary_result <= 0) return 0;
+    if (!step->operation_active || !step->operation_id ||
+        tx->generation != tx->closed_generation || tx->child_active ||
+        tx->receipt_pending || tx->receipt_ack || sess->cleanup_active ||
+        sess->cleanup_pending || tx->old_registry != sess->rels ||
+        tx->old_count != sess->nrels ||
+        step->retirement_native_count) return EINVAL;
+    /* The real transaction maintenance still exists and owns this final
+     * suffix even when Original has sticky accounting failure or has ended.
+     * Failed admission preserves tx and every public gate in pending state. */
+    int rc = wl_evaluation_control_charge_attempt(tx->maintenance,
+            tx->maintenance_id, WL_COLUMNAR_SESSION_FAILED_RETRY_WORK);
+    if (rc) return rc;
+    step->failed_retry_session = sess;
+    step->failed_retry_plan = sess->plan;
+    step->failed_retry_registry = tx->old_registry;
+    step->failed_retry_count = tx->old_count;
+    step->failed_retry_identity = step->operation_identity;
+    step->failed_retry_control =
+        wl_evaluation_control_identity(sess->base.evaluation_control);
+    step->failed_retry_source_id = step->operation_id;
+    step->failed_retry_generation = tx->closed_generation;
+    step->failed_retry_paid = true;
+    step->failed_retry_ready = step->failed_retry_mutated = false;
+    return 0;
+}
+
 static int
 col_controlled_step_finish_inner(wl_col_session_t *sess,
     wl_columnar_controlled_step_t *step, int result,
@@ -9875,6 +9976,7 @@ col_controlled_step_finish_inner(wl_col_session_t *sess,
         step->previous_protocol = 0;
     }
     uint64_t finished_id = step->operation_id;
+    bool terminal_closed = false;
     int rc = result;
     if (source) {
         if (wl_session_source_finance_charge(source, 80)) abort();
@@ -9889,15 +9991,20 @@ col_controlled_step_finish_inner(wl_col_session_t *sess,
         if (source) {
             if (wl_session_source_finance_finish(source)) abort();
             if (wl_session_source_finance_rebegin(source)) abort();
-            if (wl_session_source_finance_charge(source, 208)) abort();
+            if (wl_session_source_finance_charge(source,
+                step->failed_retry_paid ? 240 : 208)) abort();
             *return_paid = true;
         }
         if (finish.protocol ||
             finish.kind == WL_EVALUATION_CONTROL_ATTEMPT_FINISH_REJECTED)
             return finish.protocol ? finish.protocol : EINVAL;
+        terminal_closed = finish.kind ==
+            WL_EVALUATION_CONTROL_ATTEMPT_FINISH_OWN_FINISHED &&
+            finish.report_valid && finish.report.attempt_id == finished_id;
         rc = wl_columnar_session_ended_result(&finish, result, 0);
     } else if (source) {
-        if (wl_session_source_finance_charge(source, 208)) abort();
+        if (wl_session_source_finance_charge(source,
+            step->failed_retry_paid ? 240 : 208)) abort();
         *return_paid = true;
     }
     if (!step->snapshot_owned && step->retirement_native_count
@@ -9922,6 +10029,12 @@ col_controlled_step_finish_inner(wl_col_session_t *sess,
     step->primary_result = 0;
     step->refused = result != 0
         && result != WL_EVALUATION_CONTROL_WORK_LIMIT;
+    /* The positive SOURCE240 terminal stage funds this callback-free suffix.
+     * Genuine Original FINISH must match the maintenance-prepared generation. */
+    if (terminal_closed && rc > 0 &&
+        step->failed_retry_source_id == finished_id &&
+        wl_columnar_session_failed_retry_valid(sess, step, false))
+        step->failed_retry_ready = true;
     return rc;
 }
 
@@ -9948,8 +10061,10 @@ static int
 col_controlled_step_finish(wl_col_session_t *sess,
     wl_columnar_controlled_step_t *step, int result)
 {
-    if ((!sess->join_batch_bytes && !sess->base.source_c1_admission)
-        || step->recursive_route)
+    /* Preserve SOURCE admission for both current-main routes and failed
+     * successor metadata. Its maintenance receipt never authorizes a child. */
+    if ((!sess->join_batch_bytes && !sess->base.source_c1_admission
+        && !step->failed_retry_paid) || step->recursive_route)
         return col_controlled_step_finish_inner(sess, step, result, NULL, NULL);
     if (step->snapshot_owned) {
         wl_columnar_session_snapshot_finish_source_t payload = {sess, step,
@@ -12330,6 +12445,7 @@ wl_columnar_session_observed_child_result(wl_col_session_t *sess,
             tx->receipt_ack = true;
             return EAGAIN;
         }
+        tx->closed_generation = tx->generation;
         tx->receipt_pending = tx->receipt_ack = tx->child_active = false;
         memset(&tx->receipt_key, 0, sizeof(tx->receipt_key));
         col_controlled_step_grant_release(step, &step->previous_funding);
@@ -12374,6 +12490,7 @@ wl_columnar_session_observed_child(wl_col_session_t *sess,
             step->operation_id, tx->generation)) return EINVAL;
         /* No frame was born. The genuine private image still has its own
         * readers and storage; preserve its real failure for disposal. */
+        tx->closed_generation = tx->generation;
         tx->child_active = false;
         if (!step->primary_result) step->primary_result = rc;
         step->transaction_discard = true;
@@ -12385,6 +12502,7 @@ wl_columnar_session_observed_child(wl_col_session_t *sess,
         return wl_columnar_session_observed_child_result(sess, step, rc);
     if (rc && step->reply.kind == WL_COLUMNAR_EVAL_SERIAL_FRAMED_REPLY_REJECTED
         && !sess->cleanup_active) {
+        tx->closed_generation = tx->generation;
         tx->child_active = false;
         return rc;
     }
@@ -13869,6 +13987,8 @@ wl_columnar_session_observed_dispose(wl_col_session_t *sess,
         if (!done) return EAGAIN;
     }
     if (source_successor && wl_session_source_footer(&sess->base)) abort();
+    rc = wl_columnar_session_failed_retry_prepare(sess, step, tx);
+    if (rc) return rc;
     (void)wl_evaluation_control_finish(tx->maintenance, tx, 0, 0);
     (void)wl_evaluation_control_detach(tx->maintenance, tx);
     wl_evaluation_control_release(tx->maintenance);
@@ -14764,6 +14884,10 @@ col_controlled_step_drive(wl_col_session_t *sess,
         step->operation_id = begin.attempt_id;
         if (!step->operation_id) return EINVAL;
         step->operation_active = true;
+        /* A genuine new generation consumes the old terminal retry receipt.
+         * BEGIN refusal leaves it intact; no stale proof crosses forward work. */
+        step->failed_retry_paid = step->failed_retry_ready =
+            step->failed_retry_mutated = false;
         if (step->snapshot_owned)
             wl_columnar_session_snapshot_attempt_set(step->snapshot,
                 begin.attempt_id);
@@ -15232,6 +15356,8 @@ col_controlled_step(wl_col_session_t *sess,
         step->staging_cancel_pending) return
             wl_columnar_session_staging_cancel_drive(sess, step);
     if (step && step->snapshot_retry && !snapshot) return EBUSY;
+    bool failed_retry = wl_columnar_session_failed_retry_valid(sess, step,
+            true);
     if (step && snapshot) {
         step->snapshot_owned = true;
         step->snapshot = snapshot;
@@ -15266,7 +15392,8 @@ col_controlled_step(wl_col_session_t *sess,
         step->retryable = false;
         successor_step = true;
     }
-    if (step && step->complete && step->successor_mutation_seen) {
+    if (step &&
+        ((step->complete && step->successor_mutation_seen) || failed_retry)) {
         int rc = col_controlled_step_static_preflight_c1(sess, true);
         if (rc) return rc;
         if (sess->base.source_c1_admission
@@ -15530,6 +15657,9 @@ col_session_controlled_step_state(const wl_session_t *session)
     if (step->staging_cancel_pending || step->retirement_native_count
         || step->retirement_begin_failure_pending) return
             WL_CONTROLLED_STEP_PENDING;
+    if (wl_columnar_session_failed_retry_valid(sess, step, true))
+        return step->failed_retry_mutated ? WL_CONTROLLED_STEP_DIRTY :
+               WL_CONTROLLED_STEP_RETRYABLE;
     if (step->snapshot_retry && !step->operation_active)
         return WL_CONTROLLED_STEP_SNAPSHOT_RETRYABLE;
     if (step->provenance_invalid
@@ -15596,8 +15726,10 @@ col_session_controlled_mutation_admit(wl_session_t *session, bool insert,
         && ((!step->general_observed
         && (!step->observed || step->callback_changed))
         || (step->general_observed && !step->transaction))) {
-        if (!step->complete || step->operation_active
-            || step->observer_cleanup_pending) return EBUSY;
+        if ((!step->complete && !wl_columnar_session_failed_retry_valid(sess,
+            step, true)) ||
+            step->operation_active ||
+            step->observer_cleanup_pending) return EBUSY;
         if (!relation || !sess->plan || !sess->plan->edb_declared_width
             || !sess->plan->edb_relations)
             return ENOTSUP;
@@ -15676,6 +15808,17 @@ col_session_controlled_mutation_committed(wl_session_t *session,
         return;
     wl_col_session_t *sess = COL_SESSION(session);
     wl_columnar_controlled_step_t *step = sess->controlled_step;
+    if (wl_columnar_session_failed_retry_quiescent(sess, step, true)) {
+        /* Only the facade's real successful admitted mutation reaches this
+         * notification. Incremental removal may create a retraction registry
+         * entry; refresh that actual container, never at read-only admission.
+         * No frame/transaction is live and public heads remain unchanged. */
+        step->failed_retry_registry = sess->rels;
+        step->failed_retry_count = sess->nrels;
+        step->failed_retry_mutated = true;
+        step->append_proven = false;
+        return;
+    }
     if (step && step->recursive_route && !insert) {
         /* Admission proved a quiescent authenticated boundary. The mutation
          * committed, so its new input generation deliberately supersedes the
