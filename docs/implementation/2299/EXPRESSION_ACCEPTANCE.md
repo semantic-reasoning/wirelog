@@ -57,7 +57,7 @@ ledger explicitly.
 | `WL_PLAN_EXPR_ARITH_SHA1` | open | admitted | unit7-digests |
 | `WL_PLAN_EXPR_ARITH_SHA256` | open | admitted | unit7-digests |
 | `WL_PLAN_EXPR_ARITH_SHA512` | open | admitted | unit7-digests |
-| `WL_PLAN_EXPR_ARITH_HMAC_SHA256` | open | open | open |
+| `WL_PLAN_EXPR_ARITH_HMAC_SHA256` | open | admitted | unit7-hmac |
 | `WL_PLAN_EXPR_ARITH_UUID4` | open | open | open |
 | `WL_PLAN_EXPR_ARITH_UUID5` | open | open | open |
 | `WL_PLAN_EXPR_CMP_EQ` | existing-numeric | admitted | baseline-numeric |
@@ -104,9 +104,9 @@ ledger explicitly.
 | `WL_PLAN_EXPR_ARITH_SHA1_S` | open | admitted | unit7-digests |
 | `WL_PLAN_EXPR_ARITH_SHA256_S` | open | admitted | unit7-digests |
 | `WL_PLAN_EXPR_ARITH_SHA512_S` | open | admitted | unit7-digests |
-| `WL_PLAN_EXPR_ARITH_HMAC_SHA256_SS` | open | open | open |
-| `WL_PLAN_EXPR_ARITH_HMAC_SHA256_SI` | open | open | open |
-| `WL_PLAN_EXPR_ARITH_HMAC_SHA256_IS` | open | open | open |
+| `WL_PLAN_EXPR_ARITH_HMAC_SHA256_SS` | open | admitted | unit7-hmac |
+| `WL_PLAN_EXPR_ARITH_HMAC_SHA256_SI` | open | admitted | unit7-hmac |
+| `WL_PLAN_EXPR_ARITH_HMAC_SHA256_IS` | open | admitted | unit7-hmac |
 | `WL_PLAN_EXPR_ARITH_UUID5_SS` | open | open | open |
 | `WL_PLAN_EXPR_ARITH_UUID5_SI` | open | open | open |
 | `WL_PLAN_EXPR_ARITH_UUID5_IS` | open | open | open |
@@ -950,3 +950,69 @@ not `-D...=0`; real enabled and disabled production builds are each analyzed.
 The disabled build never gains a mandatory PSA header dependency for linting.
 Unit7a does not qualify HMAC, UUID, extensions or the remaining recursive,
 pipeline and worker host intersections.
+
+## Unit7b: original HMAC import/MAC/destroy compatibility
+
+Four HMAC-SHA256 opcodes preserve the original message/key order and independent
+native/symbol selection. The helper calls init, prepares the original HMAC /
+SIGN_MESSAGE / HMAC(SHA256) attributes, imports the unchanged key, resets
+attributes after every import attempt, calls mac_compute with capacity32 and
+actual_len0, and attempts exactly one destroy before folding the complete32-byte
+MAC. Empty keys retain the original single zero-byte substitution. Import/MAC
+refusal, provider memory errors, short/long lengths and destroy failure remain
+semantic failures. There is no long-key normalization, multipart route, retry
+of provider refusal, inferred key policy or provider acceptance expansion.
+
+Attribute lifetime, imported-key authority and destroy-attempt state are
+separate. Ownership is acquired only on successful import, even if a failed
+provider writes an ID. Destroy consumes the local authority before the call;
+a failed status or postcall control stop cannot cause a second attempt. A real
+provider destroy failure may leave provider-owned resources unrecoverable, as
+with raw; tests destroy the real key before overriding its status. They do not
+claim unconditional provider recovery from an arbitrary destroy failure.
+
+T=224. ENTRY230, INIT231, FIRST_CLEANUP_PREPAY233, ATTRIBUTES234, IMPORT235,
+MAC237, NORMAL_DESTROY239 and FINAL241 are eight positive fixed packets. The
+unchanged32-byte hash fold contributes5T, so success is13T=2912. Init failure is
+3T=672; import failure6T=1344; MAC/wrong-length/destroy failure8T=1792; disabled
+semantics2T=448. Post-init232, post-import236, post-MAC238 and post-destroy240
+observe saved Original identity immediately after the call/ownership transition.
+Every fixed packet uses the existing G9+C13+T29 wrapper plus at most157 fixed
+caller actions (208<=224<=256): attribute initialization/setters, fixed native
+buffers, ownership booleans, reset/destroy call fronts and error routing contain
+no input-sized engine loops. Import/MAC/init/reset/destroy provider interiors
+are explicit synchronous cooperation or mandatory-cleanup boundaries.
+
+FIRST_CLEANUP_PREPAY precedes attribute preparation and import. Its bounded
+cleanup suffix resets live attributes and consumes one actual imported-key
+owner without checkpoints or control debit. Therefore cancellation, accounting
+error, Original END or denial of the normal destroy packet still completes
+mandatory local cleanup before returning the primary error. Post-destroy and
+final stops find consumed authority and cannot repeat destroy. Pre/post/final
+control errors keep outputs untouched and outrank pending semantic library
+failure; sticky positive accounting error keeps its normal precedence over
+later cancellation. Provider fault wrappers are test instrumentation, not
+engine control checkpoints in this mandatory suffix.
+
+Scalar242 admits pop/selection; each243 span admission independently resolves
+its actual intern string or copies into a distinct caller-owned native buffer.
+Existing metered C-string scanning owns each length traversal. Scalar244 splits
+message and key preparation;245 guards result interpretation. Fixed fronts
+retain the224/208 envelope. The binary producer and result remain INT64; arity
+and incompatible output declarations retain existing parser rejection. Disabled
+instructions execute preceding bytecode but skip span resolution and all PSA
+calls. Existing digest8-tag fees and qualification are unchanged.
+
+Tests retain digest assertions and add RFC/raw vectors, keys0/1/63/64/65/4096
+with actual provider refusal parity, all4 scalar/native/symbol/context variants,
+13 exact-prefix/one-short boundaries, each pre/post-call cancel/work/END/
+overflow seam, provider-memory faults and combined library/control failures.
+Wrappers assert exact attributes, bytes, capacity, actual length, reset and
+exactly-once key destruction. Actual FILTER/MAP covers all4 tags with typed
+values, false/empty controls and signed deletion events. Hot MAP and populated
+mixed LFTJ histories require exclusive real ownership, unchanged prior rows,
+Original report/successor0, no premature events, resource closure and retry.
+Long-message preparation stops after prior rows at the real512-byte scan seam
+and succeeds unchanged after reset. Disabled MAP ERANGE permits actual public
+input correction; disabled FILTER rejects rows. Inventory qualification is
+restricted to these four tags; UUID, extensions and broader host rows stay open.
