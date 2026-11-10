@@ -322,6 +322,9 @@ struct wl_columnar_eval_stack_cleanup_frame {
     wl_columnar_eval_stack_cleanup_frame_t *pending_prev;
     uint64_t cleanup_receipt_id;
     uint64_t cleanup_receipt_plan_epoch;
+    uint32_t cleanup_receipt_index;
+    bool cleanup_receipt_index_valid;
+    wl_columnar_eval_cleanup_receipt_key_t cleanup_receipt_index_key;
     eval_stack_t stack;
     eval_entry_t result;
     wl_columnar_memory_reservation_t reservation;
@@ -2531,16 +2534,40 @@ wl_columnar_eval_stack_cleanup_free(
             frame->session->cleanup_receipt_session_generation;
         key.receipt_id = frame->cleanup_receipt_id;
         key.plan_epoch = frame->cleanup_receipt_plan_epoch;
-        for (unsigned i = 0;
-            i < WL_COLUMNAR_EVAL_STACK_CLEANUP_MAX_FRAMES; ++i) {
-            wl_columnar_eval_cleanup_receipt_t *candidate
-                = &frame->session->cleanup_receipts[i];
-            if (candidate->state != WL_COLUMNAR_EVAL_CLEANUP_RECEIPT_FREE
-                && candidate->key.receipt_id == key.receipt_id
-                && candidate->key.session_generation == key.session_generation
-                && candidate->key.plan_epoch == key.plan_epoch) {
-                receipt = candidate;
-                break;
+        if (frame->cleanup_receipt_index_valid) {
+            uint32_t index = frame->cleanup_receipt_index;
+            if (index >=
+                WL_COLUMNAR_EVAL_STACK_CLEANUP_MAX_FRAMES) return EINVAL;
+            wl_columnar_eval_cleanup_receipt_t *candidate =
+                &frame->session->cleanup_receipts[index];
+            const wl_columnar_eval_cleanup_receipt_key_t *saved =
+                &frame->cleanup_receipt_index_key;
+            if (saved->receipt_id != key.receipt_id ||
+                saved->plan_epoch != key.plan_epoch
+                || saved->session_generation != key.session_generation
+                || candidate->state == WL_COLUMNAR_EVAL_CLEANUP_RECEIPT_FREE
+                || candidate->key.receipt_id != saved->receipt_id
+                || candidate->key.plan_epoch != saved->plan_epoch
+                || candidate->key.session_generation !=
+                saved->session_generation
+                || candidate->key.operation_attempt_id !=
+                saved->operation_attempt_id
+                || candidate->key.operation_id !=
+                saved->operation_id) return EINVAL;
+            receipt = candidate;
+        } else {
+            for (unsigned i = 0;
+                i < WL_COLUMNAR_EVAL_STACK_CLEANUP_MAX_FRAMES; ++i) {
+                wl_columnar_eval_cleanup_receipt_t *candidate
+                    = &frame->session->cleanup_receipts[i];
+                if (candidate->state != WL_COLUMNAR_EVAL_CLEANUP_RECEIPT_FREE
+                    && candidate->key.receipt_id == key.receipt_id
+                    && candidate->key.session_generation ==
+                    key.session_generation
+                    && candidate->key.plan_epoch == key.plan_epoch) {
+                    receipt = candidate;
+                    break;
+                }
             }
         }
         if (!receipt || (receipt->state !=
@@ -2595,6 +2622,11 @@ wl_columnar_eval_cleanup_receipt_find(wl_col_session_t *session,
         || key->session_generation !=
         session->cleanup_receipt_session_generation)
         return NULL;
+    uint32_t index = 0;
+    int indexed = wl_columnar_session_unary_cleanup_receipt_index(session, key,
+            &index);
+    if (!indexed) return &session->cleanup_receipts[index];
+    if (indexed != ENOENT) return NULL; /* Protected owner never rescans on refusal. */
     /* Fixed source extent, including a refused first receipt debit. The ID
      * is only a rejection filter; every candidate retains full key proof. */
 #if WL_COLUMNAR_EVAL_STACK_CLEANUP_MAX_FRAMES != 32u
@@ -2760,6 +2792,112 @@ wl_columnar_eval_stack_cleanup_receipt_key_protected(
     return frame->prepared_unary || (automatic->identity == automatic
            && automatic->frame == frame
            && automatic->phase != WL_COLUMNAR_EVAL_STACK_AUTO_UNUSED);
+}
+
+#ifdef WL_SESSION_TEST_HOOKS
+void (*wl_columnar_eval_stack_test_receipt_lookup_checkpoint)(
+    wl_evaluation_control_t *, unsigned, uint32_t);
+#endif
+static int
+wl_columnar_eval_stack_receipt_lookup_tail(wl_evaluation_control_t *funding,
+    uint64_t id, unsigned phase, uint32_t index)
+{
+#ifdef WL_SESSION_TEST_HOOKS
+    if (wl_columnar_eval_stack_test_receipt_lookup_checkpoint)
+        wl_columnar_eval_stack_test_receipt_lookup_checkpoint(funding, phase,
+            index);
+#else
+    (void)phase; (void)index;
+#endif
+    return wl_evaluation_control_charge_attempt(funding, id, 0);
+}
+
+/* One-time metered lookup, from this actual fresh frame's allocated key.
+ * Outputs remain unpublished on every refusal, including a missing match. */
+int
+wl_columnar_eval_stack_cleanup_receipt_find_frame_attempt(
+    wl_columnar_eval_stack_cleanup_frame_t *frame, uint32_t *index_out,
+    wl_columnar_eval_cleanup_receipt_key_t *out,
+    wl_evaluation_control_t *funding, uint64_t id)
+{
+    if (!frame || !frame->identity || !frame->session || !index_out || !out
+        || !funding || funding == frame->session->base.evaluation_control ||
+        !id)
+        return EINVAL;
+    int rc = wl_evaluation_control_charge_attempt(funding, id, 128);
+    if (rc) return rc;
+    rc = wl_columnar_eval_stack_receipt_lookup_tail(funding, id, 0, 0);
+    if (rc) return rc;
+    if (frame != frame->session->cleanup_active || frame->prepared_unary
+        || frame->stream_host || !frame->cleanup_receipt_id
+        || !frame->cleanup_receipt_plan_epoch) return EINVAL;
+    for (uint32_t i = 0; i < WL_COLUMNAR_EVAL_STACK_CLEANUP_MAX_FRAMES; ++i) {
+        rc = wl_evaluation_control_charge_attempt(funding, id, 192);
+        if (rc) return rc;
+        rc = wl_columnar_eval_stack_receipt_lookup_tail(funding, id, 1, i);
+        if (rc) return rc;
+        const wl_columnar_eval_cleanup_receipt_t *receipt =
+            &frame->session->cleanup_receipts[i];
+        if (receipt->state == WL_COLUMNAR_EVAL_CLEANUP_RECEIPT_FREE
+            || receipt->key.receipt_id != frame->cleanup_receipt_id
+            || receipt->key.plan_epoch != frame->cleanup_receipt_plan_epoch
+            || receipt->key.session_generation !=
+            frame->session->cleanup_receipt_session_generation) continue;
+        if (receipt->state != WL_COLUMNAR_EVAL_CLEANUP_RECEIPT_RESERVED
+            || !receipt->key.operation_attempt_id || !receipt->key.operation_id)
+            return EINVAL;
+        rc = wl_evaluation_control_charge_attempt(funding, id, 128);
+        if (rc) return rc;
+        rc = wl_columnar_eval_stack_receipt_lookup_tail(funding, id, 2, i);
+        if (rc) return rc;
+        *out = receipt->key; *index_out = i;
+        return 0;
+    }
+    return ENOENT;
+}
+
+/* Fixed lookup is valid only after the real birth scan and owning bind.
+ * Index is a location, never permission; every actual key field still matches. */
+int
+wl_columnar_eval_stack_cleanup_receipt_index_key_for_frame(
+    wl_columnar_eval_stack_cleanup_frame_t *frame, uint32_t index,
+    wl_columnar_eval_cleanup_receipt_key_t *out)
+{
+    if (!frame || !frame->identity || !frame->session || !out
+        || index >= WL_COLUMNAR_EVAL_STACK_CLEANUP_MAX_FRAMES
+        || !frame->cleanup_receipt_id || !frame->cleanup_receipt_plan_epoch
+        || frame->prepared_unary || frame->stream_dispatch) return EINVAL;
+    const wl_columnar_eval_cleanup_receipt_t *receipt =
+        &frame->session->cleanup_receipts[index];
+    if (receipt->state == WL_COLUMNAR_EVAL_CLEANUP_RECEIPT_FREE
+        || receipt->key.receipt_id != frame->cleanup_receipt_id
+        || receipt->key.plan_epoch != frame->cleanup_receipt_plan_epoch
+        || receipt->key.session_generation !=
+        frame->session->cleanup_receipt_session_generation
+        || frame->framed.identity != &frame->framed
+        || frame->framed.frame != frame ||
+        frame->framed.session != frame->session
+        || receipt->key.operation_attempt_id != frame->framed.attempt_id
+        || receipt->key.operation_id != frame->framed.operation_identity)
+        return EINVAL;
+    *out = receipt->key;
+    return 0;
+}
+
+int
+wl_columnar_eval_stack_cleanup_receipt_frame_index_bind(
+    wl_columnar_eval_stack_cleanup_frame_t *frame, uint32_t index,
+    const wl_columnar_eval_cleanup_receipt_key_t *key)
+{
+    wl_columnar_eval_cleanup_receipt_key_t actual;
+    if (wl_columnar_eval_stack_cleanup_receipt_index_key_for_frame(frame, index,
+        &actual)
+        || !wl_columnar_eval_cleanup_receipt_key_equal(key,
+        &actual)) return EINVAL;
+    frame->cleanup_receipt_index_key = actual;
+    frame->cleanup_receipt_index = index;
+    frame->cleanup_receipt_index_valid = true;
+    return 0;
 }
 
 int
@@ -3181,18 +3319,35 @@ wl_columnar_eval_stack_cleanup_receipt_host_internal(
     source_rc = source ? wl_session_source_finance_charge(source,
             80) : 0;
     if (source_rc) return source_rc;
-    wl_columnar_eval_cleanup_receipt_t *receipt =
-        wl_columnar_eval_cleanup_receipt_find(session, key);
-    if (!receipt) return ENOENT;
-    if (!request->funding || request->funding == request->operation
-        || !request->funding_id
-        || wl_evaluation_control_active_attempt_id(request->funding)
-        != request->funding_id)
-        return EINVAL;
     if (source) {
+        /* Keep the established gateway prefix in its own actual generation.
+         * This80 cell covers checked settlement/rebegin and the next front. */
         source_rc = wl_session_source_finance_finish(source);
         if (source_rc) return source_rc;
+        source_rc = wl_session_source_finance_rebegin(source);
+        if (source_rc) return source_rc;
+        source_rc = wl_session_source_finance_charge(source, 224);
     }
+    wl_columnar_eval_cleanup_receipt_t *receipt = NULL;
+    int lookup_protocol = 0;
+    if (!source_rc) {
+        receipt = wl_columnar_eval_cleanup_receipt_find(session, key);
+        if (!receipt) lookup_protocol = ENOENT;
+        else if (!request->funding || request->funding == request->operation
+            || !request->funding_id
+            || wl_evaluation_control_active_attempt_id(request->funding)
+            != request->funding_id)
+            lookup_protocol = EINVAL;
+        /* A missing/invalid lookup also reaches the real post-lookup check.
+         * Fresh224+32 has outstanding at most256, without assumed progress. */
+        if (source) source_rc = wl_session_source_finance_charge(source, 32);
+    }
+    if (source && source->active) {
+        int finish_rc = wl_session_source_finance_finish(source);
+        if (!source_rc) source_rc = finish_rc;
+    }
+    if (source_rc) return source_rc;
+    if (lookup_protocol) return lookup_protocol;
     /* No callback can invalidate this fresh full-key match at admission. */
     int rc = wl_evaluation_control_charge_attempt(request->funding,
             request->funding_id, WL_COLUMNAR_EVAL_SERIAL_FRAMED_HOST_WORK);

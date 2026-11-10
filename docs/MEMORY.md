@@ -6385,5 +6385,126 @@ batching, preserving separate positive checkpoints around finish/publication.
 | New attempt accepted | Old receipt flags consumed before forward work; new private image built from real current EDB | Existing publication/cutoff protocol |
 
 A live unrelated control generation does not become funding or replay authority.
-The unchanged non-JOIN Original-END retained-child gap needs its own authenticated
-native cleanup proof; absence of physical bytes never substitutes for ACK.
+Original-END unary retirement uses the separate authenticated owner below;
+absence of physical bytes never substitutes for ACK.
+
+
+#### Ordinary observed unary retirement after Original END (#2299)
+
+`wl_columnar_controlled_step.unary_cleanup` is a distinct owning record,
+registered by `wl_columnar_session_unary_cleanup_register` before framed begin
+returns to any callback-capable child. Its metered shape scan admits actual
+VARIABLE/FILTER/MAP/CONSOLIDATE compositions. JOIN, CONCAT and LFTJ keep their
+separate recovery owners. The dormant record binds the real session/step,
+transaction/head/bindings generation, frame/context, Original identity/attempt,
+operation identity, native thread and receipt key. It grants no forward work.
+Registration publishes once after all fallible admissions. A registration
+refusal leaves no record; the fresh framed bootstrap rolls back its pin and
+actual receipt before any child runs.
+
+| Owner phase | Required live authority | Legal work |
+|---|---|---|
+| INERT, registered | Real frame/ctx/transaction birth; Original still active | Existing forward host only |
+| CHILD | Registered root, creator thread, actual frame/ctx, binding generation/head, exact first receipt | Consume the actual pending action once, then retire existing scalar/program/table/batch/source owners; real child ACK and frame receipt ACK |
+| DISPOSE | Real recorded transaction with closed child generation, no child/receipt/frame/pending grant; same head/count/generation | Existing maintenance-financed private disposal cursors |
+| FINAL | Actual child/receipt ACK and transaction disposal; no retirement/source/staging debt | Fixed terminal bookkeeping and financial footer |
+| DONE | Record cleared only after actual closure | Idle public STEP replay, or the existing snapshot retry entry |
+
+`wl_columnar_session_unary_cleanup_pending` protects admission even if a deeper
+proof or creator-thread check fails. Every action separately proves authority;
+a financial admission is never permission. Independent SOURCE funds outer
+proof/dispatch, actual framed grants fund native child actions, and transaction
+maintenance funds its own disposal. Neither Original nor a new successor is
+charged, cancelled, reset or finished by this path. Matching immutable Original
+REPORT can preserve an already recorded positive execution error over later
+identity-loss EINVAL; overwritten reports confer no inferred history. Once
+latched, the native cause is frozen.
+
+The actual receipt location is discovered once with a metered scan, before
+framed begin publishes any callback-capable child. ENTRY128, one SLOT192 per
+inspected record, and FINAL128 guard the copied index/full key; refusal leaves
+outputs unchanged. The real frame and session record retain that index only
+after exact owning key validation. Later proof, physical frame free and receipt
+read/ACK validate the indexed record without rescanning; a mismatch never falls
+back to a generic lookup for this owner. General component APIs keep their
+existing full receipt domain.
+
+A legal no-callback cold empty FILTER can leave its own committed FREED receipt
+at0; a hot observed successor legitimately owns1. This repair preserves the
+historical receipt and never manufactures its ACK. Full session generation,
+receipt ID, plan epoch, operation attempt and operation identity prevent slot
+reuse from creating authority. Displacement is refused both while the frame is
+active and after physical free but before actual ACK. Missing lookup or denied
+binding retains the actual fresh bootstrap rollback; it does not activate a
+child. The fixed frame cache remains valid after framed context retirement only
+for its genuine physical-free obligation.
+
+| Financial region | Positive admissions / allowance |
+|---|---|
+| Registration | Fixed960:128 entry +192 root +192 binding +192 key/thread +128 indexed bind +128 publication; plus192 per actual plan op and the separate receipt lookup256+192*K |
+| Birth capacity | 8128+192 per actual head op covers two384 host fronts, fixed960 and maximum32-record lookup6400; actual inspected records alone are debited |
+| Repeated native proof | Four192 root/frame/binding/key regions +128 pending-result association +192 immutable-report/cause region =1088 |
+| Dispatcher | Own SOURCE2304 capacity;140 selection,80 busy/thread,96 slot,1088 origin/child proof or192 retirement proof; separate60/64/96 action and128 return stages |
+| Host SOURCE | Distinct2048 capacity for unary entry/gateway/late phases; gateway includes1088 proof and retains its existing financial cuts |
+| Native child cell | Minimum4096 capacity: two1088 proofs +384 facade +384 framed +128 child +200 latch +32 dispatch =3304; unused capacity is not debited |
+| Physical disposal | Existing per-slot prepayments and independent maintenance cursors; no whole-drain allowance |
+
+Every new registration/lookup/proof admission is <=256. Existing host and
+financial payments retain their separate documented contracts. Registration regions conservatively fit128
+or192 including fixed caller/refusal tails: publication has fewer than80 fixed
+source actions, root/binding/key regions fewer than160. Proof root/frame/binding/
+key regions each fit192; pending association fits128; report accessor, exact-ID
+check and cause-selection/return fit192. The once-metered receipt lookup removes variable receipt searches from later
+indexed proof/free/read/ACK regions. SOURCE capacity covers its
+own lexical phase only, never the native grant. Normal ACK clears the dormant
+record; a new operation clears DONE before a new birth.
+
+The dormant selector precedes cleanup SOURCE construction: its fixed read-only
+root/active-generation observation fits128 source actions and exposes no factory
+or report callback for unselected live work. Invalid inner provenance stays
+selected and protected; every selected action retains the complete funded proof.
+Registration capacity is derived from the actual immutable head's uint32 op count
+using uint64 arithmetic (maximum fits without overflow); the per-op192 and
+per-receipt192 checks remain separate.
+Larger expression projection lists therefore cannot repeatedly exhaust a fixed
+birth grant before reaching publication. This capacity is not a native drain
+allowance and changes no executed-work charge.
+
+Indexed generic receipt resolution is a mechanical accelerator, never a native
+permission check. It uses only registered-key presence, full-key equality,
+bounded index and actual slot equality/state; an invalid selected index refuses
+without falling back to a search. Full root/thread/frame/binding proof remains
+mandatory at each native caller. Unrelated keys retain the cheap legacy lookup.
+The receipt gateway retains its original SOURCE80 prefix, then genuinely
+finishes/rebegins before a separately admitted lookup224 and post-lookup32.
+That fresh256 generation is finished on success and staged lookup/funding error
+before native384 admission; neither the outer return81 nor later LATE work can
+borrow it. Direct unary receipt reads use192 rather than104. Conservative fixed ceilings are24 prefix/arguments,80 location/full-key
+checks,40 copied status and32 caller/return =176<=192. Native grant accounting
+remains separate. Indexed physical frame retirement adds fixed saved-key versus
+frame/record comparisons, within its existing independently prepaid256 physical
+cell (conservative whole caller/free/release ceiling224); it never runs another
+receipt search after binding.
+
+
+Genuine receipt ACK completion has its own retained journal. A registered unary
+ACK caller prepays a fixed192 region before invoking the irreversible ACK; a
+one-short refusal returns resumable EAGAIN before ACK and preserves its owner.
+Successful ACK records the actual full key/index, result, session receipt
+generation and next receipt/plan serials before the financial-finish hook.
+Normal same-Original ACK clears the dormant registration. If that hook ends
+Original, the journal and registration remain until authenticated disposal.
+A FREE slot or absent frame alone never proves that ACK occurred.
+
+After such an END, the ACKED transfer uses independent SOURCE: four192 proof
+regions cover root/thread/Original identity, transaction bindings, full key/index
+and receipt serial/quiescence, and retained report/cause;128 prepays publication.
+Only that genuine matching journal closes the actual child generation and clears
+its receipt state, then selects private transaction disposal. It never repeats
+ACK, reads freed frame/context storage or charges Original/successor. Reused
+slots, changed serials or invalid provenance remain protected. Financial refusal
+at any proof/transition is resumable and leaves publication for a funded retry.
+Indexed receipt status/retry/ACK SOURCE lookup uses the separate224+32 generation
+above; direct copied-status accounting is96. These funds remain distinct from
+the native child grant. Host TUPLE is96 only for registered unary ownership,
+with actual processed lower16 before CLOSE176; other routes keep72/CLOSE176.
