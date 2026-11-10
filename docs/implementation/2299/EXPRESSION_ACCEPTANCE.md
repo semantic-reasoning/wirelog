@@ -58,8 +58,8 @@ ledger explicitly.
 | `WL_PLAN_EXPR_ARITH_SHA256` | open | admitted | unit7-digests |
 | `WL_PLAN_EXPR_ARITH_SHA512` | open | admitted | unit7-digests |
 | `WL_PLAN_EXPR_ARITH_HMAC_SHA256` | open | admitted | unit7-hmac |
-| `WL_PLAN_EXPR_ARITH_UUID4` | open | open | open |
-| `WL_PLAN_EXPR_ARITH_UUID5` | open | open | open |
+| `WL_PLAN_EXPR_ARITH_UUID4` | open | admitted | unit7-uuid-numeric |
+| `WL_PLAN_EXPR_ARITH_UUID5` | open | admitted | unit7-uuid-numeric |
 | `WL_PLAN_EXPR_CMP_EQ` | existing-numeric | admitted | baseline-numeric |
 | `WL_PLAN_EXPR_CMP_NEQ` | existing-numeric | admitted | baseline-numeric |
 | `WL_PLAN_EXPR_CMP_LT` | existing-numeric | admitted | baseline-numeric |
@@ -107,9 +107,9 @@ ledger explicitly.
 | `WL_PLAN_EXPR_ARITH_HMAC_SHA256_SS` | open | admitted | unit7-hmac |
 | `WL_PLAN_EXPR_ARITH_HMAC_SHA256_SI` | open | admitted | unit7-hmac |
 | `WL_PLAN_EXPR_ARITH_HMAC_SHA256_IS` | open | admitted | unit7-hmac |
-| `WL_PLAN_EXPR_ARITH_UUID5_SS` | open | open | open |
-| `WL_PLAN_EXPR_ARITH_UUID5_SI` | open | open | open |
-| `WL_PLAN_EXPR_ARITH_UUID5_IS` | open | open | open |
+| `WL_PLAN_EXPR_ARITH_UUID5_SS` | open | admitted | unit7-uuid-numeric |
+| `WL_PLAN_EXPR_ARITH_UUID5_SI` | open | admitted | unit7-uuid-numeric |
+| `WL_PLAN_EXPR_ARITH_UUID5_IS` | open | admitted | unit7-uuid-numeric |
 
 ## Value, error and context contract
 
@@ -1016,3 +1016,81 @@ Long-message preparation stops after prior rows at the real512-byte scan seam
 and succeeds unchanged after reset. Disabled MAP ERANGE permits actual public
 input correction; disabled FILTER rejects rows. Inventory qualification is
 restricted to these four tags; UUID, extensions and broader host rows stay open.
+
+## Unit7c1: five numeric UUID routes
+
+UUID4 and the four numeric UUID5 operand variants preserve their original PSA
+routes. UUID4 calls init and generate_random16, sets version4/variant10 and
+copies the first native int64 bytes. Only byte6 version is observable in this
+8-byte result; tests do not invent an observable byte8 variant. UUID5 keeps
+init, SHA1 setup, optional first header, first complete data update, optional
+second header, second complete data update and finish20 with actual_len0.
+It never substitutes hash_compute, subdivides provider updates or XXH-folds
+the digest. Numeric conversion sets version5/variant10 and copies the native
+first8 bytes. Provider bodies remain explicit synchronous boundaries; input
+update latency is not claimed to be inside the engine quantum.
+
+Base UUID5 always uses native8+8 unframed bytes even for valid intern IDs.
+SS/SI/IS resolve each selected symbol separately, use first-NUL C-string bytes,
+and retain native-byte fallback and the original diagnostic for invalid IDs or
+missing context. Framed operands use the actual resolved type byte S/I, LE64
+length and exact operand bytes. Two distinct caller-owned native buffers stay
+stable through the synchronous operation. Each9-byte header is built through
+nine separately admitted stores, followed by one complete9-byte update.
+
+Operation state initialization is also engine work. The installed PSA hash
+operation is232 bytes; a single runtime aggregate zeroing would not establish
+the claimed fixed source bound. The implementation instead copies the exact
+static `PSA_HASH_OPERATION_INIT` representation into an uninitialized actual
+local operation in separately admitted chunks of at most8 bytes. No active
+operation is copied, no all-zero representation is assumed, and no API can
+read partially initialized state. STATE_INIT301 separately funds scalar flags
+and digest20 initialization. Each318 copy interval conservatively counts at
+most12 actions per byte (96), guard51 and a complete64-action fixed allowance
+for indexing/loop/return/next-admission:211<=224<256. Other fixed caller regions
+retain their208 bound. There is no per-call whole-state assignment or bulk
+zeroing hidden outside these cuts.
+
+Let T=224 and I=sizeof(operation)/8 plus1 if a remainder exists. Current ABI
+has I29. Pair helper success is(9+I)T unframed and(29+I)T framed, currently38T
+and58T. Enabled semantic-fault prefixes addI to the original fixed ordinals:
+init5, setup6; unframed firstdata7, seconddata8, finish9; framed firstheader16,
+firstdata17, secondheader27, seconddata28, finish29. Each includes exactly one
+semantic FINAL315. Disabled pair remains2T and does no state initialization or
+operand lookup. UUID4 helper success is4T, init failure3T, random failure4T,
+disabled2T. Scalar decode, operand scans/preparation and numeric conversion /
+return347/348 are separate funding, not included in pair-helper tariffs.
+
+Abort caller credit302 precedes setup. Setup-attempted state is acquired before
+the setup call, so failed setup also follows the original abort path. Any
+control stop or provider failure after that point aborts once without engine
+checkpoints or successor debit. Abort authority is consumed before the call;
+failure cannot trigger a repeated attempt or replace a primary control error.
+A successful expected-length finish consumes the operation before postfinish314;
+no abort follows a subsequent control stop. Wrong-length success retains raw's
+idempotent abort. Fault wrappers perform actual cleanup before overriding its
+status; arbitrary provider cleanup failure is not promised recoverable.
+Every semantic result/error still passes final saved-Original guard315. Partial
+state-copy stops own no provider call, setup authority or abort obligation.
+
+Tests independently check SHA1/native/frame vectors, exact original API
+arguments and update counts (including empty/default-fallback scalar inputs),
+UUID4 deterministic entropy and actual observable structure, all prefix and
+one-short limits, every8-byte state-copy offset, pre/post provider seams,
+mid-header construction, wrong lengths and combined abort/control failures.
+All nonzero control returns preserve output sentinels and failed flag; frozen
+Original and successor0 are checked before actual reset/retry. Scalar tests
+include underflow and capped-stack nullary producer behavior. Malformed arity
+and incompatible output declarations retain parser rejection.
+
+Compiler-selected FILTER/MAP tests require all5 opcode counters with accepted,
+false and empty rows; exact typed values, signed deletion and no duplicate
+future-call events; hot prior-row nonpublication, unchanged relation generation,
+resource closure and successful retry. Populated independent LFTJ heads retain
+exclusive real owners. Stops after UUID4 random and incomplete UUID5 data update
+check actual abort0/1; long operand preparation stops at a real512-byte seam
+before operation setup. Provider failures map to ERANGE with successful retry.
+Real random UUID4 raw/controlled hosts compare structure and full-tuple signed
+ledgers, never accidental literal equality. Disabled FILTER rejects rows and
+MAP ERANGE permits public input correction. Qualification is limited to these
+five numeric tags. RFC STRING UUID5, extensions and remaining hosts stay open.

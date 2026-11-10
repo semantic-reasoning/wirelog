@@ -3527,6 +3527,20 @@ wl_columnar_expr_scalar_crypto_tag(uint8_t tag)
 }
 
 static bool
+wl_columnar_expr_scalar_uuid_tag(uint8_t tag)
+{
+    switch ((wl_plan_expr_tag_t)tag) {
+    case WL_PLAN_EXPR_ARITH_UUID4:
+    case WL_PLAN_EXPR_ARITH_UUID5:
+    case WL_PLAN_EXPR_ARITH_UUID5_SS:
+    case WL_PLAN_EXPR_ARITH_UUID5_SI:
+    case WL_PLAN_EXPR_ARITH_UUID5_IS:
+        return true;
+    default: return false;
+    }
+}
+
+static bool
 wl_columnar_expr_scalar_hmac_tag(uint8_t tag)
 {
     switch ((wl_plan_expr_tag_t)tag) {
@@ -3586,6 +3600,11 @@ wl_columnar_expr_scalar_decode(const uint8_t *bytes, uint32_t size,
         *pos += length;
         break;
     }
+    case WL_PLAN_EXPR_ARITH_UUID4:
+    case WL_PLAN_EXPR_ARITH_UUID5:
+    case WL_PLAN_EXPR_ARITH_UUID5_SS:
+    case WL_PLAN_EXPR_ARITH_UUID5_SI:
+    case WL_PLAN_EXPR_ARITH_UUID5_IS:
     case WL_PLAN_EXPR_ARITH_HMAC_SHA256:
     case WL_PLAN_EXPR_ARITH_HMAC_SHA256_SS:
     case WL_PLAN_EXPR_ARITH_HMAC_SHA256_SI:
@@ -3685,6 +3704,7 @@ wl_columnar_expr_compile_scalar_attempt_controlled(const uint8_t *bytes,
         case WL_PLAN_EXPR_VAR: case WL_PLAN_EXPR_VAR_FLOAT:
         case WL_PLAN_EXPR_VAR_STRING: case WL_PLAN_EXPR_CONST_INT:
         case WL_PLAN_EXPR_CONST_FLOAT: case WL_PLAN_EXPR_CONST_STR:
+        case WL_PLAN_EXPR_ARITH_UUID4:
         case WL_PLAN_EXPR_BOOL:
             break;
         case WL_PLAN_EXPR_STR_FN_STR_REPLACE:
@@ -3798,7 +3818,8 @@ wl_columnar_expr_scalar_result_type_attempt_controlled(
         owner->producer.op == WL_PLAN_EXPR_VAR_STRING
         || owner->producer.op ==
         WL_PLAN_EXPR_CONST_STR) result = WIRELOG_TYPE_STRING;
-    else if (wl_columnar_expr_scalar_hmac_tag(owner->producer.op) ||
+    else if (wl_columnar_expr_scalar_uuid_tag(owner->producer.op) ||
+        wl_columnar_expr_scalar_hmac_tag(owner->producer.op) ||
         wl_columnar_expr_scalar_crypto_tag(owner->producer.op) ||
         owner->producer.op == WL_PLAN_EXPR_ARITH_HASH_S ||
         owner->producer.op == WL_PLAN_EXPR_ARITH_CRC32_ETH_S ||
@@ -4227,6 +4248,28 @@ wl_columnar_expr_scalar_hmac_span(int64_t operand, bool symbol,
     *data = native; *length = sizeof(operand);
     return 0;
 }
+
+static int
+wl_columnar_expr_scalar_uuid_span(int64_t operand, bool symbol,
+    wl_intern_t *intern, uint8_t *native, const uint8_t **data, size_t *length,
+    wl_evaluation_control_t *control, uint64_t id)
+{
+    int rc = wl_columnar_expr_scalar_region(control, id, 343, 0);
+    if (rc) return rc;
+    const char *text = symbol && intern ? wl_intern_reverse(intern,
+            operand) : NULL;
+    if (text) {
+        *data = (const uint8_t *)text;
+        return wl_columnar_expr_cstr_length_attempt_controlled(text, length,
+                   control, id);
+    }
+    if (symbol) WL_LOG(WL_LOG_SEC_EVAL, WL_LOG_DEBUG,
+            "digest operand %" PRId64 " is declared symbol but names no "
+            "interned string: digesting its int64 representation", operand);
+    memcpy(native, &operand, sizeof(operand));
+    *data = native; *length = sizeof(operand);
+    return 0;
+}
 #endif
 
 int
@@ -4274,6 +4317,62 @@ wl_columnar_expr_eval_scalar_attempt_controlled(
             if (rc) return rc;
             expr_push_string(&stack, v, owner->bytes + in.iarg,
                 (uint32_t)in.larg);
+        } else if (wl_columnar_expr_scalar_uuid_tag(in.op)) {
+            rc = wl_columnar_expr_scalar_region(control, id, 340, in.op);
+            if (rc) return rc;
+            int64_t result = 0; bool uuid_failed = false;
+            if (in.op == WL_PLAN_EXPR_ARITH_UUID4) {
+                rc = wl_columnar_expr_crypto_uuid4_attempt_controlled(&result,
+                        &uuid_failed, control, id);
+                if (rc) return rc;
+            } else {
+                int64_t name = expr_pop(&stack), namespace = expr_pop(&stack);
+                uint8_t digest[20];
+#ifdef WL_MBEDTLS_ENABLED
+                bool ns_symbol = in.op == WL_PLAN_EXPR_ARITH_UUID5_SS
+                    || in.op == WL_PLAN_EXPR_ARITH_UUID5_SI;
+                bool name_symbol = in.op == WL_PLAN_EXPR_ARITH_UUID5_SS
+                    || in.op == WL_PLAN_EXPR_ARITH_UUID5_IS;
+                uint8_t ns_native[sizeof(namespace)], name_native[sizeof(name)];
+                const uint8_t *ns_data, *name_data;
+                size_t ns_length, name_length;
+                rc = wl_columnar_expr_scalar_uuid_span(namespace, ns_symbol,
+                        intern, ns_native, &ns_data, &ns_length, control, id);
+                if (rc) return rc;
+                rc = wl_columnar_expr_scalar_region(control, id, 344, in.op);
+                if (rc) return rc;
+                rc = wl_columnar_expr_scalar_uuid_span(name, name_symbol,
+                        intern,
+                        name_native, &name_data, &name_length, control, id);
+                if (rc) return rc;
+                rc = wl_columnar_expr_crypto_uuid_pair_attempt_controlled(
+                    in.op != WL_PLAN_EXPR_ARITH_UUID5,
+                    ns_data == ns_native ? (uint8_t)'I' : (uint8_t)'S', ns_data,
+                    ns_length,
+                    name_data == name_native ? (uint8_t)'I' : (uint8_t)'S',
+                    name_data, name_length,
+                    digest, &uuid_failed, control, id);
+#else
+                (void)name; (void)namespace;
+                rc = wl_columnar_expr_crypto_uuid_pair_attempt_controlled(
+                    in.op != WL_PLAN_EXPR_ARITH_UUID5, 0, NULL, 0, 0, NULL, 0,
+                    digest, &uuid_failed, control, id);
+#endif
+                if (rc) return rc;
+                rc = wl_columnar_expr_scalar_region(control, id, 347, in.op);
+                if (rc) return rc;
+                if (!uuid_failed) {
+                    digest[6] = (uint8_t)((digest[6] & 0x0f) | 0x50);
+                    digest[8] = (uint8_t)((digest[8] & 0x3f) | 0x80);
+                    memcpy(&result, digest, sizeof(result));
+                }
+            }
+            rc = wl_columnar_expr_scalar_region(control, id, 348, in.op);
+            if (rc) return rc;
+            if (uuid_failed) {
+                semantic = true; break;
+            }
+            expr_push(&stack, result);
         } else if (wl_columnar_expr_scalar_hmac_tag(in.op)) {
             rc = wl_columnar_expr_scalar_region(control, id, 242, in.op);
             if (rc) return rc;

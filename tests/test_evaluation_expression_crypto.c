@@ -1421,17 +1421,1173 @@ static void hmac_compiler_policy(void) {
     CHECK(native && native == hmac_output_type_policy(true));
 }
 
+#ifdef WL_MBEDTLS_ENABLED
+extern psa_status_t (*wl_columnar_expr_crypto_uuid_test_init)(void);
+extern psa_status_t (*wl_columnar_expr_crypto_uuid_test_random)(uint8_t *,
+    size_t);
+extern psa_status_t (*wl_columnar_expr_crypto_uuid_test_setup)(
+    psa_hash_operation_t *, psa_algorithm_t);
+extern psa_status_t (*wl_columnar_expr_crypto_uuid_test_update)(
+    psa_hash_operation_t *, const uint8_t *, size_t);
+extern psa_status_t (*wl_columnar_expr_crypto_uuid_test_finish)(
+    psa_hash_operation_t *, uint8_t *, size_t, size_t *);
+extern psa_status_t (*wl_columnar_expr_crypto_uuid_test_abort)(
+    psa_hash_operation_t *);
+enum {U_REAL, U_INIT_FAIL, U_SETUP_FAIL, U_UPDATE_FAIL, U_FINISH_FAIL, U_SHORT,
+      U_LONG, U_RANDOM_FAIL};
+static unsigned u_fault, u_init_calls, u_setup_calls, u_updates, u_finish_calls,
+    u_abort_calls, u_random_calls, u_fail_update;
+static bool u_framed, u_live, u_abort_fail;
+static psa_hash_operation_t *u_operation;
+static const uint8_t *u_first, *u_second;
+static size_t u_first_length, u_second_length;
+static uint8_t u_first_header[9], u_second_header[9];
+static psa_status_t u_init(void) {
+    ++u_init_calls;
+    return u_fault == U_INIT_FAIL ? PSA_ERROR_NOT_SUPPORTED : psa_crypto_init();
+}
+static psa_status_t u_random(uint8_t *output, size_t length) {
+    CHECK(!u_random_calls++ && length == 16);
+    if (u_fault == U_RANDOM_FAIL) return PSA_ERROR_NOT_SUPPORTED;
+    memset(output, 0xab, length); return PSA_SUCCESS;
+}
+static psa_status_t u_setup(psa_hash_operation_t *operation,
+    psa_algorithm_t algorithm) {
+    CHECK(!u_setup_calls++ && !u_live && algorithm == PSA_ALG_SHA_1);
+    u_operation = operation;
+    if (u_fault == U_SETUP_FAIL) return PSA_ERROR_NOT_SUPPORTED;
+    psa_status_t status = psa_hash_setup(operation, algorithm);
+    CHECK(status == PSA_SUCCESS); u_live = true; return status;
+}
+static psa_status_t u_update(psa_hash_operation_t *operation,
+    const uint8_t *data, size_t length) {
+    CHECK(operation == u_operation && u_live);
+    unsigned ordinal = u_updates++;
+    if (u_framed && (ordinal == 0 || ordinal == 2))
+        CHECK(length == 9 && !memcmp(data,
+            ordinal ? u_second_header : u_first_header, 9));
+    else {
+        bool first = u_framed ? ordinal == 1 : ordinal == 0;
+        CHECK(ordinal < (u_framed ? 4u : 2u) &&
+            data == (first ? u_first : u_second) &&
+            length == (first ? u_first_length : u_second_length));
+    }
+    if (u_fault == U_UPDATE_FAIL &&
+        u_updates == u_fail_update) return PSA_ERROR_NOT_SUPPORTED;
+    return psa_hash_update(operation, data, length);
+}
+static psa_status_t u_finish(psa_hash_operation_t *operation, uint8_t *output,
+    size_t capacity, size_t *actual) {
+    CHECK(!u_finish_calls++ && operation == u_operation && u_live &&
+        capacity == 20 && !*actual);
+    if (u_fault == U_FINISH_FAIL) return PSA_ERROR_NOT_SUPPORTED;
+    psa_status_t status = psa_hash_finish(operation, output, capacity, actual);
+    CHECK(status == PSA_SUCCESS && *actual == 20); u_live = false;
+    if (u_fault == U_SHORT) --*actual;
+    if (u_fault == U_LONG) ++*actual;
+    return status;
+}
+static psa_status_t u_abort(psa_hash_operation_t *operation) {
+    CHECK(!u_abort_calls++ && operation == u_operation);
+    CHECK(psa_hash_abort(operation) == PSA_SUCCESS); u_live = false;
+    return u_abort_fail ? PSA_ERROR_GENERIC_ERROR : PSA_SUCCESS;
+}
+static void u_shim(bool framed, unsigned fault, unsigned fail_update,
+    uint8_t first_tag, const uint8_t *first, size_t first_length,
+    uint8_t second_tag, const uint8_t *second, size_t second_length) {
+    CHECK(!u_live); u_operation = NULL; u_framed = framed; u_fault = fault;
+    u_fail_update = fail_update; u_abort_fail = false;
+    u_init_calls = u_setup_calls = u_updates = u_finish_calls = u_abort_calls =
+        u_random_calls = 0;
+    u_first = first; u_first_length = first_length; u_second = second;
+    u_second_length = second_length;
+    u_first_header[0] = first_tag; u_second_header[0] = second_tag;
+    for (unsigned i = 0; i < 8; ++i) {
+        u_first_header[i+1] = (uint8_t)((uint64_t)first_length >> (8*i));
+        u_second_header[i+1] = (uint8_t)((uint64_t)second_length >> (8*i));
+    }
+    wl_columnar_expr_crypto_uuid_test_init = u_init;
+    wl_columnar_expr_crypto_uuid_test_random = u_random;
+    wl_columnar_expr_crypto_uuid_test_setup = u_setup;
+    wl_columnar_expr_crypto_uuid_test_update = u_update;
+    wl_columnar_expr_crypto_uuid_test_finish = u_finish;
+    wl_columnar_expr_crypto_uuid_test_abort = u_abort;
+}
+static void u_unshim(void) {
+    CHECK(!u_live);
+    wl_columnar_expr_crypto_uuid_test_init = NULL;
+    wl_columnar_expr_crypto_uuid_test_random = NULL;
+    wl_columnar_expr_crypto_uuid_test_setup = NULL;
+    wl_columnar_expr_crypto_uuid_test_update = NULL;
+    wl_columnar_expr_crypto_uuid_test_finish = NULL;
+    wl_columnar_expr_crypto_uuid_test_abort = NULL;
+}
+#endif
+static void u_from_hex(const char *hex, uint8_t *bytes, size_t length) {
+    for (size_t i = 0; i < length; ++i) {
+        unsigned value;
+        CHECK(sscanf(hex+2*i, "%2x", &value) == 1); bytes[i] = (uint8_t)value;
+    }
+}
+
+#ifdef WL_MBEDTLS_ENABLED
+static unsigned u_state_packets(void) {
+    return (unsigned)(sizeof(psa_hash_operation_t)/8 +
+           (sizeof(psa_hash_operation_t)%8 != 0));
+}
+#endif
+static void uuid_pair_oracles(void) {
+    const uint8_t first[] = "ab", second[] = "c";
+    for (unsigned framed = 0; framed < 2; ++framed) {
+        uint8_t expected[20]; u_from_hex(framed ?
+            "8485069ab79f21cdfc505919828c910ee9805041" :
+            "a9993e364706816aba3e25717850c26c9cd0d89d", expected, 20);
+#ifdef WL_MBEDTLS_ENABLED
+        const unsigned faults[] = {U_REAL, U_INIT_FAIL, U_SETUP_FAIL,
+                                   U_UPDATE_FAIL,
+                                   U_FINISH_FAIL, U_SHORT, U_LONG};
+#else
+        const unsigned faults[] = {0};
+#endif
+        for (unsigned f = 0; f < sizeof(faults)/sizeof(*faults); ++f) {
+            unsigned updates = framed ? 4 : 2;
+#ifdef WL_MBEDTLS_ENABLED
+            if (faults[f] != U_UPDATE_FAIL) updates = 1;
+#endif
+            for (unsigned cut = 1; cut <= updates; ++cut)
+                for (unsigned below = 0; below < 2; ++below) {
+#ifdef WL_MBEDTLS_ENABLED
+                    unsigned fault = faults[f], packets = framed ? 29 : 9;
+                    if (fault == U_INIT_FAIL) packets = 5;
+                    if (fault == U_SETUP_FAIL) packets = 6;
+                    if (fault == U_UPDATE_FAIL) {
+                        const unsigned framed_packets[] = {16, 17, 27, 28};
+                        packets = framed ? framed_packets[cut-1] : 6+cut;
+                    }
+                    uint64_t tariff = UINT64_C(224)*(packets+u_state_packets());
+#else
+                    uint64_t tariff = 448;
+#endif
+                    wl_evaluation_control_t *c = begin(tariff-below);
+#ifdef WL_MBEDTLS_ENABLED
+                    u_shim(framed, fault, cut, 'S', first, 2, 'S', second, 1);
+                    /* Failed abort status cannot replace the original semantic
+                     * failure; the wrapper still performs actual cleanup. */
+                    u_abort_fail = fault == U_UPDATE_FAIL && cut == 1;
+#endif
+                    uint8_t output[20]; memset(output, 0xee, sizeof(output));
+                    bool failed = false;
+                    int rc =
+                        wl_columnar_expr_crypto_uuid_pair_attempt_controlled(
+                        framed,
+                        'S', first, 2, 'S', second, 1, output, &failed, c,
+                        wl_evaluation_control_active_attempt_id(c));
+                    CHECK(rc == (below ? WL_EVALUATION_CONTROL_WORK_LIMIT : 0));
+#ifdef WL_MBEDTLS_ENABLED
+                    bool valid = fault == U_REAL;
+                    CHECK(u_init_calls == 1 &&
+                        u_setup_calls == (fault != U_INIT_FAIL));
+                    CHECK(u_abort_calls == (fault != U_REAL &&
+                        fault != U_INIT_FAIL));
+                    CHECK(u_updates == (fault == U_INIT_FAIL ||
+                        fault == U_SETUP_FAIL ? 0 :
+                        fault == U_UPDATE_FAIL ? cut : framed ? 4u : 2u));
+                    CHECK(u_finish_calls == (fault == U_REAL ||
+                        fault == U_FINISH_FAIL ||
+                        fault == U_SHORT || fault == U_LONG)); u_unshim();
+#else
+                    bool valid = false;
+#endif
+                    CHECK(failed == (!below && !valid));
+                    for (unsigned i = 0; i < 20; ++i)
+                        CHECK(output[i] ==
+                            (below ? 0xee : valid ? expected[i] : 0));
+                    finish(c, rc);
+                }
+        }
+    }
+}
+static void uuid4_oracles(void) {
+#ifdef WL_MBEDTLS_ENABLED
+    const unsigned faults[] = {U_REAL, U_INIT_FAIL, U_RANDOM_FAIL};
+    const uint8_t native[8] = {0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0x4b, 0xab};
+    int64_t expected; memcpy(&expected, native, sizeof(expected));
+#else
+    const unsigned faults[] = {0}; int64_t expected = 0;
+#endif
+    for (unsigned f = 0; f < sizeof(faults)/sizeof(*faults); ++f)
+        for (unsigned below = 0; below < 2; ++below) {
+#ifdef WL_MBEDTLS_ENABLED
+            unsigned fault = faults[f];
+            uint64_t tariff = fault == U_INIT_FAIL ? 672 : 896;
+            u_shim(false, fault, 0, 0, NULL, 0, 0, NULL, 0);
+#else
+            uint64_t tariff = 448;
+#endif
+            wl_evaluation_control_t *c = begin(tariff-below);
+            int64_t value = 999; bool failed = false;
+            int rc = wl_columnar_expr_crypto_uuid4_attempt_controlled(&value,
+                    &failed, c,
+                    wl_evaluation_control_active_attempt_id(c));
+#ifdef WL_MBEDTLS_ENABLED
+            bool valid = fault == U_REAL;
+            CHECK(u_init_calls == 1 &&
+                u_random_calls == (fault != U_INIT_FAIL) &&
+                !u_setup_calls && !u_updates && !u_finish_calls &&
+                !u_abort_calls); u_unshim();
+#else
+            bool valid = false;
+#endif
+            CHECK(rc == (below ? WL_EVALUATION_CONTROL_WORK_LIMIT : 0) &&
+                failed == (!below && !valid) &&
+                value == (below ? 999 : valid ? expected : 0));
+            finish(c, rc);
+        }
+}
+
+static uint64_t u_stop_progress;
+static void u_stop(wl_evaluation_control_t *c, unsigned phase,
+    uint64_t progress, bool failed) {
+    if (u_stop_progress != UINT64_MAX && progress != u_stop_progress) return;
+    h_stop(c, phase, progress, failed);
+}
+static void uuid_pair_stops(void) {
+    const uint8_t first[] = "ab", second[] = "c";
+#ifdef WL_MBEDTLS_ENABLED
+    const struct {unsigned phase; uint64_t progress; bool framed_only;
+    } cuts[] = {
+        {318, UINT64_MAX, false}, {300, UINT64_MAX, false},
+        {301, UINT64_MAX, false},
+        {302, UINT64_MAX, false},
+        {303, UINT64_MAX, false}, {304, UINT64_MAX, false},
+        {305, UINT64_MAX, false},
+        {317, UINT64_MAX, false}, {306, 7, true}, {306, 23, true},
+        {307, 0, true}, {307, 1, true}, {308, 0, true}, {308, 1, true},
+        {309, UINT64_MAX, false}, {310, UINT64_MAX, false},
+        {311, UINT64_MAX, false},
+        {312, UINT64_MAX, false}, {313, UINT64_MAX, false},
+        {314, UINT64_MAX, false},
+        {315, UINT64_MAX, false}
+    };
+    const unsigned faults[] = {U_REAL, U_SETUP_FAIL, U_UPDATE_FAIL,
+                               U_FINISH_FAIL, U_SHORT, U_LONG, U_INIT_FAIL};
+#else
+    const struct {unsigned phase; uint64_t progress; bool framed_only;
+    } cuts[] = {
+        {300, UINT64_MAX, false}, {315, UINT64_MAX, false}
+    };
+    const unsigned faults[] = {0};
+#endif
+    for (unsigned framed = 0; framed < 2; ++framed)
+        for (unsigned scenario = 0; scenario < sizeof(faults)/sizeof(*faults);
+            ++scenario)
+            for (unsigned cut = 0; cut < sizeof(cuts)/sizeof(*cuts); ++cut)
+                for (h_stop_action = 0; h_stop_action < 4; ++h_stop_action) {
+                    if (cuts[cut].framed_only && !framed) continue;
+                    unsigned phase = cuts[cut].phase;
+                    if (scenario &&
+                        phase !=
+                        (scenario == 1 ? 317 : scenario == 2 ? 310 : scenario ==
+                        6 ? 304 : 314)) continue;
+                    h_stop_phase = phase; u_stop_progress = cuts[cut].progress;
+                    h_stopped = false; h_successor = 0;
+                    wl_evaluation_control_t *c = begin(h_stop_action ==
+                            1 ? UINT64_MAX-1 : 0);
+#ifdef WL_MBEDTLS_ENABLED
+                    u_shim(framed, faults[scenario], framed ? 2 : 1, 'S', first,
+                        2, 'S', second, 1);
+                    u_abort_fail = scenario != 0;
+#endif
+                    uint8_t output[20]; memset(output, 0xee, sizeof(output));
+                    bool failed = false;
+                    wl_columnar_expr_test_checkpoint = u_stop;
+                    int rc =
+                        wl_columnar_expr_crypto_uuid_pair_attempt_controlled(
+                        framed,
+                        'S', first, 2, 'S', second, 1, output, &failed, c,
+                        wl_evaluation_control_active_attempt_id(c));
+                    wl_columnar_expr_test_checkpoint = NULL;
+                    CHECK(h_stopped && !failed &&
+                        rc ==
+                        (h_stop_action == 0 ? WL_EVALUATION_CONTROL_CANCELLED :
+                        h_stop_action ==
+                        1 ? WL_EVALUATION_CONTROL_WORK_LIMIT : h_stop_action ==
+                        3 ? EOVERFLOW : EINVAL));
+                    for (unsigned i = 0; i < 20; ++i) CHECK(output[i] == 0xee);
+#ifdef WL_MBEDTLS_ENABLED
+                    bool initialized = phase != 300 && phase != 301 &&
+                        phase != 302 && phase != 303 && phase != 318;
+                    bool setup = initialized && phase != 304 && phase != 305;
+                    CHECK(u_init_calls == initialized &&
+                        u_setup_calls == setup);
+                    CHECK(u_abort_calls == (setup &&
+                        (scenario || (phase != 314 && phase != 315))));
+                    if (phase ==
+                        306) CHECK(u_updates ==
+                            (u_stop_progress < 16 ? 0u : 2u));
+                    if (phase == 314 ||
+                        phase == 315) CHECK(u_finish_calls == 1);
+                    u_unshim();
+#endif
+                    if (h_successor) {
+                        uint64_t used = UINT64_MAX;
+                        wl_evaluation_control_report_t report;
+                        CHECK(!wl_evaluation_control_test_active_consumed(c,
+                            h_successor, &used) && !used);
+                        CHECK(!wl_evaluation_control_report(c, &report) &&
+                            report.attempt_id == h_report.attempt_id &&
+                            report.limit == h_report.limit &&
+                            report.consumed == h_report.consumed &&
+                            report.result == h_report.result &&
+                            report.stop_reason == h_report.stop_reason &&
+                            report.execution_status ==
+                            h_report.execution_status &&
+                            report.cleanup_status == h_report.cleanup_status);
+                        CHECK(!wl_evaluation_control_finish(c, &owner, 0, 0));
+                    } else CHECK(wl_evaluation_control_finish(c, &owner,
+                            rc > 0 ? rc : 0, 0) == rc);
+                    CHECK(!wl_evaluation_control_reset(c) &&
+                        !wl_evaluation_control_begin(c, &owner));
+                    CHECK(!wl_columnar_expr_crypto_uuid_pair_attempt_controlled(
+                            framed,
+                            'S', first, 2, 'S', second, 1, output, &failed, c,
+                            wl_evaluation_control_active_attempt_id(c)));
+#ifdef WL_MBEDTLS_ENABLED
+                    CHECK(!failed);
+#else
+                    CHECK(failed);
+#endif
+                    finish(c, 0);
+                }
+}
+
+static void uuid_prefixes(void) {
+#ifdef WL_MBEDTLS_ENABLED
+    const uint8_t first[] = "ab", second[] = "c";
+    for (unsigned framed = 0; framed < 2; ++framed)
+        for (unsigned prefix = 1;
+            prefix <= (framed ? 29u : 9u)+u_state_packets(); ++prefix) {
+            uint64_t cap = UINT64_C(224)*prefix-1;
+            wl_evaluation_control_t *c = begin(cap);
+            u_shim(framed, U_REAL, 0, 'S', first, 2, 'S', second, 1);
+            uint8_t output[20]; memset(output, 0xee, sizeof(output));
+            bool failed = false;
+            CHECK(wl_columnar_expr_crypto_uuid_pair_attempt_controlled(framed,
+                'S', first, 2, 'S', second, 1, output, &failed, c,
+                wl_evaluation_control_active_attempt_id(c)) ==
+                WL_EVALUATION_CONTROL_WORK_LIMIT);
+            for (unsigned i = 0; i < 20; ++i) CHECK(output[i] == 0xee);
+            CHECK(!failed &&
+                u_init_calls == (cap >= (4+u_state_packets())*UINT64_C(224)) &&
+                u_setup_calls == (cap >= (5+u_state_packets())*UINT64_C(224)));
+            unsigned updates = framed ? (cap >=
+                (15+u_state_packets())*UINT64_C(224)) + (cap >=
+                (16+u_state_packets())*UINT64_C(224)) +
+                (cap >= (26+u_state_packets())*UINT64_C(224)) + (cap >=
+                (27+u_state_packets())*UINT64_C(224)) :
+                (cap >= (6+u_state_packets())*UINT64_C(224)) + (cap >=
+                (7+u_state_packets())*UINT64_C(224));
+            CHECK(u_updates == updates &&
+                u_finish_calls ==
+                (cap >= ((framed ? 28 : 8)+u_state_packets())*UINT64_C(224)) &&
+                u_abort_calls == (u_setup_calls && !u_finish_calls));
+            u_unshim(); finish(c, WL_EVALUATION_CONTROL_WORK_LIMIT);
+        }
+    for (unsigned prefix = 1; prefix <= 4; ++prefix) {
+        uint64_t cap = UINT64_C(224)*prefix-1;
+        wl_evaluation_control_t *c = begin(cap);
+        u_shim(false, U_REAL, 0, 0, NULL, 0, 0, NULL, 0);
+        int64_t value = 999; bool failed = false;
+        CHECK(wl_columnar_expr_crypto_uuid4_attempt_controlled(&value, &failed,
+            c,
+            wl_evaluation_control_active_attempt_id(c)) ==
+            WL_EVALUATION_CONTROL_WORK_LIMIT);
+        CHECK(value == 999 && !failed && u_init_calls == (cap >= 448) &&
+            u_random_calls == (cap >= 672) && !u_abort_calls); u_unshim();
+        finish(c, WL_EVALUATION_CONTROL_WORK_LIMIT);
+    }
+#endif
+}
+
+static void u_retire(wl_evaluation_control_t *c, int rc) {
+    if (h_successor) {
+        uint64_t used = UINT64_MAX; wl_evaluation_control_report_t report;
+        CHECK(!wl_evaluation_control_test_active_consumed(c, h_successor,
+            &used) && !used);
+        CHECK(!wl_evaluation_control_report(c, &report) &&
+            report.attempt_id == h_report.attempt_id &&
+            report.limit == h_report.limit &&
+            report.consumed == h_report.consumed &&
+            report.result == h_report.result &&
+            report.stop_reason == h_report.stop_reason &&
+            report.execution_status == h_report.execution_status &&
+            report.cleanup_status == h_report.cleanup_status);
+        CHECK(!wl_evaluation_control_finish(c, &owner, 0, 0));
+    } else CHECK(wl_evaluation_control_finish(c, &owner, rc > 0 ? rc : 0,
+            0) == rc);
+    CHECK(!wl_evaluation_control_reset(c) && !wl_evaluation_control_begin(c,
+        &owner));
+}
+static void uuid4_stops(void) {
+#ifdef WL_MBEDTLS_ENABLED
+    const unsigned phases[] = {320, 321, 322, 323, 324, 325},
+        faults[] = {U_REAL, U_INIT_FAIL, U_RANDOM_FAIL};
+#else
+    const unsigned phases[] = {320, 325}, faults[] = {0};
+#endif
+    for (unsigned scenario = 0; scenario < sizeof(faults)/sizeof(*faults);
+        ++scenario)
+        for (unsigned p = 0; p < sizeof(phases)/sizeof(*phases); ++p)
+            for (h_stop_action = 0; h_stop_action < 4; ++h_stop_action) {
+                unsigned phase = phases[p];
+                if (scenario && phase != (scenario == 1 ? 322 : 324)) continue;
+                h_stop_phase = phase; h_stopped = false; h_successor = 0;
+                wl_evaluation_control_t *c = begin(h_stop_action ==
+                        1 ? UINT64_MAX-1 : 0);
+#ifdef WL_MBEDTLS_ENABLED
+                u_shim(false, faults[scenario], 0, 0, NULL, 0, 0, NULL, 0);
+#endif
+                int64_t value = 999; bool failed = false;
+                wl_columnar_expr_test_checkpoint = h_stop;
+                int rc =
+                    wl_columnar_expr_crypto_uuid4_attempt_controlled(&value,
+                        &failed, c,
+                        wl_evaluation_control_active_attempt_id(c));
+                wl_columnar_expr_test_checkpoint = NULL;
+                CHECK(h_stopped && value == 999 && !failed && rc ==
+                    (h_stop_action == 0 ? WL_EVALUATION_CONTROL_CANCELLED :
+                    h_stop_action ==
+                    1 ? WL_EVALUATION_CONTROL_WORK_LIMIT : h_stop_action ==
+                    3 ? EOVERFLOW : EINVAL));
+#ifdef WL_MBEDTLS_ENABLED
+                CHECK(u_init_calls == (phase >= 322) &&
+                    u_random_calls == (phase >= 324) &&
+                    !u_setup_calls && !u_updates && !u_finish_calls &&
+                    !u_abort_calls); u_unshim();
+#endif
+                u_retire(c, rc);
+                CHECK(!wl_columnar_expr_crypto_uuid4_attempt_controlled(&value,
+                    &failed, c,
+                    wl_evaluation_control_active_attempt_id(c)));
+#ifdef WL_MBEDTLS_ENABLED
+                CHECK(!failed); uint8_t bytes[8];
+                memcpy(bytes, &value, sizeof(bytes));
+                CHECK((bytes[6]&0xf0) == 0x40);
+#else
+                CHECK(failed && !value);
+#endif
+                finish(c, 0);
+            }
+}
+
+static const uint8_t u_tags[] = {WL_PLAN_EXPR_ARITH_UUID5,
+                                 WL_PLAN_EXPR_ARITH_UUID5_SS,
+                                 WL_PLAN_EXPR_ARITH_UUID5_SI,
+                                 WL_PLAN_EXPR_ARITH_UUID5_IS};
+static void uuid_numeric_parity(void) {
+    wl_intern_t *intern = wl_intern_create(); CHECK(intern);
+    char large[4097]; memset(large, 'a', 4096); large[4096] = 0;
+    const int64_t inputs[] = {0, 1, -1, INT64_MIN, INT64_MAX,
+                              wl_intern_put(intern, "ab"),
+                              wl_intern_put(intern, "c"),
+                              wl_intern_put(intern, ""),
+                              wl_intern_put(intern, large),
+                              wl_intern_put(intern, "\x80\xff"),
+                              wl_intern_put(intern, "a\0ignored")};
+    for (unsigned tag = 0; tag < 4; ++tag)
+        for (unsigned v = 0; v < sizeof(inputs)/sizeof(*inputs); ++v)
+            for (unsigned null = 0; null < 2; ++null)
+                for (unsigned underflow = 0; underflow < 2; ++underflow) {
+                    uint8_t bytes[24];
+                    uint32_t n = underflow ? 1 : hmac_bytecode(bytes, inputs[v],
+                            inputs[(v+3) % (sizeof(inputs)/sizeof(*inputs))],
+                            u_tags[tag]);
+                    if (underflow) bytes[0] = u_tags[tag];
+                    wl_columnar_expr_context_t context =
+                    {.intern = null ? NULL : intern};
+                    int64_t raw = 999, value = 999;
+                    wl_columnar_expr_status_t raw_status, status;
+                    int raw_rc = wl_columnar_expr_eval_run_ctx(bytes, n, NULL,
+                            0, &raw, &context, &raw_status);
+                    wl_evaluation_control_t *c = begin(0);
+                    bool supported = false, failed = false;
+                    wl_columnar_expr_attempt_scalar_t *program = NULL;
+                    CHECK(!wl_columnar_expr_compile_scalar_attempt_controlled(
+                            bytes, n, NULL, &program, &supported, c,
+                            wl_evaluation_control_active_attempt_id(c)) &&
+                        supported);
+                    wirelog_column_type_t type = WIRELOG_TYPE_BOOL;
+                    CHECK(
+                        !wl_columnar_expr_scalar_result_type_attempt_controlled(
+                            program, NULL, 0, &type, &supported, c,
+                            wl_evaluation_control_active_attempt_id(c)) &&
+                        supported && type == WIRELOG_TYPE_INT64);
+                    scan_calls = 0;
+                    wl_columnar_expr_test_checkpoint = scan_hook;
+                    CHECK(!wl_columnar_expr_eval_scalar_attempt_controlled(
+                            program, NULL, 0, &context, &value, &failed,
+                            &status, c,
+                            wl_evaluation_control_active_attempt_id(c)));
+                    wl_columnar_expr_test_checkpoint = NULL;
+                    CHECK(value == raw && status == raw_status &&
+                        failed == (raw_rc != 0));
+#ifndef WL_MBEDTLS_ENABLED
+                    CHECK(!scan_calls);
+#endif
+                    wl_columnar_expr_attempt_scalar_free(program); finish(c, 0);
+                }
+    for (unsigned full = 0; full < 2; ++full) {
+        uint8_t bytes[COL_FILTER_STACK*9+16]; uint32_t n = 0;
+        if (full) {
+            for (unsigned i = 0; i < COL_FILTER_STACK-1; ++i) {
+                int64_t value = i; bytes[n++] = WL_PLAN_EXPR_CONST_INT;
+                memcpy(bytes+n, &value, 8); n += 8;
+            }
+            uint16_t length = 2; bytes[n++] = WL_PLAN_EXPR_CONST_STR;
+            memcpy(bytes+n, &length, 2); n += 2; memcpy(bytes+n, "ab", 2);
+            n += 2;
+        }
+        bytes[n++] = WL_PLAN_EXPR_ARITH_UUID4;
+        wl_columnar_expr_context_t context = {.intern = intern};
+        int64_t raw = 999, value = 999;
+        wl_columnar_expr_status_t raw_status, status;
+        int raw_rc = wl_columnar_expr_eval_run_ctx(bytes, n, NULL, 0, &raw,
+                &context, &raw_status);
+        wl_evaluation_control_t *c = begin(0);
+        bool supported = false, failed = false;
+        wl_columnar_expr_attempt_scalar_t *program = NULL;
+        CHECK(!wl_columnar_expr_compile_scalar_attempt_controlled(bytes, n,
+            NULL, &program, &supported, c,
+            wl_evaluation_control_active_attempt_id(c)) && supported);
+        wirelog_column_type_t type = WIRELOG_TYPE_BOOL;
+        CHECK(!wl_columnar_expr_scalar_result_type_attempt_controlled(program,
+            NULL, 0, &type, &supported, c,
+            wl_evaluation_control_active_attempt_id(c)) && supported &&
+            type == (full ? WIRELOG_TYPE_STRING : WIRELOG_TYPE_INT64));
+#ifdef WL_MBEDTLS_ENABLED
+        u_shim(false, U_REAL, 0, 0, NULL, 0, 0, NULL, 0);
+#endif
+        CHECK(!wl_columnar_expr_eval_scalar_attempt_controlled(program, NULL, 0,
+            &context, &value, &failed, &status, c,
+            wl_evaluation_control_active_attempt_id(c)) &&
+            failed == (raw_rc != 0) && status == raw_status);
+#ifdef WL_MBEDTLS_ENABLED
+        CHECK(u_random_calls == 1 && !failed); u_unshim();
+        if (full) CHECK(value == raw);
+        else {
+            uint8_t actual[8], raw_bytes[8];
+            const uint8_t expected[8] = {0xab, 0xab, 0xab, 0xab, 0xab, 0xab,
+                                         0x4b, 0xab};
+            memcpy(actual, &value, 8); memcpy(raw_bytes, &raw, 8);
+            CHECK(!memcmp(actual, expected, 8) && (raw_bytes[6]&0xf0) == 0x40);
+        }
+#else
+        CHECK(failed && value == raw);
+#endif
+        wl_columnar_expr_attempt_scalar_free(program); finish(c, 0);
+    }
+    wl_intern_free(intern);
+}
+
+static int64_t u_expected[3][5];
+static unsigned u_seen[5];
+static const char *u_map_source = ".decl input(i:int64,s:string)\n"
+    ".decl out(i:int64,s:string,a:int64,b:int64,c:int64,d:int64,e:int64)\n"
+    "out(i,s,uuid4(),uuid5(i,i),uuid5(s,s),uuid5(s,i),uuid5(i,s)) :- input(i,s).\n";
+static fixture_t u_create(const char *source) {
+    fixture_t f = create(source);
+    for (unsigned r = 0; r < 3; ++r) {
+#ifdef WL_MBEDTLS_ENABLED
+        const uint8_t native[8] = {0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0x4b,
+                                   0xab};
+        memcpy(&u_expected[r][0], native, 8);
+#else
+        u_expected[r][0] = 0;
+#endif
+        for (unsigned tag = 0; tag < 4; ++tag) {
+            uint8_t bytes[24]; uint32_t n = hmac_bytecode(bytes,
+                    f.input[r][tag == 1 || tag == 2],
+                    f.input[r][tag == 1 || tag == 3], u_tags[tag]);
+            wl_columnar_expr_context_t context = {.intern = f.plan->intern};
+            wl_columnar_expr_status_t status;
+            int rc = wl_columnar_expr_eval_run_ctx(bytes, n, NULL, 0,
+                    &u_expected[r][tag+1], &context, &status);
+#ifdef WL_MBEDTLS_ENABLED
+            CHECK(!rc && status == WL_COLUMNAR_EXPR_OK);
+#else
+            CHECK(rc && status == WL_COLUMNAR_EXPR_MALFORMED &&
+                !u_expected[r][tag+1]);
+#endif
+        }
+    }
+    return f;
+}
+static void u_capture(const char *name, const int64_t *row, uint32_t width,
+    int32_t diff, void *arg) {
+    fixture_t *f = arg;
+    if (!strcmp(name, "side")) {
+        CHECK(width == 1 && row[0] == 1 && diff == 1); return;
+    }
+    CHECK(!strcmp(name,
+        "out") && (diff == 1 || diff == -1) && row[0] >= 1 && row[0] <= 3);
+    unsigned r = (unsigned)(row[0]-1);
+    CHECK(width == (f->filter ? 2 : 7) && row[1] == f->input[r][1]);
+    if (!f->filter) for (unsigned tag = 0; tag < 5;
+            ++tag) CHECK(row[tag+2] == u_expected[r][tag]);
+    f->balance[r] += diff; CHECK(f->balance[r] >= 0 && f->balance[r] <= 1);
+    ++f->events; f->positives += diff == 1; f->negatives += diff == -1;
+}
+static void u_contents(fixture_t *f, unsigned count) {
+    col_rel_t *out = session_find_rel(COL_SESSION(f->session), "out");
+    CHECK(out && out->nrows == count && out->ncols == (f->filter ? 2 : 7) &&
+        out->column_types[0] == WIRELOG_TYPE_INT64 &&
+        out->column_types[1] == WIRELOG_TYPE_STRING);
+    bool visited[3] = {false, false, false};
+    for (uint32_t row = 0; row < out->nrows; ++row) {
+        int64_t i = out->columns[0][row];
+        CHECK(i >= 1 && i <= 3 && !visited[i-1]);
+        visited[i-1] = true; CHECK(out->columns[1][row] == f->input[i-1][1]);
+        if (!f->filter) for (unsigned tag = 0; tag < 5; ++tag)
+                CHECK(out->column_types[tag+2] == WIRELOG_TYPE_INT64 &&
+                    out->columns[tag+2][row] == u_expected[i-1][tag]);
+    }
+}
+#ifdef WL_MBEDTLS_ENABLED
+static unsigned u_host_target;
+static unsigned u_host_random_calls, u_host_abort_calls;
+static psa_status_t u_host_random(uint8_t *data, size_t length) {
+    CHECK(length == 16); ++u_host_random_calls; memset(data, 0xab, length);
+    return PSA_SUCCESS;
+}
+static psa_status_t u_host_abort(psa_hash_operation_t *operation) {
+    ++u_host_abort_calls; return psa_hash_abort(operation);
+}
+#endif
+static void u_host_hook(wl_evaluation_control_t *c, unsigned phase,
+    uint64_t progress, bool failed) {
+    (void)failed;
+    if (phase == 340) {
+        unsigned tag = 0;
+        if (progress != WL_PLAN_EXPR_ARITH_UUID4) {
+            for (tag = 0; tag < 4; ++tag) if (progress == u_tags[tag]) break;
+            ++tag;
+        }
+        CHECK(tag < 5); ++u_seen[tag];
+    }
+#ifdef WL_MBEDTLS_ENABLED
+    unsigned evaluations = 0;
+    for (unsigned i = 0; i < 5; ++i) evaluations += u_seen[i];
+    if (!active || !c || session_stopped || phase != u_host_target ||
+        evaluations < 6) return;
+    CHECK(wl_columnar_session_test_cleanup_owners(COL_SESSION(
+            active->session)) == 2);
+    session_stopped = true;
+    if (session_action == 0) wl_evaluation_control_request_cancel(c);
+    else if (session_action == 1) CHECK(wl_evaluation_control_charge(c,
+            UINT64_MAX) == WL_EVALUATION_CONTROL_WORK_LIMIT);
+    else {
+        wl_evaluation_control_attempt_finish_result_t r =
+            wl_evaluation_control_finish_attempt(c,
+                active->session->operation_admission,
+                wl_evaluation_control_active_attempt_id(c), 0, 0);
+        CHECK(!r.protocol && r.report_valid && r.report.consumed &&
+            !r.report.result);
+        session_report = r.report; CHECK(!wl_evaluation_control_reset(c));
+        wl_evaluation_control_attempt_begin_result_t b =
+            wl_evaluation_control_begin_attempt(c,
+                active->session->operation_admission);
+        CHECK(!b.protocol && b.attempt_id != r.report.attempt_id);
+        session_successor = b.attempt_id;
+    }
+#else
+    (void)c;
+#endif
+}
+
+static void uuid_session_maps(void) {
+#ifdef WL_MBEDTLS_ENABLED
+    const unsigned targets[] = {324, 310};
+    for (unsigned mixed = 0; mixed < 2; ++mixed)
+        for (unsigned target = 0; target < 2; ++target)
+            for (session_action = 0; session_action < 3; ++session_action) {
+                char source[1024];
+                snprintf(source, sizeof(source), "%s%s", u_map_source,
+                    mixed ?
+                    ".decl a(x:int64)\n.decl b(x:int64)\n.decl c(x:int64)\n"
+                    ".decl side(x:int64)\nside(x) :- a(x),b(x),c(x).\n" : "");
+                fixture_t f = u_create(source);
+                wl_session_set_delta_cb(f.session, u_capture, &f);
+                wl_columnar_expr_crypto_uuid_test_random = u_host_random;
+                if (mixed) {
+                    int64_t one = 1; const char *names[] = {"a", "b", "c"};
+                    for (unsigned i = 0; i < 3;
+                        ++i) CHECK(!wl_session_insert(f.session, names[i], &one,
+                            1, 1));
+                    CHECK(!wl_session_insert(f.session, "input", f.input[0], 1,
+                        2));
+                }
+                CHECK(!complete(f.session)); u_contents(&f, mixed);
+                if (mixed) CHECK(f.session->source_c1_admission);
+                col_rel_t *prior = session_find_rel(COL_SESSION(f.session),
+                        "out");
+                col_relation_snapshot_t generation =
+                    wl_columnar_relation_snapshot(prior);
+                for (unsigned r = mixed; r < 3;
+                    ++r) CHECK(!wl_session_insert(f.session, "input",
+                        f.input[r], 1, 2));
+                active = &f; memset(u_seen, 0, sizeof(u_seen));
+                session_stopped = false; session_successor = 0;
+                u_host_random_calls = u_host_abort_calls = mixed_owner_reads =
+                    0; u_host_target = targets[target];
+                if (session_action ==
+                    1) CHECK(!wl_evaluation_control_configure(f.control,
+                        UINT64_MAX-1));
+                wl_columnar_expr_crypto_uuid_test_abort = u_host_abort;
+                wl_columnar_expr_test_checkpoint = u_host_hook;
+                wl_columnar_session_test_source_tail = mixed_source_tail;
+                int rc = complete(f.session);
+                wl_columnar_expr_test_checkpoint = NULL;
+                wl_columnar_session_test_source_tail = NULL;
+                CHECK(session_stopped && mixed_owner_reads &&
+                    u_host_abort_calls == target && u_host_random_calls >= 2 &&
+                    rc ==
+                    (session_action == 0 ? WL_EVALUATION_CONTROL_CANCELLED :
+                    session_action ==
+                    1 ? WL_EVALUATION_CONTROL_WORK_LIMIT : EINVAL));
+                u_contents(&f, mixed); CHECK(f.events == mixed &&
+                    prior == session_find_rel(COL_SESSION(f.session), "out") &&
+                    wl_columnar_relation_snapshot_equal(generation,
+                    wl_columnar_relation_snapshot(prior)));
+                CHECK(!COL_SESSION(f.session)->cleanup_active &&
+                    !COL_SESSION(f.session)->cleanup_pending &&
+                    !COL_SESSION(f.session)->cleanup_reserved_bytes);
+                if (session_action == 2) {
+                    wl_evaluation_control_report_t report;
+                    uint64_t used = UINT64_MAX;
+                    CHECK(!wl_evaluation_control_report(f.control, &report) &&
+                        report.attempt_id == session_report.attempt_id &&
+                        report.limit == session_report.limit &&
+                        report.consumed == session_report.consumed &&
+                        report.result == session_report.result &&
+                        report.stop_reason == session_report.stop_reason &&
+                        report.execution_status ==
+                        session_report.execution_status &&
+                        report.cleanup_status == session_report.cleanup_status);
+                    CHECK(!wl_evaluation_control_test_active_consumed(f.control,
+                        session_successor, &used) && !used);
+                    wl_evaluation_control_attempt_finish_result_t r =
+                        wl_evaluation_control_finish_attempt(f.control,
+                            f.session->operation_admission, session_successor,
+                            0, 0);
+                    CHECK(!r.protocol && r.report_valid && !r.report.consumed);
+                }
+                CHECK(!wl_evaluation_control_reset(f.control)); active = NULL;
+                memset(u_seen, 0, sizeof(u_seen));
+                wl_columnar_expr_test_checkpoint = u_host_hook;
+                CHECK(!complete(f.session));
+                wl_columnar_expr_test_checkpoint = NULL;
+                u_contents(&f, 3);
+                CHECK(f.events == 3 && f.positives == 3 && !f.negatives &&
+                    u_host_abort_calls == target);
+                for (unsigned tag = 0; tag < 5; ++tag) CHECK(u_seen[tag] >= 3);
+                CHECK(!wl_session_remove(f.session, "input", f.input[0], 1, 2));
+                CHECK(!complete(f.session)); u_contents(&f, 2);
+                CHECK(f.events == 4 && f.negatives == 1 && !f.balance[0]);
+                if (mixed) {
+                    col_rel_t *side = session_find_rel(COL_SESSION(f.session),
+                            "side");
+                    CHECK(side && side->nrows == 1 &&
+                        side->column_types[0] == WIRELOG_TYPE_INT64 &&
+                        side->columns[0][0] == 1);
+                }
+                CHECK(!complete(f.session) && f.events == 4);
+                wl_columnar_expr_crypto_uuid_test_random = NULL;
+                wl_columnar_expr_crypto_uuid_test_abort = NULL;
+                destroy(&f);
+            }
+#else
+    const char *fn[] = {"uuid4()", "uuid5(i,i)", "uuid5(s,s)", "uuid5(s,i)",
+                        "uuid5(i,s)"};
+    for (unsigned tag = 0; tag < 5; ++tag) {
+        char source[512]; snprintf(source, sizeof(source),
+            ".decl input(i:int64,s:string)\n.decl out(i:int64,n:int64)\nout(i,%s) :- input(i,s).\n",
+            fn[tag]);
+        fixture_t f = u_create(source);
+        wl_session_set_delta_cb(f.session, u_capture, &f);
+        CHECK(!complete(f.session)); inputs(&f);
+        memset(u_seen, 0, sizeof(u_seen));
+        wl_columnar_expr_test_checkpoint = u_host_hook;
+        CHECK(complete(f.session) == ERANGE);
+        wl_columnar_expr_test_checkpoint = NULL;
+        col_rel_t *out = session_find_rel(COL_SESSION(f.session), "out");
+        CHECK(out && !out->nrows && !f.events && u_seen[tag] &&
+            !COL_SESSION(f.session)->cleanup_active &&
+            !COL_SESSION(f.session)->cleanup_pending &&
+            !COL_SESSION(f.session)->cleanup_reserved_bytes);
+        for (unsigned r = 0; r < 3;
+            ++r) CHECK(!wl_session_remove(f.session, "input", f.input[r], 1,
+                2));
+        CHECK(!wl_evaluation_control_reset(f.control) && !complete(f.session));
+        CHECK(!complete(f.session) && !f.events); destroy(&f);
+    }
+#endif
+}
+
+static void uuid_session_filters(void) {
+    const char *fn[] = {"uuid4()", "uuid5(i,i)", "uuid5(s,s)", "uuid5(s,i)",
+                        "uuid5(i,s)"};
+    for (unsigned tag = 0; tag < 5; ++tag)
+        for (unsigned reject = 0; reject < 2; ++reject) {
+            fixture_t reference = u_create(u_map_source);
+            int64_t expected = reject ? 0 : u_expected[0][tag];
+#ifdef WL_MBEDTLS_ENABLED
+            CHECK(u_expected[0][tag]);
+            if (tag) CHECK(u_expected[0][tag] != u_expected[1][tag] &&
+                    u_expected[0][tag] != u_expected[2][tag]);
+#endif
+            destroy(&reference);
+            char source[512]; snprintf(source, sizeof(source),
+                ".decl input(i:int64,s:string)\n.decl out(i:int64,s:string)\n"
+                "out(i,s) :- input(i,s), %s=%" PRId64 ".\n", fn[tag], expected);
+            fixture_t f = u_create(source); f.filter = true;
+            wl_session_set_delta_cb(f.session, u_capture, &f);
+#ifdef WL_MBEDTLS_ENABLED
+            wl_columnar_expr_crypto_uuid_test_random = u_host_random;
+#endif
+            CHECK(!complete(f.session)); u_contents(&f, 0); inputs(&f);
+            active = NULL; memset(u_seen, 0, sizeof(u_seen));
+            wl_columnar_expr_test_checkpoint = u_host_hook;
+            CHECK(!complete(f.session));
+            wl_columnar_expr_test_checkpoint = NULL;
+            CHECK(u_seen[tag] >= 3);
+#ifdef WL_MBEDTLS_ENABLED
+            unsigned accepted = reject ? 0 : tag ? 1 : 3;
+            u_contents(&f, accepted);
+            CHECK(f.events == accepted && f.positives == accepted &&
+                !f.negatives);
+            if (accepted) {
+                if (tag) {
+                    col_rel_t *out = session_find_rel(COL_SESSION(f.session),
+                            "out");
+                    CHECK(out->columns[0][0] == 1 && f.balance[0] == 1 &&
+                        !f.balance[1] && !f.balance[2]);
+                }
+                CHECK(!wl_session_remove(f.session, "input", f.input[0], 1, 2));
+                CHECK(!complete(f.session)); u_contents(&f, accepted-1);
+                CHECK(f.events == accepted+1 && f.negatives == 1 &&
+                    !f.balance[0]);
+            }
+            wl_columnar_expr_crypto_uuid_test_random = NULL;
+#else
+            u_contents(&f, 0); CHECK(!f.events);
+#endif
+            unsigned events = f.events;
+            CHECK(!complete(f.session) && f.events == events); destroy(&f);
+        }
+}
+
+#ifdef WL_MBEDTLS_ENABLED
+static void u_long_hook(wl_evaluation_control_t *c, unsigned phase,
+    uint64_t progress, bool failed) {
+    if (phase == 41 && progress < 512) return;
+    if (phase == 41) CHECK(u_seen[2] >= 3);
+    u_host_hook(c, phase, progress, failed);
+}
+static void uuid_long_preparation(void) {
+    for (session_action = 0; session_action < 3; ++session_action) {
+        fixture_t f = u_create(u_map_source);
+        wl_session_set_delta_cb(f.session, u_capture, &f);
+        wl_columnar_expr_crypto_uuid_test_random = u_host_random;
+        wl_columnar_expr_crypto_uuid_test_abort = u_host_abort;
+        CHECK(!complete(f.session)); inputs(&f);
+        active = &f; memset(u_seen, 0, sizeof(u_seen)); session_stopped = false;
+        session_successor = 0;
+        u_host_target = 41; u_host_random_calls = u_host_abort_calls = 0;
+        if (session_action ==
+            1) CHECK(!wl_evaluation_control_configure(f.control, UINT64_MAX-1));
+        wl_columnar_expr_test_checkpoint = u_long_hook;
+        int rc = complete(f.session); wl_columnar_expr_test_checkpoint = NULL;
+        CHECK(session_stopped && !u_host_abort_calls &&
+            u_host_random_calls == 3 && !f.events &&
+            rc == (session_action == 0 ? WL_EVALUATION_CONTROL_CANCELLED :
+            session_action == 1 ? WL_EVALUATION_CONTROL_WORK_LIMIT : EINVAL));
+        u_contents(&f, 0);
+        CHECK(!COL_SESSION(f.session)->cleanup_active &&
+            !COL_SESSION(f.session)->cleanup_pending &&
+            !COL_SESSION(f.session)->cleanup_reserved_bytes);
+        if (session_action == 2) {
+            wl_evaluation_control_report_t report; uint64_t used = UINT64_MAX;
+            CHECK(!wl_evaluation_control_report(f.control, &report) &&
+                report.attempt_id == session_report.attempt_id &&
+                report.limit == session_report.limit &&
+                report.consumed == session_report.consumed &&
+                report.result == session_report.result &&
+                report.stop_reason == session_report.stop_reason &&
+                report.execution_status == session_report.execution_status &&
+                report.cleanup_status == session_report.cleanup_status);
+            CHECK(!wl_evaluation_control_test_active_consumed(f.control,
+                session_successor, &used) && !used);
+            wl_evaluation_control_attempt_finish_result_t r =
+                wl_evaluation_control_finish_attempt(f.control,
+                    f.session->operation_admission, session_successor, 0, 0);
+            CHECK(!r.protocol && r.report_valid && !r.report.consumed);
+        }
+        CHECK(!wl_evaluation_control_reset(f.control)); active = NULL;
+        CHECK(!complete(f.session)); u_contents(&f, 3);
+        CHECK(f.events == 3 && f.positives == 3 && !f.negatives &&
+            !u_host_abort_calls);
+        CHECK(!wl_session_remove(f.session, "input", f.input[0], 1, 2));
+        CHECK(!complete(f.session)); u_contents(&f, 2);
+        CHECK(f.events == 4 && f.negatives == 1 && !f.balance[0]);
+        wl_columnar_expr_crypto_uuid_test_random = NULL;
+        wl_columnar_expr_crypto_uuid_test_abort = NULL;
+        destroy(&f);
+    }
+}
+#endif
+
+#ifdef WL_MBEDTLS_ENABLED
+static psa_status_t u_host_init_fail(void) {
+    return PSA_ERROR_NOT_SUPPORTED;
+}
+static psa_status_t u_host_setup_fail(psa_hash_operation_t *operation,
+    psa_algorithm_t algorithm) {
+    (void)operation; CHECK(algorithm == PSA_ALG_SHA_1);
+    return PSA_ERROR_NOT_SUPPORTED;
+}
+static psa_status_t u_host_short_finish(psa_hash_operation_t *operation,
+    uint8_t *output,
+    size_t capacity, size_t *actual) {
+    CHECK(capacity == 20 && !*actual);
+    psa_status_t status = psa_hash_finish(operation, output, capacity, actual);
+    CHECK(status == PSA_SUCCESS && *actual == 20); --*actual; return status;
+}
+static void uuid_host_faults(void) {
+    for (unsigned fault = 0; fault < 3; ++fault) {
+        fixture_t f = u_create(u_map_source);
+        wl_session_set_delta_cb(f.session, u_capture, &f);
+        wl_columnar_expr_crypto_uuid_test_random = u_host_random;
+        wl_columnar_expr_crypto_uuid_test_abort = u_host_abort;
+        CHECK(!complete(f.session)); inputs(&f);
+        u_host_abort_calls = 0; active = NULL;
+        memset(u_seen, 0, sizeof(u_seen));
+        if (!fault) wl_columnar_expr_crypto_uuid_test_init = u_host_init_fail;
+        if (fault ==
+            1) wl_columnar_expr_crypto_uuid_test_setup = u_host_setup_fail;
+        if (fault ==
+            2) wl_columnar_expr_crypto_uuid_test_finish = u_host_short_finish;
+        wl_columnar_expr_test_checkpoint = u_host_hook;
+        CHECK(complete(f.session) == ERANGE);
+        wl_columnar_expr_test_checkpoint = NULL;
+        CHECK(u_seen[0] && u_host_abort_calls == (fault != 0) && !f.events);
+        u_contents(&f, 0);
+        CHECK(!COL_SESSION(f.session)->cleanup_active &&
+            !COL_SESSION(f.session)->cleanup_pending &&
+            !COL_SESSION(f.session)->cleanup_reserved_bytes);
+        wl_evaluation_control_report_t report;
+        CHECK(!wl_evaluation_control_report(f.control,
+            &report) && report.result == ERANGE &&
+            report.execution_status == ERANGE && !report.cleanup_status);
+        wl_columnar_expr_crypto_uuid_test_init = NULL;
+        wl_columnar_expr_crypto_uuid_test_setup = NULL;
+        wl_columnar_expr_crypto_uuid_test_finish = NULL;
+        CHECK(!wl_evaluation_control_reset(f.control) && !complete(f.session));
+        u_contents(&f, 3);
+        CHECK(f.events == 3 && f.positives == 3 && !f.negatives);
+        CHECK(!complete(f.session) && f.events == 3);
+        wl_columnar_expr_crypto_uuid_test_random = NULL;
+        wl_columnar_expr_crypto_uuid_test_abort = NULL;
+        destroy(&f);
+    }
+}
+#endif
+
+#ifdef WL_MBEDTLS_ENABLED
+typedef struct {int64_t value; int count;} u_record_t;
+static u_record_t u_records[3][8];
+static unsigned u_record_count[3];
+static void u_real_capture(const char *name, const int64_t *row, uint32_t width,
+    int32_t diff, void *arg) {
+    fixture_t *f = arg; CHECK(!strcmp(name, "out") && width == 2 &&
+        (diff == 1 || diff == -1) && row[0] >= 1 && row[0] <= 3);
+    uint8_t bytes[8]; memcpy(bytes, &row[1], 8); CHECK((bytes[6]&0xf0) == 0x40);
+    unsigned r = (unsigned)(row[0]-1), slot;
+    for (slot = 0; slot < u_record_count[r];
+        ++slot) if (u_records[r][slot].value == row[1]) break;
+    if (slot == u_record_count[r]) {
+        CHECK(diff == 1 && slot < 8); ++u_record_count[r];
+        u_records[r][slot].value = row[1];
+    }
+    u_records[r][slot].count += diff;
+    CHECK(u_records[r][slot].count >= 0 && u_records[r][slot].count <= 1);
+    f->balance[r] += diff; ++f->events; f->positives += diff == 1;
+    f->negatives += diff == -1;
+}
+static void u_real_contents(fixture_t *f, unsigned first) {
+    col_rel_t *out = session_find_rel(COL_SESSION(f->session), "out");
+    CHECK(out && out->nrows == 3-first && out->ncols == 2 &&
+        out->column_types[0] == WIRELOG_TYPE_INT64 &&
+        out->column_types[1] == WIRELOG_TYPE_INT64);
+    bool seen_rows[3] = {false, false, false};
+    for (uint32_t row = 0; row < out->nrows; ++row) {
+        int64_t id = out->columns[0][row];
+        CHECK(id > first && id <= 3 && !seen_rows[id-1]);
+        seen_rows[id-1] = true; unsigned matches = 0;
+        for (unsigned slot = 0; slot < u_record_count[id-1]; ++slot)
+            if (u_records[id-1][slot].count) {
+                ++matches;
+                CHECK(u_records[id-1][slot].value == out->columns[1][row]);
+            }
+        CHECK(matches == 1);
+    }
+    for (unsigned r = 0; r < 3; ++r) CHECK(f->balance[r] == (r >= first));
+}
+static void uuid4_real_hosts(void) {
+    for (unsigned controlled = 0; controlled < 2; ++controlled) {
+        fixture_t f = {0}; wirelog_error_t error;
+        f.program =
+            wirelog_parse_string(
+            ".decl input(i:int64,s:string)\n.decl out(i:int64,n:int64)\n"
+            "out(i,uuid4()) :- input(i,s).\n", &error);
+        CHECK(f.program && !wl_plan_from_program(f.program, &f.plan) &&
+            !wl_evaluation_control_create(0, &f.control));
+        wl_session_options_t options; wl_session_options_init(&options);
+        options.evaluation_control = controlled ? f.control : NULL;
+        CHECK(!wl_session_create_with_options(wl_backend_columnar(), f.plan, 1,
+            &options, &f.session));
+        for (unsigned r = 0; r < 3; ++r) {
+            f.input[r][0] = r+1;
+            f.input[r][1] = wl_intern_put(f.plan->intern, "abc");
+        }
+        memset(u_records, 0, sizeof(u_records));
+        memset(u_record_count, 0, sizeof(u_record_count));
+        memset(u_seen, 0, sizeof(u_seen)); active = NULL;
+        wl_session_set_delta_cb(f.session, u_real_capture, &f);
+        CHECK(!complete(f.session)); inputs(&f);
+        wl_columnar_expr_test_checkpoint = u_host_hook;
+        CHECK(!complete(f.session)); u_real_contents(&f, 0);
+        CHECK(f.events == 3 && f.positives == 3 && !f.negatives &&
+            u_seen[0] == (controlled ? 3u : 0u));
+        col_rel_t *out = session_find_rel(COL_SESSION(f.session), "out");
+        col_relation_snapshot_t generation = wl_columnar_relation_snapshot(out);
+        CHECK(!complete(f.session) && f.events == 3 &&
+            wl_columnar_relation_snapshot_equal(generation,
+            wl_columnar_relation_snapshot(out)));
+        CHECK(!wl_session_remove(f.session, "input", f.input[0], 1,
+            2) && !complete(f.session));
+        u_real_contents(&f, 1); CHECK(f.events >= 4 && f.negatives >= 1);
+        unsigned events = f.events;
+        CHECK(!complete(f.session) && f.events == events);
+        wl_columnar_expr_test_checkpoint = NULL; destroy(&f);
+    }
+}
+#endif
+
+static void uuid_compiler_policy(void) {
+    const char *expressions[] = {"uuid4(i)", "uuid5(i)", "uuid5(i,i,i)"};
+    for (unsigned i = 0; i < 3; ++i) {
+        char source[256]; snprintf(source, sizeof(source),
+            ".decl input(i:int64)\n.decl out(n:int64)\nout(%s) :- input(i).\n",
+            expressions[i]);
+        wirelog_error_t error;
+        wirelog_program_t *program = wirelog_parse_string(source, &error);
+        CHECK(!program && error != WIRELOG_OK);
+    }
+    wirelog_error_t error; wirelog_program_t *program = wirelog_parse_string(
+        ".decl input(i:int64)\n.decl out(n:string)\nout(uuid4()) :- input(i).\n",
+        &error);
+    CHECK(!program && error != WIRELOG_OK);
+}
+
+static void uuid_state_stops(void) {
+#ifdef WL_MBEDTLS_ENABLED
+    const uint8_t first[] = "ab", second[] = "c";
+    for (unsigned framed = 0; framed < 2; ++framed)
+        for (size_t offset = 0; offset < sizeof(psa_hash_operation_t);
+            offset += 8)
+            for (h_stop_action = 0; h_stop_action < 4; ++h_stop_action) {
+                h_stop_phase = 318; u_stop_progress = offset; h_stopped = false;
+                h_successor = 0;
+                wl_evaluation_control_t *c = begin(h_stop_action ==
+                        1 ? UINT64_MAX-1 : 0);
+                u_shim(framed, U_REAL, 0, 'S', first, 2, 'S', second, 1);
+                uint8_t output[20]; memset(output, 0xee, sizeof(output));
+                bool failed = false;
+                wl_columnar_expr_test_checkpoint = u_stop;
+                int rc =
+                    wl_columnar_expr_crypto_uuid_pair_attempt_controlled(framed,
+                        'S', first, 2, 'S', second, 1, output, &failed, c,
+                        wl_evaluation_control_active_attempt_id(c));
+                wl_columnar_expr_test_checkpoint = NULL;
+                CHECK(h_stopped && !failed &&
+                    rc ==
+                    (h_stop_action == 0 ? WL_EVALUATION_CONTROL_CANCELLED :
+                    h_stop_action ==
+                    1 ? WL_EVALUATION_CONTROL_WORK_LIMIT : h_stop_action ==
+                    3 ? EOVERFLOW : EINVAL));
+                CHECK(!u_init_calls && !u_setup_calls && !u_updates &&
+                    !u_finish_calls && !u_abort_calls);
+                for (unsigned i = 0; i < 20; ++i) CHECK(output[i] == 0xee);
+                u_unshim(); u_retire(c, rc);
+                CHECK(!wl_columnar_expr_crypto_uuid_pair_attempt_controlled(
+                        framed,
+                        'S', first, 2, 'S', second, 1, output, &failed, c,
+                        wl_evaluation_control_active_attempt_id(c)) && !failed);
+                uint8_t expected[20];
+                u_from_hex(framed ? "8485069ab79f21cdfc505919828c910ee9805041" :
+                    "a9993e364706816aba3e25717850c26c9cd0d89d", expected, 20);
+                CHECK(!memcmp(output, expected, 20)); finish(c, 0);
+            }
+#endif
+}
+
+static void uuid_empty_updates(void) {
+#ifdef WL_MBEDTLS_ENABLED
+    const uint8_t *first[] = {(const uint8_t *)"", (const uint8_t *)"ab"};
+    const uint8_t *second[] = {(const uint8_t *)"c", (const uint8_t *)""};
+    const size_t first_length[] = {0, 2}, second_length[] = {1, 0};
+    const char *golden[2][2] = {{"84a516841ba77a5b4648de2cd0dfcb30ea46dbb4",
+                                 "da23614e02469a0d7c7bd1bdab5c9c474b1904dc"},
+                                {"42210917762b55a95395f9f7a1b2752a66f9077b",
+                                 "6aa5f1f14d19baf8866418240e2c056327e4cab5"}};
+    for (unsigned framed = 0; framed < 2; ++framed)
+        for (unsigned empty = 0; empty < 2; ++empty) {
+            wl_evaluation_control_t *c = begin(UINT64_C(224)*
+                    ((framed ? 29u : 9u)+u_state_packets()));
+            u_shim(framed, U_REAL, 0, 'S', first[empty], first_length[empty],
+                'S', second[empty], second_length[empty]);
+            uint8_t output[20], expected[20]; bool failed = false;
+            u_from_hex(golden[framed][empty], expected, 20);
+            CHECK(!wl_columnar_expr_crypto_uuid_pair_attempt_controlled(framed,
+                'S', first[empty], first_length[empty], 'S', second[empty],
+                second_length[empty],
+                output, &failed, c,
+                wl_evaluation_control_active_attempt_id(c)) && !failed &&
+                !memcmp(output, expected, 20));
+            CHECK(u_updates == (framed ? 4u : 2u) && u_finish_calls == 1 &&
+                !u_abort_calls);
+            u_unshim(); finish(c, 0);
+        }
+#endif
+}
+
 int main(void) {
 #ifdef WL_MBEDTLS_ENABLED
     prepare_known();
 #endif
     helper_oracles(); helper_stops(); scalar_parity(); session_maps();
+    uuid_empty_updates(); uuid_compiler_policy(); uuid_state_stops();
+    uuid_pair_oracles();
+    uuid4_oracles();
+    uuid_pair_stops(); uuid_prefixes(); uuid4_stops(); uuid_numeric_parity();
+    uuid_session_maps(); uuid_session_filters();
     hmac_compiler_policy(); hmac_oracles(); hmac_scalar_parity(); hmac_stops();
     hmac_prefixes();
     hmac_session_maps(); hmac_session_filters();
     session_filters();
 #ifdef WL_MBEDTLS_ENABLED
-    mixed_session_maps(); hmac_long_preparation();
+    mixed_session_maps(); hmac_long_preparation(); uuid_long_preparation();
+    uuid_host_faults(); uuid4_real_hosts();
 #endif
     puts("controlled crypto digests: all checks passed"); return 0;
 }
