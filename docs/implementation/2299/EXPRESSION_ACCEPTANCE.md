@@ -90,7 +90,7 @@ ledger explicitly.
 | `WL_PLAN_EXPR_STR_FN_TRIM` | open | admitted | unit6-selectors |
 | `WL_PLAN_EXPR_STR_FN_TO_STRING` | open | admitted | unit6-builders |
 | `WL_PLAN_EXPR_STR_FN_TO_NUMBER` | open | admitted | unit5-decimal |
-| `WL_PLAN_EXPR_STR_FN_UUID5_RFC` | open | open | open |
+| `WL_PLAN_EXPR_STR_FN_UUID5_RFC` | open | admitted | unit7-uuid-rfc |
 | `WL_PLAN_EXPR_CMP_STR_EQ` | empty-only | admitted | unit4-sessions |
 | `WL_PLAN_EXPR_CMP_STR_NEQ` | empty-only | admitted | unit4-sessions |
 | `WL_PLAN_EXPR_CMP_STR_LT` | empty-only | admitted | unit4-sessions |
@@ -1094,3 +1094,50 @@ Real random UUID4 raw/controlled hosts compare structure and full-tuple signed
 ledgers, never accidental literal equality. Disabled FILTER rejects rows and
 MAP ERANGE permits public input correction. Qualification is limited to these
 five numeric tags. RFC STRING UUID5, extensions and remaining hosts stay open.
+
+
+## Unit7c2: existing RFC UUID5 string expression
+
+Only UUID5_RFC is newly qualified here; extension admission and remaining host
+coverage remain open. Raw lookup order is namespace then name, with missing name
+rejected before parsing and malformed namespace rejected before the name scan.
+The parser accepts exactly36 ASCII bytes, case-insensitive hex and hyphens at
+8/13/18/23, with arbitrary namespace version/variant. It reads at most37 bytes
+and stops at first NUL. Private16-byte output is copied only after FINAL353.
+With T224: ENTRY350, actual LENGTH_READ351, actual PARSE_CHAR352, FINAL353;
+valid75T, NULL2T, first NUL at j<36 gives(j+3)T, overlong39T,
+first invalid syntax index b gives(40+b)T. Each character region conservatively
+counts120 actions plus guard51 and caller40=211<=224. Final fixed memcpy16
+counts32 byte actions plus the fixed guard/caller envelope. No aggregate input
+scan or partial caller publication occurs.
+
+The reused unframed SHA1 pair hashes namespace16 then the complete name,
+including an explicit empty-name update; state-copy and abort contracts remain
+unit7c1's(9+I)T (currently38T), not the old9T. Version5 and variant10 modification
+has its own scalar admission375. Formatting is ENTRY360,37 STORE361 regions
+(including hyphens and NUL), FINAL362:39T. Each store derives one output byte;
+the final fixed memcpy37 counts74 byte actions+guard51+caller40=165<=224.
+Both helpers preserve output sentinels on nonzero control returns. Semantic
+parse invalidity publishes only validfalse after the final guard.
+
+Controlled interning always runs, including duplicate strings, using the actual
+intern governor and existing transactional error precedence. Allocation failure
+returns ENOMEM without publishing the scalar value. A stop after successful
+interning may retain a legitimate persistent symbol, while the row and relation
+generation remain uncommitted. STRING result schema is independent of stack
+provenance: the existing raw opcode pushes an INT64 intern ID. Raw registered
+extension callbacks verify RFC INT64 versus literal/VAR_STRING STRING arguments;
+a read-only test observer checks the controlled RFC stack slot. Controlled
+extension admission is not implied by this reference test.
+
+Tests cover exact independent helper tariffs/every positive prefix, every
+parser/store stop offset, cancellation/work/Original-END-successor/overflow,
+raw scalar IDs/NULL/invalid namespaces/names/order, empty and non-UTF8 names,
+allocation failure even for duplicates, governor denial and duplicate reuse,
+retained-symbol stops and retry. Actual compiler STRING MAP and FILTER hosts
+check full/delta/empty/all-false results, typed cells, signed delete/reinsert,
+hot prior-row generation stability, malformed namespace correction via public
+input APIs, mixed populated LFTJ exclusive owners, real resource closure,
+frozen Original/successor0 and retry. Disabled MAP retains ERANGE and public
+correction; FILTER rejects without provider work. Existing digest/HMAC/numeric
+UUID qualifications and fees are unchanged.

@@ -5943,6 +5943,11 @@ int wl_columnar_expr_crypto_uuid_pair_attempt_controlled(bool framed,
     uint8_t second_tag, const uint8_t *second, size_t second_length,
     uint8_t *output, bool *failed, wl_evaluation_control_t *control,
     uint64_t id);
+int wl_columnar_expr_crypto_uuid_parse_attempt_controlled(const char *text,
+    uint8_t *output, bool *valid, wl_evaluation_control_t *control,
+    uint64_t id);
+int wl_columnar_expr_crypto_uuid_format_attempt_controlled(const uint8_t *bytes,
+    char *output, wl_evaluation_control_t *control, uint64_t id);
 
 int wl_columnar_expr_hash_bytes_attempt_controlled(const uint8_t *, size_t,
     int64_t *, wl_evaluation_control_t *, uint64_t);

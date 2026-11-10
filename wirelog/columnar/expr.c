@@ -3600,6 +3600,7 @@ wl_columnar_expr_scalar_decode(const uint8_t *bytes, uint32_t size,
         *pos += length;
         break;
     }
+    case WL_PLAN_EXPR_STR_FN_UUID5_RFC:
     case WL_PLAN_EXPR_ARITH_UUID4:
     case WL_PLAN_EXPR_ARITH_UUID5:
     case WL_PLAN_EXPR_ARITH_UUID5_SS:
@@ -3808,7 +3809,8 @@ wl_columnar_expr_scalar_result_type_attempt_controlled(
     if (rc) return rc;
     wirelog_column_type_t result;
     bool valid = true;
-    if (owner->producer.op == WL_PLAN_EXPR_STR_FN_STR_REPLACE ||
+    if (owner->producer.op == WL_PLAN_EXPR_STR_FN_UUID5_RFC ||
+        owner->producer.op == WL_PLAN_EXPR_STR_FN_STR_REPLACE ||
         owner->producer.op == WL_PLAN_EXPR_STR_FN_SUBSTR ||
         owner->producer.op == WL_PLAN_EXPR_STR_FN_TRIM ||
         owner->producer.op == WL_PLAN_EXPR_STR_FN_CAT ||
@@ -4272,6 +4274,11 @@ wl_columnar_expr_scalar_uuid_span(int64_t operand, bool symbol,
 }
 #endif
 
+#ifdef WL_SESSION_TEST_HOOKS
+/* Read-only test observation; not an extension admission or permission. */
+void (*wl_columnar_expr_test_uuid_rfc_push)(uint32_t, int64_t);
+#endif
+
 int
 wl_columnar_expr_eval_scalar_attempt_controlled(
     const wl_columnar_expr_attempt_scalar_t *owner, const int64_t *row,
@@ -4317,6 +4324,87 @@ wl_columnar_expr_eval_scalar_attempt_controlled(
             if (rc) return rc;
             expr_push_string(&stack, v, owner->bytes + in.iarg,
                 (uint32_t)in.larg);
+        } else if (in.op == WL_PLAN_EXPR_STR_FN_UUID5_RFC) {
+            rc = wl_columnar_expr_scalar_region(control, id, 370, 0);
+            if (rc) return rc;
+            int64_t name_id = expr_pop(&stack), namespace_id = expr_pop(&stack),
+                result = 0;
+            bool rfc_failed = true;
+#ifdef WL_MBEDTLS_ENABLED
+            rc = wl_columnar_expr_scalar_region(control, id, 371, 0);
+            if (rc) return rc;
+            const char *namespace_text = intern ? wl_intern_reverse(intern,
+                    namespace_id) : NULL;
+            const char *name = intern ? wl_intern_reverse(intern,
+                    name_id) : NULL;
+            if (intern && name) {
+                uint8_t namespace_uuid[16], digest[20]; char formatted[37];
+                bool parsed = false;
+                rc = wl_columnar_expr_scalar_region(control, id, 372, 0);
+                if (rc) return rc;
+                rc =
+                    wl_columnar_expr_crypto_uuid_parse_attempt_controlled(
+                    namespace_text,
+                    namespace_uuid, &parsed, control, id);
+                if (rc) return rc;
+                if (parsed) {
+                    rc = wl_columnar_expr_scalar_region(control, id, 373, 0);
+                    if (rc) return rc;
+                    size_t name_length;
+                    rc = wl_columnar_expr_cstr_length_attempt_controlled(name,
+                            &name_length, control, id);
+                    if (rc) return rc;
+                    rc = wl_columnar_expr_scalar_region(control, id, 374,
+                            name_length);
+                    if (rc) return rc;
+                    rc =
+                        wl_columnar_expr_crypto_uuid_pair_attempt_controlled(
+                        false,
+                        0, namespace_uuid, sizeof(namespace_uuid), 0,
+                        (const uint8_t *)name, name_length, digest,
+                        &rfc_failed, control, id);
+                    if (rc) return rc;
+                    rc = wl_columnar_expr_scalar_region(control, id, 375, 0);
+                    if (rc) return rc;
+                    if (!rfc_failed) {
+                        digest[6] = (uint8_t)((digest[6] & 0x0f) | 0x50);
+                        digest[8] = (uint8_t)((digest[8] & 0x3f) | 0x80);
+                        rc = wl_columnar_expr_scalar_region(control, id, 376,
+                                0);
+                        if (rc) return rc;
+                        rc =
+                            wl_columnar_expr_crypto_uuid_format_attempt_controlled
+                                (digest,
+                                formatted, control, id);
+                        if (rc) return rc;
+                        rc = wl_columnar_expr_scalar_region(control, id, 377,
+                                0);
+                        if (rc) return rc;
+                        rc = wl_columnar_expr_scalar_intern(intern, formatted,
+                                &result, control, id);
+                        if (rc) return rc;
+                        rc = wl_columnar_expr_scalar_region(control, id, 378,
+                                0);
+                        if (rc) return rc;
+                    }
+                }
+            }
+#else
+            (void)name_id; (void)namespace_id;
+#endif
+            rc = wl_columnar_expr_scalar_region(control, id, 379, 0);
+            if (rc) return rc;
+            if (rfc_failed) {
+                semantic = true; break;
+            }
+            /* Raw returns an integer intern ID on the expression stack;
+             * STRING result schema does not change extension-argument ABI. */
+            expr_push(&stack, result);
+#ifdef WL_SESSION_TEST_HOOKS
+            if (stack.top && wl_columnar_expr_test_uuid_rfc_push)
+                wl_columnar_expr_test_uuid_rfc_push(stack.types[stack.top-1],
+                    stack.vals[stack.top-1]);
+#endif
         } else if (wl_columnar_expr_scalar_uuid_tag(in.op)) {
             rc = wl_columnar_expr_scalar_region(control, id, 340, in.op);
             if (rc) return rc;
