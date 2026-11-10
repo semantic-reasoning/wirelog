@@ -66,6 +66,15 @@ with tempfile.TemporaryDirectory(prefix='expression-inventory-') as folder:
     ledger_path.write_text(ledger, encoding='utf-8')
     assert gate.check(fixture)[0], 'removed HMAC admission must fail'
     source_path.write_text(original, encoding='utf-8')
+    ledger_path.write_text(ledger.replace(unrelated, unrelated.replace(
+        'unit6-replace', 'unit7-uuid-numeric')), encoding='utf-8')
+    assert gate.check(fixture)[0], 'numeric UUID qualification cannot close another tag'
+    scalar_uuid = original.index('case WL_PLAN_EXPR_ARITH_UUID4:', scalar_start)
+    source_path.write_text(original[:scalar_uuid] + original[scalar_uuid:].replace(
+        'case WL_PLAN_EXPR_ARITH_UUID4:', '', 1), encoding='utf-8')
+    ledger_path.write_text(ledger, encoding='utf-8')
+    assert gate.check(fixture)[0], 'removed UUID admission must fail'
+    source_path.write_text(original, encoding='utf-8')
     ledger_path.write_text(ledger + row, encoding='utf-8')
     assert gate.check(fixture)[0], 'duplicate rows must fail'
     ledger_path.write_text(ledger.replace(row, ''), encoding='utf-8')
