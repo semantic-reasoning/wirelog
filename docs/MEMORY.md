@@ -6529,3 +6529,22 @@ successor controls never finance mandatory retirement.
 Existing genuinely indexed key checks, real receipt ACK and private transaction
 disposal close the route, including END after successful ACK; tests require
 active/pending/reserved0 and governor/pin balance before retry and destruction.
+
+### One-column observed FILTER protocol (#2299)
+
+Four-op VARIABLE/FILTER/MAP/CONSOLIDATE heads use the general private observed
+transaction, including numeric FILTER. This repairs scalar-error observer debt
+before it is born, rather than ignoring an actual observer at mutation admission.
+Three-op identity projection retains its prior narrow admission/behavior. The
+fixed preflight payload adds at most6 actions, complete payload26; SOURCE retains
+its existing208/96/80 reader while DIRECT remains a direct fixed read.
+
+APPEND_AUDIT uses the existing readonly Original classifier for supported,
+nonempty FILTERs. PRE128 + child fees + POST128 describes append eligibility;
+scalar requirements choose canonical general execution before append copying or
+old-head CONCAT rewriting. Numeric FILTER still uses the real append plan.
+Each new parent interval is bounded by42+56+24=122 under128/quantum256; scalar
+fallback and numeric continuation are mutually exclusive fixed tails. The actual
+transaction owns partial frontier metadata; a boolean never supplies native
+permission. Genuine canonical unary proof/ACK and the R1 terminal receipt allow
+post-error input correction, and no raw observer policy or public API is changed.

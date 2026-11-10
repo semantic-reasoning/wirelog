@@ -677,6 +677,8 @@ void (*wl_columnar_session_test_observed_preflight_checkpoint)(
     wl_evaluation_control_t *, unsigned, uint64_t);
 int wl_columnar_session_test_fail_framed_funding_before_stop;
 int wl_columnar_session_test_fail_framed_funding_after_stop;
+void (*wl_columnar_session_test_filter_append_checkpoint)(
+    wl_evaluation_control_t *, unsigned, bool);
 void (*wl_columnar_session_test_head_scalar_checkpoint)(
     wl_evaluation_control_t *, unsigned, uint32_t);
 void (*wl_columnar_session_test_join_birth_checkpoint)(
@@ -8458,6 +8460,12 @@ wl_columnar_session_preflight_general_relation(void *payload)
         || r->ops[r->op_count - 2].op != WL_PLAN_OP_MAP
         || r->ops[r->op_count - 1].op != WL_PLAN_OP_CONSOLIDATE)
         p->done = p->shape = true;
+    if (p->done) return 0;
+    /* A FILTER can fail after a committed model exists. The general private
+     * transaction owns rollback and a real R1 correction receipt; the narrow
+     * observer cannot supply that authority. This includes numeric FILTERs.
+     * Fixed added work<=6; no expression payload is inspected here. */
+    if (r->op_count == 4) p->done = p->shape = true;
     return 0;
 }
 
@@ -13193,6 +13201,36 @@ wl_columnar_session_head_scalar_classify(wl_col_session_t *sess,
     return 0;
 }
 
+/* Descriptive optimization eligibility, never native permission. PRE/POST128
+ * each include charge engine42 + fixed helper/caller56 + next front24=122.
+ * Child classifiers retain their own224/per-byte regions. FILTER-false
+ * continuation and scalar fallback are mutually exclusive fixed tails. */
+int
+wl_columnar_session_filter_append_supported_attempt_controlled(
+    const wl_plan_expr_buffer_t *expr, bool *supported,
+    wl_evaluation_control_t *control, uint64_t id)
+{
+    if (!expr || !supported) return EINVAL;
+#ifdef WL_SESSION_TEST_HOOKS
+    if (wl_columnar_session_test_filter_append_checkpoint)
+        wl_columnar_session_test_filter_append_checkpoint(control, 0, false);
+#endif
+    int rc = wl_evaluation_control_charge_attempt(control, id, 128);
+    if (rc) return rc;
+    bool scalar = false;
+    rc = wl_columnar_expr_requires_scalar_attempt_controlled(expr->data,
+            expr->size, &scalar, control, id);
+    if (rc) return rc;
+#ifdef WL_SESSION_TEST_HOOKS
+    if (wl_columnar_session_test_filter_append_checkpoint)
+        wl_columnar_session_test_filter_append_checkpoint(control, 1, scalar);
+#endif
+    rc = wl_evaluation_control_charge_attempt(control, id, 128);
+    if (rc) return rc;
+    *supported = !scalar;
+    return 0;
+}
+
 static int
 wl_columnar_session_observed_child(wl_col_session_t *sess,
     wl_columnar_controlled_step_t *step)
@@ -13771,6 +13809,16 @@ wl_columnar_session_observed_action(wl_col_session_t *sess,
         bool supported = !head->recursive
             && wl_columnar_session_recursive_positive_op(op)
             && tx->entries[plan->edb_count + tx->index].public_relation;
+        if (supported && op->op == WL_PLAN_OP_FILTER && op->filter_expr.size) {
+            bool append_filter = false;
+            rc = wl_columnar_session_filter_append_supported_attempt_controlled(
+                &op->filter_expr, &append_filter, control, step->operation_id);
+            if (rc) return rc;
+            /* Scalar FILTER takes the canonical private plan before any
+             * append-copy or old-head CONCAT rewrite. Numeric FILTER keeps
+             * the existing positive/linearity audit and optimized path. */
+            if (!append_filter) supported = false;
+        }
         /* Only pure projections: expressions may change monotonicity or
          * require a separate qualified incremental representation. */
         if (supported && op->op == WL_PLAN_OP_MAP

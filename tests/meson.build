@@ -7423,3 +7423,15 @@ test_evaluation_join_scalar_recovery_exe = executable(
 )
 test('evaluation_join_scalar_recovery', test_evaluation_join_scalar_recovery_exe,
      suite: ['unit', 'tsan'], timeout: 120)
+
+# #2299 narrow one-column FILTER uses the qualified general recovery route.
+observed_filter_recovery_exe = executable('test_evaluation_observed_filter_recovery',
+  files('test_evaluation_observed_filter_recovery.c'),
+  c_args: ['-DWL_SESSION_TEST_HOOKS=1'],
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
+  link_with: [testlib_prod],
+)
+test('evaluation_observed_filter_recovery', observed_filter_recovery_exe,
+  suite: ['unit', 'tsan'], timeout: 120,
+)
