@@ -126,6 +126,7 @@ static wl_atomic_u64 reserve_timeouts;
 static wl_atomic_u64 heavy_worker; /* worker id + 1, 0 until chosen */
 static wl_atomic_u64 heavy_round;  /* current_round when it was chosen */
 static wl_atomic_u64 worker_failed;
+static wl_atomic_u64 fail_blocked; /* waiters the failing hold saw */
 
 /* Bumped on the coordinator, which is the thread that runs the snapshot. */
 static wl_atomic_u64 pump_calls;
@@ -142,7 +143,7 @@ static uint64_t round_blocked_base; /* blocked_waits at the round's start */
 static uint32_t queue_threads; /* the workqueue's real thread count */
 static bool skew_paused;
 static bool skew_heavy_blocked; /* the heavy lane waited, the rest closed */
-static uint64_t hold_blocked;   /* producers waiting when a hold ended */
+static uint64_t hold_blocked;   /* waiters when a hold's predicate held */
 static bool final_valid;
 static wl_tdd_channel_stats_t final_stats; /* after the last joined round */
 
@@ -179,11 +180,25 @@ pred_published(const wl_tdd_channel_stats_t *stats, void *ctx)
     return stats->published >= 1;
 }
 
+/*
+ * When wl_tdd_channel_test_wait() calls them, hold predicates run under the
+ * channel's lock.  pred_space_waiter_seen, pred_all_blocked,
+ * pred_worker_failed and pred_failed_rest_blocked store the space_waiters
+ * they saw through their ctx when they return true, and leave it unchanged
+ * otherwise (#2355).  A wl_tdd_channel_stats() call after the wait takes the
+ * lock again once the wait has released it, and a waiter admitted in between
+ * would make that second read report fewer waiters, or none.
+ */
+
+/* A producer waits for space; the waiters seen are stored in
+ * *(uint64_t *)@ctx. */
 static bool
-pred_space_waiter(const wl_tdd_channel_stats_t *stats, void *ctx)
+pred_space_waiter_seen(const wl_tdd_channel_stats_t *stats, void *ctx)
 {
-    (void)ctx;
-    return stats->space_waiters >= 1;
+    if (stats->space_waiters < 1)
+        return false;
+    *(uint64_t *)ctx = stats->space_waiters;
+    return true;
 }
 
 /* Only the caller's own lane is still open. */
@@ -212,33 +227,49 @@ pred_heavy_blocked(const wl_tdd_channel_stats_t *stats, void *ctx)
     return *witness || stats->lanes_open == 0;
 }
 
+typedef struct {
+    const uint32_t *threads; /* the workqueue's thread count */
+    uint64_t *seen;          /* space_waiters when the predicate held */
+} all_blocked_ctx_t;
+
 /* Every producer that can run waits for space: as many wait as there are
- * open lanes, or as the workqueue has threads, whichever is smaller. */
+ * open lanes, or as the workqueue has threads, whichever is smaller.  @ctx
+ * is an all_blocked_ctx_t. */
 static bool
 pred_all_blocked(const wl_tdd_channel_stats_t *stats, void *ctx)
 {
-    uint32_t threads = *(const uint32_t *)ctx;
+    const all_blocked_ctx_t *c = ctx;
+    uint32_t threads = *c->threads;
     uint32_t runnable = stats->lanes_open < threads ? stats->lanes_open
         : threads;
-    return stats->space_waiters >= 1 && stats->space_waiters >= runnable;
+    if (stats->space_waiters < 1 || stats->space_waiters < runnable)
+        return false;
+    *c->seen = stats->space_waiters;
+    return true;
 }
 
+/* The failing worker has failed; the space_waiters seen then are stored in
+ * *(uint64_t *)@ctx. */
 static bool
 pred_worker_failed(const wl_tdd_channel_stats_t *stats, void *ctx)
 {
-    (void)stats;
-    (void)ctx;
-    return load(&worker_failed) != 0;
+    if (load(&worker_failed) == 0)
+        return false;
+    *(uint64_t *)ctx = stats->space_waiters;
+    return true;
 }
 
 /* The failing worker has failed and every lane still open waits for space.
- * Its own lane never waits for space, so it has closed by then. */
+ * Its own lane never waits for space, so it has closed by then.  The
+ * waiters seen are stored in *(uint64_t *)@ctx. */
 static bool
 pred_failed_rest_blocked(const wl_tdd_channel_stats_t *stats, void *ctx)
 {
-    (void)ctx;
-    return load(&worker_failed) != 0 && stats->space_waiters >= 1
-           && stats->space_waiters == stats->lanes_open;
+    if (load(&worker_failed) == 0 || stats->space_waiters < 1
+        || stats->space_waiters != stats->lanes_open)
+        return false;
+    *(uint64_t *)ctx = stats->space_waiters;
+    return true;
 }
 
 /* Wait on @ch for @pred; an expiry bumps @timeouts. */
@@ -258,7 +289,9 @@ fail_once_blocked(wl_tdd_channel_t *ch)
 {
     if (!first(&reserve_fired))
         return 0;
-    wait_on(ch, pred_space_waiter, NULL, &reserve_timeouts);
+    uint64_t seen = 0;
+    wait_on(ch, pred_space_waiter_seen, &seen, &reserve_timeouts);
+    atomic_store_explicit(&fail_blocked, seen, memory_order_relaxed);
     atomic_store_explicit(&worker_failed, 1, memory_order_relaxed);
     return reserve_fail_rc;
 }
@@ -366,26 +399,26 @@ pump_hook(wl_tdd_channel_t *ch)
          * run waits for space. */
         if (!first(&pump_calls))
             return 0;
-        wait_on(ch, pred_all_blocked, &queue_threads, &pump_timeouts);
-        wl_tdd_channel_stats(ch, &stats);
-        hold_blocked = stats.space_waiters;
+        {
+            all_blocked_ctx_t all = {
+                .threads = &queue_threads,
+                .seen = &hold_blocked,
+            };
+            wait_on(ch, pred_all_blocked, &all, &pump_timeouts);
+        }
         return pump_fail_rc;
     case PUMP_WAIT_FAILED:
         /* The first pump holds back until the failing worker has failed. */
         if (!first(&pump_calls))
             return 0;
-        wait_on(ch, pred_worker_failed, NULL, &pump_timeouts);
-        wl_tdd_channel_stats(ch, &stats);
-        hold_blocked = stats.space_waiters;
+        wait_on(ch, pred_worker_failed, &hold_blocked, &pump_timeouts);
         return 0;
     case PUMP_FAIL_FAILED:
         /* The first pump reports pump_fail_rc once the failing worker's
          * lane has closed and every other open lane waits for space. */
         if (!first(&pump_calls))
             return 0;
-        wait_on(ch, pred_failed_rest_blocked, NULL, &pump_timeouts);
-        wl_tdd_channel_stats(ch, &stats);
-        hold_blocked = stats.space_waiters;
+        wait_on(ch, pred_failed_rest_blocked, &hold_blocked, &pump_timeouts);
         return pump_fail_rc;
     default:
         return 0;
@@ -400,11 +433,8 @@ abandon_hook(wl_col_session_t *coord)
     if (!first(&abandon_calls))
         return false;
     if (abandon_mode == ABANDON_AFTER_BLOCK) {
-        wl_tdd_channel_stats_t stats;
-        wait_on(coord->tdd_channel, pred_space_waiter, NULL,
+        wait_on(coord->tdd_channel, pred_space_waiter_seen, &hold_blocked,
             &publish_timeouts);
-        wl_tdd_channel_stats(coord->tdd_channel, &stats);
-        hold_blocked = stats.space_waiters;
     } else {
         wait_for_waiting_producer(coord->tdd_channel);
     }
@@ -463,6 +493,7 @@ hooks_reset(void)
     atomic_store_explicit(&heavy_round, 0, memory_order_relaxed);
     atomic_store_explicit(&current_round, 0, memory_order_relaxed);
     atomic_store_explicit(&worker_failed, 0, memory_order_relaxed);
+    atomic_store_explicit(&fail_blocked, 0, memory_order_relaxed);
     atomic_store_explicit(&pump_calls, 0, memory_order_relaxed);
     atomic_store_explicit(&abandon_calls, 0, memory_order_relaxed);
     atomic_store_explicit(&publish_timeouts, 0, memory_order_relaxed);
@@ -1185,8 +1216,8 @@ test_cancel_releases_blocked(const program_t *p, uint32_t workers)
             "%s W=%u snapshot rc=%d/%d, want EPROTO", p->name, workers,
             first_rc, second_rc);
         CHECK(first_blocked >= 1 && hold_blocked >= 1,
-            "%s W=%u no producer waited for space at the cancel", p->name,
-            workers);
+            "%s W=%u no producer waited for space when the hold ended",
+            p->name, workers);
         CHECK(first_timeouts == 0 && load(&pump_timeouts) == 0,
             "%s W=%u the producers never all waited", p->name, workers);
         CHECK(first_s < WAIT_MS / 1000.0 && second_s < WAIT_MS / 1000.0,
@@ -1238,7 +1269,7 @@ test_abandoned_blocked_round(uint32_t workers)
             (unsigned long long)load(&publish_timeouts));
         CHECK(rc == EIO, "W=%u snapshot rc=%d, want EIO", workers, rc);
         CHECK(hold_blocked >= 1 && load(&publish_timeouts) == 0,
-            "W=%u no producer waited for space when the round was left",
+            "W=%u no producer waited for space when the hold ended",
             workers);
         CHECK(channel_released(f.coord), "W=%u channel not released",
             workers);
@@ -1286,9 +1317,11 @@ test_worker_error_while_blocked(uint32_t workers)
         set_env("WIRELOG_TDD_CHANNEL_BYTES", NULL);
         const char *replay = f.coord->tdd_audit.replay;
         fprintf(stderr, "  worker EOVERFLOW while blocked W=%u: rc=%d "
-            "threads=%u replay=%s blocked=%llu cancelled=%d "
-            "timeouts=%llu/%llu rows=%zu/%zu\n", workers, rc, queue_threads,
-            replay ? replay : "(none)", (unsigned long long)hold_blocked,
+            "threads=%u replay=%s fail_blocked=%llu blocked=%llu "
+            "cancelled=%d timeouts=%llu/%llu rows=%zu/%zu\n", workers, rc,
+            queue_threads, replay ? replay : "(none)",
+            (unsigned long long)load(&fail_blocked),
+            (unsigned long long)hold_blocked,
             final_stats.cancelled, (unsigned long long)load(&reserve_timeouts),
             (unsigned long long)load(&pump_timeouts), got.count,
             serial.count);
@@ -1297,8 +1330,11 @@ test_worker_error_while_blocked(uint32_t workers)
                 "%u workqueue thread(s)\n", workers, queue_threads);
         } else {
             CHECK(rc == 0, "W=%u snapshot rc=%d", workers, rc);
-            CHECK(load(&reserve_timeouts) == 0 && hold_blocked >= 1,
+            CHECK(load(&reserve_timeouts) == 0 && load(&fail_blocked) >= 1,
                 "W=%u no producer waited when the worker failed", workers);
+            CHECK(hold_blocked >= 1,
+                "W=%u no producer still waited when the consumer saw the "
+                "failure", workers);
             CHECK(load(&pump_timeouts) == 0,
                 "W=%u the consumer never saw the failure", workers);
             CHECK(final_valid && !final_stats.cancelled,
@@ -1357,10 +1393,12 @@ test_worker_error_outranks_cancel(uint32_t workers)
         const char *strategy = f.coord->tdd_audit.strategy;
         const char *replay = f.coord->tdd_audit.replay;
         fprintf(stderr, "  worker EOVERFLOW outranks cancel W=%u: rc=%d "
-            "threads=%u strategy=%s replay=%s replay_rc=%d blocked=%llu "
-            "cancelled=%d channel_rc=%d timeouts=%llu/%llu rows=%zu/%zu\n",
+            "threads=%u strategy=%s replay=%s replay_rc=%d fail_blocked=%llu "
+            "blocked=%llu cancelled=%d channel_rc=%d timeouts=%llu/%llu "
+            "rows=%zu/%zu\n",
             workers, rc, queue_threads, strategy ? strategy : "(none)",
             replay ? replay : "(none)", f.coord->tdd_audit.replay_rc,
+            (unsigned long long)load(&fail_blocked),
             (unsigned long long)hold_blocked, final_stats.cancelled,
             final_stats.channel_rc, (unsigned long long)load(&reserve_timeouts),
             (unsigned long long)load(&pump_timeouts), got.count,
@@ -1375,7 +1413,7 @@ test_worker_error_outranks_cancel(uint32_t workers)
             CHECK(load(&reserve_timeouts) == 0 && load(&pump_timeouts) == 0,
                 "W=%u a hook's wait timed out", workers);
             CHECK(hold_blocked >= 1,
-                "W=%u no lower-numbered producer waited at the cancel",
+                "W=%u no lower-numbered producer waited when the hold ended",
                 workers);
             CHECK(final_valid && final_stats.cancelled
                 && final_stats.channel_rc == EPROTO,
@@ -1429,6 +1467,77 @@ test_skew_witness(void)
         "closed lane revoked the captured witness");
 }
 
+/* #2355: pred_space_waiter_seen, pred_all_blocked, pred_worker_failed and
+ * pred_failed_rest_blocked store the waiters they saw only when they hold,
+ * and a later check that does not hold leaves the stored count alone. */
+static void
+test_hold_witness(void)
+{
+    uint32_t threads = 4;
+    uint64_t seen = 7;
+    all_blocked_ctx_t all = { .threads = &threads, .seen = &seen };
+    wl_tdd_channel_stats_t stats = { 0 };
+
+    stats.lanes_open = 3;
+    CHECK(!pred_all_blocked(&stats, &all) && seen == 7,
+        "all-blocked held without a waiter");
+    stats.space_waiters = 2;
+    CHECK(!pred_all_blocked(&stats, &all) && seen == 7,
+        "all-blocked held with a runnable producer not waiting");
+    stats.space_waiters = 3;
+    CHECK(pred_all_blocked(&stats, &all) && seen == 3,
+        "all-blocked did not store the waiters it saw");
+    stats.lanes_open = 6;
+    stats.space_waiters = 4;
+    CHECK(pred_all_blocked(&stats, &all) && seen == 4,
+        "all-blocked ignored the thread cap");
+    stats.space_waiters = 0;
+    CHECK(!pred_all_blocked(&stats, &all) && seen == 4,
+        "a later all-blocked check revoked the stored waiters");
+
+    seen = 7;
+    stats = (wl_tdd_channel_stats_t){ 0 };
+    CHECK(!pred_space_waiter_seen(&stats, &seen) && seen == 7,
+        "space-waiter held without a waiter");
+    stats.space_waiters = 2;
+    CHECK(pred_space_waiter_seen(&stats, &seen) && seen == 2,
+        "space-waiter did not store the waiters it saw");
+
+    seen = 7;
+    stats = (wl_tdd_channel_stats_t){ 0 };
+    atomic_store_explicit(&worker_failed, 0, memory_order_relaxed);
+    stats.space_waiters = 2;
+    CHECK(!pred_worker_failed(&stats, &seen) && seen == 7,
+        "worker-failed held before the failure");
+    /* Guard case: every open lane waits, but worker_failed is still 0, so
+     * only that clause can make the predicate decline. */
+    stats.lanes_open = 2;
+    CHECK(!pred_failed_rest_blocked(&stats, &seen) && seen == 7,
+        "failed-rest-blocked held before the failure");
+    atomic_store_explicit(&worker_failed, 1, memory_order_relaxed);
+    CHECK(pred_worker_failed(&stats, &seen) && seen == 2,
+        "worker-failed did not store the waiters it saw");
+    seen = 7;
+    stats.space_waiters = 0;
+    CHECK(pred_worker_failed(&stats, &seen) && seen == 0,
+        "worker-failed did not store a count of no waiters");
+    seen = 7;
+    stats.lanes_open = 0;
+    CHECK(!pred_failed_rest_blocked(&stats, &seen) && seen == 7,
+        "failed-rest-blocked held with every lane closed");
+    stats.lanes_open = 2;
+    stats.space_waiters = 1;
+    CHECK(!pred_failed_rest_blocked(&stats, &seen) && seen == 7,
+        "failed-rest-blocked held with an open lane not waiting");
+    stats.space_waiters = 2;
+    CHECK(pred_failed_rest_blocked(&stats, &seen) && seen == 2,
+        "failed-rest-blocked did not store the waiters it saw");
+    stats.space_waiters = 1;
+    CHECK(!pred_failed_rest_blocked(&stats, &seen) && seen == 2,
+        "a later failed-rest-blocked check revoked the stored waiters");
+    atomic_store_explicit(&worker_failed, 0, memory_order_relaxed);
+}
+
 int
 main(void)
 {
@@ -1445,6 +1554,7 @@ main(void)
     test_abandoned_round_is_cancelled(2);
 
     test_skew_witness();
+    test_hold_witness();
     test_channel_capacity();
     static const uint32_t widths[] = { 2, 8 };
     for (size_t i = 0; i < sizeof(widths) / sizeof(widths[0]); i++) {
