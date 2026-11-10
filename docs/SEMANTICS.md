@@ -2503,3 +2503,21 @@ until their genuine terminal status; it is not limited to sixteen calls.
 Busy, identity and cleanup errors remain authoritative. The complete ordinary
 JOIN coverage and reproducible regression commands are recorded in
 [JOIN host acceptance](implementation/2297/JOIN_HOST_ACCEPTANCE.md).
+
+
+#### Correcting failed hot scalar successors (#2299 / #1953)
+
+A positive error from an ordinary scalar MAP after earlier completion preserves
+the previous committed image and signed-notification baseline. Once actual child
+ACK, private rollback/disposal and Original FINISH complete, the session exposes
+authenticated RETRYABLE state rather than retaining PENDING solely because the
+failed evaluation never converged. Public correction remains restricted to
+existing declared EDBs and widths. Invalid/failed/zero-row requests do not promote
+state; real successful correction marks DIRTY and replay rebuilds from current
+inputs. Repeating STEP with uncorrected input repeats its genuine error.
+
+The terminal receipt does not mark the failed query successful, poll or reset a
+successor controller, discard frozen error/denial reports, or release retained
+cleanup obligations. A fresh accepted attempt consumes it. Exact committed values,
+generations and required signed events remain authoritative through correction,
+retry, evaluating snapshot and subsequent calls.

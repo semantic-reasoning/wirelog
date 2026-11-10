@@ -6362,3 +6362,28 @@ financial/noncalled/action errors integrity-abort; no ordinary return exposes a
 partially reset canonical descriptor. NonC1 keeps its original reset. Real
 successor histories assert multiple completed chunks while retaining literal,
 signed/raw, report and callback oracles; the counter is not a cost oracle.
+
+
+#### Failed scalar-successor terminal retry receipts (#2299 / #1953)
+
+`wl_columnar_controlled_step.failed_retry_*` is fixed metadata, not a private
+storage capability. The real observed transaction records `closed_generation`
+only at actual child terminal ACK or authenticated no-frame refusal. After all
+private readers/retirements/arrays and reservations are closed, maintenance
+prepays192 registration units and captures the owning session, operation/control generation,
+plan and public registry provenance before its physical retirement. Only the
+matching genuine Original FINISH can make `failed_retry_ready` visible. This
+terminal path uses the existing SOURCE FINISH224/240 stages even without JOIN
+batching, preserving separate positive checkpoints around finish/publication.
+
+| Boundary | Preserved/reset state | Legal next entry |
+|---|---|---|
+| Child/transaction cleanup or FINISH pending | Receipt not ready; actual resource/receipt owners retained | Existing owned cleanup only; mutation remains blocked |
+| Failed private successor fully retired and Original closed | Prior public image/generation and report preserved; authentic receipt ready, no private owners | STEP retry or declared-EDB correction; uncorrected RETRYABLE snapshot stays protected |
+| Failed/zero correction request | Terminal receipt and report unchanged | Same terminal boundary |
+| Successful admitted EDB mutation | Only commit notification refreshes actual registry/count and marks DIRTY; logical notification baseline stays unchanged | Fresh bounded STEP or evaluating snapshot |
+| New attempt accepted | Old receipt flags consumed before forward work; new private image built from real current EDB | Existing publication/cutoff protocol |
+
+A live unrelated control generation does not become funding or replay authority.
+The unchanged non-JOIN Original-END retained-child gap needs its own authenticated
+native cleanup proof; absence of physical bytes never substitutes for ACK.
