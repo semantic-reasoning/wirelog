@@ -3640,6 +3640,52 @@ wl_columnar_expr_scalar_decode(const uint8_t *bytes, uint32_t size,
     return wl_columnar_expr_attempt_charge(control, id, 0);
 }
 
+/* Read-only route classification. Both decoder grammars remain authoritative;
+ * no payload byte is searched as a tag and no instruction is evaluated.
+ * ENTRY/FINAL224 and PRE/POST224 surround each existing paid child decoder.
+ * New fixed fronts fit211; child byte/digit regions retain their own prices.
+ * ENOTSUP is descriptive, not an eagerly published query semantic error. */
+int
+wl_columnar_expr_requires_scalar_attempt_controlled(const uint8_t *bytes,
+    uint32_t size, bool *requires, wl_evaluation_control_t *control,
+    uint64_t id)
+{
+    if (!requires) return EINVAL;
+    int rc = wl_columnar_expr_scalar_region(control, id, 550, 0);
+    if (rc) return rc;
+    bool scalar = false;
+    uint32_t pos = 0;
+    while (bytes && pos < size) {
+        uint32_t start = pos;
+        expr_instr_t instruction;
+        rc = wl_columnar_expr_scalar_region(control, id, 551, start);
+        if (rc) return rc;
+        int decoded = wl_columnar_expr_attempt_decode(bytes, size, &pos,
+                &instruction, 1, control, id, false);
+        if (decoded && decoded != ENOTSUP) return decoded;
+        rc = wl_columnar_expr_scalar_region(control, id, 552, start);
+        if (rc) return rc;
+        if (!decoded) {
+            if (pos <= start || pos > size) break;
+            continue;
+        }
+        pos = start;
+        rc = wl_columnar_expr_scalar_region(control, id, 553, start);
+        if (rc) return rc;
+        decoded = wl_columnar_expr_scalar_decode(bytes, size, &pos,
+                &instruction, control, id);
+        if (decoded && decoded != ENOTSUP) return decoded;
+        rc = wl_columnar_expr_scalar_region(control, id, 554, start);
+        if (rc) return rc;
+        scalar = !decoded && pos > start && pos <= size;
+        break;
+    }
+    rc = wl_columnar_expr_scalar_region(control, id, 555, pos);
+    if (rc) return rc;
+    *requires = scalar;
+    return 0;
+}
+
 static int
 wl_columnar_expr_scalar_admit(wl_columnar_memory_governor_ref_t *governor,
     uint64_t bytes, wl_columnar_memory_reservation_t *credit, bool *held,

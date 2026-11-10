@@ -9025,8 +9025,13 @@ int wl_columnar_eval_stack_cleanup_receipt_frame_index_bind(
 int wl_columnar_eval_stack_cleanup_receipt_index_key_for_frame(
     wl_columnar_eval_stack_cleanup_frame_t *, uint32_t,
     wl_columnar_eval_cleanup_receipt_key_t *);
-int wl_columnar_session_unary_cleanup_receipt_index(const wl_col_session_t *,
+int wl_columnar_session_native_cleanup_receipt_index(const wl_col_session_t *,
     const wl_columnar_eval_cleanup_receipt_key_t *, uint32_t *);
+int wl_columnar_expr_requires_scalar_attempt_controlled(const uint8_t *,
+    uint32_t, bool *, wl_evaluation_control_t *, uint64_t);
+int wl_columnar_session_join_cleanup_register(wl_col_session_t *,
+    wl_columnar_eval_serial_framed_attempt_t *, wl_evaluation_control_t *,
+    uint64_t, uint32_t, bool);
 int wl_columnar_session_unary_cleanup_register(wl_col_session_t *,
     wl_columnar_eval_serial_framed_attempt_t *, wl_evaluation_control_t *,
     uint64_t,
@@ -9182,6 +9187,14 @@ extern int wl_columnar_session_test_fail_framed_funding_before_stop;
 extern int wl_columnar_session_test_fail_framed_funding_after_stop;
 /* Capacity injection and read-only completed-grant observation only. These
  * callbacks never dispatch engines or alter classifier/receipt authority. */
+/* Fresh forward registration only; before funding and before Original poll. */
+int wl_columnar_session_test_head_scalar_state(wl_col_session_t *,
+    uint64_t [4], bool);
+extern void (*wl_columnar_session_test_head_scalar_checkpoint)(
+    wl_evaluation_control_t *, unsigned, uint32_t);
+extern void (*wl_columnar_session_test_join_birth_checkpoint)(
+    wl_columnar_eval_serial_framed_attempt_t *, wl_evaluation_control_t *,
+    uint64_t, unsigned, uint32_t, bool);
 extern uint64_t (*wl_columnar_session_test_framed_grant_limit)(
     const wl_col_session_t *, wl_columnar_eval_serial_framed_host_action_t,
     uint64_t);

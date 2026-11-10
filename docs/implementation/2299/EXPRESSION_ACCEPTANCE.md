@@ -1199,3 +1199,116 @@ successor/overflow, frozen reports/successor0/reset retry, both saturation
 counters, foreign authentic descriptor, exactly-once resource retirement and
 actual unregister/final-snapshot-with-lease lifetime. Raw registry lifecycle
 regressions and standalone linkage remain separate controls.
+
+## Ordinary observed JOIN plus scalar END recovery prerequisite
+
+Committed8a STRLEN-after-JOIN reproduced the missing native birth independently
+of extension admission: Original END plus successor returned EINVAL with12160
+bytes and an active frame retained, successor work0. Batching and globalC1 flags
+were bothfalse, so late JOIN registration skipped the real joined frame, while
+pure-unary registration correctly excluded JOIN. Pointer presence and AUTO debt
+were not substitute native permission.
+
+Fresh ordinary observed nonC1/nonbatch scalar-required capture now registers
+an abort-capable composed JOIN
+frame before any child can invoke library/user work. The independently metered
+shape is VARIABLE/FILTER/MAP/JOIN/CONCAT with terminal CONSOLIDATE and at least
+one JOIN; LFTJ and other existing routes retain their own contracts. Pure-unary
+birth remains separate and exclusive. ROOT, transaction/head/bindings, exact
+frame/thread/Original/operation and actual indexed/full-key checks precede
+publication. Failed admission rolls back only the genuine fresh bootstrap and
+pin through the existing failed-begin owner, never a fabricated ACK.
+
+Registrar literal work is256 for ENTRY, each actual OP, ROOT, BINDING,
+KEY_THREAD, INDEX_BIND and PUBLICATION:256*(N+6) for eligible N records. Each
+packet funds first, then atomically polls the saved Original with zero debit;
+financial refusal is observed before Original. Cancellation, sticky accounting,
+END or rebind stops before that packet's body. The final publication poll is
+the last callback boundary before stores. This is fresh forward preparation;
+registered repeat and native retirement never execute these polls.
+
+The controller source is expanded, rather than treated as an opaque boundary:
+charge_attempt18 includes null/ID checks5, mutex front2, active/ID selection4,
+nested charge/result4, unlock front2 and return1. charge_locked has at most24
+fixed actions covering active/accounting/stop/cancel, limit and overflow tests,
+updates and return (including2 conservative alternative-assignment slack).
+Only primitive mutex/atomic retry bodies remain cooperative. Both controller
+calls84 plus helper/caller glue22 plus maximum stage144 total250<=256. Stage
+ceilings ENTRY96, OP/ROOT64, BINDING112, KEY144, INDEX112 and PUBLICATION96 include
+fixed nested frame/owner/thread, indexed five-field key reads/copies/equality,
+error tails and transitions. Test barriers are production-disabled. The helper's
+stage/progress plumbing fits the22 glue allowance; no whole plan loop is hidden.
+
+The first ADVANCE financier has finite capacity max(existing,10240+512*N):
+6400 maximum initial receipt lookup,768 host fronts,1536 unary fixed and1536 JOIN
+fixed, plus two actual256 per-op scans. Capacity is not an executed work debit.
+The four-op compiler fixture VARIABLE/JOIN/MAP/CONSOLIDATE with authentic
+historical receipt index0 uses current index1: lookup640+host768+unary768
+precedes new JOIN2560, total4736. Independent one-short oracles use capacities
+2431,2687,...,4735 and consumed2176,2432,...,4480. No scalar forward work occurs
+before real refused bootstrap retirement and retry. Every fresh stage also
+covers cancellation from an actual other thread, work exhaustion, END alone,
+END/successor and sticky overflow, with exact independent prefix and frozen
+Original consumption. Funding-first refusal is checked separately from the
+Original cancellation later returned by the session facade.
+
+Before first host finance, and before `child_active`, a readonly forward pass
+classifies actual immutable head expressions on Original funding. It calls the
+existing numeric decoder at instruction starts; only ENOTSUP rewinds a private
+position for the existing scalar decoder. Success there describes scalar
+fallback. Both ENOTSUP results describe false without publishing a query error;
+real control/accounting errors propagate unchanged. No provider, intern,
+lookup, allocation or evaluation occurs. Constant payload bytes are never tag
+candidates. The cache is actual transaction/head/generation metadata, initialized
+with the real head storage and replaced before each new child generation;
+framed birth still requires the complete native shape/root/binding/key proof.
+The cache never supplies native permission. Pre-frame refusal uses the genuine
+transaction disposal path and creates no frame or receipt ACK.
+
+Classifier fixed work is ENTRY224, PRE224/POST224 around every numeric and
+scalar decoder attempt, and FINAL224: (2+2R+2F)*224 plus the existing decoder
+child fees. A child control error returns without POST/FINAL; all outputs stay
+unchanged. Plan traversal pays ENTRY/FINAL224, OP224 per visited operator,
+MAP_HEADER224 and SLOT224 per visited expression-array record. Scalar discovery
+shortens the actual traversal. Head-region source includes both controller
+bodies84, fixed body at most120 and fronts20, total224. The preceding fresh
+unary registration now uses the same256 funding/Original-poll packets as JOIN,
+so a long MAP/FILTER prefix cannot hide cancellation before JOIN classification.
+Registered/native retirement never uses these forward polls.
+
+Primitive tests model every positive224 boundary for empty, numeric, scalar,
+numeric-prefix/scalar-last, malformed and unknown encodings, including scalar
+opcode aliases inside integer payload. Compiler head tests stop all new
+pre-frame phases and long OP63 from another thread, retaining exact Original
+reports, output identity/generation, successor0 and genuine transaction cleanup.
+A provenance-only test fault invalidates the actual cached generation at first
+grant creation, for both unary and JOIN heads. Protected rejection occurs before
+any scalar work or publication, with real bootstrap/resource closure and a
+normal fresh-description retry. Pure-unary registration covers all seven fresh
+stages and actual64-MAP prefix;
+all new JOIN stages, six real grant/ACK finish cuts and signed retry controls
+remain. Existing numeric AUTO metadata-purpose2304 and C1 SOURCE672/LATE407
+assertions pass unchanged: numeric/projection and existing C1/batch heads keep
+their original real retirement routes.
+
+The SOURCE host wrapper selects2048 from the authenticated current scalar-head
+fact before a birth record exists; this selects finance, never authority,
+and does not set globalC1. Existing BANK248/88/104 policy, checked generation
+settlements and independent gateway/native/tuple/close funding remain. LATE157
+observes the already published JOIN record without repeating publication170.
+Actual receipt location is bound once at birth. Generic lookup selects exactly
+one registered JOIN/unary record, validates its actual slot/full key, and never
+rescans on a protected mismatch; native action still requires the complete
+route proof. Existing legacy C1 registration retains its prior fallback.
+
+Tests use real physical empty-frame APIs for old FREED records, then genuine
+compiler/session work at actual indices0/1/31. STRLEN and CAT cover hot/cold
+generation stability, cancellation, exhaustion, Original END alone/successor,
+sticky overflow, frozen reports/successor0, complete native closure, raised-limit
+retry, exact typed cells and signed delete/reinsert/no-op events. All six genuine
+grant-finish boundaries pass, including exactly one successful receipt ACK and
+actual slotFREE before cut5 END. No new JOIN ACK journal was needed or added.
+Negative probes reject wrong full keys/index binding, protected stored-key
+mismatch, use of Original as financier and duplicate published registration,
+without Original debit or ownership changes. Extension invocation and the
+remaining legal expression-host matrix are still separate qualifications.

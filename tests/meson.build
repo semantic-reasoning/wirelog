@@ -7412,3 +7412,14 @@ test_evaluation_extension_lookup_exe = executable(
 )
 test('evaluation_extension_lookup', test_evaluation_extension_lookup_exe,
      suite: ['unit', 'tsan'])
+
+test_evaluation_join_scalar_recovery_exe = executable(
+  'test_evaluation_join_scalar_recovery',
+  files('test_evaluation_join_scalar_recovery.c'),
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  c_args: ['-DWL_SESSION_TEST_HOOKS=1'],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
+  link_with: [testlib_prod],
+)
+test('evaluation_join_scalar_recovery', test_evaluation_join_scalar_recovery_exe,
+     suite: ['unit', 'tsan'], timeout: 120)

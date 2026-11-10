@@ -6441,8 +6441,8 @@ for its genuine physical-free obligation.
 
 | Financial region | Positive admissions / allowance |
 |---|---|
-| Registration | Fixed960:128 entry +192 root +192 binding +192 key/thread +128 indexed bind +128 publication; plus192 per actual plan op and the separate receipt lookup256+192*K |
-| Birth capacity | 8128+192 per actual head op covers two384 host fronts, fixed960 and maximum32-record lookup6400; actual inspected records alone are debited |
+| Registration | Fixed1536: six256 ENTRY/ROOT/BINDING/KEY/INDEX/PUBLISH regions, each funding then saved-Original zero poll; plus256 per actual plan op and the separate receipt lookup256+192*K |
+| Birth capacity | max(existing,10240+512 per actual head op) covers two384 host fronts, two1536 fixed registrations and maximum32-record lookup6400; actual inspected records alone are debited |
 | Repeated native proof | Four192 root/frame/binding/key regions +128 pending-result association +192 immutable-report/cause region =1088 |
 | Dispatcher | Own SOURCE2304 capacity;140 selection,80 busy/thread,96 slot,1088 origin/child proof or192 retirement proof; separate60/64/96 action and128 return stages |
 | Host SOURCE | Distinct2048 capacity for unary entry/gateway/late phases; gateway includes1088 proof and retains its existing financial cuts |
@@ -6508,3 +6508,24 @@ Indexed receipt status/retry/ACK SOURCE lookup uses the separate224+32 generatio
 above; direct copied-status accounting is96. These funds remain distinct from
 the native child grant. Host TUPLE is96 only for registered unary ownership,
 with actual processed lower16 before CLOSE176; other routes keep72/CLOSE176.
+
+### Observed JOIN plus scalar callback END (#2299)
+
+An ordinary observed nonC1/nonbatch composed JOIN head requiring scalar
+fallback owns its native retirement before any scalar/library callback can
+replace the evaluation attempt. This genuine
+JOIN_DYNAMIC birth binds the actual receipt index and complete key; pure unary,
+LFTJ and legacy C1 lifetimes remain distinct. Registration charges actual
+256 packets (1536+256 per visited eligible plan record); initial financier
+capacity10240+512 per actual plan record covers at most two metered shape scans
+and bounded lookup, without charging unused capacity as work. An Original-funded readonly decoder pass caches a transaction-head/generation
+fact before first host finance or child activation. Numeric AUTO and C1/batch
+legacy routes keep their existing owners. New scalar-head SOURCE financing
+selects capacity2048 without granting native permission or
+enabling C1. Each fresh packet observes the saved Original with atomic zero
+debit after independent funding; funding refusal wins before that poll.
+Registered/native retirement never uses these fresh polls. Current and
+successor controls never finance mandatory retirement.
+Existing genuinely indexed key checks, real receipt ACK and private transaction
+disposal close the route, including END after successful ACK; tests require
+active/pending/reserved0 and governor/pin balance before retry and destruction.
