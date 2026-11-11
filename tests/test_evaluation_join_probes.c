@@ -1169,7 +1169,8 @@ filtered_probe_anti(wirelog_ir_node_t *node)
 
 static unsigned filtered_phase, filtered_fault, filtered_rows,
     filtered_build_maps, filtered_probe_maps;
-static bool filtered_fired;
+static bool filtered_fired, filtered_scalar_mode;
+static unsigned filtered_scalar_owners;
 static wl_columnar_memory_governor_ref_t *filtered_governor;
 static wl_columnar_memory_reservation_t filtered_peer;
 
@@ -1179,7 +1180,22 @@ filtered_checkpoint(wl_evaluation_control_t *control, unsigned phase,
 {
     (void)progress;
     CHECK(control == active);
-    if (phase == 44) ++filtered_rows;
+    if (phase == 44) {
+        ++filtered_rows;
+        if (filtered_scalar_mode) {
+            wl_col_session_t *col = (wl_col_session_t *)active_session;
+            wl_columnar_eval_serial_framed_attempt_t *framed = NULL;
+            wl_columnar_filter_context_t *context = NULL;
+            CHECK(col && col->cleanup_active &&
+                !wl_columnar_eval_stack_framed_context(col->cleanup_active, col,
+                &framed)
+                && !wl_columnar_eval_stack_filter_context_owned(
+                    framed->child.frame,
+                    &context, &framed->child)
+                && context->scalar_program && !context->program);
+            ++filtered_scalar_owners;
+        }
+    }
     if (phase == 50) ++filtered_build_maps;
     if (phase == 51) ++filtered_probe_maps;
     if (!filtered_fault || filtered_fired || phase != filtered_phase) return;
@@ -1218,16 +1234,21 @@ filtered_capture(const char *name, const int64_t *row, uint32_t columns,
 }
 
 static void
-filtered_generated_probes(void)
+filtered_generated_probes(unsigned domain)
 {
     for (unsigned semi = 0; semi < 2; ++semi)
         for (unsigned batched = 0; batched < 2; ++batched)
             for (unsigned fault = 0; fault < 9; ++fault) {
                 wirelog_error_t error;
-                wirelog_program_t *program = wirelog_parse_string(
+                const char *source = domain ?
+                    ".decl left(k:int64)\n.decl right(k:int64,v:symbol)\n"
+                    ".decl output(k:int64)\n"
+                    "output(k):-left(k),!right(k,\"chosen\").\n" :
                     ".decl left(k:int64)\n.decl right(k:int64,v:int64)\n"
                     ".decl output(k:int64)\n"
-                    "output(k):-left(k),!right(k,7).\n", &error);
+                    "output(k):-left(k),!right(k,7).\n";
+                wirelog_program_t *program = wirelog_parse_string(source,
+                        &error);
                 CHECK(program);
                 if (semi) {
                     wirelog_ir_node_t *anti = NULL;
@@ -1287,6 +1308,14 @@ filtered_generated_probes(void)
                 right[0] = 64; /* Rejected duplicate cannot create membership. */
                 right[2*3] = 64; right[2*3+1] = 7;
                 right[2*64] = 17; right[2*64+1] = 7;
+                if (domain) {
+                    /* Real strings inserted after plan construction. */
+                    int64_t yes = wl_intern_put(plan->intern, "chosen");
+                    int64_t no = wl_intern_put(plan->intern, "rejected");
+                    CHECK(yes >= 0 && no >= 0);
+                    for (unsigned r = 0; r < 65; ++r)
+                        right[2*r+1] = r == 3 || r == 64 ? yes : no;
+                }
                 for (unsigned i = 0; i < 2; ++i) {
                     filtered_events_t events = {.semi = semi != 0};
                     CHECK(!wl_session_insert(sessions[i], "left", left, 3, 1)
@@ -1297,7 +1326,9 @@ filtered_generated_probes(void)
                     wl_col_session_t *col = (wl_col_session_t *)sessions[i];
                     col->join_batch_bytes = batched ? 256 : 0;
                     if (!i) {
-                        active = control;
+                        active = control; active_session = sessions[i];
+                        filtered_scalar_mode = domain != 0;
+                        filtered_scalar_owners = 0;
                         filtered_fault = fault; filtered_fired = false;
                         wl_columnar_memory_reservation_init(&filtered_peer);
                         filtered_rows = filtered_build_maps =
@@ -1329,6 +1360,7 @@ filtered_generated_probes(void)
                         CHECK(!wl_evaluation_control_reset(control)
                             && !wl_evaluation_control_configure(control, 0));
                         filtered_fault = 0;
+                        filtered_scalar_owners = 0;
                         filtered_rows = filtered_build_maps =
                             filtered_probe_maps = 0;
                         rc = finish(sessions[i]);
@@ -1337,9 +1369,10 @@ filtered_generated_probes(void)
                         && events.mask == (semi ? 3u : 4u));
                     if (!i) {
                         CHECK(filtered_rows == 65 && filtered_build_maps == 2
-                            && filtered_probe_maps >= 2);
+                            && filtered_probe_maps >= 2
+                            && filtered_scalar_owners == (domain ? 65u : 0u));
                         wl_columnar_join_test_attempt_checkpoint = NULL;
-                        active = NULL;
+                        active = NULL; active_session = NULL;
                     }
                     const col_rel_t *out = session_find_rel(col, "output");
                     CHECK(out && out->ncols == 1 &&
@@ -1375,7 +1408,10 @@ int
 main(int argc, char **argv)
 {
     if (argc == 2 && !strcmp(argv[1], "filtered-numeric")) {
-        filtered_generated_probes(); return 0;
+        filtered_generated_probes(0); return 0;
+    }
+    if (argc == 2 && !strcmp(argv[1], "filtered-scalar")) {
+        filtered_generated_probes(1); return 0;
     }
     static const probe_case_t cases[] = {
         {"keys", PROBE_KEYS, 0},
