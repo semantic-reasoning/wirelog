@@ -2619,6 +2619,69 @@ typedef enum {
     WL_COLUMNAR_EVAL_DELTA_OBSERVER_RETIRE_DISCARD,
 } wl_columnar_eval_delta_observer_retire_t;
 
+enum wl_columnar_eval_delta_resource_phase {
+    WL_COLUMNAR_EVAL_DELTA_RESOURCE_INERT,
+    WL_COLUMNAR_EVAL_DELTA_RESOURCE_BUILD_READER,
+    WL_COLUMNAR_EVAL_DELTA_RESOURCE_PREPARE_READER,
+    WL_COLUMNAR_EVAL_DELTA_RESOURCE_STREAM_READER,
+    WL_COLUMNAR_EVAL_DELTA_RESOURCE_ENTRY_READER,
+    WL_COLUMNAR_EVAL_DELTA_RESOURCE_READERS_DONE,
+    WL_COLUMNAR_EVAL_DELTA_RESOURCE_CURRENT,
+    WL_COLUMNAR_EVAL_DELTA_RESOURCE_EVENTS,
+    WL_COLUMNAR_EVAL_DELTA_RESOURCE_STAGING,
+    WL_COLUMNAR_EVAL_DELTA_RESOURCE_PREPARE_FREE,
+    WL_COLUMNAR_EVAL_DELTA_RESOURCE_ROWS, WL_COLUMNAR_EVAL_DELTA_RESOURCE_NAME,
+    WL_COLUMNAR_EVAL_DELTA_RESOURCE_PAYLOAD,
+    WL_COLUMNAR_EVAL_DELTA_RESOURCE_HOLD,
+    WL_COLUMNAR_EVAL_DELTA_RESOURCE_METADATA_MOVE,
+    WL_COLUMNAR_EVAL_DELTA_RESOURCE_OBSERVER_FREE,
+    WL_COLUMNAR_EVAL_DELTA_RESOURCE_METADATA,
+    WL_COLUMNAR_EVAL_DELTA_RESOURCE_GOVERNOR,
+    WL_COLUMNAR_EVAL_DELTA_RESOURCE_BUILD_METADATA,
+    WL_COLUMNAR_EVAL_DELTA_RESOURCE_BUILD_GOVERNOR,
+    WL_COLUMNAR_EVAL_DELTA_RESOURCE_BUILD_FREE,
+    WL_COLUMNAR_EVAL_DELTA_RESOURCE_GC,
+    WL_COLUMNAR_EVAL_DELTA_RESOURCE_DONE, WL_COLUMNAR_EVAL_DELTA_RESOURCE_CLEAR
+};
+
+/* Selected finite observer resource continuation. Actual ownership comes from
+ * its caller's live Session and canonical slots, never this phase or quote.
+ * It remains outside observer/build/prepare allocations through final ACK. */
+typedef struct {
+    const void *identity;
+    struct wl_col_session_t *session;
+    wl_compound_arena_t *arena;
+    wl_columnar_eval_delta_observer_t *observer;
+    wl_columnar_eval_delta_observer_build_t *build;
+    wl_columnar_eval_delta_observer_prepare_t *prepare;
+#if defined(WL_HAVE_C11_THREADS)
+    thrd_t thread;
+#elif defined(_WIN32) || defined(_WIN64)
+    DWORD thread;
+#else
+    pthread_t thread;
+#endif
+    bool thread_valid, busy;
+    unsigned phase, index, count, token_phase;
+    size_t extent, initialized_bytes, clear_offset;
+    wl_columnar_eval_delta_observer_retire_t disposition;
+    bool build_owned, partial, readers_done, rollback, token_mode_set;
+    wl_arena_compound_arena_hold_release_t hold;
+    wl_arena_compound_arena_gc_step_t gc;
+} wl_columnar_eval_delta_observer_resource_t;
+
+typedef struct {
+    int protocol;
+    unsigned action;
+    uint64_t work;
+    bool readers_done, done;
+} wl_columnar_eval_delta_observer_resource_quote_t;
+typedef struct {
+    int protocol;
+    unsigned action;
+    bool progressed, readers_done, done;
+} wl_columnar_eval_delta_observer_resource_reply_t;
+
 enum wl_columnar_eval_delta_observer_retire_credit {
     WL_COLUMNAR_EVAL_DELTA_OBSERVER_CREDIT_STAGING = 1,
     WL_COLUMNAR_EVAL_DELTA_OBSERVER_CREDIT_PAYLOAD,
@@ -2698,6 +2761,74 @@ typedef struct wl_columnar_session_cold_relation {
 struct wl_columnar_kfusion_cohort;
 typedef struct wl_columnar_eval_tdd_run wl_columnar_eval_tdd_run_t;
 typedef struct wl_columnar_controlled_step wl_columnar_controlled_step_t;
+
+typedef enum {
+    WL_COLUMNAR_EVAL_DELTA_RESOURCE_CALL_BEGIN,
+    WL_COLUMNAR_EVAL_DELTA_RESOURCE_CALL_OBSERVE,
+    WL_COLUMNAR_EVAL_DELTA_RESOURCE_CALL_STEP,
+    WL_COLUMNAR_EVAL_DELTA_RESOURCE_CALL_ACK
+} wl_columnar_eval_delta_resource_call_t;
+
+typedef struct {
+    int protocol;
+    wl_columnar_eval_delta_observer_retire_t disposition;
+    bool *acknowledged;
+    bool acked;
+} wl_columnar_session_observed_observer_permit_t;
+
+wl_columnar_session_observed_observer_permit_t
+    wl_columnar_session_observed_observer_prove(struct wl_col_session_t *,
+    wl_columnar_controlled_step_t *, wl_columnar_eval_delta_resource_call_t,
+    wl_columnar_eval_delta_observer_resource_t *, wl_evaluation_control_t *,
+    uint64_t);
+bool wl_columnar_session_observed_observer_pending(
+    const struct wl_col_session_t *);
+
+wl_columnar_eval_delta_observer_resource_reply_t
+    wl_columnar_eval_delta_observer_resource_begin_owned(
+    struct wl_col_session_t *, wl_columnar_controlled_step_t *,
+    wl_columnar_eval_delta_observer_resource_t *, wl_evaluation_control_t *,
+    uint64_t);
+wl_columnar_eval_delta_observer_resource_quote_t
+    wl_columnar_eval_delta_observer_resource_observe_owned(
+    struct wl_col_session_t *, wl_columnar_controlled_step_t *,
+    wl_columnar_eval_delta_observer_resource_t *, wl_evaluation_control_t *,
+    uint64_t);
+wl_columnar_eval_delta_observer_resource_reply_t
+    wl_columnar_eval_delta_observer_resource_step_owned(
+    struct wl_col_session_t *, wl_columnar_controlled_step_t *,
+    wl_columnar_eval_delta_observer_resource_t *, wl_evaluation_control_t *,
+    uint64_t);
+wl_columnar_eval_delta_observer_resource_reply_t
+    wl_columnar_eval_delta_observer_resource_ack_owned(
+    struct wl_col_session_t *, wl_columnar_controlled_step_t *,
+    wl_columnar_eval_delta_observer_resource_t *, wl_evaluation_control_t *,
+    uint64_t);
+
+#ifdef WL_SESSION_TEST_HOOKS
+enum {
+    WL_COLUMNAR_EVAL_DELTA_TEST_RESOURCE_BEGIN = 1,
+    WL_COLUMNAR_EVAL_DELTA_TEST_RESOURCE_ACK,
+    WL_COLUMNAR_EVAL_DELTA_TEST_RESOURCE_STEP_BASE = 256
+};
+extern void (*wl_columnar_eval_delta_test_resource_prefooter)(
+    wl_evaluation_control_t *, uint64_t, unsigned);
+extern void (*wl_columnar_eval_delta_test_observer_advanced)(
+    struct wl_col_session_t *);
+int wl_columnar_eval_delta_test_observer_resource_view(
+    const struct wl_col_session_t *, uint64_t[16]);
+extern uint64_t (*wl_columnar_session_test_observer_resource_limit)(
+    const struct wl_col_session_t *, uint64_t);
+extern void (*wl_columnar_session_test_observer_resource_finished)(
+    const struct wl_col_session_t *, unsigned, wl_evaluation_control_report_t,
+    int);
+int wl_columnar_session_test_observer_resource_view(
+    const struct wl_col_session_t *, uint64_t[12]);
+extern void (*wl_columnar_session_test_observer_parent_free)(
+    struct wl_col_session_t *);
+
+#endif
+
 bool wl_columnar_session_controlled_batch_authorized(
     const struct wl_col_session_t *, const wl_evaluation_control_t *,
     uint64_t, uint64_t);
