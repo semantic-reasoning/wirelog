@@ -300,6 +300,34 @@ test_plain_ack_refused(void)
     }
 }
 
+/*
+ * C2b: a later non-recursive STEP runs through the observed child, which
+ * also retries a refused acknowledgement instead of reporting it.
+ */
+static void
+test_observed_ack_refused(void)
+{
+    for (unsigned refusals = 1; refusals <= 2; ++refusals) {
+        char *text = copy_rules_text(1);
+        fixture_t f;
+        fixture_open(&f, text);
+        for (int64_t i = 1; i <= 3; ++i)
+            CHECK(!insert_edge(&f, i, i + 1));
+        CHECK(drive(&f, ACT_NONE, 0, NULL) == 0);
+        CHECK(!insert_edge(&f, 10, 11));
+        ack_refusals = refusals;
+        wl_columnar_session_test_framed_grant_limit = refuse_receipt_ack;
+        int rc = drive(&f, ACT_NONE, 0, NULL);
+        wl_columnar_session_test_framed_grant_limit = NULL;
+        CHECK(rc == 0 && !ack_refusals && receipt_slots(&f) == 0);
+        CHECK(!insert_edge(&f, 20, 21));
+        CHECK(drive(&f, ACT_NONE, 0, NULL) == 0 && receipt_slots(&f) == 0);
+        CHECK(rows(&f, "b0") == f.edge_count);
+        fixture_close(&f);
+        free(text);
+    }
+}
+
 static fixture_t *hook_fixture;
 static unsigned hook_point;
 static uint32_t hook_iteration;
@@ -345,6 +373,7 @@ main(void)
     test_bootstrap_refusal();
     test_plain_receipts();
     test_plain_ack_refused();
+    test_observed_ack_refused();
     puts("controlled recovery passed");
     return 0;
 }

@@ -12917,6 +12917,35 @@ wl_columnar_session_observed_cancel_claims(wl_columnar_controlled_step_t *step,
     return 0;
 }
 
+/* A refused RETRY or ACK leaves the transaction's receipt where it was, as
+ * this attempt's debt: retry it rather than report the refused grant.  A
+ * receipt that is gone was consumed by the ACK, whatever the reply said
+ * (#2351).  Returns 1 when the reply should be judged as usual. */
+static int
+wl_columnar_session_observed_receipt_refused(wl_col_session_t *sess,
+    wl_columnar_controlled_step_t *step,
+    wl_columnar_eval_serial_framed_host_action_t action, int rc)
+{
+    wl_columnar_session_observed_transaction_t *tx = step->transaction;
+    if (!rc || rc == EAGAIN
+        || (action != WL_COLUMNAR_EVAL_SERIAL_FRAMED_RECEIPT_ACK
+        && action != WL_COLUMNAR_EVAL_SERIAL_FRAMED_RECEIPT_RETRY))
+        return 1;
+    wl_columnar_eval_cleanup_receipt_state_t left =
+        col_controlled_step_receipt_state(sess, &tx->receipt_key);
+    if (left == WL_COLUMNAR_EVAL_CLEANUP_RECEIPT_TRANSFERRED
+        || left == WL_COLUMNAR_EVAL_CLEANUP_RECEIPT_FREED)
+        return EAGAIN;
+    if (left != WL_COLUMNAR_EVAL_CLEANUP_RECEIPT_FREE
+        || action != WL_COLUMNAR_EVAL_SERIAL_FRAMED_RECEIPT_ACK)
+        return 1;
+    /* Defensive: an ACK that took effect but reported an error. */
+    tx->receipt_pending = tx->receipt_ack = tx->child_active = false;
+    memset(&tx->receipt_key, 0, sizeof(tx->receipt_key));
+    col_controlled_step_grant_release(step, &step->previous_funding);
+    return 0;
+}
+
 static int
 wl_columnar_session_observed_child_result(wl_col_session_t *sess,
     wl_columnar_controlled_step_t *step, int rc)
@@ -12975,6 +13004,10 @@ wl_columnar_session_observed_child(wl_col_session_t *sess,
             : WL_COLUMNAR_EVAL_SERIAL_FRAMED_RECEIPT_RETRY)
         : WL_COLUMNAR_EVAL_SERIAL_FRAMED_ADVANCE;
     int rc = col_controlled_step_host_action(sess, step, &head->plan, action);
+    int refused = wl_columnar_session_observed_receipt_refused(sess, step,
+            action, rc);
+    if (refused == EAGAIN) return EAGAIN;
+    if (!refused) return tx->child_result;
     if (action == WL_COLUMNAR_EVAL_SERIAL_FRAMED_ADVANCE
         && rc > 0 && rc != EAGAIN && step->reply.kind ==
         WL_COLUMNAR_EVAL_SERIAL_FRAMED_REPLY_BOOTSTRAP_RECEIPT
