@@ -7208,6 +7208,17 @@ test_evaluation_iteration_cap_exe = executable(
 test('evaluation_iteration_cap', test_evaluation_iteration_cap_exe,
      suite: ['unit', 'tsan'], timeout: 60)
 
+# #2351: controlled sessions keep stepping, and report governed denials.
+test_controlled_recovery_exe = executable(
+  'test_controlled_recovery', files('test_controlled_recovery.c'),
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
+  c_args: ['-DWL_SESSION_TEST_HOOKS=1'],
+  link_with: [testlib_prod],
+)
+test('controlled_recovery', test_controlled_recovery_exe,
+     suite: ['unit', 'tsan'], timeout: 120)
+
 test_session_budget_refusal_exe = executable(
   'test_session_budget_refusal', files('test_session_budget_refusal.c'),
   include_directories: [wirelog_inc, wirelog_src_inc],
