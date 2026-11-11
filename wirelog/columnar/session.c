@@ -130,6 +130,7 @@ typedef struct {
     bool edge_held;
     bool committed;
     bool postcommit_yielded;
+    bool cleanup_error_logged;
 } col_controlled_recursive_step_t;
 
 typedef enum {
@@ -12160,6 +12161,11 @@ col_controlled_recursive_abort_cleanup(wl_col_session_t *sess,
     }
     if (col_controlled_recursive_maintenance_begin(recursive))
         return EAGAIN;
+    /* A builder stopped before READY hands its partial relation to the
+     * managed retirement below in the FAILED shape it documents (#2351). */
+    if (recursive->build.identity
+        && wl_columnar_relation_managed_binary_build_abandon(
+            &recursive->build)) return EINVAL;
     while (recursive->retirement_next < 6) {
         uint32_t slot = recursive->retirement_next;
         col_rel_t **relation = slot == 0 ? &recursive->replacement
@@ -12237,6 +12243,15 @@ col_controlled_step_recursive_drive(wl_col_session_t *sess,
         if (cleanup_rc == EAGAIN || cleanup_rc == EBUSY) return EAGAIN;
         if (cleanup_rc && !recursive->primary_result)
             recursive->primary_result = cleanup_rc;
+        /* Cleanup owns storage, governor bytes and leases, so the STEP
+         * stays pending rather than dropping them.  The caller sees only
+         * EAGAIN, so report the first such failure (#2351). */
+        if (cleanup_rc && !recursive->cleanup_error_logged) {
+            recursive->cleanup_error_logged = true;
+            WL_LOG(WL_LOG_SEC_EVAL, WL_LOG_ERROR,
+                "controlled recursive abort cleanup failed rc=%d; "
+                "the STEP stays pending until cleanup succeeds", cleanup_rc);
+        }
         if (cleanup_rc) return EAGAIN;
         int result = recursive->primary_result;
         free(recursive);

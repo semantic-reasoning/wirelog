@@ -949,7 +949,9 @@ extern void (*wl_columnar_relation_scalar_retirement_init_test_checkpoint)(
 
 /* One-funded-action-at-a-time builder for a private, unnamed binary INT64
  * relation. On a terminal allocation failure, relation retains all partial
- * ownership so it can be passed to managed_retirement_begin(). */
+ * ownership so it can be passed to managed_retirement_begin().  abandon()
+ * puts a builder stopped before READY into that FAILED shape; the recursive
+ * route's abort cleanup and the candidate merge cleanup call it. */
 typedef enum wl_columnar_relation_managed_binary_build_phase {
     WL_COLUMNAR_RELATION_MANAGED_BINARY_BUILD_INERT = 0,
     WL_COLUMNAR_RELATION_MANAGED_BINARY_BUILD_DESCRIPTOR,
@@ -3727,6 +3729,9 @@ wl_columnar_relation_managed_binary_build_step_budgeted(
     wl_evaluation_control_t *control, uint64_t expected_attempt_id,
     uint64_t *remaining);
 int
+wl_columnar_relation_managed_binary_build_abandon(
+    wl_columnar_relation_managed_binary_build_t *build);
+int
 wl_columnar_relation_managed_binary_build_adopt_schema(
     wl_columnar_relation_managed_binary_build_t *build,
     const char *const *column_names);
@@ -4652,6 +4657,10 @@ extern void (*wl_columnar_relation_test_new_like_before_release)(
     const col_rel_t *);
 extern void (*wl_columnar_relation_test_before_reader_cas)(
     wl_evaluation_control_t *, wl_columnar_source_access_gate_t *, uint64_t);
+/* Called on each step of a binary builder with the phase it is in, before
+ * that step is funded. */
+extern void (*wl_columnar_relation_test_builder_phase)(
+    wl_evaluation_control_t *, unsigned);
 extern void (*wl_columnar_relation_test_after_reader_cas)(
     wl_evaluation_control_t *, wl_columnar_source_access_gate_t *, bool);
 extern void (*wl_columnar_relation_test_before_writer_cas)(
