@@ -2149,7 +2149,7 @@ wl_columnar_filter_op_attempt_start_owned(const wl_plan_op_t *op,
             &ctx->source_initialized);
         if (!ctx->source_initialized) ctx->source_bare = false;
     } else {
-        rc = wl_columnar_relation_scalar_source_begin_attempt_controlled(
+        rc = wl_columnar_eval_stack_scalar_source_begin_owned(frame, owner, op,
             &ctx->source, input, true);
     }
     rc = wl_columnar_filter_attempt_return(control, attempt_id, rc);
@@ -2709,9 +2709,8 @@ wl_columnar_filter_consolidate_attempt_start_owned(const wl_plan_op_t *op,
     if (rc)
         goto done;
     rc =
-        wl_columnar_relation_scalar_source_begin_attempt_controlled(
-        &ctx->source,
-        input, true);
+        wl_columnar_eval_stack_scalar_source_begin_owned(frame, owner, op,
+            &ctx->source, input, true);
     rc = wl_columnar_filter_attempt_return(control, attempt_id, rc);
     if (rc)
         goto done;
@@ -3468,7 +3467,7 @@ wl_columnar_filter_map_attempt_start_owned(const wl_plan_op_t *op,
         /* MAP addresses physical lanes through project_indices and builds
          * its output from the projection, so an INLINE input yields a
          * relation with no compound layout, as the raw MAP does (#2301). */
-        rc = wl_columnar_relation_scalar_source_admit_attempt_controlled(
+        rc = wl_columnar_eval_stack_scalar_source_admit_owned(frame, owner, op,
             &ctx->source, input, false,
             WL_COLUMNAR_RELATION_SOURCE_ADMIT_INLINE);
     }
@@ -3941,6 +3940,168 @@ wl_columnar_filter_empty_end_step_owned(
         ? WL_COLUMNAR_FILTER_PROGRESS_YIELD
         : WL_COLUMNAR_FILTER_PROGRESS_RETAINED);
     return rc == EAGAIN ? 0 : rc;
+}
+
+static int
+wl_columnar_filter_source_end_context(
+    wl_columnar_eval_stack_cleanup_frame_t *frame, const void *owner,
+    wl_evaluation_control_t *funding, uint64_t id,
+    wl_columnar_filter_context_t **out,
+    wl_columnar_filter_source_end_kind_t *kind)
+{
+    if (!owner || !out || !kind) return EINVAL;
+    int rc = wl_columnar_eval_stack_filter_context_nonstream_owned(frame, out,
+            owner);
+    if (rc) return rc;
+    wl_columnar_filter_context_t *ctx = *out;
+    rc = wl_columnar_filter_attempt_context_valid(frame, ctx);
+    if (rc) return rc;
+    /* The real financing observation splits context proof from source proof;
+    * it neither supplies resource permission nor refunds another promise. */
+    /* The numeric owner retains Original through ACK even after CONTROL
+     * clears ctx->control on a late no-END query. */
+    const wl_columnar_eval_plan_numeric_attempt_t *r = owner;
+    if (!funding || funding == r->control || !id) return EINVAL;
+    rc = wl_evaluation_control_charge_attempt(funding, id, 0);
+    if (rc) return rc;
+    *kind = WL_COLUMNAR_FILTER_SOURCE_END_NONE;
+    bool right = ctx->stage == WL_COLUMNAR_FILTER_STAGE_JOIN_RIGHT_SOURCE;
+    if (!(right ? ctx->join_right_initialized
+        : ctx->stage == WL_COLUMNAR_FILTER_STAGE_SOURCE &&
+        ctx->source_initialized))
+        return 0;
+    bool bare = right ? ctx->join_right_bare : ctx->source_bare;
+    bool child = r->phase == WL_COLUMNAR_EVAL_PLAN_NUMERIC_CHILD
+        || r->phase == WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_UNARY_CHILD
+        || ((r->phase == WL_COLUMNAR_EVAL_PLAN_NUMERIC_PENDING
+        || r->phase == WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_PENDING)
+        && (r->pending_action == WL_COLUMNAR_EVAL_PLAN_NUMERIC_CHILD
+        || r->pending_action ==
+        WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_UNARY_CHILD));
+    if (!child || !ctx->pin_owned || r->session != ctx->session
+        || r->control != ctx->control || r->attempt_id != ctx->attempt_id
+        || !r->plan || !r->plan->ops || r->cursor >= r->end
+        || r->cursor >= r->plan->op_count) return EINVAL;
+    const wl_plan_op_t *op = &r->plan->ops[r->cursor];
+    if (op->op != WL_PLAN_OP_FILTER && op->op != WL_PLAN_OP_MAP
+        && op->op != WL_PLAN_OP_JOIN && op->op != WL_PLAN_OP_SEMIJOIN
+        && op->op != WL_PLAN_OP_ANTIJOIN && op->op != WL_PLAN_OP_REDUCE
+        && op->op != WL_PLAN_OP_CONSOLIDATE) return EINVAL;
+    if (bare || right) {
+        if (!ctx->join_decision_pending || ctx->join_operation != op
+            || (op->op != WL_PLAN_OP_JOIN && op->op != WL_PLAN_OP_SEMIJOIN
+            && op->op != WL_PLAN_OP_ANTIJOIN)) return EINVAL;
+    }
+    if (bare) {
+        const wl_columnar_relation_empty_source_t *source = right
+            ? &ctx->join_empty_reader : &ctx->source_empty_reader;
+        if (source->identity != source ||
+            source->phase == WL_COLUMNAR_RELATION_EMPTY_SOURCE_DRAINED
+            || source->attempt_id != ctx->attempt_id
+            || source->control_identity !=
+            wl_evaluation_control_identity(ctx->control)) return EINVAL;
+        *kind =
+            right ? WL_COLUMNAR_FILTER_SOURCE_END_EMPTY_RIGHT :
+            WL_COLUMNAR_FILTER_SOURCE_END_EMPTY_LEFT;
+    } else {
+        const wl_columnar_relation_scalar_source_t *source =
+            right ? &ctx->join_right : &ctx->source;
+        if (source->identity != source ||
+            source->end_attempt_id != ctx->attempt_id
+            || source->control_identity !=
+            wl_evaluation_control_identity(ctx->control)
+            || (right && !ctx->join_initialized)) return EINVAL;
+        *kind =
+            right ? WL_COLUMNAR_FILTER_SOURCE_END_SCALAR_RIGHT :
+            WL_COLUMNAR_FILTER_SOURCE_END_SCALAR_LEFT;
+    }
+    return 0;
+}
+
+int
+wl_columnar_filter_source_end_pending_owned(
+    wl_columnar_eval_stack_cleanup_frame_t *frame, const void *owner,
+    wl_evaluation_control_t *funding, uint64_t id,
+    wl_columnar_filter_source_end_kind_t *kind)
+{
+    if (!kind) return EINVAL;
+    wl_columnar_filter_context_t *ctx = NULL;
+    wl_columnar_filter_source_end_kind_t selected =
+        WL_COLUMNAR_FILTER_SOURCE_END_NONE;
+    int rc = wl_columnar_filter_source_end_context(frame, owner, funding, id,
+            &ctx,
+            &selected);
+    if (!rc) *kind = selected;
+    return rc;
+}
+
+int
+wl_columnar_filter_source_end_step_owned(
+    wl_columnar_eval_stack_cleanup_frame_t *frame,
+    wl_columnar_filter_status_t *status, const void *owner,
+    wl_evaluation_control_t *funding, uint64_t id)
+{
+    if (!status) return EINVAL;
+    wl_columnar_filter_context_t *ctx = NULL;
+    wl_columnar_filter_source_end_kind_t kind;
+    int rc = wl_columnar_filter_source_end_context(frame, owner, funding, id,
+            &ctx, &kind);
+    if (rc) return rc;
+    if (kind == WL_COLUMNAR_FILTER_SOURCE_END_NONE) return EBUSY;
+    rc = wl_evaluation_control_charge_attempt(funding, id, 0);
+    if (rc) return rc;
+    if (kind == WL_COLUMNAR_FILTER_SOURCE_END_EMPTY_LEFT
+        || kind == WL_COLUMNAR_FILTER_SOURCE_END_EMPTY_RIGHT) {
+        wl_columnar_relation_empty_source_t *source =
+            kind == WL_COLUMNAR_FILTER_SOURCE_END_EMPTY_RIGHT
+            ? &ctx->join_empty_reader : &ctx->source_empty_reader;
+        ctx->busy = true;
+        bool done = false;
+        rc = wl_columnar_relation_empty_source_end(source, funding, id, &done);
+        ctx->busy = false;
+        if (rc && rc != EAGAIN) return rc;
+        if (!rc && done) {
+            if (kind == WL_COLUMNAR_FILTER_SOURCE_END_EMPTY_RIGHT) {
+                ctx->join_right_initialized = false;
+                ctx->join_right_bare = false;
+                ctx->stage = WL_COLUMNAR_FILTER_STAGE_JOIN_PHYSICAL;
+            } else {
+                ctx->source_initialized = false; ctx->source_bare = false;
+                ctx->stage = WL_COLUMNAR_FILTER_STAGE_JOIN_DECIDE;
+            }
+        }
+        wl_columnar_filter_attempt_status(ctx, status, done
+            ? WL_COLUMNAR_FILTER_PROGRESS_YIELD :
+            WL_COLUMNAR_FILTER_PROGRESS_RETAINED);
+        return rc == EAGAIN ? 0 : rc;
+    }
+    if (!funding || funding == ctx->control || !id) return EINVAL;
+    rc = wl_evaluation_control_charge_attempt(funding, id, 128);
+    if (rc) return rc;
+    wl_columnar_relation_scalar_source_t *source =
+        kind == WL_COLUMNAR_FILTER_SOURCE_END_SCALAR_RIGHT
+        ? &ctx->join_right : &ctx->source;
+    ctx->busy = true;
+    bool done = false;
+    rc = wl_columnar_relation_scalar_source_end_step(source,
+            ctx->execution_result,
+            funding, id, &done);
+    ctx->busy = false;
+    if (rc) return rc;
+    if (done) {
+        if (kind == WL_COLUMNAR_FILTER_SOURCE_END_SCALAR_RIGHT) {
+            ctx->join_right_initialized = false;
+            ctx->stage = WL_COLUMNAR_FILTER_STAGE_JOIN_PHYSICAL;
+        } else {
+            ctx->source_initialized = false;
+            ctx->stage = ctx->join_decision_pending
+                ? WL_COLUMNAR_FILTER_STAGE_JOIN_DECIDE :
+                WL_COLUMNAR_FILTER_STAGE_DECIDE;
+        }
+    }
+    wl_columnar_filter_attempt_status(ctx, status,
+        WL_COLUMNAR_FILTER_PROGRESS_YIELD);
+    return 0;
 }
 
 static int

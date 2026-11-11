@@ -16534,6 +16534,8 @@ static bool observed_owner_batch_fallback;
 static bool observed_owner_refused;
 static unsigned observed_owner_financial_stops;
 static bool observed_owner_peer_probed, observed_owner_wrong_key_probed;
+static const wl_columnar_relation_scalar_source_t *observed_begin_record;
+static bool observed_begin_retained;
 
 static void *
 observed_owner_peer(void *unused)
@@ -16555,7 +16557,8 @@ static void
 observed_owner_negative_probes(void)
 {
     wl_col_session_t *col = (wl_col_session_t *)observed_owner_session;
-    if (!observed_owner_seen || !observed_owner_fault) return;
+    if (!observed_owner_seen || !observed_owner_fault ||
+        observed_owner_fault >= 5) return;
     if (!observed_owner_peer_probed) {
         wl_thread_t thread;
         CHECK(!wl_thread_create(&thread, observed_owner_peer, NULL)
@@ -16708,10 +16711,26 @@ observed_owner_checkpoint(const wl_col_session_t *session,
 {
     (void)funding;
     if (observed_owner_seen) {
-        if (protocol == WL_EVALUATION_CONTROL_WORK_LIMIT)
+        if (observed_owner_cut >= 10 && observed_owner_fault &&
+            !observed_begin_retained){
+            CHECK(session->cleanup_active && observed_begin_record
+                && observed_begin_record->identity == observed_begin_record
+                && observed_begin_record->phase ==
+                WL_COLUMNAR_RELATION_SCALAR_SOURCE_ENDING
+                && observed_begin_record->first_result_saved
+                && observed_begin_record->first_result == EINVAL
+                && observed_begin_record->descriptor_reader.owner);
+            CHECK((observed_begin_record->owner_reader.owner != NULL) ==
+                (observed_owner_cut != 10));
+            observed_begin_retained = true;
+        }
+        if (protocol == WL_EVALUATION_CONTROL_WORK_LIMIT
+            || (observed_owner_fault == 5 &&
+            protocol == WL_EVALUATION_CONTROL_CANCELLED))
             ++observed_owner_financial_stops;
         return;
     }
+    if (observed_owner_fault >= 5 || observed_owner_cut >= 10) return;
     uint64_t id =
         wl_evaluation_control_active_attempt_id(observed_owner_control);
     wl_columnar_eval_serial_framed_attempt_t *ctx = NULL;
@@ -16763,7 +16782,29 @@ observed_owner_checkpoint(const wl_col_session_t *session,
             return;
     } else if (observed_owner_cut != 6) {
         if (!ctx) return;
-        if (observed_owner_cut == 2) {
+        if (observed_owner_cut == 7) {
+            if (!ctx->child_bound ||
+                ctx->child.source.identity != &ctx->child.source
+                || ctx->child.source.phase !=
+                WL_COLUMNAR_RELATION_SCALAR_SOURCE_ENDING
+                || ctx->child.source.end_cursor != 1) return;
+        } else if (observed_owner_cut == 8 || observed_owner_cut == 9) {
+            if (!ctx->child_bound) return;
+            wl_columnar_filter_context_t *filter = NULL;
+            if (wl_columnar_eval_stack_filter_context_owned(
+                    session->cleanup_active,
+                    &filter, &ctx->child)) return;
+            const wl_columnar_relation_scalar_source_t *source =
+                observed_owner_cut == 8
+                ? &filter->source : &filter->join_right;
+            if (filter->stage !=
+                (observed_owner_cut == 8 ? WL_COLUMNAR_FILTER_STAGE_SOURCE
+                : WL_COLUMNAR_FILTER_STAGE_JOIN_RIGHT_SOURCE)
+                || !(observed_owner_cut ==
+                8 ? filter->source_initialized : filter->join_right_initialized)
+                || source->phase != WL_COLUMNAR_RELATION_SCALAR_SOURCE_ENDING
+                || source->end_cursor != 1) return;
+        } else if (observed_owner_cut == 2) {
             if (ctx->phase != WL_COLUMNAR_EVAL_SERIAL_FRAMED_LOOKUP ||
                 ctx->child_bound)
                 return;
@@ -16795,6 +16836,99 @@ observed_owner_checkpoint(const wl_col_session_t *session,
     }
 }
 
+static void
+observed_source_begin_claim(wl_evaluation_control_t *control,
+    wl_columnar_source_access_gate_t *gate, bool acquired)
+{
+    if (observed_owner_seen || !acquired ||
+        control != observed_owner_control) return;
+    wl_col_session_t *session = (wl_col_session_t *)observed_owner_session;
+    if (!session || !session->cleanup_active) return;
+    wl_columnar_eval_serial_framed_attempt_t *ctx = NULL;
+    if (wl_columnar_eval_stack_framed_context(session->cleanup_active, session,
+        &ctx)
+        || !ctx->capture_only || !ctx->private_bindings ||
+        !ctx->child_bound) return;
+    if (observed_owner_cut < 12 && !ctx->child.source_initialized) return;
+    wl_columnar_relation_scalar_source_t *source = &ctx->child.source;
+    if (observed_owner_cut >= 12) {
+        wl_columnar_filter_context_t *filter = NULL;
+        if (wl_columnar_eval_stack_filter_context_owned(session->cleanup_active,
+            &filter, &ctx->child)) return;
+        if (!(observed_owner_cut ==
+            12 ? filter->source_initialized :
+            filter->join_right_initialized)) return;
+        source = observed_owner_cut ==
+            12 ? &filter->source : &filter->join_right;
+    }
+    if (source->identity != source || !source->descriptor) return;
+    const wl_columnar_source_access_reader_t *reader = observed_owner_cut == 10
+        ? &source->descriptor_reader : &source->owner_reader;
+    if (source->phase !=
+        (observed_owner_cut == 10 ? WL_COLUMNAR_RELATION_SCALAR_SOURCE_INERT
+        : WL_COLUMNAR_RELATION_SCALAR_SOURCE_DESCRIPTOR)
+        || reader->identity != (uintptr_t)reader ||
+        reader->owner != gate) return;
+    observed_owner_seen = true; observed_begin_record = source;
+    observed_owner_key = ctx->cleanup_receipt_key;
+    observed_owner_plan = ctx->plan;
+    observed_owner_bindings = ctx->private_bindings;
+    observed_owner_capture_out = ctx->capture_out;
+    observed_owner_batch_fallback = ctx->controlled_materialized_batch_fallback;
+    if (!observed_owner_fault) return;
+    uint64_t id = wl_evaluation_control_active_attempt_id(control);
+    CHECK(id && id == ctx->attempt_id);
+    wl_evaluation_control_attempt_finish_result_t ended =
+        wl_evaluation_control_finish_attempt(control,
+            observed_owner_session->operation_admission, id, 0, 0);
+    CHECK(!ended.protocol && ended.report_valid && !ended.report.result);
+    observed_owner_frozen = ended.report;
+    if (observed_owner_fault == 2) {
+        CHECK(!wl_evaluation_control_begin(control,
+            observed_owner_session->operation_admission));
+        observed_owner_successor =
+            wl_evaluation_control_active_attempt_id(control);
+        CHECK(observed_owner_successor && observed_owner_successor != id);
+    }
+}
+
+static void
+observed_source_footer(const wl_columnar_relation_scalar_source_t *source,
+    wl_evaluation_control_t *funding, uint64_t id, unsigned point)
+{
+    if (observed_owner_seen || observed_owner_fault < 5 || point != 1
+        || source->phase != WL_COLUMNAR_RELATION_SCALAR_SOURCE_DRAINED) return;
+    wl_col_session_t *session = (wl_col_session_t *)observed_owner_session;
+    if (!session || !session->cleanup_active) return;
+    wl_columnar_eval_serial_framed_attempt_t *ctx = NULL;
+    if (wl_columnar_eval_stack_framed_context(session->cleanup_active, session,
+        &ctx)
+        || !ctx->capture_only || !ctx->private_bindings ||
+        !ctx->child_bound) return;
+    if (observed_owner_cut == 7) {
+        if (source != &ctx->child.source) return;
+    } else {
+        wl_columnar_filter_context_t *filter = NULL;
+        if (wl_columnar_eval_stack_filter_context_owned(session->cleanup_active,
+            &filter, &ctx->child)
+            || source !=
+            (observed_owner_cut ==
+            8 ? &filter->source : &filter->join_right)) return;
+    }
+    CHECK(funding != observed_owner_control && id);
+    observed_owner_seen = true;
+    if (observed_owner_fault ==
+        5) wl_evaluation_control_request_cancel(funding);
+    else {
+        uint64_t consumed = 0;
+        CHECK(!wl_evaluation_control_test_active_consumed(funding, id,
+            &consumed));
+        CHECK(wl_evaluation_control_charge_attempt(funding, id,
+            UINT64_MAX - consumed)
+            == WL_EVALUATION_CONTROL_WORK_LIMIT);
+    }
+}
+
 static int
 observed_owner_complete(wl_session_t *session)
 {
@@ -16823,10 +16957,11 @@ observed_owner_contents(wl_session_t *session, unsigned expected_mask)
 }
 
 static void
-test_observed_owner_recovery(void)
+test_observed_owner_recovery_range(unsigned first, unsigned last,
+    unsigned faults)
 {
-    for (unsigned cut = 0; cut < 7; ++cut)
-        for (unsigned fault = 0; fault < 5; ++fault) {
+    for (unsigned cut = first; cut < last; ++cut)
+        for (unsigned fault = 0; fault < faults; ++fault) {
             /* After ACK this owner consumes its journal without another host. */
             if (cut == 5 && fault == 4) continue;
             wirelog_error_t error;
@@ -16863,6 +16998,7 @@ test_observed_owner_recovery(void)
             memset(&observed_owner_key, 0, sizeof(observed_owner_key));
             observed_owner_receipt_index = 0;
             observed_owner_refused = false;
+            observed_begin_record = NULL; observed_begin_retained = false;
             observed_owner_peer_probed = observed_owner_wrong_key_probed =
                 false;
             observed_owner_financial_stops = 0;
@@ -16874,8 +17010,14 @@ test_observed_owner_recovery(void)
                 observed_owner_metadata_finished;
             wl_columnar_session_test_framed_grant_finished =
                 observed_owner_checkpoint;
+            wl_columnar_relation_test_scalar_end_checkpoint = fault >=
+                5 ? observed_source_footer : NULL;
+            wl_columnar_relation_test_after_reader_cas = cut >=
+                10 ? observed_source_begin_claim : NULL;
             int rc = observed_owner_complete(observed_owner_session);
             wl_columnar_session_test_framed_grant_finished = NULL;
+            wl_columnar_relation_test_scalar_end_checkpoint = NULL;
+            wl_columnar_relation_test_after_reader_cas = NULL;
             wl_columnar_session_test_framed_grant_limit = NULL;
             wl_columnar_session_test_metadata_limit = NULL;
             wl_columnar_session_test_metadata_finished = NULL;
@@ -16889,14 +17031,17 @@ test_observed_owner_recovery(void)
                 CHECK(observed_owner_refused &&
                     observed_owner_financial_stops == 1);
             }
-            if (!observed_owner_seen || rc != (fault ? EINVAL : 0))
+            if (fault >= 5) CHECK(observed_owner_financial_stops == 1);
+            bool ended_original = fault && fault < 5;
+            if (!observed_owner_seen || rc != (ended_original ? EINVAL : 0))
                 fprintf(stderr,
                     "observed owner cut=%u fault=%u seen=%u rc=%d\n",
                     cut, fault, observed_owner_seen, rc);
-            CHECK(observed_owner_seen && rc == (fault ? EINVAL : 0));
+            CHECK(observed_owner_seen && rc == (ended_original ? EINVAL : 0));
             CHECK(!col->cleanup_active && !col->cleanup_pending &&
                 !col->cleanup_reserved_bytes);
-            if (fault) {
+            if (ended_original) {
+                if (cut >= 10) CHECK(observed_begin_retained);
                 CHECK(observed_owner_peer_probed &&
                     observed_owner_wrong_key_probed);
                 CHECK(observed_owner_events == 1 && observed_owner_mask == 1);
@@ -16945,9 +17090,21 @@ test_observed_owner_recovery(void)
         }
 }
 
+static void
+test_observed_owner_recovery(void)
+{
+    test_observed_owner_recovery_range(0, 7, 5);
+}
+
 int
 main(int argc, char **argv)
 {
+    if (argc == 2 && !strcmp(argv[1], "--observed-source-begin-recovery")) {
+        test_observed_owner_recovery_range(10, 14, 3); return 0;
+    }
+    if (argc == 2 && !strcmp(argv[1], "--observed-source-end-recovery")) {
+        test_observed_owner_recovery_range(7, 10, 7); return 0;
+    }
     if (argc == 2 && !strcmp(argv[1], "--observed-owner-recovery")) {
         test_observed_owner_recovery(); return 0;
     }
