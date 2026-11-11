@@ -768,3 +768,29 @@ caller profiles, legacy constructor failure cleanup, actual incoming and
 assigned SOURCE promises, performed lower and correlated carry remain required
 in S.FIN and the containing closure rows. No test count, zero check, FINISH,
 unused reservation or local upper closes those obligations.
+
+
+## Observed native AUTO FINISH continuation
+
+The canonical observed recovery route retains AUTO selection for its authentic
+error drain. The previous blanket native-cleanup exclusion bypassed the
+ACKED JOIN's finite FINISH and reached ordinary destruction. The production
+prepared-AUTO fixture reproduced this on both CI TSan compilers and locally;
+its strict FINISH count remains unchanged. A separate checkpoint now proves
+the exact numeric owner/operation enters FINISH after Original ends, with its
+initiating CANCEL/WORK result retained.
+
+The new discriminator adds two native/observed flag reads and, only for an
+observed native continuation, the existing `auto_error_drain` straight-line
+owner/receipt/phase predicate. That predicate has no resource-sized loop;
+its actual longest arm includes the embedded numeric owner and filter stage.
+It precedes the selector's first genuine funding admission. The selector then
+reuses its actual full binding, saved operation/cursor, ACKED receipt and quiet
+FINISH checks; publication remains excluded by the saved error. Pending launch,
+consume and ACK retain their existing distinct financier contracts.
+
+This added pre-admission source interval must be included in the containing
+framed CHILD census, including the predicate's failed arms and ancestor return.
+It is not paid by the later selector charge and does not inherit the local
+source-END bounds above. No new whole-call256 or assigned SOURCE/carry claim
+is made here. The containing S.FIN qualification remains open.

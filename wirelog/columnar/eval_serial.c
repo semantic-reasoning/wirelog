@@ -439,7 +439,13 @@ wl_columnar_eval_serial_framed_attempt_step(
             ctx->phase = WL_COLUMNAR_EVAL_SERIAL_FRAMED_CLAIM;
             return 0;
         }
-        if (!ctx->native_cleanup) {
+        /* A canonical observed error drain still owns the ACKED JOIN's
+         * finite FINISH. Native cleanup must not bypass that receipt and
+         * fall through to ordinary destruction. The AUTO selector retains
+         * its exact binding, operation and quiet-FINISH proofs. */
+        if (!ctx->native_cleanup
+            || (ctx->observed_native_cleanup
+            && wl_columnar_eval_stack_auto_error_drain(ctx))) {
             bool selected = false;
             rc = wl_columnar_eval_stack_auto_select(ctx, funding, funding_id,
                     &selected);
