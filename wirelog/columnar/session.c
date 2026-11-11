@@ -386,6 +386,9 @@ struct wl_columnar_controlled_step {
     bool terminal_receipt_ack, terminal_committed;
     int terminal_result;
     wl_columnar_eval_cleanup_receipt_key_t terminal_receipt_key;
+    /* Whether the route was still current just before the append being
+     * recorded, so a refused route accepts appends only (#2351). */
+    bool append_route_current;
     char *successor_private_name;
     char successor_name_buffer[128];
     uint32_t successor_name_suffix;
@@ -6607,12 +6610,49 @@ col_controlled_step_provenance_current(const wl_col_session_t *sess,
 }
 
 static void
+col_controlled_step_note_append_begin(wl_col_session_t *sess)
+{
+    wl_columnar_controlled_step_t *step = sess->controlled_step;
+    if (step && step->recursive_route)
+        step->append_route_current =
+            col_controlled_step_provenance_current(sess, step);
+}
+
+/* Any other storage change to a refused route invalidates it. */
+static void
+col_controlled_step_record_removal(wl_col_session_t *sess)
+{
+    wl_columnar_controlled_step_t *step = sess->controlled_step;
+    if (step && step->recursive_route && step->provenance_valid
+        && !step->complete && !step->operation_active)
+        step->provenance_invalid = true;
+}
+
+static void
 col_controlled_step_record_edge_append(wl_col_session_t *sess, col_rel_t *edge)
 {
     wl_columnar_controlled_step_t *step = sess ? sess->controlled_step : NULL;
     /* General transactions authorize EDB mutations through their owned table;
      * the public mutation-completed callback schedules full recomputation. */
     if (step && !step->recursive_route) return;
+    /* Removals invalidate a refused route on their own; this proof also
+     * covers any other storage change made before the append. */
+    bool route_current = step && step->append_route_current;
+    if (step) step->append_route_current = false;
+    /* A refused or cancelled later STEP left the committed `path` in place,
+     * and the route was still current just before this append: the retry
+     * reads the grown `edge` (#2351). */
+    if (step && !step->complete && step->provenance_valid && route_current
+        && !step->provenance_invalid && !step->operation_active
+        && !step->recursive && edge && edge == step->provenance_edge
+        && session_find_rel(sess, "edge") == edge
+        && wl_columnar_relation_snapshot_equal(
+            step->provenance_path_snapshot,
+            wl_columnar_relation_snapshot(session_find_rel(sess, "path")))) {
+        step->provenance_edge_snapshot = wl_columnar_relation_snapshot(edge);
+        step->retryable = true;
+        return;
+    }
     if (!step || !step->complete || !step->recursive_route
         || !step->provenance_valid || step->provenance_invalid
         || edge != step->provenance_edge
@@ -6742,6 +6782,7 @@ col_session_insert(wl_session_t *session, const char *relation,
     wl_col_session_t *sess = COL_SESSION(session);
     if (sess->plain_step_completion_pending)
         return EBUSY;
+    col_controlled_step_note_append_begin(sess);
     if (sess->delta_cb != NULL) {
         int incremental_rc = col_session_insert_incremental(session, relation,
                 data, num_rows, num_cols);
@@ -6947,6 +6988,7 @@ col_session_insert_incremental(wl_session_t *session, const char *relation,
         return EBUSY;
     if (COL_SESSION(session)->plain_step_completion_pending)
         return EBUSY;
+    col_controlled_step_note_append_begin(COL_SESSION(session));
 
     int cleanup_rc = wl_columnar_session_cleanup_ready_quiescent(
         COL_SESSION(session));
@@ -7190,6 +7232,18 @@ remove_release:
             writer_rc = release_rc;
     }
     return writer_rc;
+}
+
+/* The backend's remove: a removal changes a refused route's storage outside
+ * the admitted append path, so it invalidates that route (#2351). */
+static int
+col_session_remove_recorded(wl_session_t *session, const char *relation,
+    const int64_t *data, uint32_t num_rows, uint32_t num_cols)
+{
+    int rc = col_session_remove(session, relation, data, num_rows, num_cols);
+    if (!rc && num_rows)
+        col_controlled_step_record_removal(COL_SESSION(session));
+    return rc;
 }
 
 /*
@@ -18205,7 +18259,7 @@ static const wl_compute_backend_t col_backend = {
     .session_destroy = col_session_destroy,
     .session_insert = col_session_insert,
     .session_make_compound = col_session_make_compound,
-    .session_remove = col_session_remove,
+    .session_remove = col_session_remove_recorded,
     .session_step = col_session_step,
     .session_set_delta_cb = col_session_set_delta_cb,
     .session_snapshot = col_session_snapshot,

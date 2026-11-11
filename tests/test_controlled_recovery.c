@@ -116,6 +116,22 @@ insert_edge(fixture_t *f, int64_t x, int64_t y)
     return rc;
 }
 
+static int
+remove_edge(fixture_t *f, int64_t x, int64_t y)
+{
+    int64_t row[2] = { x, y };
+    int rc = wl_session_remove(f->session, "edge", row, 1, 2);
+    if (!rc) {
+        for (uint32_t i = 0; i < f->edge_count; ++i)
+            if (f->edges[i][0] == x && f->edges[i][1] == y) {
+                f->edges[i][0] = f->edges[--f->edge_count][0];
+                f->edges[i][1] = f->edges[f->edge_count][1];
+                break;
+            }
+    }
+    return rc;
+}
+
 /* Size of the transitive closure of the inserted edges, computed directly. */
 static uint32_t
 closure_size(const fixture_t *f)
@@ -516,6 +532,119 @@ test_recursive_cancel(void)
     fixture_close(&f);
 }
 
+typedef enum { STOP_PRESSURE, STOP_CANCEL, STOP_EXHAUST } stop_t;
+
+static fixture_t *stop_fixture;
+static stop_t stop_kind;
+
+/* Stop the running STEP once its first body has been evaluated. */
+static void
+stop_after_first_body(wl_evaluation_control_t *control, unsigned point,
+    uint32_t iteration)
+{
+    if (point != WL_COLUMNAR_SESSION_TEST_RECURSIVE_AFTER_BODY
+        || iteration != 1 || !stop_fixture) return;
+    if (stop_kind == STOP_PRESSURE) pressure_hold(stop_fixture);
+    else if (stop_kind == STOP_CANCEL)
+        wl_evaluation_control_request_cancel(control);
+    else
+        (void)wl_evaluation_control_charge(control, UINT64_MAX);
+    stop_fixture = NULL;
+}
+
+static int
+drive_stopped(fixture_t *f, stop_t kind)
+{
+    stop_fixture = f;
+    stop_kind = kind;
+    wl_columnar_session_test_recursive_step_checkpoint = stop_after_first_body;
+    int rc = drive(f, ACT_NONE, 0, NULL);
+    wl_columnar_session_test_recursive_step_checkpoint = NULL;
+    CHECK(!stop_fixture);
+    return rc;
+}
+
+/* A committed 5-edge closure whose later STEP, after one more edge, stops. */
+static int
+open_stopped_successor(fixture_t *f, stop_t kind)
+{
+    open_chain(f, 5);
+    CHECK(drive(f, ACT_NONE, 0, NULL) == 0);
+    CHECK(!insert_edge(f, 6, 7));
+    return drive_stopped(f, kind);
+}
+
+/*
+ * C5: after a refused or cancelled later STEP, appends to `edge` are still
+ * the admitted mutation, and the retry publishes the closure of every edge.
+ */
+static void
+test_append_after_stopped_successor(void)
+{
+    static const stop_t kinds[] = { STOP_PRESSURE, STOP_CANCEL };
+    for (unsigned k = 0; k < 2; ++k) {
+        fixture_t f;
+        int rc = open_stopped_successor(&f, kinds[k]);
+        CHECK(rc == (kinds[k] == STOP_PRESSURE ? ENOSPC
+            : WL_EVALUATION_CONTROL_CANCELLED));
+        CHECK(!insert_edge(&f, 7, 8));
+        CHECK(drive(&f, ACT_NONE, 0, NULL) == 0);
+        CHECK(rows(&f, "path") == closure_size(&f));
+        CHECK(!insert_edge(&f, 8, 9));
+        CHECK(drive(&f, ACT_NONE, 0, NULL) == 0);
+        CHECK(rows(&f, "path") == closure_size(&f));
+        fixture_close(&f);
+    }
+}
+
+/* C5: a removal after the refusal still invalidates the route for good. */
+static void
+test_removal_after_stopped_successor(void)
+{
+    fixture_t f;
+    CHECK(open_stopped_successor(&f, STOP_PRESSURE) == ENOSPC);
+    CHECK(!remove_edge(&f, 1, 2));
+    CHECK(drive(&f, ACT_NONE, 0, NULL) == EINVAL);
+    CHECK(insert_edge(&f, 7, 8) == EBUSY);
+    CHECK(drive(&f, ACT_NONE, 0, NULL) == EINVAL);
+    fixture_close(&f);
+
+    CHECK(open_stopped_successor(&f, STOP_PRESSURE) == ENOSPC);
+    CHECK(!remove_edge(&f, 1, 2));
+    CHECK(!insert_edge(&f, 7, 8));
+    CHECK(drive(&f, ACT_NONE, 0, NULL) == EINVAL);
+    fixture_close(&f);
+}
+
+/* C5: a refused first STEP accepts more edges and then completes. */
+static void
+test_append_after_refused_first_step(void)
+{
+    fixture_t f;
+    open_chain(&f, 5);
+    CHECK(drive_stopped(&f, STOP_PRESSURE) == ENOSPC);
+    CHECK(!insert_edge(&f, 6, 7));
+    CHECK(drive(&f, ACT_NONE, 0, NULL) == 0);
+    CHECK(rows(&f, "path") == closure_size(&f));
+    fixture_close(&f);
+}
+
+/*
+ * C5: a later STEP stopped by its work limit stays pending; mutations wait
+ * for the retry, which then completes.
+ */
+static void
+test_work_limit_successor(void)
+{
+    fixture_t f;
+    CHECK(open_stopped_successor(&f, STOP_EXHAUST)
+        == WL_EVALUATION_CONTROL_WORK_LIMIT);
+    CHECK(insert_edge(&f, 7, 8) == EBUSY);
+    CHECK(drive(&f, ACT_NONE, 0, NULL) == 0);
+    CHECK(rows(&f, "path") == closure_size(&f));
+    fixture_close(&f);
+}
+
 int
 main(void)
 {
@@ -529,6 +658,10 @@ main(void)
     test_recursive_ack_refused();
     test_recursive_cleanup_pending();
     test_recursive_cancel();
+    test_append_after_stopped_successor();
+    test_removal_after_stopped_successor();
+    test_append_after_refused_first_step();
+    test_work_limit_successor();
     puts("controlled recovery passed");
     return 0;
 }
