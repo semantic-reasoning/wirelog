@@ -372,10 +372,11 @@ pair_first(void *payload)
     pair_fixture_t *p = payload;
     CHECK(!p->first && !p->between && !p->second);
     ++p->first;
-    const wl_evaluation_control_source_pair_policy_t small = {1, 1, 1, 1};
+    const wl_evaluation_control_source_pair_policy_t minimal_policy = {1, 1, 1,
+                                                                       1};
     wl_evaluation_control_source_pair_result_t nested =
         wl_evaluation_control_source_bank_run_lexical_pair(p->bank,
-            WL_EVALUATION_CONTROL_SOURCE_OPERATION, &small,
+            WL_EVALUATION_CONTROL_SOURCE_OPERATION, &minimal_policy,
             pair_first, p, pair_second, p);
     CHECK(nested.financial_result == EBUSY && !nested.first_called &&
         !nested.second_called);
@@ -421,13 +422,14 @@ lexical_pair(void)
         CHECK(r.financial_result == EINVAL && !r.first_called &&
             !r.second_called && !calls);
     }
-    const wl_evaluation_control_source_pair_policy_t small = {1, 1, 1, 1};
+    const wl_evaluation_control_source_pair_policy_t minimal_policy = {1, 1, 1,
+                                                                       1};
     wl_evaluation_control_source_context_t context = {0};
     CHECK(!wl_evaluation_control_source_context_begin(bank,
         WL_EVALUATION_CONTROL_SOURCE_OPERATION, &context));
     wl_evaluation_control_source_pair_result_t busy =
         wl_evaluation_control_source_bank_run_lexical_pair(bank,
-            WL_EVALUATION_CONTROL_SOURCE_OPERATION, &small,
+            WL_EVALUATION_CONTROL_SOURCE_OPERATION, &minimal_policy,
             count_action, &calls, count_action, &calls);
     CHECK(busy.financial_result == EBUSY && !busy.first_called &&
         !busy.second_called && !calls);
