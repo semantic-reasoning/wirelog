@@ -392,6 +392,130 @@ test_bootstrap_refusal(void)
     }
 }
 
+/* C4: later recursive STEPs no longer leak a receipt per body iteration. */
+static void
+test_recursive_later_steps(void)
+{
+    fixture_t f;
+    open_chain(&f, 16);
+    CHECK(drive(&f, ACT_NONE, 0, NULL) == 0);
+    CHECK(receipt_slots(&f) == 0);
+    CHECK(!insert_edge(&f, 21, 22));
+    CHECK(drive(&f, ACT_NONE, 0, NULL) == 0);
+    CHECK(receipt_slots(&f) == 0 && rows(&f, "path") == closure_size(&f));
+    fixture_close(&f);
+
+    open_chain(&f, 3);
+    CHECK(drive(&f, ACT_NONE, 0, NULL) == 0);
+    for (int64_t k = 0; k < 12; ++k) {
+        CHECK(!insert_edge(&f, 30 + k, 31 + k));
+        CHECK(drive(&f, ACT_NONE, 0, NULL) == 0);
+        CHECK(receipt_slots(&f) == 0);
+        CHECK(rows(&f, "path") == closure_size(&f));
+    }
+    fixture_close(&f);
+}
+
+/* C4: a refused acknowledgement of a body receipt is retried. */
+static void
+test_recursive_ack_refused(void)
+{
+    for (unsigned later = 0; later <= 1; ++later)
+        for (unsigned refusals = 1; refusals <= 2; ++refusals) {
+            fixture_t f;
+            open_chain(&f, 3);
+            if (later) {
+                CHECK(drive(&f, ACT_NONE, 0, NULL) == 0);
+                CHECK(!insert_edge(&f, 4, 5));
+            }
+            ack_refusals = refusals;
+            wl_columnar_session_test_framed_grant_limit = refuse_receipt_ack;
+            int rc = drive(&f, ACT_NONE, 0, NULL);
+            wl_columnar_session_test_framed_grant_limit = NULL;
+            CHECK(rc == 0 && !ack_refusals && receipt_slots(&f) == 0);
+            CHECK(rows(&f, "path") == closure_size(&f));
+            fixture_close(&f);
+        }
+}
+
+static unsigned retry_grants;
+
+static void
+count_retry_grants(const wl_col_session_t *session,
+    wl_columnar_eval_serial_framed_host_action_t action,
+    wl_evaluation_control_t *grant, int rc)
+{
+    (void)session; (void)grant; (void)rc;
+    if (action == WL_COLUMNAR_EVAL_SERIAL_FRAMED_RECEIPT_RETRY) retry_grants++;
+}
+
+/*
+ * C4: a body whose disposal is refused leaves a pending receipt; the
+ * recursive driver retries it with its own key and then carries on with the
+ * body's result.
+ */
+static void
+test_recursive_cleanup_pending(void)
+{
+    for (unsigned later = 0; later <= 1; ++later)
+        for (unsigned refusals = 1; refusals <= 3; ++refusals) {
+            fixture_t f;
+            open_chain(&f, 3);
+            if (later) {
+                CHECK(drive(&f, ACT_NONE, 0, NULL) == 0);
+                CHECK(!insert_edge(&f, 4, 5));
+            }
+            retry_grants = 0;
+            wl_columnar_session_test_framed_grant_finished = count_retry_grants;
+            wl_columnar_eval_stack_test_fail_cleanup_dispose = refusals;
+            int rc = drive(&f, ACT_NONE, 0, NULL);
+            wl_columnar_session_test_framed_grant_finished = NULL;
+            CHECK(!wl_columnar_eval_stack_test_fail_cleanup_dispose);
+            CHECK(rc == 0 && retry_grants > 0 && receipt_slots(&f) == 0);
+            CHECK(rows(&f, "path") == closure_size(&f));
+            CHECK(!insert_edge(&f, 10, 11));
+            CHECK(drive(&f, ACT_NONE, 0, NULL) == 0 && receipt_slots(&f) == 0);
+            CHECK(rows(&f, "path") == closure_size(&f));
+            fixture_close(&f);
+        }
+}
+
+static fixture_t *cancel_fixture;
+static unsigned cancel_point;
+static uint32_t cancel_iteration;
+
+static void
+cancel_at_checkpoint(wl_evaluation_control_t *control, unsigned point,
+    uint32_t iteration)
+{
+    if (point == cancel_point && iteration == cancel_iteration
+        && cancel_fixture) {
+        wl_evaluation_control_request_cancel(control);
+        cancel_fixture = NULL;
+    }
+}
+
+/* C4: a cancelled later STEP drains its body receipts, and a retry works. */
+static void
+test_recursive_cancel(void)
+{
+    fixture_t f;
+    open_chain(&f, 5);
+    CHECK(drive(&f, ACT_NONE, 0, NULL) == 0);
+    CHECK(!insert_edge(&f, 6, 7));
+    cancel_fixture = &f;
+    cancel_point = WL_COLUMNAR_SESSION_TEST_RECURSIVE_AFTER_BODY;
+    cancel_iteration = 1;
+    wl_columnar_session_test_recursive_step_checkpoint = cancel_at_checkpoint;
+    int rc = drive(&f, ACT_NONE, 0, NULL);
+    wl_columnar_session_test_recursive_step_checkpoint = NULL;
+    CHECK(!cancel_fixture);
+    CHECK(rc == WL_EVALUATION_CONTROL_CANCELLED && receipt_slots(&f) == 0);
+    CHECK(drive(&f, ACT_NONE, 0, NULL) == 0 && receipt_slots(&f) == 0);
+    CHECK(rows(&f, "path") == closure_size(&f));
+    fixture_close(&f);
+}
+
 int
 main(void)
 {
@@ -401,6 +525,10 @@ main(void)
     test_plain_ack_refused();
     test_observed_ack_refused();
     test_plain_cleanup_pending();
+    test_recursive_later_steps();
+    test_recursive_ack_refused();
+    test_recursive_cleanup_pending();
+    test_recursive_cancel();
     puts("controlled recovery passed");
     return 0;
 }
