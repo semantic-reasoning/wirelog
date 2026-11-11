@@ -3618,6 +3618,9 @@ enum {
 extern void (*wl_columnar_eval_stack_test_checkpoint)(
     wl_evaluation_control_t *, unsigned, uint64_t);
 extern int wl_columnar_eval_stack_test_fail_allocation;
+/* Refuse the next N frame disposals with EBUSY, as a still-borrowed result
+ * would.  Plain counter: single-threaded (W=1) tests only. */
+extern unsigned wl_columnar_eval_stack_test_fail_cleanup_dispose;
 /* Physical layout only, never an observed work total. */
 size_t wl_columnar_eval_stack_test_frame_size(void);
 size_t wl_columnar_eval_stack_test_allocation_size(void);

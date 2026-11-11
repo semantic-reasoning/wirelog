@@ -584,6 +584,7 @@ typedef char wl_columnar_eval_stack_attempt_contiguous_fits_t[
 void (*wl_columnar_eval_stack_test_checkpoint)(
     wl_evaluation_control_t *, unsigned, uint64_t);
 int wl_columnar_eval_stack_test_fail_allocation = -1;
+unsigned wl_columnar_eval_stack_test_fail_cleanup_dispose;
 
 size_t
 wl_columnar_eval_stack_test_frame_size(void)
@@ -2501,6 +2502,12 @@ wl_columnar_eval_stack_cleanup_dispose(
     if (frame->row_debt) return EBUSY;
     if (frame->prepared_unary) return EBUSY;
     if (frame->stream_host) return EBUSY;
+#ifdef WL_SESSION_TEST_HOOKS
+    if (wl_columnar_eval_stack_test_fail_cleanup_dispose) {
+        wl_columnar_eval_stack_test_fail_cleanup_dispose--;
+        return EBUSY;
+    }
+#endif
     int result = eval_entry_dispose(&frame->result);
     int output_rc = eval_entry_dispose(&frame->unary_output);
     if (result == 0)
