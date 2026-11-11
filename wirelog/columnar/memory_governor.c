@@ -2585,6 +2585,11 @@ reservation_release_thread_equal(
 #endif
 }
 
+#ifdef WL_COLUMNAR_MEMORY_TEST_HOOKS
+void (*wl_columnar_memory_governor_test_before_finish_credit_cas)(
+    wl_columnar_memory_reservation_t *, uint64_t);
+#endif
+
 int
 wl_columnar_memory_reservation_finish_step(
     wl_columnar_memory_reservation_t *reservation, bool rollback,
@@ -2659,6 +2664,11 @@ wl_columnar_memory_reservation_finish_step(
     if (reservation->release_bytes > old)
         return EINVAL;
     uint64_t next = old - reservation->release_bytes;
+#ifdef WL_COLUMNAR_MEMORY_TEST_HOOKS
+    if (wl_columnar_memory_governor_test_before_finish_credit_cas)
+        wl_columnar_memory_governor_test_before_finish_credit_cas(reservation,
+            old);
+#endif
     if (!atomic_compare_exchange_strong_explicit(
             &reservation->governor->reserved_bytes, &old, next,
             memory_order_release, memory_order_relaxed))

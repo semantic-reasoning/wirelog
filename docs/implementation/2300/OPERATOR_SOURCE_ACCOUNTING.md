@@ -794,3 +794,97 @@ framed CHILD census, including the predicate's failed arms and ancestor return.
 It is not paid by the later selector charge and does not inherit the local
 source-END bounds above. No new whole-call256 or assigned SOURCE/carry claim
 is made here. The containing S.FIN qualification remains open.
+
+
+## Canonical abort-observer retirement
+
+The real observed Step now retains an observer disposal journal, the exact
+transaction origin and a final-address resource receipt. Transaction malloc
+publishes its real creator thread and saved allocation/operation tuple before
+the transaction pointer. Cleanup birth proves the actual normal disposal
+reason or registered C1 native DISPOSE lineage. Historical ownership does not
+come from the current Original generation, a successful financial check or an
+external mode flag. The live C1 EVALUATE proof remains strict.
+
+Both actual disposal callers first drive the same observer kernel to its
+READERS_DONE barrier, before differential or original relation retirement.
+The receipt remains paused while those parent resources retire. The later
+adapter resumes that same receipt and replaces the old raw BUILD/PREPARE/READY
+discard trio. Each action handles one real relation-reader stage, plain token
+stage, physical free, reservation transition, arena hold/GC step or fixed
+metadata packet. Partial BUILD uses its actual initialized extent and never
+reads an unfinished observer header. Header metadata credit moves to stable
+session storage before physical header free; payload arrays precede their
+credit release. The session's independent governor/arena lifetime protects the
+qualified nonfinal reference releases.
+
+A fresh finite financier attaches to the real Step for each action. Its384
+capacity covers registration/proof/leaf schedules; separate128 admissions and
+actual reader1 or arena128 admissions retain their own meanings. Normal
+observe+step may consume128+128+128. A383 registration refusal consumes256 and
+leaves the leaf untouched; no whole384 debit is invented. Pending financier
+close remains real ownership if its saved generation no longer matches. An
+actual foreign successor is neither charged nor finished by old settlement.
+Native metadata2304 is still separate outer work, never observer body credit.
+
+ACK clears at most16 bytes through an explicit counted byte loop per admitted
+action. A later, separately admitted fixed packet publishes final inert state
+and the actual Step ACK witness before its financial footer. Physical resource
+completion is distinct from ACK completion and from successful return
+observation. The normal DISCARD continuation remains structurally pending
+after successful observer ACK until the actual parent transaction is freed.
+Its native-thread mutation proof is separate from pending visibility. Parent
+arrays cannot retire with an unacknowledged observer; borrowed transaction and
+receipt references are invalidated in the mandatory header-free packet.
+Raw observer mutators refuse the live journal, including the post-ACK parent
+tail. A copied resource address or Original financing refuses before debit.
+
+The actual production BASELINE is created after EVALUATE children. Tests first
+initialize genuine public heads and add a pending insertion so BUILD owns real
+readers. The128 public histories exercise partial allocation/initialization,
+BUILD name/rows/readers, PREPARE reader/current/events and READY; CANCEL/WORK;
+Original END/live successor at birth, barrier, physical rows, ACK, post-ACK and
+header-free boundaries; one-short funding, refused ACK footer, explicit and
+resolved-default governors and genuine peer reader/governor CAS loss. The peer cases also stop the
+financier after real CAS loss. Exact old-head/input snapshots, seven-field
+reports, successor consumption0, no premature events, later unique insertion
+and signed deletion, checked destroy and a separately held17-byte peer
+reservation provide independent content/lifetime oracles. NULL options resolve
+a default governor; tests assert its actual distinct selection and separately
+retain that real governor through checked destroy to verify its zero balance.
+They do not claim a governorless public construction path. The test hook before
+credit CAS creates a real peer reservation; it never writes fake counter or
+owner states.
+
+### Local source intervals and remaining containing work
+
+The source census expands actual engine helpers and MSVC atomic fronts. The
+kernel observes after its full resource quote, before native action, and around
+the READERS_DONE barrier. It captures a typed ephemeral pointer to the selected
+in-place progress receipt once. A refused return compares only that selected
+reader/credit/hold/GC record, with no repeated observer-shape dispatch. A
+captured header pointer is never read after its physical free: the comparison
+is evaluated only for an incomplete result with unchanged phase and index.
+The mandatory native journal remains published even if a subsequent real zero
+refuses; that refused check is not treated as a fresh observation.
+
+The explicit ACK byte loop has at most17 tests,16 address additions,16
+increments and16 target/store pairs per action. Its local128 source envelope
+includes fixed loop/control/footer fronts; final header/ACK publication has a
+separate local64 envelope. These are source counts from actual operations,
+not derived from bytes, admission price or capacity. They do not include an
+arbitrary parent or financial-close return. Reader/CAS/refused-return and
+native arena/relation joins require their own actual profiles; a successful
+zero on one alternative does not certify a stopped alternative.
+
+This unit establishes abort-observer integration and lifetime behavior. It
+**does not qualify the whole parent disposal**: differential tails, recursive
+roles, arrays, transaction header credit and old maintenance/controller tails
+remain required C2a2 work. Current committed observed FINISH still calls its
+old observer-finish/discard path before transaction disposal; preserving its
+existing delivered semantics is not proof that this committed path is finite.
+Outer snapshot loops, finance-close/parent/public refusal contours, actual
+incoming/assigned SOURCE, performed lower and correlated carry remain OPEN.
+No384 capacity, zero, FINISH, test count or local upper closes S.FIN. The
+containing closure matrix and PR remain open until those runtime routes and
+all remaining operator domains are completed and validated.

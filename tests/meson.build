@@ -6983,6 +6983,16 @@ test_evaluation_join_prepared_auto_exe = executable(
   c_args: ['-DWL_SESSION_TEST_HOOKS=1', '-DWL_COLUMNAR_MEMORY_TEST_HOOKS=1'],
   link_with: [testlib_prod_memory_hooks],
 )
+test_evaluation_observer_resources_exe = executable(
+  'test_evaluation_observer_resources', files('test_evaluation_observer_resources.c'),
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
+  c_args: ['-DWL_SESSION_TEST_HOOKS=1', '-DWL_COLUMNAR_MEMORY_TEST_HOOKS=1'],
+  link_with: [testlib_prod_memory_hooks],
+)
+test('evaluation_observer_resources', test_evaluation_observer_resources_exe,
+     suite: ['unit', 'tsan'], timeout: 120)
+
 test('evaluation_join_prepared_auto_domains', test_evaluation_join_prepared_auto_exe,
      env: ['WIRELOG_JOIN_BATCH_BYTES=', 'WIRELOG_JOIN_BATCH_STRICT='],
      suite: ['unit', 'tsan'], timeout: 120)
