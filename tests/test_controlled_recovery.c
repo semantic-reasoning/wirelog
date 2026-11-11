@@ -747,6 +747,42 @@ test_getter_poll_does_not_block(void)
     free(text);
 }
 
+/*
+ * C7: a controlled STEP reports a governed denial even when the refused site
+ * sets no flag of its own; the candidate build after the first body is
+ * such a site.
+ */
+static void
+test_controlled_step_denial_typed(void)
+{
+    fixture_t f;
+    CHECK(open_stopped_successor(&f, STOP_PRESSURE) == ENOSPC);
+    CHECK(wl_session_budget_denied(f.session));
+    CHECK(!insert_edge(&f, 7, 8));
+    CHECK(drive(&f, ACT_NONE, 0, NULL) == 0);
+    CHECK(!wl_session_budget_denied(f.session));
+    fixture_close(&f);
+}
+
+/*
+ * C7: each attempt is judged against its own denial count, so an allocation
+ * failure after a denied attempt stays ENOMEM.
+ */
+static void
+test_controlled_enomem_after_denial(void)
+{
+    fixture_t f;
+    CHECK(open_stopped_successor(&f, STOP_PRESSURE) == ENOSPC);
+    CHECK(wl_session_budget_denied(f.session));
+    wl_columnar_eval_stack_test_fail_allocation = 0;
+    int rc = drive(&f, ACT_NONE, 0, NULL);
+    wl_columnar_eval_stack_test_fail_allocation = -1;
+    CHECK(rc == ENOMEM && !wl_session_budget_denied(f.session));
+    CHECK(drive(&f, ACT_NONE, 0, NULL) == 0);
+    CHECK(rows(&f, "path") == closure_size(&f));
+    fixture_close(&f);
+}
+
 int
 main(void)
 {
@@ -767,6 +803,8 @@ main(void)
     test_getter_after_refused_snapshot();
     test_getter_inside_running_step();
     test_getter_poll_does_not_block();
+    test_controlled_step_denial_typed();
+    test_controlled_enomem_after_denial();
     puts("controlled recovery passed");
     return 0;
 }

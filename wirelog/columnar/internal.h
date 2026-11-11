@@ -2974,6 +2974,11 @@ typedef struct wl_col_session_t {
      * current operation to stop.  Kept separate from ENOSPC because cache
      * refusal and compound saturation use that status too. */
     bool memory_budget_denied;
+    /* Governor denial count when a controlled STEP's first public call began,
+     * and the attempt it belongs to; held until a return leaves no debt. */
+    bool controlled_denial_open;
+    uint64_t controlled_denial_baseline;
+    uint64_t controlled_denial_attempt;
     /* Operation-local denial while privately staging an advanced incremental
      * bulk removal.  The temporary delta is discarded before generic session
      * budget inspection can see it. */
