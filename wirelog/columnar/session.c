@@ -9928,7 +9928,8 @@ col_controlled_step_host_action_financed(wl_col_session_t *sess,
             ? step->unary_cleanup.key : ordinary_capture
             ? step->transaction->receipt_key
             : step->terminal_receipt_ack
-            && action == WL_COLUMNAR_EVAL_SERIAL_FRAMED_RECEIPT_ACK
+            && (action == WL_COLUMNAR_EVAL_SERIAL_FRAMED_RECEIPT_ACK
+            || action == WL_COLUMNAR_EVAL_SERIAL_FRAMED_RECEIPT_RETRY)
             ? step->terminal_receipt_key
             : (wl_columnar_eval_cleanup_receipt_key_t){0},
         .previous_valid = step->previous_valid,
@@ -16069,8 +16070,16 @@ col_controlled_step_drive(wl_col_session_t *sess,
         }
         step->relation_active = true;
         for (;;) {
+            /* A receipt whose cleanup is still pending is retried until its
+             * frame is freed, and only then acknowledged. */
+            bool retry = step->terminal_receipt_ack
+                && col_controlled_step_receipt_state(sess,
+                    &step->terminal_receipt_key)
+                == WL_COLUMNAR_EVAL_CLEANUP_RECEIPT_TRANSFERRED;
             int protocol = col_controlled_step_host_action(sess, step,
-                    relation, step->terminal_receipt_ack
+                    relation, retry
+                    ? WL_COLUMNAR_EVAL_SERIAL_FRAMED_RECEIPT_RETRY
+                    : step->terminal_receipt_ack
                     ? WL_COLUMNAR_EVAL_SERIAL_FRAMED_RECEIPT_ACK
                     : WL_COLUMNAR_EVAL_SERIAL_FRAMED_ADVANCE);
             if (protocol == EAGAIN) return EAGAIN;
@@ -16078,11 +16087,16 @@ col_controlled_step_drive(wl_col_session_t *sess,
                 wl_columnar_eval_cleanup_receipt_state_t left =
                     col_controlled_step_receipt_state(sess,
                         &step->terminal_receipt_key);
-                /* A refused acknowledgement leaves the attempt-bound
-                 * receipt in place: retry it under this attempt, and never
-                 * report the refused grant as the STEP result. */
-                if (left == WL_COLUMNAR_EVAL_CLEANUP_RECEIPT_FREED)
+                /* Pending cleanup and a refused grant both leave the
+                 * attempt-bound receipt in place: retry it under this
+                 * attempt, and never report the refused grant as the STEP
+                 * result. */
+                if (left == WL_COLUMNAR_EVAL_CLEANUP_RECEIPT_TRANSFERRED)
                     return EAGAIN;
+                if (left == WL_COLUMNAR_EVAL_CLEANUP_RECEIPT_FREED) {
+                    if (retry) continue;
+                    return EAGAIN;
+                }
                 step->terminal_receipt_ack = false;
                 memset(&step->terminal_receipt_key, 0,
                     sizeof(step->terminal_receipt_key));
@@ -16095,14 +16109,19 @@ col_controlled_step_drive(wl_col_session_t *sess,
                 step->reply.execution_result = step->terminal_result;
                 step->reply.committed = step->terminal_committed;
                 protocol = 0;
-            } else if (!protocol && step->reply.kind
+            } else if (!protocol && (step->reply.kind
                 == WL_COLUMNAR_EVAL_SERIAL_FRAMED_REPLY_TERMINAL
+                || step->reply.kind ==
+                WL_COLUMNAR_EVAL_SERIAL_FRAMED_REPLY_TERMINAL_CLEANUP_PENDING)
                 && step->reply.cleanup_receipt_key.receipt_id
                 && !step->join_cleanup.kind && !step->unary_cleanup.registered
                 && !sess->cleanup_active
-                && col_controlled_step_receipt_state(sess,
+                && (col_controlled_step_receipt_state(sess,
                 &step->reply.cleanup_receipt_key)
-                == WL_COLUMNAR_EVAL_CLEANUP_RECEIPT_FREED) {
+                == WL_COLUMNAR_EVAL_CLEANUP_RECEIPT_FREED
+                || col_controlled_step_receipt_state(sess,
+                &step->reply.cleanup_receipt_key)
+                == WL_COLUMNAR_EVAL_CLEANUP_RECEIPT_TRANSFERRED)) {
                 /* The closed frame's receipt keeps its outcome until it is
                  * acknowledged; leaving it FREED leaks a receipt slot per
                  * relation (#2351).  The join and unary cleanup paths

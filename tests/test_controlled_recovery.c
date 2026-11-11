@@ -328,6 +328,32 @@ test_observed_ack_refused(void)
     }
 }
 
+/*
+ * C3: a frame whose disposal is refused hands its cleanup to a pending
+ * receipt; the plain driver retries that receipt and then acknowledges it.
+ */
+static void
+test_plain_cleanup_pending(void)
+{
+    for (unsigned refusals = 1; refusals <= 2; ++refusals) {
+        char *text = copy_rules_text(1);
+        fixture_t f;
+        fixture_open(&f, text);
+        for (int64_t i = 1; i <= 3; ++i)
+            CHECK(!insert_edge(&f, i, i + 1));
+        wl_columnar_eval_stack_test_fail_cleanup_dispose = refusals;
+        int rc = drive(&f, ACT_NONE, 0, NULL);
+        CHECK(!wl_columnar_eval_stack_test_fail_cleanup_dispose);
+        CHECK(rc == 0 && receipt_slots(&f) == 0);
+        CHECK(rows(&f, "b0") == f.edge_count);
+        CHECK(!insert_edge(&f, 10, 11));
+        CHECK(drive(&f, ACT_NONE, 0, NULL) == 0 && receipt_slots(&f) == 0);
+        CHECK(rows(&f, "b0") == f.edge_count);
+        fixture_close(&f);
+        free(text);
+    }
+}
+
 static fixture_t *hook_fixture;
 static unsigned hook_point;
 static uint32_t hook_iteration;
@@ -374,6 +400,7 @@ main(void)
     test_plain_receipts();
     test_plain_ack_refused();
     test_observed_ack_refused();
+    test_plain_cleanup_pending();
     puts("controlled recovery passed");
     return 0;
 }
