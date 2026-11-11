@@ -5966,6 +5966,11 @@ int wl_columnar_expr_cstr_length_attempt_controlled(const char *, size_t *,
     wl_evaluation_control_t *, uint64_t);
 int wl_columnar_expr_bytes_compare_attempt_controlled(const uint8_t *,
     const uint8_t *, size_t, int *, wl_evaluation_control_t *, uint64_t);
+/* Compare real intern rank/lexical values without normalizing invalid IDs.
+ * Outputs publish only after the last actual saved-generation observation. */
+int wl_columnar_expr_intern_rank_compare_attempt_controlled(const wl_intern_t *,
+    int64_t, int64_t, int *, bool *, bool *, wl_evaluation_control_t *,
+    uint64_t);
 int wl_columnar_expr_bytes_copy_attempt_controlled(uint8_t *, const uint8_t *,
     size_t, size_t *, wl_evaluation_control_t *, uint64_t);
 int wl_columnar_expr_bytes_hash_attempt_controlled(const uint8_t *, size_t,

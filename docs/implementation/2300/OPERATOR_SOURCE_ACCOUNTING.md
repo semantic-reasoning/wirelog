@@ -525,3 +525,45 @@ a negated atom argument; that invalid syntax is not presented as a supported
 natural route. Accepted scalar function bytecode is exercised separately.
 No materialized, recursive, representation or financial row is closed merely
 by this predicate implementation; those remain explicit in the full matrix.
+
+## Full-issue continuation: scalar and STRING REDUCE
+
+REDUCE retains numeric compilation first and falls back to the current scalar
+owner for accepted computed operands. The real session expression context and
+common PROGRAM lifetime are the same context-bearing contracts used by the
+other scalar consumers. Operand semantic failure becomes ERANGE, whereas a
+right predicate's failure rejects its row. Missing/invalid protocol, stop,
+allocation and cap results are not rewritten as operand semantics.
+
+STRING MIN/MAX now compares authentic intern rank and lexical content through
+the existing bounded length/byte comparison kernels. A valid intern value
+outranks an unresolved ID for both MIN and MAX. Two valid strings compare
+lexically, while two unresolved IDs retain signed integer ordering. Unknown
+operand domain remains ordinary ID ordering. STRING SUM retains checked signed
+ID addition and its existing ERANGE behavior; COUNT and FLOAT arithmetic keep
+their prior paths. The aggregate cell retains the raw operator's existing
+INT64/FLOAT storage metadata rather than inventing a new result type.
+
+The comparator reads each real intern binding, performs bounded byte scans,
+and publishes its outputs only after its last saved-generation check. Its
+WORK admissions are not a new SOURCE issuer or a containing carry certificate.
+Current parsed AVG requires FLOAT; no integer AVG semantics are introduced.
+
+`evaluation_numeric_operators` now includes generated grouped/ungrouped
+MIN/MAX/SUM with shifted intern IDs and reversed inputs, computed CAT and
+STRLEN operands, literal values, raw type/content parity and actual public
+controlled/raw sessions. Public delivery occurs once, a later empty step
+preserves events and ledger bytes, and destruction of session/plan/program
+releases the retained governor to zero. Invalid/unresolved IDs, NULL intern,
+UNKNOWN domain, overflow, long lexical comparisons and interrupted comparison
+or storage have independent component oracles. A natural computed division
+failure separately proves ERANGE with no output/events and clean destruction.
+
+A genuine scalar-program-created checkpoint proves cleanup after cancellation,
+WORK refusal, subsequent temporary allocation failure, enforcing-cap refusal,
+and actual Original FINISH followed by a live successor. It observes the real
+context and program instead of seeding owner fields. The old report's seven
+fields remain unchanged, the successor consumes zero, and actual cleanup
+releases all retained governor credit. Remaining representation, recursive,
+materialized, lifecycle and full source/carry rows remain open in the closure
+matrix; these tests alone do not complete #2300.
