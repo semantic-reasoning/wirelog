@@ -847,7 +847,7 @@ test_snapshot_resource_failures(void)
             CHECK(rc == (mode < 2 ? ENOSPC : ENOMEM));
             CHECK(!actual.count && !f.actual.count
                 && session_find_rel(session, "first") == old
-                && session->memory_budget_denied == (mode < 2));
+                && wl_session_budget_denied(f.session) == (mode < 2));
             wl_evaluation_control_report_t report;
             CHECK(!wl_evaluation_control_report(f.control, &report)
                 && report.result == rc && !report.cleanup_status);
@@ -856,7 +856,7 @@ test_snapshot_resource_failures(void)
             pressure_credit = NULL; pressure_governor = NULL;
             CHECK(!wl_evaluation_control_reset(f.control));
             CHECK(!wl_session_snapshot(f.session, capture_tuple, &actual));
-            CHECK(!session->memory_budget_denied);
+            CHECK(!wl_session_budget_denied(f.session));
             CHECK(!step(f.reference));
             CHECK(!wl_session_snapshot(f.reference, capture_tuple, &expected));
             check_capture(&actual, &expected);

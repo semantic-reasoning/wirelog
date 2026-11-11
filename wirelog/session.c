@@ -2019,10 +2019,34 @@ wl_session_snapshot(wl_session_t *session, wirelog_on_tuple_fn callback,
 bool
 wl_session_budget_denied(wl_session_t *session)
 {
+    wl_session_admission_t *admission;
     bool denied;
 
-    if (!session || wl_session_operation_begin(session) != 0)
+    if (!session)
         return false;
+    admission = session->operation_admission;
+    if (admission) {
+        if (wl_session_admission_lock(admission) != 0)
+            return false;
+        if (admission->closing || admission->exclusive_attempt) {
+            wl_session_checked_unlock(admission);
+            return false;
+        }
+        /* A parked or completed controlled STEP is a quiescent boundary.
+         * Read it under the admission lock without taking an operation, so
+         * polling never makes the owner's resume or an admitted mutation see
+         * EBUSY; a call that is running still reads false (#2351). */
+        if (admission->controlled_step_pending
+            || admission->controlled_step_complete) {
+            denied = admission->active_operations == 0 && session->backend
+                && session->backend->session_budget_denied
+                && session->backend->session_budget_denied(session);
+            wl_session_checked_unlock(admission);
+            return denied;
+        }
+        admission->active_operations++;
+        wl_session_checked_unlock(admission);
+    }
     denied = session->backend && session->backend->session_budget_denied
         && session->backend->session_budget_denied(session);
     wl_session_operation_end(session);

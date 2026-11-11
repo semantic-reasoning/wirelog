@@ -511,7 +511,9 @@ wl_session_snapshot(wl_session_t *session, wirelog_on_tuple_fn callback,
  * denial.  Other ENOSPC and ENOMEM meanings remain untyped at this internal
  * boundary.  One can be reported as a denial when the governor refused anything
  * during the same call: another session sharing it, or an admission this call
- * recovered from. */
+ * recovered from.  With evaluation control it can be read while a STEP is
+ * parked on EAGAIN or complete.  While a controlled call is running,
+ * including from its own callbacks, it returns false. */
 bool
 wl_session_budget_denied(wl_session_t *session);
 
