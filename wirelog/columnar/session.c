@@ -381,6 +381,11 @@ struct wl_columnar_controlled_step {
     bool default_preflight_target_found;
     bool default_preflight_entry_charged;
     bool cursor_advance_pending;
+    /* A relation's terminal receipt still to acknowledge, and the outcome
+     * its TERMINAL reply carried (#2351). */
+    bool terminal_receipt_ack, terminal_committed;
+    int terminal_result;
+    wl_columnar_eval_cleanup_receipt_key_t terminal_receipt_key;
     char *successor_private_name;
     char successor_name_buffer[128];
     uint32_t successor_name_suffix;
@@ -9922,6 +9927,9 @@ col_controlled_step_host_action_financed(wl_col_session_t *sess,
             || action == WL_COLUMNAR_EVAL_SERIAL_FRAMED_RECEIPT_ACK)
             ? step->unary_cleanup.key : ordinary_capture
             ? step->transaction->receipt_key
+            : step->terminal_receipt_ack
+            && action == WL_COLUMNAR_EVAL_SERIAL_FRAMED_RECEIPT_ACK
+            ? step->terminal_receipt_key
             : (wl_columnar_eval_cleanup_receipt_key_t){0},
         .previous_valid = step->previous_valid,
         .previous_kind = step->previous_kind,
@@ -10420,6 +10428,9 @@ col_controlled_step_finish_inner(wl_col_session_t *sess,
     if ((step->join_cleanup.kind && !step->join_cleanup.receipt_acknowledged)
         || (step->unary_cleanup.registered
         && !step->unary_cleanup.receipt_acknowledged)) return EAGAIN;
+    /* The same attempt-bound debt for a relation's terminal receipt.
+     * Defensive: the plain driver drains it before it can finish. */
+    if (step->terminal_receipt_ack) return EAGAIN;
     /* A failed bootstrap can own a completed financial receipt without ever
      * creating a native frame. Retire only that exact serialized grant; it is
      * not evidence permitting native cleanup or a new Original generation. */
@@ -11806,6 +11817,17 @@ col_controlled_recursive_retire_managed(wl_columnar_controlled_step_t *step,
     int rc = col_controlled_recursive_retire_managed_body(step, r, owner);
     r->retirement_busy = step->retirement_busy = false;
     return rc;
+}
+
+/* After any receipt action the receipt table, not the reply, says what is
+ * left: FREE means the named receipt is gone. */
+static wl_columnar_eval_cleanup_receipt_state_t
+col_controlled_step_receipt_state(wl_col_session_t *sess,
+    const wl_columnar_eval_cleanup_receipt_key_t *key)
+{
+    wl_columnar_eval_cleanup_receipt_t receipt;
+    return wl_columnar_eval_stack_cleanup_receipt_read(sess, key, &receipt)
+           ? WL_COLUMNAR_EVAL_CLEANUP_RECEIPT_FREE : receipt.state;
 }
 
 static int
@@ -15963,9 +15985,11 @@ col_controlled_step_drive(wl_col_session_t *sess,
 
     for (;;) {
         /* Receipt-only debt belongs to the current relation. Drain it before
-         * consulting the stopped Original or advancing the schedule. */
+         * consulting the stopped Original or advancing the schedule.  A
+         * refused acknowledgement leaves its debt across public calls, and
+         * this keeps the schedule from advancing until it is drained. */
         int schedule_rc = (step->join_cleanup.kind ||
-            step->unary_cleanup.registered)
+            step->unary_cleanup.registered || step->terminal_receipt_ack)
             ? 0 : col_controlled_step_schedule(sess, step);
         if (schedule_rc == EAGAIN &&
             wl_evaluation_control_active_attempt_id(control)
@@ -16013,8 +16037,49 @@ col_controlled_step_drive(wl_col_session_t *sess,
         step->relation_active = true;
         for (;;) {
             int protocol = col_controlled_step_host_action(sess, step,
-                    relation, WL_COLUMNAR_EVAL_SERIAL_FRAMED_ADVANCE);
+                    relation, step->terminal_receipt_ack
+                    ? WL_COLUMNAR_EVAL_SERIAL_FRAMED_RECEIPT_ACK
+                    : WL_COLUMNAR_EVAL_SERIAL_FRAMED_ADVANCE);
             if (protocol == EAGAIN) return EAGAIN;
+            if (step->terminal_receipt_ack) {
+                wl_columnar_eval_cleanup_receipt_state_t left =
+                    col_controlled_step_receipt_state(sess,
+                        &step->terminal_receipt_key);
+                /* A refused acknowledgement leaves the attempt-bound
+                 * receipt in place: retry it under this attempt, and never
+                 * report the refused grant as the STEP result. */
+                if (left == WL_COLUMNAR_EVAL_CLEANUP_RECEIPT_FREED)
+                    return EAGAIN;
+                step->terminal_receipt_ack = false;
+                memset(&step->terminal_receipt_key, 0,
+                    sizeof(step->terminal_receipt_key));
+                if (left != WL_COLUMNAR_EVAL_CLEANUP_RECEIPT_FREE) {
+                    step->relation_active = false;
+                    return col_controlled_step_finish(sess, step, EINVAL);
+                }
+                step->reply.kind =
+                    WL_COLUMNAR_EVAL_SERIAL_FRAMED_REPLY_TERMINAL;
+                step->reply.execution_result = step->terminal_result;
+                step->reply.committed = step->terminal_committed;
+                protocol = 0;
+            } else if (!protocol && step->reply.kind
+                == WL_COLUMNAR_EVAL_SERIAL_FRAMED_REPLY_TERMINAL
+                && step->reply.cleanup_receipt_key.receipt_id
+                && !step->join_cleanup.kind && !step->unary_cleanup.registered
+                && !sess->cleanup_active
+                && col_controlled_step_receipt_state(sess,
+                &step->reply.cleanup_receipt_key)
+                == WL_COLUMNAR_EVAL_CLEANUP_RECEIPT_FREED) {
+                /* The closed frame's receipt keeps its outcome until it is
+                 * acknowledged; leaving it FREED leaks a receipt slot per
+                 * relation (#2351).  The join and unary cleanup paths
+                 * acknowledge their own receipts. */
+                step->terminal_receipt_key = step->reply.cleanup_receipt_key;
+                step->terminal_result = step->reply.execution_result;
+                step->terminal_committed = step->reply.committed;
+                step->terminal_receipt_ack = true;
+                continue;
+            }
             if (protocol && step->reply.kind
                 == WL_COLUMNAR_EVAL_SERIAL_FRAMED_REPLY_REJECTED
                 && !sess->cleanup_active) {

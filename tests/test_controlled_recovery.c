@@ -215,6 +215,91 @@ test_receipt_table_full(void)
     fixture_close(&f);
 }
 
+/* A program of `rules` independent non-recursive rules over `edge`. */
+static char *
+copy_rules_text(unsigned rules)
+{
+    size_t cap = 64 + (size_t)rules * 96;
+    char *text = malloc(cap);
+    CHECK(text);
+    int n = snprintf(text, cap, ".decl edge(x: int64, y: int64)\n");
+    CHECK(n >= 0 && (size_t)n < cap);
+    size_t used = (size_t)n;
+    for (unsigned i = 0; i < rules; ++i) {
+        n = snprintf(text + used, cap - used,
+                ".decl b%u(x: int64, y: int64)\nb%u(x,y) :- edge(x,y).\n",
+                i, i);
+        CHECK(n >= 0 && (size_t)n < cap - used);
+        used += (size_t)n;
+    }
+    return text;
+}
+
+static unsigned ack_refusals;
+
+static uint64_t
+refuse_receipt_ack(const wl_col_session_t *session,
+    wl_columnar_eval_serial_framed_host_action_t action, uint64_t proposed)
+{
+    (void)session;
+    if (action == WL_COLUMNAR_EVAL_SERIAL_FRAMED_RECEIPT_ACK && ack_refusals) {
+        ack_refusals--;
+        return 1;
+    }
+    return proposed;
+}
+
+/*
+ * C2: the plain controlled driver acknowledges each relation's terminal
+ * receipt, so the receipt table does not fill across relations or STEPs.
+ */
+static void
+test_plain_receipts(void)
+{
+    static const unsigned rule_counts[] = { 1, 32, 33 };
+    for (unsigned c = 0; c < sizeof(rule_counts) / sizeof(*rule_counts);
+        ++c) {
+        char *text = copy_rules_text(rule_counts[c]);
+        fixture_t f;
+        fixture_open(&f, text);
+        for (int64_t i = 1; i <= 3; ++i)
+            CHECK(!insert_edge(&f, i, i + 1));
+        CHECK(drive(&f, ACT_NONE, 0, NULL) == 0);
+        CHECK(receipt_slots(&f) == 0);
+        for (int64_t k = 0; k < 5; ++k) {
+            CHECK(!insert_edge(&f, 10 + k, 11 + k));
+            CHECK(drive(&f, ACT_NONE, 0, NULL) == 0);
+            CHECK(receipt_slots(&f) == 0);
+        }
+        CHECK(rows(&f, "b0") == f.edge_count);
+        fixture_close(&f);
+        free(text);
+    }
+}
+
+/* C2: a refused acknowledgement grant is retried under the same attempt. */
+static void
+test_plain_ack_refused(void)
+{
+    for (unsigned refusals = 1; refusals <= 2; ++refusals) {
+        char *text = copy_rules_text(1);
+        fixture_t f;
+        fixture_open(&f, text);
+        for (int64_t i = 1; i <= 3; ++i)
+            CHECK(!insert_edge(&f, i, i + 1));
+        ack_refusals = refusals;
+        wl_columnar_session_test_framed_grant_limit = refuse_receipt_ack;
+        int rc = drive(&f, ACT_NONE, 0, NULL);
+        wl_columnar_session_test_framed_grant_limit = NULL;
+        CHECK(rc == 0 && !ack_refusals && receipt_slots(&f) == 0);
+        CHECK(!insert_edge(&f, 10, 11));
+        CHECK(drive(&f, ACT_NONE, 0, NULL) == 0 && receipt_slots(&f) == 0);
+        CHECK(rows(&f, "b0") == f.edge_count);
+        fixture_close(&f);
+        free(text);
+    }
+}
+
 static fixture_t *hook_fixture;
 static unsigned hook_point;
 static uint32_t hook_iteration;
@@ -258,6 +343,8 @@ main(void)
 {
     test_receipt_table_full();
     test_bootstrap_refusal();
+    test_plain_receipts();
+    test_plain_ack_refused();
     puts("controlled recovery passed");
     return 0;
 }

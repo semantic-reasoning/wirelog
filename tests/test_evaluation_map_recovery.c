@@ -488,9 +488,16 @@ static void indexed_history(void) {
     fixture_t f = create_expression(3); active = &f;
     CHECK(!complete(f.session)); indexed_contents(&f, 0);
     wl_col_session_t *sess = COL_SESSION(f.session);
+    /* The completed STEP acknowledged its receipt and left slot 0 free. Hold
+     * a foreign receipt there, so the failed recovery below has to take
+     * another slot and must leave this one exactly as it is. */
+    CHECK(sess->cleanup_receipts[0].state
+        == WL_COLUMNAR_EVAL_CLEANUP_RECEIPT_FREE);
+    wl_columnar_eval_cleanup_receipt_key_t foreign;
+    CHECK(!wl_columnar_eval_stack_cleanup_receipt_reserve(sess, 777, 888,
+        &foreign));
     wl_columnar_eval_cleanup_receipt_t historical = sess->cleanup_receipts[0];
-    CHECK(historical.state == WL_COLUMNAR_EVAL_CLEANUP_RECEIPT_FREED
-        && historical.committed && !historical.result);
+    CHECK(historical.state == WL_COLUMNAR_EVAL_CLEANUP_RECEIPT_RESERVED);
     wl_session_set_delta_cb(f.session, indexed_delta, &f);
     int64_t rows[] = {wl_intern_put(f.plan->intern, "a"),
                       wl_intern_put(f.plan->intern, "zzz")};
@@ -523,6 +530,7 @@ static void indexed_history(void) {
     CHECK(f.events == 1 && f.positive == 1 && !f.negative
         && !memcmp(&historical, &sess->cleanup_receipts[0],
         sizeof(historical)));
+    CHECK(!wl_columnar_eval_stack_cleanup_receipt_release(sess, &foreign));
     CHECK(!wl_session_remove(f.session, "input", rows, 1,
         1) && !complete(f.session));
     indexed_contents(&f, 0);
