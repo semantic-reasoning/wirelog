@@ -3946,8 +3946,10 @@ wl_columnar_filter_empty_end_step_owned(
 static int
 wl_columnar_filter_registered_cleanup_latch_owned(
     wl_columnar_eval_stack_cleanup_frame_t *frame, const void *owner,
-    wl_evaluation_control_t *funding, uint64_t id, bool *bare_end, bool unary)
+    wl_evaluation_control_t *funding, uint64_t id, bool *bare_end,
+    wl_columnar_eval_plan_cleanup_kind_t kind)
 {
+    bool unary = kind == WL_COLUMNAR_EVAL_PLAN_CLEANUP_UNARY;
     const wl_columnar_eval_plan_numeric_attempt_t *r = owner;
     if (!r || !funding || funding == r->control || !id) return EINVAL;
     int paid = wl_evaluation_control_charge_attempt(funding, id,
@@ -3959,11 +3961,18 @@ wl_columnar_filter_registered_cleanup_latch_owned(
     int rc = wl_columnar_eval_stack_framed_context(frame, r->session, &parent);
     if (rc) return rc;
     int cause = 0;
-    rc = unary
+    if (kind == WL_COLUMNAR_EVAL_PLAN_CLEANUP_OBSERVED) {
+        wl_columnar_session_observed_cleanup_result_t proof =
+            wl_columnar_session_observed_cleanup_prove(parent, funding, id,
+                NULL);
+        rc = proof.protocol;
+        cause = proof.provisional &&
+            r->semantic_result ? r->semantic_result : proof.cause;
+    } else rc = unary
         ? wl_columnar_session_unary_cleanup_prove(parent, funding, id, NULL,
-            &cause)
+                &cause)
         : wl_columnar_session_join_cleanup_prove(parent, funding, id, NULL,
-            &cause);
+                &cause);
     if (rc) return rc;
     if (&parent->child != r) return EINVAL;
     rc = wl_evaluation_control_charge_attempt(funding, id, 112);
@@ -4417,7 +4426,7 @@ wl_columnar_filter_op_native_cleanup_latch_owned(
     wl_evaluation_control_t *funding, uint64_t id, bool *bare_end)
 {
     return wl_columnar_filter_registered_cleanup_latch_owned(frame, owner,
-               funding, id, bare_end, false);
+               funding, id, bare_end, WL_COLUMNAR_EVAL_PLAN_CLEANUP_JOIN);
 }
 
 int
@@ -4426,7 +4435,42 @@ wl_columnar_filter_unary_native_cleanup_latch_owned(
     wl_evaluation_control_t *funding, uint64_t id, bool *bare_end)
 {
     return wl_columnar_filter_registered_cleanup_latch_owned(frame, owner,
-               funding, id, bare_end, true);
+               funding, id, bare_end, WL_COLUMNAR_EVAL_PLAN_CLEANUP_UNARY);
+}
+
+int
+wl_columnar_filter_observed_native_cleanup_latch_owned(
+    wl_columnar_eval_stack_cleanup_frame_t *frame, const void *owner,
+    wl_evaluation_control_t *funding, uint64_t id, bool *bare_end)
+{
+    return wl_columnar_filter_registered_cleanup_latch_owned(frame, owner,
+               funding, id, bare_end, WL_COLUMNAR_EVAL_PLAN_CLEANUP_OBSERVED);
+}
+
+int
+wl_columnar_filter_observed_neverborn_owned(
+    wl_columnar_eval_stack_cleanup_frame_t *frame, const void *owner,
+    bool *neverborn)
+{
+    if (!neverborn) return EINVAL;
+    wl_columnar_filter_context_t *ctx = NULL;
+    int rc = wl_columnar_eval_stack_filter_context_owned(frame, &ctx, owner);
+    if (rc) return rc;
+    *neverborn = !ctx->identity && ctx->stage == WL_COLUMNAR_FILTER_STAGE_INERT
+        && !ctx->pin_owned && !ctx->control && !ctx->source_initialized
+        && !ctx->batch_initialized && !ctx->drain_initialized
+        && !ctx->join_initialized && !ctx->join_right_initialized
+        && !ctx->program && !ctx->scalar_program && !ctx->heap && !ctx->admitted
+        && !ctx->credit_committed && !ctx->ref_held && !ctx->governor
+        && !ctx->output && !ctx->private_output
+        && !ctx->table.programs && !ctx->table.scalars && !ctx->table.governor
+        && !ctx->table.initialized && !ctx->table.initialized_slots
+        && !ctx->table.scalar_initialized_slots && !ctx->table.allocated
+        && !ctx->table.admitted && !ctx->table.committed && !ctx->table.ref_held
+        && !ctx->table.scalar_allocated && !ctx->table.scalar_admitted
+        && !ctx->table.scalar_committed
+        && (!ctx->values || ctx->values == ctx->inline_values);
+    return 0;
 }
 
 int

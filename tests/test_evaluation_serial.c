@@ -16517,9 +16517,440 @@ test_completion_backend_contract(void)
     wl_evaluation_control_release(control);
 }
 
+/* A real observed recursive child must remain recoverable after Original ends. */
+static wl_session_t *observed_owner_session;
+static wl_evaluation_control_t *observed_owner_control;
+static unsigned observed_owner_cut, observed_owner_fault;
+static bool observed_owner_seen;
+static uint64_t observed_owner_successor;
+static wl_evaluation_control_report_t observed_owner_frozen;
+static unsigned observed_owner_events, observed_owner_mask;
+static wl_columnar_eval_cleanup_receipt_key_t observed_owner_key;
+static unsigned observed_owner_receipt_index;
+static const wl_plan_relation_t *observed_owner_plan;
+static const wl_columnar_eval_private_bindings_t *observed_owner_bindings;
+static col_rel_t **observed_owner_capture_out;
+static bool observed_owner_batch_fallback;
+static bool observed_owner_refused;
+static unsigned observed_owner_financial_stops;
+static bool observed_owner_peer_probed, observed_owner_wrong_key_probed;
+
+static void *
+observed_owner_peer(void *unused)
+{
+    (void)unused;
+    wl_session_t *alias = observed_owner_session;
+    int rc = wl_session_step(alias);
+    if (rc != EBUSY) fprintf(stderr,
+            "peer cut=%u fault=%u registeredprobe=%u rc=%d\n",
+            observed_owner_cut, observed_owner_fault,
+            observed_owner_peer_probed, rc);
+    CHECK(rc == EBUSY);
+    CHECK(wl_session_try_destroy(&alias) == EBUSY &&
+        alias == observed_owner_session);
+    return NULL;
+}
+
+static void
+observed_owner_negative_probes(void)
+{
+    wl_col_session_t *col = (wl_col_session_t *)observed_owner_session;
+    if (!observed_owner_seen || !observed_owner_fault) return;
+    if (!observed_owner_peer_probed) {
+        wl_thread_t thread;
+        CHECK(!wl_thread_create(&thread, observed_owner_peer, NULL)
+            && !wl_thread_join(&thread));
+        observed_owner_peer_probed = true;
+    }
+    if (observed_owner_wrong_key_probed) return;
+    int owner = 0;
+    grant_t grant = framed_prepared_grant(UINT64_C(1000000), &owner);
+    wl_columnar_session_observed_cleanup_result_t proof =
+        wl_columnar_session_observed_cleanup_frame_prove(col,
+            col->cleanup_active,
+            grant.control, grant.id, NULL);
+    if (!proof.protocol) {
+        wl_columnar_eval_stack_cleanup_frame_t *active = col->cleanup_active;
+        wl_columnar_eval_cleanup_receipt_t receipts[
+            WL_COLUMNAR_EVAL_STACK_CLEANUP_MAX_FRAMES];
+        memcpy(receipts, col->cleanup_receipts, sizeof(receipts));
+        wl_columnar_eval_serial_framed_host_reply_t reply = {0};
+        wl_columnar_eval_serial_framed_host_request_t request = {
+            .funding = grant.control, .funding_id = grant.id,
+            .operation = observed_owner_control,
+            .operation_id = observed_owner_key.operation_attempt_id,
+            .operation_identity = observed_owner_key.operation_id,
+            .action = WL_COLUMNAR_EVAL_SERIAL_FRAMED_NATIVE_CLEANUP,
+            .receipt_key = observed_owner_key, .reply = &reply,
+            .capture_only = true, .private_bindings = observed_owner_bindings,
+            .capture_out = observed_owner_capture_out,
+            .controlled_materialized_batch_fallback =
+                observed_owner_batch_fallback
+        };
+        ++request.receipt_key.receipt_id;
+        CHECK(wl_columnar_eval_serial_framed_relation(observed_owner_plan, col,
+            false, &request) == EINVAL);
+        CHECK(col->cleanup_active == active
+            && !memcmp(receipts, col->cleanup_receipts, sizeof(receipts))
+            && observed_owner_events == 1);
+        if (observed_owner_cut == 5) {
+            request.action = WL_COLUMNAR_EVAL_SERIAL_FRAMED_RECEIPT_ACK;
+            CHECK(wl_columnar_eval_serial_framed_relation(observed_owner_plan,
+                col, false, &request) == EINVAL);
+            request.receipt_key = observed_owner_key;
+            request.funding = observed_owner_control;
+            request.funding_id = observed_owner_successor
+                ? observed_owner_successor :
+                observed_owner_key.operation_attempt_id;
+            CHECK(wl_columnar_eval_serial_framed_relation(observed_owner_plan,
+                col, false, &request) == EINVAL);
+            if (observed_owner_successor) {
+                uint64_t consumed = UINT64_MAX;
+                CHECK(!wl_evaluation_control_test_active_consumed(
+                        observed_owner_control,
+                        observed_owner_successor, &consumed) && !consumed);
+            }
+            request.funding = grant.control; request.funding_id = grant.id;
+            request.receipt_key = observed_owner_key;
+            for (unsigned repeat = 0; repeat < 2; ++repeat) {
+                CHECK(!wl_columnar_eval_serial_framed_relation(
+                        observed_owner_plan,
+                        col, false, &request));
+                CHECK(reply.kind ==
+                    WL_COLUMNAR_EVAL_SERIAL_FRAMED_REPLY_TERMINAL
+                    && !reply.execution_result && !reply.cleanup_result
+                    && !memcmp(receipts, col->cleanup_receipts,
+                    sizeof(receipts)));
+            }
+            request.action = WL_COLUMNAR_EVAL_SERIAL_FRAMED_STATUS;
+            CHECK(wl_columnar_eval_serial_framed_relation(observed_owner_plan,
+                col, false, &request) == ENOENT);
+        }
+        wl_thread_t thread;
+        CHECK(!wl_thread_create(&thread, observed_owner_peer, NULL)
+            && !wl_thread_join(&thread));
+        observed_owner_wrong_key_probed = true;
+    }
+    (void)framed_prepared_grant_end(&grant, &owner);
+}
+
+static uint64_t
+observed_owner_host_limit(const wl_col_session_t *session,
+    wl_columnar_eval_serial_framed_host_action_t action, uint64_t limit)
+{
+    (void)session;
+    if (observed_owner_seen && observed_owner_fault == 4 &&
+        !observed_owner_refused
+        && action != WL_COLUMNAR_EVAL_SERIAL_FRAMED_ADVANCE
+        && action != WL_COLUMNAR_EVAL_SERIAL_FRAMED_STATUS) {
+        observed_owner_refused = true;
+        return 1;
+    }
+    return limit;
+}
+
+static uint64_t
+observed_owner_metadata_limit(const wl_col_session_t *session,
+    wl_columnar_session_metadata_purpose_t purpose, uint64_t limit)
+{
+    (void)session;
+    if (observed_owner_seen && observed_owner_fault == 3 &&
+        !observed_owner_refused
+        && purpose == WL_COLUMNAR_SESSION_METADATA_NATIVE_ERROR) {
+        observed_owner_refused = true;
+        return limit - 1;
+    }
+    return limit;
+}
+
+static void
+observed_owner_metadata_finished(const wl_col_session_t *session,
+    wl_columnar_session_metadata_purpose_t purpose,
+    wl_columnar_session_metadata_event_t event, int body,
+    wl_evaluation_control_report_t report)
+{
+    (void)session; (void)event; (void)body;
+    if (observed_owner_seen &&
+        purpose == WL_COLUMNAR_SESSION_METADATA_NATIVE_ERROR
+        && report.result == WL_EVALUATION_CONTROL_WORK_LIMIT) {
+        CHECK(observed_owner_fault == 3 && !report.consumed);
+        ++observed_owner_financial_stops;
+    }
+}
+
+static unsigned
+observed_owner_edge(int64_t a, int64_t b)
+{
+    if (a == 1 && b == 2) return 1;
+    if (a == 2 && b == 3) return 2;
+    if (a == 3 && b == 4) return 4;
+    if (a == 1 && b == 3) return 8;
+    if (a == 2 && b == 4) return 16;
+    if (a == 1 && b == 4) return 32;
+    return 0;
+}
+
+static void
+observed_owner_capture(const char *name, const int64_t *row, uint32_t width,
+    int32_t diff, void *payload)
+{
+    (void)payload;
+    if (strcmp(name, "output")) return;
+    unsigned bit = width == 2 ? observed_owner_edge(row[0], row[1]) : 0;
+    CHECK(bit && diff == 1 && !(observed_owner_mask & bit));
+    observed_owner_mask |= bit; ++observed_owner_events;
+}
+
+static void
+observed_owner_checkpoint(const wl_col_session_t *session,
+    wl_columnar_eval_serial_framed_host_action_t action,
+    wl_evaluation_control_t *funding, int protocol)
+{
+    (void)funding;
+    if (observed_owner_seen) {
+        if (protocol == WL_EVALUATION_CONTROL_WORK_LIMIT)
+            ++observed_owner_financial_stops;
+        return;
+    }
+    uint64_t id =
+        wl_evaluation_control_active_attempt_id(observed_owner_control);
+    wl_columnar_eval_serial_framed_attempt_t *ctx = NULL;
+    if (session->cleanup_active && observed_owner_cut == 6) {
+        wl_columnar_eval_serial_framed_view_t view;
+        if (wl_columnar_eval_stack_framed_inspect(session->cleanup_active,
+            session,
+            &view) || !view.prepared_unary_present || !view.capture_only
+            || !view.private_bindings ||
+            !((const wl_columnar_eval_private_bindings_t *)view.private_bindings)
+            ->dynamic_entries)
+            return;
+        CHECK(wl_columnar_eval_stack_framed_context(session->cleanup_active,
+            (wl_col_session_t *)session, &ctx) == EBUSY);
+        observed_owner_key = view.cleanup_receipt_key;
+        observed_owner_plan = view.plan;
+        observed_owner_bindings = view.private_bindings;
+        observed_owner_capture_out = (col_rel_t **)view.capture_out;
+        observed_owner_batch_fallback =
+            view.controlled_materialized_batch_fallback;
+    } else if (session->cleanup_active) {
+        if (wl_columnar_eval_stack_framed_context(session->cleanup_active,
+            (wl_col_session_t *)session, &ctx) || !ctx->capture_only
+            || !ctx->private_bindings ||
+            !ctx->private_bindings->dynamic_entries)
+            return;
+        observed_owner_key = ctx->cleanup_receipt_key;
+        observed_owner_plan = ctx->plan;
+        observed_owner_bindings = ctx->private_bindings;
+        observed_owner_capture_out = ctx->capture_out;
+        observed_owner_batch_fallback =
+            ctx->controlled_materialized_batch_fallback;
+        for (unsigned i = 0; i < WL_COLUMNAR_EVAL_STACK_CLEANUP_MAX_FRAMES; ++i)
+            if (session->cleanup_receipts[i].key.receipt_id ==
+                observed_owner_key.receipt_id
+                && session->cleanup_receipts[i].state !=
+                WL_COLUMNAR_EVAL_CLEANUP_RECEIPT_FREE)
+                observed_owner_receipt_index = i;
+    }
+    if (observed_owner_cut == 4 || observed_owner_cut == 5) {
+        if (session->cleanup_active || session->cleanup_pending
+            || !observed_owner_key.receipt_id) return;
+        const wl_columnar_eval_cleanup_receipt_t *receipt =
+            &session->cleanup_receipts[observed_owner_receipt_index];
+        if (observed_owner_cut == 4
+            ? receipt->state != WL_COLUMNAR_EVAL_CLEANUP_RECEIPT_FREED
+            : action != WL_COLUMNAR_EVAL_SERIAL_FRAMED_RECEIPT_ACK
+            || receipt->state != WL_COLUMNAR_EVAL_CLEANUP_RECEIPT_FREE)
+            return;
+    } else if (observed_owner_cut != 6) {
+        if (!ctx) return;
+        if (observed_owner_cut == 2) {
+            if (ctx->phase != WL_COLUMNAR_EVAL_SERIAL_FRAMED_LOOKUP ||
+                ctx->child_bound)
+                return;
+        } else if (observed_owner_cut == 3) {
+            if (ctx->phase != WL_COLUMNAR_EVAL_SERIAL_FRAMED_PENDING
+                || !ctx->child_bound) return;
+        } else if (ctx->phase != WL_COLUMNAR_EVAL_SERIAL_FRAMED_CHILD
+            || !ctx->child_bound
+            || ctx->child.phase != (observed_owner_cut == 0
+                ? WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_PREFLIGHT
+                : WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_UNARY_CHILD)) return;
+    }
+    observed_owner_seen = true;
+    if (!observed_owner_fault) return;
+    CHECK(id &&
+        (ctx ? ctx->attempt_id : observed_owner_key.operation_attempt_id) ==
+        id);
+    wl_evaluation_control_attempt_finish_result_t ended =
+        wl_evaluation_control_finish_attempt(observed_owner_control,
+            observed_owner_session->operation_admission, id, 0, 0);
+    CHECK(!ended.protocol && ended.report_valid && !ended.report.result);
+    observed_owner_frozen = ended.report;
+    if (observed_owner_fault == 2) {
+        CHECK(!wl_evaluation_control_begin(observed_owner_control,
+            observed_owner_session->operation_admission));
+        observed_owner_successor =
+            wl_evaluation_control_active_attempt_id(observed_owner_control);
+        CHECK(observed_owner_successor && observed_owner_successor != id);
+    }
+}
+
+static int
+observed_owner_complete(wl_session_t *session)
+{
+    for (unsigned turn = 0; turn < 100000; ++turn) {
+        int rc = wl_session_step(session);
+        if (rc != EAGAIN) return rc;
+        observed_owner_negative_probes();
+    }
+    CHECK(false); return EIO;
+}
+
+static void
+observed_owner_contents(wl_session_t *session, unsigned expected_mask)
+{
+    const col_rel_t *out = session_find_rel((wl_col_session_t *)session,
+            "output");
+    CHECK(out && out->ncols == 2);
+    unsigned mask = 0;
+    for (uint32_t r = 0; r < out->nrows; ++r) {
+        unsigned bit = observed_owner_edge(out->columns[0][r],
+                out->columns[1][r]);
+        CHECK(bit && !(mask & bit)); mask |= bit;
+    }
+    CHECK(mask == expected_mask &&
+        out->nrows == (expected_mask == 1 ? 1u : 6u));
+}
+
+static void
+test_observed_owner_recovery(void)
+{
+    for (unsigned cut = 0; cut < 7; ++cut)
+        for (unsigned fault = 0; fault < 5; ++fault) {
+            /* After ACK this owner consumes its journal without another host. */
+            if (cut == 5 && fault == 4) continue;
+            wirelog_error_t error;
+            wirelog_program_t *program = wirelog_parse_string(
+                ".decl input(x:int64,y:int64)\n.decl output(x:int64,y:int64)\n"
+                "output(x,y):-input(x,y).\n"
+                "output(x,z):-output(x,y),input(y,z).\n", &error);
+            wl_plan_t *plan = NULL;
+            CHECK(program && !wl_plan_from_program(program, &plan));
+            CHECK(!wl_evaluation_control_create(UINT64_C(1000000000),
+                &observed_owner_control));
+            wl_session_options_t options; wl_session_options_init(&options);
+            options.evaluation_control = observed_owner_control;
+            CHECK(!wl_session_create_with_options(wl_backend_columnar(), plan,
+                1,
+                &options, &observed_owner_session));
+            wl_col_session_t *col = (wl_col_session_t *)observed_owner_session;
+            wl_columnar_memory_governor_ref_t *governor = col->memory_governor;
+            wl_columnar_memory_governor_ref_retain(governor);
+            observed_owner_events = observed_owner_mask = 0;
+            observed_owner_seen = false;
+            wl_session_set_delta_cb(observed_owner_session,
+                observed_owner_capture, NULL);
+            const int64_t initial[] = {1, 2}, added[] = {2, 3, 3, 4};
+            CHECK(!wl_session_insert(observed_owner_session, "input", initial,
+                1, 2)
+                && !observed_owner_complete(observed_owner_session));
+            observed_owner_contents(observed_owner_session, 1);
+            CHECK(observed_owner_events == 1 && observed_owner_mask == 1);
+            CHECK(!wl_session_insert(observed_owner_session, "input", added, 2,
+                2));
+            observed_owner_cut = cut; observed_owner_fault = fault;
+            observed_owner_seen = false; observed_owner_successor = 0;
+            memset(&observed_owner_key, 0, sizeof(observed_owner_key));
+            observed_owner_receipt_index = 0;
+            observed_owner_refused = false;
+            observed_owner_peer_probed = observed_owner_wrong_key_probed =
+                false;
+            observed_owner_financial_stops = 0;
+            wl_columnar_session_test_framed_grant_limit =
+                observed_owner_host_limit;
+            wl_columnar_session_test_metadata_limit =
+                observed_owner_metadata_limit;
+            wl_columnar_session_test_metadata_finished =
+                observed_owner_metadata_finished;
+            wl_columnar_session_test_framed_grant_finished =
+                observed_owner_checkpoint;
+            int rc = observed_owner_complete(observed_owner_session);
+            wl_columnar_session_test_framed_grant_finished = NULL;
+            wl_columnar_session_test_framed_grant_limit = NULL;
+            wl_columnar_session_test_metadata_limit = NULL;
+            wl_columnar_session_test_metadata_finished = NULL;
+            if (fault == 3 || fault == 4) {
+                if (!observed_owner_refused ||
+                    observed_owner_financial_stops != 1)
+                    fprintf(stderr,
+                        "funding cut=%u fault=%u refused=%u stops=%u rc=%d\n",
+                        cut, fault, observed_owner_refused,
+                        observed_owner_financial_stops, rc);
+                CHECK(observed_owner_refused &&
+                    observed_owner_financial_stops == 1);
+            }
+            if (!observed_owner_seen || rc != (fault ? EINVAL : 0))
+                fprintf(stderr,
+                    "observed owner cut=%u fault=%u seen=%u rc=%d\n",
+                    cut, fault, observed_owner_seen, rc);
+            CHECK(observed_owner_seen && rc == (fault ? EINVAL : 0));
+            CHECK(!col->cleanup_active && !col->cleanup_pending &&
+                !col->cleanup_reserved_bytes);
+            if (fault) {
+                CHECK(observed_owner_peer_probed &&
+                    observed_owner_wrong_key_probed);
+                CHECK(observed_owner_events == 1 && observed_owner_mask == 1);
+                observed_owner_contents(observed_owner_session, 1);
+                wl_evaluation_control_report_t report;
+                CHECK(!wl_evaluation_control_report(observed_owner_control,
+                    &report)
+                    && report.attempt_id == observed_owner_frozen.attempt_id
+                    && report.limit == observed_owner_frozen.limit
+                    && report.consumed == observed_owner_frozen.consumed
+                    && report.stop_reason == observed_owner_frozen.stop_reason
+                    && report.execution_status ==
+                    observed_owner_frozen.execution_status
+                    && report.cleanup_status ==
+                    observed_owner_frozen.cleanup_status
+                    && report.result == observed_owner_frozen.result);
+                if (observed_owner_successor) {
+                    uint64_t used = UINT64_MAX;
+                    CHECK(!wl_evaluation_control_test_active_consumed(
+                            observed_owner_control,
+                            observed_owner_successor, &used) && !used);
+                    wl_evaluation_control_attempt_finish_result_t ended =
+                        wl_evaluation_control_finish_attempt(
+                        observed_owner_control,
+                        observed_owner_session->operation_admission,
+                        observed_owner_successor, 0, 0);
+                    CHECK(!ended.protocol && ended.report_valid &&
+                        !ended.report.consumed);
+                }
+                observed_owner_seen = false;
+                CHECK(!wl_evaluation_control_reset(observed_owner_control)
+                    && !observed_owner_complete(observed_owner_session));
+            }
+            observed_owner_contents(observed_owner_session, 63);
+            CHECK(observed_owner_events == 6 && observed_owner_mask == 63
+                && !observed_owner_complete(observed_owner_session)
+                && observed_owner_events == 6);
+            CHECK(!wl_session_try_destroy(&observed_owner_session) &&
+                !observed_owner_session);
+            wl_evaluation_control_release(observed_owner_control);
+            observed_owner_control = NULL;
+            wl_plan_free(plan); wirelog_program_free(program);
+            CHECK(!wl_columnar_memory_reserved(
+                    wl_columnar_memory_governor_ref_get(governor)));
+            wl_columnar_memory_governor_ref_release(governor);
+        }
+}
+
 int
 main(int argc, char **argv)
 {
+    if (argc == 2 && !strcmp(argv[1], "--observed-owner-recovery")) {
+        test_observed_owner_recovery(); return 0;
+    }
     if (argc == 2 && !strcmp(argv[1], "--completion-contract")) {
         test_completion_backend_contract();
         return 0;

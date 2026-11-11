@@ -449,6 +449,13 @@ wl_columnar_eval_serial_framed_attempt_step(
             WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_PENDING;
         wl_columnar_eval_serial_framed_pending(ctx, ctx->phase, funding,
             funding_id);
+        if (ctx->native_cleanup && ctx->observed_native_cleanup)
+            return ctx->pending_inner_consume
+                ? wl_columnar_eval_plan_observed_native_cleanup_consume(ctx,
+                       ctx->inner_protocol, funding, funding_id)
+                : wl_columnar_eval_plan_observed_native_cleanup_step(ctx,
+                       funding,
+                       funding_id);
         if (ctx->native_cleanup && ctx->unary_native_cleanup)
             return ctx->pending_inner_consume
                 ? wl_columnar_eval_plan_unary_native_cleanup_consume(ctx,
@@ -671,6 +678,9 @@ wl_columnar_eval_serial_framed_attempt_step(
         }
         wl_columnar_eval_serial_framed_pending(ctx, ctx->phase, funding,
             funding_id);
+        if (ctx->native_cleanup && ctx->observed_native_cleanup)
+            return wl_columnar_eval_plan_observed_native_cleanup_ack(ctx,
+                       funding, funding_id);
         if (ctx->native_cleanup && ctx->unary_native_cleanup)
             return wl_columnar_eval_plan_unary_native_cleanup_ack(ctx, funding,
                        funding_id);
@@ -1597,12 +1607,29 @@ wl_columnar_eval_serial_framed_relation_internal(const wl_plan_relation_t *rp,
                             frame, source ? source->control : request->funding,
                             source ? source->id : request->funding_id, source,
                             &cause);
+                    bool observed_native = false;
+                    if (protocol) {
+                        wl_columnar_session_observed_cleanup_result_t observed =
+                            wl_columnar_session_observed_cleanup_frame_prove(
+                            sess,
+                            frame,
+                            source ? source->control : request->funding,
+                            source ? source->id : request->funding_id,
+                            source);
+                        protocol = observed.protocol;
+                        observed_native = !protocol;
+                    }
+                    if (!wl_columnar_eval_serial_framed_key_equal(
+                            &request->receipt_key,
+                            &view.cleanup_receipt_key)) return EINVAL;
                     if (protocol) return protocol;
                     source_rc = wl_columnar_eval_serial_source_cut(source, 96);
                     if (source_rc) return source_rc;
                     wl_columnar_eval_serial_framed_host_request_t cleanup =
                         *request;
-                    cleanup.action = WL_COLUMNAR_EVAL_SERIAL_FRAMED_ABORT;
+                    cleanup.action = observed_native
+                        ? WL_COLUMNAR_EVAL_SERIAL_FRAMED_NATIVE_CLEANUP
+                        : WL_COLUMNAR_EVAL_SERIAL_FRAMED_ABORT;
                     source_rc = wl_columnar_eval_serial_source_body(source);
                     if (source_rc) return source_rc;
                     return wl_columnar_eval_stack_auto_maintain(frame, sess,
@@ -1645,6 +1672,17 @@ wl_columnar_eval_serial_framed_relation_internal(const wl_plan_relation_t *rp,
                         source ? source->control : request->funding,
                         source ? source->id : request->funding_id, source,
                         &cause);
+                bool provisional = false;
+                if (protocol && !ctx->unary_native_cleanup) {
+                    wl_columnar_session_observed_cleanup_result_t observed =
+                        wl_columnar_session_observed_cleanup_prove(ctx,
+                            source ? source->control : request->funding,
+                            source ? source->id : request->funding_id, source);
+                    protocol = observed.protocol;
+                    cause = observed.cause;
+                    provisional = observed.provisional;
+                    if (!protocol) ctx->observed_native_cleanup = true;
+                }
                 if (protocol) return protocol;
                 source_rc = wl_columnar_eval_serial_source_cut(source, 96);
                 if (source_rc) return source_rc;
@@ -1653,7 +1691,9 @@ wl_columnar_eval_serial_framed_relation_internal(const wl_plan_relation_t *rp,
                         &ctx->cleanup_receipt_key)) return EINVAL;
                 ctx->native_cleanup = true;
                 ctx->abort_requested = false;
-                if (!ctx->primary_result) ctx->primary_result = cause;
+                if (!ctx->primary_result && (!provisional
+                    || ctx->phase != WL_COLUMNAR_EVAL_SERIAL_FRAMED_PENDING))
+                    ctx->primary_result = cause;
             }
             if (ctx->phase == WL_COLUMNAR_EVAL_SERIAL_FRAMED_PENDING) {
                 if (!request->previous_valid
@@ -1748,8 +1788,20 @@ wl_columnar_eval_serial_framed_relation_internal(const wl_plan_relation_t *rp,
             return wl_columnar_eval_serial_framed_attempt_step(ctx,
                        request->funding, request->funding_id);
         }
-        if (request->action == WL_COLUMNAR_EVAL_SERIAL_FRAMED_NATIVE_CLEANUP)
-            return ENOENT;
+        if (request->action == WL_COLUMNAR_EVAL_SERIAL_FRAMED_NATIVE_CLEANUP) {
+            wl_columnar_session_observed_cleanup_result_t ownership =
+                wl_columnar_session_observed_cleanup_receipt_prove(sess,
+                    &request->receipt_key,
+                    source ? source->control : request->funding,
+                    source ? source->id : request->funding_id, source);
+            if (ownership.protocol) return ownership.protocol;
+            source_rc = wl_columnar_eval_serial_source_body(source);
+            if (source_rc) return source_rc;
+            wl_columnar_eval_serial_framed_host_request_t cleanup = *request;
+            cleanup.action = WL_COLUMNAR_EVAL_SERIAL_FRAMED_RECEIPT_RETRY;
+            return wl_columnar_eval_serial_framed_receipt_action(sess,
+                       &cleanup);
+        }
         if (request->action == WL_COLUMNAR_EVAL_SERIAL_FRAMED_STATUS
             || request->action == WL_COLUMNAR_EVAL_SERIAL_FRAMED_ABORT
             || request->action == WL_COLUMNAR_EVAL_SERIAL_FRAMED_RECEIPT_RETRY

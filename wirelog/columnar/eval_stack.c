@@ -3377,6 +3377,22 @@ wl_columnar_eval_stack_cleanup_receipt_host_internal(
         if (!source_rc) source_rc = finish_rc;
     }
     if (source_rc) return source_rc;
+    if (lookup_protocol == ENOENT
+        && request->action == WL_COLUMNAR_EVAL_SERIAL_FRAMED_RECEIPT_ACK) {
+        wl_columnar_session_observed_ack_result_t resumed =
+            wl_columnar_session_observed_ack_resume(session, key,
+                request->funding, request->funding_id);
+        if (resumed.handled) {
+            if (resumed.protocol) return resumed.protocol;
+            request->reply->execution_result = resumed.execution_result;
+            request->reply->cleanup_result = resumed.cleanup_result;
+            request->reply->committed = resumed.committed;
+            request->reply->cleanup_receipt_key = *key;
+            request->reply->kind =
+                WL_COLUMNAR_EVAL_SERIAL_FRAMED_REPLY_TERMINAL;
+            return 0;
+        }
+    }
     if (lookup_protocol) return lookup_protocol;
     /* No callback can invalidate this fresh full-key match at admission. */
     int rc = wl_evaluation_control_charge_attempt(request->funding,
@@ -6309,6 +6325,23 @@ wl_columnar_eval_stack_auto_maintain(
     rc = wl_columnar_eval_stack_auto_fund(request->funding,
             request->funding_id, request->operation, 128);
     if (rc) return rc;
+    if (request->action == WL_COLUMNAR_EVAL_SERIAL_FRAMED_NATIVE_CLEANUP) {
+        wl_columnar_session_observed_cleanup_result_t observed =
+            wl_columnar_session_observed_cleanup_prove(ctx, request->funding,
+                request->funding_id, NULL);
+        if (observed.protocol) return observed.protocol;
+        if (!wl_columnar_eval_cleanup_receipt_key_equal(&request->receipt_key,
+            &ctx->cleanup_receipt_key)) return EINVAL;
+        /* Actual registered owner and launch tuple precede this diagnostic.
+         * Native recovery never cancels or polls the old operation generation. */
+        ctx->native_cleanup = ctx->observed_native_cleanup = true;
+        a->abort_requested = true;
+        if (!a->stop_result) a->stop_result =
+                a->receipt.result_saved && a->receipt.first_result
+            ? a->receipt.first_result : ctx->primary_result
+            ? ctx->primary_result : ctx->child.semantic_result
+            ? ctx->child.semantic_result : observed.cause;
+    }
     a->busy = true;
     if (request->action == WL_COLUMNAR_EVAL_SERIAL_FRAMED_ABORT) {
         a->abort_requested = true;
