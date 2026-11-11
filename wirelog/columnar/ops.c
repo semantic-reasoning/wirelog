@@ -2943,7 +2943,7 @@ wl_columnar_ops_reduce_attempt_start_owned(const wl_plan_op_t *op,
             &ctx->source_initialized);
         if (!ctx->source_initialized) ctx->source_bare = false;
     } else {
-        rc = wl_columnar_relation_scalar_source_begin_attempt_controlled(
+        rc = wl_columnar_eval_stack_scalar_source_begin_owned(frame, owner, op,
             &ctx->source, left, false);
     }
     rc = wl_columnar_ops_reduce_attempt_return(control, id, rc);

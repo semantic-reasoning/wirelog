@@ -6991,6 +6991,10 @@ test('evaluation_serial', test_evaluation_serial_exe,
      suite: ['unit', 'tsan'], timeout: 120)
 test('evaluation_observed_owner_recovery', test_evaluation_serial_exe,
      args: ['--observed-owner-recovery'], suite: ['unit', 'tsan'], timeout: 60)
+test('evaluation_observed_source_end_recovery', test_evaluation_serial_exe,
+     args: ['--observed-source-end-recovery'], suite: ['unit', 'tsan'], timeout: 60)
+test('evaluation_observed_source_begin_recovery', test_evaluation_serial_exe,
+     args: ['--observed-source-begin-recovery'], suite: ['unit', 'tsan'], timeout: 60)
 test('evaluation_completion_backend_contract', test_evaluation_serial_exe,
      args: ['--completion-contract'],
      suite: ['unit', 'tsan'], timeout: 120)
@@ -7332,6 +7336,17 @@ test_relation_empty_source_exe = executable(
   link_with: [testlib_prod],
 )
 test('relation_empty_source', test_relation_empty_source_exe,
+     suite: ['unit', 'tsan'], timeout: 60)
+
+# #2300: resource-bearing scalar END uses one actual reader action per turn.
+test_relation_scalar_source_end_exe = executable(
+  'test_relation_scalar_source_end', files('test_relation_scalar_source_end.c'),
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
+  c_args: ['-DWL_SESSION_TEST_HOOKS=1'],
+  link_with: [testlib_prod],
+)
+test('relation_scalar_source_end', test_relation_scalar_source_end_exe,
      suite: ['unit', 'tsan'], timeout: 60)
 
 # Independent generated-program oracle (#2242).

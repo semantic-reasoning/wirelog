@@ -834,6 +834,111 @@ test_intermediate_stop(void)
 }
 
 static void
+test_owned_scalar_source_end_primitive(void)
+{
+    const uint32_t widths[] = {0, 1, 17, 257};
+    for (unsigned test = 0; test < 4; ++test) {
+        wl_plan_op_t op = {.op = WL_PLAN_OP_MAP, .project_count = 1};
+        wl_plan_relation_t plan = {.ops = &op, .op_count = 1};
+        fixture_t f; fixture_init(&f, widths[test], 7, 0);
+        fixture_begin(&f, &plan, 0, 1);
+        wl_columnar_filter_context_t *ctx = NULL;
+        for (unsigned turn = 0; ; ++turn) {
+            CHECK(turn < 10000);
+            CHECK(!wl_columnar_eval_stack_filter_context_owned(f.frame, &ctx,
+                &f.record));
+            if (f.record.phase == WL_COLUMNAR_EVAL_PLAN_NUMERIC_CHILD
+                && ctx->stage == WL_COLUMNAR_FILTER_STAGE_SOURCE &&
+                ctx->source_initialized)
+                break;
+            engine_dispatch(&f); ++f.witnesses;
+        }
+        CHECK(ctx->source.phase == WL_COLUMNAR_RELATION_SCALAR_SOURCE_HELD);
+        uint64_t before = 0, after = 0;
+        CHECK(!wl_evaluation_control_test_active_consumed(f.operation,
+            f.operation_id, &before));
+        CHECK(wl_columnar_filter_source_end_step_owned(f.frame,
+            &f.record.child_status,
+            &f.record, f.operation, f.operation_id) == EINVAL);
+        int owner = 0;
+        wl_evaluation_control_t *poor = control_new(255, &owner);
+        uint64_t id = wl_evaluation_control_active_attempt_id(poor);
+        wl_columnar_filter_status_t status = f.record.child_status;
+        CHECK(wl_columnar_filter_source_end_step_owned(f.frame,
+            &f.record.child_status,
+            &f.record, poor, id) == WL_EVALUATION_CONTROL_WORK_LIMIT);
+        CHECK(ctx->source.phase == WL_COLUMNAR_RELATION_SCALAR_SOURCE_HELD
+            && !ctx->source.first_result_saved && ctx->source_initialized &&
+            !ctx->busy
+            && f.record.child_status.progress == status.progress
+            && f.record.child_status.semantic_result == status.semantic_result
+            && f.record.child_status.execution_result == status.execution_result
+            && f.record.child_status.cleanup_result == status.cleanup_result
+            && f.record.child_status.committed == status.committed);
+        CHECK(wl_evaluation_control_finish(poor, &owner, 0,
+            0) == WL_EVALUATION_CONTROL_WORK_LIMIT);
+        wl_evaluation_control_report_t report;
+        CHECK(!wl_evaluation_control_report(poor,
+            &report) && report.consumed == 128);
+        CHECK(!wl_evaluation_control_detach(poor, &owner));
+        wl_evaluation_control_release(poor);
+        unsigned calls = 0;
+        while (ctx->source_initialized) {
+            CHECK(++calls <= 5);
+            wl_evaluation_control_t *funding = control_new(256, &owner);
+            id = wl_evaluation_control_active_attempt_id(funding);
+            CHECK(!wl_columnar_filter_source_end_step_owned(f.frame,
+                &f.record.child_status,
+                &f.record, funding, id));
+            CHECK(!wl_evaluation_control_finish(funding, &owner, 0, 0));
+            CHECK(!wl_evaluation_control_report(funding,
+                &report) && report.consumed == 256);
+            CHECK(!wl_evaluation_control_detach(funding, &owner));
+            wl_evaluation_control_release(funding);
+        }
+        CHECK(calls == 5 &&
+            ctx->source.phase == WL_COLUMNAR_RELATION_SCALAR_SOURCE_DRAINED
+            && ctx->stage == WL_COLUMNAR_FILTER_STAGE_DECIDE);
+        CHECK(!wl_evaluation_control_test_active_consumed(f.operation,
+            f.operation_id, &after)
+            && before == after);
+        for (unsigned turn = 0;
+            !(f.record.phase == WL_COLUMNAR_EVAL_PLAN_NUMERIC_CHILD
+            && ctx->stage == WL_COLUMNAR_FILTER_STAGE_FINISH); ++turn){
+            CHECK(turn < 1000); engine_dispatch(&f); ++f.witnesses;
+        }
+        CHECK(!ctx->control && !ctx->pin_owned);
+        wl_evaluation_control_request_cancel(f.operation);
+        wl_columnar_filter_source_end_kind_t kind =
+            (wl_columnar_filter_source_end_kind_t)99;
+        CHECK(wl_columnar_filter_source_end_pending_owned(f.frame, &f.record,
+            f.operation, f.operation_id, &kind) == EINVAL && (int)kind == 99);
+        /* Rejection must precede even a zero poll of the dormant controller. */
+        CHECK(!wl_evaluation_control_finish(f.operation, &f.operation_owner, 0,
+            0));
+        wl_evaluation_control_report_t frozen;
+        CHECK(!wl_evaluation_control_report(f.operation,
+            &frozen) && !frozen.stop_reason);
+        CHECK(!wl_evaluation_control_reset(f.operation)
+            && !wl_evaluation_control_begin(f.operation, &f.operation_owner));
+        uint64_t successor =
+            wl_evaluation_control_active_attempt_id(f.operation);
+        CHECK(successor != f.operation_id);
+        CHECK(wl_columnar_filter_source_end_pending_owned(f.frame, &f.record,
+            f.operation, successor, &kind) == EINVAL && (int)kind == 99);
+        run(&f); CHECK(!f.record.semantic_result && f.record.completed == 1);
+        CHECK(!wl_evaluation_control_test_active_consumed(f.operation,
+            successor, &after) && !after);
+        CHECK(!wl_evaluation_control_report(f.operation, &report)
+            && report.attempt_id == frozen.attempt_id &&
+            report.consumed == frozen.consumed
+            && report.result == frozen.result &&
+            report.stop_reason == frozen.stop_reason);
+        compare_raw(&f, &plan, 0, 1); fixture_close(&f);
+    }
+}
+
+static void
 test_retained_input(void)
 {
     wl_plan_op_t ops[2] = {{.op = WL_PLAN_OP_MAP, .project_count = 1},
@@ -3959,8 +4064,13 @@ composed_cleanup_source_turn(fixture_t *f, uint64_t funding_limit,
         WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_PENDING;
     bool aborting = f->record.phase ==
         WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_SOURCE_ABORT;
-    int original_stop = aborting ? wl_evaluation_control_charge_attempt(
-        f->operation, f->operation_id, 0) : 0;
+    bool scalar_end = f->record.phase ==
+        WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_SOURCE_END
+        && !f->record.source_bare;
+    bool terminal = scalar_end &&
+        f->record.source.phase == WL_COLUMNAR_RELATION_SCALAR_SOURCE_DRAINED;
+    int original_stop = wl_evaluation_control_charge_attempt(
+        f->operation, f->operation_id, 0);
     bool abort_stop = original_stop == WL_EVALUATION_CONTROL_CANCELLED
         || original_stop == WL_EVALUATION_CONTROL_WORK_LIMIT;
     int rc = wl_columnar_eval_plan_numeric_composed_cleanup_source(
@@ -3969,11 +4079,16 @@ composed_cleanup_source_turn(fixture_t *f, uint64_t funding_limit,
             rc == WL_EVALUATION_CONTROL_WORK_LIMIT ? rc : 0, 0);
     CHECK(finish == (rc == WL_EVALUATION_CONTROL_WORK_LIMIT ? rc : 0));
     wl_evaluation_control_report_t report;
+    /* Scalar END has dispatch1 and a separate reader/clear128 action.
+     * Invalid/pending actions still spend0; other HOST384 oracles stay exact. */
+    uint64_t expected = funding_id_adjustment || receipt_pending
+        || (aborting && !abort_stop) ? 0
+        : scalar_end ? (!abort_stop || terminal ||
+        (funding_limit && funding_limit < 129)
+            ? 1 : 129) : funding_limit == 383 ? 0 : 384;
     CHECK(!wl_evaluation_control_report(funding, &report)
         && report.attempt_id == id && !report.cleanup_status
-        && report.consumed == (funding_limit == 383
-        || funding_id_adjustment || receipt_pending
-        || (aborting && !abort_stop) ? 0 : 384));
+        && report.consumed == expected);
     CHECK(!wl_evaluation_control_detach(funding, &owner));
     wl_evaluation_control_release(funding);
     return rc;
@@ -4077,37 +4192,42 @@ test_composed_source_stopped_cleanup(void)
         && f.record.source.phase == before.source.phase);
 
     wl_evaluation_control_request_cancel(f.operation);
-    CHECK(composed_cleanup_source_turn(&f, 383, 0)
+    CHECK(composed_cleanup_source_turn(&f, 128, 0)
         == WL_EVALUATION_CONTROL_WORK_LIMIT);
-    CHECK(f.record.phase == before.phase
-        && f.record.cursor == before.cursor
-        && f.record.completed == before.completed
-        && !f.record.semantic_result
-        && f.record.source.phase == before.source.phase);
-    int rc = composed_cleanup_source_turn(&f, 0, 0);
-    f.pending_protocol = rc;
-    CHECK(rc == WL_EVALUATION_CONTROL_CANCELLED
-        && f.record.semantic_result == WL_EVALUATION_CONTROL_CANCELLED
-        && f.record.phase == WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_PENDING
-        && f.record.pending_action ==
-        WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_SOURCE_END
-        && f.record.source.phase == WL_COLUMNAR_RELATION_SCALAR_SOURCE_DRAINED
+    f.pending_protocol = WL_EVALUATION_CONTROL_WORK_LIMIT;
+    CHECK(f.record.phase == WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_PENDING
+        && f.record.source.phase == before.source.phase
         && f.record.source_initialized && f.record.cursor == before.cursor
-        && f.record.completed == before.completed);
+        && f.record.completed == before.completed
+        && f.record.semantic_result == WL_EVALUATION_CONTROL_CANCELLED);
     wl_columnar_eval_plan_numeric_attempt_t pending = f.record;
     CHECK(composed_cleanup_source_turn(&f, 0, 0) == EBUSY);
     CHECK(f.record.phase == pending.phase
         && f.record.pending_action == pending.pending_action
-        && f.record.source.phase == pending.source.phase
-        && f.record.cursor == pending.cursor
-        && f.record.completed == pending.completed);
+        && f.record.source.phase == pending.source.phase);
     CHECK(!composed_host_turn(&f, false));
-    CHECK(f.record.phase == WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_RELEASE
+    CHECK(f.record.phase == WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_SOURCE_END
+        && f.record.protocol_result == WL_EVALUATION_CONTROL_WORK_LIMIT
+        && f.record.source_initialized);
+    unsigned ends = 0;
+    while (f.record.phase == WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_SOURCE_END) {
+        CHECK(++ends <= 5);
+        CHECK(!composed_cleanup_source_turn(&f, 129, 0));
+        f.pending_protocol = 0;
+        CHECK(f.record.phase == WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_PENDING
+            && f.record.pending_action ==
+            WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_SOURCE_END
+            && f.record.source_initialized && f.record.cursor == before.cursor
+            && f.record.completed == before.completed);
+        CHECK(!composed_host_turn(&f, false));
+    }
+    CHECK(ends == 5 &&
+        f.record.phase == WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_RELEASE
         && !f.record.source_initialized
         && f.record.source.phase == WL_COLUMNAR_RELATION_SCALAR_SOURCE_DRAINED
         && f.record.semantic_result == WL_EVALUATION_CONTROL_CANCELLED
-        && f.record.cursor == before.cursor
-        && f.record.completed == before.completed);
+        && f.record.cursor == before.cursor &&
+        f.record.completed == before.completed);
     CHECK(!composed_host_turn(&f, false));
     CHECK(f.record.phase == WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_DONE
         && f.record.semantic_result == WL_EVALUATION_CONTROL_CANCELLED
@@ -4257,16 +4377,21 @@ test_composed_source_cleanup_pre_action_phases(void)
             && !session_find_rel(&f.session, "output"));
 
         if (routed == WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_SOURCE_END) {
-            int protocol = composed_cleanup_source_turn(&f, 0, 0);
-            f.pending_protocol = protocol;
-            CHECK(protocol == WL_EVALUATION_CONTROL_CANCELLED
-                && f.record.phase ==
-                WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_PENDING
-                && f.record.pending_action ==
-                WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_SOURCE_END
-                && f.record.cursor == cursor
-                && f.record.completed == completed);
-            CHECK(!composed_host_turn(&f, false));
+            unsigned ends = 0;
+            do {
+                CHECK(++ends <= 5);
+                CHECK(!composed_cleanup_source_turn(&f, 129, 0));
+                f.pending_protocol = 0;
+                CHECK(f.record.phase ==
+                    WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_PENDING
+                    && f.record.pending_action ==
+                    WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_SOURCE_END
+                    && f.record.cursor == cursor &&
+                    f.record.completed == completed);
+                CHECK(!composed_host_turn(&f, false));
+            } while (f.record.phase ==
+                WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_SOURCE_END);
+            CHECK(ends == 5);
             if (f.record.phase ==
                 WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_SOURCE_ABORT)
                 CHECK(!composed_cleanup_source_turn(&f, 0, 0));
@@ -16586,6 +16711,7 @@ main(void)
     test_lftj_owned_row_no_capture();
     test_lftj_funded_writer_drain();
     test_owned_batch_retirement_primitive();
+    test_owned_scalar_source_end_primitive();
     test_owned_row_retirement_component();
     test_owned_row_operator_contexts();
     test_owned_row_float_component();

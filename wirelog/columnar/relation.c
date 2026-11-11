@@ -8149,6 +8149,12 @@ col_rel_append_all(col_rel_t *dst, const col_rel_t *src, wl_arena_t *arena)
 }
 
 #ifdef WL_SESSION_TEST_HOOKS
+void (*wl_columnar_source_access_test_before_reader_release_cas)(
+    const wl_columnar_source_access_reader_t *,
+    wl_columnar_source_access_gate_t *, uint64_t);
+void (*wl_columnar_relation_test_scalar_end_checkpoint)(
+    const wl_columnar_relation_scalar_source_t *, wl_evaluation_control_t *,
+    uint64_t, unsigned);
 void (*wl_columnar_relation_test_before_reader_cas)(
     wl_evaluation_control_t *, wl_columnar_source_access_gate_t *, uint64_t);
 void (*wl_columnar_relation_test_builder_phase)(
@@ -15709,18 +15715,14 @@ static void
 wl_columnar_relation_constructor_attempt_reader_inert(
     wl_columnar_source_access_reader_t *reader)
 {
-    reader->owner = NULL;
-    reader->secondary_owner = NULL;
-    reader->identity = 0;
-    reader->thread_valid = false;
-    reader->transferable = false;
+    wl_columnar_source_access_reader_clear(reader);
 }
 
 static int
-wl_columnar_relation_reader_acquire_attempt_controlled(
+wl_columnar_relation_reader_acquire_mode(
     wl_columnar_source_access_gate_t *gate,
     wl_columnar_source_access_reader_t *token,
-    wl_evaluation_control_t *control, uint64_t attempt_id)
+    wl_evaluation_control_t *control, uint64_t attempt_id, bool retain_on_error)
 {
     int rc = wl_columnar_relation_constructor_attempt_charge(control,
             attempt_id,
@@ -15790,10 +15792,21 @@ wl_columnar_relation_reader_acquire_attempt_controlled(
             return 0;
         continue;
 stopped:
-        if (acquired && wl_columnar_source_access_reader_release(token) != 0)
+        if (acquired && !retain_on_error &&
+            wl_columnar_source_access_reader_release(token) != 0)
             abort();
         return rc;
     }
+}
+
+static int
+wl_columnar_relation_reader_acquire_attempt_controlled(
+    wl_columnar_source_access_gate_t *gate,
+    wl_columnar_source_access_reader_t *token,
+    wl_evaluation_control_t *control, uint64_t id)
+{
+    return wl_columnar_relation_reader_acquire_mode(gate, token, control, id,
+               false);
 }
 
 static void
@@ -18783,8 +18796,10 @@ wl_columnar_relation_new_auto_attempt_controlled(
  * metric. Control scheduling, instrumentation and original physical/token/ref
  * retirement interiors retain their documented exclusions. Ordinary source
  * end validation/latch/drain dispatch/clearing is counted, never exempted.
- * INIT256 prepays initialization86 and ONE live END72, including interrupted
- * init or declined BEGIN. DRAINED repeat is a bounded readonly bootstrap.
+ * INIT256 keeps its logical initialization/one-legacy-END72 allowance.
+ * The expanded initializer SOURCE upper is separate below; neither term
+ * certifies the legacy reader-drain interior or funds a new cleanup grant.
+ * DRAINED repeat is a bounded readonly bootstrap.
  * Selected PRE228 and RETURN243 include next refused admissions. ROW_CALL
  * prepays its caller continuation; child fees still fund their own regions.
  * Successful B2 return uses immutable locals, then G and a genuine zero poll:
@@ -18854,9 +18869,13 @@ typedef char wl_columnar_relation_scalar_source_tariffs_bound[
         && WL_COLUMNAR_RELATION_SCALAR_SOURCE_COMPOUND_WORK <=
         WL_EVALUATION_CONTROL_QUANTUM) ? 1 : -1];
 
+/* 46 real stores plus identity, reader-clear call chains, thread and tail
+ * fronts: explicit142 portable/158 MSVC, with18 reserve. See the operator
+ * accounting ledger. This SOURCE bound is independent of logical INIT256. */
+enum { WL_COLUMNAR_RELATION_SCALAR_SOURCE_INIT_SOURCE_UPPER = 176 };
 typedef char wl_columnar_relation_scalar_source_init_bound[
-        (UINT64_C(86) + UINT64_C(72) <=
-        WL_COLUMNAR_RELATION_SCALAR_SOURCE_INIT_WORK) ? 1 : -1];
+        (WL_COLUMNAR_RELATION_SCALAR_SOURCE_INIT_SOURCE_UPPER <=
+        WL_EVALUATION_CONTROL_QUANTUM) ? 1 : -1];
 
 typedef char wl_columnar_relation_scalar_source_column_bound[
         (UINT64_C(208) <=
@@ -18997,6 +19016,84 @@ wl_columnar_relation_scalar_source_end(
     source->thread_valid = false;
     source->phase = WL_COLUMNAR_RELATION_SCALAR_SOURCE_DRAINED;
     return source->first_result;
+}
+
+int
+wl_columnar_relation_scalar_source_end_step(
+    wl_columnar_relation_scalar_source_t *source, int initiating_result,
+    wl_evaluation_control_t *funding, uint64_t id, bool *done)
+{
+    if (!source || !done || source->identity != source) return EINVAL;
+    uintptr_t output = (uintptr_t)done, base = (uintptr_t)source;
+    if (output >= base && output - base < sizeof(*source)) return EINVAL;
+    *done = false;
+    if (source->phase == WL_COLUMNAR_RELATION_SCALAR_SOURCE_DRAINED) {
+        *done = true; return 0;
+    }
+    if (!wl_columnar_relation_scalar_source_thread_equal(source)
+        || !funding || !id || !source->control_identity
+        || wl_evaluation_control_identity(funding) == source->control_identity
+        || source->phase < WL_COLUMNAR_RELATION_SCALAR_SOURCE_INERT
+        || source->phase > WL_COLUMNAR_RELATION_SCALAR_SOURCE_ENDING
+        || source->end_cursor > 4) return EINVAL;
+    int rc = wl_evaluation_control_charge_attempt(funding, id, 128);
+    if (rc) return rc;
+    if (source->phase != WL_COLUMNAR_RELATION_SCALAR_SOURCE_ENDING) {
+        if (!source->first_result_saved) {
+            source->first_result = initiating_result;
+            source->first_result_saved = true;
+        }
+        source->end_cursor = 0;
+        source->phase = WL_COLUMNAR_RELATION_SCALAR_SOURCE_ENDING;
+    }
+#ifdef WL_SESSION_TEST_HOOKS
+    if (wl_columnar_relation_test_scalar_end_checkpoint)
+        wl_columnar_relation_test_scalar_end_checkpoint(source, funding, id, 0);
+#endif
+    rc = wl_evaluation_control_charge_attempt(funding, id, 0);
+    if (rc) return rc;
+    if (source->end_cursor < 2) {
+        wl_columnar_source_access_reader_t *reader = source->end_cursor
+            ? &source->descriptor_reader : &source->owner_reader;
+        if (reader->owner || reader->secondary_owner) {
+            bool released = false;
+            rc = wl_columnar_source_access_reader_release_step(reader,
+                    &released);
+            if (rc && rc != EAGAIN) return rc;
+            if (released) ++source->end_cursor;
+        } else {
+            if (!wl_columnar_relation_scalar_source_reader_empty(reader)
+                || reader->acquire_stage ||
+                reader->release_stage) return EINVAL;
+            ++source->end_cursor;
+        }
+    } else if (source->end_cursor == 2) {
+        source->descriptor = NULL; source->owner = NULL;
+        source->columns = NULL; source->timestamps = NULL;
+        source->names = NULL; source->types = NULL;
+        source->width = 0; source->nrows = 0; source->capacity = 0;
+        source->timestamp_capacity = 0;
+        ++source->end_cursor;
+    } else if (source->end_cursor == 3) {
+        source->descriptor_identity = 0; source->descriptor_view_generation = 0;
+        source->descriptor_storage_generation = 0; source->owner_identity = 0;
+        source->owner_storage_generation = 0;
+        source->has_graph_column = false; source->graph_col_idx = 0;
+        source->declared_ncols = 0; source->preserve_timestamps = false;
+        ++source->end_cursor;
+    } else {
+        source->control = NULL; source->attempt_id = 0;
+        source->thread_valid = false;
+        source->phase = WL_COLUMNAR_RELATION_SCALAR_SOURCE_DRAINED;
+    }
+#ifdef WL_SESSION_TEST_HOOKS
+    if (wl_columnar_relation_test_scalar_end_checkpoint)
+        wl_columnar_relation_test_scalar_end_checkpoint(source, funding, id, 1);
+#endif
+    rc = wl_evaluation_control_charge_attempt(funding, id, 0);
+    if (!rc) *done = source->phase ==
+            WL_COLUMNAR_RELATION_SCALAR_SOURCE_DRAINED;
+    return rc;
 }
 
 enum {
@@ -19251,6 +19348,8 @@ wl_columnar_relation_scalar_source_init_attempt_controlled(
     if (rc)
         return rc;
     source->control = control; source->attempt_id = attempt_id;
+    source->control_identity = wl_evaluation_control_identity(control);
+    source->end_attempt_id = attempt_id; source->end_cursor = 0;
     source->phase = WL_COLUMNAR_RELATION_SCALAR_SOURCE_INERT;
     source->thread_valid = false;
     wl_columnar_relation_constructor_attempt_reader_inert(
@@ -19282,14 +19381,10 @@ wl_columnar_relation_scalar_source_init_attempt_controlled(
                WL_COLUMNAR_RELATION_SCALAR_SOURCE_INIT_WORK);
 }
 
-int
-wl_columnar_relation_scalar_source_begin_attempt_controlled(
+static int
+wl_columnar_relation_scalar_source_begin_mode(
     wl_columnar_relation_scalar_source_t *source, const col_rel_t *relation,
-    bool preserve_timestamps)
-{
-    return wl_columnar_relation_scalar_source_admit_attempt_controlled(
-        source, relation, preserve_timestamps, 0u);
-}
+    bool preserve_timestamps, bool retain_on_error, uint32_t admit);
 
 /* Validates a held INLINE descriptor's arity map in metered chunks of eight
  * logical entries, with the same predicates as
@@ -19329,10 +19424,10 @@ wl_columnar_relation_scalar_source_compound_check(
     return 0;
 }
 
-int
-wl_columnar_relation_scalar_source_admit_attempt_controlled(
+static int
+wl_columnar_relation_scalar_source_begin_mode(
     wl_columnar_relation_scalar_source_t *source, const col_rel_t *relation,
-    bool preserve_timestamps, uint32_t admit)
+    bool preserve_timestamps, bool retain_on_error, uint32_t admit)
 {
     int rc = wl_columnar_relation_scalar_source_check(source,
             WL_COLUMNAR_RELATION_SCALAR_SOURCE_INERT);
@@ -19351,9 +19446,9 @@ wl_columnar_relation_scalar_source_admit_attempt_controlled(
     if (rc)
         goto done;
     source->descriptor = relation;
-    rc = wl_columnar_relation_reader_acquire_attempt_controlled(
+    rc = wl_columnar_relation_reader_acquire_mode(
         (wl_columnar_source_access_gate_t *)&relation->descriptor_access,
-        &source->descriptor_reader, control, id);
+        &source->descriptor_reader, control, id, retain_on_error);
     if (rc)
         goto done;
     rc = wl_columnar_relation_constructor_attempt_charge(control, id,
@@ -19389,8 +19484,9 @@ wl_columnar_relation_scalar_source_admit_attempt_controlled(
     if (tail > 0 || !rc) rc = tail;
     if (rc)
         goto done;
-    rc = wl_columnar_relation_reader_acquire_attempt_controlled(
-        &source->owner->source_access, &source->owner_reader, control, id);
+    rc = wl_columnar_relation_reader_acquire_mode(
+        &source->owner->source_access, &source->owner_reader, control, id,
+        retain_on_error);
     if (rc)
         goto done;
     rc = wl_columnar_relation_constructor_attempt_charge(control, id,
@@ -19478,7 +19574,51 @@ wl_columnar_relation_scalar_source_admit_attempt_controlled(
     }
     return 0;
 done:
+    if (retain_on_error) {
+        if (!source->first_result_saved) {
+            source->first_result_saved = true; source->first_result = rc;
+        }
+        source->end_cursor = 0;
+        source->phase = WL_COLUMNAR_RELATION_SCALAR_SOURCE_ENDING;
+        return rc;
+    }
     return wl_columnar_relation_scalar_source_end(source, rc);
+}
+
+int
+wl_columnar_relation_scalar_source_begin_attempt_controlled(
+    wl_columnar_relation_scalar_source_t *source, const col_rel_t *relation,
+    bool timestamps)
+{
+    return wl_columnar_relation_scalar_source_begin_mode(source, relation,
+               timestamps, false, 0);
+}
+
+int
+wl_columnar_relation_scalar_source_begin_retained_attempt_controlled(
+    wl_columnar_relation_scalar_source_t *source, const col_rel_t *relation,
+    bool timestamps)
+{
+    return wl_columnar_relation_scalar_source_begin_mode(source, relation,
+               timestamps, true, 0);
+}
+
+int
+wl_columnar_relation_scalar_source_admit_attempt_controlled(
+    wl_columnar_relation_scalar_source_t *source, const col_rel_t *relation,
+    bool timestamps, uint32_t admit)
+{
+    return wl_columnar_relation_scalar_source_begin_mode(source, relation,
+        timestamps, false, admit);
+}
+
+int
+wl_columnar_relation_scalar_source_admit_retained_attempt_controlled(
+    wl_columnar_relation_scalar_source_t *source, const col_rel_t *relation,
+    bool timestamps, uint32_t admit)
+{
+    return wl_columnar_relation_scalar_source_begin_mode(source, relation,
+        timestamps, true, admit);
 }
 
 int
