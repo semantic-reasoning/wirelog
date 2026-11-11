@@ -4,6 +4,8 @@
  * per-dispatch contract. */
 #include "../wirelog/columnar/internal.h"
 #include "../wirelog/exec_plan_gen.h"
+#include "../wirelog/session.h"
+#include "../wirelog/session_options.h"
 #include "../wirelog/crc32.h"
 #include "../wirelog/wirelog.h"
 #include "../wirelog/thread.h"
@@ -5204,6 +5206,536 @@ reduce_literal_matrix(void)
         }
 }
 
+typedef struct {
+    int64_t expected[2];
+    uint32_t width;
+    unsigned events;
+} reduce_public_events_t;
+
+static void
+reduce_public_capture(const char *name, const int64_t *row, uint32_t width,
+    int32_t diff, void *payload)
+{
+    if (strcmp(name, "output")) return;
+    reduce_public_events_t *events = payload;
+    CHECK(width == events->width && diff == 1 && !events->events);
+    for (uint32_t c = 0; c < width; ++c) CHECK(row[c] == events->expected[c]);
+    ++events->events;
+}
+
+static wl_columnar_memory_governor_ref_t *
+reduce_public_generated(wl_plan_t *plan, unsigned grouped, const int64_t *data,
+    int64_t group, int64_t expected)
+{
+    wl_columnar_memory_resolution_t resolution = {
+        .budget_bytes = UINT64_C(128) << 20,
+            .usable_bytes = UINT64_C(128) << 20,
+            .mode = WL_COLUMNAR_MEMORY_MODE_ENFORCING
+    };
+    wl_columnar_memory_governor_ref_t *governor =
+        wl_columnar_memory_governor_ref_create(&resolution);
+    CHECK(governor);
+    wl_evaluation_control_t *control = NULL;
+    CHECK(!wl_evaluation_control_create(0, &control));
+    for (unsigned raw = 0; raw < 2; ++raw) {
+        wl_session_options_t options; wl_session_options_init(&options);
+        options.evaluation_control = raw ? NULL : control;
+        options.memory_governor = governor;
+        wl_session_t *session = NULL;
+        CHECK(!wl_session_create_with_options(wl_backend_columnar(), plan, 1,
+            &options, &session));
+        reduce_public_events_t events = {
+            .expected = {grouped ? group : expected, expected},
+            .width = grouped + 1
+        };
+        wl_session_set_delta_cb(session, reduce_public_capture, &events);
+        CHECK(!wl_session_insert(session, "input", data, 2, grouped + 1));
+        int rc = EAGAIN;
+        for (unsigned turn = 0; turn < 100000 && rc == EAGAIN; ++turn)
+            rc = wl_session_step(session);
+        CHECK(!rc && events.events == 1);
+        wl_col_session_t *col = (wl_col_session_t *)session;
+        const col_rel_t *out = session_find_rel(col, "output");
+        CHECK(out && out->nrows == 1 && out->ncols == events.width);
+        for (uint32_t c = 0; c < out->ncols; ++c)
+            CHECK(out->columns[c][0] == events.expected[c]);
+        CHECK(!col->cleanup_active && !col->cleanup_pending
+            && !col->cleanup_reserved_bytes);
+        wl_mem_ledger_snapshot_t before, after;
+        wl_mem_ledger_snapshot(&col->mem_ledger, &before);
+        rc = EAGAIN;
+        for (unsigned turn = 0; turn < 100000 && rc == EAGAIN; ++turn)
+            rc = wl_session_step(session);
+        wl_mem_ledger_snapshot(&col->mem_ledger, &after);
+        CHECK(!rc && events.events == 1 &&
+            before.current_bytes == after.current_bytes);
+        CHECK(!wl_session_try_destroy(&session) && !session);
+    }
+    wl_evaluation_control_release(control);
+    return governor;
+}
+
+static void
+reduce_public_operand_error(void)
+{
+    wirelog_error_t error;
+    wirelog_program_t *program = wirelog_parse_string(
+        ".decl input(v:symbol)\n.decl output(v:int64)\n"
+        "output(sum(10 / to_number(v))) :- input(v).\n", &error);
+    wl_plan_t *plan = NULL;
+    CHECK(program && !wl_plan_from_program(program, &plan));
+    int64_t input[] = {wl_intern_put(plan->intern, "2"),
+                       wl_intern_put(plan->intern, "0")};
+    CHECK(input[0] >= 0 && input[1] >= 0);
+    wl_columnar_memory_resolution_t resolution = {
+        .budget_bytes = UINT64_C(128) << 20,
+            .usable_bytes = UINT64_C(128) << 20,
+            .mode = WL_COLUMNAR_MEMORY_MODE_ENFORCING
+    };
+    wl_columnar_memory_governor_ref_t *governor =
+        wl_columnar_memory_governor_ref_create(&resolution);
+    CHECK(governor);
+    wl_evaluation_control_t *control = NULL;
+    CHECK(!wl_evaluation_control_create(0, &control));
+    for (unsigned raw = 0; raw < 2; ++raw) {
+        wl_session_options_t options; wl_session_options_init(&options);
+        options.evaluation_control = raw ? NULL : control;
+        options.memory_governor = governor;
+        wl_session_t *session = NULL;
+        CHECK(!wl_session_create_with_options(wl_backend_columnar(), plan, 1,
+            &options, &session));
+        reduce_public_events_t events = {.expected = {7, 0}, .width = 1};
+        wl_session_set_delta_cb(session, reduce_public_capture, &events);
+        CHECK(!wl_session_insert(session, "input", input, 2, 1));
+        int rc = EAGAIN;
+        for (unsigned turn = 0; turn < 100000 && rc == EAGAIN; ++turn)
+            rc = wl_session_step(session);
+        CHECK(rc == ERANGE && !events.events);
+        wl_col_session_t *col = (wl_col_session_t *)session;
+        CHECK(!session_find_rel(col, "output") && !col->cleanup_active
+            && !col->cleanup_pending && !col->cleanup_reserved_bytes);
+        if (!raw) {
+            wl_evaluation_control_report_t report;
+            CHECK(!wl_evaluation_control_report(control, &report)
+                && report.result == ERANGE && report.execution_status == ERANGE
+                && !report.cleanup_status);
+        }
+        CHECK(!wl_session_try_destroy(&session) && !session);
+    }
+    wl_evaluation_control_release(control); wl_plan_free(plan);
+    wirelog_program_free(program);
+    CHECK(!wl_columnar_memory_reserved(wl_columnar_memory_governor_ref_get(
+            governor)));
+    wl_columnar_memory_governor_ref_release(governor);
+}
+
+static reduce_fixture_t *reduce_scalar_fixture;
+static unsigned reduce_scalar_fault;
+static bool reduce_scalar_fired;
+static wl_columnar_memory_reservation_t reduce_scalar_peer;
+static wl_evaluation_control_report_t reduce_scalar_frozen;
+static uint64_t reduce_scalar_successor;
+
+static void
+reduce_scalar_created(wl_evaluation_control_t *control, unsigned phase,
+    uint64_t progress)
+{
+    (void)progress;
+    if (phase != 34 || reduce_scalar_fired) return;
+    reduce_fixture_t *f = reduce_scalar_fixture;
+    wl_columnar_filter_context_t *context = NULL;
+    CHECK(control == f->operation &&
+        !wl_columnar_eval_stack_filter_context_owned(f->frame, &context,
+        f->owner)
+        && context->scalar_program && !context->program);
+    reduce_scalar_fired = true;
+    if (reduce_scalar_fault == 0) wl_evaluation_control_request_cancel(control);
+    else if (reduce_scalar_fault == 1)
+        CHECK(wl_evaluation_control_charge_attempt(control, f->operation_id,
+            UINT64_MAX) == WL_EVALUATION_CONTROL_WORK_LIMIT);
+    else if (reduce_scalar_fault ==
+        2) wl_columnar_expr_test_fail_allocation = 0;
+    else if (reduce_scalar_fault == 3) {
+        wl_evaluation_control_attempt_finish_result_t ended =
+            wl_evaluation_control_finish_attempt(control, &f->operation_owner,
+                f->operation_id, 0, 0);
+        CHECK(!ended.protocol && ended.report_valid && !ended.report.result);
+        reduce_scalar_frozen = ended.report;
+        CHECK(!wl_evaluation_control_begin(control, &f->operation_owner));
+        reduce_scalar_successor =
+            wl_evaluation_control_active_attempt_id(control);
+        CHECK(reduce_scalar_successor &&
+            reduce_scalar_successor != f->operation_id);
+    } else {
+        wl_columnar_memory_governor_t *governor =
+            wl_columnar_memory_governor_ref_get(f->session->memory_governor);
+        uint64_t available = (UINT64_C(16) << 20)
+            - wl_columnar_memory_reserved(governor);
+        CHECK(available > 1 && wl_columnar_memory_reserve(governor,
+            available - 1, &reduce_scalar_peer));
+    }
+}
+
+static void
+reduce_scalar_created_failures(void)
+{
+    for (unsigned fault = 0; fault < 5; ++fault) {
+        wirelog_error_t error;
+        wirelog_program_t *program = wirelog_parse_string(
+            ".decl input(v:symbol)\n.decl output(v:symbol)\n"
+            "output(min(cat(v,\"\"))) :- input(v).\n", &error);
+        wl_plan_t *plan = NULL;
+        CHECK(program && !wl_plan_from_program(program, &plan));
+        const wl_plan_op_t *op = NULL;
+        for (uint32_t s = 0; s < plan->stratum_count; ++s)
+            for (uint32_t r = 0; r < plan->strata[s].relation_count; ++r) {
+                const wl_plan_relation_t *body = &plan->strata[s].relations[r];
+                for (uint32_t i = 0; i < body->op_count; ++i)
+                    if (body->ops[i].op ==
+                        WL_PLAN_OP_REDUCE) op = &body->ops[i];
+            }
+        CHECK(op && op->agg_operand_type == WL_PLAN_AGG_OPERAND_STRING);
+        int64_t id = wl_intern_put(plan->intern, "value"); CHECK(id >= 0);
+        col_rel_t *input = wl_columnar_filter_test_source(1, 0, false, false,
+                false);
+        wirelog_column_type_t type = WIRELOG_TYPE_STRING;
+        CHECK(!col_rel_set_column_types(input, &type,
+            1) && !col_rel_append_row(input, &id));
+        reduce_fixture_t f;
+        reduce_fixture_init(&f, input, false, UINT64_C(10000000), true);
+        f.op = *op; f.session->intern = plan->intern;
+        reduce_scalar_fixture = &f; reduce_scalar_fault = fault;
+        reduce_scalar_fired = false; reduce_scalar_successor = 0;
+        wl_columnar_memory_reservation_init(&reduce_scalar_peer);
+        wl_columnar_ops_test_reduce_attempt_checkpoint = reduce_scalar_created;
+        reduce_run(&f);
+        wl_columnar_ops_test_reduce_attempt_checkpoint = NULL;
+        wl_columnar_expr_test_fail_allocation = -1;
+        int expected = fault == 0 ? WL_EVALUATION_CONTROL_CANCELLED
+            : fault == 1 ? WL_EVALUATION_CONTROL_WORK_LIMIT : fault ==
+            2 ? ENOMEM
+            : fault == 3 ? EINVAL : ENOSPC;
+        CHECK(reduce_scalar_fired && f.status.semantic_result == expected
+            && !f.status.committed
+            && wl_columnar_eval_stack_cleanup_stack(f.frame)->items[0].rel ==
+            input);
+        CHECK(f.session->memory_budget_denied == (fault == 4));
+        if (fault == 4) CHECK(wl_columnar_memory_rollback(&reduce_scalar_peer));
+        if (fault == 3) {
+            wl_evaluation_control_report_t report;
+            CHECK(!wl_evaluation_control_report(f.operation, &report)
+                && report.attempt_id == reduce_scalar_frozen.attempt_id
+                && report.limit == reduce_scalar_frozen.limit
+                && report.consumed == reduce_scalar_frozen.consumed
+                && report.stop_reason == reduce_scalar_frozen.stop_reason
+                && report.execution_status ==
+                reduce_scalar_frozen.execution_status
+                && report.cleanup_status == reduce_scalar_frozen.cleanup_status
+                && report.result == reduce_scalar_frozen.result);
+            uint64_t used = UINT64_MAX;
+            CHECK(!wl_evaluation_control_test_active_consumed(f.operation,
+                reduce_scalar_successor, &used) && !used);
+            wl_evaluation_control_attempt_finish_result_t ended =
+                wl_evaluation_control_finish_attempt(f.operation,
+                    &f.operation_owner,
+                    reduce_scalar_successor, 0, 0);
+            CHECK(!ended.protocol && ended.report_valid &&
+                !ended.report.consumed);
+        }
+        wl_columnar_memory_governor_ref_t *governor =
+            f.session->memory_governor;
+        wl_columnar_memory_governor_ref_retain(governor);
+        reduce_fixture_close(&f, false);
+        wl_plan_free(plan); wirelog_program_free(program);
+        CHECK(!wl_columnar_memory_reserved(wl_columnar_memory_governor_ref_get(
+                governor)));
+        wl_columnar_memory_governor_ref_release(governor);
+        reduce_scalar_fixture = NULL;
+    }
+}
+
+static void
+reduce_string_compiler_cases(void)
+{
+    const char *functions[] = {"min", "max", "sum", "min", "sum"};
+    const char *operands[] = {"v", "v", "v", "cat(v,\"\")", "strlen(v)"};
+    for (unsigned kind = 0; kind < 5; ++kind)
+        for (unsigned grouped = 0; grouped < 2; ++grouped)
+            for (unsigned shift = 0; shift < 2; ++shift)
+                for (unsigned reversed = 0; reversed < 2; ++reversed) {
+                    char source[512];
+                    CHECK(snprintf(source, sizeof(source),
+                        ".decl input(%sv:symbol)\n.decl output(%sv:%s)\n"
+                        "output(%s%s(%s)) :- input(%sv).\n",
+                        grouped ? "g:symbol," : "", grouped ? "g:symbol," : "",
+                        kind == 2 || kind == 4 ? "int64" : "symbol",
+                        grouped ? "g," : "",
+                        functions[kind], operands[kind],
+                        grouped ? "g," : "") > 0);
+                    wirelog_error_t error;
+                    wirelog_program_t *program = wirelog_parse_string(source,
+                            &error);
+                    wl_plan_t *plan = NULL;
+                    CHECK(program && !wl_plan_from_program(program, &plan));
+                    const wl_plan_op_t *reduce = NULL;
+                    for (uint32_t s = 0; s < plan->stratum_count; ++s)
+                        for (uint32_t r = 0; r < plan->strata[s].relation_count;
+                            ++r){
+                            const wl_plan_relation_t *body =
+                                &plan->strata[s].relations[r];
+                            for (uint32_t o = 0; o < body->op_count; ++o)
+                                if (body->ops[o].op == WL_PLAN_OP_REDUCE) {
+                                    CHECK(!reduce); reduce = &body->ops[o];
+                                }
+                        }
+                    CHECK(reduce &&
+                        reduce->agg_operand_type ==
+                        (kind ==
+                        4 ? WL_PLAN_AGG_OPERAND_SCALAR :
+                        WL_PLAN_AGG_OPERAND_STRING)
+                        && reduce->group_by_count == grouped &&
+                        reduce->agg_expr.data
+                        && reduce->agg_expr.size &&
+                        (kind >= 3 ||
+                        reduce->agg_expr.data[0] == WL_PLAN_EXPR_VAR));
+                    wl_intern_t *table = plan->intern;
+                    CHECK(table);
+                    if (shift) CHECK(wl_intern_put(table,
+                            "padding before") >= 0);
+                    int64_t z = wl_intern_put(table, "zz"),
+                        a = wl_intern_put(table, "aa");
+                    int64_t g = wl_intern_put(table, "group");
+                    CHECK(z >= 0 && a > z && g >= 0);
+                    col_rel_t *input = wl_columnar_filter_test_source(grouped +
+                            1, 0, false, false, false);
+                    wirelog_column_type_t types[] = {WIRELOG_TYPE_STRING,
+                                                     WIRELOG_TYPE_STRING};
+                    CHECK(!col_rel_set_column_types(input, types, grouped + 1));
+                    for (unsigned row = 0; row < 2; ++row) {
+                        int64_t tuple[] = {g, (row == reversed) ? z : a};
+                        CHECK(!col_rel_append_row(input,
+                            grouped ? tuple : tuple + 1));
+                    }
+                    reduce_fixture_t f;
+                    reduce_fixture_init(&f, input, false, 0, true);
+                    f.session->intern = table; f.op = *reduce;
+                    eval_stack_t raw = {0};
+                    CHECK(!eval_stack_push(&raw, input, false));
+                    CHECK(!col_op_reduce(&f.op, &raw, f.session));
+                    reduce_run(&f);
+                    CHECK(!f.status.semantic_result && f.status.committed);
+                    col_rel_t *out =
+                        wl_columnar_eval_stack_cleanup_stack(
+                        f.frame)->items[0].rel;
+                    CHECK(out->nrows == 1 && out->ncols == grouped + 1 &&
+                        !out->timestamps);
+                    uint32_t ai = reduce->aggregate_index <
+                        out->ncols ? reduce->aggregate_index : grouped;
+                    CHECK(out->column_types[ai] == WIRELOG_TYPE_INT64
+                        && out->columns[ai][0] ==
+                        (kind == 0 ||
+                        kind == 3 ? a : kind == 1 ? z : kind == 4 ? 4 : z + a));
+                    for (uint32_t c = 0; c < out->ncols; ++c)
+                        CHECK(out->columns[c][0] ==
+                            raw.items[0].rel->columns[c][0]
+                            && out->column_types[c] ==
+                            raw.items[0].rel->column_types[c]);
+                    CHECK(!eval_stack_drain(&raw));
+                    reduce_fixture_close(&f, false);
+                    int64_t public_data[] = {g, reversed ? a : z, g,
+                                             reversed ? z : a};
+                    int64_t ungrouped_data[] = {reversed ? a : z,
+                                                reversed ? z : a};
+                    int64_t expected = kind == 0 || kind == 3 ? a
+                        : kind == 1 ? z : kind == 4 ? 4 : z + a;
+                    wl_columnar_memory_governor_ref_t *public_governor =
+                        reduce_public_generated(plan, grouped,
+                            grouped ? public_data : ungrouped_data, g,
+                            expected);
+                    wl_plan_free(plan); wirelog_program_free(program);
+                    CHECK(!wl_columnar_memory_reserved(
+                            wl_columnar_memory_governor_ref_get(
+                                public_governor)));
+                    wl_columnar_memory_governor_ref_release(public_governor);
+                }
+}
+
+static unsigned reduce_string_stop_phase, reduce_string_stop_mode;
+static bool reduce_string_stop_seen;
+
+static void
+reduce_string_stop(wl_evaluation_control_t *control, unsigned phase,
+    uint64_t progress)
+{
+    if (!control || reduce_string_stop_seen || phase != reduce_string_stop_phase
+        || (phase == 42 && progress != 4096)) return;
+    reduce_string_stop_seen = true;
+    if (!reduce_string_stop_mode) wl_evaluation_control_request_cancel(control);
+    else CHECK(wl_evaluation_control_charge_attempt(control,
+            wl_evaluation_control_active_attempt_id(control),
+            UINT64_C(10000000))
+            == WL_EVALUATION_CONTROL_WORK_LIMIT);
+}
+
+static void
+reduce_string_byte_stop(wl_evaluation_control_t *control, unsigned phase,
+    uint64_t progress, bool failed)
+{
+    (void)failed;
+    reduce_string_stop(control, phase, progress);
+}
+
+static void
+reduce_string_stops(void)
+{
+    for (unsigned kind = 0; kind < 2; ++kind)
+        for (unsigned stage = 0; stage < 3; ++stage)
+            for (unsigned stop = 0; stop < 2; ++stop) {
+                wl_intern_t *table = wl_intern_create(); CHECK(table);
+                char left[4098], right[4098];
+                memset(left, 'x', sizeof(left));
+                memset(right, 'x', sizeof(right));
+                left[4097] = right[4097] = 0; left[4096] = 'a';
+                right[4096] = 'b';
+                int64_t a = wl_intern_put(table, left),
+                    b = wl_intern_put(table, right);
+                CHECK(a >= 0 && b >= 0);
+                col_rel_t *input = wl_columnar_filter_test_source(1, 0, false,
+                        false, false);
+                wirelog_column_type_t type = WIRELOG_TYPE_STRING;
+                CHECK(!col_rel_set_column_types(input, &type, 1));
+                CHECK(!col_rel_append_row(input,
+                    &b) && !col_rel_append_row(input, &a));
+                reduce_fixture_t f;
+                reduce_fixture_init(&f, input, false, UINT64_C(10000000),
+                    false);
+                f.session->intern = table;
+                f.op.agg_operand_type = WL_PLAN_AGG_OPERAND_STRING;
+                f.op.agg_fn = kind ? WIRELOG_AGG_MAX : WIRELOG_AGG_MIN;
+                reduce_string_stop_phase = stage == 0 ? 41 : stage ==
+                    1 ? 42 : 49;
+                reduce_string_stop_mode = stop; reduce_string_stop_seen = false;
+                wl_columnar_expr_test_checkpoint = reduce_string_byte_stop;
+                wl_columnar_ops_test_reduce_attempt_checkpoint =
+                    reduce_string_stop;
+                reduce_run(&f);
+                wl_columnar_expr_test_checkpoint = NULL;
+                wl_columnar_ops_test_reduce_attempt_checkpoint = NULL;
+                int expected =
+                    stop ? WL_EVALUATION_CONTROL_WORK_LIMIT :
+                    WL_EVALUATION_CONTROL_CANCELLED;
+                CHECK(reduce_string_stop_seen &&
+                    f.status.semantic_result == expected && !f.status.committed
+                    && wl_columnar_eval_stack_cleanup_stack(
+                        f.frame)->items[0].rel == input
+                    && input->nrows == 2 && input->columns[0][0] == b &&
+                    input->columns[0][1] == a);
+                CHECK(wl_evaluation_control_finish(f.operation,
+                    &f.operation_owner, expected, 0) == expected);
+                CHECK(!wl_evaluation_control_reset(f.operation));
+                CHECK(!wl_evaluation_control_configure(f.operation, 0));
+                CHECK(!wl_evaluation_control_begin(f.operation,
+                    &f.operation_owner));
+                f.operation_id =
+                    wl_evaluation_control_active_attempt_id(f.operation);
+                f.phase = 0; reduce_run(&f);
+                CHECK(f.status.committed && !f.status.semantic_result);
+                col_rel_t *out =
+                    wl_columnar_eval_stack_cleanup_stack(f.frame)->items[0].rel;
+                CHECK(out->nrows == 1 && out->columns[0][0] == (kind ? b : a));
+                reduce_fixture_close(&f, false);
+                wl_intern_free(table);
+            }
+}
+
+static void
+reduce_string_rank_matrix(void)
+{
+    const wirelog_agg_fn_t functions[] = {WIRELOG_AGG_MIN, WIRELOG_AGG_MAX,
+                                          WIRELOG_AGG_SUM};
+    for (unsigned shift = 0; shift < 2; ++shift)
+        for (unsigned kind = 0; kind < 3; ++kind)
+            for (unsigned shape = 0; shape < 8; ++shape)
+                for (unsigned reversed = 0; reversed < 2; ++reversed) {
+                    wl_intern_t *table = wl_intern_create(); CHECK(table);
+                    if (shift) {
+                        CHECK(wl_intern_put(table, "padding one") >= 0);
+                        CHECK(wl_intern_put(table, "padding two") >= 0);
+                    }
+                    int64_t z = wl_intern_put(table, "z");
+                    int64_t a = wl_intern_put(table, "a");
+                    CHECK(z >= 0 && a > z);
+                    const int64_t pairs[][2] = {
+                        {z, a}, {9999, a}, {a, 9999}, {-7, 9999},
+                        {a, a}, {z, a}, {INT64_MAX, 1}, {z, a}
+                    };
+                    col_rel_t *input = wl_columnar_filter_test_source(1, 0,
+                            false, false, false);
+                    wirelog_column_type_t type = WIRELOG_TYPE_STRING;
+                    CHECK(!col_rel_set_column_types(input, &type, 1));
+                    for (unsigned row = 0; row < 2; ++row) {
+                        int64_t value = pairs[shape][reversed ? 1 - row : row];
+                        CHECK(!col_rel_append_row(input, &value));
+                    }
+                    reduce_fixture_t f;
+                    reduce_fixture_init(&f, input, false, 0, (shape % 2) != 0);
+                    f.session->intern = shape == 5 ? NULL : table;
+                    f.op.agg_fn = functions[kind];
+                    f.op.agg_operand_type = shape ==
+                        7 ? WL_PLAN_AGG_OPERAND_UNKNOWN
+                        : WL_PLAN_AGG_OPERAND_STRING;
+                    eval_stack_t raw = {0};
+                    CHECK(!eval_stack_push(&raw, input, false));
+                    int raw_rc = col_op_reduce(&f.op, &raw, f.session);
+                    reduce_run(&f);
+                    bool overflow = kind == 2 && shape == 6;
+                    CHECK(f.status.semantic_result == (overflow ? ERANGE : 0)
+                        && f.status.committed == !overflow);
+                    CHECK(raw_rc == (overflow ? ERANGE : 0));
+                    if (!overflow) {
+                        col_rel_t *actual =
+                            wl_columnar_eval_stack_cleanup_stack(
+                            f.frame)->items[0].rel;
+                        col_rel_t *expected_raw = raw.items[0].rel;
+                        CHECK(actual->nrows == 1 && actual->ncols == 1
+                            && actual->column_types[0] == WIRELOG_TYPE_INT64
+                            && !actual->timestamps && !actual->has_graph_column
+                            && expected_raw->nrows == 1 &&
+                            expected_raw->ncols == 1
+                            && expected_raw->column_types[0] ==
+                            actual->column_types[0]);
+                        int64_t expected;
+                        if (kind ==
+                            2) expected = pairs[shape][0] + pairs[shape][1];
+                        else if (shape < 3 ||
+                            shape == 4) expected = kind == 0 ||
+                                shape != 0 ? a : z;
+                        else if (shape == 6) expected = 1; /* Existing valid ID outranks huge invalid ID. */
+                        else {
+                            int64_t left = pairs[shape][0],
+                                right = pairs[shape][1];
+                            expected = kind == 0 ? (left < right ? left : right)
+                                : (left > right ? left : right);
+                        }
+                        if (actual->columns[0][0] != expected ||
+                            actual->columns[0][0] !=
+                            expected_raw->columns[0][0])
+                            fprintf(stderr,
+                                "STRING reduce shift=%u kind=%u shape=%u rev=%u actual=%lld raw=%lld expected=%lld\n",
+                                shift, kind, shape, reversed,
+                                (long long)actual->columns[0][0],
+                                (long long)expected_raw->columns[0][0],
+                                (long long)expected);
+                        CHECK(actual->columns[0][0] == expected
+                            && actual->columns[0][0] ==
+                            expected_raw->columns[0][0]);
+                    }
+                    CHECK(!eval_stack_drain(&raw));
+                    reduce_fixture_close(&f, false);
+                    wl_intern_free(table);
+                }
+}
+
 static void
 reduce_error_order(void)
 {
@@ -5396,8 +5928,8 @@ reduce_allocation_and_domains(void)
         }
         reduce_run(&f);
         CHECK(f.status.semantic_result ==
-            (mode < 4 ? 0 : mode == 7 ? EOVERFLOW : ENOTSUP));
-        CHECK(f.status.committed == (mode < 4));
+            (mode <= 4 ? 0 : mode == 7 ? EOVERFLOW : ENOTSUP));
+        CHECK(f.status.committed == (mode <= 4));
         reduce_fixture_close(&f, false);
     }
 }
@@ -7267,7 +7799,11 @@ main(void)
     concat_retained_and_turnover(); concat_resource_and_compatibility();
     test_binary_replacement(); binary_test_native_and_lifo();
     binary_test_turnover();
-    reduce_literal_matrix(); reduce_error_order(); reduce_stop_matrix();
+    reduce_literal_matrix();
+    reduce_string_compiler_cases(); reduce_string_rank_matrix();
+    reduce_string_stops(); reduce_scalar_created_failures();
+    reduce_public_operand_error(); reduce_error_order();
+    reduce_stop_matrix();
     reduce_collisions(); reduce_owned_authority();
     reduce_allocation_and_domains(); reduce_retained_resources();
     reduce_shape_and_expression(); reduce_wide_and_float_overflow();

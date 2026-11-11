@@ -2100,6 +2100,50 @@ wl_columnar_expr_bytes_compare_attempt_controlled(const uint8_t *left,
 }
 
 int
+wl_columnar_expr_intern_rank_compare_attempt_controlled(
+    const wl_intern_t *intern,
+    int64_t a, int64_t b, int *ordering, bool *candidate_valid,
+    bool *current_valid,
+    wl_evaluation_control_t *control, uint64_t attempt_id)
+{
+    if (!ordering || !candidate_valid || !current_valid) return EINVAL;
+    int rc = wl_columnar_expr_byte_region(control, attempt_id);
+    if (rc) return rc;
+    const char *left = wl_intern_reverse(intern, a);
+    rc = wl_columnar_expr_byte_region(control, attempt_id);
+    if (rc) return rc;
+    const char *right = wl_intern_reverse(intern, b);
+    rc = wl_columnar_expr_byte_cutoff(control, attempt_id);
+    if (rc) return rc;
+    bool valid = left && right;
+    int result = 0;
+    if (valid) {
+        size_t left_length, right_length;
+        rc = wl_columnar_expr_cstr_length_attempt_controlled(left, &left_length,
+                control, attempt_id);
+        if (rc) return rc;
+        rc = wl_columnar_expr_cstr_length_attempt_controlled(right,
+                &right_length,
+                control, attempt_id);
+        if (rc) return rc;
+        size_t common = left_length < right_length ? left_length : right_length;
+        rc =
+            wl_columnar_expr_bytes_compare_attempt_controlled(
+            (const uint8_t *)left,
+            (const uint8_t *)right, common, &result, control, attempt_id);
+        if (rc) return rc;
+        if (!result) result = (left_length > right_length) - (left_length <
+                right_length);
+    }
+    rc = wl_columnar_expr_byte_cutoff(control, attempt_id);
+    if (rc) return rc;
+    *ordering = result;
+    *candidate_valid = left != NULL;
+    *current_valid = right != NULL;
+    return 0;
+}
+
+int
 wl_columnar_expr_bytes_copy_attempt_controlled(uint8_t *destination,
     const uint8_t *source, size_t length, size_t *copied,
     wl_evaluation_control_t *control, uint64_t attempt_id)
