@@ -8710,7 +8710,7 @@ typedef struct wl_columnar_eval_serial_framed_attempt {
     bool candidate_owned, materialized, committed, pending_inner_consume;
     bool close_proven, abort_supported, abort_requested;
     bool native_cleanup;
-    bool unary_native_cleanup;
+    bool unary_native_cleanup, observed_native_cleanup;
     bool controlled_materialized_batch_fallback;
     const wl_columnar_eval_private_bindings_t *private_bindings;
     col_rel_t **capture_out;
@@ -9131,6 +9131,52 @@ int wl_columnar_session_unary_cleanup_register(wl_col_session_t *,
     wl_columnar_eval_serial_framed_attempt_t *, wl_evaluation_control_t *,
     uint64_t,
     uint32_t, bool);
+typedef enum {
+    WL_COLUMNAR_EVAL_PLAN_CLEANUP_JOIN,
+    WL_COLUMNAR_EVAL_PLAN_CLEANUP_UNARY,
+    WL_COLUMNAR_EVAL_PLAN_CLEANUP_OBSERVED
+} wl_columnar_eval_plan_cleanup_kind_t;
+typedef struct {
+    bool handled;
+    int protocol, execution_result, cleanup_result;
+    bool committed;
+} wl_columnar_session_observed_ack_result_t;
+wl_columnar_session_observed_ack_result_t
+    wl_columnar_session_observed_ack_resume(wl_col_session_t *,
+    const wl_columnar_eval_cleanup_receipt_key_t *, wl_evaluation_control_t *,
+    uint64_t);
+typedef struct {
+    int protocol, cause;
+    bool provisional;
+} wl_columnar_session_observed_cleanup_result_t;
+wl_columnar_session_observed_cleanup_result_t
+    wl_columnar_session_observed_cleanup_prove(
+    const wl_columnar_eval_serial_framed_attempt_t *, wl_evaluation_control_t *,
+    uint64_t, wl_session_source_finance_t *);
+wl_columnar_session_observed_cleanup_result_t
+    wl_columnar_session_observed_cleanup_frame_prove(const wl_col_session_t *,
+    const wl_columnar_eval_stack_cleanup_frame_t *, wl_evaluation_control_t *,
+    uint64_t, wl_session_source_finance_t *);
+wl_columnar_session_observed_cleanup_result_t
+    wl_columnar_session_observed_cleanup_receipt_prove(const wl_col_session_t *,
+    const wl_columnar_eval_cleanup_receipt_key_t *, wl_evaluation_control_t *,
+    uint64_t, wl_session_source_finance_t *);
+int wl_columnar_eval_plan_observed_native_cleanup_step(
+    wl_columnar_eval_serial_framed_attempt_t *, wl_evaluation_control_t *,
+    uint64_t);
+int wl_columnar_eval_plan_observed_native_cleanup_consume(
+    wl_columnar_eval_serial_framed_attempt_t *, int, wl_evaluation_control_t *,
+    uint64_t);
+int wl_columnar_eval_plan_observed_native_cleanup_ack(
+    wl_columnar_eval_serial_framed_attempt_t *, wl_evaluation_control_t *,
+    uint64_t);
+int wl_columnar_filter_observed_native_cleanup_latch_owned(
+    wl_columnar_eval_stack_cleanup_frame_t *, const void *,
+    wl_evaluation_control_t *,
+    uint64_t, bool *);
+int wl_columnar_filter_observed_neverborn_owned(
+    wl_columnar_eval_stack_cleanup_frame_t *,
+    const void *, bool *);
 int wl_columnar_session_unary_cleanup_prove(
     const wl_columnar_eval_serial_framed_attempt_t *, wl_evaluation_control_t *,
     uint64_t, wl_session_source_finance_t *, int *);
