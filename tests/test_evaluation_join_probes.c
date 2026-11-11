@@ -2,6 +2,8 @@
 #include "../wirelog/columnar/internal.h"
 #include "../wirelog/columnar/join_pipeline.h"
 #include "../wirelog/exec_plan_gen.h"
+#include "../wirelog/ir/ir.h"
+#include "../wirelog/ir/program.h"
 #include "../wirelog/session.h"
 #include "../wirelog/session_options.h"
 #include "../wirelog/thread.h"
@@ -1153,9 +1155,228 @@ run_case(const probe_case_t *test)
     }
 }
 
+/* Numeric right-filter probe qualification. SEMI is explicitly IR generated. */
+static wirelog_ir_node_t *
+filtered_probe_anti(wirelog_ir_node_t *node)
+{
+    if (!node || node->type == WIRELOG_IR_ANTIJOIN) return node;
+    for (uint32_t i = 0; i < node->child_count; ++i) {
+        wirelog_ir_node_t *found = filtered_probe_anti(node->children[i]);
+        if (found) return found;
+    }
+    return NULL;
+}
+
+static unsigned filtered_phase, filtered_fault, filtered_rows,
+    filtered_build_maps, filtered_probe_maps;
+static bool filtered_fired;
+static wl_columnar_memory_governor_ref_t *filtered_governor;
+static wl_columnar_memory_reservation_t filtered_peer;
+
+static void
+filtered_checkpoint(wl_evaluation_control_t *control, unsigned phase,
+    uint64_t progress)
+{
+    (void)progress;
+    CHECK(control == active);
+    if (phase == 44) ++filtered_rows;
+    if (phase == 50) ++filtered_build_maps;
+    if (phase == 51) ++filtered_probe_maps;
+    if (!filtered_fault || filtered_fired || phase != filtered_phase) return;
+    filtered_fired = true;
+    if (filtered_fault == 7) {
+        wl_columnar_memory_governor_t *governor =
+            wl_columnar_memory_governor_ref_get(filtered_governor);
+        uint64_t available = (UINT64_C(128) << 20)
+            - wl_columnar_memory_reserved(governor);
+        CHECK(available > 1 && wl_columnar_memory_reserve(governor,
+            available - 1, &filtered_peer));
+    } else if (filtered_fault == 8)
+        wl_columnar_join_test_attempt_fail_allocation = 0;
+    else if (filtered_fault & 1) wl_evaluation_control_request_cancel(control);
+    else CHECK(wl_evaluation_control_charge(control, UINT64_MAX)
+            == WL_EVALUATION_CONTROL_WORK_LIMIT);
+}
+
+typedef struct {
+    unsigned events, mask;
+    bool semi;
+} filtered_events_t;
+
+static void
+filtered_capture(const char *name, const int64_t *row, uint32_t columns,
+    int32_t diff, void *payload)
+{
+    if (strcmp(name, "output")) return;
+    filtered_events_t *events = payload;
+    CHECK(columns == 1 && diff == 1);
+    unsigned bit = row[0] == 64 ? 1 : row[0] == 17 ? 2 : row[0] == 99 ? 4 : 0;
+    CHECK(bit && !(events->mask & bit)
+        && (events->semi ? bit != 4 : bit == 4));
+    events->mask |= bit;
+    ++events->events;
+}
+
+static void
+filtered_generated_probes(void)
+{
+    for (unsigned semi = 0; semi < 2; ++semi)
+        for (unsigned batched = 0; batched < 2; ++batched)
+            for (unsigned fault = 0; fault < 9; ++fault) {
+                wirelog_error_t error;
+                wirelog_program_t *program = wirelog_parse_string(
+                    ".decl left(k:int64)\n.decl right(k:int64,v:int64)\n"
+                    ".decl output(k:int64)\n"
+                    "output(k):-left(k),!right(k,7).\n", &error);
+                CHECK(program);
+                if (semi) {
+                    wirelog_ir_node_t *anti = NULL;
+                    for (uint32_t r = 0; r < program->rule_count && !anti; ++r)
+                        anti = filtered_probe_anti(program->rules[r].ir_root);
+                    CHECK(anti);
+                    /* Explicit IR membership variant of the natural ANTI plan. */
+                    anti->type = WIRELOG_IR_SEMIJOIN;
+                    CHECK(!wl_ir_program_rebuild_relation_irs(program));
+                }
+                wl_plan_t *plan = NULL;
+                CHECK(!wl_plan_from_program(program, &plan));
+                unsigned emitted = 0;
+                for (uint32_t st = 0; st < plan->stratum_count; ++st)
+                    for (uint32_t r = 0; r < plan->strata[st].relation_count;
+                        ++r){
+                        const wl_plan_relation_t *rel =
+                            &plan->strata[st].relations[r];
+                        for (uint32_t o = 0; o < rel->op_count; ++o) {
+                            const wl_plan_op_t *op = &rel->ops[o];
+                            if (op->op !=
+                                (semi ? WL_PLAN_OP_SEMIJOIN :
+                                WL_PLAN_OP_ANTIJOIN)) continue;
+                            CHECK(op->right_filter_expr.size &&
+                                op->right_filter_expr.data
+                                && !op->materialized && op->key_count == 1
+                                && !strcmp(op->right_relation, "right"));
+                            ++emitted;
+                        }
+                    }
+                CHECK(emitted == 1);
+                wl_evaluation_control_t *control = NULL;
+                CHECK(!wl_evaluation_control_create(UINT64_C(10000000),
+                    &control));
+                wl_columnar_memory_resolution_t resolution = {
+                    .budget_bytes = UINT64_C(128) << 20,
+                        .usable_bytes = UINT64_C(128) << 20,
+                        .mode = WL_COLUMNAR_MEMORY_MODE_ENFORCING
+                };
+                filtered_governor =
+                    wl_columnar_memory_governor_ref_create(&resolution);
+                CHECK(filtered_governor);
+                wl_session_options_t options; wl_session_options_init(&options);
+                options.evaluation_control = control;
+                options.memory_governor = filtered_governor;
+                wl_session_t *sessions[2] = {NULL, NULL};
+                CHECK(!wl_session_create_with_options(wl_backend_columnar(),
+                    plan, 1,
+                    &options, &sessions[0]));
+                CHECK(!wl_session_create(wl_backend_columnar(), plan, 1,
+                    &sessions[1]));
+                const int64_t left[] = {64, 17, 99};
+                int64_t right[130];
+                for (unsigned r = 0; r < 65; ++r) {
+                    right[2*r] = 1000 + r; right[2*r+1] = 8;
+                }
+                right[0] = 64; /* Rejected duplicate cannot create membership. */
+                right[2*3] = 64; right[2*3+1] = 7;
+                right[2*64] = 17; right[2*64+1] = 7;
+                for (unsigned i = 0; i < 2; ++i) {
+                    filtered_events_t events = {.semi = semi != 0};
+                    CHECK(!wl_session_insert(sessions[i], "left", left, 3, 1)
+                        && !wl_session_insert(sessions[i], "right", right, 65,
+                        2));
+                    wl_session_set_delta_cb(sessions[i], filtered_capture,
+                        &events);
+                    wl_col_session_t *col = (wl_col_session_t *)sessions[i];
+                    col->join_batch_bytes = batched ? 256 : 0;
+                    if (!i) {
+                        active = control;
+                        filtered_fault = fault; filtered_fired = false;
+                        wl_columnar_memory_reservation_init(&filtered_peer);
+                        filtered_rows = filtered_build_maps =
+                            filtered_probe_maps = 0;
+                        filtered_phase = fault >= 7 ? 43 : fault >=
+                            5 ? 51 : fault >= 3 ? 50 : 44;
+                        wl_columnar_join_test_attempt_checkpoint =
+                            filtered_checkpoint;
+                    }
+                    int rc = finish(sessions[i]);
+                    if (!i && fault) {
+                        CHECK(filtered_fired && !events.events && !events.mask
+                            && !session_find_rel(col, "output"));
+                        CHECK(rc == (fault == 8 ? ENOMEM : fault == 7 ? ENOSPC
+                            : fault &
+                            1 ? WL_EVALUATION_CONTROL_CANCELLED :
+                            WL_EVALUATION_CONTROL_WORK_LIMIT));
+                        CHECK(wl_session_budget_denied(sessions[i]) ==
+                            (fault == 7));
+                        if (fault ==
+                            7) CHECK(wl_columnar_memory_rollback(
+                                    &filtered_peer));
+                        wl_columnar_join_test_attempt_fail_allocation = -1;
+                        wl_evaluation_control_report_t report;
+                        CHECK(!wl_evaluation_control_report(control, &report)
+                            && report.result == rc && report.consumed
+                            && !wl_evaluation_control_active_attempt_id(
+                                control));
+                        CHECK(!wl_evaluation_control_reset(control)
+                            && !wl_evaluation_control_configure(control, 0));
+                        filtered_fault = 0;
+                        filtered_rows = filtered_build_maps =
+                            filtered_probe_maps = 0;
+                        rc = finish(sessions[i]);
+                    }
+                    CHECK(!rc && events.events == (semi ? 2u : 1u)
+                        && events.mask == (semi ? 3u : 4u));
+                    if (!i) {
+                        CHECK(filtered_rows == 65 && filtered_build_maps == 2
+                            && filtered_probe_maps >= 2);
+                        wl_columnar_join_test_attempt_checkpoint = NULL;
+                        active = NULL;
+                    }
+                    const col_rel_t *out = session_find_rel(col, "output");
+                    CHECK(out && out->ncols == 1 &&
+                        out->nrows == events.events);
+                    unsigned mask = 0;
+                    for (uint32_t r = 0; r < out->nrows; ++r)
+                        mask |= out->columns[0][r] ==
+                            64 ? 1 : out->columns[0][r] ==
+                            17 ? 2 : out->columns[0][r] == 99 ? 4 : 0;
+                    CHECK(mask == events.mask && !col->cleanup_active
+                        && !col->cleanup_pending &&
+                        !col->cleanup_reserved_bytes);
+                    wl_mem_ledger_snapshot_t before, after;
+                    wl_mem_ledger_snapshot(&col->mem_ledger, &before);
+                    CHECK(!finish(sessions[i]) &&
+                        events.events == (semi ? 2u : 1u));
+                    wl_mem_ledger_snapshot(&col->mem_ledger, &after);
+                    CHECK(before.current_bytes == after.current_bytes);
+                    CHECK(!wl_session_try_destroy(&sessions[i]) &&
+                        !sessions[i]);
+                }
+                wl_evaluation_control_release(control); wl_plan_free(plan);
+                wirelog_program_free(program);
+                CHECK(!wl_columnar_memory_reserved(
+                        wl_columnar_memory_governor_ref_get(
+                            filtered_governor)));
+                wl_columnar_memory_governor_ref_release(filtered_governor);
+                filtered_governor = NULL;
+            }
+}
+
 int
 main(int argc, char **argv)
 {
+    if (argc == 2 && !strcmp(argv[1], "filtered-numeric")) {
+        filtered_generated_probes(); return 0;
+    }
     static const probe_case_t cases[] = {
         {"keys", PROBE_KEYS, 0},
         {"keys-wide0", PROBE_WIDE, 0}, {"keys-wide1", PROBE_WIDE, 1},

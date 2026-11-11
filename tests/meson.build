@@ -7313,7 +7313,7 @@ foreach join_probe_case : [
   'schema0', 'schema1',
   'events0', 'events1', 'events2', 'events3', 'events4',
   'allocations0', 'allocations1', 'allocations2', 'schema-final-denial',
-  'first-semi', 'first-anti', 'funding',
+  'first-semi', 'first-anti', 'funding', 'filtered-numeric',
 ]
   test('evaluation_join_probes_' + join_probe_case,
        test_evaluation_join_probes_exe, args: [join_probe_case],
