@@ -2524,9 +2524,162 @@ probe_future_graph_order(void)
                 }
 }
 
+static void
+filtered_probe_cases(void)
+{
+    const uint32_t widths[] = {0, 1, 17, 65, 257};
+    for (unsigned anti = 0; anti < 2; ++anti)
+        for (unsigned keyed = 0; keyed < 2; ++keyed)
+            for (size_t w = 0; w < sizeof(widths) / sizeof(widths[0]); ++w)
+                for (unsigned filter = 0; filter < 3; ++filter) {
+                    if ((!widths[w] && keyed) || (!widths[w] && !filter))
+                        continue;
+                    fixture_t f;
+                    fixture_init(&f, widths[w], 9, 65, 0);
+                    f.op.op = anti ? WL_PLAN_OP_ANTIJOIN : WL_PLAN_OP_SEMIJOIN;
+                    f.op.key_count = keyed;
+                    uint8_t bytes[32];
+                    f.op.right_filter_expr = right_filter(bytes,
+                            (uint8_t)filter);
+                    /* Independently specified fixture keys are the row index.
+                     * col0-even filter admits noncontiguous original rows,
+                     * including64, while only9 original left rows exist. */
+                    uint32_t expected = filter == 2 ? (anti ? 9 : 0)
+                        : !keyed ? (anti ? 0 : 9)
+                        : !filter ? (anti ? 4 : 5) : (anti ? 0 : 9);
+                    probe_compare(&f, expected);
+                    col_rel_t *out =
+                        wl_columnar_eval_stack_cleanup_stack(
+                        f.frame)->items[0].rel;
+                    if (keyed && !filter)
+                        for (uint32_t row = 0; row < out->nrows; ++row)
+                            CHECK(out->columns[0][row] ==
+                                (int64_t)(row * 2 + anti));
+                    fixture_close(&f);
+                }
+    /* A high original row must be reached in the actual collision chain,
+    * not just inserted. Rejected duplicates cannot create membership. */
+    for (unsigned anti = 0; anti < 2; ++anti) {
+        fixture_t f; fixture_init(&f, 2, 3, 65, 0);
+        f.op.op = anti ? WL_PLAN_OP_ANTIJOIN : WL_PLAN_OP_SEMIJOIN;
+        f.op.key_count = 1;
+        uint8_t predicate[] = {WL_PLAN_EXPR_VAR, 4, 0, 'c', 'o', 'l', '1'};
+        f.op.right_filter_expr = (wl_plan_expr_buffer_t){predicate,
+                                                         sizeof(predicate)};
+        wl_columnar_relation_touch_storage(f.left);
+        wl_columnar_relation_touch_storage(f.registry[0]);
+        f.left->columns[0][0] = 64; f.left->columns[0][1] = 17;
+        f.left->columns[0][2] = 99;
+        for (uint32_t r = 0; r < 65; ++r) {
+            f.registry[0]->columns[0][r] = 1000 + r;
+            f.registry[0]->columns[1][r] = 0;
+        }
+        f.registry[0]->columns[0][1] = 64; /* Rejected duplicate. */
+        f.registry[0]->columns[0][3] = 64;
+        f.registry[0]->columns[1][3] = 1;
+        f.registry[0]->columns[0][16] = 17; /* Rejected duplicate. */
+        f.registry[0]->columns[0][64] = 17;
+        f.registry[0]->columns[1][64] = 1;
+        f.registry[0]->columns[0][63] = 99; /* Only rejected witness. */
+        probe_compare(&f, anti ? 1 : 2);
+        const col_rel_t *out =
+            wl_columnar_eval_stack_cleanup_stack(f.frame)->items[0].rel;
+        CHECK(out->columns[0][0] == (anti ? 99 : 64));
+        if (!anti) CHECK(out->columns[0][1] == 17);
+        fixture_close(&f);
+    }
+
+}
+
+static void
+filtered_probe_error_and_stop_cases(void)
+{
+    const unsigned phases[] = {43, 44, 45, 46, 26, 28, 29, 30, 31, 18};
+    for (unsigned anti = 0; anti < 2; ++anti) {
+        for (size_t phase = 0; phase < sizeof(phases) / sizeof(phases[0]);
+            ++phase)
+            for (unsigned turnover = 0; turnover < 2; ++turnover) {
+                fixture_t f; fixture_init(&f, 17, 3, 65, 0);
+                f.op.op = anti ? WL_PLAN_OP_ANTIJOIN : WL_PLAN_OP_SEMIJOIN;
+                f.op.key_count = 1;
+                uint8_t bytes[32];
+                f.op.right_filter_expr = right_filter(bytes, 0);
+                hook_fixture = &f; hook_phase = phases[phase]; hook_calls = 0;
+                hook_restart = turnover != 0;
+                wl_columnar_join_test_attempt_checkpoint = checkpoint;
+                run(&f);
+                wl_columnar_join_test_attempt_checkpoint = NULL;
+                CHECK(hook_calls == 1 && !f.status.committed
+                    && f.status.semantic_result ==
+                    (turnover ? EINVAL : WL_EVALUATION_CONTROL_CANCELLED)
+                    && wl_columnar_eval_stack_cleanup_stack(
+                        f.frame)->items[0].rel == f.left);
+                fixture_close(&f);
+            }
+        for (unsigned expression = 0; expression < 3; ++expression) {
+            fixture_t f; fixture_init(&f, 2, expression == 0 ? 0 : 3, 5, 0);
+            f.op.op = anti ? WL_PLAN_OP_ANTIJOIN : WL_PLAN_OP_SEMIJOIN;
+            f.op.key_count = 1;
+            uint8_t bytes[32];
+            f.op.right_filter_expr = right_filter(bytes,
+                    expression == 2 ? 4 : 2);
+            /* All false, failed division, and empty left all finish the full
+            * required filter before producing zero/semi or all/anti rows. */
+            probe_compare(&f, expression == 0 || !anti ? 0 : 3);
+            fixture_close(&f);
+        }
+        fixture_t nullary; fixture_init(&nullary, 2, 3, 0, 0);
+        col_rel_destroy(nullary.registry[0]);
+        nullary.registry[0] = relation_new("right", 0, 5);
+        nullary.op.op = anti ? WL_PLAN_OP_ANTIJOIN : WL_PLAN_OP_SEMIJOIN;
+        nullary.op.key_count = 1;
+        uint8_t bytes[32];
+        nullary.op.right_filter_expr = right_filter(bytes, 2);
+        probe_compare(&nullary, anti ? 3 : 0);
+        fixture_close(&nullary);
+        fixture_t missing; fixture_init(&missing, 2, 3, 5, 0);
+        missing.op.op = anti ? WL_PLAN_OP_ANTIJOIN : WL_PLAN_OP_SEMIJOIN;
+        missing.op.right_relation = "missing";
+        missing.op.right_filter_expr = (wl_plan_expr_buffer_t){NULL, 1};
+        run(&missing);
+        CHECK(!missing.status.semantic_result && !missing.status.committed
+            && wl_columnar_eval_stack_cleanup_stack(
+                missing.frame)->items[0].rel == missing.left);
+        fixture_close(&missing);
+        for (unsigned selected = 0; selected < 2; ++selected) {
+            fixture_t f; fixture_init(&f, 2, 3, 0, 0);
+            f.op.op = anti ? WL_PLAN_OP_ANTIJOIN : WL_PLAN_OP_SEMIJOIN;
+            f.op.key_count = 1;
+            f.op.right_filter_expr = right_filter(bytes, 0);
+            col_rel_destroy(f.registry[0]);
+            f.registry[0] = relation_new("right", 2, 0);
+            wirelog_column_type_t types[] = {WIRELOG_TYPE_INT64,
+                                             WIRELOG_TYPE_FLOAT};
+            CHECK(!col_rel_set_column_types(f.registry[0], types, 2));
+            for (uint32_t r = 0; r < 5; ++r) {
+                int64_t row[] = {r, wl_columnar_float_to_bits((double)r)};
+                CHECK(!col_rel_append_row(f.registry[0], row));
+            }
+            f.registry[0]->columns[1][selected ? 2 : 1] =
+                INT64_C(0x7ff8000000000000);
+            if (selected) {
+                /* Invalid accepted row wins before malformed projection guard;
+                 * never call raw with its inconsistent pointer/count contract. */
+                if (!anti) f.op.project_count = 1;
+                run(&f);
+                CHECK(f.status.semantic_result == EINVAL && !f.status.committed
+                    && wl_columnar_eval_stack_cleanup_stack(
+                        f.frame)->items[0].rel == f.left);
+            } else probe_compare(&f, anti ? 1 : 2);
+            fixture_close(&f);
+        }
+    }
+}
+
 int
 main(void)
 {
+    filtered_probe_cases(); filtered_probe_error_and_stop_cases();
     probe_semantics(); probe_metadata(); probe_float_keys(); probe_rejections();
     probe_interrupts();
     probe_allocations_and_quota(); probe_literal_prefixes();
