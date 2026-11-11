@@ -1087,7 +1087,10 @@ preparation, a final edge snapshot check, and the registry commit. A stop before
 that commit drains child cleanup receipts before releasing the lease. The
 prepared registration, merge state and managed private relations are then
 cleaned while the session remains pending and supported mutations stay gated;
-the previous `path` remains registered for retry. Commit is the publication
+the previous `path` remains registered for retry. A body whose frame cannot be
+bootstrapped stops the STEP with the bootstrap's own error, for example
+`ENOBUFS` when every cleanup receipt slot is in use or `ENOSPC` when the
+governor refuses it (#2351). Commit is the publication
 point: afterward the new `path` is authoritative, and lease release plus final
 private retirement resume as pending cleanup without publishing again. If
 relation storage changes outside the admitted append path, the route is

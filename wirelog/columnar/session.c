@@ -11816,8 +11816,14 @@ col_controlled_recursive_body_drive(wl_col_session_t *sess,
     int protocol = col_controlled_step_host_action(sess, step,
             recursive->relation, WL_COLUMNAR_EVAL_SERIAL_FRAMED_ADVANCE);
     if (protocol == EAGAIN) return EAGAIN;
-    if (protocol && step->reply.kind
-        == WL_COLUMNAR_EVAL_SERIAL_FRAMED_REPLY_REJECTED) {
+    /* A refused bootstrap also replies BOOTSTRAP_RECEIPT, with no frame and
+     * no receipt behind it; asking for its status would only report the
+     * missing receipt (#2351). */
+    if (protocol && (step->reply.kind
+        == WL_COLUMNAR_EVAL_SERIAL_FRAMED_REPLY_REJECTED
+        || (step->reply.kind
+        == WL_COLUMNAR_EVAL_SERIAL_FRAMED_REPLY_BOOTSTRAP_RECEIPT
+        && !sess->cleanup_active))) {
         recursive->body_active = false;
         col_controlled_recursive_fail(recursive, protocol);
         return 0;
