@@ -9927,6 +9927,10 @@ col_controlled_step_host_action_financed(wl_col_session_t *sess,
             || action == WL_COLUMNAR_EVAL_SERIAL_FRAMED_RECEIPT_ACK)
             ? step->unary_cleanup.key : ordinary_capture
             ? step->transaction->receipt_key
+            : step->recursive_route && recursive && recursive->receipt_pending
+            && (action == WL_COLUMNAR_EVAL_SERIAL_FRAMED_RECEIPT_RETRY
+            || action == WL_COLUMNAR_EVAL_SERIAL_FRAMED_RECEIPT_ACK)
+            ? recursive->receipt_key
             : step->terminal_receipt_ack
             && (action == WL_COLUMNAR_EVAL_SERIAL_FRAMED_RECEIPT_ACK
             || action == WL_COLUMNAR_EVAL_SERIAL_FRAMED_RECEIPT_RETRY)
@@ -11851,6 +11855,23 @@ col_controlled_recursive_body_drive(wl_col_session_t *sess,
         col_controlled_recursive_fail(recursive, protocol);
         return 0;
     }
+    /* The closed body frame keeps its receipt until it is acknowledged;
+     * leaving it FREED leaks one receipt slot per iteration (#2351).  The
+     * acknowledgement then continues with the body's result. */
+    if (step->reply.kind ==
+        WL_COLUMNAR_EVAL_SERIAL_FRAMED_REPLY_TERMINAL
+        && step->reply.cleanup_receipt_key.receipt_id
+        && col_controlled_step_receipt_state(sess,
+        &step->reply.cleanup_receipt_key)
+        == WL_COLUMNAR_EVAL_CLEANUP_RECEIPT_FREED) {
+        recursive->body_active = false;
+        recursive->receipt_key = step->reply.cleanup_receipt_key;
+        recursive->receipt_pending = true;
+        if (step->reply.execution_result && !recursive->primary_result)
+            recursive->primary_result = step->reply.execution_result;
+        recursive->phase = COL_CONTROLLED_RECURSIVE_BODY_RECEIPT_ACK;
+        return 0;
+    }
     if (step->reply.kind ==
         WL_COLUMNAR_EVAL_SERIAL_FRAMED_REPLY_TERMINAL) {
         recursive->body_active = false;
@@ -11927,23 +11948,44 @@ col_controlled_recursive_receipt_drive(wl_col_session_t *sess,
     int rc = col_controlled_step_host_action(sess, step,
             recursive->relation, action);
     if (rc == EAGAIN) return EAGAIN;
-    if (rc) return rc;
-    if (step->reply.kind ==
-        WL_COLUMNAR_EVAL_SERIAL_FRAMED_REPLY_TERMINAL_CLEANUP_PENDING)
-        return EAGAIN;
-    if (step->reply.kind != WL_COLUMNAR_EVAL_SERIAL_FRAMED_REPLY_TERMINAL)
-        return EAGAIN;
-    if (step->reply.execution_result && !recursive->primary_result)
-        recursive->primary_result = step->reply.execution_result;
-    if (recursive->phase == COL_CONTROLLED_RECURSIVE_BODY_RECEIPT_RETRY) {
+    /* The receipt table, not the reply, says what is left (#2351). */
+    wl_columnar_eval_cleanup_receipt_state_t left =
+        col_controlled_step_receipt_state(sess, &recursive->receipt_key);
+    if (action == WL_COLUMNAR_EVAL_SERIAL_FRAMED_RECEIPT_RETRY) {
+        /* Pending cleanup stays this attempt's debt until its frame frees. */
+        if (left == WL_COLUMNAR_EVAL_CLEANUP_RECEIPT_TRANSFERRED)
+            return EAGAIN;
+        if (left != WL_COLUMNAR_EVAL_CLEANUP_RECEIPT_FREED)
+            return rc ? rc : EINVAL;
+        if (!rc && step->reply.kind ==
+            WL_COLUMNAR_EVAL_SERIAL_FRAMED_REPLY_TERMINAL
+            && step->reply.execution_result && !recursive->primary_result)
+            recursive->primary_result = step->reply.execution_result;
         recursive->phase = COL_CONTROLLED_RECURSIVE_BODY_RECEIPT_ACK;
         return EAGAIN;
     }
+    /* A refused acknowledgement is retried under this attempt. */
+    if (left == WL_COLUMNAR_EVAL_CLEANUP_RECEIPT_FREED) return EAGAIN;
+    if (left != WL_COLUMNAR_EVAL_CLEANUP_RECEIPT_FREE) return rc ? rc : EINVAL;
     recursive->receipt_pending = false;
     memset(&recursive->receipt_key, 0, sizeof(recursive->receipt_key));
-    recursive->phase = recursive->primary_result
-        ? COL_CONTROLLED_RECURSIVE_ABORT
-        : COL_CONTROLLED_RECURSIVE_BEGIN_MERGE;
+    if (recursive->primary_result) {
+        recursive->phase = COL_CONTROLLED_RECURSIVE_ABORT;
+        return 0;
+    }
+    /* An acknowledged body continues exactly as a TERMINAL one does. */
+    if (!recursive->body_result) {
+        col_controlled_recursive_fail(recursive, EINVAL);
+        return 0;
+    }
+    recursive->iterations++;
+    rc = col_controlled_recursive_checkpoint(sess, recursive,
+            WL_COLUMNAR_SESSION_TEST_RECURSIVE_AFTER_BODY);
+    if (rc) {
+        col_controlled_recursive_fail(recursive, rc);
+        return 0;
+    }
+    recursive->phase = COL_CONTROLLED_RECURSIVE_BUILD_CANDIDATE;
     return 0;
 }
 
@@ -11953,7 +11995,10 @@ col_controlled_recursive_abort_body(wl_col_session_t *sess,
     col_controlled_recursive_step_t *recursive)
 {
     if (recursive->receipt_pending) {
-        recursive->phase = COL_CONTROLLED_RECURSIVE_BODY_RECEIPT_RETRY;
+        /* Defensive: an acknowledgement in progress is finished, not
+         * restarted as a retry. */
+        if (recursive->phase != COL_CONTROLLED_RECURSIVE_BODY_RECEIPT_ACK)
+            recursive->phase = COL_CONTROLLED_RECURSIVE_BODY_RECEIPT_RETRY;
         return col_controlled_recursive_receipt_drive(sess, step, recursive);
     }
     if (!recursive->body_active) return 0;
@@ -11975,6 +12020,18 @@ col_controlled_recursive_abort_body(wl_col_session_t *sess,
         recursive->body_active = false;
         if (step->reply.execution_result && !recursive->primary_result)
             recursive->primary_result = step->reply.execution_result;
+        /* An aborted body's receipt is acknowledged in the same call.  No
+        * test reaches an abort whose body closed with a FREED receipt. */
+        if (step->reply.cleanup_receipt_key.receipt_id
+            && col_controlled_step_receipt_state(sess,
+            &step->reply.cleanup_receipt_key)
+            == WL_COLUMNAR_EVAL_CLEANUP_RECEIPT_FREED) {
+            recursive->receipt_key = step->reply.cleanup_receipt_key;
+            recursive->receipt_pending = true;
+            recursive->phase = COL_CONTROLLED_RECURSIVE_BODY_RECEIPT_ACK;
+            return col_controlled_recursive_receipt_drive(sess, step,
+                       recursive);
+        }
         return 0;
     }
     if (step->reply.kind == WL_COLUMNAR_EVAL_SERIAL_FRAMED_REPLY_MORE
