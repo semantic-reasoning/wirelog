@@ -15146,7 +15146,8 @@ static bool
 wl_columnar_session_join_cleanup_pending(const wl_col_session_t *sess)
 {
     const wl_columnar_controlled_step_t *step = sess->controlled_step;
-    if (!wl_columnar_session_join_cleanup_root(sess, step)) return false;
+    if (!step || !wl_columnar_session_join_cleanup_root(sess, step))
+        return false;
     const wl_columnar_session_join_cleanup_t *p = &step->join_cleanup;
     return (p->phase >= WL_COLUMNAR_SESSION_NATIVE_ERROR_CHILD
            && p->phase <= WL_COLUMNAR_SESSION_NATIVE_ERROR_FINAL)
@@ -16698,9 +16699,8 @@ wl_columnar_session_controlled_step_drain_for_destroy(wl_col_session_t *sess)
 /* Controlled initial STEP uses the framed relation host; raw session
  * behavior keeps the established synchronous evaluator. */
 static int
-col_session_step(wl_session_t *session)
+col_session_step_body(wl_session_t *session)
 {
-    if (!session) return EINVAL;
     wl_col_session_t *sess = COL_SESSION(session);
     if (sess->controlled_step &&
         (sess->controlled_step->native_error_busy
@@ -16736,10 +16736,72 @@ col_session_step(wl_session_t *session)
     int cold_rc = wl_columnar_session_cold_execution_check(sess);
     if (cold_rc != 0) return cold_rc;
     if (session->evaluation_control)
-        return col_controlled_step(COL_SESSION(session), NULL);
+        return col_controlled_step(sess, NULL);
     const uint64_t denials = col_session_governor_denials(sess);
     return col_session_note_budget_outcome(sess, col_session_step_impl(session),
                denials);
+}
+
+/* Native, staging, retirement or receipt debt keeps a controlled STEP's
+ * attempt open across public calls, including after a nonzero return.  The
+ * tests end every attempt without such debt; this keeps a window open across
+ * the cleanup calls that would follow one. */
+static bool
+col_controlled_step_debt(const wl_col_session_t *sess)
+{
+    const wl_columnar_controlled_step_t *step = sess->controlled_step;
+    if (sess->cleanup_active || sess->cleanup_pending
+        || wl_columnar_session_join_cleanup_pending(sess)) return true;
+    return step && (step->operation_active || step->staging_cancel_pending
+           || step->retirement_begin_failure_pending
+           || step->finish_source_pending || step->retirement_native_count
+           || (step->native_error_phase
+           >= WL_COLUMNAR_SESSION_NATIVE_ERROR_CHILD
+           && step->native_error_phase
+           <= WL_COLUMNAR_SESSION_NATIVE_ERROR_FINAL));
+}
+
+/* A controlled STEP spans public calls, so its outcome is typed against the
+ * denial count from its first call rather than the last one (#2351).  Every
+ * return is typed, including those of the cleanup and retirement paths that
+ * finish an attempt, and the baseline closes once a return leaves no debt.
+ * A new attempt opens its own baseline when the previous one closed; one
+ * that starts while debt keeps the window open is typed against it. */
+static int
+col_session_step(wl_session_t *session)
+{
+    if (!session) return EINVAL;
+    if (!session->evaluation_control) return col_session_step_body(session);
+    wl_col_session_t *sess = COL_SESSION(session);
+    uint64_t attempt = sess->controlled_step
+        ? sess->controlled_step->operation_id : 0;
+    /* Defensive: a window left open by debt is reopened when a call enters
+     * a different attempt than the one it recorded. */
+    if (sess->controlled_denial_open && attempt
+        && sess->controlled_denial_attempt
+        && attempt != sess->controlled_denial_attempt)
+        sess->controlled_denial_open = false;
+    if (!sess->controlled_denial_open) {
+        /* A new attempt replaces the last one's report, as an uncontrolled
+         * STEP does when it begins. */
+        wl_columnar_session_budget_denial_clear(sess);
+        sess->controlled_denial_baseline = col_session_governor_denials(sess);
+        sess->controlled_denial_attempt = attempt;
+        sess->controlled_denial_open = true;
+    }
+    int rc = col_session_step_body(session);
+    /* Follow the attempt this call ran, so a later call of the same attempt
+     * is never mistaken for a new one. */
+    if (sess->controlled_step && sess->controlled_step->operation_id)
+        sess->controlled_denial_attempt = sess->controlled_step->operation_id;
+    if (rc == EAGAIN) return rc;
+    rc = col_session_note_budget_outcome(sess, rc,
+            sess->controlled_denial_baseline);
+    if (!col_controlled_step_debt(sess)) {
+        sess->controlled_denial_open = false;
+        sess->controlled_denial_attempt = 0;
+    }
+    return rc;
 }
 
 static wl_controlled_step_state_t

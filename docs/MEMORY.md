@@ -2194,17 +2194,24 @@ first. A zero-row insert or remove returns 0 and changes no relation. The public
 before the backend call, so a refused or zero-row call clears it too: read the
 flag right after `STEP` or `SNAPSHOT`.
 
-`wl_session_budget_denied` is true after an uncontrolled `STEP` or `SNAPSHOT`
-that returned `ENOSPC` and during which the governor refused an admission,
-wherever that happened: a denial during worker setup or on a worker that has
-retired leaves no session flag behind. Calls under evaluation control do not go
-through this rule (#2351). An internal `ENOMEM` with such a refusal is returned
-as `ENOSPC`, so the facades report `WIRELOG_ERR_MEMORY_BUDGET`. The flag is
-false after an uncontrolled call that returned 0, even if a refused admission
-was recovered from. The refusal can also be another session's on a shared
-governor, or one this evaluation recovered from, which mistypes an `ENOSPC` or
-`ENOMEM` that is not about admission. A flag set where a denial is known can
-also accompany another nonzero code.
+`wl_session_budget_denied` is true after a `STEP`, or a `SNAPSHOT` without
+evaluation control, that returned `ENOSPC` and during which the governor refused
+an admission, wherever that happened: a denial during worker setup, on a worker
+that has retired, or at a site that sets no flag of its own leaves no session
+flag behind. An internal `ENOMEM` with such a refusal is returned as `ENOSPC`,
+so the facades report `WIRELOG_ERR_MEMORY_BUDGET`. The flag is false after a
+call that returned 0, even if a refused admission was recovered from. A `STEP`
+under evaluation control spans public calls, so it is judged against the
+governor's count when its first call began, through its final return; the next
+controlled `STEP` clears the flag and starts a new count once the previous
+STEP's cleanup has finished, and a STEP that resumes outstanding cleanup is
+judged with it. A controlled `SNAPSHOT` is not typed this way: it reports only
+the denials that its refused admissions flag. While a controlled `STEP` is
+parked on `EAGAIN`, the flag shows only denials that its attempt has flagged so
+far; read it after the final return (#2351). The refusal can also be another
+session's on a shared governor, or one this evaluation recovered from, which
+mistypes an `ENOSPC` or `ENOMEM` that is not about admission. A flag set where a
+denial is known can also accompany another nonzero code.
 
 Input stays refused because the session holds an uncommitted evaluation. After
 a merge, the relation holds rows that are neither normalized nor counted as
@@ -2254,9 +2261,10 @@ A public memory governor reached the refused first `STEP`, the refused observed
 `STEP` and the refused evaluating `SNAPSHOT` without a test hook: a second
 session held the budget down, the evaluation was refused, and the second session
 then went away (`tests/test_session_budget_refusal.c`). Internally a refused
-admission returns `ENOSPC` or `ENOMEM`; an uncontrolled `STEP` or `SNAPSHOT`
-returns `ENOMEM` as `ENOSPC` when the governor refused an admission during the
-call.
+admission returns `ENOSPC` or `ENOMEM`; a `STEP`, with or without evaluation
+control, or an uncontrolled `SNAPSHOT` returns `ENOMEM` as `ENOSPC` when the
+governor refused an admission during the call, or during the attempt of a
+controlled `STEP`.
 
 The cursor clears in two places only: the commit block of a `STEP`, or of the
 drain inside a `SNAPSHOT`, that succeeds, and a stratum that reaches its

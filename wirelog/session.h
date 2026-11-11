@@ -512,8 +512,10 @@ wl_session_snapshot(wl_session_t *session, wirelog_on_tuple_fn callback,
  * boundary.  One can be reported as a denial when the governor refused anything
  * during the same call: another session sharing it, or an admission this call
  * recovered from.  With evaluation control it can be read while a STEP is
- * parked on EAGAIN or complete.  While a controlled call is running,
- * including from its own callbacks, it returns false. */
+ * parked on EAGAIN or complete; a controlled STEP is typed when its attempt
+ * returns something other than EAGAIN, and a new attempt clears it.  While a
+ * controlled call is running, including from its own callbacks, it returns
+ * false. */
 bool
 wl_session_budget_denied(wl_session_t *session);
 
