@@ -567,3 +567,40 @@ fields remain unchanged, the successor consumes zero, and actual cleanup
 releases all retained governor credit. Remaining representation, recursive,
 materialized, lifecycle and full source/carry rows remain open in the closure
 matrix; these tests alone do not complete #2300.
+
+
+## Canonical observed-child recovery
+
+The ordinary observed transaction now retains the actual current child's full
+receipt key before financier callbacks. This key is an identity candidate;
+real frame/receipt, operation, head, bindings, generation and native-thread
+proofs supply authority. The pending and ACK protocol flags remain separate.
+The cached receipt index is validated against all key fields. Receipt scans
+poll at each slot inside the independently admitted fixed owner envelope.
+
+The typed observed recovery route consumes genuine pending launch tuples,
+redirects neverborn numeric/filter work, and maintains authentic prepared
+publication receipts without an ordinary ABORT or any Original/successor
+charge. Actual receipt errors take priority over the provisional EINVAL used
+for an ended-successful but incomplete operation. Prepared mutable getters
+remain EBUSY; their read-only protection is retained through real ACK.
+
+Actual ACK publishes a result journal before financier callbacks. A completed
+ACK can return its actual result again only after full key, slot, session
+receipt generation and next-ID/epoch validation. Arbitrary FREE/ENOENT never
+means completed cleanup. Metadata financial close distinguishes an initial
+admission refusal with zero consumption from a stop after admitted work.
+
+`evaluation_observed_owner_recovery` exercises seven authentic recursive
+checkpoints: numeric preflight, unary child, framed lookup, pending result,
+FREED before parent consume, ACK after slot clear, and prepared publication.
+Each has healthy, ended0, live-successor and one-short metadata
+histories. Refused host funding is exercised at the six checkpoints with a
+remaining host action; post-ACK journal consumption needs no new host grant. Wrong full keys and wrong native threads are rejected before and
+after registration. Repeated genuine ACK results, absent STATUS, frozen report
+fields, zero successor consumption, nonpublication, exact future events and
+zero governor retention are checked using actual sessions and receipts.
+
+This repairs the canonical owner/receipt handoff. It does not certify finite
+observer/transaction disposal, RUNNING ROW/resource END/FINISH adapters or the
+containing SOURCE/carry proof. Those completion rows remain open in this PR.
