@@ -1090,13 +1090,19 @@ cleaned while the session remains pending and supported mutations stay gated;
 the previous `path` remains registered for retry. A body whose frame cannot be
 bootstrapped stops the STEP with the bootstrap's own error, for example
 `ENOBUFS` when every cleanup receipt slot is in use or `ENOSPC` when the
-governor refuses it (#2351). Commit is the publication
+governor refuses it (#2351). After a refused or cancelled later `STEP`,
+further positive appends to `edge` are still admitted while `edge` and `path`
+are as the route recorded them, and the retry evaluates the grown `edge`. A
+refused first `STEP` likewise admits appends to `edge` before its retry. A
+later `STEP` stopped by its work limit stays pending instead: mutations remain
+`EBUSY` until its retry completes. Commit is the publication
 point: afterward the new `path` is authoritative, and lease release plus final
 private retirement resume as pending cleanup without publishing again. If
-relation storage changes outside the admitted append path, the route is
-invalidated and neither stale `path` snapshots nor further appends are
-admitted. Other recursive plans and mutation shapes remain unsupported, so
-#1821 still requires additional operator coverage.
+relation storage changes outside the admitted append path, including a removal
+from `edge` after a refused `STEP`, the route is invalidated: the next `STEP`
+returns `EINVAL`, and from then on neither stale `path` snapshots nor further
+appends are admitted. Other recursive plans and mutation shapes remain
+unsupported, so #1821 still requires additional operator coverage.
 
 When a composed attempt owns an LFTJ child at the moment its original
 operation control latches cancellation or work-limit, the internal
