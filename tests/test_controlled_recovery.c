@@ -7,9 +7,13 @@
 #include "../wirelog/exec_plan_gen.h"
 #include "../wirelog/session.h"
 #include "../wirelog/session_options.h"
+#include "../wirelog/thread.h"
 #include "../wirelog/wirelog.h"
 #include <errno.h>
 #include <inttypes.h>
+#ifndef _MSC_VER
+#include <stdatomic.h>
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -645,6 +649,104 @@ test_work_limit_successor(void)
     fixture_close(&f);
 }
 
+static void
+ignore_tuple(const char *relation, const int64_t *row, uint32_t ncols,
+    void *user_data)
+{
+    (void)relation; (void)row; (void)ncols; (void)user_data;
+}
+
+/*
+ * C6: wl_session_budget_denied reads a completed controlled session, so a
+ * snapshot refused by the governor is reported.
+ */
+static void
+test_getter_after_refused_snapshot(void)
+{
+    fixture_t f;
+    open_chain(&f, 3);
+    CHECK(drive(&f, ACT_NONE, 0, NULL) == 0);
+    CHECK(!wl_session_budget_denied(f.session));
+    pressure_hold(&f);
+    int rc = wl_session_snapshot(f.session, ignore_tuple, NULL);
+    pressure_release(&f);
+    CHECK(!wl_evaluation_control_reset(f.control));
+    CHECK(rc == ENOSPC && col(&f)->memory_budget_denied);
+    CHECK(wl_session_budget_denied(f.session));
+    CHECK(!wl_session_snapshot(f.session, ignore_tuple, NULL));
+    CHECK(!wl_evaluation_control_reset(f.control));
+    CHECK(!wl_session_budget_denied(f.session));
+    fixture_close(&f);
+}
+
+static wl_session_t *delta_session;
+static unsigned delta_calls;
+static bool delta_saw_denied;
+
+static void
+read_getter_in_delta(const char *relation, const int64_t *row, uint32_t ncols,
+    int32_t diff, void *user_data)
+{
+    (void)relation; (void)row; (void)ncols; (void)diff; (void)user_data;
+    delta_calls++;
+    delta_saw_denied |= wl_session_budget_denied(delta_session);
+}
+
+/* C6: a running controlled STEP, here inside its own delta callback, still
+ * reads false. */
+static void
+test_getter_inside_running_step(void)
+{
+    char *text = copy_rules_text(1);
+    fixture_t f;
+    fixture_open(&f, text);
+    for (int64_t i = 1; i <= 3; ++i)
+        CHECK(!insert_edge(&f, i, i + 1));
+    delta_session = f.session;
+    delta_calls = 0;
+    delta_saw_denied = false;
+    wl_session_set_delta_cb(f.session, read_getter_in_delta, NULL);
+    col(&f)->memory_budget_denied = true;
+    CHECK(drive(&f, ACT_NONE, 0, NULL) == 0);
+    CHECK(delta_calls > 0 && !delta_saw_denied);
+    col(&f)->memory_budget_denied = false;
+    fixture_close(&f);
+    free(text);
+}
+
+static atomic_bool poll_stop;
+
+static void *
+poll_getter(void *arg)
+{
+    wl_session_t *session = arg;
+    while (!atomic_load_explicit(&poll_stop, memory_order_seq_cst))
+        (void)wl_session_budget_denied(session);
+    return NULL;
+}
+
+/* C6: polling the getter never makes a completed boundary's insert EBUSY. */
+static void
+test_getter_poll_does_not_block(void)
+{
+    char *text = copy_rules_text(1);
+    fixture_t f;
+    fixture_open(&f, text);
+    CHECK(!insert_edge(&f, 1, 2));
+    CHECK(drive(&f, ACT_NONE, 0, NULL) == 0);
+    atomic_store_explicit(&poll_stop, false, memory_order_seq_cst);
+    wl_thread_t poller;
+    CHECK(!wl_thread_create(&poller, poll_getter, f.session));
+    for (int64_t k = 0; k < 200; ++k) {
+        int64_t row[2] = { 2 + k % 40, 3 + k % 40 };
+        CHECK(!wl_session_insert(f.session, "edge", row, 1, 2));
+    }
+    atomic_store_explicit(&poll_stop, true, memory_order_seq_cst);
+    CHECK(!wl_thread_join(&poller));
+    fixture_close(&f);
+    free(text);
+}
+
 int
 main(void)
 {
@@ -662,6 +764,9 @@ main(void)
     test_removal_after_stopped_successor();
     test_append_after_refused_first_step();
     test_work_limit_successor();
+    test_getter_after_refused_snapshot();
+    test_getter_inside_running_step();
+    test_getter_poll_does_not_block();
     puts("controlled recovery passed");
     return 0;
 }
