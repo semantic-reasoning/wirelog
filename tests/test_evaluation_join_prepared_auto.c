@@ -17,6 +17,7 @@
                       } } while (0)
 
 static unsigned publication_heads, finish_heads, acknowledgments;
+static unsigned ended_finish_heads;
 static unsigned funding_injections;
 
 static uint64_t
@@ -78,8 +79,20 @@ prepared_checkpoint(wl_columnar_eval_stack_unary_prepared_t *p)
 {
     if (p->phase == WL_COLUMNAR_EVAL_STACK_PREPARED_JOIN_HEAD)
         ++publication_heads;
-    if (p->phase == WL_COLUMNAR_EVAL_STACK_PREPARED_FINISH_HEAD)
+    if (p->phase == WL_COLUMNAR_EVAL_STACK_PREPARED_FINISH_HEAD) {
         ++finish_heads;
+        const wl_columnar_eval_plan_numeric_attempt_t *n = p->numeric_owner;
+        CHECK(n && n->frame == p->frame && n->session == p->session
+            && n->control == p->control && n->attempt_id == p->attempt_id
+            && n->cursor < n->end
+            && p->operation == &n->plan->ops[n->cursor]);
+        if (wl_evaluation_control_active_attempt_id(p->control)
+            != p->attempt_id) {
+            CHECK(n->semantic_result == WL_EVALUATION_CONTROL_CANCELLED
+                || n->semantic_result == WL_EVALUATION_CONTROL_WORK_LIMIT);
+            ++ended_finish_heads;
+        }
+    }
     if (p->phase == WL_COLUMNAR_EVAL_STACK_PREPARED_ACK_READY)
         ++acknowledgments;
 }
@@ -126,7 +139,7 @@ test_generated(bool snapshot, bool observed, bool empty)
         CHECK(!wl_session_insert(sessions[i], "b", b, 2, 3));
         if (!empty) CHECK(!wl_session_insert(sessions[i], "c", c, 2, 2));
     }
-    publication_heads = finish_heads = acknowledgments = 0;
+    publication_heads = finish_heads = acknowledgments = ended_finish_heads = 0;
     funding_injections = 0;
     wl_columnar_session_test_framed_grant_limit = grant_limit;
     wl_columnar_eval_stack_test_unary_prepared_checkpoint = prepared_checkpoint;
@@ -163,7 +176,8 @@ test_generated(bool snapshot, bool observed, bool empty)
     CHECK(!drive(session, false, NULL) && events.count == delivered);
     if (!empty) {
         events.count = captured.count = 0;
-        publication_heads = finish_heads = acknowledgments = 0;
+        publication_heads = finish_heads = acknowledgments =
+            ended_finish_heads = 0;
         CHECK(!wl_session_remove(session, "c", c, 1, 2));
         CHECK(!wl_session_remove(raw, "c", c, 1, 2));
         wl_columnar_eval_stack_test_unary_prepared_checkpoint =
@@ -909,7 +923,8 @@ test_dynamic_bound_failure(unsigned turnover)
         bound_factory_turned_over = false;
         bound_receipt_short_requested = false;
         bound_receipt_refusals = bound_receipt_acks = 0;
-        publication_heads = finish_heads = acknowledgments = 0;
+        publication_heads = finish_heads = acknowledgments =
+            ended_finish_heads = 0;
         wl_columnar_session_test_framed_grant_limit = bound_failure_limit;
         wl_columnar_eval_stack_test_unary_prepared_checkpoint =
             prepared_checkpoint;
@@ -958,7 +973,10 @@ test_dynamic_bound_failure(unsigned turnover)
                     wl_columnar_memory_governor_ref_get(governor)) ==
                 reserved_before);
         }
+        /* Ended-Original recovery still executes the exact saved JOIN's
+         * finite FINISH; a generic native destroy is not this witness. */
         CHECK(finish_heads == (mode == 0 ? 0u : 1u));
+        CHECK(ended_finish_heads == (turnover && mode >= 2 ? 1u : 0u));
         for (unsigned i = 0; i < 3; ++i)
             CHECK(wl_columnar_relation_snapshot_equal(before[i],
                 wl_columnar_relation_snapshot(session_find_rel(columnar,
