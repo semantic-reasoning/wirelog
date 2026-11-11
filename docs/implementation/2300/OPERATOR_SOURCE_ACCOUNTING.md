@@ -489,3 +489,39 @@ step preserves event count and ledger bytes. Actual destruction releases the
 retained governor to zero after the sessions, plan and program are destroyed.
 These fixtures qualify their stated ordinary intersections; they do not claim
 all supported representation, deletion, materialized or recursive combinations.
+
+## Full-issue continuation: scalar right predicates
+
+The complete required outcome and unresolved rows are tracked in
+[CLOSURE_MATRIX.md](CLOSURE_MATRIX.md). Numeric filtered probes are an initial
+unit of that work, not an issue-closing delivery.
+
+Present nonempty right selection now retains the numeric compiled owner when
+supported and otherwise compiles through the current context-bearing scalar
+owner. Both JOIN and probe initializers explicitly clear both program slots;
+the common PROGRAM retirement frees the actual numeric/scalar owner before
+physical selection storage and its credit/reference tails. The scalar call
+uses the real session intern, extension snapshot, configured/active worker
+counts, parallel status and callback session key, with predicate rather than
+MAP extension-result permission. No raw expression fallback is introduced.
+The empty-right helper retains its existing mandatory-setup/no-evaluation
+contract; missing right still bypasses expression processing.
+
+The additional scalar compile is bracketed by actual saved-Original charges
+and return checks. Row evaluation enters the existing bounded scalar evaluator
+with the authenticated source row and complete context after the existing
+WORK admission. Semantic failure remains FILTER false; allocation, admission,
+stop and protocol errors retain their own channels. Original prices and these
+local observations do not close the containing Source/carry row.
+
+The scalar public fixture repeats the36 numeric-policy/fault histories with
+an actual compiler-selected string literal predicate. Its phase44 witness
+reads the authentic framed child and confirms a live scalar owner with no
+numeric owner on every evaluated right row. Explicit component JOIN/SEMI/ANTI
+predicates additionally run a long-string CONTAINS expression with literal
+content and raw parity, then cancel or create a genuine successor after
+program creation. The parser does not accept a computed function directly in
+a negated atom argument; that invalid syntax is not presented as a supported
+natural route. Accepted scalar function bytecode is exercised separately.
+No materialized, recursive, representation or financial row is closed merely
+by this predicate implementation; those remain explicit in the full matrix.

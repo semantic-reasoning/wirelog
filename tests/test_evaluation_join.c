@@ -338,6 +338,7 @@ compare_raw(fixture_t *f)
         if (f->registry[i]) CHECK(!wl_columnar_relation_deep_copy_governed(
                     f->registry[i], &right[i], NULL));
     raw.rels = right; raw.nrels = f->session.nrels;
+    raw.intern = f->session.intern;
     raw.delta_seeded = f->session.delta_seeded;
     wl_mem_ledger_init(&raw.mem_ledger, 0);
     eval_stack_t stack = {0};
@@ -1106,6 +1107,7 @@ probe_compare(fixture_t *f, uint32_t expected_rows)
         if (f->registry[i]) CHECK(!wl_columnar_relation_deep_copy_governed(
                     f->registry[i], &right[i], NULL));
     raw.rels = right; raw.nrels = f->session.nrels;
+    raw.intern = f->session.intern;
     raw.join_output_limit = f->session.join_output_limit;
     raw.delta_seeded = f->session.delta_seeded;
     wl_mem_ledger_init(&raw.mem_ledger, 0);
@@ -2676,6 +2678,59 @@ filtered_probe_error_and_stop_cases(void)
     }
 }
 
+static void
+right_scalar_function_cases(void)
+{
+    const uint8_t predicate[] = {
+        WL_PLAN_EXPR_VAR_STRING, 4, 0, 'c', 'o', 'l', '1',
+        WL_PLAN_EXPR_CONST_STR, 3, 0, 'c', 'h', 'o',
+        WL_PLAN_EXPR_STR_FN_CONTAINS
+    };
+    for (unsigned kind = 0; kind < 3; ++kind)
+        for (unsigned fault = 0; fault < 3; ++fault) {
+            fixture_t f; fixture_init(&f, 2, 3, 5, 0);
+            wl_intern_t *intern = wl_intern_create(); CHECK(intern);
+            f.session.intern = intern;
+            f.op.op = kind == 0 ? WL_PLAN_OP_JOIN
+            : kind == 1 ? WL_PLAN_OP_SEMIJOIN : WL_PLAN_OP_ANTIJOIN;
+            f.op.key_count = 1;
+            f.op.right_filter_expr = (wl_plan_expr_buffer_t){predicate,
+                                                             sizeof(predicate)};
+            char long_text[2050]; memset(long_text, 'x', sizeof(long_text));
+            memcpy(long_text + sizeof(long_text) - 4, "cho", 4);
+            int64_t yes = wl_intern_put(intern, long_text);
+            int64_t no = wl_intern_put(intern, "absent");
+            CHECK(yes >= 0 && no >= 0);
+            wirelog_column_type_t types[] = {WIRELOG_TYPE_INT64,
+                                             WIRELOG_TYPE_STRING};
+            CHECK(!col_rel_set_column_types(f.registry[0], types, 2));
+            for (uint32_t r = 0; r < 5; ++r)
+                f.registry[0]->columns[1][r] = r % 2 ? no : yes;
+            if (fault) {
+                hook_fixture = &f; hook_phase = 44; hook_calls = 0;
+                hook_restart = fault == 2;
+                wl_columnar_join_test_attempt_checkpoint = checkpoint;
+                run(&f);
+                wl_columnar_join_test_attempt_checkpoint = NULL;
+                CHECK(hook_calls == 1 && !f.status.committed
+                    && f.status.semantic_result == (fault == 2 ? EINVAL
+                    : WL_EVALUATION_CONTROL_CANCELLED)
+                    && wl_columnar_eval_stack_cleanup_stack(
+                        f.frame)->items[0].rel == f.left);
+                fixture_close(&f); wl_intern_free(intern);
+                continue;
+            }
+            if (!kind) compare_raw(&f);
+            else probe_compare(&f, kind == 1 ? 2 : 1);
+            const col_rel_t *out =
+                wl_columnar_eval_stack_cleanup_stack(f.frame)->items[0].rel;
+            CHECK(out->nrows == (kind == 2 ? 1u : 2u));
+            CHECK(out->columns[0][0] == (kind == 2 ? 1 : 0));
+            if (kind != 2) CHECK(out->columns[0][1] == 2);
+            fixture_close(&f); wl_intern_free(intern);
+        }
+}
+
 int
 main(void)
 {
@@ -2693,6 +2748,7 @@ main(void)
     key_interrupt_cases(); key_governor_cases(); key_literal_prefixes();
     hash_literal_prefixes(); batch_knob_refused_case();
     probe_right_filter_edges();
+    right_scalar_function_cases();
     right_filter_cases();
     right_filter_owned_storage_case();
     right_filter_owned_refusal_retry_case();
