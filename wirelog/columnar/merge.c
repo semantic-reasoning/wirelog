@@ -4585,6 +4585,10 @@ wl_columnar_managed_candidate_merge_cleanup_step(
             maintenance_control, maintenance_attempt_id);
         if (rc != 0)
             return rc;
+        /* A builder stopped before READY is retired in its FAILED shape. */
+        rc = wl_columnar_relation_managed_binary_build_abandon(build);
+        if (rc != 0)
+            return rc;
         rc = wl_columnar_relation_managed_retirement_begin(retirement,
                 build->relation);
         if (rc != 0)

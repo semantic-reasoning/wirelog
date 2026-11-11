@@ -783,6 +783,79 @@ test_controlled_enomem_after_denial(void)
     fixture_close(&f);
 }
 
+static unsigned builder_target_phase;
+static unsigned builder_target_entry;
+static unsigned builder_entries;
+static bool builder_cancelled;
+static unsigned builder_call, builder_cancel_call;
+
+static wl_evaluation_control_t *builder_root;
+
+/* Only the session's own control can be cancelled by a caller; builders
+ * funded by an internal maintenance control are left alone. */
+static void
+cancel_at_builder_phase(wl_evaluation_control_t *control, unsigned phase)
+{
+    if (phase != builder_target_phase || control != builder_root) return;
+    if (++builder_entries == builder_target_entry) {
+        wl_evaluation_control_request_cancel(control);
+        builder_cancelled = true;
+        builder_cancel_call = builder_call;
+    }
+}
+
+/*
+ * C8: a STEP cancelled while a binary builder sits before READY, in the
+ * recursive driver or inside a merge, still stops, releases every governor
+ * byte the builder held, and can be retried.  Every builder that enters the
+ * phase during the STEP is targeted in turn.
+ */
+static void
+test_cancel_inside_builder(void)
+{
+    static const unsigned phases[] = {
+        WL_COLUMNAR_RELATION_MANAGED_BINARY_BUILD_SHAPE,
+        WL_COLUMNAR_RELATION_MANAGED_BINARY_BUILD_COMMIT_RETAINED
+    };
+    for (unsigned later = 0; later <= 1; ++later)
+        for (unsigned p = 0; p < 2; ++p)
+            for (unsigned entry = 1;; ++entry) {
+                fixture_t f;
+                open_chain(&f, 5);
+                if (later) {
+                    CHECK(drive(&f, ACT_NONE, 0, NULL) == 0);
+                    CHECK(!insert_edge(&f, 6, 7));
+                }
+                builder_target_phase = phases[p];
+                builder_target_entry = entry;
+                builder_entries = 0;
+                builder_cancelled = false;
+                builder_root = f.control;
+                wl_columnar_relation_test_builder_phase =
+                    cancel_at_builder_phase;
+                int rc;
+                builder_call = 0;
+                do {
+                    rc = wl_session_step(f.session);
+                    ++builder_call;
+                } while (rc == EAGAIN && (!builder_cancelled
+                    || builder_call - builder_cancel_call < 1024));
+                wl_columnar_relation_test_builder_phase = NULL;
+                if (!builder_cancelled) {
+                    /* Every builder of this phase has been targeted. */
+                    CHECK(rc == 0 && entry > 1);
+                    fixture_close(&f);
+                    break;
+                }
+                CHECK(rc == WL_EVALUATION_CONTROL_CANCELLED);
+                CHECK(receipt_slots(&f) == 0);
+                CHECK(!wl_evaluation_control_reset(f.control));
+                CHECK(drive(&f, ACT_NONE, 0, NULL) == 0);
+                CHECK(rows(&f, "path") == closure_size(&f));
+                fixture_close(&f);
+            }
+}
+
 int
 main(void)
 {
@@ -805,6 +878,7 @@ main(void)
     test_getter_poll_does_not_block();
     test_controlled_step_denial_typed();
     test_controlled_enomem_after_denial();
+    test_cancel_inside_builder();
     puts("controlled recovery passed");
     return 0;
 }

@@ -3617,6 +3617,11 @@ wl_columnar_relation_managed_binary_build_step_budgeted(
         return 0;
     if (build->phase == WL_COLUMNAR_RELATION_MANAGED_BINARY_BUILD_FAILED)
         return build->failure_status ? build->failure_status : EINVAL;
+#ifdef WL_SESSION_TEST_HOOKS
+    if (wl_columnar_relation_test_builder_phase)
+        wl_columnar_relation_test_builder_phase(control,
+            (unsigned)build->phase);
+#endif
     bool lane_allocation = build->phase
         == WL_COLUMNAR_RELATION_MANAGED_BINARY_BUILD_COLUMN_0
         || build->phase
@@ -3854,6 +3859,53 @@ failed:
     build->allocation_control_identity = 0;
     build->allocation_attempt_id = 0;
     return rc;
+}
+
+/* Callback-free, allocation-free and unfunded, so a stopped attempt can
+ * still call it.  Puts a builder stopped before READY into the FAILED shape,
+ * whose relation managed_retirement_begin() accepts; READY and FAILED are
+ * kept as they are (#2351). */
+int
+wl_columnar_relation_managed_binary_build_abandon(
+    wl_columnar_relation_managed_binary_build_t *build)
+{
+    if (!build || build->identity != (uintptr_t)build)
+        return EINVAL;
+    switch (build->phase) {
+    case WL_COLUMNAR_RELATION_MANAGED_BINARY_BUILD_READY:
+    case WL_COLUMNAR_RELATION_MANAGED_BINARY_BUILD_FAILED:
+        return 0;
+    case WL_COLUMNAR_RELATION_MANAGED_BINARY_BUILD_INERT:
+        return EINVAL;
+    case WL_COLUMNAR_RELATION_MANAGED_BINARY_BUILD_SHAPE:
+        /* The SHAPE action itself, which writes descriptor fields only. */
+        build->relation->ncols = 2;
+        build->relation->declared_ncols = 2;
+        build->relation->capacity = build->capacity;
+        build->relation->merge_buf_cap = build->capacity;
+        build->relation->nrows = 0;
+        build->relation->sorted_nrows = 0;
+        break;
+    case WL_COLUMNAR_RELATION_MANAGED_BINARY_BUILD_COMMIT_RETAINED:
+        /* As the commit-failure branch does: return the uncommitted claim. */
+        if (build->governor_ref) {
+            if (!wl_columnar_memory_rollback(
+                    &build->relation->retained_reservation))
+                return EINVAL;
+            wl_columnar_memory_reservation_init(
+                &build->relation->retained_reservation);
+        }
+        break;
+    default:
+        break;
+    }
+    build->failure_status = ECANCELED;
+    build->phase = WL_COLUMNAR_RELATION_MANAGED_BINARY_BUILD_FAILED;
+    build->allocation_phase = WL_COLUMNAR_RELATION_MANAGED_BINARY_BUILD_INERT;
+    build->allocation_units_remaining = 0;
+    build->allocation_control_identity = 0;
+    build->allocation_attempt_id = 0;
+    return 0;
 }
 
 int
@@ -8093,6 +8145,8 @@ col_rel_append_all(col_rel_t *dst, const col_rel_t *src, wl_arena_t *arena)
 #ifdef WL_SESSION_TEST_HOOKS
 void (*wl_columnar_relation_test_before_reader_cas)(
     wl_evaluation_control_t *, wl_columnar_source_access_gate_t *, uint64_t);
+void (*wl_columnar_relation_test_builder_phase)(
+    wl_evaluation_control_t *, unsigned);
 void (*wl_columnar_relation_test_after_reader_cas)(
     wl_evaluation_control_t *, wl_columnar_source_access_gate_t *, bool);
 void (*wl_columnar_relation_test_before_writer_cas)(
