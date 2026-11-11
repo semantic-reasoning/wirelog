@@ -12182,6 +12182,15 @@ col_controlled_recursive_abort_cleanup(wl_col_session_t *sess,
             && *relation == recursive->working;
         bool aliases_copy = slot == 3 && *relation
             && *relation == recursive->copy_destination;
+        /* A private relation whose growth was refused keeps the denial on
+         * itself, and managed retirement refuses such a relation.  Keep the
+         * denial on the session instead, so the STEP still reports it and
+         * the relation can be retired (#2351). */
+        if (*relation && (*relation)->memory_budget_denial_pending
+            && !recursive->retirement_owner) {
+            sess->memory_budget_denied = true;
+            (*relation)->memory_budget_denial_pending = false;
+        }
         rc = col_controlled_recursive_retire_managed(step, recursive, relation);
         if (rc == EAGAIN || rc == EBUSY) return EAGAIN;
         if (rc) return rc;

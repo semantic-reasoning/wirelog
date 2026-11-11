@@ -896,6 +896,46 @@ test_cancel_inside_edge_acquire(void)
     }
 }
 
+/*
+ * A refusal while a private relation grows leaves the denial on that
+ * relation; the abort cleanup still retires it, so the STEP stops with the
+ * denial and a retry completes once the pressure is gone.
+ */
+static void
+test_refused_private_growth(void)
+{
+    for (unsigned later = 0; later <= 1; ++later) {
+        fixture_t f;
+        open_chain(&f, 5);
+        if (later) {
+            CHECK(drive(&f, ACT_NONE, 0, NULL) == 0);
+            CHECK(!insert_edge(&f, 6, 7));
+        }
+        hook_fixture = &f;
+        hook_point = WL_COLUMNAR_SESSION_TEST_RECURSIVE_SCHEMA_ADOPTED;
+        hook_iteration = 1;
+        wl_columnar_session_test_recursive_step_checkpoint =
+            pressure_at_checkpoint;
+        unsigned calls = 0, held_calls = 0;
+        int rc;
+        do {
+            rc = wl_session_step(f.session);
+            ++calls;
+            if (f.pressure_held && ++held_calls == 200)
+                pressure_release(&f);
+        } while (rc == EAGAIN && calls < 20000);
+        wl_columnar_session_test_recursive_step_checkpoint = NULL;
+        CHECK(held_calls > 0);
+        pressure_release(&f);
+        CHECK(rc == ENOSPC && wl_session_budget_denied(f.session));
+        CHECK(receipt_slots(&f) == 0);
+        CHECK(!wl_evaluation_control_reset(f.control));
+        CHECK(drive(&f, ACT_NONE, 0, NULL) == 0);
+        CHECK(rows(&f, "path") == closure_size(&f));
+        fixture_close(&f);
+    }
+}
+
 int
 main(void)
 {
@@ -920,6 +960,7 @@ main(void)
     test_controlled_enomem_after_denial();
     test_cancel_inside_builder();
     test_cancel_inside_edge_acquire();
+    test_refused_private_growth();
     puts("controlled recovery passed");
     return 0;
 }
