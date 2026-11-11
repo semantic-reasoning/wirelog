@@ -856,6 +856,46 @@ test_cancel_inside_builder(void)
             }
 }
 
+static wl_columnar_source_access_gate_t *edge_gate;
+
+static void
+cancel_before_edge_reader(wl_evaluation_control_t *control,
+    wl_columnar_source_access_gate_t *gate, uint64_t expected)
+{
+    (void)expected;
+    if (control && gate == edge_gate) {
+        wl_evaluation_control_request_cancel(control);
+        edge_gate = NULL;
+    }
+}
+
+/*
+ * C9: a STEP cancelled between the two gates of its `edge` reader releases
+ * the half-acquired lease, so the session can still be destroyed.
+ */
+static void
+test_cancel_inside_edge_acquire(void)
+{
+    for (unsigned later = 0; later <= 1; ++later) {
+        fixture_t f;
+        open_chain(&f, 5);
+        if (later) {
+            CHECK(drive(&f, ACT_NONE, 0, NULL) == 0);
+            CHECK(!insert_edge(&f, 6, 7));
+        }
+        col_rel_t *edge = session_find_rel(col(&f), "edge");
+        CHECK(edge);
+        edge_gate = &edge->descriptor_access;
+        wl_columnar_relation_test_before_reader_cas = cancel_before_edge_reader;
+        int rc = drive(&f, ACT_NONE, 0, NULL);
+        wl_columnar_relation_test_before_reader_cas = NULL;
+        CHECK(!edge_gate && rc == WL_EVALUATION_CONTROL_CANCELLED);
+        CHECK(drive(&f, ACT_NONE, 0, NULL) == 0);
+        CHECK(rows(&f, "path") == closure_size(&f));
+        fixture_close(&f);
+    }
+}
+
 int
 main(void)
 {
@@ -879,6 +919,7 @@ main(void)
     test_controlled_step_denial_typed();
     test_controlled_enomem_after_denial();
     test_cancel_inside_builder();
+    test_cancel_inside_edge_acquire();
     puts("controlled recovery passed");
     return 0;
 }

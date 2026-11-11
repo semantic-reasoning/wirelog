@@ -12111,7 +12111,11 @@ static int
 col_controlled_recursive_release_edge(
     col_controlled_recursive_step_t *recursive)
 {
-    if (!recursive->edge_held) return 0;
+    /* A stop between the descriptor and owner gates leaves edge_held false
+     * with the descriptor gate still held; release that partial lease too,
+     * or destroy finds `edge` still read (#2351). */
+    if (!recursive->edge_held && !recursive->edge_reader.descriptor_held)
+        return 0;
     int rc = wl_columnar_relation_reader_step(recursive->edge,
             &recursive->edge_reader, true, NULL, 0);
     if (!rc) recursive->edge_held = false;
