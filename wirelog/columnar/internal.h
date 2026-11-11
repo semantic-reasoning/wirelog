@@ -4860,13 +4860,15 @@ typedef enum {
     WL_COLUMNAR_RELATION_SCALAR_SOURCE_INERT,
     WL_COLUMNAR_RELATION_SCALAR_SOURCE_DESCRIPTOR,
     WL_COLUMNAR_RELATION_SCALAR_SOURCE_HELD,
+    WL_COLUMNAR_RELATION_SCALAR_SOURCE_ENDING,
     WL_COLUMNAR_RELATION_SCALAR_SOURCE_DRAINED
 } wl_columnar_relation_scalar_source_phase_t;
 
 typedef struct wl_columnar_relation_scalar_source {
     struct wl_columnar_relation_scalar_source *identity;
     wl_evaluation_control_t *control;
-    uint64_t attempt_id;
+    uint64_t attempt_id, control_identity, end_attempt_id;
+    unsigned end_cursor;
     wl_columnar_relation_scalar_source_phase_t phase;
 #if defined(WL_HAVE_C11_THREADS)
     thrd_t owner_thread;
@@ -4916,6 +4918,13 @@ int wl_columnar_relation_scalar_source_begin_attempt_controlled(
 int wl_columnar_relation_scalar_source_admit_attempt_controlled(
     wl_columnar_relation_scalar_source_t *source, const col_rel_t *relation,
     bool preserve_timestamps, uint32_t admit);
+/* Retained failures keep actual acquired claims and enter ENDING. Only the
+ * genuine initialized source may then be driven through finite funded END. */
+int wl_columnar_relation_scalar_source_begin_retained_attempt_controlled(
+    wl_columnar_relation_scalar_source_t *, const col_rel_t *, bool);
+/* The same opt-in representation check, retaining acquired readers on error. */
+int wl_columnar_relation_scalar_source_admit_retained_attempt_controlled(
+    wl_columnar_relation_scalar_source_t *, const col_rel_t *, bool, uint32_t);
 int wl_columnar_relation_scalar_source_validate_attempt_controlled(
     const wl_columnar_relation_scalar_source_t *, wl_evaluation_control_t *,
     uint64_t);
@@ -5065,6 +5074,17 @@ int wl_columnar_relation_append_batch_mark_sorted_operator_controlled(
     wl_columnar_relation_append_batch_t *, wl_evaluation_control_t *, uint64_t);
 int wl_columnar_relation_scalar_source_end(
     wl_columnar_relation_scalar_source_t *source, int initiating_result);
+/* One finite reader/metadata action. Protocol is separate from first_result;
+ * ENDING blocks forward access. Progress survives a stopped financier footer.
+ * The caller owns source storage until done and keeps its cleanup grants live. */
+int wl_columnar_relation_scalar_source_end_step(
+    wl_columnar_relation_scalar_source_t *, int,
+    wl_evaluation_control_t *, uint64_t, bool *);
+#ifdef WL_SESSION_TEST_HOOKS
+extern void (*wl_columnar_relation_test_scalar_end_checkpoint)(
+    const wl_columnar_relation_scalar_source_t *, wl_evaluation_control_t *,
+    uint64_t, unsigned);
+#endif
 
 /* Fresh private scalar construction. Same strict non-NULL name/governor/out
 * domain as raw; NULL control delegates raw. The name remains immutable for
@@ -8197,11 +8217,33 @@ int wl_columnar_filter_batch_end_step_owned_funded(
     const void *, wl_evaluation_control_t *, uint64_t);
 /* Exact owned ordinary JOIN cleanup only. Queries refuse all stream hosts;
  * actual END uses distinct supplied funding after the parent dispatch1. */
+typedef enum {
+    WL_COLUMNAR_FILTER_SOURCE_END_NONE,
+    WL_COLUMNAR_FILTER_SOURCE_END_EMPTY_LEFT,
+    WL_COLUMNAR_FILTER_SOURCE_END_EMPTY_RIGHT,
+    WL_COLUMNAR_FILTER_SOURCE_END_SCALAR_LEFT,
+    WL_COLUMNAR_FILTER_SOURCE_END_SCALAR_RIGHT
+} wl_columnar_filter_source_end_kind_t;
+int wl_columnar_filter_source_end_pending_owned(
+    wl_columnar_eval_stack_cleanup_frame_t *, const void *,
+    wl_evaluation_control_t *, uint64_t,
+    wl_columnar_filter_source_end_kind_t *);
+int wl_columnar_filter_source_end_step_owned(
+    wl_columnar_eval_stack_cleanup_frame_t *, wl_columnar_filter_status_t *,
+    const void *, wl_evaluation_control_t *, uint64_t);
 int wl_columnar_filter_empty_end_pending_owned(
     wl_columnar_eval_stack_cleanup_frame_t *, const void *, bool *);
 int wl_columnar_filter_empty_end_step_owned(
     wl_columnar_eval_stack_cleanup_frame_t *, wl_columnar_filter_status_t *,
     const void *, wl_evaluation_control_t *, uint64_t);
+int wl_columnar_eval_stack_scalar_source_begin_owned(
+    wl_columnar_eval_stack_cleanup_frame_t *, const void *,
+    const wl_plan_op_t *,
+    wl_columnar_relation_scalar_source_t *, const col_rel_t *, bool);
+int wl_columnar_eval_stack_scalar_source_admit_owned(
+    wl_columnar_eval_stack_cleanup_frame_t *, const void *,
+    const wl_plan_op_t *,
+    wl_columnar_relation_scalar_source_t *, const col_rel_t *, bool, uint32_t);
 int wl_columnar_eval_stack_filter_context_nonstream_owned(
     wl_columnar_eval_stack_cleanup_frame_t *, wl_columnar_filter_context_t **,
     const void *);

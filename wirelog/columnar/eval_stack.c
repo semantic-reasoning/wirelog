@@ -2111,6 +2111,67 @@ wl_columnar_eval_stack_filter_context_owned(
     return 0;
 }
 
+int
+wl_columnar_eval_stack_scalar_source_begin_owned(
+    wl_columnar_eval_stack_cleanup_frame_t *frame, const void *owner,
+    const wl_plan_op_t *op, wl_columnar_relation_scalar_source_t *source,
+    const col_rel_t *relation, bool timestamps)
+{
+    return wl_columnar_eval_stack_scalar_source_admit_owned(frame, owner, op,
+        source, relation, timestamps, 0);
+}
+
+int
+wl_columnar_eval_stack_scalar_source_admit_owned(
+    wl_columnar_eval_stack_cleanup_frame_t *frame, const void *owner,
+    const wl_plan_op_t *op, wl_columnar_relation_scalar_source_t *source,
+    const col_rel_t *relation, bool timestamps, uint32_t admit)
+{
+    wl_columnar_filter_context_t *ctx = NULL;
+    int rc = wl_columnar_eval_stack_filter_context_owned(frame, &ctx, owner);
+    if (rc) return rc;
+    if (!op ||
+        (source != &ctx->source && source != &ctx->join_right)) return EINVAL;
+    if (frame->stream_host) {
+        if (frame->stream_dispatch != WL_COLUMNAR_JOIN_STREAM_START
+            || !wl_columnar_join_pipeline_stream_authorized(owner, frame,
+            frame->stream_host, WL_COLUMNAR_JOIN_STREAM_START, op,
+            frame->stream_input, frame->stream_generation,
+            frame->stream_schema))
+            return EBUSY;
+        /* The actual stream lease retains its separate legacy BEGIN contract. */
+        return wl_columnar_relation_scalar_source_admit_attempt_controlled(
+            source,
+            relation, timestamps, admit);
+    }
+    if (!owner) return
+            wl_columnar_relation_scalar_source_admit_attempt_controlled(
+            source, relation, timestamps, admit);
+    const wl_columnar_eval_plan_numeric_attempt_t *r = owner;
+    if (ctx->identity != ctx || ctx->frame != frame ||
+        ctx->session != r->session
+        || ctx->control != r->control || ctx->attempt_id != r->attempt_id)
+        return EINVAL;
+    bool pending_start = (r->phase == WL_COLUMNAR_EVAL_PLAN_NUMERIC_PENDING
+        && r->pending_action == WL_COLUMNAR_EVAL_PLAN_NUMERIC_READY)
+        || (r->phase == WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_PENDING
+        && r->pending_action == WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_READY);
+    bool selected = pending_start && r->plan && r->plan->ops
+        && r->cursor < r->end && r->cursor < r->plan->op_count
+        && op == &r->plan->ops[r->cursor];
+    /* Independent owned primitive calls can execute a different operation
+     * while the numeric engine is parked; their legacy END contract remains. */
+    if (!selected) return
+            wl_columnar_relation_scalar_source_admit_attempt_controlled(
+            source, relation, timestamps, admit);
+    /* This is forward BEGIN, after complete actual ownership and launch
+     * selection. Separate its metadata proof from the source's first body. */
+    rc = wl_evaluation_control_charge_attempt(r->control, r->attempt_id, 0);
+    if (rc) return rc;
+    return wl_columnar_relation_scalar_source_admit_retained_attempt_controlled(
+        source, relation, timestamps, admit);
+}
+
 /* Operator entry validation is callback-free and consumes no authority.
  * IDLE frames have no creator-thread identity: callers serialize their use. */
 int

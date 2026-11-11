@@ -1153,6 +1153,12 @@ wl_columnar_source_access_reader_clear(
     token->release_stage = 0;
 }
 
+#ifdef WL_SESSION_TEST_HOOKS
+extern void (*wl_columnar_source_access_test_before_reader_release_cas)(
+    const wl_columnar_source_access_reader_t *,
+    wl_columnar_source_access_gate_t *, uint64_t);
+#endif
+
 /* Perform at most one source-gate reference decrement. Contention returns
  * EAGAIN with the token retaining its remaining release stage. */
 static inline int
@@ -1182,6 +1188,11 @@ wl_columnar_source_access_reader_release_step(
     if (token->release_stage == 0 && token->secondary_owner
         && !wl_columnar_source_access_gate_busy(token->secondary_owner))
         return EINVAL;
+#ifdef WL_SESSION_TEST_HOOKS
+    if (wl_columnar_source_access_test_before_reader_release_cas)
+        wl_columnar_source_access_test_before_reader_release_cas(token, gate,
+            observed);
+#endif
     if (!atomic_compare_exchange_strong_explicit(&gate->state, &observed,
         observed - 1u, memory_order_release, memory_order_relaxed))
         return EAGAIN;

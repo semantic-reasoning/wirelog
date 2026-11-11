@@ -1707,7 +1707,7 @@ wl_columnar_eval_plan_source_hold(wl_columnar_eval_plan_numeric_attempt_t *r)
 {
     /* The scalar reader also admits an INLINE EDB (#2301). */
     if (!r->source_bare)
-        return wl_columnar_relation_scalar_source_admit_attempt_controlled(
+        return wl_columnar_relation_scalar_source_admit_retained_attempt_controlled(
             &r->source, r->source_selected, !r->source_empty,
             WL_COLUMNAR_RELATION_SOURCE_ADMIT_INLINE);
     bool done = false;
@@ -1744,9 +1744,11 @@ static int
 wl_columnar_eval_plan_source_end(wl_columnar_eval_plan_numeric_attempt_t *r,
     wl_evaluation_control_t *funding, uint64_t id)
 {
-    if (!r->source_bare)
-        return wl_columnar_relation_scalar_source_end(&r->source,
-                   r->semantic_result);
+    if (!r->source_bare) {
+        bool done = false;
+        return wl_columnar_relation_scalar_source_end_step(&r->source,
+                   r->semantic_result, funding, id, &done);
+    }
     bool done = false;
     int rc = wl_columnar_relation_empty_source_end(&r->source_empty_reader,
             funding, id, &done);
@@ -1757,7 +1759,7 @@ wl_columnar_eval_plan_source_end(wl_columnar_eval_plan_numeric_attempt_t *r,
  * dispatch1 plus the actual reader END charges. Receipt consumption remains
  * a separate HOST384 action. */
 static int
-wl_columnar_eval_plan_empty_fund(wl_evaluation_control_t *funding,
+wl_columnar_eval_plan_source_end_fund(wl_evaluation_control_t *funding,
     uint64_t id, const wl_evaluation_control_t *control)
 {
     if (!funding || !id || wl_evaluation_control_identity(funding) ==
@@ -1897,9 +1899,13 @@ wl_columnar_eval_plan_numeric_source_consume(
         record->phase = WL_COLUMNAR_EVAL_PLAN_NUMERIC_SOURCE_END;
         return 0;
     case WL_COLUMNAR_EVAL_PLAN_NUMERIC_SOURCE_END:
+        if (child_result) {
+            record->protocol_result = child_result;
+            record->phase = WL_COLUMNAR_EVAL_PLAN_NUMERIC_SOURCE_END;
+            return 0;
+        }
         if (!wl_columnar_eval_plan_source_drained(record)) {
-            record->protocol_result = child_result ? child_result
-                : record->source_bare ? 0 : EBUSY;
+            record->protocol_result = 0;
             record->phase = WL_COLUMNAR_EVAL_PLAN_NUMERIC_SOURCE_END;
             return 0;
         }
@@ -1985,21 +1991,23 @@ wl_columnar_eval_plan_numeric_attempt_step(
     if (rc) return rc;
     if (wl_columnar_eval_stack_frame_mutation_blocked(
             record->frame)) return EBUSY;
-    bool empty_child = false;
+    wl_columnar_filter_source_end_kind_t source_child =
+        WL_COLUMNAR_FILTER_SOURCE_END_NONE;
     if (record->phase == WL_COLUMNAR_EVAL_PLAN_NUMERIC_CHILD) {
-        rc = wl_columnar_filter_empty_end_pending_owned(record->frame, record,
-                &empty_child);
+        rc = wl_columnar_filter_source_end_pending_owned(record->frame, record,
+                funding, funding_id, &source_child);
         if (rc) return rc;
     }
     if ((record->phase == WL_COLUMNAR_EVAL_PLAN_NUMERIC_SOURCE_END
-        && record->source_bare && record->source_initialized) || empty_child) {
-        rc = wl_columnar_eval_plan_empty_fund(funding, funding_id,
+        && record->source_initialized) ||
+        source_child != WL_COLUMNAR_FILTER_SOURCE_END_NONE) {
+        rc = wl_columnar_eval_plan_source_end_fund(funding, funding_id,
                 record->control);
         if (rc) return rc;
-        if (empty_child) {
+        if (source_child != WL_COLUMNAR_FILTER_SOURCE_END_NONE) {
             record->pending_action = record->phase;
             record->phase = WL_COLUMNAR_EVAL_PLAN_NUMERIC_PENDING;
-            return wl_columnar_filter_empty_end_step_owned(record->frame,
+            return wl_columnar_filter_source_end_step_owned(record->frame,
                        &record->child_status, record, funding, funding_id);
         }
         return wl_columnar_eval_plan_numeric_source_step(record, funding,
@@ -2790,9 +2798,13 @@ wl_columnar_eval_plan_composed_source_consume(
         record->phase = WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_SOURCE_END;
         return 0;
     case WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_SOURCE_END:
+        if (child_result) {
+            record->protocol_result = child_result;
+            record->phase = WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_SOURCE_END;
+            return 0;
+        }
         if (!wl_columnar_eval_plan_source_drained(record)) {
-            record->protocol_result = child_result ? child_result
-                : record->source_bare ? 0 : EBUSY;
+            record->protocol_result = 0;
             record->phase = WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_SOURCE_END;
             return 0;
         }
@@ -3334,21 +3346,23 @@ wl_columnar_eval_plan_numeric_composed_attempt_step_validated_body(
         return wl_columnar_join_pipeline_numeric_step_funded(record, funding,
                    funding_id);
     }
-    bool empty_child = false;
+    wl_columnar_filter_source_end_kind_t source_child =
+        WL_COLUMNAR_FILTER_SOURCE_END_NONE;
     if (record->phase == WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_UNARY_CHILD) {
-        rc = wl_columnar_filter_empty_end_pending_owned(record->frame, record,
-                &empty_child);
+        rc = wl_columnar_filter_source_end_pending_owned(record->frame, record,
+                funding, funding_id, &source_child);
         if (rc) return rc;
     }
     if ((record->phase == WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_SOURCE_END
-        && record->source_bare && record->source_initialized) || empty_child) {
-        rc = wl_columnar_eval_plan_empty_fund(funding, funding_id,
+        && record->source_initialized) ||
+        source_child != WL_COLUMNAR_FILTER_SOURCE_END_NONE) {
+        rc = wl_columnar_eval_plan_source_end_fund(funding, funding_id,
                 record->control);
         if (rc) return rc;
-        if (empty_child) {
+        if (source_child != WL_COLUMNAR_FILTER_SOURCE_END_NONE) {
             record->pending_action = record->phase;
             record->phase = WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_PENDING;
-            return wl_columnar_filter_empty_end_step_owned(record->frame,
+            return wl_columnar_filter_source_end_step_owned(record->frame,
                        &record->child_status, record, funding, funding_id);
         }
         if (record->abort_requested
@@ -3811,7 +3825,6 @@ wl_columnar_eval_plan_numeric_composed_cleanup_source(
     } else if (record->phase ==
         WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_SOURCE_END) {
         if (!record->source_initialized
-            || wl_columnar_eval_plan_source_drained(record)
             || (record->source_bare ? record->source_empty_reader.identity !=
             &record->source_empty_reader : record->source.identity !=
             &record->source)) return EBUSY;
@@ -3826,8 +3839,8 @@ wl_columnar_eval_plan_numeric_composed_cleanup_source(
     }
 
     rc = record->phase == WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_SOURCE_END
-        && record->source_bare
-        ? wl_columnar_eval_plan_empty_fund(funding, funding_id, record->control)
+        ? wl_columnar_eval_plan_source_end_fund(funding, funding_id,
+            record->control)
         : wl_columnar_eval_plan_composed_fund(funding, funding_id,
             record->control);
     if (rc) return rc;
@@ -4407,13 +4420,18 @@ wl_columnar_eval_plan_registered_cleanup_step(
         if (rc) break;
         rc = wl_evaluation_control_charge_attempt(funding, id, bare ? 56 : 32);
         if (rc) break;
-        if (bare) {
-            rc = wl_columnar_eval_plan_empty_fund(funding, id, n->control);
+        wl_columnar_filter_source_end_kind_t source_kind;
+        rc = wl_columnar_filter_source_end_pending_owned(n->frame, n,
+                funding, id, &source_kind);
+        if (rc) break;
+        bool ending = source_kind != WL_COLUMNAR_FILTER_SOURCE_END_NONE;
+        if (ending) {
+            rc = wl_columnar_eval_plan_source_end_fund(funding, id, n->control);
             if (rc) break;
         }
         n->pending_action = n->phase;
         n->phase = WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_PENDING;
-        rc = bare ? wl_columnar_filter_empty_end_step_owned(n->frame,
+        rc = ending ? wl_columnar_filter_source_end_step_owned(n->frame,
                 &n->child_status, n, funding, id)
             : wl_columnar_filter_op_attempt_step_owned(n->frame,
                 &n->child_status, n);
@@ -4452,10 +4470,8 @@ wl_columnar_eval_plan_registered_cleanup_step(
             funding, id);
         break;
     case WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_SOURCE_END:
-        if (n->source_bare) {
-            rc = wl_columnar_eval_plan_empty_fund(funding, id, n->control);
-            if (rc) break;
-        }
+        rc = wl_columnar_eval_plan_source_end_fund(funding, id, n->control);
+        if (rc) break;
         rc = wl_columnar_eval_plan_composed_source_step(n, funding, id);
         break;
     case WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_SOURCE_ABORT:
@@ -4619,12 +4635,20 @@ wl_columnar_eval_plan_numeric_native_cleanup_step(
     wl_columnar_eval_plan_numeric_attempt_t *n = &ctx->child;
     n->composed_busy = true;
     switch (n->phase) {
-    case WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_UNARY_CHILD:
+    case WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_UNARY_CHILD: {
+        wl_columnar_filter_source_end_kind_t source_kind;
+        rc = wl_columnar_filter_source_end_pending_owned(n->frame, n,
+                funding, id, &source_kind);
+        if (rc) break;
         n->pending_action = n->phase;
         n->phase = WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_PENDING;
-        rc = wl_columnar_filter_op_attempt_step_owned(n->frame,
+        rc = source_kind != WL_COLUMNAR_FILTER_SOURCE_END_NONE
+            ? wl_columnar_filter_source_end_step_owned(n->frame,
+                &n->child_status, n, funding, id)
+            : wl_columnar_filter_op_attempt_step_owned(n->frame,
                 &n->child_status, n);
         break;
+    }
     case WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_UNARY_ACK:
         n->pending_action = n->phase;
         n->phase = WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_PENDING;

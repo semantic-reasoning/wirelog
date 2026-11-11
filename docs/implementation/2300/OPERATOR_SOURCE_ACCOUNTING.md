@@ -604,3 +604,167 @@ zero governor retention are checked using actual sessions and receipts.
 This repairs the canonical owner/receipt handoff. It does not certify finite
 observer/transaction disposal, RUNNING ROW/resource END/FINISH adapters or the
 containing SOURCE/carry proof. Those completion rows remain open in this PR.
+
+
+## Finite nonstream scalar BEGIN and END
+
+`scalar_source_begin_retained_attempt_controlled` preserves genuine acquired
+reader claims when BEGIN fails. Both descriptor and owner acquisition use the
+retained kernel; a successful CAS publishes the actual token before a later
+refusal can return. Failure saves the actual first cause and enters ENDING,
+including failure after HELD or snapshot publication. Shape, gather, clone and
+repeated BEGIN then refuse forward access. No owner or acquisition is inferred
+from a phase label: initialized token records identify the remaining claims.
+
+The existing BEGIN wrapper keeps its legacy automatic drain. The frame adapter
+selects retained BEGIN only for an authenticated nonstream numeric owner with
+an actual PENDING READY launch and the current plan operation. Independent
+owned primitives may execute a different operation while their numeric owner
+is parked; their existing contract remains. A stream branch requires the real
+START lease, host, downstream operation, input, generation and schema proof.
+Its finite stream BEGIN/END integration remains separately required.
+
+The new scalar END sibling returns protocol independently from the saved
+initiating result. It validates source identity, native thread and the saved
+Original allocation identity, rejects Original as financier before a charge,
+and performs one actual reader-release step or one fixed metadata packet.
+ENDING forbids forward access before any decrement. Owner and descriptor
+readers retain their real release stages across contention and refused
+financial returns. Descriptor data is not dereferenced after its protection
+is gone. The first result, including zero, remains frozen. Terminal progress
+survives a refused footer and permits a later observation without repeating a
+release. A drained query does not dereference the old controller or relation.
+
+The typed filter selector proves NONE, empty left/right or scalar left/right
+from actual context, child phase, current operation, saved tuple and original
+source record. It performs a genuine saved-financier observation after its
+common context proof; failure returns protocol, never a false NONE result.
+The action repeats proof. Scalar source initialization remains set until a
+successful DRAINED observation. Busy is cleared on every return, and a failed
+call preserves the returned status and enclosing cleanup stage.
+
+Dispatch wiring covers normal numeric, composed, registered
+JOIN/UNARY/OBSERVED and AUTO cleanup while retaining each owner's existing
+admission restrictions. The tests below name actual paths; wiring alone is
+not activation evidence. Empty sources call their existing finite relation
+leaf after the new complete proof; the old empty adapter is not recursively
+reproved. Source END consume checks the child protocol before DRAINED. A
+financier failure after terminal physical progress therefore schedules a new
+terminal observation; it does not become an Original semantic error or an
+implicit success. Ordinary incomplete progress schedules another END instead
+of inventing EBUSY. The existing synchronous API remains for its explicit
+legacy callers, including stream paths awaiting their actual adapter.
+
+The scalar leaf admits128 per unfinished action; an already DRAINED query
+requires no new leaf admission. The selected numeric plan dispatch
+admits1 separately; a filter wrapper admits its own128 before the leaf. These
+are real separate checks and logical prices, not source-observation upper
+bounds. Existing Original INIT256 is unchanged. Its saved allocation/attempt
+identity, ending cursor and complete inert reader stages are published before
+initialized=true. Actual frame allocation and governor accounting use the
+expanded record size. Old unused INIT/END slack is neither refunded nor used
+as a new SOURCE promise. Containing source/private-binding profiles and
+correlated carry still require separate qualification.
+
+`relation_scalar_source_end` has317 direct histories: real INERT/HELD and
+interrupted descriptor/owner/validation/snapshot states; typed, timestamped,
+shared-owner and widths0/1/17/257; exact128/one-short127; stopped/stale/copied/
+wrong-thread/Original-aliased financiers; actual CAS contention; refused
+post-release and terminal footers; Original turnover during BEGIN; legacy
+controls and genuine unsupported-descriptor ENOTSUP. Literal values, type and
+signed timestamp metadata, snapshots, gate counts and governor baselines are
+preserved. `evaluation_numeric_plan` separately asserts the wrapper's255/256
+boundary and five actual END actions without Original consumption, plus the
+plan-source128/129 dispatch boundary and pending financial refusal.
+
+Actual recursive sessions add12 retained-BEGIN and21 END histories. They prove
+that claims remain after interrupted BEGIN, then retire through actual finite
+consumers. Numeric, left and right END checkpoints cover healthy, ended0,
+live successor, metadata/host refusal and actual CANCEL/WORK after terminal
+physical progress. The seven-field old report, successor consumption0,
+pre-cutoff heads, future event uniqueness and governor release are checked.
+The existing34 canonical-owner histories remain independent regressions.
+
+This unit does not close finite observer/parent disposal, RUNNING ROW/batch,
+generic FINISH, stream source adapters, materialized domains or complete
+SOURCE/carry and platform qualification. Their closure matrix rows stay OPEN
+within the same Draft PR.
+
+
+### Local scalar-source observation bounds
+
+These are manually expanded written-source upper envelopes: evaluated scalar
+predicates, address/arithmetic fronts, stores, actual arguments/calls/results/
+returns and native first fronts. They are neither prices, byte counts,
+measurements nor strict executed lower witnesses. Controller/thread/native
+interiors retain only their existing narrow qualifications. The MSVC wide CAS
+and neutral active-ID read C shims are expanded; only the underlying
+Interlocked native operation retains its platform boundary.
+
+A **simple parent** below contributes exactly the existing73-cell numeric
+return envelope. The no-private-bindings entry uses the existing61-cell
+validation profile. Neither profile includes arbitrary static binding loops,
+dynamic observed authorization, stream/LATE/public ancestors or SourceRoot.
+They need their own complete joins; the tables cannot retrospectively qualify
+an earlier long prefix. A stopped zero is not a fresh observation: its full
+refused return remains attached to the preceding successful observation.
+
+| Complete local packet | C11/POSIX upper | MSVC upper | Expanded basis |
+|---|---:|---:|---|
+| INIT entry/admission refusal |32 |32 | Output bootstrap, null guards, real charge/front and refused return |
+| Admitted INIT through actual tail observation/local return |160 |176 |46 scalar target/store pairs92 + identity7 + two reader-clear call chains14 + thread2 + continuation1 + tail front6 + expanded tail20/36 =142/158, reserve18 |
+| Common source-END owner/context/alias proof to first actual zero |144 |144 | One nonstream getter58 + context/thread32 + arguments/bootstrap/alias/refusal38, reserve16 |
+| No-binding numeric entry through that common zero |240 |240 | Existing validation61 + common144 + direct caller fronts28, reserve7 |
+| Common zero through actual family proof and next dispatch observation/refusal |224 |240 | Source/child/tuple/op proof160 + selector12 + numeric16 + financier/active-ID28, reserve8; MSVC shim16 |
+| Common zero through refused second zero and simple-parent return |248 |248 | Family160 + result/NONE/zero/refusal12 + parent73, reserve3 |
+| Scalar END entry through its128 observation/refusal |112 |112 | Header/output geometry32 + thread/identity32 + financing/phase/cursor32 + real charge/refusal16 |
+| Scalar END admission to first-cause/ENDING publication and entry zero |48 |48 | Phase/result8 + at most4 meaningful target/store fronts16 + real zero/refusal16, reserve8 |
+| Scalar entry zero through one actual reader action to footer zero |160 |176 | Dispatch24 + expanded reader96/112 + result/cursor16 + footer16, reserve8 |
+| Scalar already-empty reader to footer |96 |96 | Real empty/stage guards32 + dispatch24 + cursor/footer24, reserve16 |
+| Scalar pointer/extent or identity/schema packet to footer |80 |80 | At most11 real metadata targets plus branch/cursor and actual footer fronts |
+| Scalar terminal packet to footer |64 |64 | Dispatch10 + four target/store fronts16 + footer16, reserve22 |
+| Scalar footer through wrapper publication and simple-parent return |160 |176 | Leaf12 + wrapper55 + parent73, reserve20; conservative MSVC allowance16 |
+| New bare wrapper second zero to direct empty leaf charge1 |128 |144 | Source/busy/done/arguments24 + header16 + thread16 + identity/active-ID/phase40 + charge16, reserve16; MSVC shim16 |
+| Empty charge1 through one reader CAS and simple-parent return |240 |256 | Leaf dispatch16 + reader96/112 + busy/status/return48 + parent73, reserve7 |
+| Empty already-empty reader to terminal admission |64 |64 | Ending/reader10 + inert-token20 + next real admission16, reserve18 |
+| Empty terminal admission through nonfinal control release and simple-parent return |192 |208 | Control/clear24 + nonfinal native release16/32 + done/return8 + wrapper48 + parent73, reserve23 |
+| Source-END consumption after its funding observation |80 |80 | Protocol-before-DRAINED, partial/terminal phase publication and simple return |
+
+The alias guard uses the **numeric owner's** still-retained Original pointer,
+including NONE/FINISH after CONTROL cleared the filter's pointer. It precedes
+the first real check. A late regression requests cancellation without
+observing it, rejects Original financing, and then finishes with stop NONE;
+a separate live-successor query is also rejected with consumption0.
+
+`reader_release_step` expands its real token/stage/thread proof, gate/load/
+secondary check, one CAS, physical progress or token clear, and return. Its
+portable96 and MSVC112 bounds include the latter's width selection, expected
+read, native call/result/comparison and failure writeback. A generic reader
+release loop is not hidden inside this bound. The selected empty wrapper
+retains an independent context pin, so releasing its empty-source controller
+reference is nonfinal; this qualification does not extend to an unrelated
+caller without that pin. MSVC reader/refusal packets use their full256
+local envelope. Extra ancestors require recounting.
+
+Retained BEGIN has a real Original **forward** observation after complete
+frame/context/current-launch selection and before its source-body entry.
+It separates metadata proof from the actual BEGIN checks and acquisitions.
+It is not executed as native END or used to refresh cleanup permission. Each
+failed acquisition preserves only its real token, and the failure journal
+blocks forward reuse. Legacy false-mode wrapper deltas and their constructor/
+stream callers still require their own profiles; the earlier86 initializer
+subtotal and tight old253 comments are not inherited automatically.
+
+The native C11 layout was checked against the old source record:256 becomes
+272 bytes, reader40 and thread8. This is layout evidence for that actual
+compiler, not a source metric or a POSIX/MSVC size assertion. Existing
+sizeof-based frame/host allocations, range geometry and accounted zero walks
+use the expanded layout. INIT logical256 stays unchanged; its old legacy END72
+bookkeeping is a separate term. In particular176+72 does not certify a common
+source interval, create a cleanup credit or settle incoming carry.
+
+These tables qualify local packets only. Full private-binding/public/stream
+caller profiles, legacy constructor failure cleanup, actual incoming and
+assigned SOURCE promises, performed lower and correlated carry remain required
+in S.FIN and the containing closure rows. No test count, zero check, FINISH,
+unused reservation or local upper closes those obligations.
