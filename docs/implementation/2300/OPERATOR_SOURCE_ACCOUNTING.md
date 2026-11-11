@@ -415,3 +415,77 @@ API for both ended Original and active successor. It rejects generic begin
 on the real embedded child before funding, preserves full context/report,
 then completes the existing native cleanup and verifies literal retry and
 resource baselines. Neither fixture manufactures native permission flags.
+
+## Numeric right-filtered membership probes
+
+The controlled SEMIJOIN/ANTIJOIN route now evaluates a present right filter
+before key, nullary, projection and output work. It reuses the ordinary JOIN
+numeric selection and empty-filter helpers. Missing right still repushes the
+original input before inspecting the expression. A failed numeric expression
+rejects that row; only selected rows undergo whole-row FLOAT validation.
+String-expression, materialized, differential, recursive and parallel probe
+expansion is not established by this change.
+
+The selection vector retains original row numbers in input order. Hash heads
+and `next` contain compact selected ordinals; both hash construction and probe
+comparison validate and translate an ordinal before reading the original
+right relation. The hash allocation and all membership loops use selected
+count. The output tuple remains in scratch slot 1, separate from the selection
+vector. Sources and their snapshots remain unchanged. The prior ANTI keep-all
+optimization still requires a physically empty right input; a filter-empty
+right may use the ordinary value-output path.
+
+### Observation intervals and logical work
+
+Each selected-row translation adds one actual Original-control CELL128
+admission, followed by the existing saved-generation tail observation. Build
+uses checkpoint50 and probe uses51. These are Original WORK consumption:
+`wl_columnar_join_attempt_charge` validates the saved generation and calls
+`wl_evaluation_control_charge_attempt`. They create no Source BANK, lexical
+lane, independent financier or assigned SOURCE promise. The neighboring
+WORK192 and CELL128 prices therefore must not be added as though this change
+issued a new SOURCE promise. They also provide no proof of a future containing
+SOURCE carry bound. Existing private-finance activation requirements remain.
+
+The local source census counts scalar stores, comparisons, address/arithmetic
+fronts and actual argument/call/result/return fronts. Controller and unchanged
+native/helper interiors retain only their existing qualification. These are
+conservative observation upper bounds, not performed lower bounds, prices,
+whole-route certification, or permission to widen an allocator boundary.
+
+| Changed containing interval | Upper | Expansion |
+|---|---:|---|
+| Preselection WORK check through selected helper's first real charge | 96 | Result/refusal, selected count/flag, empty choice, arguments/front and helper charge wrapper |
+| Last selection check through helper return and caller return check | 96 | Count/return or empty helper suffix, caller result and return-check arguments/arbitration |
+| Caller return check through projection/governor/key setup to tail24 | 128 | Optional projection refusal, governor selection, fixed key locals and tail wrappers |
+| Build row admission through mapping admission | 64 | Result/refusal, identity row initialization, filtered branch and charge arguments/wrapper |
+| Mapping admission through checked load and tail50/51 | 96 | Indexed map load, signed/range guards, conversion/store and tail arguments/wrappers |
+| tail50 through hashing's first real key charge | 96 | Return/refusal, hash local, actual helper arguments, fixed key setup and charge |
+| tail51 through tail17 and next comparison admission | 96 | Return/refusal, row store, multiplied progress expression, tail and keyed dispatch |
+| Mapping refusal/invalid result through status and numeric caller return | 224 | Fixed refusal front48 + existing status suffix64 + numeric caller73 + reserve39 |
+
+No additional lower-bound credit or incoming promise is claimed. Complete
+Source/carry and resource-bearing retirement qualification is still open;
+this partial domain expansion does not close #2300 or activate the experimental
+Root/BANK integration.
+
+### Evidence
+
+`evaluation_join` covers both probe kinds, keyed/unkeyed, widths0/1/17/65/257,
+all/none/sparse selections, a noncontiguous high-row collision chain, rejected
+duplicates, expression failure, missing/empty/nullary right, accepted/rejected
+invalid FLOATs, and cancellation or genuine generation turnover at selection
+and both mapping sites. It checks literal content and independent raw parity.
+Materialized probe rejection remains covered.
+
+`evaluation_join_probes_filtered-numeric` exercises public sessions using a
+compiler-selected filtered ANTI plan and a separately identified explicit-IR
+SEMI variant. It asserts actual emitted plan fields and selection/build/probe
+witnesses. Its36 histories cross both kinds with ordinary/batched policy and
+healthy, cancellation/WORK refusal at each of three phases, enforcing-cap
+refusal and allocation failure. Failures expose no output head or delta event;
+reset/raised-work retry delivers each expected row once. A subsequent empty
+step preserves event count and ledger bytes. Actual destruction releases the
+retained governor to zero after the sessions, plan and program are destroyed.
+These fixtures qualify their stated ordinary intersections; they do not claim
+all supported representation, deletion, materialized or recursive combinations.
