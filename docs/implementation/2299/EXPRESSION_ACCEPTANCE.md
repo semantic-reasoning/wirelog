@@ -2145,3 +2145,102 @@ failure tests are retained. Timestamp capacity proves addressability, not that
 all spare entries carry initialized provenance; seed composition must not read
 unknown spare slots or restore stale provenance over newly appended defaults.
 This prerequisite alone does not activate the inline-seed or recursive host.
+
+### Standalone physical seed transport prerequisite (unit 12)
+
+`session_seed.h` defines an internal, opaque physical actor. Its caller supplies
+stable disjoint context storage, one captured Original attempt, actual target,
+optional seed shadow, an immutable reset recipe, and subsequently the actual
+rule result. Calls are externally serialized and non-reentrant; sources and
+recipe storage remain alive through End. The actor checks its creator thread.
+It creates no native frame, registry entry, session completion record, installed
+API, or SOURCE permission. This is a reusable physical prerequisite, not runtime
+activation or completion of issue #2299.
+
+Prepare physically creates the actual private reset base and restores seed rows
+before reporting RULE_READY. It retains independent timestamp capacity even when
+observed reset gives the columns capacity zero. Actual rule append subsequently
+prepares missing type metadata before real same-base payload growth, installs
+metadata afterward, and uses real B2 row mutation. Conditional normalization
+sorts scalar values stably and retains the earliest duplicate's timestamp; it
+does not sum multiplicities. The returned result precedes STEP compaction.
+Tests explicitly compact the taken result when comparing it with completed raw
+STEP, so those boundaries are not conflated.
+
+The physical Arrow representation follows this source tree's actual helpers:
+raw type preparation and reconstruction use `g` for FLOAT and `l` for other
+scalar types, while the native type vector retains its actual scalar enum.
+An initial base copies its actual canonical one-character source format.
+Malformed NULL, empty, or longer formats are refused before a two-byte copy.
+No arbitrary Arrow parser or unbounded Arrow release is hidden in a packet.
+
+The ownership ledger contains the real target/shadow/rule readers; private
+working and conditional normalized relations; constructor descriptor, metadata,
+payload and length-table tokens; restore and gather/index scratch; replacement
+columns and timestamps; real growth/refund/downsize records; and staged new and
+detached old metadata. Private results have no external `mem_ledger` attachment.
+Governor tokens cover their actual allocations, including the old/new metadata
+policy overlap until old physical allocations retire. Each maintenance turn
+frees one allocation or advances a real credit receipt. Direct scalar retirement
+receipts destroy only the actor's two owned output slots. Actual source readers
+end before those private relations retire. A live refund remains discoverable
+until its receipt is DONE even after its token leaves REPLACING.
+
+Every new physical action buys 256 before its body. Copy and clear actions cover
+at most eight bytes. Tight B2 child return retains exactly the existing 253 plus
+three result-transport slots at the immediate actor boundary: continuation is
+installed before invoking the child and examined only after the next purchase.
+This does not certify an external session caller that assigns the returned
+status and dispatches progress/errors afterward. The test driver is semantic
+oracle scaffolding, not such a certified controller. Future canonical integration
+needs its own reviewed result carrier and funded caller envelope; no caller work
+can be retrospectively charged to a successful child or a refused reserve. Final metadata binding uses a
+saved-ID poll, two real token moves and fixed publication, with impossible move
+failure treated as an invariant violation. Real cleanup uses a distinct active
+funding attempt and never spends the stopped Original or its successor.
+
+The registered `evaluation_seed_physical` target exercises the 40 parsed raw
+loaded/unloaded, observed/plain, scalar/inferred/filtered and timestamp cases;
+repeated resets and insert/remove histories; actual bulk and normalized-output
+growth; malformed format rejection; real allocator prefixes and governor
+refusals; component cancellation/local-255/local-256/overflow/END-successor cuts;
+and all initialization cut points. These are component identities and local
+boundary witnesses, not an observed whole-host tariff. Checks include actual
+schema/type/name and logical timestamp equality, independent cap-zero/TS
+geometry, exclusive Take, repeatable End, source gate release, frozen Original
+reports, successor zero consumption and final governor zero. Complete source,
+LLVM/profile and independent final review gates remain separate requirements.
+
+Qualification exposed a raw append defect: a timestamped destination receiving
+an unstamped source could publish stale or uninitialized logical stamps. The
+separately reviewed prerequisite `e81be70a` corrects the existing final append
+boundary to zero exactly newly logical unstamped rows. Its raw tests and ledger
+remain separate. This actor follows that reviewed base: numeric B2 supplies zero
+to newly logical unstamped rule rows, actual initial logical target rows and
+stamped rule sources retain provenance, and stable normalization preserves the
+earliest representative. The old spare-history compatibility path and caller
+initialized-capacity extent were removed. Timestamp capacity is never treated
+as an initialized semantic extent; raw comparisons cover actual logical rows.
+
+The v3 governor-refusal claim is withdrawn: its mode 6 accidentally took the
+controller-padding path, and its conditional budget-restoration assertion was
+unreachable. Those historical passing runs do not establish governor denial.
+The corrected mode 6 changes only the actual shared governor's usable bound at
+selected positive admissions, requires that injection to occur, checks actual
+DENIED status and real token/claim state, and requires ENOSPC with an unstopped
+Original report. Zero-byte payload cases are excluded from admission evidence.
+The original and peer source images and shared reservation total remain intact;
+restoring the usable bound enables a successful physical retry on the same real
+sources, followed by actual owner cleanup and final governor zero. No reserved
+counter is restored or invented. Unlimited controller overflow is a separate
+mode with an exact EOVERFLOW assertion.
+
+Actual extension calls distinguish pre-rule restore denial (zero callbacks)
+from post-rule bulk-append denial (1101 callbacks). A separate genuinely
+untyped governed target and peer are created through existing allocation,
+schema and row-append APIs; their real STRING rule result exercises metadata
+length/new-tree denial and metadata cancellation, END/successor, local budget
+and overflow cuts. Its raw comparison uses the actual append/consolidate/compact
+helpers on that actual peer rather than modifying a session registry or clearing
+a type pointer. Read-only test observers report actual denied token state and
+never confer source or cleanup authority.

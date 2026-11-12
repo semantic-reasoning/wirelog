@@ -7519,3 +7519,13 @@ empty_expression_sources_exe = executable('test_evaluation_empty_expression_sour
 )
 test('evaluation_empty_expression_sources', empty_expression_sources_exe,
   suite: ['unit', 'tsan'], timeout: 120)
+
+seed_physical_exe = executable('test_evaluation_seed_physical',
+  files('test_evaluation_seed_physical.c'),
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  c_args: ['-DWL_SESSION_TEST_HOOKS=1'],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
+  link_with: [testlib_prod],
+)
+test('evaluation_seed_physical', seed_physical_exe,
+  suite: ['unit', 'tsan'], timeout: 120)

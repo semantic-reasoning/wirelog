@@ -26262,3 +26262,2595 @@ wl_columnar_relation_scalar_source_new_like_typed_operator_attempt_controlled(
     else if (local && col_rel_destroy_checked(local) != 0) abort();
     return rc;
 }
+
+/* Standalone physical seed transport. The original rule evaluator is a
+ * separate owner; this actor never creates a frame or changes a registry. */
+#include "columnar/session_seed.h"
+
+typedef enum {
+    WL_COLUMNAR_SESSION_SEED_A_NEW,
+    WL_COLUMNAR_SESSION_SEED_A_TARGET,
+    WL_COLUMNAR_SESSION_SEED_A_CAPTURE,
+    WL_COLUMNAR_SESSION_SEED_A_BASE,
+    WL_COLUMNAR_SESSION_SEED_A_RESTORE,
+    WL_COLUMNAR_SESSION_SEED_A_WAIT,
+    WL_COLUMNAR_SESSION_SEED_A_RULE,
+    WL_COLUMNAR_SESSION_SEED_A_APPEND,
+    WL_COLUMNAR_SESSION_SEED_A_SORT,
+    WL_COLUMNAR_SESSION_SEED_A_COMPLETE
+} wl_columnar_session_seed_actor_phase_t;
+
+typedef struct {
+    wl_columnar_memory_reservation_t token;
+    wl_columnar_memory_retirement_receipt_t retirement;
+    wl_columnar_memory_admission_status_t status;
+    bool initialized, committed, retiring;
+    uint64_t bytes;
+} wl_columnar_session_seed_credit_t;
+
+typedef enum {
+    WL_COLUMNAR_SESSION_SEED_B_ENTER,
+    WL_COLUMNAR_SESSION_SEED_B_CREDIT_INIT,
+    WL_COLUMNAR_SESSION_SEED_B_REF,
+    WL_COLUMNAR_SESSION_SEED_B_NAME,
+    WL_COLUMNAR_SESSION_SEED_B_LENGTH_SIZE,
+    WL_COLUMNAR_SESSION_SEED_B_LENGTH_RESERVE,
+    WL_COLUMNAR_SESSION_SEED_B_LENGTH_ALLOC,
+    WL_COLUMNAR_SESSION_SEED_B_LENGTH_COMMIT,
+    WL_COLUMNAR_SESSION_SEED_B_META,
+    WL_COLUMNAR_SESSION_SEED_B_META_NAME,
+    WL_COLUMNAR_SESSION_SEED_B_RESERVE,
+    WL_COLUMNAR_SESSION_SEED_B_DESCRIPTOR,
+    WL_COLUMNAR_SESSION_SEED_B_ZERO,
+    WL_COLUMNAR_SESSION_SEED_B_TOKEN_INIT,
+    WL_COLUMNAR_SESSION_SEED_B_IDENTITY,
+    WL_COLUMNAR_SESSION_SEED_B_STORAGE,
+    WL_COLUMNAR_SESSION_SEED_B_NAME_ALLOC,
+    WL_COLUMNAR_SESSION_SEED_B_NAME_COPY,
+    WL_COLUMNAR_SESSION_SEED_B_GRID_ALLOC,
+    WL_COLUMNAR_SESSION_SEED_B_GRID_ZERO,
+    WL_COLUMNAR_SESSION_SEED_B_LANE,
+    WL_COLUMNAR_SESSION_SEED_B_SCRATCH,
+    WL_COLUMNAR_SESSION_SEED_B_SCRATCH_ZERO,
+    WL_COLUMNAR_SESSION_SEED_B_TS,
+    WL_COLUMNAR_SESSION_SEED_B_TS_ZERO,
+    WL_COLUMNAR_SESSION_SEED_B_TS_HISTORY,
+    WL_COLUMNAR_SESSION_SEED_B_NAMES,
+    WL_COLUMNAR_SESSION_SEED_B_NAMES_ZERO,
+    WL_COLUMNAR_SESSION_SEED_B_COLNAME,
+    WL_COLUMNAR_SESSION_SEED_B_COLNAME_COPY,
+    WL_COLUMNAR_SESSION_SEED_B_TYPES,
+    WL_COLUMNAR_SESSION_SEED_B_TYPE_COPY,
+    WL_COLUMNAR_SESSION_SEED_B_ARROW,
+    WL_COLUMNAR_SESSION_SEED_B_ARROW_FORMAT,
+    WL_COLUMNAR_SESSION_SEED_B_CHILDREN,
+    WL_COLUMNAR_SESSION_SEED_B_CHILDREN_ZERO,
+    WL_COLUMNAR_SESSION_SEED_B_CHILD,
+    WL_COLUMNAR_SESSION_SEED_B_CHILD_INIT,
+    WL_COLUMNAR_SESSION_SEED_B_CHILD_FORMAT,
+    WL_COLUMNAR_SESSION_SEED_B_CHILD_NAME,
+    WL_COLUMNAR_SESSION_SEED_B_CHILD_NAME_COPY,
+    WL_COLUMNAR_SESSION_SEED_B_COMMIT,
+    WL_COLUMNAR_SESSION_SEED_B_MOVE,
+    WL_COLUMNAR_SESSION_SEED_B_BIND,
+    WL_COLUMNAR_SESSION_SEED_B_BOUND,
+    WL_COLUMNAR_SESSION_SEED_B_PUBLISH,
+    WL_COLUMNAR_SESSION_SEED_B_DONE
+} wl_columnar_session_seed_base_phase_t;
+
+typedef struct {
+    wl_columnar_session_seed_base_phase_t phase;
+    const col_rel_t *source;
+    col_rel_t *relation;
+    char *name;
+    int64_t **columns;
+    int64_t *scratch;
+    col_delta_timestamp_t *timestamps;
+    char **names;
+    wirelog_column_type_t *types;
+    uint64_t *lengths;
+    uint32_t width, capacity, ts_capacity;
+    uint32_t column, lanes, names_owned, child_count;
+    uint32_t table_zero, names_zero, children_zero;
+    unsigned token_index, embedded_index, bind_group;
+    uint64_t byte, name_length, metadata_bytes, payload_bytes;
+    uint64_t descriptor_bytes, lane_bytes, scratch_bytes, timestamp_bytes;
+    wl_columnar_session_seed_credit_t credit[3], length_credit;
+    bool active, schema_ok, scratch_present, names_present, types_present;
+    bool relation_ref, arrow_initialized, bound;
+    bool token_in_header[3];
+    unsigned cleanup_phase;
+    unsigned output;
+} wl_columnar_session_seed_base_t;
+
+typedef struct {
+    unsigned phase, kind;
+    col_rel_t *relation;
+    uint32_t requested, width, old_capacity, old_ts_capacity, old_rows;
+    uint32_t lane, lanes, table_zero, old_lane;
+    uint64_t byte, old_bytes, final_bytes, incoming, aggregate;
+    int64_t **columns, **displaced_columns;
+    col_delta_timestamp_t *timestamps, *displaced_timestamps;
+    wl_columnar_session_seed_credit_t fresh;
+    wl_columnar_memory_admission_status_t status;
+    wl_columnar_memory_governor_growth_commit_prepared_t prepared;
+    wl_columnar_memory_growth_refund_attempt_t refund;
+    wl_columnar_memory_downsize_attempt_t downsize;
+    bool active, growth, ready, published, refund_live, downsize_live;
+    bool fresh_canonical, fresh_committed;
+} wl_columnar_session_seed_resize_t;
+
+typedef struct {
+    unsigned phase, column, zeroed, allocated, initialized, old_column, cleanup;
+    uint32_t width;
+    uint64_t byte, name_byte, bytes, length_bytes, old_bytes;
+    uint64_t *lengths;
+    wirelog_column_type_t *types;
+    struct ArrowSchema schema, old_schema;
+    wl_columnar_session_seed_credit_t length_credit, new_credit, old_credit;
+    bool active, prepared, bound, root_initialized, new_owned, old_owned;
+    bool detached, installed, old_schema_ok;
+} wl_columnar_session_seed_metadata_t;
+
+struct wl_columnar_session_seed {
+    struct wl_columnar_session_seed *identity;
+    wl_evaluation_control_t *control;
+    uint64_t id, control_identity;
+    wl_columnar_memory_governor_ref_t *governor;
+#if defined(WL_HAVE_C11_THREADS)
+    thrd_t thread;
+#elif defined(_WIN32) || defined(_WIN64)
+    DWORD thread;
+#else
+    pthread_t thread;
+#endif
+    bool thread_valid, control_retained, governor_retained, ending;
+    wl_columnar_session_seed_progress_t progress;
+    wl_columnar_session_seed_actor_phase_t phase;
+    unsigned stage, next_stage, child_kind, cleanup_stage;
+    int last_result, first_result;
+    bool result_saved, child_pending;
+    const col_rel_t *target, *shadow, *rule;
+    const wl_columnar_session_seed_recipe_t *recipe;
+    wl_columnar_relation_reader_step_t target_reader;
+    wl_columnar_relation_reader_step_t shadow_reader, rule_reader;
+    wl_columnar_relation_scalar_source_t sources[4];
+    bool source_initialized[4];
+    col_rel_t *working, *normalized;
+    bool owned[2], normalized_result;
+    wl_columnar_relation_append_batch_t batch;
+    wl_columnar_relation_private_batch_drain_t drain;
+    bool batch_initialized, drain_initialized;
+    unsigned output, source, row, column;
+    uint32_t width, seed_rows, rule_rows, rows;
+    int64_t *restore_rows, *values;
+    uint32_t *indices, *temporary;
+    wl_columnar_session_seed_credit_t restore_credit, scratch_credit;
+    uint64_t restore_bytes, scratch_bytes, byte;
+    uint64_t span, base, middle, end, left, right, out;
+    uint32_t compare_left, compare_right, compare_column, position, previous;
+    int order;
+    int64_t left_bits, right_bits;
+    wirelog_column_type_t compare_type;
+    bool have_previous, normalize;
+    wl_columnar_session_seed_base_t base_build;
+    wl_columnar_session_seed_resize_t resize;
+    wl_columnar_session_seed_metadata_t metadata;
+    bool resize_resetting;
+    uint64_t resize_reset_byte;
+    unsigned pending_cleanup;
+    bool batch_resetting;
+    uint64_t batch_reset_byte, base_reset_byte;
+    unsigned compare_phase;
+    wl_columnar_relation_scalar_retirement_t retirement[2];
+    wl_columnar_relation_scalar_retirement_initializer_t initializer[2];
+    bool begun[2], retired[2];
+    unsigned owner, retire_stage;
+};
+
+#ifdef WL_SESSION_TEST_HOOKS
+void (*wl_columnar_session_seed_test_checkpoint)(
+    const wl_columnar_session_seed_t *, unsigned, unsigned);
+#endif
+
+static bool
+wl_columnar_session_seed_thread(const wl_columnar_session_seed_t *a)
+{
+#if defined(WL_HAVE_C11_THREADS)
+    return a->thread_valid && thrd_equal(a->thread, thrd_current());
+#elif defined(_WIN32) || defined(_WIN64)
+    return a->thread_valid && a->thread == GetCurrentThreadId();
+#else
+    return a->thread_valid && pthread_equal(a->thread, pthread_self());
+#endif
+}
+
+static int
+wl_columnar_session_seed_cut(wl_columnar_session_seed_t *a,
+    wl_evaluation_control_t *funding, uint64_t id, unsigned phase)
+{
+    if (!a || a->identity != a) return EINVAL;
+#ifdef WL_SESSION_TEST_HOOKS
+    if (wl_columnar_session_seed_test_checkpoint)
+        wl_columnar_session_seed_test_checkpoint(a, phase, a->stage);
+#else
+    (void)phase;
+#endif
+    int rc = wl_evaluation_control_charge_attempt(funding, id, 256);
+    if (rc) return rc;
+    return wl_columnar_session_seed_thread(a)?0:EINVAL;
+}
+
+static void
+wl_columnar_session_seed_copy8(void *to, const void *from, uint64_t bytes,
+    uint64_t *cursor)
+{
+    uint64_t n = bytes - *cursor;
+    if (n > 8) n = 8;
+    for (uint64_t i = 0; i < n; ++i)
+        ((unsigned char *)to)[*cursor+i] = from ?
+            ((const unsigned char *)from)[*cursor+i] : 0;
+    *cursor += n;
+}
+
+static void
+wl_columnar_session_seed_credit_init(wl_columnar_session_seed_credit_t *c)
+{
+    wl_columnar_memory_reservation_init(&c->token);
+    c->initialized = true;
+}
+
+static int
+wl_columnar_session_seed_credit_reserve(wl_columnar_session_seed_t *a,
+    wl_columnar_session_seed_credit_t *c)
+{
+    if (!a->governor || !c->bytes) return 0;
+    int rc = wl_columnar_memory_governor_reserve_source_attempt_controlled(
+        wl_columnar_memory_governor_ref_get(a->governor), c->bytes,
+        &c->token, &c->status, a->control, a->id);
+    if (rc) return rc;
+    return c->status == WL_COLUMNAR_MEMORY_ADMISSION_OK ||
+           c->status == WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY ? 0 :
+           c->status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED ? ENOSPC :
+           c->status ==
+           WL_COLUMNAR_MEMORY_ADMISSION_OVERFLOW ? EOVERFLOW : EINVAL;
+}
+
+static int
+wl_columnar_session_seed_credit_commit(wl_columnar_session_seed_t *a,
+    wl_columnar_session_seed_credit_t *c, const void *owner)
+{
+    if (!a->governor || !c->bytes) return 0;
+    return wl_columnar_memory_governor_commit_source_attempt_controlled(
+        &c->token, owner, &c->committed, a->control, a->id);
+}
+
+/* The caller funds one parent selection; the receipt owns its separate64. */
+static int
+wl_columnar_session_seed_credit_end(wl_columnar_session_seed_t *a,
+    wl_columnar_session_seed_credit_t *c,
+    wl_columnar_memory_reservation_t *token, wl_evaluation_control_t *funding,
+    uint64_t id, bool *done)
+{
+    *done = false;
+    if (!c->initialized || !a->governor || !c->bytes) {
+        c->bytes = 0; *done = true; return 0;
+    }
+    if (!c->retiring) {
+        uint64_t state = atomic_load_explicit(&token->state,
+                memory_order_acquire);
+        if (state == WL_COLUMNAR_MEMORY_RESERVATION_EMPTY ||
+            state == WL_COLUMNAR_MEMORY_RESERVATION_RELEASED) {
+            c->bytes = 0; *done = true; return 0;
+        }
+        bool reserved = state == WL_COLUMNAR_MEMORY_RESERVATION_RESERVED;
+        const void *owner = reserved ? NULL : (const void *)(uintptr_t)
+            atomic_load_explicit(&token->owner_bits, memory_order_acquire);
+        int rc = wl_columnar_memory_retirement_begin(token,
+                wl_columnar_memory_governor_ref_get(a->governor), owner,
+                reserved ? WL_COLUMNAR_MEMORY_RETIRE_ROLLBACK_RESERVED :
+                WL_COLUMNAR_MEMORY_RETIRE_RELEASE_COMMITTED, &c->retirement);
+        if (rc) return rc;
+        c->retiring = true; return 0;
+    }
+    if (c->retirement.phase != WL_COLUMNAR_MEMORY_RETIREMENT_DONE) {
+        int rc = wl_columnar_memory_retirement_step(&c->retirement, funding,
+                id);
+        return rc == EAGAIN?0:rc;
+    }
+    int rc = wl_columnar_memory_retirement_acknowledge(&c->retirement);
+    if (!rc) {
+        c->bytes = 0; c->retiring = false; *done = true;
+    }
+    return rc;
+}
+
+size_t
+wl_columnar_session_seed_size(void)
+{
+    return sizeof(wl_columnar_session_seed_t);
+}
+
+int
+wl_columnar_session_seed_init(wl_columnar_session_seed_t *a,
+    wl_evaluation_control_t *control, uint64_t id,
+    wl_columnar_memory_governor_ref_t *governor)
+{
+    if (!a || !control || !id) return EINVAL;
+    for (uint64_t byte = 0; byte < sizeof(*a);) {
+#ifdef WL_SESSION_TEST_HOOKS
+        if (wl_columnar_session_seed_test_checkpoint)
+            wl_columnar_session_seed_test_checkpoint(NULL, 9000,
+                (unsigned)(byte/8));
+#endif
+        int rc = wl_evaluation_control_charge_attempt(control, id, 256);
+        if (rc) return rc;
+        wl_columnar_session_seed_copy8(a, NULL, sizeof(*a), &byte);
+    }
+#ifdef WL_SESSION_TEST_HOOKS
+    if (wl_columnar_session_seed_test_checkpoint)
+        wl_columnar_session_seed_test_checkpoint(NULL, 9001, 0);
+#endif
+    int rc = wl_evaluation_control_charge_attempt(control, id, 256);
+    if (rc) return rc;
+    rc = wl_evaluation_control_retain(control);
+    if (rc) return rc;
+    if (governor) wl_columnar_memory_governor_ref_retain(governor);
+    rc = wl_evaluation_control_charge_attempt(control, id, 0);
+    if (rc) {
+        if (governor) wl_columnar_memory_governor_ref_release(governor);
+        wl_evaluation_control_release(control); return rc;
+    }
+    a->control = control; a->id = id;
+    a->control_identity = wl_evaluation_control_identity(control);
+    a->control_retained = true; a->governor = governor;
+    a->governor_retained = governor != NULL;
+#if defined(WL_HAVE_C11_THREADS)
+    a->thread = thrd_current();
+#elif defined(_WIN32) || defined(_WIN64)
+    a->thread = GetCurrentThreadId();
+#else
+    a->thread = pthread_self();
+#endif
+    a->thread_valid = true; a->identity = a;
+    return 0;
+}
+
+static int
+wl_columnar_session_seed_base_begin(wl_columnar_session_seed_t *a,
+    const col_rel_t *source, uint32_t capacity, uint32_t ts_capacity,
+    bool schema_ok)
+{
+    int rc = wl_columnar_session_seed_cut(a, a->control, a->id, 1000);
+    if (rc) return rc;
+    wl_columnar_session_seed_base_t *b = &a->base_build;
+    if (b->active || !source || (schema_ok != source->schema_ok) ||
+        (!schema_ok && (source->ncols || capacity || ts_capacity)))
+        return EINVAL;
+    b->source = source; b->width = source->ncols; b->capacity = capacity;
+    b->output = a->output;
+    b->ts_capacity = ts_capacity; b->schema_ok = schema_ok;
+    b->scratch_present = source->row_scratch != NULL;
+    b->names_present = source->col_names != NULL;
+    b->types_present = source->column_types != NULL;
+    b->phase = WL_COLUMNAR_SESSION_SEED_B_CREDIT_INIT;
+    b->active = true; return 0;
+}
+
+static int
+wl_columnar_session_seed_base_step(wl_columnar_session_seed_t *a)
+{
+    int rc = wl_columnar_session_seed_cut(a, a->control, a->id, 1001);
+    if (rc) return rc;
+    wl_columnar_session_seed_base_t *b = &a->base_build;
+    const col_rel_t *s = b->source;
+    col_rel_t *r = b->relation;
+    if (!b->active || !s) return EINVAL;
+    switch (b->phase) {
+    case WL_COLUMNAR_SESSION_SEED_B_CREDIT_INIT:
+        if (b->token_index < 3)
+            wl_columnar_session_seed_credit_init(&b->credit[b->token_index++]);
+        else {
+            wl_columnar_session_seed_credit_init(&b->length_credit);
+            b->token_index = 0; b->phase = WL_COLUMNAR_SESSION_SEED_B_REF;
+        }
+        return 0;
+    case WL_COLUMNAR_SESSION_SEED_B_REF:
+        if (a->governor) {
+            wl_columnar_memory_governor_ref_retain(a->governor);
+            b->relation_ref = true;
+        }
+        b->phase = WL_COLUMNAR_SESSION_SEED_B_NAME; return 0;
+    case WL_COLUMNAR_SESSION_SEED_B_NAME:
+        if (b->name_length == UINT64_MAX)return EOVERFLOW;
+        if (!a->recipe->name[b->name_length++])
+            b->phase = WL_COLUMNAR_SESSION_SEED_B_LENGTH_SIZE;
+        return 0;
+    case WL_COLUMNAR_SESSION_SEED_B_LENGTH_SIZE:
+        if (!wl_columnar_memory_size_mul(b->width, sizeof(uint64_t),
+            &b->length_credit.bytes) || b->length_credit.bytes > SIZE_MAX)
+            return EOVERFLOW;
+        b->phase = WL_COLUMNAR_SESSION_SEED_B_LENGTH_RESERVE; return 0;
+    case WL_COLUMNAR_SESSION_SEED_B_LENGTH_RESERVE:
+        b->phase = WL_COLUMNAR_SESSION_SEED_B_LENGTH_ALLOC;
+        return (a->last_result = wl_columnar_session_seed_credit_reserve(a,
+               &b->length_credit));
+    case WL_COLUMNAR_SESSION_SEED_B_LENGTH_ALLOC:
+        if (b->length_credit.bytes) {
+            b->lengths = wl_columnar_relation_constructor_allocate(
+                b->length_credit.bytes, false);
+            if (!b->lengths) return ENOMEM;
+        }
+        b->phase = WL_COLUMNAR_SESSION_SEED_B_LENGTH_COMMIT; return 0;
+    case WL_COLUMNAR_SESSION_SEED_B_LENGTH_COMMIT:
+        b->metadata_bytes = b->schema_ok?3:0;
+        b->phase = WL_COLUMNAR_SESSION_SEED_B_META;
+        return (a->last_result = wl_columnar_session_seed_credit_commit(a,
+               &b->length_credit, b->lengths));
+    case WL_COLUMNAR_SESSION_SEED_B_META:
+        if (b->column == b->width) {
+            b->column = 0; b->byte = 0;
+            b->phase = WL_COLUMNAR_SESSION_SEED_B_RESERVE; return 0;
+        }
+        {
+            uint64_t add = (b->names_present?sizeof(char *):0)+
+                (b->types_present?sizeof(wirelog_column_type_t):0)+
+                (b->schema_ok?sizeof(struct ArrowSchema *)+
+                sizeof(struct ArrowSchema)+2:0);
+            if (!wl_columnar_memory_size_add(b->metadata_bytes, add,
+                &b->metadata_bytes)) return EOVERFLOW;
+            b->phase = WL_COLUMNAR_SESSION_SEED_B_META_NAME; return 0;
+        }
+    case WL_COLUMNAR_SESSION_SEED_B_META_NAME:
+    {
+        const char *name = b->names_present?s->col_names[b->column]:NULL;
+        if (name && name[b->byte]){
+            if (b->byte == UINT64_MAX) return EOVERFLOW;
+            b->byte++; return 0;
+        }
+        uint64_t len = b->byte+1, add = (name && b->names_present?len:0)+
+            (b->schema_ok?len:0);
+        b->lengths[b->column] = len;
+        if (!wl_columnar_memory_size_add(b->metadata_bytes, add,
+            &b->metadata_bytes)) return EOVERFLOW;
+        b->column++; b->byte = 0; b->phase = WL_COLUMNAR_SESSION_SEED_B_META;
+        return 0;
+    }
+    case WL_COLUMNAR_SESSION_SEED_B_RESERVE:
+        /* One checked product per invocation; no future rule capacity. */
+        switch (b->bind_group++) {
+        case 0:
+            if (!wl_columnar_memory_size_add(sizeof(col_rel_t), b->name_length,
+                &b->descriptor_bytes)) {
+                return EOVERFLOW;
+            }
+            return 0;
+        case 1:
+            if (!wl_columnar_memory_size_mul(b->capacity, sizeof(int64_t),
+                &b->lane_bytes)) {
+                return EOVERFLOW;
+            }
+            return 0;
+        case 2:
+            if (!wl_columnar_memory_size_mul(b->scratch_present?b->width:0,
+                sizeof(int64_t), &b->scratch_bytes)){
+                return EOVERFLOW;
+            }
+            return 0;
+        case 3:
+            if (!wl_columnar_memory_size_mul(b->ts_capacity,
+                sizeof(col_delta_timestamp_t), &b->timestamp_bytes)){
+                return EOVERFLOW;
+            }
+            return 0;
+        case 4:
+            if (!wl_columnar_memory_size_mul(b->width, b->lane_bytes,
+                &b->payload_bytes)) {
+                return EOVERFLOW;
+            }
+            return 0;
+        case 5:
+            if (!wl_columnar_memory_size_add(b->payload_bytes,
+                b->capacity?(uint64_t)b->width*sizeof(int64_t *):0,
+                &b->payload_bytes)) {
+                return EOVERFLOW;
+            }
+            return 0;
+        case 6:
+            if (!wl_columnar_memory_size_add(b->payload_bytes, b->scratch_bytes,
+                &b->payload_bytes)) {
+                return EOVERFLOW;
+            }
+            return 0;
+        case 7:
+            if (!wl_columnar_memory_size_add(b->payload_bytes,
+                b->timestamp_bytes,
+                &b->payload_bytes)) {
+                return EOVERFLOW;
+            }
+            return 0;
+        case 8:
+            if (b->descriptor_bytes > SIZE_MAX ||
+                b->metadata_bytes > SIZE_MAX ||
+                b->payload_bytes > SIZE_MAX)return EOVERFLOW;
+            b->credit[0].bytes = b->descriptor_bytes;
+            b->credit[1].bytes = b->metadata_bytes;
+            b->credit[2].bytes = b->payload_bytes; return 0;
+        case 9: return (a->last_result =
+                   wl_columnar_session_seed_credit_reserve(
+                       a, &b->credit[0]));
+        case 10: return (a->last_result =
+                   wl_columnar_session_seed_credit_reserve(
+                       a, &b->credit[1]));
+        case 11: return (a->last_result =
+                   wl_columnar_session_seed_credit_reserve(
+                       a, &b->credit[2]));
+        default: b->bind_group = 0;
+            b->phase = WL_COLUMNAR_SESSION_SEED_B_DESCRIPTOR;
+            return 0;
+        }
+    case WL_COLUMNAR_SESSION_SEED_B_DESCRIPTOR:
+        b->relation =
+            wl_columnar_relation_constructor_allocate(sizeof(col_rel_t),
+                false);
+        if (!b->relation) return ENOMEM;
+        b->phase = WL_COLUMNAR_SESSION_SEED_B_ZERO; return 0;
+    case WL_COLUMNAR_SESSION_SEED_B_ZERO:
+        wl_columnar_session_seed_copy8(r, NULL, sizeof(*r), &b->byte);
+        if (b->byte == sizeof(*r)) {
+            b->byte = 0;
+            b->phase = WL_COLUMNAR_SESSION_SEED_B_TOKEN_INIT;
+        }
+        return 0;
+    case WL_COLUMNAR_SESSION_SEED_B_TOKEN_INIT:
+        switch (b->embedded_index++) {
+        case 0: wl_columnar_memory_reservation_init(&r->descriptor_reservation);
+            return 0;
+        case 1: wl_columnar_memory_reservation_init(&r->metadata_reservation);
+            return 0;
+        case 2: wl_columnar_memory_reservation_init(&r->retained_reservation);
+            return 0;
+        case 3: wl_columnar_memory_reservation_init(&r->pool_name_reservation);
+            return 0;
+        case 4: wl_columnar_memory_reservation_init(&r->dedup_reservation);
+            return 0;
+        default: b->phase = WL_COLUMNAR_SESSION_SEED_B_IDENTITY; return 0;
+        }
+    case WL_COLUMNAR_SESSION_SEED_B_IDENTITY:
+        b->phase = WL_COLUMNAR_SESSION_SEED_B_STORAGE;
+        return (a->last_result =
+               wl_columnar_relation_constructor_attempt_identity(
+                   &r->relation_identity, a->control, a->id));
+    case WL_COLUMNAR_SESSION_SEED_B_STORAGE:
+        r->view_generation = b->schema_ok?2u+b->types_present:1u;
+        r->storage_generation = 1u+(b->ts_capacity != 0);
+        col_rel_storage_owner_init(r);
+        b->phase = WL_COLUMNAR_SESSION_SEED_B_NAME_ALLOC; return 0;
+    case WL_COLUMNAR_SESSION_SEED_B_NAME_ALLOC:
+        b->name = wl_columnar_relation_constructor_allocate(b->name_length,
+                false);
+        if (!b->name) return ENOMEM;
+        b->phase = WL_COLUMNAR_SESSION_SEED_B_NAME_COPY; return 0;
+    case WL_COLUMNAR_SESSION_SEED_B_NAME_COPY:
+        wl_columnar_session_seed_copy8(b->name, a->recipe->name, b->name_length,
+            &b->byte);
+        if (b->byte == b->name_length) {
+            b->byte = 0;
+            b->phase = WL_COLUMNAR_SESSION_SEED_B_GRID_ALLOC;
+        }
+        return 0;
+    case WL_COLUMNAR_SESSION_SEED_B_GRID_ALLOC:
+        if (b->capacity && b->width) {
+            b->columns = (int64_t **)wl_columnar_relation_constructor_allocate(
+                (uint64_t)b->width*sizeof(int64_t *), false);
+            if (!b->columns) return ENOMEM;
+        }
+        b->phase = WL_COLUMNAR_SESSION_SEED_B_GRID_ZERO; return 0;
+    case WL_COLUMNAR_SESSION_SEED_B_GRID_ZERO:
+        if (b->columns && b->table_zero < b->width) {
+            b->columns[b->table_zero++] = NULL; return 0;
+        }
+        b->phase = WL_COLUMNAR_SESSION_SEED_B_LANE; return 0;
+    case WL_COLUMNAR_SESSION_SEED_B_LANE:
+        if (b->columns && b->lanes < b->width) {
+            b->columns[b->lanes] = wl_columnar_relation_constructor_allocate(
+                b->lane_bytes, false);
+            if (!b->columns[b->lanes]) return ENOMEM;
+            b->lanes++; return 0;
+        }
+        b->phase = WL_COLUMNAR_SESSION_SEED_B_SCRATCH; return 0;
+    case WL_COLUMNAR_SESSION_SEED_B_SCRATCH:
+        if (b->scratch_bytes) {
+            b->scratch = wl_columnar_relation_constructor_allocate(
+                b->scratch_bytes, false);
+            if (!b->scratch) return ENOMEM;
+        }
+        b->phase = WL_COLUMNAR_SESSION_SEED_B_SCRATCH_ZERO; return 0;
+    case WL_COLUMNAR_SESSION_SEED_B_SCRATCH_ZERO:
+        if (b->byte < b->scratch_bytes) {
+            wl_columnar_session_seed_copy8(b->scratch, NULL, b->scratch_bytes,
+                &b->byte); return 0;
+        }
+        b->byte = 0; b->phase = WL_COLUMNAR_SESSION_SEED_B_TS; return 0;
+    case WL_COLUMNAR_SESSION_SEED_B_TS:
+        if (b->timestamp_bytes) {
+            b->timestamps = wl_columnar_relation_constructor_allocate(
+                b->timestamp_bytes, false);
+            if (!b->timestamps) return ENOMEM;
+        }
+        b->phase = WL_COLUMNAR_SESSION_SEED_B_TS_ZERO; return 0;
+    case WL_COLUMNAR_SESSION_SEED_B_TS_ZERO:
+        if (b->byte < b->timestamp_bytes) {
+            wl_columnar_session_seed_copy8(b->timestamps, NULL,
+                b->timestamp_bytes,
+                &b->byte); return 0;
+        }
+        b->byte = 0; b->phase = WL_COLUMNAR_SESSION_SEED_B_TS_HISTORY; return 0;
+    case WL_COLUMNAR_SESSION_SEED_B_TS_HISTORY:
+    {
+        uint32_t extent = s == a->target?
+            s->nrows:0;
+        if (extent > b->ts_capacity) extent = b->ts_capacity;
+        if (b->timestamps && s->timestamps && b->byte < (uint64_t)extent*
+            sizeof(col_delta_timestamp_t)){
+            wl_columnar_session_seed_copy8(b->timestamps, s->timestamps,
+                (uint64_t)extent*sizeof(col_delta_timestamp_t), &b->byte);
+            return 0;
+        }
+        b->byte = 0; b->phase = WL_COLUMNAR_SESSION_SEED_B_NAMES; return 0;
+    }
+    case WL_COLUMNAR_SESSION_SEED_B_NAMES:
+        if (b->names_present && b->width) {
+            b->names = (char **)wl_columnar_relation_constructor_allocate(
+                (uint64_t)b->width*sizeof(char *), false);
+            if (!b->names) return ENOMEM;
+        }
+        b->phase = WL_COLUMNAR_SESSION_SEED_B_NAMES_ZERO; return 0;
+    case WL_COLUMNAR_SESSION_SEED_B_NAMES_ZERO:
+        if (b->names && b->names_zero < b->width) {
+            b->names[b->names_zero++] = NULL; return 0;
+        }
+        b->phase = WL_COLUMNAR_SESSION_SEED_B_COLNAME; return 0;
+    case WL_COLUMNAR_SESSION_SEED_B_COLNAME:
+        if (b->column == b->width || !b->names_present) {
+            b->column = 0; b->phase = WL_COLUMNAR_SESSION_SEED_B_TYPES;
+            return 0;
+        }
+        if (!s->col_names[b->column]) {
+            b->column++; return 0;
+        }
+        b->names[b->column] = wl_columnar_relation_constructor_allocate(
+            b->lengths[b->column], false);
+        if (!b->names[b->column]) return ENOMEM;
+        b->names_owned = b->column+1;
+        b->phase = WL_COLUMNAR_SESSION_SEED_B_COLNAME_COPY; return 0;
+    case WL_COLUMNAR_SESSION_SEED_B_COLNAME_COPY:
+        wl_columnar_session_seed_copy8(b->names[b->column],
+            s->col_names[b->column], b->lengths[b->column], &b->byte);
+        if (b->byte == b->lengths[b->column]) {
+            b->byte = 0; b->column++;
+            b->phase = WL_COLUMNAR_SESSION_SEED_B_COLNAME;
+        }
+        return 0;
+    case WL_COLUMNAR_SESSION_SEED_B_TYPES:
+        if (b->types_present && b->width) {
+            b->types = wl_columnar_relation_constructor_allocate(
+                (uint64_t)b->width*sizeof(*b->types), false);
+            if (!b->types) return ENOMEM;
+        }
+        b->phase = WL_COLUMNAR_SESSION_SEED_B_TYPE_COPY; return 0;
+    case WL_COLUMNAR_SESSION_SEED_B_TYPE_COPY:
+        if (b->types && b->column < b->width) {
+            b->types[b->column] = s->column_types[b->column];
+            b->column++; return 0;
+        }
+        b->column = 0; b->phase = WL_COLUMNAR_SESSION_SEED_B_ARROW; return 0;
+    case WL_COLUMNAR_SESSION_SEED_B_ARROW:
+        if (!b->schema_ok) {
+            b->phase = WL_COLUMNAR_SESSION_SEED_B_COMMIT; return 0;
+        }
+        ArrowSchemaInit(&r->schema); b->arrow_initialized = true;
+        r->schema.flags = s->schema.flags;
+        b->phase = WL_COLUMNAR_SESSION_SEED_B_ARROW_FORMAT; return 0;
+    case WL_COLUMNAR_SESSION_SEED_B_ARROW_FORMAT:
+        r->schema.format = wl_columnar_relation_constructor_allocate(3, true);
+        if (!r->schema.format) return ENOMEM;
+        memcpy((void *)r->schema.format, "+s", 3);
+        b->phase = WL_COLUMNAR_SESSION_SEED_B_CHILDREN; return 0;
+    case WL_COLUMNAR_SESSION_SEED_B_CHILDREN:
+        if (b->width) {
+            r->schema.children =
+                (struct ArrowSchema **)wl_columnar_relation_constructor_allocate
+                (
+                (uint64_t)b->width*sizeof(struct ArrowSchema *), true);
+            if (!r->schema.children) return ENOMEM;
+        }
+        b->phase = WL_COLUMNAR_SESSION_SEED_B_CHILDREN_ZERO; return 0;
+    case WL_COLUMNAR_SESSION_SEED_B_CHILDREN_ZERO:
+        if (b->children_zero < b->width) {
+            r->schema.children[b->children_zero++] = NULL; return 0;
+        }
+        r->schema.n_children = b->width;
+        b->phase = WL_COLUMNAR_SESSION_SEED_B_CHILD; return 0;
+    case WL_COLUMNAR_SESSION_SEED_B_CHILD:
+        if (b->column == b->width) {
+            b->column = 0; b->phase = WL_COLUMNAR_SESSION_SEED_B_COMMIT;
+            return 0;
+        }
+        r->schema.children[b->column] =
+            wl_columnar_relation_constructor_allocate(
+            sizeof(struct ArrowSchema), true);
+        if (!r->schema.children[b->column]) return ENOMEM;
+        b->phase = WL_COLUMNAR_SESSION_SEED_B_CHILD_INIT; return 0;
+    case WL_COLUMNAR_SESSION_SEED_B_CHILD_INIT:
+        ArrowSchemaInit(r->schema.children[b->column]);
+        b->child_count = b->column+1;
+        if (s->schema.children && s->schema.children[b->column])
+            r->schema.children[b->column]->flags =
+                s->schema.children[b->column]->flags;
+        b->phase = WL_COLUMNAR_SESSION_SEED_B_CHILD_FORMAT; return 0;
+    case WL_COLUMNAR_SESSION_SEED_B_CHILD_FORMAT:
+    {
+        const char *format;
+        if (!b->output) {
+            const struct ArrowSchema *original = s->schema.children ?
+                s->schema.children[b->column] : NULL;
+            if (!original || !original->format || !original->format[0] ||
+                original->format[1] || original->metadata ||
+                original->dictionary || original->private_data ||
+                original->n_children || original->children) return ENOTSUP;
+            format = original->format;
+        } else format = b->types && b->types[b->column] == WIRELOG_TYPE_FLOAT ?
+                "g" : "l";
+        struct ArrowSchema *child = r->schema.children[b->column];
+        child->format = wl_columnar_relation_constructor_allocate(2, true);
+        if (!child->format) return ENOMEM;
+        memcpy((void *)child->format, format, 2);
+        b->phase = WL_COLUMNAR_SESSION_SEED_B_CHILD_NAME; return 0;
+    }
+    case WL_COLUMNAR_SESSION_SEED_B_CHILD_NAME:
+        r->schema.children[b->column]->name =
+            wl_columnar_relation_constructor_allocate(b->lengths[b->column],
+                true);
+        if (!r->schema.children[b->column]->name) return ENOMEM;
+        b->phase = WL_COLUMNAR_SESSION_SEED_B_CHILD_NAME_COPY; return 0;
+    case WL_COLUMNAR_SESSION_SEED_B_CHILD_NAME_COPY:
+        wl_columnar_session_seed_copy8(
+            (void *)r->schema.children[b->column]->name,
+            b->names_present?s->col_names[b->column]:NULL,
+            b->lengths[b->column], &b->byte);
+        if (b->byte == b->lengths[b->column]) {
+            b->byte = 0; b->column++;
+            b->phase = WL_COLUMNAR_SESSION_SEED_B_CHILD;
+        }
+        return 0;
+    case WL_COLUMNAR_SESSION_SEED_B_COMMIT:
+        if (b->token_index < 3) {
+            wl_columnar_session_seed_credit_t *c = &b->credit[b->token_index++];
+            return (a->last_result = wl_columnar_session_seed_credit_commit(a,
+                   c, r));
+        }
+        b->token_index = 0; b->phase = WL_COLUMNAR_SESSION_SEED_B_MOVE;
+        return 0;
+    case WL_COLUMNAR_SESSION_SEED_B_MOVE:
+        if (b->token_index < 3) {
+            unsigned i = b->token_index++;
+            wl_columnar_memory_reservation_t *dest = i == 0?
+                &r->descriptor_reservation:i == 1?&r->metadata_reservation:
+                &r->retained_reservation;
+            if (a->governor && b->credit[i].bytes) {
+                if (!wl_columnar_relation_constructor_reservation_move(dest,
+                    &b->credit[i].token)) return EINVAL;
+                b->token_in_header[i] = true;
+            }
+            return 0;
+        }
+        b->phase = WL_COLUMNAR_SESSION_SEED_B_BIND; return 0;
+    case WL_COLUMNAR_SESSION_SEED_B_BIND:
+        switch (b->bind_group++) {
+        case 0: r->name = b->name; r->ncols = b->width;
+            r->capacity = b->capacity;
+            r->columns = b->columns; return 0;
+        case 1: r->timestamps = b->timestamps;
+            r->timestamp_capacity = b->ts_capacity;
+            r->row_scratch = b->scratch; r->column_types = b->types; return 0;
+        case 2: r->col_names = b->names; r->declared_ncols = s->declared_ncols;
+            r->has_graph_column = s->has_graph_column;
+            r->graph_col_idx = s->graph_col_idx; return 0;
+        case 3: r->schema_ok = b->schema_ok; r->memory_governor = a->governor;
+            r->descriptor_reserved_bytes = a->governor?b->descriptor_bytes:0;
+            r->metadata_reserved_bytes = a->governor?b->metadata_bytes:0;
+            return 0;
+        case 4: r->retained_reserved_bytes = a->governor?b->payload_bytes:0;
+            r->nrows = 0; r->base_nrows = 0; r->sorted_nrows = 0; return 0;
+        default: b->bound = true; b->relation_ref = false;
+            b->phase = WL_COLUMNAR_SESSION_SEED_B_BOUND;
+            a->progress = WL_COLUMNAR_SESSION_SEED_NEEDS_CLEANUP; return 0;
+        }
+    case WL_COLUMNAR_SESSION_SEED_B_PUBLISH:
+        if ((b->output?a->normalized:a->working) || !b->bound || b->lengths ||
+            b->length_credit.bytes)
+            return EINVAL;
+        rc = wl_evaluation_control_charge_attempt(a->control, a->id, 0);
+        if (rc) return rc;
+        if (b->output) a->normalized = b->relation;
+        else a->working = b->relation;
+        a->owned[b->output] = true; b->relation = NULL;
+        b->active = false; b->phase = WL_COLUMNAR_SESSION_SEED_B_DONE; return 0;
+    default: return EBUSY;
+    }
+}
+
+static int
+wl_columnar_session_seed_base_cleanup_step(wl_columnar_session_seed_t *a,
+    wl_evaluation_control_t *funding, uint64_t id, bool *done)
+{
+    int rc = wl_columnar_session_seed_cut(a, funding, id, 1002);
+    if (rc) return rc;
+    *done = false;
+    wl_columnar_session_seed_base_t *b = &a->base_build;
+    if (!b->active) {
+        *done = true; return 0;
+    }
+    if (b->lengths) {
+        free(b->lengths); b->lengths = NULL; return 0;
+    }
+    if (b->length_credit.bytes) {
+        bool closed = false;
+        rc = wl_columnar_session_seed_credit_end(a, &b->length_credit,
+                &b->length_credit.token, funding, id, &closed);
+        return rc;
+    }
+    if (b->bound) {
+        if (!a->ending) {
+            b->phase = WL_COLUMNAR_SESSION_SEED_B_PUBLISH;
+            a->progress = WL_COLUMNAR_SESSION_SEED_FORWARD; *done = true;
+            return 0;
+        }
+        if (b->output?a->normalized:a->working) return EINVAL;
+        if (b->output) a->normalized = b->relation;
+        else a->working = b->relation;
+        a->owned[b->output] = true; b->relation = NULL;
+        b->active = false; *done = true; return 0;
+    }
+    col_rel_t *r = b->relation;
+    if (b->cleanup_phase == 0) {
+        if (b->timestamps) {
+            free(b->timestamps); b->timestamps = NULL; return 0;
+        }
+        if (b->scratch) {
+            free(b->scratch); b->scratch = NULL; return 0;
+        }
+        if (b->lanes) {
+            free(b->columns[--b->lanes]); b->columns[b->lanes] = NULL; return 0;
+        }
+        if (b->columns) {
+            free((void *)b->columns); b->columns = NULL; return 0;
+        }
+        wl_columnar_memory_reservation_t *token = b->token_in_header[2]?
+            &r->retained_reservation:&b->credit[2].token;
+        bool closed = false;
+        rc = wl_columnar_session_seed_credit_end(a, &b->credit[2], token,
+                funding, id, &closed);
+        if (!rc && closed)b->cleanup_phase++;
+        return rc;
+    }
+    if (b->cleanup_phase == 1) {
+        if (b->arrow_initialized && r->schema.children &&
+            b->phase == WL_COLUMNAR_SESSION_SEED_B_CHILD_INIT &&
+            r->schema.children[b->column]) {
+            ArrowFree(r->schema.children[b->column]);
+            r->schema.children[b->column] = NULL; return 0;
+        }
+        if (b->child_count) {
+            /* An initialized child prefix owns a real table and current
+             * child. Losing either is an invariant breach, not a cleanup
+             * refusal that may discard ownership or continue partially. */
+            if (!r || !r->schema.children) abort();
+            struct ArrowSchema *child = r->schema.children[b->child_count-1];
+            if (!child) abort();
+            if (child->name) {
+                ArrowFree((void *)child->name); child->name = NULL; return 0;
+            }
+            if (child->format) {
+                ArrowFree((void *)child->format); child->format = NULL;
+                return 0;
+            }
+            ArrowFree(child); r->schema.children[--b->child_count] = NULL;
+            return 0;
+        }
+        if (b->arrow_initialized && r->schema.children) {
+            ArrowFree((void *)r->schema.children); r->schema.children = NULL;
+            return 0;
+        }
+        if (b->arrow_initialized && r->schema.format) {
+            ArrowFree((void *)r->schema.format); r->schema.format = NULL;
+            return 0;
+        }
+        if (b->names_owned) {
+            free(b->names[--b->names_owned]);
+            b->names[b->names_owned] = NULL; return 0;
+        }
+        if (b->names) {
+            free((void *)b->names); b->names = NULL; return 0;
+        }
+        if (b->types) {
+            free(b->types); b->types = NULL; return 0;
+        }
+        wl_columnar_memory_reservation_t *token = b->token_in_header[1]?
+            &r->metadata_reservation:&b->credit[1].token;
+        bool closed = false;
+        rc = wl_columnar_session_seed_credit_end(a, &b->credit[1], token,
+                funding, id, &closed);
+        if (!rc && closed)b->cleanup_phase++;
+        return rc;
+    }
+    if (b->cleanup_phase == 2) {
+        if (b->name) {
+            free(b->name); b->name = NULL; return 0;
+        }
+        if (b->token_in_header[0]) {
+            if (!wl_columnar_relation_constructor_reservation_move(
+                    &b->credit[0].token,
+                    &r->descriptor_reservation)) return EINVAL;
+            b->token_in_header[0] = false; return 0;
+        }
+        if (b->relation) {
+            free(b->relation); b->relation = NULL; return 0;
+        }
+        bool closed = false;
+        rc = wl_columnar_session_seed_credit_end(a, &b->credit[0],
+                &b->credit[0].token, funding, id, &closed);
+        if (!rc && closed)b->cleanup_phase++;
+        return rc;
+    }
+    if (b->relation_ref) {
+        wl_columnar_memory_governor_ref_release(a->governor);
+        b->relation_ref = false; return 0;
+    }
+    b->active = false; *done = true; return 0;
+}
+
+static int
+wl_columnar_session_seed_reserve_begin(wl_columnar_session_seed_t *a,
+    unsigned kind, uint32_t requested)
+{
+    int rc = wl_columnar_session_seed_cut(a, a->control, a->id, 1100);
+    if (rc) return rc;
+    wl_columnar_session_seed_resize_t *x = &a->resize;
+    col_rel_t *r = a->working;
+    if (x->active || !r || !a->owned[0] || a->batch_initialized ||
+        r->storage_owner != r || r->mem_ledger || r->col_shared ||
+        r->arena_owned || r->pool_owned || r->compound_kind ||
+        r->merge_columns || r->retract_backup_columns || !r->ncols)
+        return ENOTSUP;
+    x->relation = r; x->kind = kind; x->requested = requested;
+    x->width = r->ncols; x->old_capacity = r->capacity;
+    x->old_ts_capacity = r->timestamp_capacity; x->old_rows = r->nrows;
+    x->active = true; x->phase = 1; return 0;
+}
+
+/* No metadata or scratch replacement. All staging survives a stopped return. */
+static int
+wl_columnar_session_seed_reserve_step(wl_columnar_session_seed_t *a)
+{
+    int rc = wl_columnar_session_seed_cut(a, a->control, a->id, 1101);
+    if (rc) return rc;
+    wl_columnar_session_seed_resize_t *x = &a->resize;
+    col_rel_t *r = x->relation;
+    if (!x->active || r != a->working)return EINVAL;
+    switch (x->phase) {
+    case 1:
+        if (r->storage_owner_identity != r->relation_identity ||
+            r->storage_owner_generation != r->storage_generation ||
+            r->nrows > r->capacity || col_rel_storage_alias_borrow_count(r) ||
+            (r->capacity && !r->columns) || (!r->capacity && r->columns) ||
+            !col_rel_timestamp_shape_valid(r)) return EINVAL;
+        x->phase = 2; return 0;
+    case 2:
+        if (x->lane < x->width && r->capacity) {
+            if (!r->columns[x->lane++]) return EINVAL;
+            return 0;
+        }
+        x->lane = 0; x->phase = 3; return 0;
+    case 3:
+        if (x->requested <= r->capacity && (!r->timestamps ||
+            x->requested <= r->timestamp_capacity)) {
+            x->active = false; return 0;
+        }
+        if (x->requested < r->capacity)x->requested = r->capacity;
+        if (r->storage_generation >= WL_COLUMNAR_REL_GENERATION_INVALID-1)
+            return EOVERFLOW;
+        x->phase = 4; return 0;
+    case 4:
+        switch (x->lane++) {
+        case 0:
+            if (!wl_columnar_memory_size_mul(x->width, r->capacity,
+                &x->old_bytes)) {
+                return EOVERFLOW;
+            }
+            return 0;
+        case 1:
+            if (!wl_columnar_memory_size_mul(x->old_bytes, sizeof(int64_t),
+                &x->old_bytes)) {
+                return EOVERFLOW;
+            }
+            return 0;
+        case 2:
+            if (!wl_columnar_memory_size_add(x->old_bytes,
+                r->columns?(uint64_t)x->width*sizeof(int64_t *):0,
+                &x->old_bytes)) {
+                return EOVERFLOW;
+            }
+            return 0;
+        case 3:
+            if (!wl_columnar_memory_size_add(x->old_bytes,
+                r->timestamps?(uint64_t)r->timestamp_capacity*
+                sizeof(col_delta_timestamp_t):0, &x->old_bytes)){
+                return EOVERFLOW;
+            }
+            return 0;
+        case 4:
+            if (!wl_columnar_memory_size_add(x->old_bytes,
+                r->row_scratch?(uint64_t)x->width*sizeof(int64_t):0,
+                &x->old_bytes)) {
+                return EOVERFLOW;
+            }
+            return 0;
+        case 5:
+            if (!wl_columnar_memory_size_mul(x->width, x->requested,
+                &x->incoming)) {
+                return EOVERFLOW;
+            }
+            return 0;
+        case 6:
+            if (!wl_columnar_memory_size_mul(x->incoming, sizeof(int64_t),
+                &x->incoming)) {
+                return EOVERFLOW;
+            }
+            return 0;
+        case 7:
+            if (!wl_columnar_memory_size_add(x->incoming,
+                (uint64_t)x->width*sizeof(int64_t *), &x->incoming)){
+                return EOVERFLOW;
+            }
+            return 0;
+        case 8:
+            if (!wl_columnar_memory_size_add(x->incoming,
+                r->timestamps?(uint64_t)x->requested*
+                sizeof(col_delta_timestamp_t):0, &x->incoming)){
+                return EOVERFLOW;
+            }
+            return 0;
+        case 9:
+            if (!wl_columnar_memory_size_add(x->incoming,
+                r->row_scratch?(uint64_t)x->width*sizeof(int64_t):0,
+                &x->final_bytes)) {
+                return EOVERFLOW;
+            }
+            return 0;
+        case 10:
+            if (!wl_columnar_memory_size_add(x->old_bytes, x->incoming,
+                &x->aggregate) || x->final_bytes > SIZE_MAX ||
+                (a->governor && x->old_bytes != r->retained_reserved_bytes)){
+                return EOVERFLOW;
+            }
+            return 0;
+        default:
+            x->lane = 0; x->growth = x->old_bytes != 0;
+            wl_columnar_session_seed_credit_init(&x->fresh);
+            x->fresh.bytes = x->final_bytes; x->phase = 5; return 0;
+        }
+    case 5:
+        x->phase = 6;
+        if (!a->governor) return 0;
+        if (x->growth)
+            return (a->last_result =
+                   wl_columnar_memory_governor_begin_growth_attempt_controlled(
+                       &r->retained_reservation, x->incoming, &x->status,
+                       a->control, a->id));
+        return (a->last_result = wl_columnar_session_seed_credit_reserve(a,
+               &x->fresh));
+    case 6:
+        if (a->governor && x->growth &&
+            x->status != WL_COLUMNAR_MEMORY_ADMISSION_OK &&
+            x->status != WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY)
+            return x->status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED?ENOSPC:
+                   x->status ==
+                   WL_COLUMNAR_MEMORY_ADMISSION_OVERFLOW?EOVERFLOW:EINVAL;
+        x->columns = (int64_t **)wl_columnar_relation_constructor_allocate(
+            (uint64_t)x->width*sizeof(int64_t *), false);
+        if (!x->columns) return ENOMEM;
+        x->phase = 7; return 0;
+    case 7:
+        if (x->table_zero < x->width) {
+            x->columns[x->table_zero++] = NULL; return 0;
+        }
+        x->phase = 8; return 0;
+    case 8:
+        if (x->lanes < x->width) {
+            x->columns[x->lanes] = wl_columnar_relation_constructor_allocate(
+                (uint64_t)x->requested*sizeof(int64_t), false);
+            if (!x->columns[x->lanes]) return ENOMEM;
+            x->lanes++; return 0;
+        }
+        x->phase = 9; return 0;
+    case 9:
+        if (x->lane < x->width && x->old_rows) {
+            wl_columnar_session_seed_copy8(x->columns[x->lane],
+                r->columns[x->lane], (uint64_t)x->old_rows*sizeof(int64_t),
+                &x->byte);
+            if (x->byte == (uint64_t)x->old_rows*sizeof(int64_t)) {
+                x->byte = 0; x->lane++;
+            }
+            return 0;
+        }
+        x->lane = 0; x->phase = 10; return 0;
+    case 10:
+        if (r->timestamps) {
+            x->timestamps = wl_columnar_relation_constructor_allocate(
+                (uint64_t)x->requested*sizeof(col_delta_timestamp_t), false);
+            if (!x->timestamps) return ENOMEM;
+        }
+        x->phase = 11; return 0;
+    case 11:
+        if (x->timestamps && x->byte < (uint64_t)x->old_rows*
+            sizeof(col_delta_timestamp_t)) {
+            wl_columnar_session_seed_copy8(x->timestamps, r->timestamps,
+                (uint64_t)x->old_rows*sizeof(col_delta_timestamp_t), &x->byte);
+            return 0;
+        }
+        x->phase = 12; return 0;
+    case 12:
+        if (x->timestamps && x->byte < (uint64_t)x->requested*
+            sizeof(col_delta_timestamp_t)) {
+            wl_columnar_session_seed_copy8(x->timestamps, NULL,
+                (uint64_t)x->requested*sizeof(col_delta_timestamp_t), &x->byte);
+            return 0;
+        }
+        x->phase = 13; return 0;
+    case 13:
+        x->phase = 14;
+        if (!a->governor) return 0;
+        if (x->growth)
+            return (a->last_result =
+                   wl_columnar_memory_governor_growth_commit_prepare_attempt_controlled
+                   (
+                       &r->retained_reservation,
+                       wl_columnar_memory_governor_ref_get(a->governor), r,
+                       &x->prepared, &x->ready, a->control, a->id));
+        if (!wl_columnar_relation_constructor_reservation_move(
+                &r->retained_reservation, &x->fresh.token)) return EINVAL;
+        x->fresh_canonical = true; return 0;
+    case 14:
+        if (a->governor && x->growth && !x->ready) return EINVAL;
+        rc = wl_evaluation_control_charge_attempt(a->control, a->id, 0);
+        if (rc) return rc;
+        if (a->governor && x->growth) {
+            rc = wl_columnar_memory_governor_growth_commit_finish(&x->prepared);
+            if (rc) return rc;
+        } else if (a->governor) {
+            rc = wl_columnar_memory_governor_commit_source_attempt_controlled(
+                &r->retained_reservation, r, &x->fresh_committed, a->control,
+                a->id);
+            if (rc || !x->fresh_committed) return rc?rc:EINVAL;
+        }
+        /* No hook/debit between genuine credit commit and coupled ownership. */
+        x->displaced_columns = r->columns;
+        x->displaced_timestamps = r->timestamps;
+        r->columns = x->columns; r->timestamps = x->timestamps;
+        r->capacity = x->requested;
+        r->timestamp_capacity = x->timestamps?x->requested:0;
+        r->storage_generation++;
+        r->storage_owner_generation = r->storage_generation;
+        r->retained_reserved_bytes = a->governor?
+            (x->growth?x->aggregate:x->final_bytes):0;
+        x->columns = NULL; x->timestamps = NULL; x->lanes = 0;
+        x->published = true; x->phase = 20;
+        a->progress = WL_COLUMNAR_SESSION_SEED_NEEDS_CLEANUP; return 0;
+    default: return EBUSY;
+    }
+}
+
+static int
+wl_columnar_session_seed_reserve_cleanup_step(wl_columnar_session_seed_t *a,
+    wl_evaluation_control_t *funding, uint64_t id, bool *done)
+{
+    int rc = wl_columnar_session_seed_cut(a, funding, id, 1102);
+    if (rc) return rc;
+    *done = false;
+    wl_columnar_session_seed_resize_t *x = &a->resize;
+    if (a->resize_resetting) {
+        wl_columnar_session_seed_copy8(x, NULL, sizeof(*x),
+            &a->resize_reset_byte);
+        if (a->resize_reset_byte == sizeof(*x)) {
+            a->resize_resetting = false; *done = true;
+            if (!a->ending) a->progress = WL_COLUMNAR_SESSION_SEED_FORWARD;
+        }
+        return 0;
+    }
+    if (!x->active) {
+        *done = true; return 0;
+    }
+    col_rel_t *r = x->relation;
+    if (!x->published) {
+        if (x->prepared.phase ==
+            WL_COLUMNAR_MEMORY_GOVERNOR_GROWTH_COMMIT_CLAIMED ||
+            x->prepared.phase ==
+            WL_COLUMNAR_MEMORY_GOVERNOR_GROWTH_COMMIT_READY){
+            return wl_columnar_memory_governor_growth_commit_cancel(
+                &x->prepared);
+        }
+        if (x->lanes) {
+            free(x->columns[--x->lanes]); x->columns[x->lanes] = NULL; return 0;
+        }
+        if (x->columns) {
+            free((void *)x->columns); x->columns = NULL; return 0;
+        }
+        if (x->timestamps) {
+            free(x->timestamps); x->timestamps = NULL; return 0;
+        }
+        if (a->governor && x->growth &&
+            (x->refund_live ||
+            atomic_load_explicit(&r->retained_reservation.state,
+            memory_order_acquire) == WL_COLUMNAR_MEMORY_RESERVATION_REPLACING)){
+            if (!x->refund_live) {
+                rc = wl_columnar_memory_growth_refund_attempt_begin(
+                    &r->retained_reservation, r, &x->refund);
+                if (!rc) x->refund_live = true;
+                return rc;
+            }
+            if (x->refund.phase != WL_COLUMNAR_MEMORY_GROWTH_REFUND_DONE) {
+                rc =
+                    wl_columnar_memory_growth_refund_attempt_advance(
+                    &x->refund);
+                return rc == EAGAIN?0:rc;
+            }
+        }
+        if (!x->growth && x->fresh.initialized) {
+            bool closed = false;
+            rc = wl_columnar_session_seed_credit_end(a, &x->fresh,
+                    x->fresh_canonical?&r->retained_reservation:&x->fresh.token,
+                    funding, id, &closed);
+            if (rc || !closed) return rc;
+        }
+        x->active = false; a->resize_resetting = true; a->resize_reset_byte = 0;
+        return 0;
+    }
+    if (x->displaced_columns && x->old_lane < x->width) {
+        free(x->displaced_columns[x->old_lane]);
+        x->displaced_columns[x->old_lane++] = NULL; return 0;
+    }
+    if (x->displaced_columns) {
+        free((void *)x->displaced_columns); x->displaced_columns = NULL;
+        return 0;
+    }
+    if (x->displaced_timestamps) {
+        free(x->displaced_timestamps); x->displaced_timestamps = NULL; return 0;
+    }
+    if (a->governor && x->growth && x->aggregate > x->final_bytes) {
+        if (!x->downsize_live) {
+            rc =
+                wl_columnar_memory_downsize_attempt_begin(
+                &r->retained_reservation,
+                r, x->final_bytes, &x->downsize);
+            if (!rc) x->downsize_live = true;
+            return rc;
+        }
+        if (x->downsize.phase != WL_COLUMNAR_MEMORY_DOWNSIZE_DONE) {
+            rc = wl_columnar_memory_downsize_attempt_advance(&x->downsize);
+            return rc == EAGAIN?0:rc;
+        }
+        r->retained_reserved_bytes = x->final_bytes;
+    }
+    x->active = false; a->resize_resetting = true; a->resize_reset_byte = 0;
+    return 0;
+}
+
+#define WL_COLUMNAR_SESSION_SEED_CHILD(next_, call_) do { \
+            a->next_stage = (next_); a->child_pending = true; \
+            return (a->last_result = (call_)); \
+} while (0)
+
+static int wl_columnar_session_seed_metadata_prepare_step(
+    wl_columnar_session_seed_t *);
+static int wl_columnar_session_seed_metadata_bind_step(
+    wl_columnar_session_seed_t *);
+static int wl_columnar_session_seed_metadata_cleanup_step(
+    wl_columnar_session_seed_t *, wl_evaluation_control_t *, uint64_t, bool *);
+
+static int
+wl_columnar_session_seed_compare(wl_columnar_session_seed_t *a, bool *done)
+{
+    int rc = wl_columnar_session_seed_cut(a, a->control, a->id,
+            1300+a->compare_phase);
+    if (rc) return rc;
+    *done = false;
+    wl_columnar_relation_scalar_source_t *s = &a->sources[3];
+    if (a->compare_column == a->width || a->order) {
+        *done = true; return 0;
+    }
+    if (!a->compare_phase) {
+        a->left_bits = s->columns[a->compare_column][a->compare_left];
+        a->right_bits = s->columns[a->compare_column][a->compare_right];
+        a->compare_type =
+            s->types?s->types[a->compare_column]:WIRELOG_TYPE_INT64;
+        a->compare_phase = 1; return 0;
+    }
+    a->order = a->compare_type == WIRELOG_TYPE_FLOAT?
+        wl_columnar_float_compare_bits(a->left_bits, a->right_bits):
+        (a->left_bits > a->right_bits)-(a->left_bits < a->right_bits);
+    if (a->order == WL_COLUMNAR_CMP_INCOMPATIBLE)return EINVAL;
+    a->compare_column++; a->compare_phase = 0; return 0;
+}
+
+int
+wl_columnar_session_seed_prepare(wl_columnar_session_seed_t *a,
+    const col_rel_t *target, const col_rel_t *shadow,
+    const wl_columnar_session_seed_recipe_t *recipe)
+{
+    if (!a) return EINVAL;
+    int rc = wl_columnar_session_seed_cut(a, a->control, a->id, 1400);
+    if (rc) return rc;
+    if (a->phase != WL_COLUMNAR_SESSION_SEED_A_NEW || !target || !recipe ||
+        !recipe->name ||
+        recipe->reset > WL_COLUMNAR_SESSION_SEED_DETACH_OBSERVED)
+        return EINVAL;
+    a->target = target; a->shadow = shadow; a->recipe = recipe;
+    a->phase = WL_COLUMNAR_SESSION_SEED_A_TARGET; return 0;
+}
+
+int
+wl_columnar_session_seed_attach_rule(wl_columnar_session_seed_t *a,
+    const col_rel_t *rule)
+{
+    if (!a) return EINVAL;
+    int rc = wl_columnar_session_seed_cut(a, a->control, a->id, 1401);
+    if (rc) return rc;
+    if (a->progress != WL_COLUMNAR_SESSION_SEED_RULE_READY || !rule)
+        return EINVAL;
+    a->rule = rule; a->stage = 0;
+    a->phase = WL_COLUMNAR_SESSION_SEED_A_RULE;
+    a->progress = WL_COLUMNAR_SESSION_SEED_FORWARD; return 0;
+}
+
+wl_columnar_session_seed_progress_t
+wl_columnar_session_seed_progress(const wl_columnar_session_seed_t *a)
+{
+    return a && a->identity == a?a->progress:WL_COLUMNAR_SESSION_SEED_ENDED;
+}
+
+static void
+wl_columnar_session_seed_need_cleanup(wl_columnar_session_seed_t *a,
+    unsigned kind, unsigned next)
+{
+    a->pending_cleanup = kind; a->next_stage = next;
+    a->progress = WL_COLUMNAR_SESSION_SEED_NEEDS_CLEANUP;
+}
+
+int
+wl_columnar_session_seed_step(wl_columnar_session_seed_t *a)
+{
+    if (!a) return EINVAL;
+    int rc = wl_columnar_session_seed_cut(a, a->control, a->id, 1402);
+    if (rc) return rc;
+    if (a->progress != WL_COLUMNAR_SESSION_SEED_FORWARD || a->ending)
+        return EBUSY;
+    if (a->child_pending) {
+        if (a->last_result) return a->last_result;
+        a->child_pending = false; a->stage = a->next_stage; return 0;
+    }
+    switch (a->phase) {
+    case WL_COLUMNAR_SESSION_SEED_A_TARGET:
+        switch (a->stage) {
+        case 0:
+            rc = wl_columnar_relation_reader_step(a->target, &a->target_reader,
+                    false, a->control, a->id);
+            if (rc == EAGAIN)return 0;
+            if (rc) return rc;
+            a->stage++; return 0;
+        case 1:
+            if (!wl_columnar_relation_snapshot_equal(a->recipe->target_snapshot,
+                wl_columnar_relation_snapshot(a->target))) return EINVAL;
+            if (!a->target->schema_ok) {
+                a->stage = 4; return 0;
+            }
+            WL_COLUMNAR_SESSION_SEED_CHILD(2,
+                wl_columnar_relation_scalar_source_init_attempt_controlled(
+                    &a->sources[0], &a->source_initialized[0], a->control,
+                    a->id));
+        case 2:
+            WL_COLUMNAR_SESSION_SEED_CHILD(4,
+                wl_columnar_relation_scalar_source_begin_attempt_controlled(
+                    &a->sources[0], a->target, true));
+        case 4:
+            if (!a->shadow) {
+                a->stage = 8; return 0;
+            }
+            rc = wl_columnar_relation_reader_step(a->shadow, &a->shadow_reader,
+                    false, a->control, a->id);
+            if (rc == EAGAIN)return 0;
+            if (rc) return rc;
+            a->stage++; return 0;
+        case 5:
+            if (!a->shadow->nrows) {
+                a->stage = 8; return 0;
+            }
+            WL_COLUMNAR_SESSION_SEED_CHILD(6,
+                wl_columnar_relation_scalar_source_init_attempt_controlled(
+                    &a->sources[1], &a->source_initialized[1], a->control,
+                    a->id));
+        case 6:
+            WL_COLUMNAR_SESSION_SEED_CHILD(8,
+                wl_columnar_relation_scalar_source_begin_attempt_controlled(
+                    &a->sources[1], a->shadow, true));
+        default:
+            a->width = a->target->ncols;
+            a->seed_rows = a->shadow?a->shadow->nrows:0;
+            a->phase = WL_COLUMNAR_SESSION_SEED_A_BASE; a->stage = 0; return 0;
+        }
+    case WL_COLUMNAR_SESSION_SEED_A_BASE:
+        if (!a->stage) {
+            a->output = 0; a->stage = 1;
+            return wl_columnar_session_seed_base_begin(a, a->target,
+                       a->recipe->reset ==
+                       WL_COLUMNAR_SESSION_SEED_DETACH_OBSERVED?0:
+                       a->target->capacity,
+                       a->recipe->reset ==
+                       WL_COLUMNAR_SESSION_SEED_RESET_PLAIN?0:
+                       a->target->timestamp_capacity, a->target->schema_ok);
+        }
+        if (a->base_build.active) return wl_columnar_session_seed_base_step(a);
+        a->phase = WL_COLUMNAR_SESSION_SEED_A_RESTORE; a->stage = 0; return 0;
+    case WL_COLUMNAR_SESSION_SEED_A_RESTORE:
+        switch (a->stage) {
+        case 0:
+            a->rows = a->recipe->reset == WL_COLUMNAR_SESSION_SEED_KEEP_INITIAL?
+                a->target->nrows:a->seed_rows;
+            a->source = a->recipe->reset ==
+                WL_COLUMNAR_SESSION_SEED_KEEP_INITIAL?0:1;
+            if (a->rows && a->working->ncols != a->sources[a->source].width)
+                return EINVAL;
+            if (!a->rows) {
+                a->stage = 14; return 0;
+            }
+            if (!wl_columnar_memory_size_mul(a->rows, a->width,
+                &a->restore_bytes))
+                return EOVERFLOW;
+            a->stage++; return 0;
+        case 1:
+            if (!wl_columnar_memory_size_mul(a->restore_bytes, sizeof(int64_t),
+                &a->restore_bytes) || a->restore_bytes > SIZE_MAX)
+                return EOVERFLOW;
+            wl_columnar_session_seed_credit_init(&a->restore_credit);
+            a->restore_credit.bytes = a->restore_bytes; a->stage++; return 0;
+        case 2:
+            WL_COLUMNAR_SESSION_SEED_CHILD(3,
+                wl_columnar_session_seed_credit_reserve(a, &a->restore_credit));
+        case 3:
+            a->restore_rows = wl_columnar_relation_constructor_allocate(
+                a->restore_bytes?a->restore_bytes:sizeof(int64_t), false);
+            if (!a->restore_rows) return ENOMEM;
+            a->row = 0;
+            WL_COLUMNAR_SESSION_SEED_CHILD(4,
+                wl_columnar_session_seed_credit_commit(a, &a->restore_credit,
+                a->restore_rows));
+        case 4:
+            if (a->row < a->rows) {
+                a->next_stage = 5; a->child_pending = true;
+                return (a->last_result =
+                       wl_columnar_relation_scalar_source_gather_attempt_controlled
+                       (
+                           &a->sources[a->source], a->row,
+                           a->restore_rows+(size_t)a->row*a->width, a->width));
+            }
+            a->row = 0; a->column = 0; a->stage = 6; return 0;
+        case 5: a->row++; a->stage = 4; return 0;
+        case 6:
+            if (a->row < a->rows) {
+                if (a->column < a->width) {
+                    if (a->working->column_types &&
+                        a->working->column_types[a->column] ==
+                        WIRELOG_TYPE_FLOAT &&
+                        !wl_columnar_float_bits_valid(a->restore_rows[
+                            (size_t)a->row*a->width+a->column])) return EINVAL;
+                    a->column++; return 0;
+                }
+                a->column = 0; a->row++; return 0;
+            }
+            a->row = 0; a->stage = 7; return 0;
+        case 7:
+            if (a->rows > a->working->capacity || (a->working->timestamps &&
+                a->rows > a->working->timestamp_capacity)) {
+                a->column =
+                    a->working->capacity?a->working->capacity:COL_REL_INIT_CAP;
+                a->stage = 8; return 0;
+            }
+            a->stage = 10; return 0;
+        case 8:
+            if (a->column < a->rows) {
+                if (a->column > UINT32_MAX/2)return EOVERFLOW;
+                a->column *= 2; return 0;
+            }
+            a->stage = 9;
+            return wl_columnar_session_seed_reserve_begin(a, 0, a->column);
+        case 9:
+            if (a->resize.active) return wl_columnar_session_seed_reserve_step(
+                    a);
+            a->stage = 10; return 0;
+        case 10:
+            a->batch_initialized = true;
+            wl_columnar_relation_private_batch_drain_init(&a->drain);
+            a->drain_initialized = true;
+            WL_COLUMNAR_SESSION_SEED_CHILD(11,
+                wl_columnar_relation_append_batch_begin_attempt_controlled(
+                    &a->batch, a->working, a->control, a->id));
+        case 11:
+            if (a->row == a->rows) {
+                wl_columnar_session_seed_need_cleanup(a, 1, 13); return 0;
+            }
+            if (a->recipe->reset == WL_COLUMNAR_SESSION_SEED_KEEP_INITIAL &&
+                a->working->timestamps && a->sources[0].timestamps)
+                WL_COLUMNAR_SESSION_SEED_CHILD(12,
+                    wl_columnar_relation_append_batch_selected_source_row_operator_controlled
+                    (
+                        &a->batch, &a->sources[0], a->row,
+                        a->restore_rows+(size_t)a->row*a->width, a->width));
+            WL_COLUMNAR_SESSION_SEED_CHILD(12,
+                wl_columnar_relation_append_batch_numeric_row_operator_controlled
+                (
+                    &a->batch, a->restore_rows+(size_t)a->row*a->width,
+                    a->control, a->id));
+        case 12: a->row++; a->stage = 11; return 0;
+        case 13: wl_columnar_session_seed_need_cleanup(a, 2, 14); return 0;
+        default:
+            a->progress = WL_COLUMNAR_SESSION_SEED_RULE_READY;
+            a->phase = WL_COLUMNAR_SESSION_SEED_A_WAIT; return 0;
+        }
+    case WL_COLUMNAR_SESSION_SEED_A_RULE:
+        switch (a->stage) {
+        case 0:
+            rc = wl_columnar_relation_reader_step(a->rule, &a->rule_reader,
+                    false,
+                    a->control, a->id);
+            if (rc == EAGAIN)return 0;
+            if (rc) return rc;
+            a->stage++; return 0;
+        case 1:
+            if (a->working->ncols != a->rule->ncols)return EINVAL;
+            a->rule_rows = a->rule->nrows;
+            if (!a->rule_rows) {
+                a->phase = WL_COLUMNAR_SESSION_SEED_A_SORT;
+                a->stage = 0; return 0;
+            }
+            WL_COLUMNAR_SESSION_SEED_CHILD(2,
+                wl_columnar_relation_scalar_source_init_attempt_controlled(
+                    &a->sources[2], &a->source_initialized[2], a->control,
+                    a->id));
+        case 2:
+            WL_COLUMNAR_SESSION_SEED_CHILD(3,
+                wl_columnar_relation_scalar_source_begin_attempt_controlled(
+                    &a->sources[2], a->rule, true));
+        case 3:
+            if (a->column < a->width) {
+                wirelog_column_type_t left = a->working->column_types?
+                    a->working->column_types[a->column]:WIRELOG_TYPE_INT64;
+                wirelog_column_type_t right = a->sources[2].types?
+                    a->sources[2].types[a->column]:WIRELOG_TYPE_INT64;
+                if ((left == WIRELOG_TYPE_FLOAT ||
+                    right == WIRELOG_TYPE_FLOAT) &&
+                    left != right)return EINVAL;
+                a->column++; return 0;
+            }
+            a->row = 0; a->column = 0; a->stage = 4; return 0;
+        case 4:
+            if (a->row < a->rule_rows) {
+                if (a->column < a->width) {
+                    if (a->sources[2].types && a->sources[2].types[a->column] ==
+                        WIRELOG_TYPE_FLOAT && !wl_columnar_float_bits_valid(
+                            a->sources[2].columns[a->column][a->row])) return
+                            EINVAL;
+                    a->column++; return 0;
+                }
+                a->row++; a->column = 0; return 0;
+            }
+            a->row = 0; a->stage = 5; return 0;
+        default: a->phase = WL_COLUMNAR_SESSION_SEED_A_APPEND; a->stage = 0;
+            return 0;
+        }
+    case WL_COLUMNAR_SESSION_SEED_A_APPEND:
+        switch (a->stage) {
+        case 0:
+            if (a->rule_rows > UINT32_MAX-a->working->nrows)return EOVERFLOW;
+            a->rows = a->working->nrows+a->rule_rows;
+            a->stage = 1; return 0;
+        case 1:
+            if (!a->working->column_types && a->sources[2].types) {
+                if (!a->metadata.prepared)
+                    return wl_columnar_session_seed_metadata_prepare_step(a);
+            }
+            a->stage = 3; return 0;
+        case 3:
+            a->column = a->working->capacity;
+            if (a->rows > a->column) {
+                a->column = a->column?a->column:COL_REL_INIT_CAP;
+                a->stage = 4; return 0;
+            }
+            if (a->working->timestamps &&
+                a->rows > a->working->timestamp_capacity) {
+                a->stage = 4; return 0;
+            }
+            a->stage = 6; return 0;
+        case 4:
+            if (a->column < a->rows) {
+                if (a->column > UINT32_MAX/2)return EOVERFLOW;
+                a->column *= 2; return 0;
+            }
+            a->stage = 5;
+            return wl_columnar_session_seed_reserve_begin(a, 1, a->column);
+        case 5:
+            if (a->resize.active) return wl_columnar_session_seed_reserve_step(
+                    a);
+            a->stage = 6; return 0;
+        case 6:
+            if (a->metadata.active && !a->metadata.bound)
+                return wl_columnar_session_seed_metadata_bind_step(a);
+            a->stage = 7; return 0;
+        case 7:
+            wl_columnar_session_seed_credit_init(&a->scratch_credit);
+            a->scratch_credit.bytes = (uint64_t)(a->width?a->width:1)*
+                sizeof(int64_t);
+            WL_COLUMNAR_SESSION_SEED_CHILD(8,
+                wl_columnar_session_seed_credit_reserve(a, &a->scratch_credit));
+        case 8:
+            a->values = wl_columnar_relation_constructor_allocate(
+                a->scratch_credit.bytes, false);
+            if (!a->values) return ENOMEM;
+            WL_COLUMNAR_SESSION_SEED_CHILD(9,
+                wl_columnar_session_seed_credit_commit(a, &a->scratch_credit,
+                a->values));
+        case 9:
+            a->batch_initialized = true;
+            wl_columnar_relation_private_batch_drain_init(&a->drain);
+            a->drain_initialized = true;
+            WL_COLUMNAR_SESSION_SEED_CHILD(10,
+                wl_columnar_relation_append_batch_begin_attempt_controlled(
+                    &a->batch, a->working, a->control, a->id));
+        case 10:
+            if (a->row == a->rule_rows) {
+                wl_columnar_session_seed_need_cleanup(a, 1, 15); return 0;
+            }
+            WL_COLUMNAR_SESSION_SEED_CHILD(11,
+                wl_columnar_relation_scalar_source_gather_attempt_controlled(
+                    &a->sources[2], a->row, a->values, a->width));
+        case 11:
+            if (a->sources[2].timestamps && a->working->timestamps)
+                WL_COLUMNAR_SESSION_SEED_CHILD(12,
+                    wl_columnar_relation_append_batch_selected_source_row_operator_controlled
+                    (
+                        &a->batch, &a->sources[2], a->row, a->values,
+                        a->width));
+            WL_COLUMNAR_SESSION_SEED_CHILD(12,
+                wl_columnar_relation_append_batch_numeric_row_operator_controlled
+                (
+                    &a->batch, a->values, a->control, a->id));
+        case 12:
+            /* Numeric B2 has initialized this newly logical timestamp to
+             * zero; only a real stamped rule source supplies provenance. */
+            a->stage = 14; return 0;
+        case 14: a->row++; a->stage = 10; return 0;
+        default: a->phase = WL_COLUMNAR_SESSION_SEED_A_SORT; a->stage = 0;
+            return 0;
+        }
+    case WL_COLUMNAR_SESSION_SEED_A_SORT:
+        switch (a->stage) {
+        case 0:
+            a->normalize = a->seed_rows && a->working->nrows > 1;
+            if (!a->normalize) {
+                a->progress = WL_COLUMNAR_SESSION_SEED_COMPOSED;
+                a->phase = WL_COLUMNAR_SESSION_SEED_A_COMPLETE; return 0;
+            }
+            WL_COLUMNAR_SESSION_SEED_CHILD(1,
+                wl_columnar_relation_scalar_source_init_attempt_controlled(
+                    &a->sources[3], &a->source_initialized[3], a->control,
+                    a->id));
+        case 1:
+            WL_COLUMNAR_SESSION_SEED_CHILD(2,
+                wl_columnar_relation_scalar_source_begin_attempt_controlled(
+                    &a->sources[3], a->working, true));
+        case 2:
+            a->rows = a->working->nrows; a->width = a->working->ncols;
+            wl_columnar_session_seed_need_cleanup(a, 3, 3); return 0;
+        case 3:
+            wl_columnar_session_seed_credit_init(&a->scratch_credit);
+            if (!wl_columnar_memory_size_mul(a->rows, 2*sizeof(uint32_t),
+                &a->scratch_bytes)) return EOVERFLOW;
+            a->stage++; return 0;
+        case 4:
+            if (!wl_columnar_memory_size_add(a->scratch_bytes,
+                (uint64_t)(a->width?a->width:1)*sizeof(int64_t),
+                &a->scratch_bytes) || a->scratch_bytes > SIZE_MAX)
+                return EOVERFLOW;
+            a->scratch_credit.bytes = a->scratch_bytes;
+            WL_COLUMNAR_SESSION_SEED_CHILD(5,
+                wl_columnar_session_seed_credit_reserve(a, &a->scratch_credit));
+        case 5:
+            a->values = wl_columnar_relation_constructor_allocate(
+                a->scratch_bytes, false);
+            if (!a->values) return ENOMEM;
+            WL_COLUMNAR_SESSION_SEED_CHILD(6,
+                wl_columnar_session_seed_credit_commit(a, &a->scratch_credit,
+                a->values));
+        case 6:
+            a->indices = (uint32_t *)(a->values+(a->width?a->width:1));
+            a->temporary = a->indices+a->rows; a->row = 0; a->stage = 7;
+            return 0;
+        case 7:
+            if (a->row < a->rows) {
+                a->indices[a->row] = a->row; a->row++; return 0;
+            }
+            a->span = 1; a->base = 0; a->stage = 8; return 0;
+        case 8:
+            if (a->span >= a->rows) {
+                a->stage = 20; return 0;
+            }
+            if (a->base >= a->rows) {
+                uint32_t *swap = a->indices; a->indices = a->temporary;
+                a->temporary = swap;
+                if (a->span > UINT64_MAX/2)return EOVERFLOW;
+                a->span *= 2; a->base = 0; return 0;
+            }
+            a->middle = a->base+a->span < a->rows?a->base+a->span:a->rows;
+            a->end = a->base+2*a->span < a->rows?a->base+2*a->span:a->rows;
+            a->left = a->base; a->right = a->middle; a->out = a->base;
+            a->stage = 9; return 0;
+        case 9:
+            if (a->out == a->end) {
+                a->base = a->end; a->stage = 8; return 0;
+            }
+            if (a->left == a->middle) {
+                a->order = 1; a->stage = 11; return 0;
+            }
+            if (a->right == a->end) {
+                a->order = -1; a->stage = 11; return 0;
+            }
+            a->compare_left = a->indices[a->left];
+            a->compare_right = a->indices[a->right]; a->compare_column = 0;
+            a->compare_phase = 0; a->order = 0; a->stage = 10; return 0;
+        case 10:
+        {
+            bool done = false;
+            rc = wl_columnar_session_seed_compare(a, &done);
+            if (!rc && done) a->stage = 11;
+            return rc;
+        }
+        case 11:
+            a->temporary[a->out++] = a->order <= 0?
+                a->indices[a->left++]:a->indices[a->right++];
+            a->stage = 9; return 0;
+        case 20:
+            if (a->base_reset_byte < sizeof(a->base_build)) {
+                wl_columnar_session_seed_copy8(&a->base_build, NULL,
+                    sizeof(a->base_build), &a->base_reset_byte); return 0;
+            }
+            a->output = 1; a->stage = 21;
+            return wl_columnar_session_seed_base_begin(a, a->working,
+                       COL_REL_INIT_CAP,
+                       a->working->timestamps?COL_REL_INIT_CAP:0, true);
+        case 21:
+            if (a->base_build.active) return wl_columnar_session_seed_base_step(
+                    a);
+            a->batch_initialized = true;
+            wl_columnar_relation_private_batch_drain_init(&a->drain);
+            a->drain_initialized = true;
+            WL_COLUMNAR_SESSION_SEED_CHILD(22,
+                wl_columnar_relation_append_batch_begin_attempt_controlled(
+                    &a->batch, a->normalized, a->control, a->id));
+        case 22:
+            a->position = 0; a->have_previous = false; a->stage = 23; return 0;
+        case 23:
+            if (a->position == a->rows) {
+                a->stage = 29; return 0;
+            }
+            if (!a->have_previous) {
+                a->stage = 26; return 0;
+            }
+            a->compare_left = a->previous;
+            a->compare_right = a->indices[a->position]; a->compare_column = 0;
+            a->compare_phase = 0; a->order = 0; a->stage = 24; return 0;
+        case 24:
+        {
+            bool done = false;
+            rc = wl_columnar_session_seed_compare(a, &done);
+            if (!rc && done) a->stage = 25;
+            return rc;
+        }
+        case 25:
+            if (!a->order) {
+                a->position++; a->stage = 23; return 0;
+            }
+            a->stage = 26; return 0;
+        case 26:
+            WL_COLUMNAR_SESSION_SEED_CHILD(27,
+                wl_columnar_relation_scalar_source_gather_attempt_controlled(
+                    &a->sources[3], a->indices[a->position], a->values,
+                    a->width));
+        case 27:
+            WL_COLUMNAR_SESSION_SEED_CHILD(28,
+                wl_columnar_relation_append_batch_selected_source_row_operator_controlled
+                (
+                    &a->batch, &a->sources[3], a->indices[a->position],
+                    a->values,
+                    a->width));
+        case 28:
+            a->previous = a->indices[a->position++]; a->have_previous = true;
+            a->stage = 23; return 0;
+        case 29:
+            WL_COLUMNAR_SESSION_SEED_CHILD(30,
+                wl_columnar_relation_append_batch_mark_sorted_operator_controlled
+                (
+                    &a->batch, a->control, a->id));
+        case 30: wl_columnar_session_seed_need_cleanup(a, 1, 31); return 0;
+        default:
+            a->normalized_result = true;
+            a->progress = WL_COLUMNAR_SESSION_SEED_COMPOSED;
+            a->phase = WL_COLUMNAR_SESSION_SEED_A_COMPLETE; return 0;
+        }
+    default: return EBUSY;
+    }
+}
+
+static int
+wl_columnar_session_seed_funding(wl_columnar_session_seed_t *a,
+    wl_evaluation_control_t *funding, uint64_t id)
+{
+    if (!a || a->identity != a || !funding || funding == a->control || !id ||
+        wl_evaluation_control_active_attempt_id(funding) != id)return EINVAL;
+    return 0;
+}
+
+static int
+wl_columnar_session_seed_batch_cleanup(wl_columnar_session_seed_t *a,
+    wl_evaluation_control_t *funding, uint64_t id, bool *done)
+{
+    *done = false;
+    if (a->batch_initialized) {
+        if (!a->batch.identity && !a->batch.raw.single.set.identity) {
+            a->batch_initialized = false; a->batch_resetting = true;
+            a->batch_reset_byte = 0; return 0;
+        }
+        bool ended = false;
+        int rc = wl_columnar_relation_private_batch_drain_step_funded(&a->drain,
+                &a->batch, 0, &ended, funding, id);
+        if (rc) return rc;
+        if (ended) {
+            a->batch_initialized = false; a->batch_resetting = true;
+            a->batch_reset_byte = 0;
+        }
+        return 0;
+    }
+    if (a->batch_resetting) {
+        if (a->batch_reset_byte < sizeof(a->batch)) {
+            wl_columnar_session_seed_copy8(&a->batch, NULL, sizeof(a->batch),
+                &a->batch_reset_byte); return 0;
+        }
+        uint64_t cursor = a->batch_reset_byte-sizeof(a->batch);
+        if (cursor < sizeof(a->drain)) {
+            wl_columnar_session_seed_copy8(&a->drain, NULL, sizeof(a->drain),
+                &cursor);
+            a->batch_reset_byte = sizeof(a->batch)+cursor; return 0;
+        }
+        a->batch_resetting = false; a->drain_initialized = false;
+    }
+    *done = true; return 0;
+}
+
+int
+wl_columnar_session_seed_maintenance_step(wl_columnar_session_seed_t *a,
+    wl_evaluation_control_t *funding, uint64_t id)
+{
+    int rc = wl_columnar_session_seed_funding(a, funding, id);
+    if (rc) return rc;
+    rc = wl_columnar_session_seed_cut(a, funding, id, 1500);
+    if (rc) return rc;
+    bool done = false;
+    if (a->base_build.active)
+        return wl_columnar_session_seed_base_cleanup_step(a, funding, id,
+                   &done);
+    if (a->resize.active || a->resize_resetting)
+        return wl_columnar_session_seed_reserve_cleanup_step(a, funding, id,
+                   &done);
+    if (a->pending_cleanup == 4) {
+        rc = wl_columnar_session_seed_metadata_cleanup_step(a, funding, id,
+                &done);
+        if (!rc && done) {
+            a->pending_cleanup = 0;
+            if (!a->ending) a->progress = WL_COLUMNAR_SESSION_SEED_FORWARD;
+        }
+        return rc;
+    }
+    if (a->pending_cleanup == 1 || a->batch_initialized || a->batch_resetting) {
+        rc = wl_columnar_session_seed_batch_cleanup(a, funding, id, &done);
+        if (!rc && done) {
+            a->pending_cleanup = 0;
+            if (!a->ending) {
+                a->stage = a->next_stage;
+                a->progress = WL_COLUMNAR_SESSION_SEED_FORWARD;
+            }
+        }
+        return rc;
+    }
+    if (a->pending_cleanup == 2) {
+        if (a->restore_rows) {
+            free(a->restore_rows); a->restore_rows = NULL; return 0;
+        }
+        rc = wl_columnar_session_seed_credit_end(a, &a->restore_credit,
+                &a->restore_credit.token, funding, id, &done);
+    } else if (a->pending_cleanup == 3) {
+        if (a->values) {
+            free(a->values); a->values = NULL; a->indices = NULL;
+            a->temporary = NULL;
+            return 0;
+        }
+        rc = wl_columnar_session_seed_credit_end(a, &a->scratch_credit,
+                &a->scratch_credit.token, funding, id, &done);
+    } else return EBUSY;
+    if (!rc && done) {
+        a->pending_cleanup = 0;
+        if (!a->ending) {
+            a->stage = a->next_stage;
+            a->progress = WL_COLUMNAR_SESSION_SEED_FORWARD;
+        }
+    }
+    return rc;
+}
+
+static int
+wl_columnar_session_seed_retire_step(wl_columnar_session_seed_t *a,
+    wl_evaluation_control_t *funding, uint64_t id, bool preserve, bool *done)
+{
+    *done = false;
+    if (a->owner >= 2) {
+        *done = true; return 0;
+    }
+    unsigned owner = a->owner;
+    col_rel_t **slot = owner?&a->normalized:&a->working;
+    if ((!a->owned[owner] || !*slot) && !a->begun[owner]) {
+        a->owner++; return 0;
+    }
+    if (preserve && owner == (unsigned)a->normalized_result) {
+        a->owner++; return 0;
+    }
+    wl_columnar_relation_scalar_retirement_t *r = &a->retirement[owner];
+    wl_columnar_relation_scalar_retirement_initializer_t *i =
+        &a->initializer[owner];
+    int rc;
+    switch (a->retire_stage) {
+    case 0:
+        rc = wl_columnar_relation_scalar_retirement_init_begin(i, a, r, *slot,
+                funding, id);
+        if (!rc) a->retire_stage = 1;
+        return rc;
+    case 1:
+    {
+        bool begun = false;
+        rc = wl_columnar_relation_scalar_retirement_init_step(i, a, r, *slot,
+                funding, id, &begun);
+        if (begun){
+            a->begun[owner] = true; a->retire_stage = 2;
+        }
+        return rc;
+    }
+    case 2:
+        rc = wl_columnar_relation_scalar_retirement_init_reset(i, a, funding,
+                id);
+        if (!rc) a->retire_stage = 3;
+        return rc;
+    case 3:
+        rc = wl_columnar_relation_scalar_retirement_prepare(r, funding, id);
+        if (!rc && r->ready)a->retire_stage = 4;
+        return rc == EAGAIN?0:rc;
+    case 4:
+        rc = wl_columnar_relation_scalar_retirement_commit(r);
+        if (!rc) a->retire_stage = 5;
+        return rc;
+    case 5:
+        rc = wl_columnar_relation_scalar_retirement_step(r, funding, id);
+        if (rc) return rc == EAGAIN?0:rc;
+        /* Real physical success and its actual owner slot are inseparable. */
+        *slot = NULL; a->owned[owner] = false; a->retired[owner] = true;
+        a->byte = 0; a->retire_stage = 6; return 0;
+    default:
+        if (a->byte < sizeof(*r)) {
+            wl_columnar_session_seed_copy8(r, NULL, sizeof(*r), &a->byte);
+            return 0;
+        }
+        a->begun[owner] = false; a->owner++; a->retire_stage = 0; return 0;
+    }
+}
+
+static int
+wl_columnar_session_seed_drain(wl_columnar_session_seed_t *a,
+    wl_evaluation_control_t *funding, uint64_t id, bool preserve, bool *done)
+{
+    *done = false;
+    int rc;
+    if (a->cleanup_stage == 0) {
+        if (a->base_build.active || a->resize.active || a->resize_resetting ||
+            a->batch_initialized || a->batch_resetting || a->pending_cleanup)
+            return wl_columnar_session_seed_maintenance_step(a, funding, id);
+        a->cleanup_stage++; return 0;
+    }
+    if (a->cleanup_stage <= 4) {
+        unsigned k = a->cleanup_stage-1;
+        if (a->source_initialized[k]) {
+            if (a->sources[k].phase !=
+                WL_COLUMNAR_RELATION_SCALAR_SOURCE_DRAINED) {
+                rc = wl_columnar_relation_scalar_source_end(&a->sources[k], 0);
+                if (rc) return rc;
+            }
+            a->source_initialized[k] = false;
+        }
+        a->cleanup_stage++; return 0;
+    }
+    if (a->cleanup_stage <= 7) {
+        unsigned k = a->cleanup_stage-5;
+        wl_columnar_relation_reader_step_t *reader = k == 0?&a->target_reader:
+            k == 1?&a->shadow_reader:&a->rule_reader;
+        const col_rel_t *source = k == 0?a->target:k == 1?a->shadow:a->rule;
+        if (reader->descriptor_held || reader->token.owner) {
+            rc = wl_columnar_relation_reader_step(source, reader, true, NULL,
+                    0);
+            return rc == EAGAIN?0:rc;
+        }
+        a->cleanup_stage++; return 0;
+    }
+    if (a->cleanup_stage == 8) {
+        if (a->restore_rows) {
+            free(a->restore_rows); a->restore_rows = NULL; return 0;
+        }
+        bool closed = false;
+        rc = wl_columnar_session_seed_credit_end(a, &a->restore_credit,
+                &a->restore_credit.token, funding, id, &closed);
+        if (!rc && closed)a->cleanup_stage++;
+        return rc;
+    }
+    if (a->cleanup_stage == 9) {
+        if (a->values) {
+            free(a->values); a->values = NULL; a->indices = NULL;
+            a->temporary = NULL;
+            return 0;
+        }
+        bool closed = false;
+        rc = wl_columnar_session_seed_credit_end(a, &a->scratch_credit,
+                &a->scratch_credit.token, funding, id, &closed);
+        if (!rc && closed)a->cleanup_stage++;
+        return rc;
+    }
+    if (a->cleanup_stage == 10) {
+        if (a->metadata.active) {
+            bool closed = false;
+            rc = wl_columnar_session_seed_metadata_cleanup_step(a, funding, id,
+                    &closed);
+            if (rc || !closed) return rc;
+        }
+        a->cleanup_stage++; return 0;
+    }
+    if (a->cleanup_stage == 11) {
+        bool closed = false;
+        rc = wl_columnar_session_seed_retire_step(a, funding, id, preserve,
+                &closed);
+        if (!rc && closed)a->cleanup_stage++;
+        return rc;
+    }
+    if (!preserve && (a->owned[0] || a->owned[1])) {
+        a->owner = 0; a->retire_stage = 0; a->cleanup_stage = 11; return 0;
+    }
+    *done = true; return 0;
+}
+
+int
+wl_columnar_session_seed_finalize(wl_columnar_session_seed_t *a,
+    wl_evaluation_control_t *funding, uint64_t id, bool *ready)
+{
+    if (!ready) return EINVAL;
+    *ready = false;
+    int rc = wl_columnar_session_seed_funding(a, funding, id);
+    if (rc) return rc;
+    rc = wl_columnar_session_seed_cut(a, funding, id, 1501);
+    if (rc) return rc;
+    if (a->ending || (a->progress != WL_COLUMNAR_SESSION_SEED_COMPOSED &&
+        a->progress != WL_COLUMNAR_SESSION_SEED_RESULT_READY))return EBUSY;
+    if (a->progress == WL_COLUMNAR_SESSION_SEED_RESULT_READY) {
+        *ready = true; return 0;
+    }
+    rc = wl_columnar_session_seed_drain(a, funding, id, true, ready);
+    if (!rc && *ready)a->progress = WL_COLUMNAR_SESSION_SEED_RESULT_READY;
+    return rc;
+}
+
+int
+wl_columnar_session_seed_take(wl_columnar_session_seed_t *a, col_rel_t **out)
+{
+    if (!a) return EINVAL;
+    int rc = wl_columnar_session_seed_cut(a, a->control, a->id, 1502);
+    if (rc) return rc;
+    if (!out || *out || a->progress != WL_COLUMNAR_SESSION_SEED_RESULT_READY ||
+        a->ending || wl_columnar_relation_scalar_init_overlap(a, sizeof(*a),
+        (const void *)out,
+        sizeof(*out))) return EINVAL;
+    col_rel_t **slot = a->normalized_result?&a->normalized:&a->working;
+    if (!*slot || !a->owned[a->normalized_result]) return EINVAL;
+    rc = wl_evaluation_control_charge_attempt(a->control, a->id, 0);
+    if (rc) return rc;
+    *out = *slot; *slot = NULL; a->owned[a->normalized_result] = false;
+    a->progress = WL_COLUMNAR_SESSION_SEED_TAKEN; return 0;
+}
+
+int
+wl_columnar_session_seed_end(wl_columnar_session_seed_t *a, int initiating,
+    wl_evaluation_control_t *funding, uint64_t id, bool *done)
+{
+    if (!done) return EINVAL;
+    *done = false;
+    int rc = wl_columnar_session_seed_funding(a, funding, id);
+    if (rc) return rc;
+    rc = wl_columnar_session_seed_cut(a, funding, id, 1503);
+    if (rc) return rc;
+    if (a->progress == WL_COLUMNAR_SESSION_SEED_ENDED) {
+        *done = true; return 0;
+    }
+    if (!a->result_saved) {
+        a->result_saved = true; a->first_result = initiating;
+    }
+    a->ending = true;
+    bool closed = false;
+    rc = wl_columnar_session_seed_drain(a, funding, id, false, &closed);
+    if (rc || !closed) return rc;
+    if (a->governor_retained) {
+        a->governor_retained = false;
+        wl_columnar_memory_governor_ref_release(a->governor); return 0;
+    }
+    if (a->control_retained) {
+        a->control_retained = false; wl_evaluation_control_release(a->control);
+        return 0;
+    }
+    a->progress = WL_COLUMNAR_SESSION_SEED_ENDED; *done = true; return 0;
+}
+
+#ifdef WL_SESSION_TEST_HOOKS
+int
+wl_columnar_session_seed_test_view(const wl_columnar_session_seed_t *a,
+    uint64_t out[16])
+{
+    if (!a || a->identity != a || !out)return EINVAL;
+    memset(out, 0, 16*sizeof(*out));
+    out[0] = a->progress; out[1] = a->phase; out[2] = a->stage;
+    out[3] = a->base_build.phase; out[4] = a->resize.phase;
+    out[5] = a->batch_initialized; out[6] = a->owned[0]; out[7] = a->owned[1];
+    /* A begun receipt may already have freed the descriptor while its real
+     * token/governor retirement is still draining. Never inspect that slot. */
+    out[8] = a->working && !a->begun[0]?a->working->nrows:0;
+    out[9] = a->working && !a->begun[0]?a->working->capacity:0;
+    out[10] = a->working && !a->begun[0]?a->working->timestamp_capacity:0;
+    out[11] = a->base_build.payload_bytes; out[12] = a->resize.incoming;
+    out[13] = a->cleanup_stage; out[14] = a->retire_stage; out[15] = a->owner;
+    return 0;
+}
+#endif
+#undef WL_COLUMNAR_SESSION_SEED_CHILD
+
+/* Saved-ID scalar metadata preparation. The legacy integer-only preparer is
+ * intentionally not used: its active-ID charges and Arrow l are unsuitable. */
+static int
+wl_columnar_session_seed_metadata_prepare_step(wl_columnar_session_seed_t *a)
+{
+    int rc = wl_columnar_session_seed_cut(a, a->control, a->id, 1600);
+    if (rc) return rc;
+    wl_columnar_session_seed_metadata_t *m = &a->metadata;
+    col_rel_t *r = a->working;
+    switch (m->phase) {
+    case 0:
+        if (!r || r->column_types || !a->sources[2].types ||
+            a->batch_initialized || r->schema.metadata ||
+            r->schema.dictionary ||
+            r->schema.private_data || r->schema.name ||
+            r->schema.n_children != (int64_t)r->ncols)return ENOTSUP;
+        m->active = true; m->width = r->ncols; m->phase = 1; return 0;
+    case 1: wl_columnar_session_seed_credit_init(&m->length_credit);
+        m->phase++; return 0;
+    case 2: wl_columnar_session_seed_credit_init(&m->new_credit);
+        m->phase++; return 0;
+    case 3: wl_columnar_session_seed_credit_init(&m->old_credit);
+        m->old_bytes = r->metadata_reserved_bytes;
+        m->length_credit.bytes = (uint64_t)m->width*sizeof(uint64_t);
+        m->phase++; return 0;
+    case 4:
+        m->phase = 5;
+        return (a->last_result = wl_columnar_session_seed_credit_reserve(a,
+               &m->length_credit));
+    case 5:
+        m->lengths = wl_columnar_relation_constructor_allocate(
+            m->length_credit.bytes, false);
+        if (!m->lengths) return ENOMEM;
+        m->phase = 6;
+        return (a->last_result = wl_columnar_session_seed_credit_commit(a,
+               &m->length_credit, m->lengths));
+    case 6:
+        if (m->column == m->width) {
+            m->column = 0; m->phase = 8; return 0;
+        }
+        {
+            struct ArrowSchema *child = r->schema.children[m->column];
+            if (!child || child->metadata || child->dictionary ||
+                child->private_data || child->n_children || child->children)
+                return ENOTSUP;
+            m->phase = 7; return 0;
+        }
+    case 7:
+    {
+        const char *name = r->col_names?r->col_names[m->column]:NULL;
+        if (name && name[m->name_byte]){
+            if (m->name_byte == UINT64_MAX) return EOVERFLOW;
+            m->name_byte++; return 0;
+        }
+        m->lengths[m->column++] = m->name_byte+1; m->name_byte = 0;
+        m->phase = 6; return 0;
+    }
+    case 8:
+        m->bytes = 3+(uint64_t)m->width*(sizeof(wirelog_column_type_t)+
+            sizeof(struct ArrowSchema *)+sizeof(struct ArrowSchema)+2+
+            (r->col_names?sizeof(char *):0));
+        m->phase = 9; return 0;
+    case 9:
+        if (m->column < m->width) {
+            uint64_t add = m->lengths[m->column];
+            if (r->col_names && r->col_names[m->column]) {
+                if (!wl_columnar_memory_size_add(add, add,
+                    &add)) return EOVERFLOW;
+            }
+            if (!wl_columnar_memory_size_add(m->bytes, add, &m->bytes))
+                return EOVERFLOW;
+            m->column++; return 0;
+        }
+        m->column = 0; m->new_credit.bytes = m->bytes; m->phase = 10;
+        return (a->last_result = wl_columnar_session_seed_credit_reserve(a,
+               &m->new_credit));
+    case 10:
+        m->types = wl_columnar_relation_constructor_allocate(
+            (uint64_t)m->width*sizeof(*m->types), false);
+        if (!m->types) return ENOMEM;
+        m->phase = 11; return 0;
+    case 11:
+        if (m->column < m->width) {
+            m->types[m->column] = a->sources[2].types[m->column];
+            m->column++; return 0;
+        }
+        m->column = 0; m->phase = 12; return 0;
+    case 12:
+        ArrowSchemaInit(&m->schema); m->root_initialized = true;
+        m->new_owned = true;
+        m->phase = 13; return 0;
+    case 13:
+        m->schema.format = wl_columnar_relation_constructor_allocate(3, true);
+        if (!m->schema.format) return ENOMEM;
+        memcpy((void *)m->schema.format, "+s", 3); m->phase = 14; return 0;
+    case 14:
+        m->schema.children =
+            (struct ArrowSchema **)wl_columnar_relation_constructor_allocate(
+            (uint64_t)m->width*sizeof(struct ArrowSchema *), true);
+        if (!m->schema.children) return ENOMEM;
+        m->phase = 15; return 0;
+    case 15:
+        if (m->zeroed < m->width) {
+            m->schema.children[m->zeroed++] = NULL; return 0;
+        }
+        m->schema.n_children = m->width; m->phase = 16; return 0;
+    case 16:
+        if (m->column == m->width) {
+            m->phase = 20; m->prepared = true;
+            wl_columnar_session_seed_need_cleanup(a, 4, a->stage); return 0;
+        }
+        m->schema.children[m->column] =
+            wl_columnar_relation_constructor_allocate(
+            sizeof(struct ArrowSchema), true);
+        if (!m->schema.children[m->column]) return ENOMEM;
+        m->allocated = m->column+1; m->phase = 17; return 0;
+    case 17:
+        ArrowSchemaInit(m->schema.children[m->column]);
+        m->initialized = m->column+1; m->phase = 18; return 0;
+    case 18:
+    {
+        const char *fmt = m->types[m->column] == WIRELOG_TYPE_FLOAT ? "g" : "l";
+        struct ArrowSchema *child = m->schema.children[m->column];
+        child->format = wl_columnar_relation_constructor_allocate(2, true);
+        if (!child->format) return ENOMEM;
+        memcpy((void *)child->format, fmt, 2); m->phase = 19; return 0;
+    }
+    case 19:
+        m->schema.children[m->column]->name =
+            wl_columnar_relation_constructor_allocate(m->lengths[m->column],
+                true);
+        if (!m->schema.children[m->column]->name) return ENOMEM;
+        m->phase = 21; return 0;
+    case 21:
+        wl_columnar_session_seed_copy8(
+            (void *)m->schema.children[m->column]->name,
+            r->col_names?r->col_names[m->column]:NULL, m->lengths[m->column],
+            &m->byte);
+        if (m->byte == m->lengths[m->column]) {
+            m->byte = 0; m->column++; m->phase = 16;
+        }
+        return 0;
+    default: return EBUSY;
+    }
+}
+
+static int
+wl_columnar_session_seed_metadata_bind_step(wl_columnar_session_seed_t *a)
+{
+    int rc = wl_columnar_session_seed_cut(a, a->control, a->id, 1601);
+    if (rc) return rc;
+    wl_columnar_session_seed_metadata_t *m = &a->metadata;
+    col_rel_t *r = a->working;
+    switch (m->phase) {
+    case 20: m->byte = 0; m->phase = 30; return 0;
+    case 30:
+        wl_columnar_session_seed_copy8(&m->old_schema, &r->schema,
+            sizeof(struct ArrowSchema), &m->byte);
+        if (m->byte == sizeof(struct ArrowSchema)) {
+            m->old_schema_ok = r->schema_ok; m->byte = 0; m->phase = 31;
+        }
+        return 0;
+    case 31:
+        m->old_owned = true; r->schema.release = NULL; r->schema_ok = false;
+        m->detached = true; m->phase = 32; return 0;
+    case 32:
+        wl_columnar_session_seed_copy8(&r->schema, &m->schema,
+            offsetof(struct ArrowSchema, release), &m->byte);
+        if (m->byte == offsetof(struct ArrowSchema, release)) {
+            m->byte = 0; m->phase = 33;
+        }
+        return 0;
+    case 33:
+        wl_columnar_session_seed_copy8((void *)&r->schema.private_data,
+            (const void *)&m->schema.private_data,
+            sizeof(r->schema.private_data), &m->byte);
+        if (m->byte == sizeof(r->schema.private_data)) {
+            m->byte = 0; m->phase = 34;
+        }
+        return 0;
+    case 34:
+        m->phase = 35;
+        return (a->last_result = wl_columnar_session_seed_credit_commit(a,
+               &m->new_credit, r));
+    case 35:
+        if (!m->detached || !m->new_owned || r->column_types ||
+            (a->governor && !m->new_credit.committed))return EINVAL;
+        rc = wl_evaluation_control_charge_attempt(a->control, a->id, 0);
+        if (rc) return rc;
+        /* Move failure here is an invariant breach, never a recoverable
+         * partially installed canonical metadata state. */
+        if (a->governor) {
+            if (r->metadata_reserved_bytes &&
+                !wl_columnar_relation_constructor_reservation_move(
+                    &m->old_credit.token, &r->metadata_reservation)) abort();
+            if (!wl_columnar_relation_constructor_reservation_move(
+                    &r->metadata_reservation, &m->new_credit.token)) abort();
+        }
+        m->old_credit.bytes = m->old_bytes;
+        r->metadata_reserved_bytes = a->governor?m->bytes:0;
+        r->column_types = m->types; m->types = NULL;
+        r->schema.release = m->schema.release; r->schema_ok = true;
+        m->new_credit.bytes = 0; m->new_owned = false; m->installed = true;
+        wl_columnar_session_seed_need_cleanup(a, 4, a->stage); return 0;
+    default: return EBUSY;
+    }
+}
+
+/* One actual Arrow allocation or token receipt per maintenance turn. */
+static int
+wl_columnar_session_seed_metadata_cleanup_step(wl_columnar_session_seed_t *a,
+    wl_evaluation_control_t *funding, uint64_t id, bool *done)
+{
+    int rc = wl_columnar_session_seed_cut(a, funding, id, 1602);
+    if (rc) return rc;
+    *done = false;
+    wl_columnar_session_seed_metadata_t *m = &a->metadata;
+    col_rel_t *r = a->working;
+    if (!m->active) {
+        *done = true; return 0;
+    }
+    if (!a->ending && !m->installed && m->phase != 20)return EBUSY;
+    if (m->lengths) {
+        free(m->lengths); m->lengths = NULL; return 0;
+    }
+    if (m->length_credit.bytes) {
+        bool closed = false;
+        return wl_columnar_session_seed_credit_end(a, &m->length_credit,
+                   &m->length_credit.token, funding, id, &closed);
+    }
+    if (!a->ending && !m->installed) {
+        *done = true; return 0;
+    }
+    if (!m->installed && m->detached) {
+        if (m->cleanup == 0) {
+            m->byte = 0; m->cleanup = 1; return 0;
+        }
+        if (m->cleanup == 1) {
+            wl_columnar_session_seed_copy8(&r->schema, &m->old_schema,
+                offsetof(struct ArrowSchema, release), &m->byte);
+            if (m->byte == offsetof(struct ArrowSchema, release)) {
+                m->byte = 0; m->cleanup = 2;
+            }
+            return 0;
+        }
+        if (m->cleanup == 2) {
+            wl_columnar_session_seed_copy8((void *)&r->schema.private_data,
+                (const void *)&m->old_schema.private_data,
+                sizeof(r->schema.private_data),
+                &m->byte);
+            if (m->byte == sizeof(r->schema.private_data))m->cleanup = 3;
+            return 0;
+        }
+        r->schema.release = m->old_schema.release;
+        r->schema_ok = m->old_schema_ok;
+        m->old_owned = false; m->detached = false; return 0;
+    }
+    if (m->old_owned) {
+        if (m->old_column < (uint32_t)m->old_schema.n_children) {
+            struct ArrowSchema *child = m->old_schema.children[m->old_column];
+            if (child->name) {
+                ArrowFree((void *)child->name); child->name = NULL;
+                return 0;
+            }
+            if (child->format) {
+                ArrowFree((void *)child->format); child->format = NULL;
+                return 0;
+            }
+            ArrowFree(child); m->old_schema.children[m->old_column++] = NULL;
+            return 0;
+        }
+        if (m->old_schema.children) {
+            ArrowFree((void *)m->old_schema.children);
+            m->old_schema.children = NULL;
+            return 0;
+        }
+        if (m->old_schema.format) {
+            ArrowFree((void *)m->old_schema.format);
+            m->old_schema.format = NULL;
+            return 0;
+        }
+        m->old_owned = false; return 0;
+    }
+    if (m->old_credit.bytes) {
+        bool closed = false;
+        return wl_columnar_session_seed_credit_end(a, &m->old_credit,
+                   &m->old_credit.token, funding, id, &closed);
+    }
+    if (m->installed) {
+        m->bound = true;
+        if (a->ending) m->active = false;
+        *done = true; return 0;
+    }
+    if (m->allocated > m->initialized) {
+        ArrowFree(m->schema.children[--m->allocated]);
+        m->schema.children[m->allocated] = NULL; return 0;
+    }
+    if (m->initialized) {
+        struct ArrowSchema *child = m->schema.children[m->initialized-1];
+        if (child->name) {
+            ArrowFree((void *)child->name); child->name = NULL; return 0;
+        }
+        if (child->format) {
+            ArrowFree((void *)child->format); child->format = NULL;
+            return 0;
+        }
+        ArrowFree(child); m->schema.children[--m->initialized] = NULL;
+        m->allocated = m->initialized; return 0;
+    }
+    if (m->root_initialized && m->schema.children) {
+        ArrowFree((void *)m->schema.children); m->schema.children = NULL;
+        return 0;
+    }
+    if (m->root_initialized && m->schema.format) {
+        ArrowFree((void *)m->schema.format); m->schema.format = NULL; return 0;
+    }
+    if (m->types) {
+        free(m->types); m->types = NULL; return 0;
+    }
+    if (m->new_credit.bytes) {
+        bool closed = false;
+        return wl_columnar_session_seed_credit_end(a, &m->new_credit,
+                   &m->new_credit.token, funding, id, &closed);
+    }
+    m->active = false; *done = true; return 0;
+}
+#ifdef WL_SESSION_TEST_HOOKS
+unsigned
+wl_columnar_session_seed_test_metadata_phase(
+    const wl_columnar_session_seed_t *a)
+{
+    return a && a->identity == a?a->metadata.phase:UINT_MAX;
+}
+#endif
+#ifdef WL_SESSION_TEST_HOOKS
+int
+wl_columnar_session_seed_test_base_geometry(const wl_columnar_session_seed_t *a,
+    uint64_t out[8])
+{
+    if (!a || a->identity != a || !out || !a->base_build.active ||
+        !a->base_build.bound || !a->base_build.relation) return EINVAL;
+    const col_rel_t *r = a->base_build.relation;
+    if (r->memory_governor && r->retained_reserved_bytes &&
+        (r->retained_reservation.identity != &r->retained_reservation ||
+        atomic_load_explicit(&r->retained_reservation.state,
+        memory_order_acquire)
+        != WL_COLUMNAR_MEMORY_RESERVATION_COMMITTED ||
+        atomic_load_explicit(&r->retained_reservation.owner_bits,
+        memory_order_acquire)
+        != (uint64_t)(uintptr_t)r))return EINVAL;
+    out[0] = r->ncols; out[1] = r->capacity; out[2] = r->timestamp_capacity;
+    out[3] = r->columns != NULL; out[4] = r->row_scratch != NULL;
+    out[5] = r->timestamps != NULL; out[6] = r->retained_reserved_bytes;
+    out[7] = r->memory_governor?r->retained_reservation.bytes:0;
+    return 0;
+}
+#endif
+
+#ifdef WL_SESSION_TEST_HOOKS
+unsigned
+wl_columnar_session_seed_test_base_group(const wl_columnar_session_seed_t *a)
+{
+    return a && a->identity == a ? a->base_build.bind_group : UINT_MAX;
+}
+/* Observation of actual denied owners only; no source or cleanup authority. */
+int
+wl_columnar_session_seed_test_admission(const wl_columnar_session_seed_t *a,
+    unsigned site, uint64_t out[8])
+{
+    if (!a || a->identity != a || !out) return EINVAL;
+    const wl_columnar_session_seed_credit_t *c = NULL;
+    const wl_columnar_memory_reservation_t *token = NULL;
+    uint64_t status, bytes;
+    switch (site) {
+    case WL_COLUMNAR_SESSION_SEED_TEST_BASE_LENGTH: c =
+            &a->base_build.length_credit; break;
+    case WL_COLUMNAR_SESSION_SEED_TEST_BASE_DESCRIPTOR: c =
+            &a->base_build.credit[0]; break;
+    case WL_COLUMNAR_SESSION_SEED_TEST_BASE_METADATA: c =
+            &a->base_build.credit[1]; break;
+    case WL_COLUMNAR_SESSION_SEED_TEST_BASE_PAYLOAD: c =
+            &a->base_build.credit[2]; break;
+    case WL_COLUMNAR_SESSION_SEED_TEST_RESTORE: c = &a->restore_credit; break;
+    case WL_COLUMNAR_SESSION_SEED_TEST_APPEND_SCRATCH:
+    case WL_COLUMNAR_SESSION_SEED_TEST_SORT_SCRATCH: c = &a->scratch_credit;
+        break;
+    case WL_COLUMNAR_SESSION_SEED_TEST_TYPE_LENGTH: c =
+            &a->metadata.length_credit; break;
+    case WL_COLUMNAR_SESSION_SEED_TEST_TYPE_METADATA: c =
+            &a->metadata.new_credit; break;
+    case WL_COLUMNAR_SESSION_SEED_TEST_RESIZE:
+        if (!a->resize.active || !a->working || !a->owned[0] ||
+            a->begun[0]) return EINVAL;
+        if (a->resize.growth) {
+            status = a->resize.status; bytes = a->resize.incoming;
+            token = &a->working->retained_reservation; break;
+        }
+        c = &a->resize.fresh; break;
+    default: return EINVAL;
+    }
+    if (c) {
+        if (!c->initialized) return EINVAL;
+        status = c->status; bytes = c->bytes; token = &c->token;
+    }
+    if (status != WL_COLUMNAR_MEMORY_ADMISSION_DENIED || !bytes ||
+        !token) return EINVAL;
+    out[0] = status; out[1] = bytes;
+    out[2] = atomic_load_explicit(&token->state, memory_order_acquire);
+    out[3] = atomic_load_explicit(&token->owner_bits, memory_order_acquire);
+    out[4] = a->resize.prepared.phase; out[5] = a->resize.refund.phase;
+    out[6] = a->resize.downsize.phase; out[7] = token->bytes;
+    return 0;
+}
+#endif
