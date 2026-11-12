@@ -29685,3 +29685,700 @@ wl_columnar_session_seed_test_compact_view(const wl_columnar_session_seed_t *a,
     return 0;
 }
 #endif
+
+/* Standalone one-range radix scratch owner. No runtime/pool integration. */
+#include "columnar/radix_workspace_attempt.h"
+typedef enum {
+    WL_COLUMNAR_RELATION_RADIX_W_NEW,
+    WL_COLUMNAR_RELATION_RADIX_W_HEADER,
+    WL_COLUMNAR_RELATION_RADIX_W_SET_A,
+    WL_COLUMNAR_RELATION_RADIX_W_SET_B,
+    WL_COLUMNAR_RELATION_RADIX_W_MEMBER,
+    WL_COLUMNAR_RELATION_RADIX_W_ROLE,
+    WL_COLUMNAR_RELATION_RADIX_W_DESCRIPTOR,
+    WL_COLUMNAR_RELATION_RADIX_W_OWNER,
+    WL_COLUMNAR_RELATION_RADIX_W_SNAP_A,
+    WL_COLUMNAR_RELATION_RADIX_W_SNAP_B,
+    WL_COLUMNAR_RELATION_RADIX_W_SLOTS,
+    WL_COLUMNAR_RELATION_RADIX_W_SLOTS_SELF,
+    WL_COLUMNAR_RELATION_RADIX_W_SLOTS_OWNER,
+    WL_COLUMNAR_RELATION_RADIX_W_WRITER_D,
+    WL_COLUMNAR_RELATION_RADIX_W_WRITER_S,
+    WL_COLUMNAR_RELATION_RADIX_W_WRITER_O,
+    WL_COLUMNAR_RELATION_RADIX_W_RANGE_CAPTURE,
+    WL_COLUMNAR_RELATION_RADIX_W_RANGE,
+    WL_COLUMNAR_RELATION_RADIX_W_RANGE_TS,
+    WL_COLUMNAR_RELATION_RADIX_W_LANE,
+    WL_COLUMNAR_RELATION_RADIX_W_GENERATION_CAPTURE,
+    WL_COLUMNAR_RELATION_RADIX_W_GENERATION,
+    WL_COLUMNAR_RELATION_RADIX_W_TYPES,
+    WL_COLUMNAR_RELATION_RADIX_W_SELECT,
+    WL_COLUMNAR_RELATION_RADIX_W_SIZE_PERM,
+    WL_COLUMNAR_RELATION_RADIX_W_SIZE_TEMP,
+    WL_COLUMNAR_RELATION_RADIX_W_SIZE_TWO,
+    WL_COLUMNAR_RELATION_RADIX_W_SIZE_TEMP_ADD,
+    WL_COLUMNAR_RELATION_RADIX_W_SIZE_BUCKET,
+    WL_COLUMNAR_RELATION_RADIX_W_SIZE_BUCKET_ADD,
+    WL_COLUMNAR_RELATION_RADIX_W_SIZE_COUNT,
+    WL_COLUMNAR_RELATION_RADIX_W_SIZE_COUNT_ADD,
+    WL_COLUMNAR_RELATION_RADIX_W_SIZE_INSERT_SLOTS,
+    WL_COLUMNAR_RELATION_RADIX_W_SIZE_INSERT_WIDTH,
+    WL_COLUMNAR_RELATION_RADIX_W_SIZE_INSERT_BYTES,
+    WL_COLUMNAR_RELATION_RADIX_W_SIZE_INSERT_ADD,
+    WL_COLUMNAR_RELATION_RADIX_W_SIZE_TS,
+    WL_COLUMNAR_RELATION_RADIX_W_SIZE_TS_ADD,
+    WL_COLUMNAR_RELATION_RADIX_W_SIZE_TOTAL,
+    WL_COLUMNAR_RELATION_RADIX_W_GOVERNOR,
+    WL_COLUMNAR_RELATION_RADIX_W_TOKEN,
+    WL_COLUMNAR_RELATION_RADIX_W_RESERVE_SELECT,
+    WL_COLUMNAR_RELATION_RADIX_W_RESERVE_CALL,
+    WL_COLUMNAR_RELATION_RADIX_W_VERDICT,
+    WL_COLUMNAR_RELATION_RADIX_W_ALLOC_TS,
+    WL_COLUMNAR_RELATION_RADIX_W_ALLOC_A,
+    WL_COLUMNAR_RELATION_RADIX_W_ALLOC_B,
+    WL_COLUMNAR_RELATION_RADIX_W_ALLOC_TEMP,
+    WL_COLUMNAR_RELATION_RADIX_W_ALLOC_THREE,
+    WL_COLUMNAR_RELATION_RADIX_W_ALLOC_BUCKET,
+    WL_COLUMNAR_RELATION_RADIX_W_BIND_BUCKET,
+    WL_COLUMNAR_RELATION_RADIX_W_ALLOC_COUNT,
+    WL_COLUMNAR_RELATION_RADIX_W_ALLOC_INSERT,
+    WL_COLUMNAR_RELATION_RADIX_W_BIND_INSERT,
+    WL_COLUMNAR_RELATION_RADIX_W_PROV_A,
+    WL_COLUMNAR_RELATION_RADIX_W_PROV_B,
+    WL_COLUMNAR_RELATION_RADIX_W_PROV_C,
+    WL_COLUMNAR_RELATION_RADIX_W_FINGERPRINT,
+    WL_COLUMNAR_RELATION_RADIX_W_RECHECK_A,
+    WL_COLUMNAR_RELATION_RADIX_W_RECHECK_B,
+    WL_COLUMNAR_RELATION_RADIX_W_RECHECK_SLOTS,
+    WL_COLUMNAR_RELATION_RADIX_W_RECHECK_SELF,
+    WL_COLUMNAR_RELATION_RADIX_W_RECHECK_OWNER,
+    WL_COLUMNAR_RELATION_RADIX_W_RECHECK_D,
+    WL_COLUMNAR_RELATION_RADIX_W_RECHECK_S,
+    WL_COLUMNAR_RELATION_RADIX_W_RECHECK_O,
+    WL_COLUMNAR_RELATION_RADIX_W_FINAL,
+    WL_COLUMNAR_RELATION_RADIX_W_READY,
+    WL_COLUMNAR_RELATION_RADIX_W_EXPOSED,
+} wl_columnar_relation_radix_workspace_phase_t;
+struct wl_columnar_relation_radix_workspace_attempt {
+    struct wl_columnar_relation_radix_workspace_attempt *identity;
+    wl_evaluation_control_t *original;
+    uint64_t id;
+#if defined(WL_HAVE_C11_THREADS)
+    thrd_t thread;
+#elif defined(_WIN32) || defined(_WIN64)
+    DWORD thread;
+#else
+    pthread_t thread;
+#endif
+    bool control_held, governor_held, ending, ended;
+    unsigned phase, end_phase;
+    int child_result;
+    col_rel_t *relation, *owner;
+    wl_columnar_relation_mutation_lease_t *lease;
+    wl_columnar_relation_mutation_set_t *set;
+    const wl_columnar_relation_mutation_role_t *roles;
+    wl_columnar_relation_mutation_lease_t *leases;
+    wl_columnar_relation_mutation_descriptor_t *descriptors;
+    wl_columnar_relation_mutation_owner_t *owners;
+    size_t lease_count, descriptor_count, owner_count, member, index;
+    uint64_t nonce, identity_value, view, storage, hash;
+    uint32_t start, count, width, rows, capacity, ts_capacity, lane;
+    uint32_t k8, k16, insertion, permutation, timestamp_rows;
+    bool found, has_float, has_ts, has_types, failed_batch, token_initialized;
+    size_t perm_bytes, temp_bytes, bucket_bytes, count_bytes, insert_bytes,
+        ts_bytes, bytes, slots;
+    uint64_t clear;
+    wl_columnar_memory_governor_ref_t *governor;
+    wl_columnar_memory_governor_t *budget;
+    wl_columnar_memory_admission_status_t status;
+    wl_columnar_radix_workspace_t workspace;
+    wl_columnar_memory_retirement_receipt_t receipt;
+};
+#ifdef WL_SESSION_TEST_HOOKS
+void (*wl_columnar_relation_radix_workspace_attempt_test_checkpoint)(
+    const wl_columnar_relation_radix_workspace_attempt_t *, unsigned);
+#endif
+static bool
+wl_columnar_relation_radix_workspace_attempt_thread(
+    const wl_columnar_relation_radix_workspace_attempt_t *a)
+{
+#if defined(WL_HAVE_C11_THREADS)
+    return thrd_equal(a->thread, thrd_current());
+#elif defined(_WIN32) || defined(_WIN64)
+    return a->thread == GetCurrentThreadId();
+#else
+    return pthread_equal(a->thread, pthread_self());
+#endif
+}
+static int
+wl_columnar_relation_radix_workspace_attempt_cut(
+    wl_columnar_relation_radix_workspace_attempt_t *a,
+    wl_evaluation_control_t *c, uint64_t id, unsigned phase)
+{
+    if (!a || a->identity != a) return EINVAL;
+#ifdef WL_SESSION_TEST_HOOKS
+    if (wl_columnar_relation_radix_workspace_attempt_test_checkpoint)
+        wl_columnar_relation_radix_workspace_attempt_test_checkpoint(a, phase);
+#else
+    (void)phase;
+#endif
+    int rc = wl_evaluation_control_charge_attempt(c, id, 256);
+    if (rc) return rc;
+    return wl_columnar_relation_radix_workspace_attempt_thread(a)?0:EINVAL;
+}
+/* The context owns only scratch. This live check authenticates the genuine
+ * borrowed lease/set before every subsequent preparation read. */
+static int
+wl_columnar_relation_radix_workspace_attempt_live(
+    const wl_columnar_relation_radix_workspace_attempt_t *a,
+    const wl_columnar_relation_mutation_lease_t *l,
+    const wl_columnar_relation_mutation_set_t *s)
+{
+    if (!l || l->identity != (uintptr_t)l || l->set != s ||
+        l->acquisition_nonce != a->nonce || l->relation != a->relation ||
+        l->detached)
+        return EINVAL;
+    if (!s || s->identity != (uintptr_t)s ||
+        s->acquisition_nonce != a->nonce) return EINVAL;
+    if (a->phase < WL_COLUMNAR_RELATION_RADIX_W_MEMBER) return 0;
+    if (s->roles != a->roles || s->leases != a->leases ||
+        s->descriptors != a->descriptors ||
+        s->owners != a->owners || s->lease_count != a->lease_count ||
+        s->descriptor_count != a->descriptor_count ||
+        s->owner_count != a->owner_count ||
+        s->descriptors_acquired != a->descriptor_count ||
+        s->owners_acquired != a->owner_count)
+        return EINVAL;
+    return 0;
+}
+static bool
+wl_columnar_relation_radix_workspace_attempt_current(
+    const wl_columnar_relation_radix_workspace_attempt_t *a)
+{
+    const col_rel_t *r = a->relation;
+    return r->relation_identity == a->identity_value &&
+           r->view_generation == a->view &&
+           r->storage_generation == a->storage && r->nrows == a->rows &&
+           r->ncols == a->width &&
+           r->capacity == a->capacity &&
+           r->timestamp_capacity == a->ts_capacity &&
+           (r->timestamps != NULL) == a->has_ts &&
+           (r->column_types != NULL) == a->has_types;
+}
+size_t wl_columnar_relation_radix_workspace_attempt_size(void) {
+    return sizeof(wl_columnar_relation_radix_workspace_attempt_t);
+}
+int
+wl_columnar_relation_radix_workspace_attempt_init(
+    wl_columnar_relation_radix_workspace_attempt_t *a,
+    wl_evaluation_control_t *c, uint64_t id)
+{
+    if (!a || !c || !id) return EINVAL;
+    for (size_t byte = 0; byte < sizeof(*a);) {
+        int rc = wl_evaluation_control_charge_attempt(c, id, 256);
+        if (rc) return rc;
+        for (unsigned n = 0; n < 8 && byte < sizeof(*a);
+            n++, byte++) ((unsigned char *)a)[byte] = 0;
+    }
+    int rc = wl_evaluation_control_charge_attempt(c, id, 256);
+    if (rc) return rc;
+    rc = wl_evaluation_control_retain_try(c);
+    if (rc) return rc;
+    a->original = c; a->control_held = true; a->id = id;
+#if defined(WL_HAVE_C11_THREADS)
+    a->thread = thrd_current();
+#elif defined(_WIN32) || defined(_WIN64)
+    a->thread = GetCurrentThreadId();
+#else
+    a->thread = pthread_self();
+#endif
+    rc = wl_evaluation_control_charge_attempt(c, id, 0);
+    if (rc) {
+        a->control_held = false; wl_evaluation_control_release(c); return rc;
+    }
+    a->identity = a; return 0;
+}
+int
+wl_columnar_relation_radix_workspace_attempt_begin(
+    wl_columnar_relation_radix_workspace_attempt_t *a, col_rel_t *r,
+    uint32_t start, uint32_t count, wl_columnar_relation_mutation_lease_t *l)
+{
+    if (!a || a->identity != a || a->ending || a->phase) return EINVAL;
+    int rc = wl_columnar_relation_radix_workspace_attempt_cut(a, a->original,
+            a->id, 2000);
+    if (rc) return rc;
+    a->relation = r; a->lease = l; a->start = start; a->count = count;
+    a->phase = WL_COLUMNAR_RELATION_RADIX_W_HEADER; return 0;
+}
+int
+wl_columnar_relation_radix_workspace_attempt_prepare_step(
+    wl_columnar_relation_radix_workspace_attempt_t *a, bool *ready)
+{
+    if (!ready || !a || a->identity != a || a->ending) return EINVAL;
+    *ready = false;
+    int rc = wl_columnar_relation_radix_workspace_attempt_cut(a, a->original,
+            a->id, 2000+a->phase);
+    if (rc) return rc;
+    if (a->phase == WL_COLUMNAR_RELATION_RADIX_W_RESERVE_CALL) {
+        a->phase = WL_COLUMNAR_RELATION_RADIX_W_VERDICT;
+        return (a->child_result =
+               wl_columnar_memory_governor_reserve_source_attempt_controlled(
+                   a->budget, a->bytes, &a->workspace.admission, &a->status,
+                   a->original, a->id));
+    }
+    if (a->child_result) return a->child_result;
+    wl_columnar_relation_mutation_lease_t *l = a->lease;
+    wl_columnar_relation_mutation_set_t *s = a->set;
+    if (a->phase >= WL_COLUMNAR_RELATION_RADIX_W_SET_A &&
+        a->phase != WL_COLUMNAR_RELATION_RADIX_W_TOKEN &&
+        a->phase != WL_COLUMNAR_RELATION_RADIX_W_RESERVE_SELECT) {
+        rc = wl_columnar_relation_radix_workspace_attempt_live(a, l, s);
+        if (rc) return rc;
+    }
+    col_rel_t *r = a->relation;
+    wl_columnar_radix_workspace_t *w = &a->workspace;
+    switch (a->phase) {
+    case WL_COLUMNAR_RELATION_RADIX_W_HEADER:
+        if (!r || !l || l->identity != (uintptr_t)l || !l->set ||
+            !l->acquisition_nonce ||
+            l->relation != r || l->detached ||
+            l->role_flags !=
+            WL_COLUMNAR_RELATION_PAYLOAD_MUTATION) return EINVAL;
+        a->set = l->set; a->nonce = l->acquisition_nonce; break;
+    case WL_COLUMNAR_RELATION_RADIX_W_SET_A:
+        if (!s->roles || !s->leases || !s->descriptors ||
+            !s->owners) return EINVAL;
+        a->roles = s->roles; a->leases = s->leases;
+        a->descriptors = s->descriptors; a->owners = s->owners; break;
+    case WL_COLUMNAR_RELATION_RADIX_W_SET_B:
+        if (s->descriptors_acquired != s->descriptor_count ||
+            s->owners_acquired != s->owner_count ||
+            l->descriptor_slot >= s->descriptor_count) return EINVAL;
+        a->lease_count = s->lease_count;
+        a->descriptor_count = s->descriptor_count;
+        a->owner_count = s->owner_count; break;
+    case WL_COLUMNAR_RELATION_RADIX_W_MEMBER:
+        if (a->index < a->lease_count) {
+            if (&s->leases[a->index] == l) {
+                a->found = true; a->member = a->index;
+            }
+            a->index++; return 0;
+        }
+        if (!a->found) return EINVAL;
+        break;
+    case WL_COLUMNAR_RELATION_RADIX_W_ROLE:
+        if (s->roles[a->member].relation != r ||
+            s->roles[a->member].role_flags != l->role_flags ||
+            l->role_flags !=
+            WL_COLUMNAR_RELATION_PAYLOAD_MUTATION) return EINVAL; break;
+    case WL_COLUMNAR_RELATION_RADIX_W_DESCRIPTOR:
+        if (l->descriptor_slot >= a->descriptor_count ||
+            s->descriptors[l->descriptor_slot].relation != r) return EINVAL;
+        break;
+    case WL_COLUMNAR_RELATION_RADIX_W_OWNER:
+        rc = col_rel_storage_owner_resolve(r, &a->owner);
+        if (rc) return rc;
+        if (a->owner != l->owner) return EINVAL; break;
+    case WL_COLUMNAR_RELATION_RADIX_W_SNAP_A:
+        if (r->relation_identity != l->relation_identity ||
+            r->storage_generation != l->relation_generation ||
+            r->storage_owner_identity != l->owner_identity ||
+            r->storage_owner_generation != l->owner_generation) return EINVAL;
+        break;
+    case WL_COLUMNAR_RELATION_RADIX_W_SNAP_B:
+        if (a->owner->relation_identity != l->owner_identity ||
+            a->owner->storage_generation != l->owner_generation ||
+            !wl_columnar_relation_generation_valid(l->relation_generation) ||
+            !wl_columnar_relation_generation_valid(
+                l->owner_generation)) return EINVAL; break;
+    case WL_COLUMNAR_RELATION_RADIX_W_SLOTS:
+    case WL_COLUMNAR_RELATION_RADIX_W_RECHECK_SLOTS:
+        if (l->descriptor_slot >= a->descriptor_count ||
+            s->descriptors[l->descriptor_slot].relation != r) return EINVAL;
+        break;
+    case WL_COLUMNAR_RELATION_RADIX_W_SLOTS_SELF:
+    case WL_COLUMNAR_RELATION_RADIX_W_RECHECK_SELF:
+        if (l->self_owner_slot >= a->owner_count ||
+            s->owners[l->self_owner_slot].owner != r) return EINVAL;
+        break;
+    case WL_COLUMNAR_RELATION_RADIX_W_SLOTS_OWNER:
+    case WL_COLUMNAR_RELATION_RADIX_W_RECHECK_OWNER:
+        if (l->owner_slot >= a->owner_count ||
+            s->owners[l->owner_slot].owner != a->owner ||
+            s->roles[a->member].relation != r ||
+            s->roles[a->member].role_flags != l->role_flags ||
+            l->role_flags !=
+            WL_COLUMNAR_RELATION_PAYLOAD_MUTATION) return EINVAL;
+        break;
+    case WL_COLUMNAR_RELATION_RADIX_W_WRITER_D:
+    case WL_COLUMNAR_RELATION_RADIX_W_RECHECK_D:
+        rc =
+            wl_columnar_source_access_writer_validate(
+            &s->descriptors[l->descriptor_slot].writer, &r->descriptor_access);
+        if (rc) return rc; break;
+    case WL_COLUMNAR_RELATION_RADIX_W_WRITER_S:
+    case WL_COLUMNAR_RELATION_RADIX_W_RECHECK_S:
+        rc =
+            wl_columnar_source_access_writer_validate(
+            &s->owners[l->self_owner_slot].writer, &r->source_access);
+        if (rc) return rc; break;
+    case WL_COLUMNAR_RELATION_RADIX_W_WRITER_O:
+    case WL_COLUMNAR_RELATION_RADIX_W_RECHECK_O:
+        /* This packet freshly validates the real canonical token even when
+         * it is the self token checked by the preceding packet. */
+        rc =
+            wl_columnar_source_access_writer_validate(
+            &s->owners[l->owner_slot].writer,
+            &a->owner->source_access);
+        if (rc) return rc;
+        break;
+    case WL_COLUMNAR_RELATION_RADIX_W_RANGE:
+        if (a->start > r->nrows || a->count > r->nrows-a->start ||
+            r->nrows > r->capacity || (r->ncols && !r->columns)) return EINVAL;
+        break;
+    case WL_COLUMNAR_RELATION_RADIX_W_RANGE_TS:
+        if (!col_rel_timestamp_shape_valid(r)) return EINVAL;
+        break;
+    case WL_COLUMNAR_RELATION_RADIX_W_RANGE_CAPTURE:
+        a->width = r->ncols; a->rows = r->nrows; a->capacity = r->capacity;
+        a->ts_capacity = r->timestamp_capacity;
+        a->has_ts = r->timestamps != NULL;
+        a->has_types = r->column_types != NULL; break;
+    case WL_COLUMNAR_RELATION_RADIX_W_LANE:
+        if (a->lane < a->width) {
+            if (!r->columns[a->lane]) return EINVAL; a->lane++; return 0;
+        }
+        a->lane = 0; break;
+    case WL_COLUMNAR_RELATION_RADIX_W_GENERATION:
+        if (!wl_columnar_relation_generation_valid(
+                r->view_generation)) return EINVAL;
+        if (a->width && a->count > 1 &&
+            (r->view_generation >= WL_COLUMNAR_REL_GENERATION_INVALID-1 ||
+            (r->col_shared &&
+            r->storage_generation >=
+            WL_COLUMNAR_REL_GENERATION_INVALID-1))) return EOVERFLOW;
+        break;
+    case WL_COLUMNAR_RELATION_RADIX_W_GENERATION_CAPTURE:
+        a->identity_value = r->relation_identity; a->view = r->view_generation;
+        a->storage = r->storage_generation; break;
+    case WL_COLUMNAR_RELATION_RADIX_W_TYPES:
+        if (r->column_types && a->lane < a->width) {
+            a->has_float |= r->column_types[a->lane] == WIRELOG_TYPE_FLOAT;
+            a->lane++; return 0;
+        }
+        a->lane = 0; break;
+    case WL_COLUMNAR_RELATION_RADIX_W_SELECT:
+        if (a->count > 1) {
+            if (a->has_float || a->count <= 32) a->insertion = a->count;
+            else if (a->count >= 50000) a->k16 = a->count;
+            else a->k8 = a->count;
+        }
+        a->permutation = a->k8 > a->k16?a->k8:a->k16;
+        a->timestamp_rows = a->permutation >
+            a->insertion?a->permutation:a->insertion; break;
+    case WL_COLUMNAR_RELATION_RADIX_W_SIZE_PERM:
+        if (!col_rel_size_multiply(a->permutation, sizeof(uint32_t),
+            &a->perm_bytes)) return EOVERFLOW; break;
+    case WL_COLUMNAR_RELATION_RADIX_W_SIZE_TEMP:
+        if (!col_rel_size_multiply(a->permutation, sizeof(int64_t),
+            &a->temp_bytes)) return EOVERFLOW; break;
+    case WL_COLUMNAR_RELATION_RADIX_W_SIZE_TWO:
+        if (!col_rel_size_multiply(a->perm_bytes, 2,
+            &a->bytes)) return EOVERFLOW; break;
+    case WL_COLUMNAR_RELATION_RADIX_W_SIZE_TEMP_ADD:
+        if (!col_rel_size_add(a->bytes, a->temp_bytes,
+            &a->bytes)) return EOVERFLOW; break;
+    case WL_COLUMNAR_RELATION_RADIX_W_SIZE_BUCKET:
+        if (!col_rel_size_multiply(a->k16, sizeof(uint16_t),
+            &a->bucket_bytes)) return EOVERFLOW; break;
+    case WL_COLUMNAR_RELATION_RADIX_W_SIZE_BUCKET_ADD:
+        if (a->bucket_bytes < a->k8) a->bucket_bytes = a->k8;
+        if (!col_rel_size_add(a->bytes, a->bucket_bytes,
+            &a->bytes)) return EOVERFLOW; break;
+    case WL_COLUMNAR_RELATION_RADIX_W_SIZE_COUNT:
+        if (!col_rel_size_multiply(a->k16?65536u:0, sizeof(uint32_t),
+            &a->count_bytes)) return EOVERFLOW; break;
+    case WL_COLUMNAR_RELATION_RADIX_W_SIZE_COUNT_ADD:
+        if (!col_rel_size_add(a->bytes, a->count_bytes,
+            &a->bytes)) return EOVERFLOW; break;
+    case WL_COLUMNAR_RELATION_RADIX_W_SIZE_INSERT_SLOTS:
+        if (!col_rel_size_add(a->insertion, a->insertion?1u:0u,
+            &a->slots)) return EOVERFLOW; break;
+    case WL_COLUMNAR_RELATION_RADIX_W_SIZE_INSERT_WIDTH:
+        if (!col_rel_size_multiply(a->slots, a->width,
+            &a->insert_bytes)) return EOVERFLOW; break;
+    case WL_COLUMNAR_RELATION_RADIX_W_SIZE_INSERT_BYTES:
+        if (!col_rel_size_multiply(a->insert_bytes, sizeof(int64_t),
+            &a->insert_bytes)) return EOVERFLOW; break;
+    case WL_COLUMNAR_RELATION_RADIX_W_SIZE_INSERT_ADD:
+        if (!col_rel_size_add(a->bytes, a->insert_bytes,
+            &a->bytes)) return EOVERFLOW; break;
+    case WL_COLUMNAR_RELATION_RADIX_W_SIZE_TS:
+        if (!col_rel_size_multiply(a->has_ts?a->timestamp_rows:0,
+            sizeof(col_delta_timestamp_t), &a->ts_bytes)) return EOVERFLOW;
+        break;
+    case WL_COLUMNAR_RELATION_RADIX_W_SIZE_TS_ADD:
+        if (!col_rel_size_add(a->bytes, a->ts_bytes,
+            &a->bytes)) return EOVERFLOW; break;
+    case WL_COLUMNAR_RELATION_RADIX_W_SIZE_TOTAL:
+        if ((uint64_t)a->bytes != a->bytes) return EOVERFLOW; break;
+    case WL_COLUMNAR_RELATION_RADIX_W_GOVERNOR:
+        a->governor = r->memory_governor;
+        if (a->governor) {
+            wl_columnar_memory_governor_ref_retain(a->governor);
+            a->governor_held = true;
+        }
+        break;
+    case WL_COLUMNAR_RELATION_RADIX_W_TOKEN:
+        wl_columnar_memory_reservation_init(&w->admission);
+        a->token_initialized = true; break;
+    case WL_COLUMNAR_RELATION_RADIX_W_RESERVE_SELECT:
+        a->budget = wl_columnar_memory_governor_ref_get(a->governor);
+        a->phase = a->governor &&
+            a->bytes ? WL_COLUMNAR_RELATION_RADIX_W_RESERVE_CALL :
+            WL_COLUMNAR_RELATION_RADIX_W_VERDICT;
+        return 0;
+    case WL_COLUMNAR_RELATION_RADIX_W_VERDICT:
+        if (a->governor && a->bytes) {
+            if (a->status != WL_COLUMNAR_MEMORY_ADMISSION_OK &&
+                a->status != WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY){
+                if (a->status ==
+                    WL_COLUMNAR_MEMORY_ADMISSION_DENIED) r->
+                    memory_budget_denial_pending = true;
+                return a->status ==
+                       WL_COLUMNAR_MEMORY_ADMISSION_DENIED?ENOMEM:a->status ==
+                       WL_COLUMNAR_MEMORY_ADMISSION_OVERFLOW?EOVERFLOW:EINVAL;
+            }
+            w->admission_active = true;
+        }
+        break;
+    case WL_COLUMNAR_RELATION_RADIX_W_ALLOC_TS:
+        if (a->ts_bytes) {
+            w->timestamps = wl_columnar_relation_radix_malloc(a->ts_bytes,
+                    "radix_workspace_timestamps");
+            if (!w->timestamps) return ENOMEM;
+            w->timestamp_capacity = a->timestamp_rows;
+        }
+        break;
+    case WL_COLUMNAR_RELATION_RADIX_W_ALLOC_A:
+        if (a->permutation) {
+            w->perm_a =
+                (uint32_t *)wl_columnar_relation_radix_malloc(a->perm_bytes,
+                    "radix_workspace_perm_a"); a->failed_batch |= !w->perm_a;
+        }
+        break;
+    case WL_COLUMNAR_RELATION_RADIX_W_ALLOC_B:
+        if (a->permutation) {
+            w->perm_b =
+                (uint32_t *)wl_columnar_relation_radix_malloc(a->perm_bytes,
+                    "radix_workspace_perm_b"); a->failed_batch |= !w->perm_b;
+        }
+        break;
+    case WL_COLUMNAR_RELATION_RADIX_W_ALLOC_TEMP:
+        if (a->permutation) {
+            w->temp_column =
+                (int64_t *)wl_columnar_relation_radix_malloc(a->temp_bytes,
+                    "radix_workspace_temp_column");
+            a->failed_batch |= !w->temp_column;
+        }
+        break;
+    case WL_COLUMNAR_RELATION_RADIX_W_ALLOC_THREE:
+        if (a->failed_batch) return ENOMEM; break;
+    case WL_COLUMNAR_RELATION_RADIX_W_ALLOC_BUCKET:
+        if (a->bucket_bytes) {
+            w->bucket_values =
+                wl_columnar_relation_radix_malloc(a->bucket_bytes,
+                    "radix_workspace_bucket_values");
+            if (!w->bucket_values) return ENOMEM;
+        }
+        break;
+    case WL_COLUMNAR_RELATION_RADIX_W_BIND_BUCKET:
+        if (a->bucket_bytes) {
+            w->byte_values = (uint8_t *)w->bucket_values;
+            w->short_values = (uint16_t *)w->bucket_values;
+            w->k8_capacity = a->k8; w->k16_capacity = a->k16;
+        }
+        break;
+    case WL_COLUMNAR_RELATION_RADIX_W_ALLOC_COUNT:
+        if (a->count_bytes) {
+            w->count16 =
+                (uint32_t *)wl_columnar_relation_radix_malloc(a->count_bytes,
+                    "radix_workspace_count16"); if (!w->count16) return ENOMEM;
+        }
+        break;
+    case WL_COLUMNAR_RELATION_RADIX_W_ALLOC_INSERT:
+        if (a->insertion) {
+            w->insertion_rows =
+                (int64_t *)wl_columnar_relation_radix_malloc(a->insert_bytes,
+                    "radix_workspace_insertion_rows");
+            if (!w->insertion_rows) return ENOMEM;
+        }
+        break;
+    case WL_COLUMNAR_RELATION_RADIX_W_BIND_INSERT:
+        if (a->insertion) {
+            w->insertion_capacity = a->insertion;
+            w->insertion_bytes = a->insert_bytes;
+        }
+        break;
+    case WL_COLUMNAR_RELATION_RADIX_W_PROV_A:
+        w->prepared_relation = r; w->prepared_identity = a->identity_value;
+        w->prepared_view_generation = a->view;
+        w->prepared_storage_generation = a->storage; break;
+    case WL_COLUMNAR_RELATION_RADIX_W_PROV_B:
+        w->prepared_start = a->start; w->prepared_count = a->count;
+        w->prepared_nrows = a->rows; w->prepared_ncols = a->width; break;
+    case WL_COLUMNAR_RELATION_RADIX_W_PROV_C:
+        w->prepared_capacity = a->capacity;
+        w->prepared_timestamp_capacity = a->ts_capacity;
+        w->prepared_has_timestamps = a->has_ts;
+        w->prepared_has_types = a->has_types;
+        a->hash = UINT64_C(14695981039346656037); break;
+    case WL_COLUMNAR_RELATION_RADIX_W_FINGERPRINT:
+        if (r->column_types && a->lane < a->width) {
+            a->hash ^= (uint64_t)r->column_types[a->lane];
+            a->hash *= UINT64_C(1099511628211); a->lane++; return 0;
+        }
+        w->prepared_type_fingerprint = a->hash; break;
+    case WL_COLUMNAR_RELATION_RADIX_W_RECHECK_A:
+        if (r->relation_identity != a->identity_value ||
+            r->view_generation != a->view ||
+            r->storage_generation != a->storage ||
+            r->nrows != a->rows || r->ncols != a->width) return EINVAL; break;
+    case WL_COLUMNAR_RELATION_RADIX_W_RECHECK_B:
+        if (r->capacity != a->capacity ||
+            r->timestamp_capacity != a->ts_capacity ||
+            (r->timestamps != NULL) != a->has_ts ||
+            (r->column_types != NULL) != a->has_types) return EINVAL; break;
+    case WL_COLUMNAR_RELATION_RADIX_W_FINAL:
+        if (!wl_columnar_relation_radix_workspace_attempt_current(
+                a)) return EINVAL;
+#ifdef WL_SESSION_TEST_HOOKS
+        if (wl_columnar_relation_radix_workspace_attempt_test_checkpoint)
+            wl_columnar_relation_radix_workspace_attempt_test_checkpoint(a,
+                2101);
+#endif
+        rc = wl_evaluation_control_charge_attempt(a->original, a->id, 0);
+        if (rc) return rc;
+        a->phase = WL_COLUMNAR_RELATION_RADIX_W_READY; *ready = true; return 0;
+    case WL_COLUMNAR_RELATION_RADIX_W_READY:
+        *ready = true; return 0;
+    default: return EINVAL;
+    }
+    a->phase++; return 0;
+}
+int
+wl_columnar_relation_radix_workspace_attempt_borrow(
+    wl_columnar_relation_radix_workspace_attempt_t *a,
+    const wl_columnar_radix_workspace_t **out)
+{
+    if (!a || a->identity != a || !out || *out || a->ending ||
+        a->phase != WL_COLUMNAR_RELATION_RADIX_W_READY) return EINVAL;
+    int rc = wl_columnar_relation_radix_workspace_attempt_cut(a, a->original,
+            a->id, 2100);
+    if (rc) return rc;
+    rc = wl_columnar_relation_radix_workspace_attempt_live(a, a->lease, a->set);
+    if (rc) return rc;
+    if (!wl_columnar_relation_radix_workspace_attempt_current(a)) return EINVAL;
+    /* Actual serialized set slots/writers remain valid under the same nonce;
+     * source provenance must also still match immediately before the borrow. */
+#ifdef WL_SESSION_TEST_HOOKS
+    if (wl_columnar_relation_radix_workspace_attempt_test_checkpoint)
+        wl_columnar_relation_radix_workspace_attempt_test_checkpoint(a, 2102);
+#endif
+    rc = wl_evaluation_control_charge_attempt(a->original, a->id, 0);
+    if (rc) return rc;
+    a->phase = WL_COLUMNAR_RELATION_RADIX_W_EXPOSED; *out = &a->workspace;
+    return 0;
+}
+int
+wl_columnar_relation_radix_workspace_attempt_end_step(
+    wl_columnar_relation_radix_workspace_attempt_t *a,
+    wl_evaluation_control_t *funding, uint64_t id, bool *done)
+{
+    if (!done || !a || a->identity != a || !funding || funding == a->original ||
+        !id) return EINVAL;
+    *done = false;
+    int rc = wl_columnar_relation_radix_workspace_attempt_cut(a, funding, id,
+            2200+a->end_phase);
+    if (rc) return rc;
+    a->ending = true;
+    wl_columnar_radix_workspace_t *w = &a->workspace;
+    switch (a->end_phase) {
+    case 0: free(w->perm_a); w->perm_a = NULL; break;
+    case 1: free(w->perm_b); w->perm_b = NULL; break;
+    case 2: free(w->bucket_values); w->bucket_values = NULL;
+        w->byte_values = NULL; w->short_values = NULL; break;
+    case 3: free(w->count16); w->count16 = NULL; break;
+    case 4: free(w->temp_column); w->temp_column = NULL; break;
+    case 5: free(w->insertion_rows); w->insertion_rows = NULL; break;
+    case 6: free(w->timestamps); w->timestamps = NULL; break;
+    case 7: {
+        if (!a->token_initialized) {
+            a->end_phase = 11; return 0;
+        }
+        uint64_t state = atomic_load_explicit(&w->admission.state,
+                memory_order_acquire);
+        if (state == WL_COLUMNAR_MEMORY_RESERVATION_RESERVED) {
+            a->end_phase = 8; return 0;
+        }
+        if (state != WL_COLUMNAR_MEMORY_RESERVATION_EMPTY &&
+            state != WL_COLUMNAR_MEMORY_RESERVATION_RELEASED) return EBUSY;
+        a->end_phase = 11; return 0;
+    }
+    case 8:
+        rc = wl_columnar_memory_retirement_begin(&w->admission,
+                wl_columnar_memory_governor_ref_get(a->governor), NULL,
+                WL_COLUMNAR_MEMORY_RETIRE_ROLLBACK_RESERVED, &a->receipt);
+        if (rc) return rc;
+        break;
+    case 9:
+        if (a->receipt.phase != WL_COLUMNAR_MEMORY_RETIREMENT_DONE) {
+            rc = wl_columnar_memory_retirement_step(&a->receipt, funding, id);
+            return rc == EAGAIN?0:rc;
+        }
+        break;
+    case 10:
+        rc = wl_columnar_memory_retirement_acknowledge(&a->receipt);
+        if (rc) return rc;
+        w->admission_active = false; break;
+    case 11:
+        if (a->clear < sizeof(*w)) {
+            for (unsigned i = 0; i < 8 && a->clear < sizeof(*w);
+                i++) ((unsigned char *)w)[a->clear++] = 0;
+            return 0;
+        }
+        break;
+    case 12:
+        if (a->governor_held) {
+            a->governor_held = false;
+            wl_columnar_memory_governor_ref_release(a->governor);
+        }
+        break;
+    case 13:
+        if (a->control_held) {
+            a->control_held = false; wl_evaluation_control_release(a->original);
+        }
+        break;
+    default: a->ended = true; *done = true; return 0;
+    }
+    a->end_phase++; return 0;
+}
+#ifdef WL_SESSION_TEST_HOOKS
+int
+wl_columnar_relation_radix_workspace_attempt_test_view(
+    const wl_columnar_relation_radix_workspace_attempt_t *a, uint64_t out[12])
+{
+    if (!a || a->identity != a || !out) return EINVAL;
+    out[0] = a->phase; out[1] = a->end_phase; out[2] = a->bytes;
+    out[3] = a->status;
+    out[4] =
+        a->token_initialized ?
+        atomic_load_explicit(&a->workspace.admission.state,
+            memory_order_acquire) : UINT64_MAX;
+    out[5] = a->workspace.admission_active; out[6] = a->receipt.phase;
+    out[7] = a->child_result;
+    out[8] = a->index; out[9] = a->lane; out[10] = a->clear;
+    out[11] = a->governor_held;
+    return 0;
+}
+#endif
