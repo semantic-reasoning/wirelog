@@ -88,8 +88,8 @@ equal_capture(capture_t *a, capture_t *b, const char *what, unsigned kind)
 
 enum {
     K_SINGLE, K_UNION_A, K_UNION_C, K_UNION_BOTH, K_FILTER, K_COUNT,
-    K_GROUPED, K_TWO_COL, K_INT32, K_UINT32, K_UINT64, K_BOOL, K_FLOAT,
-    K_FLOAT_EXPR, K_COUNT_KINDS
+    K_GROUPED, K_TWO_COL, K_INT_EXPR, K_INT32, K_UINT32, K_UINT64, K_BOOL,
+    K_FLOAT, K_FLOAT_EXPR, K_COUNT_KINDS
 };
 
 #define UNION_TEXT ".decl a(x:int64)\n.decl c(x:int64)\n.decl out(x:int64)\n" \
@@ -116,6 +116,10 @@ static const struct {
       { "a", NULL }, NULL, WL_PLAN_OP_REDUCE, "$reduce" },
     { ".decl a(x:int64,y:int64)\n.decl out(y:int64,x:int64)\n"
       "out(y,x) :- a(x,y).\n",
+      { "a", NULL }, NULL, WL_PLAN_OP_MAP, "$map" },
+    /* An integer expression, which the observed routes read through the
+     * general observed transaction (#2301). */
+    { ".decl a(x:int64)\n.decl out(y:int64)\nout(x + 1) :- a(x).\n",
       { "a", NULL }, NULL, WL_PLAN_OP_MAP, "$map" },
     { ".decl a(x:int32)\n.decl out(x:int32)\nout(x) :- a(x).\n",
       { "a", NULL }, NULL, WL_PLAN_OP_MAP, "$map" },
@@ -576,7 +580,8 @@ stopped(unsigned kind, unsigned mode, const char *at, unsigned empty_at)
  * STRING or compound column, is untyped once it has rows, as in the
  * uncontrolled session: the first call sees rows inserted before it, the
  * next a further insert with one repeated row, the last nothing new. The
- * head matches the uncontrolled session in rows, width and type. */
+ * head matches the uncontrolled session in rows, width and type. The INT64
+ * integer-expression body runs the same rounds. */
 static void
 untyped_rows(unsigned kind, bool snapshot, bool observed)
 {
@@ -644,6 +649,9 @@ main(void)
         for (unsigned snapshot = 0; snapshot < 2; snapshot++)
             for (unsigned observed = 0; observed < 2; observed++)
                 untyped_rows(kind, snapshot, observed);
+    for (unsigned snapshot = 0; snapshot < 2; snapshot++)
+        for (unsigned observed = 0; observed < 2; observed++)
+            untyped_rows(K_INT_EXPR, snapshot, observed);
     for (unsigned kind = 0; kind < K_FLOAT; kind++)
         for (unsigned mode = 1; mode < 3; mode++) {
             /* At the consumer's publication, or at CONCAT for a UNION. */

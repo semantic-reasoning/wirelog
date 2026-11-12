@@ -8529,13 +8529,33 @@ wl_columnar_session_preflight_general_relation(void *payload)
     return 0;
 }
 
+/* The legacy observed route reads a MAP with no expression or with the
+ * single expression `col0`. */
+static bool
+wl_columnar_session_observer_identity_map(const wl_plan_op_t *map)
+{
+    if (!map->map_expr_count) return true;
+    if (!map->map_exprs || map->map_expr_count != 1) return false;
+    const wl_plan_expr_buffer_t *expr = &map->map_exprs[0];
+    if (!expr->size) return true;
+    uint16_t len = 0;
+    if (!expr->data || expr->size != 7 || expr->data[0] != WL_PLAN_EXPR_VAR)
+        return false;
+    memcpy(&len, expr->data + 1, sizeof(len));
+    return len == 4 && memcmp(expr->data + 3, "col0", 4) == 0;
+}
+
 static int
 wl_columnar_session_preflight_general_map(void *payload)
 {
     wl_columnar_session_preflight_read_t *p = payload;
     const wl_plan_op_t *map = &p->relation->ops[p->relation->op_count - 2];
+    /* Any other expression, such as `x + 1` over an INT64 EDB, goes to the
+     * general observed transaction (#2301), as a MAP over a
+     * single-column FLOAT EDB does. */
     p->shape = map->project_count != 1 || !map->project_indices
-        || map->project_indices[0] != 0;
+        || map->project_indices[0] != 0
+        || !wl_columnar_session_observer_identity_map(map);
     return 0;
 }
 
@@ -8610,17 +8630,7 @@ wl_columnar_session_preflight_observer_expression(void *payload)
 {
     wl_columnar_session_preflight_read_t *p = payload;
     const wl_plan_op_t *map = &p->relation->ops[p->relation->op_count - 2];
-    if (!map->map_expr_count) return 0;
-    const wl_plan_expr_buffer_t *expr = &map->map_exprs[0];
-    if (!expr->data && expr->size) return ENOTSUP;
-    if (expr->data && expr->size) {
-        uint16_t len = 0;
-        if (expr->size != 7 ||
-            expr->data[0] != WL_PLAN_EXPR_VAR) return ENOTSUP;
-        memcpy(&len, expr->data + 1, sizeof(len));
-        if (len != 4 || memcmp(expr->data + 3, "col0", 4) != 0) return ENOTSUP;
-    }
-    return 0;
+    return wl_columnar_session_observer_identity_map(map) ? 0 : ENOTSUP;
 }
 
 static int
