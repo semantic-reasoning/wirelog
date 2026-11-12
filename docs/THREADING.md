@@ -228,7 +228,7 @@ These exist so struct fields can be declared portably; the audit in
 
 Every `atomic_*` call site in `wirelog/` production sources. Counted
 mechanically by `scripts/ci/check-threading-doc.sh`; row count must
-match the script's count (currently **563**).
+match the script's count (currently **570**).
 
 Format: `file:function[#N]` | field | operation | order | justification.
 
@@ -670,7 +670,7 @@ concurrent alias removals cannot underflow the count.
 | `session.c:session_pool_rel_promote#3` | `src->storage_alias_borrows` | `atomic_store_explicit` | relaxed | Leave the closed pool tombstone with no child aliases |
 
 112 + 21 + 37 = **170 atomic call sites** in the summarized groups; the full
-symbol-anchored inventory below covers 563 sites.
+symbol-anchored inventory below covers 570 sites.
 
 The `#N` suffix counts all atomic sites in a symbol, regardless of operation;
 the first site remains unsuffixed. `scripts/ci/check-threading-doc.sh` uses
@@ -1779,7 +1779,7 @@ DONE. If a stop leaves the receipt holding a claim, its caller preserves that
 receipt and resumes with a fresh live maintenance attempt; it cannot abandon or
 reinitialize the receipt/token while the claim remains held.
 
-The complete current atomic-source inventory contains 563 call sites.
+The complete current atomic-source inventory contains 570 call sites.
 
 ### Caller-attempt-bound single mutation admission
 
@@ -2877,3 +2877,10 @@ performs those atomic operations.
 | `evaluation_control.c:wl_evaluation_control_test_source_early_report` | `control->references` | `atomic_fetch_add_explicit` | relaxed | Test-only neutral observation under BANK and control locks requires the canonical inactive two-reference financial owner before copying its genuine completed report; no state mutation, cancellation poll or handle loan |
 | `evaluation_control.c:wl_evaluation_control_source_bank_begin_checkpoint` | `control->active_attempt_id` | `atomic_exchange_explicit` | release | Publish the actual sealed private BANK generation before its same-lock zero observation; retain begun-and-stopped ownership until genuine FINISH/report, without a controller loan or Native permission |
 | `evaluation_control.c:wl_evaluation_control_lexical_finance_checkpoint_owned` | `control->references` | `atomic_fetch_add_explicit` | relaxed | Under the actual mutex require the exclusive creation and attachment pair before the same-lock financial checkpoint; no report, release or Native permission |
+| `relation.c:wl_columnar_session_seed_credit_end` | `token->state` | `atomic_load_explicit` | acquire | Observe the actual private seed token state after physical storage retirement; distinguish empty/released, reserved rollback and committed release before starting its real retirement receipt |
+| `relation.c:wl_columnar_session_seed_credit_end#2` | `token->owner_bits` | `atomic_load_explicit` | acquire | Capture the actual committed owner address for the real retirement receipt without dereferencing the already retired physical owner; reserved tokens use no owner |
+| `relation.c:wl_columnar_session_seed_reserve_cleanup_step` | `r->retained_reservation.state` | `atomic_load_explicit` | acquire | Observe a real REPLACING retained token before beginning the private resize refund; an already live refund follows its own receipt to DONE even after token state changes |
+| `relation.c:wl_columnar_session_seed_test_base_geometry` | `r->retained_reservation.state` | `atomic_load_explicit` | acquire | Read-only test observation requires the actual bound unpublished private base token to be COMMITTED before reporting allocation geometry; no source, native or publication authority is granted |
+| `relation.c:wl_columnar_session_seed_test_base_geometry#2` | `r->retained_reservation.owner_bits` | `atomic_load_explicit` | acquire | Read-only test observation verifies the actual retained token owner is the bound private base descriptor before reporting its bytes; the caller still must obey actor serialization and lifetime |
+| `relation.c:wl_columnar_session_seed_test_admission` | `token->state` | `atomic_load_explicit` | acquire | Read-only test observation verifies the actual denied seed admission leaves its selected real token empty/released, or preserves the committed old growth token; this observation grants no source, native or cleanup permission |
+| `relation.c:wl_columnar_session_seed_test_admission#2` | `token->owner_bits` | `atomic_load_explicit` | acquire | Read-only test observation captures the actual selected token owner after DENIED status so tests can distinguish released staging from the still-owned old growth image before real cleanup |
