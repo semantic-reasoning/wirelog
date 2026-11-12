@@ -228,7 +228,7 @@ These exist so struct fields can be declared portably; the audit in
 
 Every `atomic_*` call site in `wirelog/` production sources. Counted
 mechanically by `scripts/ci/check-threading-doc.sh`; row count must
-match the script's count (currently **579**).
+match the script's count (currently **581**).
 
 Format: `file:function[#N]` | field | operation | order | justification.
 
@@ -670,7 +670,7 @@ concurrent alias removals cannot underflow the count.
 | `session.c:session_pool_rel_promote#3` | `src->storage_alias_borrows` | `atomic_store_explicit` | relaxed | Leave the closed pool tombstone with no child aliases |
 
 112 + 21 + 37 = **170 atomic call sites** in the summarized groups; the full
-symbol-anchored inventory below covers 579 sites.
+symbol-anchored inventory below covers 581 sites.
 
 The `#N` suffix counts all atomic sites in a symbol, regardless of operation;
 the first site remains unsuffixed. `scripts/ci/check-threading-doc.sh` uses
@@ -786,6 +786,8 @@ release to be retried without retaining freed storage.
 | `eval_delta.c:wl_columnar_eval_delta_observer_release_credit` | `token->state` | `atomic_load_explicit` | acquire | Observe reservation state before checked retirement; preserve the original token when release refuses |
 | `eval_delta.c:wl_columnar_eval_delta_release_token` | `token->state` | `atomic_load_explicit` | acquire | Observe temporary scratch reservation state before its local release path |
 | `eval_delta.c:wl_columnar_eval_delta_observer_discard` | `sess->delta_observer_retirement_metadata.state` | `atomic_load_explicit` | acquire | Check the session-owned metadata token before retrying observer retirement |
+| `eval_delta.c:wl_columnar_eval_delta_resource_credit` | `token->state` | `atomic_load_explicit` | acquire | Select and retain the actual reservation rollback/finish mode; recognize EMPTY/RELEASED without copying the token |
+| `eval_delta.c:wl_columnar_eval_delta_resource_progress_value` | `p->credit->state` | `atomic_load_explicit` | acquire | Observe progress of the selected still-live credit receipt on a refused return; conveys no Native authority |
 | `eval_delta.c:wl_retraction_stage_prepare` | `r->retained_reservation.state` | `atomic_load_explicit` | acquire | Validate the committed payload token under the relation writer before staging a second physical image |
 | `eval_delta.c:wl_retraction_stage_prepare#2` | `r->retained_reservation.owner_bits` | `atomic_load_explicit` | acquire | Confirm the token is still bound to the canonical relation before growing its charge |
 
@@ -1779,7 +1781,7 @@ DONE. If a stop leaves the receipt holding a claim, its caller preserves that
 receipt and resumes with a fresh live maintenance attempt; it cannot abandon or
 reinitialize the receipt/token while the claim remains held.
 
-The complete current atomic-source inventory contains 579 call sites.
+The complete current atomic-source inventory contains 581 call sites.
 
 ### Caller-attempt-bound single mutation admission
 
@@ -1848,9 +1850,9 @@ supply the ownership contract.
 
 | Anchor | Object | Operation | Ordering | Purpose |
 |--------|--------|-----------|----------|---------|
-| `relation.c:wl_columnar_relation_reader_acquire_attempt_controlled` | `gate->state` | `atomic_load_explicit` | acquire | Paid original-attempt schema-clone/copy observation; copy retains its original source pair through last gather, never an allocation lifetime pin |
-| `relation.c:wl_columnar_relation_reader_acquire_attempt_controlled#2` | `gate->state` | `atomic_compare_exchange_weak_explicit` | acquire/relaxed | MSVC strong reader claim; owner marker precedes callback and stale cleanup uses the same original token |
-| `relation.c:wl_columnar_relation_reader_acquire_attempt_controlled#3` | `gate->state` | `atomic_compare_exchange_strong_explicit` | acquire/relaxed | Non-MSVC reader retry charged separately and guarded against a successor attempt |
+| `relation.c:wl_columnar_relation_reader_acquire_mode` | `gate->state` | `atomic_load_explicit` | acquire | Paid schema-clone/copy and retained scalar-source observation; the legacy wrapper drains on error while retained BEGIN leaves actual acquired reader debt with its parent |
+| `relation.c:wl_columnar_relation_reader_acquire_mode#2` | `gate->state` | `atomic_compare_exchange_weak_explicit` | acquire/relaxed | MSVC strong reader claim; the genuine token is initialized before returning checks and retain_on_error preserves it for finite parent cleanup |
+| `relation.c:wl_columnar_relation_reader_acquire_mode#3` | `gate->state` | `atomic_compare_exchange_strong_explicit` | acquire/relaxed | Non-MSVC reader retry charged separately and guarded against a successor attempt; successful claims retain their actual token when requested |
 | `relation.c:wl_columnar_relation_constructor_attempt_identity` | `wl_next_relation_identity` | `atomic_load_explicit` | relaxed | Original-attempt paid observation; uniqueness alone publishes no payload |
 | `relation.c:wl_columnar_relation_constructor_attempt_identity#2` | `wl_next_relation_identity` | `atomic_compare_exchange_weak_explicit` | relaxed/relaxed | MSVC strong identity reservation; no counter rewind after cancellation or stale return |
 | `relation.c:wl_columnar_relation_constructor_attempt_identity#3` | `wl_next_relation_identity` | `atomic_compare_exchange_strong_explicit` | relaxed/relaxed | Non-MSVC separately admitted strong identity retry, with original-ID guard after the before-CAS seam |
