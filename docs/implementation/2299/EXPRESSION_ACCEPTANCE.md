@@ -2094,3 +2094,31 @@ remain authoritative; host reports are not used to invent expected prices.
 
 Seed composition and actual recursive epoch/typed transport remain separate
 integration obligations; this qualification grants no multiworker permission.
+
+### Completion unit 11: explicit FINISH result fields
+
+The saved-ID FINISH primitive now initializes its ten semantic result fields
+explicitly and copies its seven report fields explicitly in both OWN_FINISHED
+and ALREADY_ENDED branches. Mutex scope, owner/generation checks, stop and error
+priority, actual active-ID publication and report_valid ordering are unchanged.
+There is no wrapper, new controller payment, API or native permission. Padding
+bytes are not a semantic report or serialization contract.
+
+This makes the fixed source work countable as ten stores and one reached
+seven-field load/store copy, rather than a conservative56-byte aggregate zero
+and40-byte read/write aggregate copy. The existing conservative primitive216
+ceiling becomes104; only one of the two copy branches executes in a call.
+This is a source-level bound, not a machine performance claim or a new fee.
+A previously counted ordinary constructor-error handoff can consequently be
+bounded by244 under that exact boundary. It does not certify a complete new
+refused-controller/selector/caller path: first PRE/reserve refusal, nonselected
+SOURCE callers and retained-attempt retry still require their own composition.
+No unadmitted reserve can fund its own refusal.
+
+Existing evaluation_control and evaluation_attempt_identity tests provide real
+OWN/ENDED/MISMATCH/rejected-owner matrices, complete report fields, stop/error
+priority, threaded generation changes and frozen Original/successor0 checks.
+They are reused rather than adding assignment-mirror tests. Serial, expression,
+empty-source and native/snapshot recovery regressions remain required because
+the primitive is shared. Typed bottom transport and ordinary prechild finish
+integration are subsequent units; this scalarization alone grants neither.

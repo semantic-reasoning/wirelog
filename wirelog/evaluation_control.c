@@ -2540,7 +2540,19 @@ wl_evaluation_control_finish_attempt(wl_evaluation_control_t *control,
     const void *owner, uint64_t expected_id, int execution_status,
     int cleanup_status)
 {
-    wl_evaluation_control_attempt_finish_result_t out = {0};
+    /* Explicit semantic fields bound fixed FINISH bookkeeping without a
+     * bytewise aggregate initializer or padding-byte contract. */
+    wl_evaluation_control_attempt_finish_result_t out;
+    out.kind = WL_EVALUATION_CONTROL_ATTEMPT_FINISH_REJECTED;
+    out.protocol = 0;
+    out.report_valid = false;
+    out.report.attempt_id = 0;
+    out.report.limit = 0;
+    out.report.consumed = 0;
+    out.report.stop_reason = 0;
+    out.report.execution_status = 0;
+    out.report.cleanup_status = 0;
+    out.report.result = 0;
     if (!control || !owner || !expected_id) {
         out.protocol = EINVAL;
         return out;
@@ -2561,7 +2573,13 @@ wl_evaluation_control_finish_attempt(wl_evaluation_control_t *control,
             out.protocol = EINVAL;
         } else {
             out.kind = WL_EVALUATION_CONTROL_ATTEMPT_FINISH_ALREADY_ENDED;
-            out.report = control->completed;
+            out.report.attempt_id = control->completed.attempt_id;
+            out.report.limit = control->completed.limit;
+            out.report.consumed = control->completed.consumed;
+            out.report.stop_reason = control->completed.stop_reason;
+            out.report.execution_status = control->completed.execution_status;
+            out.report.cleanup_status = control->completed.cleanup_status;
+            out.report.result = control->completed.result;
             out.report_valid = true;
         }
         wl_mutex_unlock(&control->mutex);
@@ -2589,7 +2607,13 @@ wl_evaluation_control_finish_attempt(wl_evaluation_control_t *control,
     (void)atomic_exchange_explicit(&control->active_attempt_id, 0,
         memory_order_release);
     out.kind = WL_EVALUATION_CONTROL_ATTEMPT_FINISH_OWN_FINISHED;
-    out.report = control->completed;
+    out.report.attempt_id = control->completed.attempt_id;
+    out.report.limit = control->completed.limit;
+    out.report.consumed = control->completed.consumed;
+    out.report.stop_reason = control->completed.stop_reason;
+    out.report.execution_status = control->completed.execution_status;
+    out.report.cleanup_status = control->completed.cleanup_status;
+    out.report.result = control->completed.result;
     out.report_valid = true;
     wl_mutex_unlock(&control->mutex);
     return out;
