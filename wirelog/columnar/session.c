@@ -13858,7 +13858,8 @@ wl_columnar_session_observed_action(wl_col_session_t *sess,
         !(tx->phase == WL_SESSION_OBSERVED_EVALUATE && tx->child_active)
         && !retirement_action){
         rc = wl_evaluation_control_charge_attempt(control, step->operation_id,
-                tx->phase == WL_SESSION_OBSERVED_PLAN ? 256 : tx->phase ==
+                (tx->phase == WL_SESSION_OBSERVED_PLAN ||
+                tx->phase == WL_SESSION_OBSERVED_SCHEMA) ? 256 : tx->phase ==
                 WL_SESSION_OBSERVED_ALLOCATE ||
                 tx->phase == WL_SESSION_OBSERVED_ZERO ? 64 :
                 tx->phase == WL_SESSION_RECURSIVE_DIFFERENCE ||
@@ -14211,10 +14212,14 @@ wl_columnar_session_observed_action(wl_col_session_t *sess,
         }
         {
             uint32_t i = tx->index, width = plan->edb_declared_width[i];
+            bool undeclared = width == WL_PLAN_WIDTH_UNDECLARED;
             col_rel_t *r = tx->entries[i].relation;
-            if (!r || plan->edb_column_type_counts[i] != width
-                || (width && !plan->edb_column_types[i])) return ENOTSUP;
-            if (tx->op < width) {
+            /* Inferred type counts describe compiler context, not a physical
+             * declaration. Actual arity (including nonempty nullary input)
+             * remains owned by the source and its raw mutation validator. */
+            if (!r || (!undeclared && (plan->edb_column_type_counts[i] != width
+                || (width && !plan->edb_column_types[i])))) return ENOTSUP;
+            if (!undeclared && tx->op < width) {
                 wirelog_column_type_t type = plan->edb_column_types[i][tx->op];
                 if (!wl_columnar_session_observed_scalar_type(
                         type)) return ENOTSUP;
@@ -14227,7 +14232,7 @@ wl_columnar_session_observed_action(wl_col_session_t *sess,
                     return ENOTSUP;
                 tx->op++; return 0;
             }
-            if ((!r->ncols && width) || !r->schema_ok) {
+            if ((!undeclared && !r->ncols && width) || !r->schema_ok) {
                 if (r->nrows) return ENOTSUP;
                 col_rel_t *empty = NULL;
                 rc =
@@ -17617,7 +17622,9 @@ col_session_controlled_mutation_admit(wl_session_t *session, bool insert,
             const char *name = sess->plan->edb_relations[i];
             if (name && !strcmp(relation, name)) {
                 col_rel_t *input = session_find_rel(sess, name);
-                return input && num_cols == sess->plan->edb_declared_width[i]
+                return input && (num_cols == sess->plan->edb_declared_width[i]
+                       || sess->plan->edb_declared_width[i] ==
+                       WL_PLAN_WIDTH_UNDECLARED)
                     ? 0 : ENOTSUP;
             }
         }
@@ -17631,7 +17638,9 @@ col_session_controlled_mutation_admit(wl_session_t *session, bool insert,
             || step->observer_cleanup_pending) return EBUSY;
         for (uint32_t i = 0; i < sess->plan->edb_count; ++i) {
             col_rel_t *r = tx->entries[i].public_relation;
-            if (r && num_cols == sess->plan->edb_declared_width[i]
+            if (r && (num_cols == sess->plan->edb_declared_width[i]
+                || sess->plan->edb_declared_width[i] ==
+                WL_PLAN_WIDTH_UNDECLARED)
                 && strcmp(relation, tx->entries[i].name) == 0) return 0;
         }
         return ENOTSUP;

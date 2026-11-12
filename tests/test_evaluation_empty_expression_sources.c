@@ -2,6 +2,7 @@
 #include "../wirelog/columnar/internal.h"
 #include "../wirelog/exec_plan_gen.h"
 #include "../wirelog/session.h"
+#include "../wirelog/session_facts.h"
 #include "../wirelog/wirelog.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -403,10 +404,11 @@ static void expression(wl_evaluation_control_t *c, unsigned phase,
         CHECK(!wl_columnar_eval_stack_filter_context_owned(ctx->frame, &map,
             &ctx->child));
         CHECK(map->source.width == f->input->ncols &&
-            map->source.declared_ncols == f->width &&
+            map->source.declared_ncols == f->input->declared_ncols &&
             map->source.has_graph_column == f->input->has_graph_column &&
             map->source.graph_col_idx == f->input->graph_col_idx);
-        if (!f->input->ncols)CHECK(map->source.descriptor != f->input &&
+        if (!f->input->ncols &&
+            !f->input->schema_ok) CHECK(map->source.descriptor != f->input &&
                 map->source.descriptor->schema_ok && !map->source.nrows);
         ++f->metadata;
     }else ++f->bodies;
@@ -1385,26 +1387,26 @@ static void unobserved_graph_fee_oracle(void) {
         destroy(&f);
     }
     /* Only ABI geometry comes from the real private record. Prices64,9,4,
-     * per-lane/action1, cutoff19->20 and two real128 aux visits (framed head
+     * per-lane SCHEMA256, other actions1, cutoff19->20 and two real128 aux visits (framed head
      * lookup and composed VARIABLE DELTA lookup) are source-derived literals.
      * No observed whole-host total is used to choose a work budget. */
     uint64_t bytes = wl_columnar_session_test_general_original_bytes();
     uint64_t zero = 64u*((2u*bytes+63u)/64u-(bytes+63u)/64u);
     const unsigned phases[] = {3, 6, 7, 8, 12, 13, 14, 15, 16};
-    const uint64_t suffix[] = {0, 9, 13, 14, 271, 272, 273, 274, 274};
+    const uint64_t suffix[] = {0, 9, 13, 269, 526, 527, 528, 529, 529};
     for (unsigned k = 0; k < sizeof(phases)/sizeof(*phases); ++k) {
         unsigned phase = phases[k];
         CHECK(entries[1][phase] >= entries[0][phase]);
         CHECK(entries[1][phase]-entries[0][phase] == zero+suffix[k]);
     }
-    CHECK(totals[1]-totals[0] == zero+274 &&
+    CHECK(totals[1]-totals[0] == zero+529 &&
         maintenance[1]-maintenance[0] == 2);
     CHECK(metadata[0] && metadata[0] == metadata[1] && frames[0] &&
         frames[0] == frames[1] && sources[0] && sources[0] == sources[1]);
     CHECK(source_witness[0] && source_witness[0] == source_witness[1] &&
         source_counts[0] == 3 && source_counts[1] == 4 && aux_visits[0] == 0 &&
         aux_visits[1] == 1);
-    if (bytes == 1224)CHECK(zero == 1216 && totals[1]-totals[0] == 1490);
+    if (bytes == 1224)CHECK(zero == 1216 && totals[1]-totals[0] == 1745);
 }
 
 static void unobserved_missing_matrix(void) {
@@ -1873,7 +1875,334 @@ static void timestamp_constructor_resources(void) {
         !reserved(g)); finish(c, 0);
     wl_columnar_memory_governor_ref_release(g);
 }
+static const char *inferred_programs[] = {
+    "input(1). out(to_string(x)):-input(x).",
+    ".decl input(x:int64)\n.decl out(y:string)\ninput(1). out(to_string(x)):-input(x).",
+    "input(\"abc\"). out(strlen(x)):-input(x).",
+    ".decl input(x:string)\n.decl out(y:int64)\ninput(\"abc\"). out(strlen(x)):-input(x).",
+    "input(1.5). out(to_string(x)):-input(x).",
+    ".decl input(x:float)\n.decl out(y:string)\ninput(1.5). out(to_string(x)):-input(x)."
+};
+static unsigned inferred_private, inferred_legacy;
+static void inferred_expression(wl_evaluation_control_t *c, unsigned phase,
+    uint64_t progress, bool failed) {
+    if (!active || c != active->control || (phase != 610 && phase != 83))return;
+    wl_col_session_t *session = COL_SESSION(active->controlled);
+    if (wl_columnar_session_test_general_route_flags(session)&1u) {
+        bool saved = active->no_observer;
+        active->no_observer = session->delta_cb == NULL;
+        expression(c, phase, progress, failed); active->no_observer = saved;
+        ++inferred_private;
+    }else{
+        /* Existing plain/C1 execution has its own qualified frame/retirement
+         * route; observed-unary ownership is not inferred from it. */
+        CHECK(!session->delta_cb && !session->delta_observer);
+        ++inferred_legacy;
+    }
+}
+static void bind_inferred(fixture_t *f, bool observed) {
+    active = f; if (observed)wl_session_set_delta_cb(f->controlled, events, f);
+    inferred_private = inferred_legacy = 0;
+    wl_columnar_filter_test_map_schema = schema;
+    wl_columnar_expr_test_checkpoint = inferred_expression;
+    wl_columnar_relation_test_empty_input_checkpoint = session_source;
+}
+static fixture_t inferred_create(unsigned kind) {
+    fixture_t f = {0}; f.g = governor(); f.width = 1;
+    create_sessions(&f, inferred_programs[kind]); return f;
+}
+static int64_t inferred_value(fixture_t *f, unsigned kind, bool second) {
+    if (kind/2 == 1)return wl_intern_put(f->plan->intern, second?"abcd":"abc");
+    if (kind/2 == 2)return wl_columnar_float_to_bits(second?2.5:1.5);
+    return second?2:1;
+}
+static void inferred_equal(fixture_t *f, unsigned kind) {
+    equal(f);
+    col_rel_t *a = session_find_rel(COL_SESSION(f->raw), "out"),
+        *b = session_find_rel(COL_SESSION(f->controlled), "out");
+    CHECK(a && b);
+    if (kind/2 != 1)for (uint32_t i = 0; i < a->nrows; ++i) {
+            const char *x = wl_intern_reverse(f->plan->intern,
+                    a->columns[0][i]),
+                *y = wl_intern_reverse(f->plan->intern, b->columns[0][i]);
+            CHECK(x && y && !strcmp(x, y));
+        }
+}
+static void inferred_step(fixture_t *f, unsigned kind) {
+    CHECK(!complete(f->controlled) && !complete(f->raw));
+    inferred_equal(f, kind);
+}
+static void inferred_six_domain_histories(void) {
+    for (unsigned kind = 0; kind < 6; ++kind)for (unsigned observed = 0;
+            observed < 2;
+            ++observed) for (unsigned loaded = 0; loaded < 2; ++loaded){
+                fixture_t f = inferred_create(kind);
+                bool undeclared = (kind&1u) == 0;
+                CHECK(f.plan->edb_count == 1 &&
+                    f.plan->edb_column_type_counts[0] == 1 &&
+                    f.plan->edb_declared_width[0] ==
+                    (undeclared?WL_PLAN_WIDTH_UNDECLARED:1u) &&
+                    f.input->declared_ncols == (undeclared?0u:1u));
+                if (loaded) CHECK(!wl_session_load_facts(f.controlled,
+                        f.program) && !wl_session_load_facts(f.raw, f.program));
+                col_relation_snapshot_t before =
+                    wl_columnar_relation_snapshot(f.input);
+                bind_inferred(&f, observed != 0); inferred_step(&f, kind);
+                CHECK(f.input == session_find_rel(COL_SESSION(f.controlled),
+                    "input") &&
+                    f.input->declared_ncols == (undeclared?0u:1u) &&
+                    wl_columnar_relation_snapshot_equal(before,
+                    wl_columnar_relation_snapshot(f.input)));
+                /* Replace callbacks after a completed host to exercise its
+                 * separate re-admission policy on the next real mutation. */
+                wl_session_set_delta_cb(f.controlled, observed?NULL:events,
+                    observed?NULL:&f);
+                if (!loaded) {
+                    CHECK(!f.input->nrows && f.input->ncols == (kind/2?1u:0u));
+                    CHECK(!wl_session_load_facts(f.controlled,
+                        f.program) && !wl_session_load_facts(f.raw, f.program));
+                    CHECK(!wl_evaluation_control_reset(f.control));
+                    inferred_step(&f, kind);
+                }
+                col_rel_t *out = session_find_rel(COL_SESSION(f.controlled),
+                        "out");
+                CHECK(out && out->nrows == 1 && f.input->nrows == 1);
+                if (kind/2 == 1) CHECK(out->columns[0][0] == 3);
+                else CHECK(!strcmp(wl_intern_reverse(f.plan->intern,
+                        out->columns[0][0]),
+                        kind/2 == 2?"4609434218613702656":"1"));
+                int64_t two = inferred_value(&f, kind, true);
+                CHECK(!wl_session_insert(f.controlled, "input", &two, 1,
+                    1) && !wl_session_insert(f.raw, "input", &two, 1, 1));
+                CHECK(!wl_evaluation_control_reset(f.control));
+                inferred_step(&f, kind);
+                CHECK(session_find_rel(COL_SESSION(f.controlled),
+                    "out")->nrows == 2);
+                before = wl_columnar_relation_snapshot(f.input);
+                col_relation_snapshot_t model =
+                    wl_columnar_relation_snapshot(session_find_rel(COL_SESSION(
+                            f.controlled), "out"));
+                unsigned prior = f.events; int64_t wrong[] = {two, two};
+                CHECK(wl_session_insert(f.raw, "input", wrong, 1, 2) == EINVAL);
+                CHECK(wl_session_insert(f.controlled, "input", wrong, 1,
+                    2) == (undeclared?EINVAL:ENOTSUP));
+                CHECK(wl_columnar_relation_snapshot_equal(before,
+                    wl_columnar_relation_snapshot(f.input)) &&
+                    wl_columnar_relation_snapshot_equal(model,
+                    wl_columnar_relation_snapshot(session_find_rel(COL_SESSION(
+                        f.controlled), "out"))) && f.events == prior);
+                CHECK(wl_session_insert(f.controlled, "missing", &two, 1,
+                    1) == ENOTSUP && wl_session_insert(f.controlled, "out",
+                    &two, 1, 1) == ENOTSUP);
+                CHECK(!wl_session_remove(f.controlled, "input", &two, 1,
+                    1) && !wl_session_remove(f.raw, "input", &two, 1, 1));
+                CHECK(!wl_evaluation_control_reset(f.control));
+                inferred_step(&f, kind);
+                CHECK(session_find_rel(COL_SESSION(f.controlled),
+                    "out")->nrows == 1);
+                CHECK(!wl_session_insert(f.controlled, "input", &two, 1,
+                    1) && !wl_session_insert(f.raw, "input", &two, 1, 1));
+                CHECK(!wl_evaluation_control_reset(f.control));
+                inferred_step(&f, kind);
+                prior = f.events;
+                CHECK(!wl_evaluation_control_reset(f.control));
+                inferred_step(&f, kind); CHECK(f.events == prior);
+                CHECK(f.input->declared_ncols == (undeclared?0u:1u) &&
+                    f.input == session_find_rel(COL_SESSION(f.controlled),
+                    "input"));
+                destroy(&f);
+            }
+}
+static void inferred_first_arity(void) {
+    for (unsigned observed = 0; observed < 2;
+        ++observed) for (unsigned before_empty =
+            0;
+            before_empty < 2; ++before_empty) for (unsigned arity =
+                0; arity < 4;
+                ++arity) {
+                fixture_t f = inferred_create(0);
+                bind_inferred(&f, observed != 0);
+                if (before_empty) {
+                    inferred_step(&f, 0);
+                    CHECK(!wl_evaluation_control_reset(f.control));
+                }
+                int64_t row[] = {2, 7, 11};
+                CHECK(!wl_session_insert(f.controlled, "input", row, 1,
+                    arity) && !wl_session_insert(f.raw, "input", row, 1,
+                    arity));
+                CHECK(f.input->ncols == arity && f.input->nrows == 1 &&
+                    f.input->schema_ok && !f.input->declared_ncols);
+                unsigned sources = f.source_calls;
+                /* Actual raw MAP oracle includes the nonempty nullary missing-lane
+                 * default, separately from public/effective output schema. */
+                eval_stack_t stack = {0};
+                CHECK(!eval_stack_push(&stack,
+                    session_find_rel(COL_SESSION(f.raw), "input"), false));
+                CHECK(!col_op_map(&f.plan->strata[0].relations[0].ops[1],
+                    &stack, COL_SESSION(f.raw)) && stack.top == 1);
+                f.empty_known = stack.items[0].rel->column_types != NULL;
+                CHECK(!eval_stack_drain(&stack));
+                inferred_step(&f, 0);
+                CHECK(f.source_calls == sources && f.input->ncols == arity &&
+                    !f.input->declared_ncols);
+                col_rel_t *out = session_find_rel(COL_SESSION(f.controlled),
+                        "out");
+                CHECK(out && out->nrows == 1 &&
+                    !strcmp(wl_intern_reverse(f.plan->intern,
+                    out->columns[0][0]), arity?"2":"0"));
+                col_relation_snapshot_t image =
+                    wl_columnar_relation_snapshot(f.input);
+                int64_t wrong[] = {3, 4, 5, 6};
+                uint32_t wrong_width = arity?arity+1:1;
+                CHECK(wl_session_insert(f.raw, "input", wrong, 1,
+                    wrong_width) == EINVAL && wl_session_insert(f.controlled,
+                    "input", wrong, 1, wrong_width) == EINVAL);
+                CHECK(wl_columnar_relation_snapshot_equal(image,
+                    wl_columnar_relation_snapshot(f.input)));
+                CHECK(!wl_session_remove(f.controlled, "input", row, 1,
+                    arity) && !wl_session_remove(f.raw, "input", row, 1,
+                    arity));
+                CHECK(!wl_evaluation_control_reset(f.control));
+                inferred_step(&f, 0);
+                CHECK(!session_find_rel(COL_SESSION(f.controlled),
+                    "out")->nrows);
+                CHECK(!wl_session_insert(f.controlled, "input", row, 1,
+                    arity) && !wl_session_insert(f.raw, "input", row, 1,
+                    arity));
+                CHECK(!wl_evaluation_control_reset(f.control));
+                inferred_step(&f, 0);
+                CHECK(f.input->ncols == arity && !f.input->declared_ncols);
+                destroy(&f);
+            }
+}
+
+/* Exhaust a real attempt immediately before each SCHEMA action. Padding is
+ * adversarial work, never an oracle for the price of a complete host. */
+static unsigned schema_target, schema_seen, schema_after;
+static uint64_t schema_remaining, schema_padded, schema_id;
+static bool schema_injected;
+static void schema_boundary(wl_evaluation_control_t *c, unsigned phase,
+    uint32_t progress, const wl_columnar_eval_private_bindings_t *bindings) {
+    (void)progress; (void)bindings;
+    if (!active || c != active->control)return;
+    if (schema_injected) {
+        ++schema_after; return;
+    }
+    if (phase != 7 || schema_seen++ != schema_target)return;
+    uint64_t used = 0;
+    schema_id = wl_evaluation_control_active_attempt_id(c);
+    CHECK(schema_id && !wl_evaluation_control_test_active_consumed(c,
+        schema_id, &used) && used <= UINT64_MAX-schema_remaining);
+    uint64_t padding = UINT64_MAX-schema_remaining-used;
+    CHECK(!wl_evaluation_control_charge_attempt(c, schema_id, padding));
+    schema_padded = used+padding;
+    CHECK(wl_evaluation_control_active_attempt_id(c) == schema_id);
+    schema_injected = true;
+}
+static void schema_source_boundary(wl_evaluation_control_t *c, unsigned phase) {
+    if (schema_injected && active && c == active->control)++schema_after;
+    session_source(c, phase);
+}
+static void inferred_schema_boundaries(void) {
+    for (unsigned inferred = 0; inferred < 2; ++inferred)
+        for (unsigned observed = 0; observed < 2; ++observed)
+            for (schema_target = 0; schema_target < (inferred?2u:3u);
+                ++schema_target) for (schema_remaining = 255;
+                    schema_remaining <= 256; ++schema_remaining) {
+                    fixture_t f = inferred_create(inferred?0u:1u);
+                    bind_inferred(&f, observed != 0);
+                    /* The explicit unobserved fixture must use the qualified general
+                     * first-missing route, not the legacy populated C1 route. */
+                    col_relation_snapshot_t input =
+                        wl_columnar_relation_snapshot(f.input);
+                    col_rel_t *old = session_find_rel(COL_SESSION(f.controlled),
+                            "out");
+                    col_relation_snapshot_t model =
+                        wl_columnar_relation_snapshot(old);
+                    schema_seen = schema_after = 0; schema_injected = false;
+                    CHECK(!wl_evaluation_control_configure(f.control,
+                        UINT64_MAX));
+                    wl_columnar_session_test_observed_transaction_checkpoint =
+                        schema_boundary;
+                    wl_columnar_relation_test_empty_input_checkpoint =
+                        schema_source_boundary;
+                    CHECK(complete(f.controlled) ==
+                        WL_EVALUATION_CONTROL_WORK_LIMIT &&
+                        schema_injected && schema_seen == schema_target+1 &&
+                        !f.events);
+                    wl_evaluation_control_report_t report;
+                    CHECK(!wl_evaluation_control_report(f.control, &report) &&
+                        report.result == WL_EVALUATION_CONTROL_WORK_LIMIT &&
+                        report.attempt_id == schema_id &&
+                        report.consumed >= schema_padded &&
+                        report.consumed-schema_padded ==
+                        (schema_remaining == 256?256u:0u));
+                    CHECK(
+                        session_find_rel(COL_SESSION(f.controlled),
+                        "out") == old &&
+                        (!old || wl_columnar_relation_snapshot_equal(model,
+                        wl_columnar_relation_snapshot(old))) &&
+                        wl_columnar_relation_snapshot_equal(input,
+                        wl_columnar_relation_snapshot(f.input)));
+                    wl_columnar_session_test_observed_transaction_checkpoint =
+                        NULL;
+                    CHECK(!wl_evaluation_control_reset(f.control) &&
+                        !wl_evaluation_control_configure(f.control, 0));
+                    wl_columnar_relation_test_empty_input_checkpoint =
+                        session_source;
+                    inferred_step(&f, inferred?0u:1u);
+                    destroy(&f);
+                }
+}
+
+static void schema_stop_boundary(wl_evaluation_control_t *c, unsigned phase,
+    uint32_t progress, const wl_columnar_eval_private_bindings_t *bindings) {
+    (void)progress; (void)bindings;
+    if (!active || c != active->control || phase != 7)return;
+    if (schema_seen++ == schema_target)session_source(c, 1007);
+}
+static void inferred_schema_stops(void) {
+    for (unsigned inferred = 0; inferred < 2; ++inferred)
+        for (unsigned observed = 0; observed < 2; ++observed)
+            for (schema_target = 0; schema_target < (inferred?2u:3u);
+                ++schema_target) for (action = 0; action < 5; ++action) {
+                    fixture_t f = inferred_create(inferred?0u:1u);
+                    bind_inferred(&f, observed != 0);
+                    col_relation_snapshot_t input =
+                        wl_columnar_relation_snapshot(f.input);
+                    col_rel_t *old = session_find_rel(COL_SESSION(f.controlled),
+                            "out");
+                    col_relation_snapshot_t model =
+                        wl_columnar_relation_snapshot(old);
+                    schema_seen = 0; f.stop = 1007;
+                    CHECK(!wl_evaluation_control_configure(f.control,
+                        action == 1?UINT64_MAX:0));
+                    wl_columnar_session_test_observed_transaction_checkpoint =
+                        schema_stop_boundary;
+                    int expected = action == 0?WL_EVALUATION_CONTROL_CANCELLED:
+                        action == 1?WL_EVALUATION_CONTROL_WORK_LIMIT:action ==
+                        4?EOVERFLOW:EINVAL;
+                    CHECK(complete(f.controlled) == expected && f.did_stop &&
+                        !f.events &&
+                        session_find_rel(COL_SESSION(f.controlled),
+                        "out") == old &&
+                        (!old || wl_columnar_relation_snapshot_equal(model,
+                        wl_columnar_relation_snapshot(old))) &&
+                        wl_columnar_relation_snapshot_equal(input,
+                        wl_columnar_relation_snapshot(f.input)));
+                    unobserved_stop_report(&f, expected);
+                    wl_columnar_session_test_observed_transaction_checkpoint =
+                        NULL;
+                    f.stop = 0;
+                    CHECK(!wl_evaluation_control_reset(f.control) &&
+                        !wl_evaluation_control_configure(f.control, 0));
+                    inferred_step(&f, inferred?0u:1u); destroy(&f);
+                }
+}
+
 int main(void) {
+    inferred_schema_stops(); inferred_schema_boundaries();
+    inferred_six_domain_histories(); inferred_first_arity();
     state_only_backend_pair(); late_end_matrix(); late_two_head_matrix();
     unobserved_graph_fee_oracle();
     unobserved_missing_matrix(); unobserved_unknown_variable();
