@@ -265,6 +265,13 @@ wl_evaluation_control_source_phase_result_t
     wl_session_source_snapshot_metadata(wl_session_t *,
     wl_evaluation_control_source_action_fn, void *);
 
+/* Observer financier close: one FINISH/report, saved-generation detach,
+ * creation release or saved-value receipt action. No Native/BODY callback.
+ * The expanded local callback envelope is196; containing carry is separate. */
+wl_evaluation_control_source_phase_result_t
+    wl_session_source_operator_close_metadata(wl_session_t *,
+    wl_evaluation_control_source_action_fn, void *);
+
 /**
  * wl_session_create:
  * @backend:      The compute backend to use for this session.

@@ -161,6 +161,42 @@ argument_report_and_successor(void)
     wl_evaluation_control_release(control);
 }
 
+static void
+generation_bound_detach(void)
+{
+    int owner = 0, foreign = 0;
+    wl_evaluation_control_t *control = create_control(7, &owner);
+    CHECK(wl_evaluation_control_detach_attempt(NULL, &owner, 1) == EINVAL);
+    CHECK(wl_evaluation_control_detach_attempt(control, NULL, 1) == EINVAL);
+    CHECK(wl_evaluation_control_detach_attempt(control, &owner, 0) == EINVAL);
+    CHECK(wl_evaluation_control_detach_attempt(control, &foreign, 1) == EINVAL);
+    wl_evaluation_control_attempt_begin_result_t begin =
+        wl_evaluation_control_begin_attempt(control, &owner);
+    CHECK(!begin.protocol && begin.attempt_id == 1);
+    CHECK(wl_evaluation_control_detach_attempt(control, &owner, 1) == EBUSY);
+    CHECK(!wl_evaluation_control_charge_attempt(control, 1, 3));
+    wl_evaluation_control_attempt_finish_result_t ended =
+        wl_evaluation_control_finish_attempt(control, &owner, 1, 0, 0);
+    CHECK(!ended.protocol && ended.report_valid);
+    begin = wl_evaluation_control_begin_attempt(control, &owner);
+    CHECK(!begin.protocol && begin.attempt_id == 2);
+    CHECK(wl_evaluation_control_detach_attempt(control, &owner, 1) == EBUSY);
+    expect_consumed(control, 2, 0);
+    wl_evaluation_control_report_t report;
+    CHECK(!wl_evaluation_control_report(control, &report));
+    same_report(&report, &ended.report);
+    ended = wl_evaluation_control_finish_attempt(control, &owner, 2, ENOSPC, 0);
+    CHECK(!ended.protocol && ended.report_valid &&
+        ended.report.result == ENOSPC);
+    /* An ended successor is still foreign to the old close receipt. */
+    CHECK(wl_evaluation_control_detach_attempt(control, &owner, 1) == EBUSY);
+    CHECK(!wl_evaluation_control_report(control, &report));
+    same_report(&report, &ended.report);
+    CHECK(!wl_evaluation_control_detach_attempt(control, &owner, 2));
+    CHECK(wl_evaluation_control_detach_attempt(control, &owner, 2) == EINVAL);
+    wl_evaluation_control_release(control);
+}
+
 typedef enum { TEST_HISTORY_WORK, TEST_HISTORY_CANCEL_ERROR,
                TEST_HISTORY_CLEANUP, TEST_HISTORY_DISPOSITION,
                TEST_HISTORY_OVERFLOW,
@@ -393,6 +429,7 @@ int
 main(void)
 {
     argument_report_and_successor();
+    generation_bound_detach();
     for (history_t history = TEST_HISTORY_WORK;
         history <= TEST_HISTORY_FIRST_STOP; ++history) {
         wl_evaluation_control_report_t generic = run_history(history, false);
