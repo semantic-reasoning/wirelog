@@ -3381,10 +3381,11 @@ wl_columnar_filter_map_attempt_start_owned(const wl_plan_op_t *op,
             WL_COLUMNAR_FILTER_ATTEMPT_SOURCE_BEGIN_WORK);
     if (rc)
         goto done;
-    rc =
-        wl_columnar_relation_scalar_source_begin_attempt_controlled(
-        &ctx->source,
-        input, false);
+    /* MAP addresses physical lanes through project_indices and builds its
+     * output from the projection, so an INLINE input yields a relation with
+     * no compound layout, as the raw MAP does (#2301). */
+    rc = wl_columnar_relation_scalar_source_admit_attempt_controlled(
+        &ctx->source, input, false, WL_COLUMNAR_RELATION_SOURCE_ADMIT_INLINE);
     rc = wl_columnar_filter_attempt_return(control, attempt_id, rc);
     if (rc)
         goto done;

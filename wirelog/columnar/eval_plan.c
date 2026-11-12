@@ -1688,9 +1688,11 @@ wl_columnar_eval_plan_source_init(wl_columnar_eval_plan_numeric_attempt_t *r)
 static int
 wl_columnar_eval_plan_source_hold(wl_columnar_eval_plan_numeric_attempt_t *r)
 {
+    /* The scalar reader also admits an INLINE EDB (#2301). */
     if (!r->source_bare)
-        return wl_columnar_relation_scalar_source_begin_attempt_controlled(
-            &r->source, r->source_selected, !r->source_empty);
+        return wl_columnar_relation_scalar_source_admit_attempt_controlled(
+            &r->source, r->source_selected, !r->source_empty,
+            WL_COLUMNAR_RELATION_SOURCE_ADMIT_INLINE);
     bool done = false;
     return wl_columnar_relation_empty_source_step(&r->source_empty_reader,
                &done);
