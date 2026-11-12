@@ -26620,6 +26620,28 @@ static int wl_columnar_session_seed_compact_cleanup(
 #ifdef WL_SESSION_TEST_HOOKS
 void (*wl_columnar_session_seed_test_checkpoint)(
     const wl_columnar_session_seed_t *, unsigned, unsigned);
+void (*wl_columnar_session_seed_test_credit_checkpoint)(
+    const wl_columnar_session_seed_t *, unsigned, unsigned, int, size_t,
+    const char *,
+    const wl_columnar_memory_reservation_t *,
+    const wl_columnar_memory_retirement_receipt_t *, uint64_t, bool);
+static const char *
+wl_columnar_session_seed_test_credit_role(const wl_columnar_session_seed_t *a,
+    const wl_columnar_session_seed_credit_t *c)
+{
+    if (c == &a->base_build.length_credit) return "base.length";
+    if (c == &a->base_build.credit[0]) return "base.descriptor";
+    if (c == &a->base_build.credit[1]) return "base.metadata";
+    if (c == &a->base_build.credit[2]) return "base.payload";
+    if (c == &a->resize.fresh) return "resize.fresh";
+    if (c == &a->restore_credit) return "restore";
+    if (c == &a->scratch_credit) return "scratch";
+    if (c == &a->metadata.length_credit) return "metadata.length";
+    if (c == &a->metadata.new_credit) return "metadata.new";
+    if (c == &a->metadata.old_credit) return "metadata.old";
+    abort();
+}
+
 #endif
 
 static bool
@@ -26715,10 +26737,33 @@ wl_columnar_session_seed_credit_end(wl_columnar_session_seed_t *a,
         bool reserved = state == WL_COLUMNAR_MEMORY_RESERVATION_RESERVED;
         const void *owner = reserved ? NULL : (const void *)(uintptr_t)
             atomic_load_explicit(&token->owner_bits, memory_order_acquire);
-        int rc = wl_columnar_memory_retirement_begin(token,
+#ifdef WL_SESSION_TEST_HOOKS
+        if (wl_columnar_session_seed_test_credit_checkpoint)
+            wl_columnar_session_seed_test_credit_checkpoint(a, 1504, 0, 0,
+                (size_t)((const unsigned char *)c-(const unsigned char *)a),
+                wl_columnar_session_seed_test_credit_role(a, c),
+                token, &c->retirement, c->bytes, c->retiring);
+#endif
+        int rc = wl_columnar_session_seed_cut(a, funding, id, 1504);
+#ifdef WL_SESSION_TEST_HOOKS
+        if (wl_columnar_session_seed_test_credit_checkpoint)
+            wl_columnar_session_seed_test_credit_checkpoint(a, 1504, 1, rc,
+                (size_t)((const unsigned char *)c-(const unsigned char *)a),
+                wl_columnar_session_seed_test_credit_role(a, c),
+                token, &c->retirement, c->bytes, c->retiring);
+#endif
+        if (rc) return rc;
+        rc = wl_columnar_memory_retirement_begin(token,
                 wl_columnar_memory_governor_ref_get(a->governor), owner,
                 reserved ? WL_COLUMNAR_MEMORY_RETIRE_ROLLBACK_RESERVED :
                 WL_COLUMNAR_MEMORY_RETIRE_RELEASE_COMMITTED, &c->retirement);
+#ifdef WL_SESSION_TEST_HOOKS
+        if (wl_columnar_session_seed_test_credit_checkpoint)
+            wl_columnar_session_seed_test_credit_checkpoint(a, 1504, 2, rc,
+                (size_t)((const unsigned char *)c-(const unsigned char *)a),
+                wl_columnar_session_seed_test_credit_role(a, c),
+                token, &c->retirement, c->bytes, c->retiring);
+#endif
         if (rc) return rc;
         c->retiring = true; return 0;
     }
@@ -26727,7 +26772,30 @@ wl_columnar_session_seed_credit_end(wl_columnar_session_seed_t *a,
                 id);
         return rc == EAGAIN?0:rc;
     }
-    int rc = wl_columnar_memory_retirement_acknowledge(&c->retirement);
+#ifdef WL_SESSION_TEST_HOOKS
+    if (wl_columnar_session_seed_test_credit_checkpoint)
+        wl_columnar_session_seed_test_credit_checkpoint(a, 1505, 0, 0,
+            (size_t)((const unsigned char *)c-(const unsigned char *)a),
+            wl_columnar_session_seed_test_credit_role(a, c),
+            token, &c->retirement, c->bytes, c->retiring);
+#endif
+    int rc = wl_columnar_session_seed_cut(a, funding, id, 1505);
+#ifdef WL_SESSION_TEST_HOOKS
+    if (wl_columnar_session_seed_test_credit_checkpoint)
+        wl_columnar_session_seed_test_credit_checkpoint(a, 1505, 1, rc,
+            (size_t)((const unsigned char *)c-(const unsigned char *)a),
+            wl_columnar_session_seed_test_credit_role(a, c),
+            token, &c->retirement, c->bytes, c->retiring);
+#endif
+    if (rc) return rc;
+    rc = wl_columnar_memory_retirement_acknowledge(&c->retirement);
+#ifdef WL_SESSION_TEST_HOOKS
+    if (wl_columnar_session_seed_test_credit_checkpoint)
+        wl_columnar_session_seed_test_credit_checkpoint(a, 1505, 2, rc,
+            (size_t)((const unsigned char *)c-(const unsigned char *)a),
+            wl_columnar_session_seed_test_credit_role(a, c),
+            token, &c->retirement, c->bytes, c->retiring);
+#endif
     if (!rc) {
         c->bytes = 0; c->retiring = false; *done = true;
     }

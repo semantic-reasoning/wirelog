@@ -73,6 +73,12 @@ int wl_columnar_session_seed_test_compact_view(
     const wl_columnar_session_seed_t *, uint64_t [16]);
 extern void (*wl_columnar_session_seed_test_checkpoint)(
     const wl_columnar_session_seed_t *, unsigned, unsigned);
+/* Actual const credit images around purchase/primitive; observation only. */
+extern void (*wl_columnar_session_seed_test_credit_checkpoint)(
+    const wl_columnar_session_seed_t *, unsigned, unsigned, int, size_t,
+    const char *,
+    const wl_columnar_memory_reservation_t *,
+    const wl_columnar_memory_retirement_receipt_t *, uint64_t, bool);
 int wl_columnar_session_seed_test_view(const wl_columnar_session_seed_t *,
     uint64_t [16]);
 unsigned wl_columnar_session_seed_test_metadata_phase(
