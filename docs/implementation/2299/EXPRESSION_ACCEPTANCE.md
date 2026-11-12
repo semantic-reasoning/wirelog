@@ -1681,3 +1681,49 @@ The required raw-equivalent scalar schema walk/provenance adapter remains a
 concrete next unit. Likewise, no-observer first-missing admission95 (also seen
 with numeric identity), recursive effectful seed scheduling and typed SCC
 transport are not certified by this routing change.
+
+## Completion: complete scalar MAP schema inference
+
+MAP metadata now uses a separate controlled whole-expression query. The older
+producer-only query and its78/79 two224 regions remain unchanged. Raw MAP first
+queries a compiled producer, then falls back to its interpreted grammar. Scalar
+ownership alone does not imply that raw compilation failed: string comparisons
+are accepted by the raw compiler. Therefore one shared bounded decode advances
+independent raw-compiler and interpreted states. Raw producer state preserves
+its permissive underflow, ignored pushes at capacity and aggregate no-ops.
+Each selected producer replaces both type and known-state; invalid early types
+do not poison a later valid producer. The interpreted state validates every
+variable's actual width/type, opcode arity, depth and final singleton. Neither
+track is resurrected after grammar/type failure. Complete raw compilation wins;
+its unknown type permits interpreted fallback. Neither path evaluates values,
+allocates another compiled program, resolves an extension or invokes a callback.
+
+New610 ENTRY,611 PRE,614 RAW_TYPE,612 INTERP_TYPE and613 FINAL each pay224.
+ENTRY/PRE/INTERP/FINAL expand to controller84+fixed108+front24=216;
+RAW to84+producer20+result_type36+stores10+status8+front24=182.
+Existing decoder byte/digit prices remain separate. Equal-signature MAP
+substitution retains its incoming166<=192 and FINAL handoff146<=224.
+Successful unknown makes the entire MAP schema unknown, including already
+inferred columns; later columns cannot restore a partial type vector. Numeric
+metadata inference is unchanged.
+
+The expression_schema target independently checks every positive exact and
+one-short payment for VARwidth0=3328, VAR/TO_STRINGwidth0=3552 (unknown),
+VAR/TO_STRINGwidth1=4000 (STRING), twoVAR/CMP_STRwidth0=6656 andwidth1=7104
+(BOOL), underflowCMP_STR=1344 (raw compiled BOOL), one-byteCONST_STR=1792 and
+extension earlyUNKNOWN=672 (no payload lookup). Its oracle compares actual raw
+compile-first inference across accepted scalar tags, widths and valid/invalid
+source types, aggregate no-ops, capped pushes and producer replacement. All
+new stages and shared decode boundaries exercise cancel/work/END/successor/
+overflow with untouched output sentinels. Existing producer-only tests stay
+unchanged. Genuine host stops additionally retain frozen Original, successor0,
+committed image/schema/events and real native retirement.
+
+Actual MAP operator tests cover zero physical width, typed-empty sources,
+multiple output columns in both orders and sticky whole UNKNOWN. Populated
+subsequent MAPs also match the raw operator. Empty result deep copies expose
+an existing scalar-source rejection of zero-capacity descriptors with no
+column buffers; that exact empty-chain adapter remains an integration test
+requirement for the next source unit. This primitive does not yet repair the general
+bridge's first-missing source reification; the physical source adapter remains
+a separate integration unit, including future graph-lane semantics.

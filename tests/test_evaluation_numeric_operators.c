@@ -3273,6 +3273,124 @@ map_schema_types(bool computed, uint32_t rows)
     wl_columnar_filter_test_complete(scenario); free(scenario);
 }
 
+/* Genuine empty physical sources, whole-schema fallback and downstream MAP.
+ * Numeric lanes around the scalar lane may not resurrect a partial schema. */
+static void
+map_whole_scalar_schema(void)
+{
+    for (unsigned width = 0; width < 2; ++width)
+        for (unsigned kind = 0; kind < 5; ++kind)
+            for (unsigned rows = 0; rows < 2; ++rows)
+                for (unsigned order = 0; order < 2; ++order) {
+                    if (rows && (!width || kind == 4)) continue;
+                    wl_columnar_filter_test_program_t numeric = {0},
+                        scalar = {0};
+                    wl_columnar_filter_test_constant(&numeric,
+                        WL_PLAN_EXPR_CONST_INT, 7);
+                    if (kind == 2) {
+                        scalar.bytes[0] = WL_PLAN_EXPR_CONST_STR;
+                        uint16_t length = 1;
+                        memcpy(scalar.bytes+1, &length, 2);
+                        scalar.bytes[3] = 'x'; scalar.size = 4;
+                    } else if (kind == 4) {
+                        wl_columnar_filter_test_opcode(&scalar,
+                            WL_PLAN_EXPR_ARITH_HMAC_SHA256);
+                    } else {
+                        wl_columnar_filter_test_variable(&scalar,
+                            WL_PLAN_EXPR_VAR,
+                            0);
+                        if (kind == 3) {
+                            wl_columnar_filter_test_variable(&scalar,
+                                WL_PLAN_EXPR_VAR, 0);
+                            wl_columnar_filter_test_opcode(&scalar,
+                                WL_PLAN_EXPR_CMP_STR_EQ);
+                        } else {
+                            wl_columnar_filter_test_opcode(&scalar,
+                                WL_PLAN_EXPR_STR_FN_TO_STRING);
+                            if (kind ==
+                                1) wl_columnar_filter_test_opcode(&scalar,
+                                    WL_PLAN_EXPR_STR_FN_STRLEN);
+                        }
+                    }
+                    wl_plan_expr_buffer_t expressions[2];
+                    expressions[order] = (wl_plan_expr_buffer_t){scalar.bytes,
+                                                                 scalar.size};
+                    expressions[1-
+                        order] = (wl_plan_expr_buffer_t){numeric.bytes,
+                                                         numeric.size};
+                    wl_plan_op_t op = {.op = WL_PLAN_OP_MAP, .project_count = 2,
+                                       .map_exprs = expressions,
+                                       .map_expr_count = 2};
+                    col_rel_t *input = wl_columnar_filter_test_source(width,
+                            rows,
+                            false, false, false);
+                    wl_col_session_t *raw_session =
+                        wl_columnar_filter_test_session();
+                    eval_stack_t raw = {0};
+                    col_rel_t *raw_input = NULL;
+                    CHECK(!col_rel_deep_copy(input, &raw_input, NULL));
+                    CHECK(!eval_stack_push(&raw, raw_input, true));
+                    for (unsigned chain = 0; chain < (rows ? 2u : 1u);
+                        ++chain){
+                        wl_columnar_filter_test_scenario_t *scenario = calloc(1,
+                                sizeof(*scenario));
+                        CHECK(scenario);
+                        wl_columnar_filter_test_prepare(scenario, input, true,
+                            NULL,
+                            0, false);
+                        scenario->op = op;
+                        scenario->filter.start =
+                            wl_columnar_filter_map_attempt_start;
+                        wl_columnar_filter_test_map_run(scenario);
+                        if (scenario->filter.status.execution_result) fprintf(
+                                stderr,
+                                "schema width%u kind%u order%u chain%u rc%d\n",
+                                width, kind, order, chain,
+                                scenario->filter.status.execution_result);
+                        CHECK(scenario->filter.done &&
+                            !scenario->filter.status.execution_result);
+                        col_rel_t *result =
+                            wl_columnar_eval_stack_cleanup_stack(
+                            scenario->filter.frame)->items[0].rel;
+                        CHECK(!col_op_map(&op, &raw, raw_session));
+                        wl_columnar_filter_test_equal(result, raw.items[0].rel);
+                        CHECK(result->ncols == 2 && result->nrows == rows);
+                        if (!chain) {
+                            bool known = kind == 2 || kind == 3 ||
+                                (width && kind < 2);
+                            CHECK((result->column_types != NULL) == known);
+                            if (known) {
+                                CHECK(result->column_types[1-order] ==
+                                    WIRELOG_TYPE_INT64);
+                                CHECK(result->column_types[order] ==
+                                    (kind == 3 ? WIRELOG_TYPE_BOOL : kind ==
+                                    1 ? WIRELOG_TYPE_INT64 :
+                                    WIRELOG_TYPE_STRING));
+                            }
+                            if (rows) CHECK(!col_rel_deep_copy(result, &input,
+                                    NULL));
+                        }
+                        wl_columnar_filter_test_complete(scenario);
+                        free(scenario);
+                        /* Subsequent MAP sees the actual first result schema. */
+                        scalar.size = 0;
+                        wl_columnar_filter_test_variable(&scalar,
+                            WL_PLAN_EXPR_VAR,
+                            order);
+                        wl_columnar_filter_test_opcode(&scalar,
+                            WL_PLAN_EXPR_STR_FN_TO_STRING);
+                        expressions[order] =
+                            (wl_plan_expr_buffer_t){scalar.bytes,
+                                                    scalar.size};
+                    }
+                    CHECK(!eval_stack_drain(&raw) &&
+                        !wl_columnar_filter_test_reserved(raw_session));
+                    wl_columnar_memory_governor_ref_release(
+                        raw_session->memory_governor);
+                    free(raw_session);
+                }
+}
+
 static void
 map_omitted_nonfinite(void)
 {
@@ -6836,6 +6954,7 @@ main(void)
         map_schema_types(computed != 0, 0);
         map_schema_types(computed != 0, 3);
     }
+    map_whole_scalar_schema();
     map_omitted_nonfinite(); map_unresolved_schema(); map_codes_constructor();
     map_schema_error_precedence();
     const uint32_t map_widths[] = {0, 1, 17, 37, 129};

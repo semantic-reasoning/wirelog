@@ -3600,15 +3600,13 @@ wl_columnar_filter_map_attempt_start_owned(const wl_plan_op_t *op,
                         source_types, width, &type, &supported, control,
                         attempt_id);
             else
-                rc = wl_columnar_expr_scalar_result_type_attempt_controlled(
+                rc = wl_columnar_expr_scalar_map_schema_attempt_controlled(
                     scalar, source_types, width, &type, &supported,
                     control, attempt_id);
             rc = wl_columnar_filter_attempt_return(control, attempt_id, rc);
             if (rc) goto done;
             if (!supported) {
-                if (scalar &&
-                    wl_columnar_expr_scalar_schema_unknown(
-                        scalar)) schema_known = false;
+                if (scalar) schema_known = false;
                 else {
                     rc = ENOTSUP; goto done;
                 }
