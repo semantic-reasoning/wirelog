@@ -4893,6 +4893,15 @@ int wl_columnar_relation_scalar_source_init_attempt_controlled(
 int wl_columnar_relation_scalar_source_begin_attempt_controlled(
     wl_columnar_relation_scalar_source_t *source, const col_rel_t *relation,
     bool preserve_timestamps);
+/* Begin with opt-in representation admission. admit 0 is exactly the begin
+ * above. WL_COLUMNAR_RELATION_SOURCE_ADMIT_INLINE also admits a descriptor
+ * of compound_kind INLINE after a metered arity-map check (EINVAL when
+ * malformed); its physical lanes are then read as ordinary scalar columns
+ * with their lane types. compound_kind SIDE stays ENOTSUP. */
+#define WL_COLUMNAR_RELATION_SOURCE_ADMIT_INLINE 1u
+int wl_columnar_relation_scalar_source_admit_attempt_controlled(
+    wl_columnar_relation_scalar_source_t *source, const col_rel_t *relation,
+    bool preserve_timestamps, uint32_t admit);
 int wl_columnar_relation_scalar_source_validate_attempt_controlled(
     const wl_columnar_relation_scalar_source_t *, wl_evaluation_control_t *,
     uint64_t);
