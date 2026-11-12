@@ -7254,6 +7254,16 @@ test_evaluation_compound_sources_exe = executable(
 test('evaluation_compound_sources', test_evaluation_compound_sources_exe,
      suite: ['unit', 'tsan'], timeout: 60)
 
+test_evaluation_empty_edb_sources_exe = executable(
+  'test_evaluation_empty_edb_sources', files('test_evaluation_empty_edb_sources.c'),
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
+  c_args: ['-DWL_SESSION_TEST_HOOKS=1'],
+  link_with: [testlib_prod],
+)
+test('evaluation_empty_edb_sources', test_evaluation_empty_edb_sources_exe,
+     suite: ['unit', 'tsan'], timeout: 60)
+
 test_evaluation_physical_retirement_exe = executable(
   'test_evaluation_physical_retirement', files('test_evaluation_physical_retirement.c'),
   include_directories: [wirelog_inc, wirelog_src_inc],

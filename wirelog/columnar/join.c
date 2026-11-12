@@ -6106,18 +6106,10 @@ wl_columnar_join_attempt_source(wl_columnar_relation_scalar_source_t *source,
         && !relation->nrows;
     int rc;
     if (*bare) {
-        rc = wl_columnar_relation_empty_source_begin(empty, relation, control,
-                id);
-        *initialized = empty->identity == empty && empty->phase !=
-            WL_COLUMNAR_RELATION_EMPTY_SOURCE_DRAINED;
+        rc = wl_columnar_relation_empty_source_hold_attempt_controlled(empty,
+                relation, control, id, initialized);
         if (!*initialized) *bare = false;
-        bool done = false;
-        while (!rc && !done)
-            rc = wl_columnar_relation_empty_source_step(empty, &done);
         if (rc) return rc;
-        if (empty->control != control || empty->attempt_id != id
-            || empty->phase != WL_COLUMNAR_RELATION_EMPTY_SOURCE_HELD
-            || empty->ending) return EINVAL;
         metadata->width = 0; metadata->nrows = 0;
         metadata->types = NULL; metadata->names = NULL;
         return 0;

@@ -18818,6 +18818,24 @@ failed:
 }
 
 int
+wl_columnar_relation_empty_source_hold_attempt_controlled(
+    wl_columnar_relation_empty_source_t *a, const col_rel_t *relation,
+    wl_evaluation_control_t *control, uint64_t id, bool *initialized)
+{
+    int rc = wl_columnar_relation_empty_source_begin(a, relation, control, id);
+    *initialized = a->identity == a
+        && a->phase != WL_COLUMNAR_RELATION_EMPTY_SOURCE_DRAINED;
+    bool done = false;
+    while (!rc && !done)
+        rc = wl_columnar_relation_empty_source_step(a, &done);
+    if (rc) return rc;
+    if (a->control != control || a->attempt_id != id
+        || a->phase != WL_COLUMNAR_RELATION_EMPTY_SOURCE_HELD || a->ending)
+        return EINVAL;
+    return 0;
+}
+
+int
 wl_columnar_relation_empty_source_end(wl_columnar_relation_empty_source_t *a,
     wl_evaluation_control_t *funding, uint64_t id, bool *done)
 {

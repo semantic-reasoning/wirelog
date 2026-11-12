@@ -1966,6 +1966,22 @@ wl_columnar_filter_op_attempt_start(const wl_plan_op_t *op,
                NULL);
 }
 
+/* The unary input is the bare descriptor that VARIABLE borrowed from a
+ * never-inserted EDB without a schema: no physical schema, no columns, no
+ * rows. Stream frames keep the scalar reader and its refusal: the empty END
+ * is authenticated only on the nonstream context. */
+static bool
+wl_columnar_filter_bare_input(wl_columnar_eval_stack_cleanup_frame_t *frame,
+    const wl_columnar_filter_context_t *ctx, const col_rel_t *input,
+    const void *owner)
+{
+    if (!owner || input->schema_ok || input->ncols || input->nrows)
+        return false;
+    wl_columnar_filter_context_t *nonstream = NULL;
+    return !wl_columnar_eval_stack_filter_context_nonstream_owned(frame,
+               &nonstream, owner) && nonstream == ctx;
+}
+
 int
 wl_columnar_filter_op_attempt_start_owned(const wl_plan_op_t *op,
     wl_columnar_eval_stack_cleanup_frame_t *frame, wl_col_session_t *sess,
@@ -2107,24 +2123,35 @@ wl_columnar_filter_op_attempt_start_owned(const wl_plan_op_t *op,
         rc = wl_columnar_filter_attempt_tail(control, attempt_id, 19, retire);
         if (rc) goto done;
     }
+    /* A never-inserted EDB that session creation left without a schema is
+     * held by the authentic empty-source reader and read as width 0 with no
+     * rows, as in MAP (#2301). */
+    const bool bare = wl_columnar_filter_bare_input(frame, ctx, input, owner);
     rc = wl_columnar_filter_attempt_charge(control, attempt_id,
             WL_COLUMNAR_FILTER_ATTEMPT_SOURCE_INIT_WORK);
     if (rc)
         goto done;
-    rc =
-        wl_columnar_relation_scalar_source_init_attempt_controlled(&ctx->source,
-            &ctx->source_initialized, control, attempt_id);
-    rc = wl_columnar_filter_attempt_return(control, attempt_id, rc);
-    if (rc)
-        goto done;
+    if (!bare) {
+        rc = wl_columnar_relation_scalar_source_init_attempt_controlled(
+            &ctx->source, &ctx->source_initialized, control, attempt_id);
+        rc = wl_columnar_filter_attempt_return(control, attempt_id, rc);
+        if (rc)
+            goto done;
+    }
     rc = wl_columnar_filter_attempt_charge(control, attempt_id,
             WL_COLUMNAR_FILTER_ATTEMPT_SOURCE_BEGIN_WORK);
     if (rc)
         goto done;
-    rc =
-        wl_columnar_relation_scalar_source_begin_attempt_controlled(
-        &ctx->source,
-        input, true);
+    if (bare) {
+        ctx->source_bare = true;
+        rc = wl_columnar_relation_empty_source_hold_attempt_controlled(
+            &ctx->source_empty_reader, input, control, attempt_id,
+            &ctx->source_initialized);
+        if (!ctx->source_initialized) ctx->source_bare = false;
+    } else {
+        rc = wl_columnar_relation_scalar_source_begin_attempt_controlled(
+            &ctx->source, input, true);
+    }
     rc = wl_columnar_filter_attempt_return(control, attempt_id, rc);
     if (rc)
         goto done;
@@ -2134,10 +2161,9 @@ wl_columnar_filter_op_attempt_start_owned(const wl_plan_op_t *op,
             WL_COLUMNAR_FILTER_ATTEMPT_SOURCE_SHAPE_WORK);
     if (rc)
         goto done;
-    rc =
-        wl_columnar_relation_scalar_source_shape_attempt_controlled(
-        &ctx->source,
-        &width, &rows, &timestamped);
+    if (!bare)
+        rc = wl_columnar_relation_scalar_source_shape_attempt_controlled(
+            &ctx->source, &width, &rows, &timestamped);
     rc = wl_columnar_filter_attempt_return(control, attempt_id, rc);
     if (rc)
         goto done;
@@ -2175,9 +2201,18 @@ wl_columnar_filter_op_attempt_start_owned(const wl_plan_op_t *op,
             WL_COLUMNAR_FILTER_ATTEMPT_NEWLIKE_WORK);
     if (rc)
         goto done;
-    rc =
-        wl_columnar_relation_scalar_source_new_like_operator_attempt_controlled(
-        &ctx->source, "$filter", ctx->governor, out_slot);
+    /* The bare output is a fresh owned width-0 relation built from the held
+     * empty reader; a graph declaration gets the raw new-like EINVAL. */
+    if (bare)
+        rc =
+            wl_columnar_relation_empty_source_new_like_operator_attempt_controlled
+            (
+            &ctx->source_empty_reader, "$filter", ctx->governor, out_slot);
+    else
+        rc =
+            wl_columnar_relation_scalar_source_new_like_operator_attempt_controlled
+            (
+            &ctx->source, "$filter", ctx->governor, out_slot);
     /* Original frame slot ownership bookkeeping precedes stale-ID arbitration. */
     ctx->output = *out_slot;
     ctx->private_output = *out_slot;
@@ -3367,25 +3402,40 @@ wl_columnar_filter_map_attempt_start_owned(const wl_plan_op_t *op,
         rc = wl_columnar_filter_attempt_tail(control, attempt_id, 19, retire);
         if (rc) goto done;
     }
+    /* A never-inserted EDB that session creation left without a schema
+     * reaches MAP as the bare descriptor VARIABLE borrowed. It is held by
+     * the authentic empty-source reader, as JOIN holds it, and read as
+     * width 0 with no rows (#2301). */
+    const bool bare = wl_columnar_filter_bare_input(frame, ctx, input, owner);
     rc = wl_columnar_filter_attempt_charge(control, attempt_id,
             WL_COLUMNAR_FILTER_ATTEMPT_SOURCE_INIT_WORK);
     if (rc)
         goto done;
-    rc =
-        wl_columnar_relation_scalar_source_init_attempt_controlled(&ctx->source,
-            &ctx->source_initialized, control, attempt_id);
-    rc = wl_columnar_filter_attempt_return(control, attempt_id, rc);
-    if (rc)
-        goto done;
+    if (!bare) {
+        rc = wl_columnar_relation_scalar_source_init_attempt_controlled(
+            &ctx->source, &ctx->source_initialized, control, attempt_id);
+        rc = wl_columnar_filter_attempt_return(control, attempt_id, rc);
+        if (rc)
+            goto done;
+    }
     rc = wl_columnar_filter_attempt_charge(control, attempt_id,
             WL_COLUMNAR_FILTER_ATTEMPT_SOURCE_BEGIN_WORK);
     if (rc)
         goto done;
-    /* MAP addresses physical lanes through project_indices and builds its
-     * output from the projection, so an INLINE input yields a relation with
-     * no compound layout, as the raw MAP does (#2301). */
-    rc = wl_columnar_relation_scalar_source_admit_attempt_controlled(
-        &ctx->source, input, false, WL_COLUMNAR_RELATION_SOURCE_ADMIT_INLINE);
+    if (bare) {
+        ctx->source_bare = true;
+        rc = wl_columnar_relation_empty_source_hold_attempt_controlled(
+            &ctx->source_empty_reader, input, control, attempt_id,
+            &ctx->source_initialized);
+        if (!ctx->source_initialized) ctx->source_bare = false;
+    } else {
+        /* MAP addresses physical lanes through project_indices and builds
+         * its output from the projection, so an INLINE input yields a
+         * relation with no compound layout, as the raw MAP does (#2301). */
+        rc = wl_columnar_relation_scalar_source_admit_attempt_controlled(
+            &ctx->source, input, false,
+            WL_COLUMNAR_RELATION_SOURCE_ADMIT_INLINE);
+    }
     rc = wl_columnar_filter_attempt_return(control, attempt_id, rc);
     if (rc)
         goto done;
@@ -3395,13 +3445,14 @@ wl_columnar_filter_map_attempt_start_owned(const wl_plan_op_t *op,
             WL_COLUMNAR_FILTER_ATTEMPT_SOURCE_SHAPE_WORK);
     if (rc)
         goto done;
-    rc =
-        wl_columnar_relation_scalar_source_shape_attempt_controlled(
-        &ctx->source,
-        &width, &rows, &timestamped);
+    if (!bare)
+        rc = wl_columnar_relation_scalar_source_shape_attempt_controlled(
+            &ctx->source, &width, &rows, &timestamped);
     rc = wl_columnar_filter_attempt_return(control, attempt_id, rc);
     if (rc)
         goto done;
+    const wirelog_column_type_t *source_types = bare ? NULL
+        : ctx->source.types;
     ctx->width = width; ctx->nrows = rows;
     uint32_t output_width = op->project_count;
     /* Pre-admit this owner's first retirement before its live marker.
@@ -3546,11 +3597,11 @@ wl_columnar_filter_map_attempt_start_owned(const wl_plan_op_t *op,
             bool supported = false;
             if (program)
                 rc = wl_columnar_expr_result_type_attempt_controlled(program,
-                        ctx->source.types, width, &type, &supported, control,
+                        source_types, width, &type, &supported, control,
                         attempt_id);
             else
                 rc = wl_columnar_expr_scalar_result_type_attempt_controlled(
-                    scalar, ctx->source.types, width, &type, &supported,
+                    scalar, source_types, width, &type, &supported,
                     control, attempt_id);
             rc = wl_columnar_filter_attempt_return(control, attempt_id, rc);
             if (rc) goto done;
@@ -3565,8 +3616,8 @@ wl_columnar_filter_map_attempt_start_owned(const wl_plan_op_t *op,
         } else if (!program && !scalar) {
             uint32_t source_column = op->project_indices
                 ? op->project_indices[column] : column;
-            if (ctx->source.types && source_column < width)
-                type = ctx->source.types[source_column];
+            if (source_types && source_column < width)
+                type = source_types[source_column];
         }
         rc = wl_columnar_filter_attempt_charge(control, attempt_id,
                 WL_COLUMNAR_FILTER_MAP_FORWARD_WORK);
@@ -3784,12 +3835,20 @@ wl_columnar_filter_empty_end_context(
         if (!child || r->session != ctx->session || r->control != ctx->control
             || r->attempt_id != ctx->attempt_id) return EINVAL;
         const wl_columnar_relation_empty_source_t *a = *source;
-        if (!ctx->join_decision_pending || !ctx->pin_owned
-            || r->cursor >= r->end
-            || (r->plan->ops[r->cursor].op != WL_PLAN_OP_JOIN
-            && r->plan->ops[r->cursor].op != WL_PLAN_OP_SEMIJOIN
-            && r->plan->ops[r->cursor].op != WL_PLAN_OP_ANTIJOIN)
-            || ctx->join_operation != &r->plan->ops[r->cursor]
+        const wl_plan_op_type_t kind = r->cursor < r->end
+            ? r->plan->ops[r->cursor].op : WL_PLAN_OP_VARIABLE;
+        /* JOIN, SEMIJOIN, ANTIJOIN and REDUCE set source_bare after their
+         * join decision; MAP and FILTER set it with no join decision and no
+         * join operation (#2301). */
+        bool joined = ctx->join_decision_pending
+            && (kind == WL_PLAN_OP_JOIN || kind == WL_PLAN_OP_SEMIJOIN
+            || kind == WL_PLAN_OP_ANTIJOIN || kind == WL_PLAN_OP_REDUCE)
+            && ctx->join_operation == &r->plan->ops[r->cursor];
+        bool unary = ctx->stage == WL_COLUMNAR_FILTER_STAGE_SOURCE
+            && !ctx->join_decision_pending && !ctx->join_initialized
+            && !ctx->join_operation
+            && (kind == WL_PLAN_OP_MAP || kind == WL_PLAN_OP_FILTER);
+        if (!ctx->pin_owned || r->cursor >= r->end || (!joined && !unary)
             || a->identity != a || a->phase ==
             WL_COLUMNAR_RELATION_EMPTY_SOURCE_DRAINED
             || a->attempt_id != ctx->attempt_id
@@ -3838,7 +3897,9 @@ wl_columnar_filter_empty_end_step_owned(
             ctx->stage = WL_COLUMNAR_FILTER_STAGE_JOIN_PHYSICAL;
         } else {
             ctx->source_initialized = false; ctx->source_bare = false;
-            ctx->stage = WL_COLUMNAR_FILTER_STAGE_JOIN_DECIDE;
+            ctx->stage = ctx->join_decision_pending
+                ? WL_COLUMNAR_FILTER_STAGE_JOIN_DECIDE
+                : WL_COLUMNAR_FILTER_STAGE_DECIDE;
         }
     }
     ctx->busy = false;

@@ -9090,9 +9090,8 @@ test_entry_shapes(void)
         for (unsigned floating = 0; floating < 2; ++floating)
             for (unsigned empty = 0; empty < 2; ++empty) {
                 /* Create leaves empty nullary/all-INT sources without a
-                 * schema. Nonempty insert initializes even nullary schemas;
-                 * preserve their positive literal and raw parity checks. */
-                bool unsupported = empty && (!widths[w] || !floating);
+                 * schema. MAP reads such a never-inserted source as an
+                 * empty relation (#2301), so every shape commits. */
                 char *source = entry_program(widths[w], floating);
                 int64_t *rows = calloc(4 * (widths[w] ? widths[w] : 1),
                         sizeof(*rows)); CHECK(rows);
@@ -9114,13 +9113,6 @@ test_entry_shapes(void)
                     && entry_context(&f));
                 entry_outer_guards(&f);
                 entry_complete(&f);
-                if (unsupported) {
-                    CHECK(f.reply.execution_result == ENOTSUP
-                        && !f.reply.committed
-                        && !session_rel_hash_lookup(f.session, "output"));
-                    entry_destroy(&f); free(rows); free(source);
-                    continue;
-                }
                 CHECK(!f.reply.execution_result && f.reply.committed);
                 const col_rel_t *out = session_rel_hash_lookup(f.session,
                         "output");

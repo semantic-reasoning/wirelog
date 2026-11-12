@@ -554,3 +554,10 @@ and LFTJ with an INLINE input, direct compound, segmented, timestamped and
 spill inputs to CONCAT and CONSOLIDATE, cold sources in controlled sessions
 and lazy-owner descriptors remain with #2301 (consuming-operator algorithms
 with #2300).
+
+A further unit in the same bundle lets MAP, FILTER and REDUCE hold a
+never-inserted EDB that session creation left without a schema with the
+authentic empty-source reader, so the unobserved controlled STEP no longer
+returns ENOTSUP for those bodies over such an EDB; the ledger section
+"Never-inserted EDB sources through MAP, FILTER and REDUCE (#2301)" lists the
+routes, the evidence and the INT32 head-type and refusal items left open.
