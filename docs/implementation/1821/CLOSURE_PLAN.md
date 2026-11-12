@@ -539,3 +539,18 @@ inventory and required convergence/precedence/retry fixes are recorded in
 compound/spill representations retain #2301/#2300, default general recursion
 retains #2302, and other shared lifecycle obligations retain #1953. Neither
 #2296 nor #1953 is closed by this bundle alone.
+
+### Inline compound sources (#2301, first bundle)
+
+The scalar source reader gains an opt-in admission of compound_kind INLINE
+with a metered arity-map check; VARIABLE and MAP use it, so generated bodies
+over an inline compound EDB evaluate through the controlled session instead of
+returning ENOTSUP. The bundle qualifies single-rule, UNION and wide bodies,
+STEP and evaluating SNAPSHOT, stops, later inserts and removal, scale and a
+denied MAP scratch reservation; the ledger section "Inline compound sources
+through VARIABLE and MAP (#2301)" lists the evidence. It narrows O01, O03,
+O07, O08, F07, F07a, F07b and C05 without closing them. FILTER, JOIN, REDUCE
+and LFTJ with an INLINE input, direct compound, segmented, timestamped and
+spill inputs to CONCAT and CONSOLIDATE, cold sources in controlled sessions
+and lazy-owner descriptors remain with #2301 (consuming-operator algorithms
+with #2300).

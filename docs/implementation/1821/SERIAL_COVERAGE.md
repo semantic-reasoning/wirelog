@@ -75,14 +75,14 @@ expressions. The numeric/composed child validation remains authoritative.
 
 | ID / family / operator | Controlled destination and variants | Entry level, bound, owner | Evidence / gap |
 |---|---|---|---|
-| O01 / S01 / VARIABLE | `wl_columnar_eval_plan_numeric_source_step`; full versus delta selection, missing/empty source, registry/name lookup, scalar materialization | Session/frame restricted; A lookup and Q256 relation lanes, nested representation setup U; F | `evaluation_numeric_plan`: `test_source_delta_modes`, `test_source_long_names`, `test_source_scan_stops`; representation/config qualification G5/G6 |
+| O01 / S01 / VARIABLE | `wl_columnar_eval_plan_numeric_source_step`; full versus delta selection, missing/empty source, registry/name lookup, scalar materialization | Session/frame restricted; A lookup and Q256 relation lanes, nested representation setup U; F | `evaluation_numeric_plan`: `test_source_delta_modes`, `test_source_long_names`, `test_source_scan_stops`; representation/config qualification G5/G6; an INLINE compound EDB is admitted (#2301), `evaluation_compound_sources` |
 | O02 / S02 / FILTER | `wl_columnar_filter_op_attempt_start_owned`; predicate decode, accepted/rejected rows, empty input | Session/frame; A decode bytes/instructions/row tails; allocation/cleanup U; F | `test_entry_generated_filter_work_boundary`, `test_controlled_observed_filter_stops`; general expression domains G5 |
-| O03 / S02 / MAP | `wl_columnar_filter_map_attempt_start_owned`; projection and numeric expression output, INT64/FLOAT, integer CRC/hash | Session/frame; A decode/evaluation/copy, nested allocation U; F | `test_entry_generated_map_work_limit`, `test_entry_generated_integer_crc`, `test_entry_generated_integer_hash`; unsupported expression families G5 |
+| O03 / S02 / MAP | `wl_columnar_filter_map_attempt_start_owned`; projection and numeric expression output, INT64/FLOAT, integer CRC/hash | Session/frame; A decode/evaluation/copy, nested allocation U; F | `test_entry_generated_map_work_limit`, `test_entry_generated_integer_crc`, `test_entry_generated_integer_hash`; unsupported expression families G5; an INLINE compound input is admitted and yields a NONE output (#2301), `evaluation_compound_sources` |
 | O04 / S03 / JOIN | `wl_columnar_join_op_attempt_start_owned`; product/keyed, collisions, right predicate, projection; non-materialized ordinary route | Session/frame; A hash/probe/candidate/right-filter tails, nested source/scratch U; F | `test_controlled_session_join_step`, `test_entry_generated_right_filter_collisions_and_stop`, `test_entry_generated_right_filter_product_work_boundary`; materialized/differential/batch alternatives F01–F05 |
 | O05 / S04 / ANTIJOIN | `wl_columnar_join_probe_op_attempt_start_owned`; membership/nonmembership child | Session enum admitted, private scalar child restrictions; A child charges, whole host/config bound U; F | `test_entry_generated_operators`; complete predicate/type/fallback session matrix missing, G5 |
 | O06 / S02 / REDUCE | `wl_columnar_ops_reduce_attempt_start_owned`; grouped/ungrouped COUNT and numeric aggregates | Session/frame restricted; charged input/group/sort/projection; whole region U; F | `test_entry_generated_reduce_work_limit`, `test_entry_generated_grouped_count_work_limit`, `test_entry_generated_grouped_numeric_reduce_work_limit`; remaining aggregate/type/error matrix G5 |
-| O07 / S05 / CONCAT | Composed dispatcher → `wl_columnar_merge_concat_attempt_start_owned`; stack union inputs | Session/frame; charged source/copy/handoff; Q256 managed copies, complete ownership combinations U; F | `test_generated_union`, `test_entry_generated_operators`; owned/borrowed/segmented/typed combinations G5 |
-| O08 / S05 / CONSOLIDATE | `wl_columnar_filter_consolidate_attempt_start_owned`; sort/dedup, ordinary versus differential selection | Session/frame ordinary; charged comparison/copy, cleanup U; F | `evaluation_consolidate`, `evaluation_numeric_plan`: `test_owned_consolidate_successor`; differential branch F04, remaining representations G5/G6 |
+| O07 / S05 / CONCAT | Composed dispatcher → `wl_columnar_merge_concat_attempt_start_owned`; stack union inputs | Session/frame; charged source/copy/handoff; Q256 managed copies, complete ownership combinations U; F | `test_generated_union`, `test_entry_generated_operators`; owned/borrowed/segmented/typed combinations G5; UNION bodies whose branch reads an INLINE EDB (#2301), `evaluation_compound_sources`; CONCAT inputs there are MAP outputs with no compound layout, so direct compound, segmented, timestamped and spill inputs stay open |
+| O08 / S05 / CONSOLIDATE | `wl_columnar_filter_consolidate_attempt_start_owned`; sort/dedup, ordinary versus differential selection | Session/frame ordinary; charged comparison/copy, cleanup U; F | `evaluation_consolidate`, `evaluation_numeric_plan`: `test_owned_consolidate_successor`; differential branch F04, remaining representations G5/G6; the same compound-sourced UNION and single-rule bodies (#2301), with NONE inputs |
 | O09 / S04 / SEMIJOIN | Same owned probe child as ANTIJOIN, membership output | Session enum admitted, restricted scalar child; A child charges, whole host/config bound U; F | `test_entry_generated_operators`; SIP/predicate/fallback session qualification G5 |
 | O10 / S07,S13 / K_FUSION | Raw `col_op_k_fusion`; rejected by controlled session operator preflight | P scheduling, R serial payload; Refused; no controlled session owner | Admission matrix proves refusal before frame; #1822 for coordination, serial fallback G3/G4 |
 | O11 / S06 / LFTJ | Real default serial session → framed composed LFTJ child; source resolution/readers, allocation, copy, merge-sort, seek/join, output and retirement | Session/frame, nonrecursive one-worker admitted domain; A scalar work and sliced preparation; complete changed source uppers ≤256 plus named narrow native/library boundaries; S/F/L/O | `evaluation_lftj_hosts` domains/recovery/failures/admission/native/metadata-native/microsteps/policy/qualification, numeric-plan exact oracles; [#2298 acceptance](../2298/LFTJ_ACCEPTANCE.md) |
@@ -103,7 +103,7 @@ controlled fallback.
 | F04 / S08 | `diff_operators_active` selects `wl_columnar_join_diff_op` and `col_op_consolidate_diff`; trace/arrangement updates and `diff_join_batch.c` | R, refused at controlled host/numeric/composed entry; U; no integrated stop owner | `diff_join` is raw reference only. `arrangement.c:diff_registry_grow` also refuses an active evaluation attempt; G3 must integrate trace/registry/retraction ownership with #1820 |
 | F05 / S03 | Materialized JOIN versus named ordinary right source | R, owned ordinary child explicitly excludes `op->materialized`; unsupported private variants must not fall through raw execution; U for required materialized path | Composed abort-support validation distinguishes materialized JOIN; `test_entry_abort_and_unsupported_abort`; execution/refusal coverage by representation still G5 |
 | F06 / S06 | Raw sorted/cache inputs replaced by controlled per-attempt owned copy/sort/seek under real session owner | Qualified bounded alternative; raw cache reuse is optional, full materialized source/typed output and signed successor effects preserved; S/F/L | `test_successors`, `qualification_cache`, `test_lftj_nonoutput_seek`, `test_lftj_aggregate_successors`, raw `lftj_integration`; [acceptance](../2298/LFTJ_ACCEPTANCE.md) |
-| F07 / S01,S05 | Scalar source/owned output versus retained, segmented, compound, timestamped/weighted or spill-backed relation representations | R; each child/source admission must have a disposition; no blanket representation support claimed; F / U | `evaluation_copy`, `evaluation_relation_creation`, `evaluation_output_materialization`, retained-input fixtures; qualify source rejection/materialization and signed metadata, G5. PR #2270 owns its spill-weight feature, not this audit |
+| F07 / S01,S05 | Scalar source/owned output versus retained, segmented, compound, timestamped/weighted or spill-backed relation representations | R; each child/source admission must have a disposition; no blanket representation support claimed; F / U | `evaluation_copy`, `evaluation_relation_creation`, `evaluation_output_materialization`, retained-input fixtures; qualify source rejection/materialization and signed metadata, G5. PR #2270 owns its spill-weight feature, not this audit. #2301 first bundle: INLINE sources through VARIABLE and MAP; see the section on inline compound sources |
 | F08 / S05,S07 | Legacy recursive merge/dedup versus managed incremental candidate/union | R; `wl_columnar_merge_incremental_delta_attempt_advance` caps a call at Q256; generic legacy recursive path remains U; S/F | Restricted recursive session tests and `evaluation_work`/`evaluation_consolidate` primitives; general frontier/retraction integration G3 |
 | F09 / S11 | Governor admission, allocator/Arrow release, CAS/control references, receipt retirement and registry replacement | R engine setup/cleanup; external allocator body is noninterruptible, engine copies/scans are not thereby excluded; U unless separately precharged/bounded | Allocation/copy/receipt tests establish local tariffs, not all nested bounds; G6 must name each finite region, charge before allocation, retain resources on every failure |
 | F10 / S10,S12 | Observer/snapshot preparation → final poll → prepaid callback batch | H for callback duration; R for charged engine preparation/assembly/traversal/lookup, retained mandatory cleanup; O, A/Q64 before cutoff | `test_controlled_snapshot_preparation` and the G2 multihead/wide/budget fixtures cover preparation stops, late cancellation and finite publication. Nested policy/configuration obligations remain G6 |
@@ -124,8 +124,8 @@ references, not interruption evidence.
 | F04a | Differential arrangement/trace persistent transaction versus ephemeral hash fallback | Raw fallback must leave no transaction state; controlled entry refuses active differential mode and active-attempt registry growth. Integrated stop owner absent; G3, #1820 |
 | F05a | Ordinary keyed persistent arrangement/probe bundle versus ephemeral hash; cached right filter versus operation-owned filtered relation | General serial STEP owns a private native index registry for full-right public EDB INT64 JOIN, with bounded creation/reuse/probes and a common head/index cutoff. Existing pins/pending/deferred entries refuse replacement. Filtered/private-head/batch representations retain their previous controlled disposition; this does not qualify raw cache alternatives, G5/G6 |
 | F06a | LFTJ cache/probe versus owned source rebuild and raw output callback versus private owned-row append | Controlled session uses per-attempt bounded rebuild, no unlimited raw fallback; actual writer/ROW/ACK/drain ownership and precommit/postcutoff delivery qualified | Host failure/native/microsteps/policy and `test_lftj_postcut_delivery`; current-generation raw probe/pin checks; [source map](../2298/LFTJ_SOURCE_ACCOUNTING.md) |
-| F07a | Scalar-source compound kind NONE versus INLINE/SIDE, declared schema/type validity, timestamps and row weights | Admission predicates differ by child; no cross-operator representation support inferred. Managed copies/readers can be bounded while a surrounding child refuses the representation; G5 |
-| F07b | Retained/borrowed/owned, contiguous/segmented/spill-backed storage and empty/nullary/wide rows | Source reader/descriptor and copy helpers must preserve representation and governor state; capacity/overflow errors remain errors. Enumerated qualification combinations, not an invitation to raw fallback; G5/G6 |
+| F07a | Scalar-source compound kind NONE versus INLINE/SIDE, declared schema/type validity, timestamps and row weights | Admission predicates differ by child; no cross-operator representation support inferred. Managed copies/readers can be bounded while a surrounding child refuses the representation; G5. #2301: VARIABLE and MAP admit compound_kind INLINE after a metered arity-map check; FILTER and JOIN keep a tested ENOTSUP for an INLINE input; compound_kind SIDE stays ENOTSUP |
+| F07b | Retained/borrowed/owned, contiguous/segmented/spill-backed storage and empty/nullary/wide rows | Source reader/descriptor and copy helpers must preserve representation and governor state; capacity/overflow errors remain errors. Enumerated qualification combinations, not an invitation to raw fallback; G5/G6. #2301: borrowed public INLINE descriptors, empty, wide and arity-1 INLINE layouts; controlled sessions refuse cold (spill-backed) sources at seal |
 
 ## Configuration predicates
 
@@ -139,7 +139,7 @@ until the product contract justifies exclusion.
 | C02 / S13 | `crc32_variant` ethernet/castagnoli; `mbedTLS` disabled/enabled/auto | R. Both integer CRC fixtures exist; library crypto is not certified by numeric tests. Enabled-library paths need finite admission/error semantics or refusal before invocation, G5/G6 |
 | C03 / S13 | Native C11/POSIX/Windows threading, forced `threads=posix`; serial worker count versus coordinator/multiworker | R serial ABI/thread-affinity checks; P global worker allowance. Run the same serial contracts on supported backends; existing ABI-aware work formulas must not assume LP64, G6 |
 | C04 / S09,S13 | Batch bytes/strict, delta selectors/right-delta and output policy | Ordinary serial JOIN host qualifies actual chosen destination, strict refusal, local cap after committed sink ACK, private rollback and retry. Shared counters remain #1822; other operator policy intersections retain G6 |
-| C05 / S01,S13 | `embedded`, `ipc`, IO/plugin loader, Arrow/import/export and extension callbacks | IO/transport outside serial evaluation; R for resulting representations and expressions when consumed by an operator, H only for callback bodies. Qualification G5/G6; enabled options cannot bypass source/child admission |
+| C05 / S01,S13 | `embedded`, `ipc`, IO/plugin loader, Arrow/import/export and extension callbacks | IO/transport outside serial evaluation; R for resulting representations and expressions when consumed by an operator, H only for callback bodies. Qualification G5/G6; enabled options cannot bypass source/child admission. #2301: INLINE EDBs, with layouts from session creation and rows from host insertion, are consumed by VARIABLE and MAP; adapters unchanged |
 | C06 / S13 | Android/iOS cross builds, MSVC/Clang/GCC, debug/release/sanitizers; logging ceiling, fuzz/docs switches | R serial behavior/ABI qualification; build-only tooling is not a new evaluator route. Local tests below do not certify all targets; G6 and final #1824 qualification |
 | C07 / S07,S13 | Optimizer selects LFTJ, SIP, K_FUSION, EXCHANGE or materialized JOIN | R serial work follows O05/O09–O12/F05/F06; P redistribution. Refusal today is not permission to omit a default/supported optimizer result from final coverage, G3–G5 |
 
@@ -2613,3 +2613,66 @@ A stale pinned old public image does not reject the distinct private right
 image; its pin is released only after terminal execution. Existing independent
 primitive/funding tests remain regression oracles. Whole-bundle issue closure
 still requires the remaining U1 and final acceptance record.
+
+### Inline compound sources through VARIABLE and MAP (#2301)
+
+An EDB declared with an inline compound column, such as `p:pair/2 inline`, and
+no side compound column stores each compound as contiguous int64 lanes and has
+compound_kind INLINE. The generated body `out(i,x,y) :- a(i,pair(x,y)).` is
+VARIABLE, MAP, CONSOLIDATE, and MAP's `project_indices` address those physical
+lanes. Before this bundle a controlled STEP or SNAPSHOT of that body returned
+ENOTSUP from the shared scalar source reader, which refused every
+compound_kind other than NONE; the uncontrolled session computed the rows.
+
+`wl_columnar_relation_scalar_source_admit_attempt_controlled` takes an
+opt-in `admit` mask. With `WL_COLUMNAR_RELATION_SOURCE_ADMIT_INLINE` it admits
+an INLINE descriptor after checking its arity map in chunks of eight logical
+entries, each charged 88 (65 counted slots), with the predicates of
+`col_rel_compound_map_valid_for`; a malformed map is EINVAL. The map is read
+while both reader gates are held, and `col_rel_apply_compound_schema` returns
+EBUSY then. A mask of zero is the previous begin, with the same refusal and
+charge schedule, and every other caller still passes zero. compound_kind SIDE
+stays ENOTSUP. A layout that mixes INLINE and SIDE columns has compound_kind
+INLINE and is admitted with its SIDE lanes read as int64 handles. Session
+creation does not build such a layout: `wl_columnar_session_inline_schema`
+returns before applying one when any declared column is SIDE.
+
+VARIABLE's source hold and MAP's source begin pass the INLINE bit. VARIABLE
+FULL/AUTO still borrows the original descriptor, so the source keeps its
+layout. A forced-empty VARIABLE (FORCE_EMPTY, or a seeded FORCE_DELTA without
+a delta) over an INLINE source builds its empty output from the scalar recipe,
+which carries no compound layout, so that output has compound_kind NONE where
+the uncontrolled `wl_columnar_ops_push_empty` copies the INLINE layout. Both
+are empty; no test here drives that path, and it is left open. MAP builds its
+output from the projection, so `$map` and the published head have
+compound_kind NONE, as the uncontrolled MAP's output does. In the generated
+bodies exercised here each UNION branch ends in MAP, so CONCAT and CONSOLIDATE
+receive NONE inputs and are unchanged.
+
+`evaluation_relation_creation` checks the admitted reader on real INLINE
+layouts (pair, arity-1 box, a ten-entry wide layout, and mixed INLINE/SIDE)
+with zero and two rows: the exact and one-short charge schedule at every
+prefix, the unchanged refusal and charge without the bit, literal lane
+values, EBUSY for a schema change while held, malformed maps, SIDE and an
+unknown kind, and cancellation, work exhaustion and attempt restart inside
+the map check followed by a clean retry.
+
+`evaluation_compound_sources` runs generated single-rule, UNION and wide
+bodies through controlled and uncontrolled sessions, for STEP and evaluating
+SNAPSHOT, observed and unobserved, with an empty INLINE source and with
+cancellation and work exhaustion at `$map` or `$concat`. It compares literal
+tuple sets and the uncontrolled results, and checks that MAP read an INLINE
+input, that the source keeps its layout and image, and that a stopped call
+publishes nothing and retries. It also covers later inserts and a removal,
+300 rows, stops at each INLINE map-check charge of a real STEP (the same body
+over a scalar EDB records none), a denied MAP scratch reservation pinned at
+that reservation with `memory_budget_denied` set and a retry, and a typed
+ENOTSUP with nothing published for FILTER and JOIN bodies over an INLINE
+source.
+
+Open after this bundle: FILTER, JOIN, SEMIJOIN/ANTIJOIN, REDUCE and LFTJ with an
+INLINE input; direct compound, segmented, timestamped/weighted and spill inputs
+to CONCAT and CONSOLIDATE; cold sources in controlled sessions, which
+`wl_columnar_session_cold_mode` excludes when an evaluation control is attached;
+and lazy-owner descriptors, which the reader refuses with ENOTSUP and whose
+session reachability was not traced. #2301 is not closed by this bundle.

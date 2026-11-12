@@ -21,6 +21,8 @@
 
 extern void (*wl_columnar_eval_stack_test_physical_publication)(
     wl_col_session_t *, const col_rel_t *, const col_rel_t *);
+extern void (*wl_columnar_filter_test_attempt_checkpoint)(
+    wl_evaluation_control_t *, unsigned, uint64_t);
 
 #define MAXW 5u
 #define MAXR 64u
@@ -476,6 +478,250 @@ refused_consumer(const char *text, const char *head, unsigned want_rows)
     wl_columnar_memory_governor_ref_release(governor);
 }
 
+/* ---- later operations ---------------------------------------------------- */
+
+static void
+run_until_done(wl_session_t *s, bool snapshot, capture_t *image)
+{
+    CHECK(!(snapshot ? wl_session_snapshot(s, on_tuple, image) : step(s)));
+}
+
+/* STEP, insert (one new row, one already derived), STEP, remove, STEP, with
+ * the controlled and uncontrolled sessions emitting the same signed events. */
+static void
+successors(bool snapshot_between)
+{
+    fixture_t f;
+    fixture(&f, K_PAIR);
+    populate(f.s, K_PAIR, false);
+    populate(f.raw, K_PAIR, false);
+    capture_t ev = {.head = "out"}, raw_ev = {.head = "out"};
+    wl_session_set_delta_cb(f.s, on_delta, &ev);
+    wl_session_set_delta_cb(f.raw, on_delta, &raw_ev);
+    run_until_done(f.s, false, NULL);
+    run_until_done(f.raw, false, NULL);
+    equal_capture(&ev, &raw_ev, "first step");
+    const int64_t more[] = {4, 1, 1,   1, 10, 20};
+    for (unsigned round = 0; round < 2; round++) {
+        ev.count = raw_ev.count = 0;
+        capture_t want = {.head = "out"};
+        if (!round) {
+            CHECK(!wl_session_insert(f.s, "a", more, 2, 3));
+            CHECK(!wl_session_insert(f.raw, "a", more, 2, 3));
+            add(&want, 3, more, 1);
+        } else {
+            CHECK(!wl_session_remove(f.s, "a", &pair_rows[3], 1, 3));
+            CHECK(!wl_session_remove(f.raw, "a", &pair_rows[3], 1, 3));
+            add(&want, 3, &pair_rows[3], -1);
+        }
+        if (snapshot_between) {
+            capture_t image = {.head = "out"}, raw_image = {.head = "out"};
+            run_until_done(f.s, true, &image);
+            run_until_done(f.raw, true, &raw_image);
+            equal_capture(&image, &raw_image, "snapshot between steps");
+        }
+        run_until_done(f.s, false, NULL);
+        run_until_done(f.raw, false, NULL);
+        equal_capture(&ev, &want, "successor events");
+        /* An evaluating raw SNAPSHOT consumes the pending input without the
+         * STEP notification transaction, so the raw events are compared
+         * only when no SNAPSHOT came between the steps. */
+        if (!snapshot_between)
+            equal_capture(&raw_ev, &want, "raw successor events");
+        else
+            CHECK(!raw_ev.count);
+        capture_t image = {.head = "out"}, raw_image = {.head = "out"};
+        CHECK(!wl_session_snapshot(f.s, on_tuple, &image));
+        CHECK(!wl_session_snapshot(f.raw, on_tuple, &raw_image));
+        equal_capture(&image, &raw_image, "successor image");
+        CHECK(image.count == (round ? 3u : 4u));
+    }
+    fixture_destroy(&f);
+}
+
+/* 300 distinct rows plus a repeated block: more than one quantum of rows. */
+static void
+scale(void)
+{
+    fixture_t f;
+    fixture(&f, K_PAIR);
+    static int64_t rows[330 * 3];
+    for (unsigned r = 0; r < 330; r++) {
+        unsigned k = r < 300 ? r : r - 300;
+        rows[r * 3] = (int64_t)k;
+        rows[r * 3 + 1] = (int64_t)k * 7 - 1000;
+        rows[r * 3 + 2] = -(int64_t)k;
+    }
+    CHECK(!wl_session_insert(f.s, "a", rows, 330, 3));
+    CHECK(!wl_session_insert(f.raw, "a", rows, 330, 3));
+    static capture_t image, raw_image;
+    memset(&image, 0, sizeof(image)); memset(&raw_image, 0, sizeof(raw_image));
+    CHECK(!step(f.s) && !step(f.raw));
+    col_rel_t *head = session_find_rel((wl_col_session_t *)f.s, "out");
+    col_rel_t *raw_head = session_find_rel((wl_col_session_t *)f.raw, "out");
+    CHECK(head && raw_head && head->nrows == 300 && raw_head->nrows == 300
+        && head->ncols == 3);
+    /* Exact content: every k appears once with its derived lanes. */
+    static unsigned hit[300];
+    memset(hit, 0, sizeof(hit));
+    for (uint32_t r = 0; r < head->nrows; r++) {
+        int64_t k = head->columns[0][r];
+        CHECK(k >= 0 && k < 300 && head->columns[1][r] == k * 7 - 1000
+            && head->columns[2][r] == -k);
+        hit[k]++;
+    }
+    for (unsigned k = 0; k < 300; k++)
+        CHECK(hit[k] == 1);
+    fixture_destroy(&f);
+}
+
+/* A stop inside the INLINE map check of a real STEP. Only the admitted
+ * INLINE check charges 88 on this route: the same body over a scalar EDB
+ * records no such charge, and the INLINE body records one per map chunk in
+ * each of VARIABLE and MAP. */
+static unsigned compound_hits, compound_stop_at, compound_mode;
+static void
+compound_checkpoint(wl_evaluation_control_t *c, uint64_t work)
+{
+    if (work != 88)
+        return;
+    if (++compound_hits != compound_stop_at)
+        return;
+    if (compound_mode == 1)
+        wl_evaluation_control_request_cancel(c);
+    else
+        CHECK(wl_evaluation_control_charge(c, UINT64_MAX)
+            == WL_EVALUATION_CONTROL_WORK_LIMIT);
+}
+
+static unsigned
+count_compound_charges(const char *text, const int64_t *rows, unsigned n,
+    unsigned width)
+{
+    wirelog_error_t error;
+    wirelog_program_t *program = wirelog_parse_string(text, &error);
+    wl_plan_t *plan = NULL;
+    CHECK(program && !wl_plan_from_program(program, &plan));
+    wl_evaluation_control_t *control = NULL;
+    CHECK(!wl_evaluation_control_create(UINT64_C(1000000000), &control));
+    wl_session_options_t options;
+    wl_session_options_init(&options);
+    options.evaluation_control = control;
+    wl_session_t *s = NULL;
+    CHECK(!wl_session_create_with_options(wl_backend_columnar(), plan, 1,
+        &options, &s));
+    CHECK(!wl_session_insert(s, "a", rows, n, width));
+    compound_hits = 0; compound_stop_at = 0;
+    wl_columnar_relation_test_work_checkpoint = compound_checkpoint;
+    CHECK(!step(s));
+    wl_columnar_relation_test_work_checkpoint = NULL;
+    CHECK(!wl_session_try_destroy(&s));
+    wl_evaluation_control_release(control);
+    wl_plan_free(plan);
+    wirelog_program_free(program);
+    return compound_hits;
+}
+
+static void
+compound_stops(void)
+{
+    CHECK(count_compound_charges(".decl a(id:int64,x:int64,y:int64)\n"
+        ".decl out(id:int64,x:int64,y:int64)\nout(i,x,y) :- a(i,x,y).\n",
+        pair_rows, 4, 3) == 0);
+    CHECK(count_compound_charges(programs[K_PAIR], pair_rows, 4, 3) == 2);
+    CHECK(count_compound_charges(programs[K_WIDE], wide_rows, 3, 12) == 4);
+    for (unsigned kind = K_PAIR; kind <= K_WIDE; kind += K_WIDE - K_PAIR)
+        for (unsigned at = 1; at <= (kind == K_WIDE ? 4u : 2u); at++)
+            for (compound_mode = 1; compound_mode < 3; compound_mode++) {
+                fixture_t f;
+                fixture(&f, kind);
+                populate(f.s, kind, false);
+                capture_t ev = {.head = "out"}, want = {.head = "out"};
+                literal(kind, false, &want);
+                wl_session_set_delta_cb(f.s, on_delta, &ev);
+                source_t src;
+                source_save(&src, f.s);
+                col_rel_t *old = session_find_rel((wl_col_session_t *)f.s,
+                        "out");
+                col_relation_snapshot_t old_image =
+                    wl_columnar_relation_snapshot(old);
+                compound_hits = 0; compound_stop_at = at;
+                wl_columnar_relation_test_work_checkpoint =
+                    compound_checkpoint;
+                int rc = step(f.s);
+                wl_columnar_relation_test_work_checkpoint = NULL;
+                int expected = compound_mode == 1
+                    ? WL_EVALUATION_CONTROL_CANCELLED
+                    : WL_EVALUATION_CONTROL_WORK_LIMIT;
+                CHECK(rc == expected && compound_hits == at && !ev.count);
+                source_kept(&src, f.s, true);
+                CHECK(session_find_rel((wl_col_session_t *)f.s, "out") == old);
+                if (old)
+                    CHECK(wl_columnar_relation_snapshot_equal(old_image,
+                        wl_columnar_relation_snapshot(old)));
+                wl_evaluation_control_report_t report = {0};
+                CHECK(!wl_evaluation_control_report(f.control, &report));
+                CHECK(report.result == expected && !report.cleanup_status);
+                CHECK(!wl_evaluation_control_reset(f.control));
+                CHECK(!step(f.s));
+                equal_capture(&ev, &want, "events after a compound stop");
+                fixture_destroy(&f);
+            }
+}
+
+/* The MAP scratch reservation of the wide body (12 source lanes plus 5
+ * outputs exceed 16 values) is denied by a blocker installed at its own
+ * reservation point; nothing is published and a retry after the blocker is
+ * released completes. Phase 6 with progress 12 is MAP's scratch reservation
+ * here: CONSOLIDATE's has progress 5 and the body has no FILTER. */
+static wl_columnar_memory_governor_t *deny_governor;
+static wl_columnar_memory_reservation_t blocker;
+static unsigned deny_hits;
+static void
+deny_map_scratch(wl_evaluation_control_t *c, unsigned phase, uint64_t progress)
+{
+    (void)c;
+    if (phase != 6 || progress != 12 || deny_hits++)
+        return;
+    uint64_t usable = atomic_load_explicit(&deny_governor->usable_bytes,
+            memory_order_relaxed);
+    uint64_t reserved = wl_columnar_memory_reserved(deny_governor);
+    CHECK(usable > reserved + 1);
+    wl_columnar_memory_reservation_init(&blocker);
+    CHECK(wl_columnar_memory_reserve(deny_governor, usable - reserved - 1,
+        &blocker));
+}
+
+static void
+map_scratch_denial(void)
+{
+    fixture_t f;
+    fixture(&f, K_WIDE);
+    populate(f.s, K_WIDE, false);
+    capture_t ev = {.head = "out"}, want = {.head = "out"};
+    literal(K_WIDE, false, &want);
+    wl_session_set_delta_cb(f.s, on_delta, &ev);
+    source_t src;
+    source_save(&src, f.s);
+    col_rel_t *old = session_find_rel((wl_col_session_t *)f.s, "out");
+    deny_governor = wl_columnar_memory_governor_ref_get(f.governor);
+    deny_hits = 0;
+    wl_columnar_filter_test_attempt_checkpoint = deny_map_scratch;
+    int rc = step(f.s);
+    wl_columnar_filter_test_attempt_checkpoint = NULL;
+    if (rc != ENOSPC)
+        fprintf(stderr, "map scratch denial: rc %d\n", rc);
+    CHECK(rc == ENOSPC && deny_hits >= 1 && !ev.count);
+    CHECK(((wl_col_session_t *)f.s)->memory_budget_denied);
+    source_kept(&src, f.s, true);
+    CHECK(session_find_rel((wl_col_session_t *)f.s, "out") == old);
+    CHECK(wl_columnar_memory_release(&blocker));
+    CHECK(!wl_evaluation_control_reset(f.control));
+    CHECK(!step(f.s));
+    equal_capture(&ev, &want, "events after a denied MAP scratch");
+    fixture_destroy(&f);
+}
+
 int
 main(void)
 {
@@ -487,6 +733,11 @@ main(void)
                 for (unsigned fault = 1; fault < 3; fault++)
                     run_case(kind, snapshot, observed, false, fault);
             }
+    successors(false);
+    successors(true);
+    scale();
+    compound_stops();
+    map_scratch_denial();
     /* x > 0 keeps ids 1 and 2; the join matches x = 10 and x = 30. */
     refused_consumer(".decl a(id:int64,p:pair/2 inline)\n"
         ".decl b(k:int64,v:int64)\n.decl f(id:int64,y:int64)\n"
