@@ -3989,6 +3989,241 @@ wl_columnar_expr_scalar_result_type_attempt_controlled(
     return 0;
 }
 
+/* MAP metadata follows the raw compiler before its interpreted fallback.
+ * These fixed tag tables inspect no payload and perform no expression work. */
+static bool
+wl_columnar_expr_map_raw_tag(uint8_t tag)
+{
+    switch ((wl_plan_expr_tag_t)tag) {
+    case WL_PLAN_EXPR_VAR:
+    case WL_PLAN_EXPR_VAR_FLOAT:
+    case WL_PLAN_EXPR_CONST_INT:
+    case WL_PLAN_EXPR_CONST_FLOAT:
+    case WL_PLAN_EXPR_BOOL:
+    case WL_PLAN_EXPR_ARITH_ADD:
+    case WL_PLAN_EXPR_ARITH_SUB:
+    case WL_PLAN_EXPR_ARITH_MUL:
+    case WL_PLAN_EXPR_ARITH_DIV:
+    case WL_PLAN_EXPR_ARITH_MOD:
+    case WL_PLAN_EXPR_ARITH_BAND:
+    case WL_PLAN_EXPR_ARITH_BOR:
+    case WL_PLAN_EXPR_ARITH_BXOR:
+    case WL_PLAN_EXPR_ARITH_BNOT:
+    case WL_PLAN_EXPR_ARITH_SHL:
+    case WL_PLAN_EXPR_ARITH_SHR:
+    case WL_PLAN_EXPR_ARITH_FLOAT_ADD:
+    case WL_PLAN_EXPR_ARITH_FLOAT_SUB:
+    case WL_PLAN_EXPR_ARITH_FLOAT_MUL:
+    case WL_PLAN_EXPR_ARITH_FLOAT_DIV:
+    case WL_PLAN_EXPR_CMP_EQ:
+    case WL_PLAN_EXPR_CMP_NEQ:
+    case WL_PLAN_EXPR_CMP_LT:
+    case WL_PLAN_EXPR_CMP_GT:
+    case WL_PLAN_EXPR_CMP_LTE:
+    case WL_PLAN_EXPR_CMP_GTE:
+    case WL_PLAN_EXPR_CMP_FLOAT_EQ:
+    case WL_PLAN_EXPR_CMP_FLOAT_NEQ:
+    case WL_PLAN_EXPR_CMP_FLOAT_LT:
+    case WL_PLAN_EXPR_CMP_FLOAT_GT:
+    case WL_PLAN_EXPR_CMP_FLOAT_LTE:
+    case WL_PLAN_EXPR_CMP_FLOAT_GTE:
+    case WL_PLAN_EXPR_CMP_STR_EQ:
+    case WL_PLAN_EXPR_CMP_STR_NEQ:
+    case WL_PLAN_EXPR_CMP_STR_LT:
+    case WL_PLAN_EXPR_CMP_STR_GT:
+    case WL_PLAN_EXPR_CMP_STR_LTE:
+    case WL_PLAN_EXPR_CMP_STR_GTE:
+    case WL_PLAN_EXPR_AGG_COUNT:
+    case WL_PLAN_EXPR_AGG_SUM:
+    case WL_PLAN_EXPR_AGG_MIN:
+    case WL_PLAN_EXPR_AGG_MAX:
+        return true;
+    default: return false;
+    }
+}
+
+static bool
+wl_columnar_expr_map_interpreted_tag(uint8_t tag, uint32_t *arity,
+    wirelog_column_type_t *result)
+{
+    *arity = 0;
+    switch ((wl_plan_expr_tag_t)tag) {
+    case WL_PLAN_EXPR_VAR:
+    case WL_PLAN_EXPR_VAR_FLOAT:
+    case WL_PLAN_EXPR_VAR_STRING:
+    case WL_PLAN_EXPR_CONST_STR:
+        *result = WIRELOG_TYPE_STRING; break;
+    case WL_PLAN_EXPR_CONST_INT:
+        *result = WIRELOG_TYPE_INT64; break;
+    case WL_PLAN_EXPR_CONST_FLOAT:
+        *result = WIRELOG_TYPE_FLOAT; break;
+    case WL_PLAN_EXPR_BOOL:
+        *result = WIRELOG_TYPE_BOOL; break;
+    case WL_PLAN_EXPR_ARITH_ADD:
+    case WL_PLAN_EXPR_ARITH_SUB:
+    case WL_PLAN_EXPR_ARITH_MUL:
+    case WL_PLAN_EXPR_ARITH_DIV:
+    case WL_PLAN_EXPR_ARITH_MOD:
+    case WL_PLAN_EXPR_ARITH_BAND:
+    case WL_PLAN_EXPR_ARITH_BOR:
+    case WL_PLAN_EXPR_ARITH_BXOR:
+    case WL_PLAN_EXPR_ARITH_SHL:
+    case WL_PLAN_EXPR_ARITH_SHR:
+    case WL_PLAN_EXPR_ARITH_HMAC_SHA256:
+    case WL_PLAN_EXPR_ARITH_UUID5:
+    case WL_PLAN_EXPR_ARITH_HMAC_SHA256_SS:
+    case WL_PLAN_EXPR_ARITH_HMAC_SHA256_SI:
+    case WL_PLAN_EXPR_ARITH_HMAC_SHA256_IS:
+    case WL_PLAN_EXPR_ARITH_UUID5_SS:
+    case WL_PLAN_EXPR_ARITH_UUID5_SI:
+    case WL_PLAN_EXPR_ARITH_UUID5_IS:
+        *arity = 2; *result = WIRELOG_TYPE_INT64; break;
+    case WL_PLAN_EXPR_ARITH_BNOT:
+    case WL_PLAN_EXPR_ARITH_HASH:
+    case WL_PLAN_EXPR_ARITH_CRC32_ETH:
+    case WL_PLAN_EXPR_ARITH_CRC32_CAST:
+    case WL_PLAN_EXPR_ARITH_MD5:
+    case WL_PLAN_EXPR_ARITH_SHA1:
+    case WL_PLAN_EXPR_ARITH_SHA256:
+    case WL_PLAN_EXPR_ARITH_SHA512:
+    case WL_PLAN_EXPR_ARITH_HASH_S:
+    case WL_PLAN_EXPR_ARITH_CRC32_ETH_S:
+    case WL_PLAN_EXPR_ARITH_CRC32_CAST_S:
+    case WL_PLAN_EXPR_ARITH_MD5_S:
+    case WL_PLAN_EXPR_ARITH_SHA1_S:
+    case WL_PLAN_EXPR_ARITH_SHA256_S:
+    case WL_PLAN_EXPR_ARITH_SHA512_S:
+    case WL_PLAN_EXPR_STR_FN_STRLEN:
+    case WL_PLAN_EXPR_STR_FN_STR_ORD:
+    case WL_PLAN_EXPR_STR_FN_TO_NUMBER:
+        *arity = 1; *result = WIRELOG_TYPE_INT64; break;
+    case WL_PLAN_EXPR_ARITH_UUID4:
+        *arity = 0; *result = WIRELOG_TYPE_INT64; break;
+    case WL_PLAN_EXPR_ARITH_FLOAT_ADD:
+    case WL_PLAN_EXPR_ARITH_FLOAT_SUB:
+    case WL_PLAN_EXPR_ARITH_FLOAT_MUL:
+    case WL_PLAN_EXPR_ARITH_FLOAT_DIV:
+        *arity = 2; *result = WIRELOG_TYPE_FLOAT; break;
+    case WL_PLAN_EXPR_CMP_EQ:
+    case WL_PLAN_EXPR_CMP_NEQ:
+    case WL_PLAN_EXPR_CMP_LT:
+    case WL_PLAN_EXPR_CMP_GT:
+    case WL_PLAN_EXPR_CMP_LTE:
+    case WL_PLAN_EXPR_CMP_GTE:
+    case WL_PLAN_EXPR_CMP_FLOAT_EQ:
+    case WL_PLAN_EXPR_CMP_FLOAT_NEQ:
+    case WL_PLAN_EXPR_CMP_FLOAT_LT:
+    case WL_PLAN_EXPR_CMP_FLOAT_GT:
+    case WL_PLAN_EXPR_CMP_FLOAT_LTE:
+    case WL_PLAN_EXPR_CMP_FLOAT_GTE:
+    case WL_PLAN_EXPR_CMP_STR_EQ:
+    case WL_PLAN_EXPR_CMP_STR_NEQ:
+    case WL_PLAN_EXPR_CMP_STR_LT:
+    case WL_PLAN_EXPR_CMP_STR_GT:
+    case WL_PLAN_EXPR_CMP_STR_LTE:
+    case WL_PLAN_EXPR_CMP_STR_GTE:
+    case WL_PLAN_EXPR_STR_FN_CONTAINS:
+    case WL_PLAN_EXPR_STR_FN_STR_PREFIX:
+    case WL_PLAN_EXPR_STR_FN_STR_SUFFIX:
+        *arity = 2; *result = WIRELOG_TYPE_BOOL; break;
+    case WL_PLAN_EXPR_STR_FN_TO_UPPER:
+    case WL_PLAN_EXPR_STR_FN_TO_LOWER:
+    case WL_PLAN_EXPR_STR_FN_TRIM:
+    case WL_PLAN_EXPR_STR_FN_TO_STRING:
+        *arity = 1; *result = WIRELOG_TYPE_STRING; break;
+    case WL_PLAN_EXPR_STR_FN_CAT:
+    case WL_PLAN_EXPR_STR_FN_UUID5_RFC:
+        *arity = 2; *result = WIRELOG_TYPE_STRING; break;
+    case WL_PLAN_EXPR_STR_FN_SUBSTR:
+    case WL_PLAN_EXPR_STR_FN_STR_REPLACE:
+        *arity = 3; *result = WIRELOG_TYPE_STRING; break;
+    default: return false;
+    }
+    return true;
+}
+
+/* ENTRY/PRE/INTERP/FINAL224 each cover expanded controller84,
+ * fixed body108 and next-front24 =216. RAW224 covers controller84,
+ * producer20, result_type36, stores10, status8 and front24 =182.
+ * Decoder byte/digit regions are separate. The same-signature MAP caller
+ * retains incoming166<=192 and FINAL caller handoff146<=224.
+ * No allocation, lookup, evaluation or callback occurs during inference. */
+int
+wl_columnar_expr_scalar_map_schema_attempt_controlled(
+    const wl_columnar_expr_attempt_scalar_t *owner,
+    const wirelog_column_type_t *types, uint32_t width,
+    wirelog_column_type_t *type, bool *supported,
+    wl_evaluation_control_t *control, uint64_t id)
+{
+    if (!owner || !type || !supported) return EINVAL;
+    int rc = wl_columnar_expr_scalar_region(control, id, 610, 0);
+    if (rc) return rc;
+    uint32_t pos = 0, raw_depth = 0, depth = 0, count = 0;
+    bool raw = true, interpreted = true, raw_known = true;
+    wirelog_column_type_t raw_type = WIRELOG_TYPE_INT64;
+    wirelog_column_type_t result = WIRELOG_TYPE_INT64;
+    while (pos < owner->size) {
+        rc = wl_columnar_expr_scalar_region(control, id, 611, pos);
+        if (rc) return rc;
+        uint8_t tag = owner->bytes[pos];
+        uint32_t arity = 0;
+        if (raw && !wl_columnar_expr_map_raw_tag(tag)) raw = false;
+        if (interpreted && !wl_columnar_expr_map_interpreted_tag(tag,
+            &arity, &result)) interpreted = false;
+        if (!raw && !interpreted) break;
+        expr_instr_t instruction;
+        rc = wl_columnar_expr_scalar_decode(owner->bytes, owner->size, &pos,
+                &instruction, control, id);
+        if (rc == ENOTSUP) {
+            raw = false; interpreted = false; break;
+        }
+        if (rc) return rc;
+        if (raw) {
+            rc = wl_columnar_expr_scalar_region(control, id, 614, pos);
+            if (rc) return rc;
+            ++count;
+            uint32_t producer = UINT32_MAX;
+            wl_columnar_expr_result_producer(tag, 0, &raw_depth, &producer);
+            if (producer != UINT32_MAX)
+                raw_known = wl_columnar_expr_result_type(&instruction, 0,
+                        types, width, &raw_type);
+        }
+        if (interpreted) {
+            rc = wl_columnar_expr_scalar_region(control, id, 612, pos);
+            if (rc) return rc;
+            if (tag == WL_PLAN_EXPR_VAR || tag == WL_PLAN_EXPR_VAR_FLOAT ||
+                tag == WL_PLAN_EXPR_VAR_STRING) {
+                if (instruction.iarg >= width) interpreted = false;
+                else {
+                    result =
+                        types ? types[instruction.iarg] : WIRELOG_TYPE_INT64;
+                    if (result < WIRELOG_TYPE_INT32 ||
+                        result > WIRELOG_TYPE_BOOL ||
+                        (tag == WL_PLAN_EXPR_VAR_STRING &&
+                        result != WIRELOG_TYPE_STRING) ||
+                        (tag == WL_PLAN_EXPR_VAR_FLOAT &&
+                        result != WIRELOG_TYPE_FLOAT))
+                        interpreted = false;
+                }
+            }
+            if (depth < arity) interpreted = false;
+            else {
+                depth -= arity;
+                if (depth == COL_FILTER_STACK) interpreted = false;
+                else ++depth;
+            }
+        }
+    }
+    rc = wl_columnar_expr_scalar_region(control, id, 613, pos);
+    if (rc) return rc;
+    bool known = pos == owner->size && raw && count && raw_known;
+    if (known) result = raw_type;
+    else known = pos == owner->size && interpreted && depth == 1;
+    if (known) *type = result;
+    *supported = known;
+    return 0;
+}
+
 /* Raw put failures collapse to allocation failure. Positive controller
 * identity/accounting errors take precedence; a later cancellation does not
 * erase a genuine engine error (same policy as host attempt_return). */

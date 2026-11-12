@@ -974,7 +974,7 @@ static void map_unobserved(void){
 }
 static void map_stops(void){
     const unsigned phases[] = {70, 83, 84, 88, 550, 551, 552, 553, 554, 555,
-                               564};
+                               564, 610, 611, 614, 612, 613};
     for (unsigned p = 0; p < sizeof(phases)/sizeof(phases[0]); ++p)for (action =
             0;
             action < 5; ++action) {
@@ -988,7 +988,8 @@ static void map_stops(void){
             CHECK(!wl_evaluation_control_reset(f.control) &&
                 !wl_evaluation_control_configure(f.control,
                 action == 1?UINT64_MAX:0));
-            description = p >= 4; stop_phase = phases[p];
+            description = phases[p] >= 550 && phases[p] <= 564;
+            stop_phase = phases[p];
             stop_at = p == 1?2:p == 2?4:p == 3?2:1; hits = 0; stopped = false;
             successor = 0;
             int rc = complete(f.session); stop_phase = 0; description = false;

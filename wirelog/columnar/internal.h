@@ -6043,6 +6043,13 @@ int wl_columnar_expr_scalar_result_type_attempt_controlled(
     const wl_columnar_expr_attempt_scalar_t *, const wirelog_column_type_t *,
     uint32_t, wirelog_column_type_t *, bool *, wl_evaluation_control_t *,
     uint64_t);
+/* Whole MAP schema: raw compile-first producer precedence, then complete
+ * interpreted grammar/type/arity validation. Unknown preserves type output;
+ * errors preserve both outputs. Independent producer query above is unchanged. */
+int wl_columnar_expr_scalar_map_schema_attempt_controlled(
+    const wl_columnar_expr_attempt_scalar_t *, const wirelog_column_type_t *,
+    uint32_t, wirelog_column_type_t *, bool *, wl_evaluation_control_t *,
+    uint64_t);
 void wl_columnar_expr_attempt_scalar_free(wl_columnar_expr_attempt_scalar_t *);
 #ifdef WL_SESSION_TEST_HOOKS
 size_t wl_columnar_expr_test_scalar_owner_size(void);
@@ -6148,6 +6155,9 @@ size_t wl_columnar_expr_test_attempt_numeric_instruction_size(void);
  * Attempt compiler additionally uses10 entry,11 first-pass caller,12 setup,
  * 13 reserve caller,14/15 allocations,16 second-pass caller,17 store,
  * 18 commit caller,19 digit. Legacy phase numbers remain unchanged.
+ * Whole scalar MAP metadata uses610 entry,611 tag,614 raw-producer,
+ * 612 interpreted-type and613 final; each224, sharing existing byte/digit
+ * decoder regions. Producer-only78/79 and numeric inference are unchanged.
  * Progress is byte offset/instruction count; failed is pending semantic result. */
 extern void (*wl_columnar_expr_test_checkpoint)(wl_evaluation_control_t *,
     unsigned, uint64_t, bool);

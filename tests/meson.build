@@ -7499,3 +7499,13 @@ expression_reduce_exe = executable('test_evaluation_expression_reduce',
 )
 test('evaluation_expression_reduce', expression_reduce_exe,
   suite: ['unit', 'tsan'], timeout: 120)
+
+expression_schema_exe = executable('test_evaluation_expression_schema',
+  files('test_evaluation_expression_schema.c'),
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  c_args: ['-DWL_SESSION_TEST_HOOKS=1'],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
+  link_with: [testlib_prod],
+)
+test('evaluation_expression_schema', expression_schema_exe,
+  suite: ['unit', 'tsan'], timeout: 120)
