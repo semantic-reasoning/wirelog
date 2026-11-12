@@ -1959,3 +1959,53 @@ This closes the qualified ordinary first-missing callback-free adapter and its
 exposed late rollback debt. Inferred inline schemas, preserved inline IDB seeds,
 actual recursive tapes/effect scheduling and typed SCC transport remain concrete
 following units; this row does not certify their completion or worker ownership.
+
+### Completion unit 8: inferred input schemas and later mutations
+
+`WL_PLAN_WIDTH_UNDECLARED` records the absence of an explicit declaration.
+The compiler's inferred type count does not restrict physical input arity.
+SCHEMA now preserves real source geometry and declared_ncols, including an
+established nonempty nullary input. Undeclared inputs skip declaration-lane
+checks; their actual source and scalar actors still validate physical types.
+The empty-source constructor runs only for an actual missing schema (or a
+missing explicitly declared width), never to invent an inferred declaration.
+
+Each SCHEMA action now pays256 before inspecting the declaration/source;
+its fixed parent front fits231 and declaration lane174, including the extra
+phase-selector comparisons. Explicit one-input width w visits w+2 actions;
+undeclared one-input sources visit2 regardless of physical width. Thus the
+unit7 historical graph-minus-plain delta1490 becomes1745: its extra declaration
+lane now pays256 rather than1. Constructor vectors and the separate two
+maintenance reader releases are unchanged. Whole-host allowances are never
+inferred from a measured completion total.
+
+Both completed-host mutation policies admit an actual matched undeclared EDB
+target before calling the existing backend validator. They do not invent a
+width, accept arbitrary IDB targets, or bypass established physical schemas.
+Explicit admission remains unchanged. Mutation admission adds only fixed
+sentinel comparisons outside STEP/SOURCE and grants no scalar/native owner.
+
+Registered histories cover inferred/explicit INT64, STRING and FLOAT programs,
+loaded/unloaded and observer on/off, callback replacement, future fact loading,
+valid insert/remove/reinsert/no-op, failed wrong-width inserts and unknown/IDB
+targets. Six-domain histories compare raw values, effective types and interned
+string contents. Isolated first insertion arities0..3 before and after empty
+success preserve declared_ncols0 and the raw nonempty-nullary default value0.
+The existing integer to_string operation formats the underlying int64 payload,
+including a FLOAT payload; these tests preserve the raw operation's behavior.
+
+Every SCHEMA action receives independent exact256 and one-short255 local
+budget tests. A real Original legitimately pays adversarial padding up to the
+chosen remaining budget; padding is not a normative host price or a counter
+write. Report ID and overflow-safe post-padding debits are checked. A refused
+constructor's first positive action can precede its checkpoint, so no invented
+checkpoint witness is required: the real WORK_LIMIT and source transition are
+the refusal evidence. Public source/model pointers and snapshots stay fixed;
+normal reset and raised retry close actual owners and return the governor to0.
+Cancellation, work exhaustion, overflow, END and END-with-successor also run
+at each SCHEMA action, checking frozen Original/successor0 and raw retry parity.
+Existing compile/evaluate/final and late claim/rollback qualifications remain.
+
+This unit closes inferred physical input handling. Preserved inline IDB seeds,
+actual recursive scheduling/typed SCC transport and worker qualification remain
+separate obligations and are not certified by this row.
