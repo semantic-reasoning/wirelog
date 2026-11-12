@@ -2414,3 +2414,80 @@ with no scratch exercises fresh governed output resize without editing owner
 fields. Censused owner identities select cases rather than determining prices;
 base length/D/M/P, restore, scratch, fresh resize and metadata length/new/old
 credits are required. Existing42 real governor denial/raised-retry cases remain.
+
+### Standalone single-range radix workspace prerequisite
+
+The optional internal radix workspace attempt prepares owned scratch for one
+actual range under a genuine PAYLOAD_MUTATION lease, with skip_sorted=false and
+no additional scratch. It does not sort or activate a runtime, recursive host,
+pool owner/reset protocol or Native permission. The stable context owns the
+canonical reservation and every successful allocation until real End completes.
+Its single const borrow requires empty disjoint external output storage and a
+synchronously completed consumer before End. Existing raw preparation and sort
+APIs remain unchanged; a consumer still uses the actual leased sorter validators.
+
+Preparation authenticates current lease/set identity, nonce, array pointers and
+counts, actual member/role/descriptor/owner slots, generations and writer gates.
+Membership, physical lanes, types and FNV fingerprint are each visited one per
+real256 action. Finished/reused sets fail before further source reads. Checked
+sizes and raw allocation order are retained: timestamps first, then all three
+A/B/temp attempts before their combined failure verdict. Integer/STRING k8/k16
+and FLOAT/small-range insertion thresholds remain raw policy. No uninitialized
+scratch content is read or eagerly cleared. Actual DENIED maps to ENOMEM and the
+source denial flag; overflow stays EOVERFLOW. A new attempt may retry the same
+held source after its actual resource obstruction is removed.
+
+The complete live-set guard is conservatively expanded as96 source slots,
+including dispatch/locals, rather than the preliminary46 estimate. Descriptor/self/canonical slots, range bounds/
+timestamp shape/capture, and generation validation/capture therefore use
+adjacent real256 stages. Shape/generation capture precedes its validation, and
+final checks reject subsequent changes. The already paid canonical-writer packet freshly
+validates its actual token even when it equals the self writer. Actual fixed
+snapshot checks immediately precede READY/borrow's savedOriginal zero; a zero is a guard, not a fresh purchase. The
+owned token initialization (actual88 bytes within reserved96) and retained-
+governor reserve SELECT/CALL have no
+source read or full lease guard; later source-read stages still authenticate
+the live set. SELECT captures the actual retained budget pointer; the separately
+paid CALL preinstalls its continuation and directly returns only sticky result3.
+The actual source reserve leaf retains100/124/164/78 fees, its qualified inter-poll/terminal
+bound134 and direct result3 plus reserved external64 =201; conservative first
+refusal is162. Neither number certifies a whole positive-to-positive aggregate
+or arbitrary future canonical caller.
+
+End frees one actual scratch component per paid action before closing credit.
+A separate owned CREDIT_SELECT inspects the initialized canonical token itself,
+including RESERVED after child success but before admission_active publication.
+Real separately paid begin/ack stages count the actual88-byte receipt clear;
+retirement step64 uses genuine distinct cleanup funding. End never requires the
+old source/lease snapshot after lawful consumer sorting or source destruction.
+It clears workspace bytes in funded chunks only after credits close, then drops
+its real governor and Original references. Context initialization likewise
+meters8-byte chunks and uses bounded retain_try, including genuine failed-CAS
+and post-retain rollback cases. Original/frozen report and successor consumption
+remain independent of actual maintenance progress.
+
+The registered fixture compares raw geometry/provenance/allocation ordinals at
+0/1/2/32/33/49999/50000 rows for INT64/STRING/FLOAT/mixed types and timestamps,
+actual seven-member leases, shared-owner COW consumer, staged refusal/cancel/
+END-successor/overflow cuts, literal source100/124/164/78 exact/one-short vectors,
+real governor denial/financial overflow peers/raised retries, and the actual
+reserve-before-verdict End gap. This is a prerequisite, with no whole issue,
+canonical scheduler, pool lifetime or remote CI completion claim.
+
+Independent review correction R1 preserves the actual nullary insertion route:
+ALLOC_INSERT and BIND_INSERT select positive insertion count, including width0
+with insertion_bytes0. The raw allocator still receives malloc(0); a nonNULL
+result is a real owned pointer and publishes insertion capacity=count, while
+NULL remains raw-compatible ENOMEM. No minimum-size substitution, nullary
+refusal or fictitious zero-byte governor admission is introduced. Governed and
+unmanaged count2/32 cases with timestamps on/off compare all actual allocator
+ordinals, including the failing zero-size call, capacity/pointer/error and End
+closure. Count0/1 and count33 remain independent no-insertion/radix controls.
+
+The resource fixture also resolves review note N1: its existing actual radix
+allocation observer is installed with fail_at0 and calls reset during resource
+preparation, then restored. The no-allocation assertion on real DENIED now
+observes allocator calls rather than an inactive counter. This counter supplies
+no work-price oracle. Rejected v1 candidate/review/source receipts remain
+preserved under `/tmp/2299-radix-workspace-*-v1` and the archive manifest; this
+correction requires a fresh exact raw review and final gates.

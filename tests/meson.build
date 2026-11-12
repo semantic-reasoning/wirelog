@@ -7539,3 +7539,31 @@ seed_private_compact_exe = executable('test_evaluation_seed_private_compact',
 )
 test('evaluation_seed_private_compact', seed_private_compact_exe,
   suite: ['unit', 'tsan'], timeout: 120)
+
+# Actual raw allocation ordinals and source-admission seams share one library.
+radix_workspace_hook_src = files('../wirelog/columnar/relation.c',
+  '../wirelog/columnar/memory_governor.c', '../wirelog/evaluation_control.c')
+radix_workspace_common_src = []
+foreach source : testlib_prod_src
+  if not radix_workspace_hook_src.contains(source)
+    radix_workspace_common_src += source
+  endif
+endforeach
+assert(radix_workspace_common_src.length() + 3 == testlib_prod_src.length(),
+  'radix fixture replaces exactly relation/governor/control')
+radix_workspace_hook_lib = static_library('testlib_radix_workspace_hooks',
+  radix_workspace_hook_src,
+  objects: testlib_prod.extract_objects(radix_workspace_common_src),
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
+  c_args: testlib_prod_c_args + ['-DWL_COLUMNAR_MEMORY_TEST_HOOKS=1',
+    '-DWL_TEST_CONSOLIDATE_ALLOC_HOOK=1'], override_options: ['unity=off'])
+radix_workspace_attempt_exe = executable('test_evaluation_radix_workspace',
+  files('test_evaluation_radix_workspace.c'),
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  c_args: ['-DWL_SESSION_TEST_HOOKS=1', '-DWL_COLUMNAR_MEMORY_TEST_HOOKS=1',
+    '-DWL_TEST_CONSOLIDATE_ALLOC_HOOK=1'],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
+  link_with: [radix_workspace_hook_lib])
+test('evaluation_radix_workspace', radix_workspace_attempt_exe,
+  suite: ['unit', 'tsan'], timeout: 120)
