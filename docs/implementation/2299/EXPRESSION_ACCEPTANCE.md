@@ -2381,3 +2381,36 @@ retirement receipt begin/acknowledge. After compact ownership closes, a later
 generic End resumes the existing standalone retirement path, which is outside
 this optional method's reserved64 composition. Final canonical integration
 still needs its own concrete caller proof.
+
+### Physical seed credit receipt funding prerequisite
+
+Actual nonempty credit retirement now buys a separate256 on genuine distinct
+cleanup funding immediately before receipt begin (cut1504), and another256
+immediately before DONE acknowledgment (cut1505). Existing `retiring` and actual
+receipt phase retain the two substages; no new durable state or token API is
+introduced. Empty/ungoverned/already released credits and retirement step64 do
+not acquire these fees. A refused purchase changes neither token nor receipt
+nor credit ownership; a new genuine cleanup attempt resumes the same objects.
+
+These same-depth boundaries include the real receipt clearing bytes. If R is
+`sizeof(wl_columnar_memory_retirement_receipt_t)`, the source envelopes are
+begin83+R and acknowledge75+R to the immediate actor API return. On the current
+qualified ABI R=88, these are171 and163; proposed next20 plus signed carrier62
+would compose to253 and245. These are not ABI-independent253 claims: the proposed
+external82 composition requires R<=91 for begin and R<=99 for acknowledge.
+Standalone256 envelopes instead require R<=173 and R<=181 respectively. The
+implementation uses actual `sizeof` clearing, without a platform88 static
+assertion or a shortened clear; future geometry/caller qualification must use
+its actual R. This prerequisite does not activate that future canonical caller.
+The incoming refusal envelopes120/110 remain paid by the real preceding actor
+cut, including the new controller front and full unwind.
+
+The registered physical fixture classifies1504/1505 as cleanup funding and
+observes const actual token/receipt images around both purchase and primitive.
+It checks literal255 refusal and256 admission, cancellation, overflow, END and
+END/successor, real fresh cleanup retry, Original report/successor preservation,
+physical source images and actual governor totals. An actual ungoverned source
+with no scratch exercises fresh governed output resize without editing owner
+fields. Censused owner identities select cases rather than determining prices;
+base length/D/M/P, restore, scratch, fresh resize and metadata length/new/old
+credits are required. Existing42 real governor denial/raised-retry cases remain.

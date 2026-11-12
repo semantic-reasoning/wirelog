@@ -26,17 +26,26 @@ static int effect(const wirelog_extension_value_t *args, uint32_t n,
     out->size = 8; out->as.int64_value = args[0].as.int64_value+1; return 0;
 }
 static unsigned operation_owner, cleanup_owner;
+static unsigned paid_mode, paid_entry;
+static bool paid_enabled, paid_injected, paid_census;
+static void paid_cleanup_retry(wl_evaluation_control_t *, int);
 static unsigned injection_mode, prior_steps, extra_input, malformed_format,
     untyped_target;
 static wl_evaluation_control_t *begin(unsigned *owner) {
     wl_evaluation_control_t *c = NULL;
-    CHECK(!wl_evaluation_control_create(injection_mode == 5 ? 0 : UINT64_MAX,
+    CHECK(!wl_evaluation_control_create((injection_mode == 5 ||
+        (paid_mode == 6 && owner == &cleanup_owner)) ? 0 : UINT64_MAX,
         &c));
     CHECK(!wl_evaluation_control_attach(c, owner));
     CHECK(!wl_evaluation_control_begin(c, owner)); return c;
 }
 static void finish(wl_evaluation_control_t *c, unsigned *owner, int rc) {
-    CHECK(wl_evaluation_control_finish(c, owner, rc > 0 ? rc : 0, 0) == rc);
+    int actual_finish = wl_evaluation_control_finish(c, owner, rc > 0 ? rc : 0,
+            0);
+    if (actual_finish != rc) fprintf(stderr,
+            "finish got%d expected%d paidmode%u cleanup%d\n", actual_finish, rc,
+            paid_mode, owner == &cleanup_owner);
+    CHECK(actual_finish == rc);
     if (injection_mode == 6 && owner == &operation_owner && rc == ENOSPC) {
         wl_evaluation_control_report_t report;
         CHECK(!wl_evaluation_control_report(c, &report));
@@ -57,6 +66,7 @@ static int forward(wl_columnar_session_seed_t *a,
             wl_columnar_session_seed_progress(a);
         if (p == WL_COLUMNAR_SESSION_SEED_RULE_READY ||
             p == WL_COLUMNAR_SESSION_SEED_COMPOSED) return 0;
+        paid_entry = 1;
         int rc = p == WL_COLUMNAR_SESSION_SEED_NEEDS_CLEANUP?
             wl_columnar_session_seed_maintenance_step(a, cleanup,
                 wl_evaluation_control_active_attempt_id(cleanup)):
@@ -77,8 +87,12 @@ static int forward(wl_columnar_session_seed_t *a,
 static void end(wl_columnar_session_seed_t *a, wl_evaluation_control_t *cleanup,
     int rc) {
     bool done = false; for (unsigned i = 0; i < 500000 && !done; i++) {
+        paid_entry = 3;
         int x = wl_columnar_session_seed_end(a, rc, cleanup,
                 wl_evaluation_control_active_attempt_id(cleanup), &done);
+        if (x && paid_enabled && paid_injected) {
+            paid_cleanup_retry(cleanup, x); continue;
+        }
         if (x) {
             uint64_t v[16]; CHECK(!wl_columnar_session_seed_test_view(a, v));
             fprintf(stderr,
@@ -162,7 +176,7 @@ static bool saw_restore_denial, saw_append_growth_denial;
 static bool saw_detached_ts, saw_zero_grid;
 static bool cleanup_phase(unsigned p) {
     return p == 1002 || p == 1102 || p == 1500 || p == 1501 ||
-           p == 1503 || p == 1602;
+           p == 1503 || p == 1504 || p == 1505 || p == 1602;
 }
 static unsigned admission_site(const cut_t *c) {
     if (c->phase == 1001 &&
@@ -186,6 +200,181 @@ static unsigned admission_site(const cut_t *c) {
     if (c->phase == 1402 && c->state[0] == 8 &&
         c->stage == 4) return WL_COLUMNAR_SESSION_SEED_TEST_SORT_SCRATCH;
     return 0;
+}
+/* These identities describe actual owned credits, never a measured price. */
+typedef struct {
+    unsigned phase, fixture, fail, extra, untyped, entry;
+    size_t offset;
+    uint64_t state;
+} paid_key_t;
+static paid_key_t paid_keys[256], paid_selected;
+static size_t paid_count;
+static unsigned paid_fixture;
+static unsigned char paid_token_image[sizeof(wl_columnar_memory_reservation_t)],
+    paid_receipt_image[sizeof(wl_columnar_memory_retirement_receipt_t)];
+static uint64_t paid_bytes, paid_before, paid_original_before, paid_id;
+static bool paid_retiring, paid_observing;
+static wl_evaluation_control_report_t paid_frozen;
+static bool paid_has_frozen, paid_successor;
+static unsigned paid_roles, paid_entries;
+static uint64_t paid_reserved_before;
+static unsigned paid_verified, paid_reserved, paid_committed, paid_begin,
+    paid_ack;
+static void paid_cleanup_retry(wl_evaluation_control_t *funding, int rc) {
+    CHECK(funding == active_cleanup);
+    if (paid_has_frozen) {
+        wl_evaluation_control_report_t now;
+        CHECK(!wl_evaluation_control_report(funding, &now));
+        CHECK(now.attempt_id == paid_frozen.attempt_id &&
+            now.consumed == paid_frozen.consumed &&
+            now.limit == paid_frozen.limit &&
+            now.stop_reason == paid_frozen.stop_reason &&
+            now.execution_status == paid_frozen.execution_status &&
+            now.cleanup_status == paid_frozen.cleanup_status &&
+            now.result == paid_frozen.result);
+    }
+    if (paid_successor) {
+        uint64_t used;
+        CHECK(!wl_evaluation_control_test_active_consumed(funding,
+            wl_evaluation_control_active_attempt_id(funding), &used) && !used);
+    }
+    int stopped = paid_has_frozen && !paid_successor ? 0 :
+        wl_evaluation_control_finish(funding, &cleanup_owner, 0, 0);
+    CHECK(!stopped || stopped == rc ||
+        stopped == WL_EVALUATION_CONTROL_WORK_LIMIT || stopped == EOVERFLOW);
+    CHECK(!wl_evaluation_control_reset(funding));
+    CHECK(!wl_evaluation_control_begin(funding, &cleanup_owner));
+    paid_has_frozen = paid_successor = false;
+}
+static void paid_checkpoint(const wl_columnar_session_seed_t *a,
+    unsigned phase, unsigned event, int rc, size_t offset, const char *role,
+    const wl_columnar_memory_reservation_t *token,
+    const wl_columnar_memory_retirement_receipt_t *receipt,
+    uint64_t bytes, bool retiring) {
+    (void)a;
+    paid_key_t key = {.phase = phase, .fixture = paid_fixture,
+                      .entry = paid_entry,
+                      .fail = allocation_failure, .extra = extra_input,
+                      .untyped = untyped_target, .offset = offset,
+                      .state = atomic_load_explicit(&token->state,
+                              memory_order_acquire)};
+    if (!event && paid_census) {
+        paid_entries |= 1u<<paid_entry;
+        static const char *const roles[] = {"base.length", "base.descriptor",
+                                            "base.metadata", "base.payload",
+                                            "resize.fresh", "restore",
+                                            "scratch", "metadata.length",
+                                            "metadata.new", "metadata.old"};
+        for (unsigned i = 0; i < 10; i++)
+            if (!strcmp(role, roles[i])) paid_roles |= 1u<<i;
+        for (size_t i = 0; i < paid_count; i++)
+            if (key.phase == paid_keys[i].phase &&
+                key.entry == paid_keys[i].entry &&
+                key.fixture == paid_keys[i].fixture &&
+                key.untyped == paid_keys[i].untyped &&
+                key.offset == paid_keys[i].offset &&
+                key.state == paid_keys[i].state)return;
+        CHECK(paid_count < 256); paid_keys[paid_count++] = key;
+        fprintf(stderr,
+            "paid owner %s offset%zu phase%u state%llu fixture%u fail%u untyped%u entry%u\n",
+            role, offset, phase, (unsigned long long)key.state, paid_fixture,
+            allocation_failure, untyped_target, paid_entry); return;
+    }
+    if (!paid_enabled) return;
+    if (!event) {
+        paid_observing = false;
+        if (paid_injected || key.phase != paid_selected.phase ||
+            key.entry != paid_selected.entry ||
+            key.fixture != paid_selected.fixture ||
+            key.fail != paid_selected.fail ||
+            key.extra != paid_selected.extra ||
+            key.untyped != paid_selected.untyped ||
+            key.offset != paid_selected.offset ||
+            key.state != paid_selected.state)return;
+        paid_observing = paid_injected = true;
+        CHECK(cleanup_phase(phase) && bytes);
+        CHECK((phase == 1504 && !retiring && !receipt->identity) ||
+            (phase == 1505 && retiring &&
+            receipt->phase == WL_COLUMNAR_MEMORY_RETIREMENT_DONE));
+        if (phase == 1504) {
+            paid_begin++;
+            if (key.state == WL_COLUMNAR_MEMORY_RESERVATION_RESERVED)
+                paid_reserved++;
+            else CHECK(key.state == WL_COLUMNAR_MEMORY_RESERVATION_COMMITTED);
+            if (key.state == WL_COLUMNAR_MEMORY_RESERVATION_COMMITTED)
+                paid_committed++;
+        } else paid_ack++;
+        memcpy(paid_token_image, token, sizeof(*token));
+        memcpy(paid_receipt_image, receipt, sizeof(*receipt));
+        paid_bytes = bytes; paid_retiring = retiring;
+        paid_reserved_before = wl_columnar_memory_reserved(active_governor);
+        paid_id = wl_evaluation_control_active_attempt_id(active_cleanup);
+        CHECK(!wl_evaluation_control_test_active_consumed(active_cleanup,
+            paid_id, &paid_before));
+        CHECK(!wl_evaluation_control_test_active_consumed(active_original,
+            wl_evaluation_control_active_attempt_id(active_original),
+            &paid_original_before));
+        if (paid_mode == 1)wl_evaluation_control_request_cancel(active_cleanup);
+        else if (paid_mode == 2 || paid_mode == 3) {
+            CHECK(!wl_evaluation_control_finish(active_cleanup, &cleanup_owner,
+                0, 0));
+            CHECK(!wl_evaluation_control_report(active_cleanup, &paid_frozen));
+            paid_has_frozen = true;
+            if (paid_mode == 3) {
+                CHECK(!wl_evaluation_control_reset(active_cleanup));
+                CHECK(!wl_evaluation_control_begin(active_cleanup,
+                    &cleanup_owner)); paid_successor = true;
+                CHECK(!wl_evaluation_control_finish(active_original,
+                    &operation_owner, 0, 0));
+                CHECK(!wl_evaluation_control_report(active_original, &frozen));
+                CHECK(!wl_evaluation_control_reset(active_original));
+                CHECK(!wl_evaluation_control_begin(active_original,
+                    &operation_owner)); original_ended = true;
+            }
+        } else {
+            uint64_t left = paid_mode == 4?255:paid_mode == 5?256:0;
+            CHECK(!wl_evaluation_control_charge_attempt(active_cleanup, paid_id,
+                UINT64_MAX-paid_before-left));
+            paid_before = UINT64_MAX-left;
+        }
+        return;
+    }
+    if (!paid_observing)return;
+    if (event == 1) {
+        CHECK(wl_columnar_memory_reserved(active_governor) ==
+            paid_reserved_before);
+        unsigned char token_now[sizeof(*token)], receipt_now[sizeof(*receipt)];
+        memcpy(token_now, token, sizeof(token_now));
+        memcpy(receipt_now, receipt, sizeof(receipt_now));
+        CHECK(!memcmp(paid_token_image, token_now, sizeof(token_now)) &&
+            !memcmp(paid_receipt_image, receipt_now, sizeof(receipt_now)) &&
+            bytes == paid_bytes && retiring == paid_retiring);
+        uint64_t original;
+        CHECK(!wl_evaluation_control_test_active_consumed(active_original,
+            wl_evaluation_control_active_attempt_id(active_original),
+            &original) && original ==
+            (original_ended ? 0 : paid_original_before));
+        if (paid_mode == 5) {
+            uint64_t used;
+            CHECK(!rc && !wl_evaluation_control_test_active_consumed(
+                    active_cleanup, paid_id, &used) && used-paid_before == 256);
+        } else {
+            CHECK(rc == (paid_mode == 1?WL_EVALUATION_CONTROL_CANCELLED:
+                paid_mode == 4?WL_EVALUATION_CONTROL_WORK_LIMIT:
+                paid_mode == 6?EOVERFLOW:EINVAL));
+            paid_verified++; paid_observing = false;
+        }
+    } else {
+        CHECK(event == 2 && paid_mode == 5 && !rc);
+        if (phase == 1504)CHECK(receipt->identity &&
+                receipt->phase == WL_COLUMNAR_MEMORY_RETIREMENT_CLAIM);
+        else {
+            unsigned char zero[sizeof(*receipt)] = {0}, now[sizeof(*receipt)];
+            memcpy(now, receipt, sizeof(now));
+            CHECK(!memcmp(now, zero, sizeof(zero)));
+        }
+        paid_verified++; paid_observing = false;
+    }
 }
 static void checkpoint(const wl_columnar_session_seed_t *a, unsigned phase,
     unsigned stage) {
@@ -313,7 +502,9 @@ static int run(unsigned k, unsigned loaded, unsigned observed, unsigned ts) {
     CHECK(t && rt);
     col_rel_t *owned_target = NULL, *owned_peer = NULL;
     if (untyped_target) {
-        CHECK(!wl_columnar_relation_alloc_governed(&owned_target, "out", g));
+        if (untyped_target == 2) CHECK(!col_rel_alloc(&owned_target, "out"));
+        else CHECK(!wl_columnar_relation_alloc_governed(&owned_target, "out",
+                g));
         CHECK(!col_rel_set_schema(owned_target, t->ncols,
             (const char *const *)t->col_names));
         for (uint32_t row = 0; row < t->nrows; row++) {
@@ -322,7 +513,8 @@ static int run(unsigned k, unsigned loaded, unsigned observed, unsigned ts) {
             CHECK(!col_rel_append_row(owned_target, values));
         }
         CHECK(!owned_target->column_types);
-        CHECK(!wl_columnar_relation_alloc_governed(&owned_peer, "out", g));
+        if (untyped_target == 2) CHECK(!col_rel_alloc(&owned_peer, "out"));
+        else CHECK(!wl_columnar_relation_alloc_governed(&owned_peer, "out", g));
         CHECK(!col_rel_set_schema(owned_peer, rt->ncols,
             (const char *const *)rt->col_names));
         for (uint32_t row = 0; row < rt->nrows; row++) {
@@ -354,7 +546,7 @@ static int run(unsigned k, unsigned loaded, unsigned observed, unsigned ts) {
             r < t->timestamp_capacity; r++)
             t->timestamps[r] = rt->timestamps[r] =
                 (col_delta_timestamp_t){.iteration = 777+r, .multiplicity = 3};
-    if (injection_mode == 6) {
+    if (injection_mode == 6 || paid_enabled) {
         CHECK(!col_rel_deep_copy(t, &original_image, NULL));
         CHECK(!col_rel_deep_copy(rt, &peer_image, NULL));
     }
@@ -458,12 +650,13 @@ static int run(unsigned k, unsigned loaded, unsigned observed, unsigned ts) {
     if (injection_mode != 6 && (!untyped_target || result.rel))
         raw_rc = raw_reference(raw, rt, result.rel);
     if (!injection_mode && !allocation_failure &&
-        !malformed_format) CHECK(rc == raw_rc);
+        !malformed_format && !paid_enabled) CHECK(rc == raw_rc);
     if (malformed_format)CHECK(rc == ENOTSUP);
     col_rel_t *out = NULL; if (!rc){
         bool ready = false; for (unsigned i = 0;
             i < 500000 && !ready;
             i++){
+            paid_entry = 2;
             rc = wl_columnar_session_seed_finalize(a,
                     cleanup, wl_evaluation_control_active_attempt_id(cleanup),
                     &ready); if (rc) break;
@@ -481,12 +674,14 @@ static int run(unsigned k, unsigned loaded, unsigned observed, unsigned ts) {
     CHECK(wl_columnar_relation_snapshot_equal(before,
         wl_columnar_relation_snapshot(t)));
     wl_columnar_relation_test_constructor_fail_allocation = 0;
-    wl_columnar_session_seed_test_checkpoint = NULL;
+    if (!paid_enabled && !paid_census)
+        wl_columnar_session_seed_test_checkpoint = NULL;
     if (injection_mode){
         CHECK(injected); CHECK(rc || injection_mode == 4);
         if (injection_mode == 5)CHECK(rc == EOVERFLOW);
     }
-    if (allocation_failure && rc) CHECK(rc == ENOMEM);
+    if (allocation_failure && rc && !paid_enabled) CHECK(rc == ENOMEM);
+    if (paid_enabled && paid_injected && rc) paid_cleanup_retry(cleanup, rc);
     if (cleanup_ended){
         int stopped = wl_evaluation_control_finish(cleanup, &cleanup_owner, 0,
                 0);
@@ -539,6 +734,7 @@ static int run(unsigned k, unsigned loaded, unsigned observed, unsigned ts) {
         equal(rt, out);
         equal(t, original_image); raised_retries++;
     }
+    if (paid_enabled) equal(t, original_image);
     if (original_image)CHECK(!col_rel_destroy_checked(original_image));
     if (peer_image)CHECK(!col_rel_destroy_checked(peer_image));
     wl_columnar_source_access_writer_t writer = {0};
@@ -547,6 +743,7 @@ static int run(unsigned k, unsigned loaded, unsigned observed, unsigned ts) {
     CHECK(!wl_columnar_source_access_writer_acquire(&t->source_access,
         &writer)); CHECK(!wl_columnar_source_access_writer_release(&writer));
     free(a);
+    wl_columnar_session_seed_test_checkpoint = NULL;
     if (malformed_format)t->schema.children[0]->format = saved_format;
     if (original_ended){
         wl_evaluation_control_report_t report;
@@ -567,7 +764,8 @@ static int run(unsigned k, unsigned loaded, unsigned observed, unsigned ts) {
     if (result.owned) CHECK(!col_rel_destroy_checked(
                 result.rel));
     finish(c, &operation_owner,
-        (original_ended || (cleanup_ended && rc < 0)) ? 0 : rc);
+        (original_ended ||
+        ((cleanup_ended || paid_enabled) && rc < 0)) ? 0 : rc);
     finish(cleanup, &cleanup_owner, 0);
     if (owned_target)CHECK(!col_rel_destroy_checked(owned_target));
     if (owned_peer) CHECK(!col_rel_destroy_checked(owned_peer));
@@ -697,6 +895,49 @@ static void resource_order(void) {
     fprintf(stderr,
         "physical seed: actual effect callbacks0/1101 across allocator prefixes passed\n");
 }
+static void paid_tails(void) {
+    /* Geometry is reported, never hardcoded as an ABI-wide caller grant. */
+    fprintf(stderr,
+        "paid credit receipt geometry %zu; begin83+R, ack75+R; future82 fits iff R<=91\n",
+        sizeof(wl_columnar_memory_retirement_receipt_t));
+    paid_census = true;
+    wl_columnar_session_seed_test_credit_checkpoint = paid_checkpoint;
+    for (unsigned scenario = 0; scenario < 4; scenario++) {
+        paid_fixture = scenario == 1?5:1;
+        extra_input = scenario == 1?70:0;
+        untyped_target = scenario >= 2?scenario-1:0;
+        for (unsigned fail = 0; fail < 80; fail++) {
+            allocation_failure = fail;
+            int rc = run(paid_fixture, 1, 1, !untyped_target);
+            if (fail && !rc) break;
+        }
+    }
+    paid_census = false; allocation_failure = 0;
+    size_t count = paid_count;
+    CHECK(count);
+    for (size_t i = 0; i < count; i++) {
+        paid_selected = paid_keys[i]; paid_fixture = paid_selected.fixture;
+        allocation_failure = paid_selected.fail;
+        extra_input = paid_selected.extra;
+        untyped_target = paid_selected.untyped;
+        for (paid_mode = 1; paid_mode <= 6; paid_mode++) {
+            paid_enabled = true; paid_injected = paid_observing = false;
+            paid_has_frozen = paid_successor = false;
+            original_ended = cleanup_ended = false;
+            run(paid_fixture, 1, 1, !untyped_target);
+            CHECK(paid_injected && !paid_observing);
+        }
+    }
+    paid_enabled = false; paid_mode = 0;
+    allocation_failure = extra_input = untyped_target = 0;
+    wl_columnar_session_seed_test_credit_checkpoint = NULL;
+    CHECK(paid_reserved && paid_committed && paid_begin && paid_ack &&
+        paid_roles == (1u<<10)-1 && paid_entries == 14);
+    CHECK(paid_verified == count*6);
+    fprintf(stderr,
+        "paid credit: %zu actual owner/cut identities x6; reserved%u committed%u begin%u ack%u passed\n",
+        count, paid_reserved, paid_committed, paid_begin, paid_ack);
+}
 static size_t init_position, init_selected;
 static void init_checkpoint(const wl_columnar_session_seed_t *a, unsigned phase,
     unsigned stage) {
@@ -761,7 +1002,7 @@ int main(int argc, char **argv) {
     }
     CHECK(argc == 1);
     matrix(); histories(); component_failures(1); component_failures(5);
-    resource_order();
+    resource_order(); paid_tails();
     for (malformed_format = 1; malformed_format <= 3;
         malformed_format++) run(1, 1, 1, 1);
     malformed_format = 0; initialization_failures(); return 0;
