@@ -18,6 +18,9 @@ static unsigned stage, scenario, stop_kind, target_phase;
 static bool injected, turned, footer_refused, short_refused, foreign_checked,
     alias_checked;
 static unsigned grant_calls, kernel_actions, callbacks;
+static unsigned finished_calls, close_grant, close_stage;
+static bool child_close_injected, bank_close_injected;
+static wl_evaluation_control_report_t child_close_report;
 static uint64_t successor, event_mask;
 static int expected;
 static wl_session_t *active_session;
@@ -173,12 +176,83 @@ finished(const wl_col_session_t *s, unsigned action,
     wl_evaluation_control_report_t report, int protocol)
 {
     (void)s; (void)action;
+    ++finished_calls;
+    CHECK(close_stage == 5 && finished_calls == grant_calls);
+    CHECK(same_report(report, child_close_report));
     CHECK(report.limit == 384 || report.limit == 383);
     CHECK(report.consumed <= report.limit && !report.cleanup_status);
     if (report.limit == 383) {
         CHECK(protocol == WL_EVALUATION_CONTROL_WORK_LIMIT
             && report.consumed == 256 && !short_refused);
         short_refused = true;
+    }
+    check_original();
+}
+
+static int
+cancel_bank_action(void *payload)
+{
+    (void)payload;
+    return 0;
+}
+
+static void
+finance_phase(wl_col_session_t *s, wl_evaluation_control_t *funding,
+    uint64_t id, unsigned phase, bool after, int financial)
+{
+    CHECK(s == (wl_col_session_t *)active_session && phase >= 1 && phase <= 5);
+    if (!after) {
+        if (phase == 1) {
+            close_grant = grant_calls; close_stage = 1;
+        } else CHECK(close_grant == grant_calls && phase == close_stage);
+        CHECK((phase <= 3) == (funding != NULL));
+        CHECK((phase <= 3) == (id != 0));
+        if ((scenario == 10 || scenario == 11) && phase == 1
+            && !child_close_injected) {
+            child_close_injected = true;
+            if (scenario == 10) {
+                wl_evaluation_control_request_cancel(funding);
+                CHECK(wl_evaluation_control_charge_attempt(funding, id, 0)
+                    == WL_EVALUATION_CONTROL_CANCELLED);
+            } else CHECK(!wl_evaluation_control_finish(funding,
+                    s->controlled_step, 0, 0));
+        }
+        if (scenario >= 12 && scenario <= 15 && !bank_close_injected
+            && phase == scenario - 11) {
+            bank_close_injected = true;
+            wl_evaluation_control_test_source_lexical_cancel_after_action =
+                true;
+        }
+        if (scenario >= 16 && scenario <= 19 && !bank_close_injected
+            && phase == scenario - 15) {
+            bank_close_injected = true;
+            wl_evaluation_control_test_source_lexical_cancel_after_action =
+                true;
+            wl_evaluation_control_source_phase_result_t stopped =
+                wl_session_source_snapshot_metadata(active_session,
+                    cancel_bank_action, NULL);
+            CHECK(stopped.action_called && !stopped.action_result
+                && stopped.financial_result == WL_EVALUATION_CONTROL_CANCELLED);
+        }
+    } else {
+        CHECK(phase == close_stage + 1 || (phase == 5 && close_stage == 5)
+            || (scenario >= 16 && scenario <= 19 && financial
+            && phase == close_stage));
+        close_stage = phase;
+        if (phase == 2) {
+            CHECK(funding && id);
+            CHECK(!wl_evaluation_control_report(funding, &child_close_report)
+                && child_close_report.attempt_id == id);
+        }
+        if (financial) {
+            CHECK(financial == WL_EVALUATION_CONTROL_CANCELLED
+                && bank_close_injected
+                && !
+                wl_evaluation_control_test_source_lexical_cancel_after_action);
+            /* Reset the real quiescent BANK test generation, never Original. */
+            CHECK(!wl_session_test_source_final_reset_cancel(active_session));
+        }
+        if (phase >= 4) CHECK(!funding && !id);
     }
     check_original();
 }
@@ -340,6 +414,8 @@ history(unsigned selected_stage, unsigned selected_scenario,
     reader_peer_hit = reader_peer_held = credit_peer_hit = credit_peer_held =
         false;
     cas_footer_refused = false;
+    child_close_injected = bank_close_injected = false;
+    finished_calls = close_grant = close_stage = 0;
     CHECK(!reader_peer.owner && !reader_peer.identity);
     wl_columnar_memory_reservation_init(&credit_peer);
     grant_calls = kernel_actions = callbacks = 0; successor = event_mask = 0;
@@ -406,6 +482,7 @@ history(unsigned selected_stage, unsigned selected_scenario,
     wl_columnar_session_test_observer_resource_finished = finished;
     wl_columnar_eval_delta_test_resource_prefooter = prefooter;
     wl_columnar_session_test_observer_parent_free = parent_free;
+    wl_columnar_session_test_observer_finance_phase = finance_phase;
     wl_columnar_relation_test_before_reader_cas = reader_cas_peer;
     wl_columnar_memory_governor_test_before_finish_credit_cas = credit_cas_peer;
     int rc = run(session);
@@ -422,6 +499,9 @@ history(unsigned selected_stage, unsigned selected_scenario,
         && (scenario == 0 || target_phase == 5 || foreign_checked)
         && (scenario != 3 || short_refused)
         && (scenario != 4 || footer_refused));
+    CHECK(finished_calls == grant_calls
+        && ((scenario != 10 && scenario != 11) || child_close_injected)
+        && ((scenario < 12 || scenario > 19) || bank_close_injected));
     CHECK(session_find_rel((wl_col_session_t *)session, "output") == old_head
         && wl_columnar_relation_snapshot_equal(old_image,
         wl_columnar_relation_snapshot(old_head))
@@ -433,6 +513,7 @@ history(unsigned selected_stage, unsigned selected_scenario,
     wl_columnar_session_test_observer_resource_limit = NULL;
     wl_columnar_session_test_observer_resource_finished = NULL;
     wl_columnar_session_test_observer_parent_free = NULL;
+    wl_columnar_session_test_observer_finance_phase = NULL;
     wl_columnar_relation_test_before_reader_cas = NULL;
     wl_columnar_memory_governor_test_before_finish_credit_cas = NULL;
     if (successor) CHECK(!wl_evaluation_control_finish(c,
@@ -485,6 +566,9 @@ main(void)
         history(7, 7, k, 0); ++count;
         history(2, 8, k, 0); ++count;
         history(7, 9, k, 0); ++count;
+        for (unsigned s = 10; s <= 19; ++s) {
+            history(7, s, k, 0); ++count;
+        }
     }
     printf("observer resources: %u authentic public histories passed\n", count);
     return 0;

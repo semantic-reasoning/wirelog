@@ -888,3 +888,56 @@ incoming/assigned SOURCE, performed lower and correlated carry remain OPEN.
 No384 capacity, zero, FINISH, test count or local upper closes S.FIN. The
 containing closure matrix and PR remain open until those runtime routes and
 all remaining operator domains are completed and validated.
+
+## Observer financier settlement
+
+The canonical observer journal now retains a distinct close cursor and the
+actual seven-field FINISH report. One synchronous Source action performs
+FINISH, matching-generation detach, creation-reference release, or saved-value
+consumption. FINISH accepts only its own completed generation; detach checks
+owner, saved generation, inactivity and completed report in the same mutex.
+An active or already-ended foreign successor leaves the attachment intact.
+The generic controller APIs retain their existing behavior.
+
+Each physical transition publishes its next cursor before BANK settlement.
+Release clears the real pointer and saved ID before relinquishing the creation
+reference, and subsequent turns read only the saved report. A NULL financier
+does not erase the CONSUME/observation debt or permit another grant. A refused
+footer retries the remaining stage rather than repeating FINISH, detach or
+release. Diagnostic hooks run outside the Source callback and the close busy
+guard protects their reentry. The original operation result remains separate
+from the private grant's actual stop/protocol result.
+
+The additive internal operator-close issuer uses208/224/80, preserving existing
+snapshot-metadata callers. These are real Source coupons, not the observer's
+384 Work capacity. The expanded FINISH callback has a local conservative
+upper188 on C11/POSIX and196 with MSVC's atomic width dispatch. Its Core body
+counts128/136: meaningful result initialization10; argument guards6; mutex
+lock front14; owner/generation/active selection9; stop helper9; accounting4;
+result selection5; completed report14; active store1; atomic exchange5/13;
+kind/valid stores2; returned report14; unlock front14; returned result11.
+The callback adds58 for payload/dispatch9, arguments/call6, received result10,
+guards16, saved report14, cursor/valid stores2 and return1, then reserve2.
+Ordinary FINISH is expanded rather than treated as a Native boundary.
+
+The actual BANK CURRENT-to-CLOSE interval adds27 before callback entry and32
+after its return. Thus the complete local interval is at most248/256 on those
+platform profiles. DETACH, RELEASE and CONSUME callback envelopes are112,96
+and24; their corresponding intervals fit176,160 and88. Report copies count
+seven loads and seven stores; object padding is not logical Source work.
+These are local production profiles, excluding diagnostic test callbacks.
+
+This census does not qualify bootstrap from the preceding observer leaf,
+generic BANK refusal/return ancestry, public return, or simultaneous carry.
+In particular it does not borrow the canonical financial component's lower
+170/12/90/60 or incoming-promise condition. S.FIN and parent closure remain open.
+
+The public fixture retains the original128 histories and adds20: matching
+stopped/already-ended grants plus actual BANK cancellation after each physical
+stage and before each action. The real quiescent test reset preserves the
+completed BANK report; it never resets Original. All148 histories assert
+no new grant while close debt is retained, matching actual FINISH reports,
+exactly one diagnostic completion per grant, unchanged Original reports and
+successor consumption0, future unique signed events and actual governor
+balances. Direct controller tests separately prove live and ended foreign
+generation detach refusal, then clean up through the authentic current tuple.

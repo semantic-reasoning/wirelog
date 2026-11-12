@@ -519,6 +519,8 @@ enum {
 extern unsigned wl_evaluation_control_test_source_final_cancel_at;
 /*1/2 substitutes that real private lane's interior as invalid payload range. */
 extern unsigned wl_evaluation_control_test_source_final_geometry_fault;
+/* Cancel the actual generic lexical BANK after its next called action. */
+extern bool wl_evaluation_control_test_source_lexical_cancel_after_action;
 /* Genuine quiescent issuer reset after a completed injected CANCEL only. */
 int wl_evaluation_control_test_source_final_reset_cancel(
     wl_evaluation_control_source_bank_t *, wl_evaluation_control_source_lane_t);
@@ -554,6 +556,12 @@ wl_evaluation_control_attempt_finish_result_t
 wl_evaluation_control_finish_attempt(wl_evaluation_control_t *control,
     const void *owner, uint64_t expected_attempt_id, int execution_status,
     int cleanup_status);
+
+/* Release only the matching, completed generation's attachment. A stale
+ * expectation, including an already-ended successor, leaves ownership intact.
+ * The caller independently holds the creation reference through this call. */
+int wl_evaluation_control_detach_attempt(wl_evaluation_control_t *,
+    const void *owner, uint64_t expected_attempt_id);
 
 typedef struct {
     int protocol;

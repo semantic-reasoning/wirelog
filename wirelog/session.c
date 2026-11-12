@@ -195,6 +195,16 @@ wl_session_source_snapshot_metadata(wl_session_t *session,
     return wl_session_source_run(session, &policy, action, payload);
 }
 
+wl_evaluation_control_source_phase_result_t
+wl_session_source_operator_close_metadata(wl_session_t *session,
+    wl_evaluation_control_source_action_fn action, void *payload)
+{
+    static const wl_evaluation_control_source_phase_policy_t policy = {
+        208, 224, 80
+    };
+    return wl_session_source_run(session, &policy, action, payload);
+}
+
 int
 wl_session_source_finance_start(wl_session_t *session,
     wl_session_source_finance_t *record,
