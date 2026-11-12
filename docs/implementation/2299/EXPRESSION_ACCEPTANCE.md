@@ -2327,3 +2327,57 @@ ordering. The corrected sequence places it after unary child160/128/256 and
 INPUT192: independently derived prefix3648, guard256, exact3904 or one-short
 3903 with consumed3648. The later SHAPE192/128 pair stays unchanged. The failed
 candidate, initial review and diagnostic are retained in the workflow artifacts.
+
+### Optional private final compaction prerequisite
+
+After actual seed Finalize has drained its readers, B2 batch, scratch and unused
+output, the caller may invoke `wl_columnar_session_seed_compact_final_step` before
+Take. Existing callers that omit it still receive the original pre-compaction
+result. The new COMPACTING progress value is appended; it blocks Take until the
+optional operation completes, and repeated completed calls do not repeat a
+same-capacity replacement. This is an internal standalone prerequisite, with no
+canonical registry/session activation, Source getter, Native permission, or
+whole-issue completion claim.
+
+The method verifies the actual selected private owner, self-storage identities,
+quiescent descriptor/payload gates, absence of aliases/ledger/shared/arena/pool,
+and the actual payload token and geometry. A real zero payload with EMPTY token
+and no owner/claim is valid even when the actor's governor still owns descriptor
+and metadata credits. Guards are separate bounded actions; a progress enum or a
+financial observation alone never grants Native access.
+
+Raw policy remains exact: zero columns do nothing; positive-width empty results
+free columns and timestamps, retain scratch and metadata, preserve run metadata,
+and touch storage generation only if storage existed. Positive compaction uses
+`capacity > 4*rows` and `max(2*rows,64)`, including a real replacement when both
+old and new capacity are64. It copies only initialized logical rows and at most
+eight bytes per action, zeroing its own new timestamp tail. Initial metadata,
+raw FLOAT bits and view generation are preserved. The local copier uses explicit
+byte leaves so its source bound does not depend on a loop-index estimate.
+
+The actual governor admits old plus incoming primary/TS storage, with scratch
+counted once. A real typed DENIED/OVERFLOW or allocation failure is a soft skip;
+control stops remain errors. Commit failure is EFAULT after real rollback. A
+failed raw rollback is EAGAIN with the same matching REPLACING claim retained;
+retry does not refund/readmit it. A foreign kind or size remains EBUSY until its
+actual holder withdraws that claim. Tests use real financial peer reservations,
+not invented counter values or physical-allocation/Native claims.
+
+Distinct maintenance funding frees one staged/displaced component or advances
+one real refund/downsize/release component per turn. It settles credits only
+after the corresponding physical storage is gone. Partial empty destruction
+remains compactor-owned until its header and credit close, so generic relation
+retirement never receives a half-cleared grid. End can drain this state after
+Original cancellation or END/successor without spending Original or successor.
+The new record is initialized by the existing metered opaque-context byte loop.
+
+The prepare fee remains228. Its accepted expanded source bound is128, including
+failed checkpoint cancellation, plus direct result3 and external64 =195; the
+withdrawn80 estimate is not used. Other new intervals reserve64 external source
+slots, including actual refusals, and do not certify an arbitrary future session
+caller. The active compact cleanup calls actual refund/downsize, two-phase
+empty payload release and the explicit96-byte token reset; it does not call
+retirement receipt begin/acknowledge. After compact ownership closes, a later
+generic End resumes the existing standalone retirement path, which is outside
+this optional method's reserved64 composition. Final canonical integration
+still needs its own concrete caller proof.
