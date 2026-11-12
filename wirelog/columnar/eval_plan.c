@@ -67,6 +67,8 @@ wl_columnar_eval_plan_numeric_composed_abort_supported(
             if (depth == COL_STACK_MAX) return ENOBUFS;
             ++depth;
             break;
+        case WL_PLAN_OP_ANTIJOIN:
+        case WL_PLAN_OP_SEMIJOIN:
         case WL_PLAN_OP_JOIN:
             if (!depth) return EINVAL;
             /* The owned ordinary JOIN attempt retains cancellation state and
@@ -123,6 +125,19 @@ wl_columnar_eval_plan_numeric_composed_abort_supported_attempt_controlled(
              * contributes one result to the composed runtime stack. */
             if (depth == COL_STACK_MAX) return ENOBUFS;
             ++depth;
+            break;
+        case WL_PLAN_OP_ANTIJOIN:
+        case WL_PLAN_OP_SEMIJOIN:
+            /* Keep ordinary OP64 unchanged. From its successful debit:
+             * suffix8 + rc2 + opcode5 + dispatch1 + call fronts4 +
+             * complete next controller42 + refusal rc/return2 =64.
+             * No predicate or helper precedes this direct extra payment.
+             * The funded probe body including next OP fronts is94<=128. */
+            rc = wl_evaluation_control_charge_attempt(control, attempt_id,
+                    WL_COLUMNAR_EVAL_PLAN_ABORT_SCAN_PROBE_WORK);
+            if (rc) return rc;
+            if (!depth) return EINVAL;
+            if (plan->ops[i].materialized) return 0;
             break;
         case WL_PLAN_OP_JOIN:
             if (!depth) return EINVAL;

@@ -1,6 +1,7 @@
 /* #2299 actual compiler-selected scalar host integration. */
 #include "../wirelog/columnar/internal.h"
 #include "../wirelog/exec_plan_gen.h"
+#include "../wirelog/passes/sip.h"
 #include "../wirelog/session.h"
 #include "../wirelog/wirelog.h"
 #include "../wirelog/wirelog-extension.h"
@@ -25,6 +26,7 @@ typedef struct {
     wirelog_program_t *program; wl_plan_t *plan;
     wl_session_t *session, *raw; wl_evaluation_control_t *control;
     wl_columnar_memory_governor_ref_t *governor;
+    unsigned probe;
     unsigned width, events, positive, negative, evals, compile, selected, auth,
         empty;
     int balance[64]; bool numeric, product, right_active;
@@ -145,24 +147,26 @@ static void join_observe(wl_evaluation_control_t *c, unsigned phase,
         if (phase == 47)++active->empty;
     }
 }
-static host_t create(bool numeric, bool product){
-    host_t f = {.numeric = numeric, .product = product, .width = product?2u:1u};
-    char source[600]; snprintf(source, sizeof(source),
-        ".decl left(k:int64)\n.decl right(k:int64,s:%s)\n.decl out(%s)\n%s\n",
-        numeric?"int64":"string", product?"x:int64,k:int64":"k:int64",
-        product?
-        (numeric?"out(x,k):-left(x),right(k,1).":
-        "out(x,k):-left(x),right(k,\"yes\")."):
-        (numeric?"out(k):-left(k),right(k,1).":
-        "out(k):-left(k),right(k,\"yes\")."));
+static host_t create_kind(bool numeric, bool product, unsigned probe){
+    host_t f = {.numeric = numeric, .product = product, .probe = probe,
+                .width = product && !probe ? 2u : 1u};
+    char source[600];
+    snprintf(source, sizeof(source),
+        ".decl left(k:int64)\n.decl right(k:int64,s:%s)\n.decl out(%s)\nout(%s):-left(%s),%sright(%s,%s).\n",
+        numeric?"int64":"string", product && !probe?"x:int64,k:int64":"k:int64",
+        product && !probe?"x,k":"k", product && !probe?"x":"k", probe?"!":"",
+        product?(probe?"_":"k"):"k", numeric?"1":"\"yes\"");
     wirelog_error_t error; f.program = wirelog_parse_string(source, &error);
     CHECK(f.program && !wl_plan_from_program(f.program, &f.plan));
     const wl_plan_relation_t *h = &f.plan->strata[0].relations[0];
-    const wl_plan_op_t *join = NULL;
+    wl_plan_op_t *join = NULL;
     for (unsigned i = 0; i < h->op_count;
-        ++i) if (h->ops[i].op == WL_PLAN_OP_JOIN) join = &h->ops[i];
+        ++i) if (h->ops[i].op ==
+            (probe ? WL_PLAN_OP_ANTIJOIN : WL_PLAN_OP_JOIN)) join =
+                (wl_plan_op_t *)&h->ops[i];
     CHECK(join && join->right_filter_expr.data &&
         join->key_count == (product?0u:1u));
+    if (probe == 2)join->op = WL_PLAN_OP_SEMIJOIN; /* Explicit internal-plan witness. */
     const wl_plan_expr_buffer_t *e = &join->right_filter_expr;
     CHECK(e->size == (numeric?17u:14u) && e->data[0] == WL_PLAN_EXPR_VAR
         && e->data[7] ==
@@ -181,6 +185,9 @@ static host_t create(bool numeric, bool product){
     CHECK(!wl_session_create_with_options(wl_backend_columnar(), f.plan, 1,
         &options, &f.session));
     return f;
+}
+static host_t create(bool numeric, bool product){
+    return create_kind(numeric, product, 0);
 }
 static void bind(host_t *f){
     active = f; wl_session_set_delta_cb(f->session, event, f);
@@ -362,77 +369,216 @@ static bool report_equal(const wl_evaluation_control_report_t *a,
            a->cleanup_status == b->cleanup_status &&
            a->stop_reason == b->stop_reason;
 }
+static void probe_positives(void){
+    for (unsigned kind = 1; kind <= 2; ++kind)for (unsigned numeric = 0;
+            numeric < 2;
+            ++numeric)
+            for (unsigned keyless = 0; keyless < 2; ++keyless) {
+                host_t f = create_kind(numeric, keyless, kind); bind(&f);
+                left(&f);
+                add(&f, 1, false); add(&f, 1, true); add(&f, 2, false);
+                add(&f, 3, true); add(&f, 3, false);
+                CHECK(!complete(f.session) && !wl_session_step(f.raw));
+                compare(&f);
+                uint64_t expected = keyless?(kind == 1?0:30):(kind == 1?20:10);
+                CHECK(image(session_find_rel(COL_SESSION(f.session), "out"),
+                    1) == expected && f.selected == 2);
+                int64_t row[] = {1,
+                                 numeric?1:wl_intern_put(f.plan->intern,
+                                     "yes")};
+                CHECK(!wl_session_remove(f.session, "right", row, 1,
+                    2) && !wl_session_remove(f.raw, "right", row, 1, 2));
+                CHECK(!wl_evaluation_control_reset(f.control) &&
+                    !complete(f.session) && !wl_session_step(f.raw));
+                compare(&f);
+                row[0] = 3;
+                CHECK(!wl_session_remove(f.session, "right", row, 1,
+                    2) && !wl_session_remove(f.raw, "right", row, 1, 2));
+                CHECK(!wl_evaluation_control_reset(f.control) &&
+                    !complete(f.session) && !wl_session_step(f.raw));
+                compare(&f);
+                CHECK(image(session_find_rel(COL_SESSION(f.session), "out"),
+                    1) == (kind == 1?30u:0u));
+                add(&f, 1, true);
+                CHECK(!wl_evaluation_control_reset(f.control) &&
+                    !complete(f.session) && !wl_session_step(f.raw));
+                compare(&f);
+                unsigned events = f.events;
+                CHECK(!wl_session_step(f.session) && f.events == events);
+                closed(&f); destroy(&f);
+            }
+}
+static void probe_empty(void){
+    for (unsigned kind = 1; kind < 3; ++kind)for (unsigned keyless = 0;
+            keyless < 2;
+            ++keyless)
+            for (unsigned empty = 0; empty < 2; ++empty) {
+                host_t f = create_kind(false, keyless, kind); bind(&f);
+                left(&f);
+                add(&f, 1, false); add(&f, 2, false);
+                if (empty) {
+                    int64_t rows[] = {1, wl_intern_put(f.plan->intern, "no"), 2,
+                                      wl_intern_put(f.plan->intern, "no")};
+                    CHECK(!wl_session_remove(f.session, "right", rows, 2,
+                        2) && !wl_session_remove(f.raw, "right", rows, 2, 2));
+                }
+                CHECK(!complete(f.session) && !wl_session_step(f.raw));
+                compare(&f);
+                CHECK(image(session_find_rel(COL_SESSION(f.session), "out"),
+                    1) == (kind == 1?30u:0u));
+                CHECK(empty?f.empty && !f.evals:f.evals > 0);
+                closed(&f); destroy(&f);
+            }
+}
+static void probe_collisions(void){
+    for (unsigned kind = 1; kind < 3; ++kind) {
+        host_t f = create_kind(false, false, kind); bind(&f); left(&f);
+        const col_rel_t *r = session_find_rel(COL_SESSION(f.session), "right");
+        uint32_t bucket = wl_columnar_hash_value(2166136261u, r, 0, 1)&15u;
+        unsigned excluded[2], found = 0;
+        for (unsigned k = 5; found < 2 && k < 10000; ++k)
+            if ((wl_columnar_hash_value(2166136261u, r, 0, k)&15u) == bucket)
+                excluded[found++] = k;
+        CHECK(found == 2);
+        add(&f, excluded[0], false); add(&f, 1, true); add(&f, 1, false);
+        add(&f, excluded[1], false); add(&f, 3, true); add(&f, 2, false);
+        CHECK(!complete(f.session) && !wl_session_step(f.raw)); compare(&f);
+        CHECK(image(session_find_rel(COL_SESSION(f.session), "out"),
+            1) == (kind == 1?20u:10u));
+        int64_t rows[] = {1, wl_intern_put(f.plan->intern, "yes"), 3,
+                          wl_intern_put(f.plan->intern, "yes")};
+        CHECK(!wl_session_remove(f.session, "right", rows, 2,
+            2) && !wl_session_remove(f.raw, "right", rows, 2, 2));
+        CHECK(!wl_evaluation_control_reset(f.control) && !complete(f.session) &&
+            !wl_session_step(f.raw)); compare(&f);
+        CHECK(image(session_find_rel(COL_SESSION(f.session), "out"),
+            1) == (kind == 1?30u:0u));
+        closed(&f); destroy(&f);
+    }
+}
+static void sip_positive(void){
+    wirelog_error_t error;
+    wirelog_program_t *program = wirelog_parse_string(
+        ".decl a(x:int64,y:int64)\n.decl b(y:int64,w:int64)\n"
+        ".decl c(w:int64,z:int64,s:string)\n.decl path(x:int64,z:int64)\n"
+        "path(x,z):-a(x,y),b(y,w),c(w,z,s).\n", &error);
+    CHECK(program); wl_sip_stats_t stats = {0};
+    CHECK(!wl_sip_apply(program, &stats));
+    wl_plan_t *plan = NULL; CHECK(!wl_plan_from_program(program, &plan));
+    unsigned semi = 0;
+    for (unsigned i = 0; i < plan->stratum_count; ++i)
+        for (unsigned j = 0; j < plan->strata[i].relation_count; ++j) {
+            const wl_plan_relation_t *h = &plan->strata[i].relations[j];
+            for (unsigned k = 0; k < h->op_count; ++k)
+                if (h->ops[k].op == WL_PLAN_OP_SEMIJOIN) {
+                    ++semi; CHECK(!h->ops[k].right_filter_expr.size);
+                }
+        }
+    CHECK(semi == 1);
+    wl_evaluation_control_t *control = NULL;
+    CHECK(!wl_evaluation_control_create(0, &control));
+    wl_session_options_t options; wl_session_options_init(&options);
+    wl_session_t *raw = NULL, *bounded = NULL;
+    CHECK(!wl_session_create_with_options(wl_backend_columnar(), plan, 1,
+        &options, &raw));
+    options.evaluation_control = control;
+    CHECK(!wl_session_create_with_options(wl_backend_columnar(), plan, 1,
+        &options, &bounded));
+    int64_t a[] = {1, 2, 4, 5}, b[] = {2, 3, 5, 6},
+        c[] = {3, 4, wl_intern_put(plan->intern, "yes")};
+    wl_session_t *sessions[] = {raw, bounded};
+    for (unsigned i = 0; i < 2; ++i) {
+        CHECK(!wl_session_insert(sessions[i], "a", a, 2,
+            2) && !wl_session_insert(sessions[i], "b", b, 2,
+            2) && !wl_session_insert(sessions[i], "c", c, 1, 3));
+        CHECK(!complete(sessions[i]));
+        const col_rel_t *r = session_find_rel(COL_SESSION(sessions[i]), "path");
+        CHECK(r && r->nrows == 1 && r->ncols == 2 && r->columns[0][0] == 1 &&
+            r->columns[1][0] == 4);
+        CHECK(!COL_SESSION(sessions[i])->cleanup_active &&
+            !COL_SESSION(sessions[i])->cleanup_reserved_bytes);
+    }
+    wl_session_destroy(raw); wl_session_destroy(bounded);
+    wl_evaluation_control_release(control);
+    wl_plan_free(plan); wirelog_program_free(program);
+}
 static void stops(void){
     const unsigned phases[] = {70, 83, 84, 88, 550, 551, 552, 553, 554, 555,
                                564};
-    for (unsigned product = 0; product < 2; ++product)for (unsigned p = 0;
-            p < sizeof(phases)/sizeof(phases[0]); ++p) for (action = 0;
-                action < 5; ++action) {
-                host_t f = create(false, product); bind(&f); left(&f);
-                add(&f, 1, true);
-                CHECK(!complete(f.session) && !wl_session_step(f.raw));
-                compare(&f);
-                col_rel_t *old = session_find_rel(COL_SESSION(f.session),
-                        "out");
-                col_relation_snapshot_t old_image =
-                    wl_columnar_relation_snapshot(old);
-                unsigned events = f.events;
-                add(&f, 2, false); add(&f, 3, true);
-                CHECK(!wl_evaluation_control_reset(f.control) &&
-                    !wl_evaluation_control_configure(f.control,
-                    action == 1?UINT64_MAX:0));
-                description = p >= 4;
-                stop_phase = phases[p]; stop_at = description || !p?1:2;
-                hits = 0; stopped = false; successor = 0;
-                int rc = complete(f.session); stop_phase = 0;
-                description = false; CHECK(stopped);
-                int expected = action ==
-                    0?WL_EVALUATION_CONTROL_CANCELLED:action ==
-                    1?WL_EVALUATION_CONTROL_WORK_LIMIT:action ==
-                    4?EOVERFLOW:EINVAL;
-                if (rc != expected) {
-                    wl_evaluation_control_report_t r;
-                    int rr = wl_evaluation_control_report(f.control, &r);
-                    fprintf(stderr,
-                        "stop phase%u action%u rc%d expected%d owners%u active%p pending%p reserved%llu report%d/%d/%d\n",
-                        phases[p], action, rc, expected,
-                        wl_columnar_session_test_cleanup_owners(COL_SESSION(
-                            f.session)),
-                        (void *)COL_SESSION(f.session)->cleanup_active,
-                        (void *)COL_SESSION(f.session)->cleanup_pending,
-                        (unsigned long long)COL_SESSION(
-                            f.session)->cleanup_reserved_bytes, rr, r.result,
-                        r.cleanup_status);
-                }
-                CHECK(rc == expected && f.events == events &&
-                    session_find_rel(COL_SESSION(f.session),
-                    "out") == old &&
-                    wl_columnar_relation_snapshot_equal(old_image,
-                    wl_columnar_relation_snapshot(old))); closed(&f);
-                wl_evaluation_control_report_t report;
-                CHECK(!wl_evaluation_control_report(f.control, &report));
-                if (action == 2 || action == 3) {
-                    CHECK(report_equal(&frozen, &report)); if (action == 3){
-                        uint64_t used = 999;
-                        CHECK(!wl_evaluation_control_test_active_consumed(
-                                f.control, successor, &used) && !used);
-                        wl_evaluation_control_attempt_finish_result_t end =
-                            wl_evaluation_control_finish_attempt(f.control,
-                                f.session->operation_admission, successor, 0,
-                                0);
-                        CHECK(!end.protocol && end.report_valid &&
-                            !end.report.consumed);
+    for (unsigned kind = 0; kind < 3; ++kind)
+        for (unsigned product = 0; product < 2; ++product) for (unsigned p = 0;
+                p < sizeof(phases)/sizeof(phases[0]); ++p) for (action = 0;
+                    action < 5; ++action) {
+                    host_t f = create_kind(false, product, kind); bind(&f);
+                    left(&f);
+                    add(&f, 1, true);
+                    CHECK(!complete(f.session) && !wl_session_step(f.raw));
+                    compare(&f);
+                    col_rel_t *old = session_find_rel(COL_SESSION(f.session),
+                            "out");
+                    col_relation_snapshot_t old_image =
+                        wl_columnar_relation_snapshot(old);
+                    unsigned events = f.events;
+                    add(&f, 2, false); add(&f, 3, true);
+                    CHECK(!wl_evaluation_control_reset(f.control) &&
+                        !wl_evaluation_control_configure(f.control,
+                        action == 1?UINT64_MAX:0));
+                    description = p >= 4;
+                    stop_phase = phases[p]; stop_at = description || !p?1:2;
+                    hits = 0; stopped = false; successor = 0;
+                    int rc = complete(f.session); stop_phase = 0;
+                    description = false; CHECK(stopped);
+                    int expected = action ==
+                        0?WL_EVALUATION_CONTROL_CANCELLED:action ==
+                        1?WL_EVALUATION_CONTROL_WORK_LIMIT:action ==
+                        4?EOVERFLOW:EINVAL;
+                    if (rc != expected) {
+                        wl_evaluation_control_report_t r;
+                        int rr = wl_evaluation_control_report(f.control, &r);
+                        fprintf(stderr,
+                            "stop phase%u action%u rc%d expected%d owners%u active%p pending%p reserved%llu report%d/%d/%d\n",
+                            phases[p], action, rc, expected,
+                            wl_columnar_session_test_cleanup_owners(COL_SESSION(
+                                f.session)),
+                            (void *)COL_SESSION(f.session)->cleanup_active,
+                            (void *)COL_SESSION(f.session)->cleanup_pending,
+                            (unsigned long long)COL_SESSION(
+                                f.session)->cleanup_reserved_bytes, rr,
+                            r.result,
+                            r.cleanup_status);
                     }
-                }else CHECK(report.result == expected &&
-                        !report.cleanup_status);
-                CHECK(!wl_evaluation_control_reset(f.control) &&
-                    !wl_evaluation_control_configure(f.control,
-                    0) && !complete(f.session) && !wl_session_step(f.raw));
-                compare(&f); closed(&f); destroy(&f);
-            }
+                    CHECK(rc == expected && f.events == events &&
+                        session_find_rel(COL_SESSION(f.session),
+                        "out") == old &&
+                        wl_columnar_relation_snapshot_equal(old_image,
+                        wl_columnar_relation_snapshot(old))); closed(&f);
+                    wl_evaluation_control_report_t report;
+                    CHECK(!wl_evaluation_control_report(f.control, &report));
+                    if (action == 2 || action == 3) {
+                        CHECK(report_equal(&frozen, &report));
+                        if (action == 3) {
+                            uint64_t used = 999;
+                            CHECK(!wl_evaluation_control_test_active_consumed(
+                                    f.control, successor, &used) && !used);
+                            wl_evaluation_control_attempt_finish_result_t end =
+                                wl_evaluation_control_finish_attempt(f.control,
+                                    f.session->operation_admission, successor,
+                                    0,
+                                    0);
+                            CHECK(!end.protocol && end.report_valid &&
+                                !end.report.consumed);
+                        }
+                    }else CHECK(report.result == expected &&
+                            !report.cleanup_status);
+                    CHECK(!wl_evaluation_control_reset(f.control) &&
+                        !wl_evaluation_control_configure(f.control,
+                        0) && !complete(f.session) && !wl_session_step(f.raw));
+                    compare(&f); closed(&f); destroy(&f);
+                }
 }
 int main(void){
     numeric_right_oracle();
-    compiler_boundary(); positives(); empty_and_invalid(); stops();
+    compiler_boundary(); positives(); probe_positives(); probe_collisions();
+    probe_empty(); sip_positive(); empty_and_invalid(); stops();
     puts("bounded expression hosts: passed"); return 0;
 }

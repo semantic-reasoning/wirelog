@@ -1526,3 +1526,43 @@ ENTRY, each PRE/POST, decoder/tag/payload cuts and FINAL are explicit; the
 single column digit is192. Every positive-cut one-short budget preserves the
 output sentinel and consumes exactly the preceding literal prefix. This
 additional session-admission work is not inferred from a successful run.
+
+## Completion: filtered existence probes
+
+The compiler-generated negative atom `!right(k,"yes")` previously returned
+ENOTSUP under control although raw execution succeeded. ANTI and the internal
+SEMI actor now use the same bounded right selection as ordinary JOIN. Selection
+runs before key/schema validation; logical selected count governs existence,
+while hash-chain storage and source indices retain physical row bounds. Only
+selected original indices enter chains. A filtered-only256 packet covers the
+index selection/hash caller and keyless existence decision; unfiltered192
+actor prices remain unchanged. Missing-right exact repush precedes expression
+setup, including SEMI projection. Scalar failures reject rows; extension
+permissions remain absent.
+
+Actual SIP construction requires a plain SCAN on its pruned right input. A
+literal introduces FILTER and prevents that SEMI rewrite. Tests therefore name
+the generated ANTI, internally constructed filtered SEMI, and actual unfiltered
+SIP SEMI as separate witnesses. They do not claim a compiler-generated filtered
+SEMI. Keyed/keyless numeric/string positives, original-index collision chains,
+initially/all-filtered and typed-empty inputs, signed delete/reinsert/noop,
+missing projection and nullary/type validation have explicit raw controls.
+
+Both abort scanners now recognize the owned existence-probe cleanup grammar.
+The controlled scanner retains ENTRY33, OP64 and FINAL17 and adds a direct128
+payment only for each visited ANTI/SEMI. Before that extra debit the complete
+old64 interval is suffix8 + rc2 + opcode5 + dispatch1 + call fronts4 + next
+controller42 + refusal rc/return2 =64. Labels execute no extra statement; no
+helper, hook or predicate precedes the direct payment. The new body including
+next OP fronts fits94<=128. A mixed VARIABLE/JOIN/probe/CONSOLIDATE independent
+literal oracle totals434 with every-one-short prefix; materialized and depth0
+probe exits consume353 and225. Existing numeric schedules stay unchanged.
+
+Head classification includes probe predicates (fixed212<=224); genuine native
+birth uses the shared JOIN_DYNAMIC grammar (fixed254<=256), retaining frame,
+transaction, generation and receipt authentication. The expanded host tests
+require owner1 during scalar work and exercise decode/eval/FINAL and descriptor
+stops for all three actor kinds: cancel, work denial, END alone, END+successor
+and overflow. Frozen Original reports, successor0, immutable committed images,
+retry, native ACK and governed teardown0 remain mandatory. Classification
+selects finance; it never grants cleanup authority.
