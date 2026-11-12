@@ -4754,6 +4754,12 @@ int wl_columnar_relation_new_typed_operator_attempt_controlled(
     const char *, uint32_t, const wirelog_column_type_t *,
     wl_columnar_memory_governor_ref_t *, col_rel_t **,
     wl_evaluation_control_t *, uint64_t);
+/* Same typed private ownership contract, fixed initial capacity one. This
+ * primitive does not admit a recursive session or fund its parent handoff. */
+int wl_columnar_relation_new_typed_one_operator_attempt_controlled(
+    const char *, uint32_t, const wirelog_column_type_t *,
+    wl_columnar_memory_governor_ref_t *, col_rel_t **,
+    wl_evaluation_control_t *, uint64_t);
 /* Same original-attempt/private ownership contract, explicit capacity. Codes
  * are immutable int64 scalar type enums (including valid INT32=0), checked
  * before native conversion. Borrowed only until synchronous return; output

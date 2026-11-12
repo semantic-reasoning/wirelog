@@ -1,5 +1,8 @@
 /* #1821: real governed fresh construction, before engine integration. */
 #include "../wirelog/columnar/internal.h"
+#include "../wirelog/exec_plan_gen.h"
+#include "../wirelog/intern.h"
+#include "../wirelog/wirelog.h"
 #include <stdio.h>
 #include <math.h>
 #ifndef _WIN32
@@ -1791,6 +1794,7 @@ attempt_new_like_complete_literal(void)
  * literals, never production enums or a measured consumed-work oracle. */
 typedef struct {
     uint64_t prefix[8192], allocations[2048], total;
+    uint64_t commit_prefix[3];
     size_t count, allocation_count;
 } auto_literal_t;
 
@@ -3977,6 +3981,482 @@ sorted_stamp_cases(void)
     }
 }
 
+/* Independent capacity-one operator schedule: eight-byte data copies and
+ * eight-pointer clears, plus typed validation/math/allocation/format steps.
+ * No production prices or measured host total is used. */
+static void typed_one_literal_bytes(auto_literal_t *s, uint64_t bytes) {
+    for (uint64_t pos = 0; pos < bytes; pos += 8)
+        auto_literal_add(s, 224, false);
+}
+static void
+typed_one_literal(const char *name, uint32_t width, bool governed, bool typed,
+    auto_literal_t *s)
+{
+    *s = (auto_literal_t){0};
+#define AUTO_R(v) auto_literal_add(s, (v), false)
+#define AUTO_A(v) auto_literal_add(s, (v), true)
+#define AUTO_POINTERS() do { for (uint32_t pos = 0; pos < width; \
+                                 pos += 8) { AUTO_R(192); } } while (0)
+#define AUTO_RESERVE(nonzero) do { AUTO_R(160); \
+                                   if (governed && (nonzero)) { AUTO_R(74); \
+                                                                AUTO_R(54); \
+                                                                AUTO_R(84); \
+                                                                AUTO_R(29); \
+                                   } } while (0)
+    AUTO_R(128);
+    if (typed)for (uint32_t i = 0; i < width; ++i)AUTO_R(128);
+    AUTO_R(128); AUTO_R(128); AUTO_R(192);
+    uint64_t name_bytes = strlen(name) + 1;
+    for (uint64_t i = 0; i < name_bytes; i++) AUTO_R(96);
+    for (unsigned i = 0; i < 6; i++) AUTO_R(96);
+    AUTO_R(96);
+    if (typed) {
+        AUTO_R(96); AUTO_R(96);
+    }
+    AUTO_R(96); AUTO_R(96); AUTO_R(96);
+    if (governed) AUTO_R(96); /* scratch payload */
+    AUTO_R(128);
+    for (uint32_t i = 0; i < width; i++) {
+        auto_literal_name(s, i);
+        AUTO_R(96); AUTO_R(96); AUTO_R(96);
+    }
+    AUTO_R(96); AUTO_RESERVE(true); AUTO_A(112);
+    typed_one_literal_bytes(s, sizeof(col_rel_t));
+    for (unsigned i = 0; i < 5; i++) AUTO_R(96);
+    AUTO_A(112); typed_one_literal_bytes(s, name_bytes);
+    AUTO_R(80); AUTO_R(112); AUTO_R(96);
+    AUTO_RESERVE(true); AUTO_RESERVE(width != 0);
+    if (width) {
+        AUTO_A(112); AUTO_POINTERS();
+        for (uint32_t i = 0; i < width; i++) AUTO_A(112);
+        if (governed) AUTO_A(112);
+        AUTO_A(112); AUTO_POINTERS();
+        for (uint32_t i = 0; i < width; i++) {
+            auto_literal_name(s, i); AUTO_A(112);
+            typed_one_literal_bytes(s, 4u + digits(i));
+        }
+    }
+    if (typed && width) {
+        AUTO_A(112);
+        for (uint32_t i = 0; i < width; ++i)AUTO_R(96);
+    }
+    AUTO_R(96); AUTO_A(112); typed_one_literal_bytes(s, 3);
+    if (width) {
+        AUTO_A(112); AUTO_POINTERS();
+        for (uint32_t i = 0; i < width; i++) {
+            AUTO_A(128); AUTO_A(112);
+            if (typed)AUTO_R(96);
+            typed_one_literal_bytes(s, 2);
+            auto_literal_name(s, i); AUTO_A(112);
+            typed_one_literal_bytes(s, 4u + digits(i));
+        }
+    }
+    for (unsigned i = 0; i < 3; i++) {
+        AUTO_R(128);
+        if (governed && (i < 2 || width)) {
+            AUTO_R(74); AUTO_R(54); AUTO_R(29);
+            s->commit_prefix[i] = s->total;
+        }
+    }
+    AUTO_R(220); AUTO_R(128);
+#undef AUTO_RESERVE
+#undef AUTO_POINTERS
+#undef AUTO_A
+#undef AUTO_R
+}
+
+static void typed_one_shape(col_rel_t *r, uint32_t width,
+    const wirelog_column_type_t *types) {
+    CHECK(r && r->ncols == width && r->capacity == 1 && !r->nrows &&
+        r->schema_ok && r->schema.n_children == width &&
+        !strcmp(r->schema.format, "+s") && !r->timestamps &&
+        !r->timestamp_capacity && !r->has_graph_column && !r->declared_ncols &&
+        r->storage_owner == r && r->storage_generation == 1 &&
+        r->view_generation == 2u+(types != NULL));
+    CHECK((r->column_types != NULL) == (width && types));
+    if (width)CHECK(r->column_types != types);
+    for (uint32_t c = 0; c < width; ++c) {
+        char expected[24]; snprintf(expected, sizeof(expected), "col%u", c);
+        CHECK(r->column_types[c] == types[c] &&
+            !strcmp(r->col_names[c], expected) &&
+            !strcmp(r->schema.children[c]->name, expected) &&
+            !strcmp(r->schema.children[c]->format,
+            types[c] == WIRELOG_TYPE_FLOAT?"g":"l"));
+    }
+    if (watched) {
+        uint64_t d, m, payload;
+        credits("$typed1", width, 1, false, &d, &m, &payload);
+        if (types)m += width*sizeof(*types);
+        CHECK(r->descriptor_reserved_bytes == d &&
+            r->metadata_reserved_bytes == m &&
+            r->retained_reserved_bytes == payload);
+        wl_columnar_memory_reservation_t *tokens[] =
+        {&r->descriptor_reservation,
+         &r->metadata_reservation,
+         &r->retained_reservation};
+        const uint64_t bytes[] = {d, m, payload};
+        for (unsigned i = 0; i < 3; ++i) {
+            CHECK(tokens[i]->identity == tokens[i] &&
+                tokens[i]->bytes == bytes[i]);
+            CHECK(atomic_load(&tokens[i]->state) == (bytes[i]?
+                WL_COLUMNAR_MEMORY_RESERVATION_COMMITTED:
+                WL_COLUMNAR_MEMORY_RESERVATION_EMPTY));
+            CHECK(atomic_load(&tokens[i]->owner_bits) ==
+                (bytes[i]?(uint64_t)(uintptr_t)r:0));
+        }
+    }
+}
+static const wl_plan_idb_schema_t *typed_one_schema(uint32_t width,
+    unsigned kind, wirelog_program_t **program, wl_plan_t **plan) {
+    char text[4096]; size_t used = 0;
+    const char *names[] = {"int64", "string", "float", "int32"};
+#define TAPP(...) do { int n = snprintf(text+used, sizeof(text)-used, \
+                               __VA_ARGS__); \
+                       CHECK(n >= 0 && (size_t)n < sizeof(text)-used); \
+                       used += (size_t)n; } while (0)
+    for (unsigned decl = 0; decl < 2; ++decl) {
+        TAPP(".decl %s(", decl?"out":"input");
+        for (uint32_t c = 0; c < width; ++c)
+            TAPP("%sv%u:%s", c?",":"", c, names[width == 1?kind:c%4]);
+        TAPP(")\n");
+    }
+    TAPP("out(");
+    for (uint32_t c = 0; c < width; ++c)TAPP("%sv%u", c?",":"", c);
+    TAPP("):-input(");
+    for (uint32_t c = 0; c < width; ++c)TAPP("%sv%u", c?",":"", c);
+    TAPP(").\n");
+#undef TAPP
+    wirelog_error_t error; *program = wirelog_parse_string(text, &error);
+    int plan_rc = *program?wl_plan_from_program(*program, plan):EINVAL;
+    if (!*program || plan_rc)fprintf(stderr,
+            "typed schema parse%p plan%d source%s\n", (void *)*program, plan_rc,
+            text);
+    CHECK(*program && !plan_rc);
+    const wl_plan_idb_schema_t *schema = NULL;
+    for (uint32_t i = 0; i < (*plan)->idb_schema_count; ++i)
+        if (!strcmp((*plan)->idb_schemas[i].name,
+            "out")) schema = &(*plan)->idb_schemas[i];
+    CHECK(schema && schema->declared && schema->width == width &&
+        schema->column_types);
+    for (uint32_t c = 0; c < width; ++c) {
+        unsigned t = width == 1?kind:c%4;
+        CHECK(schema->column_types[c] == (t == 1?WIRELOG_TYPE_STRING:
+            t == 2?WIRELOG_TYPE_FLOAT:WIRELOG_TYPE_INT64));
+    }
+    return schema;
+}
+static void typed_one_values(col_rel_t *out, uint32_t width,
+    const wirelog_column_type_t *types, wl_plan_t *plan) {
+    col_rel_t *raw = col_rel_new_auto("$typed1", width); CHECK(raw);
+    if (width)CHECK(!col_rel_set_column_types(raw, types, width));
+    int64_t row[17]; CHECK(width <= 17);
+    for (uint32_t c = 0; c < width; ++c)
+        row[c] = types[c] ==
+            WIRELOG_TYPE_FLOAT?wl_columnar_float_to_bits(1.25+c):
+            types[c] == WIRELOG_TYPE_STRING?wl_intern_put(plan->intern,
+                "typed-one-value"):1;
+    CHECK(!col_rel_append_row(out, row) && !col_rel_append_row(raw, row) &&
+        out->nrows == 1 && raw->nrows == 1);
+    for (uint32_t c = 0; c < width;
+        ++c) CHECK(out->columns[c][0] == raw->columns[c][0]);
+    wl_columnar_source_access_writer_t a = {0}, b = {0};
+    CHECK(!wl_columnar_source_access_writer_acquire(&out->source_access, &a) &&
+        !wl_columnar_source_access_writer_acquire(&raw->source_access, &b) &&
+        !col_rel_reset_rows_locked(out, &a) && !col_rel_reset_rows_locked(raw,
+        &b) &&
+        !wl_columnar_source_access_writer_release(&b) &&
+        !wl_columnar_source_access_writer_release(&a) && !out->nrows &&
+        !raw->nrows);
+    CHECK(!col_rel_destroy_checked(raw));
+}
+static void typed_one_prefixes(uint32_t width,
+    const wirelog_column_type_t *types,
+    wl_plan_t *plan, bool sweep) {
+    auto_literal_t prices, untyped;
+    typed_one_literal("$typed1", width, watched != NULL, types != NULL,
+        &prices);
+    typed_one_literal("$typed1", width, watched != NULL, false, &untyped);
+    CHECK(prices.total-untyped.total == (!types?0:width?304+320*width:192));
+    const uint64_t baseline = reserved();
+    uint64_t previous = 0;
+    for (size_t i = 0; i < prices.count; ++i) {
+        if (!sweep && i+1 != prices.count) {
+            previous = prices.prefix[i]; continue;
+        }
+        for (unsigned below = 0; below < 2; ++below) {
+            wl_evaluation_control_t *c = control(prices.prefix[i]-below);
+            col_rel_t *out = NULL; external_out = &out;
+            int rc =
+                wl_columnar_relation_new_typed_one_operator_attempt_controlled(
+                "$typed1", width, types, watched, &out, c,
+                wl_evaluation_control_active_attempt_id(c));
+            external_out = NULL;
+            int expected = !below &&
+                i+1 == prices.count?0:WL_EVALUATION_CONTROL_WORK_LIMIT;
+            CHECK(rc == expected);
+            scalar_source_report(c, wl_evaluation_control_active_attempt_id(c),
+                rc, below?previous:prices.prefix[i]);
+            if (!rc) {
+                typed_one_shape(out, width, types);
+                typed_one_values(out, width, types, plan);
+                CHECK(!col_rel_destroy_checked(out));
+            } else CHECK(!out);
+            CHECK(reserved() == baseline && (!watched ||
+                wl_columnar_memory_governor_ref_is_sole(watched)));
+            release(c);
+        }
+        previous = prices.prefix[i];
+    }
+    for (size_t i = 0; i < prices.allocation_count; ++i) {
+        wl_evaluation_control_t *c = control(0); col_rel_t *out = NULL;
+        wl_columnar_relation_test_constructor_fail_allocation = (uint32_t)i+1;
+        CHECK(wl_columnar_relation_new_typed_one_operator_attempt_controlled(
+                "$typed1", width, types, watched, &out, c,
+                wl_evaluation_control_active_attempt_id(c)) == ENOMEM && !out &&
+            !wl_columnar_relation_test_constructor_fail_allocation);
+        scalar_source_report(c, wl_evaluation_control_active_attempt_id(c),
+            ENOMEM, prices.allocations[i]);
+        CHECK(reserved() == baseline);
+        release(c);
+    }
+}
+static unsigned typed_one_reserve, typed_one_deny;
+static void typed_one_denial(wl_evaluation_control_t *c, uint64_t work) {
+    checkpoint(c, work);
+    if (work == 160 && ++typed_one_reserve == typed_one_deny)
+        atomic_store(&wl_columnar_memory_governor_ref_get(
+                watched)->usable_bytes, reserved());
+}
+
+static unsigned typed_one_action, typed_one_late;
+static bool typed_one_hit, typed_one_ended;
+static uint64_t typed_one_target, typed_one_next;
+static wl_evaluation_control_report_t typed_one_original;
+static bool typed_one_reports_equal(const wl_evaluation_control_report_t *a,
+    const wl_evaluation_control_report_t *b) {
+    return a->attempt_id == b->attempt_id && a->limit == b->limit &&
+           a->consumed == b->consumed && a->result == b->result &&
+           a->stop_reason == b->stop_reason &&
+           a->execution_status == b->execution_status &&
+           a->cleanup_status == b->cleanup_status;
+}
+static void typed_one_stop(wl_evaluation_control_t *c, uint64_t work) {
+    if (typed_one_ended) {
+        ++typed_one_late; return;
+    }
+    checkpoint(c, work);
+    if (typed_one_hit || seen != typed_one_target)return;
+    typed_one_hit = true;
+    if (typed_one_action == 0)wl_evaluation_control_request_cancel(c);
+    else if (typed_one_action == 1 || typed_one_action == 4)
+        CHECK(wl_evaluation_control_charge(c, UINT64_MAX) ==
+            (typed_one_action == 1?WL_EVALUATION_CONTROL_WORK_LIMIT:EOVERFLOW));
+    else {
+        uint64_t id = wl_evaluation_control_active_attempt_id(c);
+        wl_evaluation_control_attempt_finish_result_t ended =
+            wl_evaluation_control_finish_attempt(c, &owner, id, 0, 0);
+        CHECK(!ended.protocol && ended.report_valid);
+        typed_one_original = ended.report;
+        typed_one_ended = true;
+        if (typed_one_action == 3) {
+            CHECK(!wl_evaluation_control_reset(c));
+            wl_evaluation_control_attempt_begin_result_t next =
+                wl_evaluation_control_begin_attempt(c, &owner);
+            CHECK(!next.protocol && next.attempt_id != id);
+            typed_one_next = next.attempt_id;
+        }
+    }
+}
+static void typed_one_stops(uint32_t width,
+    const wirelog_column_type_t *types) {
+    auto_literal_t prices;
+    typed_one_literal("$typed1", width, watched != NULL, true, &prices);
+    const uint64_t targets[] = {128, 128*(1+width), prices.allocations[0],
+                                prices.commit_prefix[0],
+                                prices.prefix[prices.count-2], prices.total};
+    const uint64_t baseline = reserved();
+    for (unsigned cut = 0; cut < sizeof(targets)/sizeof(*targets); ++cut) {
+        if (!targets[cut])continue;
+        for (typed_one_action = 0; typed_one_action < 5; ++typed_one_action) {
+            wl_evaluation_control_t *c = control(typed_one_action ==
+                    1?UINT64_MAX:0);
+            uint64_t id = wl_evaluation_control_active_attempt_id(c);
+            typed_one_target = targets[cut]; typed_one_next = 0;
+            typed_one_late = 0;
+            typed_one_hit = typed_one_ended = false;
+            wl_columnar_relation_test_work_checkpoint = typed_one_stop;
+            wl_columnar_memory_governor_test_work_checkpoint = typed_one_stop;
+            col_rel_t *out = NULL; external_out = &out;
+            int rc =
+                wl_columnar_relation_new_typed_one_operator_attempt_controlled(
+                "$typed1", width, types, watched, &out, c, id);
+            external_out = NULL;
+            wl_columnar_relation_test_work_checkpoint = checkpoint;
+            wl_columnar_memory_governor_test_work_checkpoint = checkpoint;
+            int expected = typed_one_action ==
+                0?WL_EVALUATION_CONTROL_CANCELLED:
+                typed_one_action == 1?WL_EVALUATION_CONTROL_WORK_LIMIT:
+                typed_one_action == 4?EOVERFLOW:EINVAL;
+            CHECK(rc == expected && typed_one_hit && !out && !typed_one_late &&
+                reserved() == baseline);
+            if (typed_one_ended) {
+                wl_evaluation_control_report_t report;
+                CHECK(typed_one_original.attempt_id == id &&
+                    typed_one_original.consumed == targets[cut] &&
+                    !wl_evaluation_control_report(c, &report) &&
+                    typed_one_reports_equal(&report, &typed_one_original));
+                CHECK(
+                    wl_columnar_relation_new_typed_one_operator_attempt_controlled
+                    (
+                        "$typed1", width, types, watched, &out, c,
+                        id) == EINVAL && !out);
+                CHECK(!wl_evaluation_control_report(c, &report) &&
+                    typed_one_reports_equal(&report, &typed_one_original));
+                if (typed_one_next) {
+                    uint64_t used = 1;
+                    CHECK(!wl_evaluation_control_test_active_consumed(c,
+                        typed_one_next, &used) && !used);
+                    wl_evaluation_control_attempt_finish_result_t end =
+                        wl_evaluation_control_finish_attempt(c, &owner,
+                            typed_one_next, 0, 0);
+                    CHECK(!end.protocol && end.report_valid &&
+                        !end.report.consumed);
+                } else CHECK(!wl_evaluation_control_active_attempt_id(c));
+            } else scalar_source_report(c, id, rc, targets[cut]);
+            retry(c, 0);
+            CHECK(
+                !wl_columnar_relation_new_typed_one_operator_attempt_controlled(
+                    "$typed1", width, types, watched, &out, c,
+                    wl_evaluation_control_active_attempt_id(c)));
+            scalar_source_report(c, wl_evaluation_control_active_attempt_id(c),
+                0, prices.total);
+            typed_one_shape(out, width, types);
+            CHECK(!col_rel_destroy_checked(out) && reserved() == baseline);
+            release(c);
+        }
+    }
+    typed_one_ended = false;
+}
+static void typed_one_domains(void) {
+    const wirelog_column_type_t bad[] = {(wirelog_column_type_t)-1,
+                                         (wirelog_column_type_t)(
+                                             WIRELOG_TYPE_BOOL+1)};
+    for (unsigned test = 0; test < 5; ++test) {
+        wl_evaluation_control_t *c = control(0); col_rel_t *out = NULL;
+        const char *name = test == 3?NULL:"$typed1";
+        const wirelog_column_type_t *types = test < 2?&bad[test]:NULL;
+        int rc = wl_columnar_relation_new_typed_one_operator_attempt_controlled(
+            name, 1, types, watched, test == 4?NULL:&out, c,
+            wl_evaluation_control_active_attempt_id(c));
+        CHECK(rc == EINVAL && !out);
+        scalar_source_report(c, wl_evaluation_control_active_attempt_id(c), rc,
+            test < 2?256:128);
+        release(c);
+    }
+    const wirelog_column_type_t valid[] = {WIRELOG_TYPE_INT32,
+                                           WIRELOG_TYPE_BOOL};
+    for (unsigned i = 0; i < 2; ++i) {
+        wl_evaluation_control_t *c = control(0); col_rel_t *out = NULL;
+        CHECK(!wl_columnar_relation_new_typed_one_operator_attempt_controlled(
+                "$typed1", 1, &valid[i], watched, &out, c,
+                wl_evaluation_control_active_attempt_id(c)));
+        typed_one_shape(out, 1, &valid[i]); finish(c, 0);
+        CHECK(!col_rel_destroy_checked(out)); release(c);
+    }
+    wl_evaluation_control_t *c = control(0);
+    uint64_t old = wl_evaluation_control_active_attempt_id(c);
+    scalar_source_report(c, old, 0, 0);
+    wl_evaluation_control_report_t report, saved;
+    CHECK(!wl_evaluation_control_report(c, &saved)); retry(c, 0);
+    col_rel_t *out = NULL;
+    CHECK(wl_columnar_relation_new_typed_one_operator_attempt_controlled(
+            "$typed1", 1,
+            &valid[0], watched, &out, c, old) == EINVAL && !out);
+    uint64_t used = 1;
+    CHECK(!wl_evaluation_control_test_active_consumed(c,
+        wl_evaluation_control_active_attempt_id(c), &used) && !used &&
+        !wl_evaluation_control_report(c,
+        &report) && typed_one_reports_equal(&report, &saved));
+    CHECK(wl_columnar_relation_new_typed_one_operator_attempt_controlled(
+            "$typed1", 1,
+            &valid[0], watched, &out, c, 0) == EINVAL && !out);
+    CHECK(wl_columnar_relation_new_typed_one_operator_attempt_controlled(
+            "$typed1", 1,
+            &valid[0], watched, &out, NULL, old) == EINVAL && !out);
+    scalar_source_report(c, wl_evaluation_control_active_attempt_id(c), 0, 0);
+    release(c);
+}
+static void typed_one_cases(void) {
+    for (unsigned governed = 0; governed < 2; ++governed) {
+        watched = governed?governor():NULL;
+        wl_columnar_memory_reservation_t held;
+        wl_columnar_memory_reservation_init(&held);
+        if (watched)CHECK(wl_columnar_memory_reserve(
+                    wl_columnar_memory_governor_ref_get(watched),
+                    17, &held) && wl_columnar_memory_commit(&held, &held));
+        const uint64_t baseline = reserved();
+        wirelog_program_t *program = NULL; wl_plan_t *plan = NULL;
+        const uint32_t widths[] = {1, 1, 1, 1, 4, 17};
+        for (unsigned f = 0; f < sizeof(widths)/sizeof(*widths); ++f) {
+            const wl_plan_idb_schema_t *schema = typed_one_schema(widths[f],
+                    f < 4?f:0,
+                    &program, &plan);
+            typed_one_prefixes(schema->width, schema->column_types, plan,
+                f == 0 || f >= 4);
+            wl_evaluation_control_t *c = control(0); col_rel_t *old = NULL;
+            CHECK(!wl_columnar_relation_new_typed_operator_attempt_controlled(
+                    "$typed1",
+                    schema->width, schema->column_types, watched, &old, c,
+                    wl_evaluation_control_active_attempt_id(c)) &&
+                old->capacity == COL_REL_INIT_CAP);
+            finish(c, 0); CHECK(!col_rel_destroy_checked(old)); release(c);
+            if (watched && f == 4)for (typed_one_deny = 1; typed_one_deny <= 3;
+                    ++typed_one_deny) {
+                    c = control(0); col_rel_t *out = NULL;
+                    typed_one_reserve = 0;
+                    wl_columnar_relation_test_work_checkpoint =
+                        typed_one_denial;
+                    CHECK(
+                        wl_columnar_relation_new_typed_one_operator_attempt_controlled
+                            ("$typed1",
+                        schema->width, schema->column_types, watched, &out, c,
+                        wl_evaluation_control_active_attempt_id(c)) == ENOSPC &&
+                        !out);
+                    wl_columnar_relation_test_work_checkpoint = checkpoint;
+                    atomic_store(&wl_columnar_memory_governor_ref_get(
+                            watched)->usable_bytes,
+                        WL_COLUMNAR_MEMORY_MIN_BUDGET);
+                    finish(c, ENOSPC); CHECK(reserved() == baseline);
+                    release(c);
+                }
+            if (f == 4)typed_one_stops(schema->width, schema->column_types);
+            c = control(0); col_rel_t *survivor = NULL;
+            CHECK(
+                !wl_columnar_relation_new_typed_one_operator_attempt_controlled(
+                    "$typed1",
+                    schema->width, schema->column_types, watched, &survivor, c,
+                    wl_evaluation_control_active_attempt_id(c)));
+            finish(c, 0); release(c);
+            wirelog_column_type_t expected[17]; uint32_t width = schema->width;
+            memcpy(expected, schema->column_types, width*sizeof(*expected));
+            CHECK(survivor->column_types != schema->column_types);
+            wl_plan_free(plan); wirelog_program_free(program);
+            typed_one_shape(survivor, width, expected);
+            CHECK(!col_rel_destroy_checked(survivor) && reserved() == baseline);
+        }
+        typed_one_domains();
+        wirelog_column_type_t dummy = WIRELOG_TYPE_FLOAT;
+        typed_one_prefixes(0, NULL, NULL, true);
+        typed_one_prefixes(0, &dummy, NULL, true);
+        if (watched) {
+            CHECK(wl_columnar_memory_release(&held) && !reserved() &&
+                wl_columnar_memory_governor_ref_is_sole(watched));
+            wl_columnar_memory_governor_ref_release(watched);
+        }
+        watched = NULL;
+    }
+}
+
 int
 main(void)
 {
@@ -3984,6 +4464,7 @@ main(void)
     wl_columnar_memory_governor_test_work_checkpoint = checkpoint;
     wl_columnar_relation_test_constructor_retired = physically_retired;
     wl_columnar_relation_test_constructor_committed = committed;
+    typed_one_cases();
     for (unsigned ts = 0; ts < 2; ts++) {
         test_success("", 0, 0, ts != 0);
         test_success("fresh", 0, 3, ts != 0);
