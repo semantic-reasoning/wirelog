@@ -1473,3 +1473,56 @@ the failed terminal must equal the sampled reservation minus that exact credit.
 The second terminal must remain equal, and complete destruction must return the
 retained governor to zero. No hardcoded byte allowance, extra drain or mutable
 receipt is substituted for genuine retirement and R1 correction admission.
+
+## Unit9a: ordinary JOIN scalar right predicates
+
+On main d0c5df81 a compiler-generated `right(k,"yes")` predicate was14
+bytes (VARcol1/CONST_STR/CMP_STR_EQ): raw STEP succeeded while controlled STEP
+returned ENOTSUP. Right selection now retains its numeric-first actor and,
+only when needed, uses the qualified scalar compiler/evaluator. Context grants
+only intern access; all seven fields are explicitly assigned with no snapshot,
+session key, worker or scalar-result extension permission. Semantic failure
+rejects the row as raw filtering does; engine/control errors remain errors.
+Compiler-invalid extension right-filter IR is tested separately from parsing:
+a valid ordinary direct callback is moved into the right input and rejected by
+the existing right-filter capability validator, without invoking a callback.
+
+Scalar fallback compile and each scalar row add a distinct256 caller packet.
+The complete compile envelope is190; explicit context construction/eval is
+123 expanded controller/fronts +7 stores +16 local/call fronts +51 next child
+fronts =197 <=256. Child traversal and owner allocation/copy remain separately
+paid. The last scalar FINAL88 through JOIN's saved-ID zero return and next
+CELL payment fits198; a zero charge is an identity edge, not finance. Existing
+numeric actor and empty-right prices are unchanged. Common PROGRAM retirement
+consumes and clears scalar_program through its existing prepaid disposal path.
+
+Right predicates are now also described by the Original-funded head classifier
+before genuine child birth. The JOIN-specific phase561 path fits208<=224;
+there is no new565 phase. The description is published only at existing564
+with actual transaction/plan/generation checks. It selects the existing
+JOIN_DYNAMIC finance protocol; it grants no native ownership by itself.
+Without that description, Original END at scalar decode70 left12168 bytes and
+an active frame. Actual compiler/session tests now require owner1, authenticated
+frame/private bindings/receipt, frozen Original, successor0 and complete native
+cleanup/ACK. Numeric right predicates acquire the real readonly classifier
+fees (ENTRY/FINAL plus PRE/POST for each decoder child); this is distinct from
+preserving numeric actor fees. Existing independent classifier/decoder literal
+exact/one-short oracles remain authoritative.
+
+The dedicated evaluation_expression_hosts target checks keyed/product JOIN,
+numeric controls, positive/rejected/invalid-symbol rows, actual typed empty
+right setup, signed deletion/reinsertion/noop, governing reservations and
+compiler capability boundaries. Deterministic stops cover right decode/eval/
+FINAL and pre-frame classifier phases550..555/564, each with cancel, work denial,
+END alone, END+successor and overflow. Old output pointers/generations/events
+remain unchanged before commit; retry and final governor0 are mandatory.
+Filtered SEMI/ANTI are not certified by this ordinary JOIN actor: an actual
+negative atom with a string constant still exposes a concrete probe adapter
+gap that subsequent completion units must repair.
+
+The compiler-produced numeric right predicate has an independent literal
+classification oracle: VARcol1/CONST_INT1/CMP_EQ costs28*224 +192 =6464.
+ENTRY, each PRE/POST, decoder/tag/payload cuts and FINAL are explicit; the
+single column digit is192. Every positive-cut one-short budget preserves the
+output sentinel and consumes exactly the preceding literal prefix. This
+additional session-admission work is not inferred from a successful run.

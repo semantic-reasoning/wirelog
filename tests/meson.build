@@ -7478,3 +7478,14 @@ test_evaluation_expression_extensions_exe = executable(
 )
 test('evaluation_expression_extensions', test_evaluation_expression_extensions_exe,
      suite: ['unit', 'tsan'], timeout: 120)
+
+# #2299 actual scalar host intersections.
+expression_hosts_exe = executable('test_evaluation_expression_hosts',
+  files('test_evaluation_expression_hosts.c'),
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  c_args: ['-DWL_SESSION_TEST_HOOKS=1'],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
+  link_with: [testlib_prod],
+)
+test('evaluation_expression_hosts', expression_hosts_exe,
+  suite: ['unit', 'tsan'], timeout: 120)

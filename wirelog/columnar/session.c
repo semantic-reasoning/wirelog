@@ -13435,6 +13435,14 @@ wl_columnar_session_head_scalar_classify(wl_col_session_t *sess,
                 op->filter_expr.data, op->filter_expr.size, &scalar, control,
                 id);
             if (rc) return rc;
+        } else if (op->op == WL_PLAN_OP_JOIN && op->right_filter_expr.size) {
+            /* Phase561 covers fixed JOIN dispatch208<=224 including child
+             * return/next front; the readonly child pays its own traversal.
+             * This description selects finance, never native permission. */
+            rc = wl_columnar_expr_requires_scalar_attempt_controlled(
+                op->right_filter_expr.data, op->right_filter_expr.size,
+                &scalar, control, id);
+            if (rc) return rc;
         } else if (op->op == WL_PLAN_OP_MAP && op->map_expr_count) {
             rc = wl_columnar_session_head_scalar_region(control, id, 562, i);
             if (rc) return rc;

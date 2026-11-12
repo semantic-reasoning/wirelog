@@ -5513,6 +5513,10 @@ join_success:
 enum {
     WL_COLUMNAR_JOIN_ATTEMPT_WORK = 192,
     WL_COLUMNAR_JOIN_ATTEMPT_CELL_WORK = 128,
+    /* Scalar-only caller packets: expanded controller/front123, seven
+     * context stores, local/call fronts16 and next child guard51 <=197.
+     * Compile has no context stores (<=190); numeric/empty prices unchanged. */
+    WL_COLUMNAR_JOIN_ATTEMPT_SCALAR_WORK = 256,
     /* Two payments per first cleanup turn:64 current +128 future per
      * payment, as in existing B2 retirement. Named capacity: common10,
      * batch18, fixed scratch12, right source1, JOIN decision1. Common10 is
@@ -6019,7 +6023,20 @@ wl_columnar_join_attempt_right_selection(wl_columnar_filter_context_t *ctx,
             expression->size, governor, &ctx->program, &supported, control, id);
     rc = wl_columnar_join_attempt_return(control, id, rc);
     if (rc) return rc;
-    if (!supported) return ENOTSUP;
+    if (!supported) {
+        /* Numeric FINAL/return and this branch reach the new packet within
+        * the existing192 caller envelope. Child traversal funds itself. */
+        rc = wl_columnar_join_attempt_charge(control, id,
+                WL_COLUMNAR_JOIN_ATTEMPT_SCALAR_WORK);
+        if (rc) return rc;
+        rc =
+            wl_columnar_expr_compile_scalar_attempt_controlled(expression->data,
+                expression->size, governor, &ctx->scalar_program, &supported,
+                control, id);
+        rc = wl_columnar_join_attempt_return(control, id, rc);
+        if (rc) return rc;
+        if (!supported) return ENOTSUP;
+    }
     rc = wl_columnar_join_attempt_charge(control, id,
             WL_COLUMNAR_JOIN_ATTEMPT_WORK);
     if (rc) return rc;
@@ -6052,8 +6069,30 @@ wl_columnar_join_attempt_right_selection(wl_columnar_filter_context_t *ctx,
         rc = wl_columnar_join_attempt_charge(control, id,
                 WL_COLUMNAR_JOIN_ATTEMPT_WORK);
         if (rc) return rc;
-        rc = wl_columnar_expr_eval_attempt_controlled(ctx->program, row,
-                ctx->join_right.width, &value, &failed, control, id);
+        if (ctx->program)
+            rc = wl_columnar_expr_eval_attempt_controlled(ctx->program, row,
+                    ctx->join_right.width, &value, &failed, control, id);
+        else {
+            rc = wl_columnar_join_attempt_charge(control, id,
+                    WL_COLUMNAR_JOIN_ATTEMPT_SCALAR_WORK);
+            if (rc) return rc;
+            /* Raw fill_filtered_rel grants only intern access. Seven explicit
+             * stores avoid aggregate zeroing and confer no callback context. */
+            wl_columnar_expr_context_t context;
+            context.intern = ctx->session->intern;
+            context.extensions = NULL;
+            context.allow_extension_scalar_result = false;
+            context.configured_worker_count = 0;
+            context.active_worker_count = 0;
+            context.parallel_execution = false;
+            context.session_key = NULL;
+            wl_columnar_expr_status_t status = WL_COLUMNAR_EXPR_OK;
+            rc = wl_columnar_expr_eval_scalar_attempt_controlled(
+                ctx->scalar_program, row, ctx->join_right.width, &context,
+                &value, &failed, &status, control, id);
+            /* Semantic failure is raw FILTER false, not a facade error.
+             * FINAL88->JOIN zero return->next CELL fits conservative198. */
+        }
         rc = wl_columnar_join_attempt_return(control, id, rc);
         if (rc) return rc;
         rc = wl_columnar_join_attempt_charge(control, id,
