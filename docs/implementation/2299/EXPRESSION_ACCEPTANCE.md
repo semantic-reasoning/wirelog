@@ -1629,3 +1629,55 @@ ENOMEM and retry, actual compiler capability rejection, native receipt ACK,
 and governed final0. Deterministic decode/eval/FINAL and pre-frame description
 stops exercise cancel, work denial, END alone, END+successor and overflow with
 frozen Original, successor0 and immutable committed pointers/generations/events.
+
+## Completion: observed one-column computed MAP routing
+
+A generated `out(strlen(to_string(x))):-input(x)` with an observer previously
+returned ENOTSUP, while the same accepted rows ran without an observer. The
+narrow observer now retains only its exact identity descriptor: no expression,
+a sole zero-sized expression (NULL or nonNULL bytes), or the seven-byte VARcol0
+encoding. Other expressions select the existing private general transaction.
+Pointer/count/size guards precede every byte read; malformed descriptors remain
+runtime validation inputs. The ordinary projection checks stay unchanged.
+The local delta_cb guard makes the already-existing outer observer boundary
+explicit; plain/C1 execution is not assigned observed unary ownership.
+
+The descriptor predicate has no input-sized traversal or decoder: original
+projection24 + descriptor guards24 + fixed memcpy4 + fixed memcmp12 + tail6
++ observer guard4 =74<=existing96 payload allowance. Existing SOURCE admission
+208/96/80 and DIRECT contracts remain distinct; this is no new BANK/bootstrap
+proof. Numeric computed MAP gets the actual general host admission cost, while
+numeric expression actor tariffs remain unchanged. SNAPSHOT independently
+selects its existing general path.
+
+The expression_hosts target now checks actual one-column scalar, numeric,
+string and extension MAP. Scalar body compilation/evaluation authenticates the
+real current MAP child (including its pending READY start), frame/private
+bindings/receipt and unary owner2. Pre-frame metadata compilers are not counted
+as that actor. Identity controls retain actual narrow observer delivery with no
+general head description; absent/empty descriptor variants also retain it.
+The independent plain/C1 positive controls require bounded expression work and
+actual typed values without borrowing observed owner2 permission.
+
+Tests cover real typed-empty inputs, populated and loaded-inline inputs,
+signed deletion/reinsertion/noop, a prior successful SNAPSHOT, later semantic
+failure/correction, and repeated injected program ENOMEM inside the genuine
+MAP owner. Extension tests check STRING argument copies, actual single-worker
+context/session key and busy callback destruction, unregister while sessions retain leases,
+callback failure/nonpublication/retry and exactly-once final destruction.
+Empty and populated scalar work plus pre-frame classification exercise cancel,
+work denial, END alone, END+successor and overflow. Committed pointers,
+generations/schema/events, frozen Original, successor0, real ACK and governed0
+remain mandatory. Operator-stage UNKNOWN still means the entire MAP is
+untyped. Final canonical copies may spell implicit INT64 explicitly, as the
+existing relation/merge contracts do; STRING/FLOAT/BOOL are never equated to it.
+
+This routing unit does not close the separately reproduced first-missing
+logical-schema adapter: before any input establishes a schema, the raw source
+has original width0, while the general bridge reifies declared physical width.
+For `to_string(x)` that exposes raw UNKNOWN versus controlled STRING even with
+no rows. Typed-empty and later-empty cases are distinct and positively checked.
+The required raw-equivalent scalar schema walk/provenance adapter remains a
+concrete next unit. Likewise, no-observer first-missing admission95 (also seen
+with numeric identity), recursive effectful seed scheduling and typed SCC
+transport are not certified by this routing change.
