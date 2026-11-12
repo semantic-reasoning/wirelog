@@ -2550,6 +2550,7 @@ cleanup_arrays:
 
 enum {
     WL_COLUMNAR_OPS_REDUCE_ATTEMPT_WORK = 192,
+    WL_COLUMNAR_OPS_REDUCE_ATTEMPT_SCALAR_WORK = 256,
     WL_COLUMNAR_OPS_REDUCE_ATTEMPT_CELL_WORK = 128,
     /* Two payments per first cleanup turn:64 current +128 future per
      * payment, as in existing B2 retirement. Named capacity: common10,
@@ -2814,7 +2815,8 @@ wl_columnar_ops_reduce_attempt_start_owned(const wl_plan_op_t *op,
         status->cleanup_result = 0; status->committed = false;
         return 0;
     }
-    ctx->program = NULL; ctx->output = NULL; ctx->private_output = NULL;
+    ctx->program = NULL; ctx->scalar_program = NULL; ctx->output = NULL;
+    ctx->private_output = NULL;
     ctx->governor = NULL; ctx->values = ctx->inline_values;
     ctx->source_initialized = false; ctx->batch_initialized = false;
     ctx->source_bare = false; ctx->join_right_bare = false;
@@ -3054,6 +3056,18 @@ wl_columnar_ops_reduce_attempt_start_owned(const wl_plan_op_t *op,
                 id);
         rc = wl_columnar_ops_reduce_attempt_return(control, id, rc);
         if (rc) goto done;
+        if (!compiled) {
+            /* Actual reduce guard24 + controller42 twice, caller16 and
+             * child front51:199<=256. Numeric return retains prior finance. */
+            rc = wl_columnar_ops_reduce_attempt_charge(control, id,
+                    WL_COLUMNAR_OPS_REDUCE_ATTEMPT_SCALAR_WORK);
+            if (rc) goto done;
+            rc = wl_columnar_expr_compile_scalar_attempt_controlled(
+                op->agg_expr.data, op->agg_expr.size, governor,
+                &ctx->scalar_program, &compiled, control, id);
+            rc = wl_columnar_ops_reduce_attempt_return(control, id, rc);
+            if (rc) goto done;
+        }
         rc = wl_columnar_ops_reduce_attempt_charge(control, id,
                 WL_COLUMNAR_OPS_REDUCE_ATTEMPT_CELL_WORK);
         if (rc) goto done;
@@ -3097,9 +3111,34 @@ wl_columnar_ops_reduce_attempt_start_owned(const wl_plan_op_t *op,
                     WL_COLUMNAR_OPS_REDUCE_ATTEMPT_WORK);
             if (rc) goto done;
             bool failed = false;
-            rc = wl_columnar_expr_eval_attempt_controlled(ctx->program,
-                    row_values, ctx->source.width, &operand, &failed, control,
-                    id);
+            if (ctx->program)
+                rc = wl_columnar_expr_eval_attempt_controlled(ctx->program,
+                        row_values, ctx->source.width, &operand, &failed,
+                        control, id);
+            else {
+                rc = wl_columnar_ops_reduce_attempt_charge(control, id,
+                        WL_COLUMNAR_OPS_REDUCE_ATTEMPT_SCALAR_WORK);
+                if (rc) goto done;
+                /* Two complete guard24/controller42 envelopes + seven
+                 * stores + caller16 + child front51 =206<=256. Raw eval_i64
+                 * supplies intern-only single-worker context. */
+                wl_columnar_expr_context_t context;
+                context.intern = session->intern;
+                context.extensions = NULL;
+                context.allow_extension_scalar_result = false;
+                context.configured_worker_count = 1;
+                context.active_worker_count = 1;
+                context.parallel_execution = false;
+                context.session_key = NULL;
+                wl_columnar_expr_status_t expression_status =
+                    WL_COLUMNAR_EXPR_OK;
+                rc = wl_columnar_expr_eval_scalar_attempt_controlled(
+                    ctx->scalar_program, row_values, ctx->source.width,
+                    &context, &operand, &failed, &expression_status,
+                    control, id);
+                /* FINAL88->saved-id guard/zero return->next CELL fits176
+                 * within198. Semantic failure below remains raw ERANGE. */
+            }
             rc = wl_columnar_ops_reduce_attempt_return(control, id, rc);
             if (rc) goto done;
             rc = wl_columnar_ops_reduce_attempt_charge(control, id,

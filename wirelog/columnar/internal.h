@@ -8468,6 +8468,7 @@ int wl_columnar_eval_plan_numeric_composed_abort_request(
 enum {
     WL_COLUMNAR_EVAL_PLAN_ABORT_SCAN_ENTRY_WORK = 33,
     WL_COLUMNAR_EVAL_PLAN_ABORT_SCAN_OP_WORK = 64,
+    /* Shared owned probe/REDUCE admission; existing probe price unchanged. */
     WL_COLUMNAR_EVAL_PLAN_ABORT_SCAN_PROBE_WORK = 128,
     WL_COLUMNAR_EVAL_PLAN_ABORT_SCAN_FINAL_WORK = 17
 };

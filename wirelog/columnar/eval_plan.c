@@ -67,6 +67,7 @@ wl_columnar_eval_plan_numeric_composed_abort_supported(
             if (depth == COL_STACK_MAX) return ENOBUFS;
             ++depth;
             break;
+        case WL_PLAN_OP_REDUCE:
         case WL_PLAN_OP_ANTIJOIN:
         case WL_PLAN_OP_SEMIJOIN:
         case WL_PLAN_OP_JOIN:
@@ -126,6 +127,7 @@ wl_columnar_eval_plan_numeric_composed_abort_supported_attempt_controlled(
             if (depth == COL_STACK_MAX) return ENOBUFS;
             ++depth;
             break;
+        case WL_PLAN_OP_REDUCE:
         case WL_PLAN_OP_ANTIJOIN:
         case WL_PLAN_OP_SEMIJOIN:
             /* Keep ordinary OP64 unchanged. From its successful debit:

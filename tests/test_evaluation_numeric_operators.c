@@ -5459,6 +5459,33 @@ reduce_expression_stops_and_ignored_count(void)
 }
 
 static void
+reduce_ignored_deep_operand(void)
+{
+    wl_columnar_filter_test_program_t expression = {0};
+    for (unsigned i = 0; i <= WL_PLAN_EXPR_STACK_MAX; ++i)
+        wl_columnar_filter_test_constant(&expression, WL_PLAN_EXPR_CONST_INT,
+            1);
+    reduce_fixture_t f;
+    reduce_fixture_init(&f, reduce_literal_input(false, false), false, 0, true);
+    f.op.agg_fn = WIRELOG_AGG_COUNT; f.op.group_by_count = 1;
+    f.op.aggregate_index = 1;
+    f.op.agg_expr = (wl_plan_expr_buffer_t){expression.bytes, expression.size};
+    eval_stack_t raw = {0}; CHECK(!eval_stack_push(&raw, f.input, false));
+    CHECK(!col_op_reduce(&f.op, &raw, f.session));
+    CHECK(raw.top == 1 && raw.items[0].rel->nrows == 3 &&
+        raw.items[0].rel->columns[1][0] == 3);
+    CHECK(!eval_stack_drain(&raw));
+    wl_columnar_expr_test_fail_allocation = 0;
+    reduce_run(&f); CHECK(wl_columnar_expr_test_fail_allocation == 0);
+    wl_columnar_expr_test_fail_allocation = -1;
+    CHECK(f.status.committed && !f.status.semantic_result);
+    const col_rel_t *out =
+        wl_columnar_eval_stack_cleanup_stack(f.frame)->items[0].rel;
+    CHECK(out->nrows == 3 && out->columns[1][0] == 3);
+    reduce_fixture_close(&f, false);
+}
+
+static void
 reduce_engine_host_refusal(void)
 {
     reduce_fixture_t f;
@@ -6735,7 +6762,8 @@ main(void)
     reduce_group_native_types(); reduce_entry_limits();
     reduce_batch_and_entry_stops(); reduce_quota_retry();
     reduce_all_reached_allocations();
-    reduce_expression_stops_and_ignored_count(); reduce_engine_host_refusal();
+    reduce_expression_stops_and_ignored_count(); reduce_ignored_deep_operand();
+    reduce_engine_host_refusal();
     raw_count_result_domains(); raw_count_generated_bodies();
     printf(
         "numeric FILTER ABI descriptor=%zu frame=%zu program_owner=%zu instruction=%zu timestamp=%zu\n",
