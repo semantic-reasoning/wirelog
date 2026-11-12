@@ -23,6 +23,12 @@ the standalone weighted JOIN/COUNT kernels are not generated opcodes.
 | Removal staging `$r$` | Copy the selected source's complete physical record verbatim. Do not rewrite its multiplicity to imitate callback deletion signs. | Exact staged removed-row stamp and value assertions, surviving source records after evaluation, later STEP/SNAPSHOT and stopped reconstruction retry. |
 | Snapshot delivery | Callbacks expose values; gathering does not reinterpret source weights. A successful raw call may compact oversized storage and advance storage generation while retaining the exact physical row image. | Exact physical source fields/values and tuple images. Precommit stop assertions additionally require unchanged source generations, public-head identity/content and no events. |
 
+Compound layout is a separate axis from the physical stamp (#2301).
+VARIABLE FULL/AUTO borrows an INLINE descriptor with its layout. MAP reads its
+lanes and produces an output with compound_kind NONE, as the uncontrolled MAP
+does. The scalar source reader admits INLINE only for callers that pass the
+INLINE bit, which are VARIABLE and MAP; other consumers keep their refusal.
+
 The composed VARIABLE/prebound checks no longer blanket-reject timestamps.
 Each real consumer owns its preservation or value-projection contract. The
 CONSOLIDATE builder requests preservation, uses its existing stable index sort
