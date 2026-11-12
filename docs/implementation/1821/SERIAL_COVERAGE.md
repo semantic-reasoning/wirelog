@@ -2688,7 +2688,7 @@ Controlled sessions reach such a source by three routes:
 |---|---|---|
 | Unobserved STEP | a STEP without a delta callback, for which `wl_columnar_session_general_shape_read` records no general shape | VARIABLE's borrowed bare descriptor (#2297) |
 | Observed specialized STEP | observed bodies that the specialized shape check admits (VARIABLE, MAP, CONSOLIDATE) | the public EDB after `col_rel_set_schema(source, 1, NULL)` |
-| General observed transaction | other observed bodies, among them a single-rule body with a FILTER, every SNAPSHOT, and an unobserved STEP for which that read records a general shape, as for some recursive strata | a private typed empty relation from the declaration |
+| General observed transaction | other observed bodies, among them a single-rule body with a FILTER, every SNAPSHOT, and an unobserved STEP for which that read records a general shape, as for some recursive strata | a private empty relation, typed when session creation gave the EDB lane types (a FLOAT or STRING column, or an INLINE compound column and no SIDE column) and untyped otherwise |
 
 Before this unit the unobserved STEP returned ENOTSUP for these bodies: the
 first consumer's scalar reader refuses `!schema_ok`. MAP, FILTER and REDUCE
@@ -2710,7 +2710,7 @@ and REDUCE keep the existing join-decision binding. A finished END moves MAP
 and FILTER to DECIDE and the join family to JOIN_DECIDE. The unary
 registered-cleanup latch still refuses a bare source. Unary cleanup is
 registered only for the general observed transaction, which replaces a bare
-EDB with a typed private relation before any consumer runs, and the test
+EDB with a private empty relation before any consumer runs, and the test
 checks that no observed or SNAPSHOT cell publishes a bare input. A native
 join-class cleanup of a bare MAP, FILTER or REDUCE goes through the join-class
 latch, which reports a bare END; no test here drives that route, and it is
@@ -2732,9 +2732,37 @@ after the stop. The observed STEP of the single-rule body is checked to give
 the EDB a schema, and that of the FILTER body, which takes the general
 observed transaction, to leave it without one.
 
-Measured and left open: the observed STEP and SNAPSHOT of a never-inserted
-INT32 EDB give an INT32 head where the uncontrolled session gives INT64, also
-in a build without this unit; once an INT32 EDB has rows, the controlled
-observed STEP, SNAPSHOT and successor STEP return ENOTSUP. CONSOLIDATE,
-CONCAT and the framed materialization keep their refusal of a bare input; in
-the generated bodies exercised here each UNION branch ends in MAP.
+The int32-declared body is covered in all four columns, with no type
+exception; see the next section. CONSOLIDATE, CONCAT and the framed
+materialization keep their refusal of a bare input; in the generated bodies
+exercised here each UNION branch ends in MAP.
+
+### Int32-declared EDBs in the general observed transaction (#2301)
+
+Session creation gives an EDB its declared lane types when one of its columns
+is FLOAT or STRING. An EDB declared with int32 or int64 columns only, and no
+compound column, stays untyped, and its inserted rows are read as int64 lanes;
+the uncontrolled session reads it that way and its heads are INT64. The
+general observed transaction, which also serves SNAPSHOT and the controlled
+successor STEP, compared the public EDB's lane types with the declared ones
+and treated an untyped lane as INT64, so an int32-declared EDB with rows
+returned ENOTSUP. For a never-inserted EDB it built the private empty input
+with the declared types, so the head was INT32 where the uncontrolled head was
+INT64.
+
+The schema phase now accepts an untyped lane for a declared INT32, INT64,
+UINT32, UINT64 or BOOL column and keeps the exact comparison for a typed lane.
+The private empty input of an untyped never-inserted EDB is built untyped,
+with `wl_columnar_relation_new_auto_operator_attempt_controlled`; an EDB that
+session creation typed keeps the typed constructor. The untyped constructor
+skips the typed constructor's per-column type check and the PREPARE unit that
+check charges for each column.
+
+`evaluation_empty_edb_sources` runs the never-inserted int32 body in all four
+columns with the head width and types compared with the uncontrolled session,
+and `untyped_rows` inserts rows before the first STEP or SNAPSHOT, then a
+further insert with a repeated row, then nothing new, in all four columns,
+comparing head rows, width and type, the evaluating SNAPSHOT image and the
+observed STEP events with the uncontrolled session. The parser takes no
+uint32, uint64 or bool declaration, so the test also runs both checks with the
+plan's int32 lane of the EDB rewritten to UINT32, UINT64 and BOOL.

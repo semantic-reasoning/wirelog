@@ -13188,6 +13188,27 @@ col_controlled_step_current_relation(wl_col_session_t *sess,
     return 0;
 }
 
+/* A private empty input: typed when types is non-NULL, else untyped. */
+static int
+wl_columnar_session_observed_empty_input(wl_col_session_t *sess,
+    const char *name, uint32_t width, const wirelog_column_type_t *types,
+    col_rel_t **out, wl_evaluation_control_t *control, uint64_t id)
+{
+    if (types)
+        return wl_columnar_relation_new_typed_operator_attempt_controlled(
+            name, width, types, sess->memory_governor, out, control, id);
+    return wl_columnar_relation_new_auto_operator_attempt_controlled(name,
+               width, 1, sess->memory_governor, out, control, id);
+}
+
+static bool
+wl_columnar_session_observed_untyped_lane(wirelog_column_type_t type)
+{
+    return type == WIRELOG_TYPE_INT32 || type == WIRELOG_TYPE_INT64
+           || type == WIRELOG_TYPE_UINT32 || type == WIRELOG_TYPE_UINT64
+           || type == WIRELOG_TYPE_BOOL;
+}
+
 /* General observed STEP keeps public descriptors unchanged until every head,
  * signed event and retirement claim is ready. Each metadata action is bounded
  * by one descriptor, plan op, slot or byte. */
@@ -14009,18 +14030,27 @@ wl_columnar_session_observed_action(wl_col_session_t *sess,
                 wirelog_column_type_t type = plan->edb_column_types[i][tx->op];
                 if (!wl_columnar_session_observed_scalar_type(
                         type)) return ENOTSUP;
+                /* An untyped lane holds int64 values (#2301). The
+                 * uncontrolled session reads an untyped EDB declared with
+                 * INT32, INT64, UINT32, UINT64 or BOOL lanes that way too. */
                 if (r->ncols && (r->ncols != width
-                    || (r->column_types ? r->column_types[tx->op] :
-                    WIRELOG_TYPE_INT64) != type))
+                    || (r->column_types ? r->column_types[tx->op] != type
+                    : !wl_columnar_session_observed_untyped_lane(type))))
                     return ENOTSUP;
                 tx->op++; return 0;
             }
             if ((!r->ncols && width) || !r->schema_ok) {
                 if (r->nrows) return ENOTSUP;
                 col_rel_t *empty = NULL;
-                rc = wl_columnar_relation_new_typed_operator_attempt_controlled(
-                    tx->entries[i].name, width, plan->edb_column_types[i],
-                    sess->memory_governor, &empty, control, step->operation_id);
+                /* Session creation gives an EDB with a FLOAT or STRING
+                 * lane, or an INLINE compound column and no SIDE column,
+                 * its lane types. An EDB without lane types gets an untyped
+                 * private empty, as the uncontrolled session reads it
+                 * (#2301). */
+                rc = wl_columnar_session_observed_empty_input(sess,
+                        tx->entries[i].name, width, r->column_types
+                        ? plan->edb_column_types[i] : NULL, &empty, control,
+                        step->operation_id);
                 if (rc) return rc;
                 tx->entries[i].relation = empty;
             }
