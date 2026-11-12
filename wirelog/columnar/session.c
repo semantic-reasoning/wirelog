@@ -8481,6 +8481,60 @@ wl_columnar_session_recursive_shape_read(wl_col_session_t *sess,
     return 0;
 }
 
+/* Fixed routing hint only: real charged name matching, original leases and
+* private binding authentication still establish the actual source identity.
+* No name, expression or source array traversal occurs in these actions. */
+typedef struct {
+    wl_col_session_t *session;
+    const wl_plan_t *plan;
+    const col_rel_t *source;
+    bool eligible, matched;
+} wl_columnar_session_missing_source_read_t;
+
+/* Fixed metadata86<=96. Observed/C1/batch return before source-header access. */
+static int
+wl_columnar_session_preflight_missing_metadata(void *payload)
+{
+    wl_columnar_session_missing_source_read_t *p = payload;
+    if (p->session->delta_cb || p->session->base.source_c1_admission ||
+        p->session->join_batch_bytes) return 0;
+    const wl_plan_t *plan = p->plan;
+    if (!plan || !plan->strata || plan->stratum_count != 1 ||
+        plan->edb_count != 1)
+        return 0;
+    const wl_plan_stratum_t *stratum = &plan->strata[0];
+    if (stratum->is_recursive || stratum->relation_count != 1 ||
+        !stratum->relations)
+        return 0;
+    if ((p->session->nrels != 1 && p->session->nrels != 2) ||
+        !p->session->rels) return 0;
+    p->source = p->session->rels[0];
+    if (!p->source)return 0;
+    const wl_plan_relation_t *head = &stratum->relations[0];
+    if (!head->ops || (head->op_count != 3 && head->op_count != 4))return 0;
+    if (head->ops[0].op != WL_PLAN_OP_VARIABLE ||
+        head->ops[head->op_count-1].op != WL_PLAN_OP_CONSOLIDATE ||
+        head->ops[head->op_count-2].op != WL_PLAN_OP_MAP ||
+        (head->op_count == 4 && head->ops[1].op != WL_PLAN_OP_FILTER)) return 0;
+    p->eligible = true;
+    return 0;
+}
+
+/* Fixed header38<=96; serialized hints confer no reader/native permission. */
+static int
+wl_columnar_session_preflight_missing_header(void *payload)
+{
+    wl_columnar_session_missing_source_read_t *p = payload;
+    if (!p->eligible)return 0;
+    if ((p->session->nrels != 1 && p->session->nrels != 2) ||
+        !p->session->rels ||
+        p->session->rels[0] != p->source) return 0;
+    p->matched = !p->source->nrows && !p->source->ncols &&
+        !p->source->schema_ok &&
+        (p->session->nrels == 1 || p->source->has_graph_column);
+    return 0;
+}
+
 static int
 wl_columnar_session_preflight_general_first(void *payload)
 {
@@ -8566,6 +8620,25 @@ wl_columnar_session_general_shape_read(wl_col_session_t *sess,
     *shape = false;
     int rc = wl_columnar_session_recursive_shape_read(sess, mode, shape);
     if (rc || *shape) return rc;
+    /* Existing SOURCE/C1 admission keeps its exact read tariff. The new
+     * ordinary no-observer match is DIRECT; skip both new actions in SOURCE. */
+    if (mode == WL_COLUMNAR_SESSION_PREFLIGHT_DIRECT){
+        wl_columnar_session_missing_source_read_t missing;
+        missing.session = sess; missing.plan = sess->plan;
+        missing.source = NULL;
+        missing.eligible = false; missing.matched = false;
+        rc = wl_columnar_session_preflight_read(mode, sess,
+                wl_columnar_session_preflight_missing_metadata, &missing);
+        if (rc)return rc;
+        if (missing.eligible){
+            rc = wl_columnar_session_preflight_read(mode, sess,
+                    wl_columnar_session_preflight_missing_header, &missing);
+            if (rc)return rc;
+        }
+        if (missing.matched){
+            *shape = true; return 0;
+        }
+    }
     wl_columnar_session_preflight_read_t p = {0};
     p.session = sess; p.plan = sess->plan;
     rc = wl_columnar_session_preflight_read(mode, sess,
@@ -10037,6 +10110,41 @@ wl_columnar_session_test_pending_source_bytes(const wl_col_session_t *sess,
     }
     *bytes = metadata->bytes + image->bytes;
     return 0;
+}
+
+/* Read-only test geometry and actual maintenance consumption, never finance
+ * or a cleanup/native permission. Called only at quiescent engine hooks. */
+size_t
+wl_columnar_session_test_general_original_bytes(void)
+{
+    return sizeof(wl_columnar_session_observed_original_t);
+}
+int
+wl_columnar_session_test_general_maintenance_consumed(
+    const wl_col_session_t *sess,
+    uint64_t *out)
+{
+    const wl_columnar_controlled_step_t *step = sess?sess->controlled_step:NULL;
+    const wl_columnar_session_observed_transaction_t *tx =
+        step?step->transaction:NULL;
+    if (!out || !step || !step->general_observed ||
+        !step->transaction_initialized ||
+        !tx || !tx->maintenance || !tx->maintenance_id ||
+        !tx->metadata_admitted ||
+        tx->maintenance == sess->base.evaluation_control)return EINVAL;
+    return wl_evaluation_control_test_active_consumed(tx->maintenance,
+               tx->maintenance_id, out);
+}
+
+unsigned
+wl_columnar_session_test_general_route_flags(const wl_col_session_t *sess)
+{
+    const wl_columnar_controlled_step_t *step = sess?sess->controlled_step:NULL;
+    if (!step)return 0;
+    return (step->general_observed?1u:0u) | (step->observed?2u:0u) |
+           (step->transaction_initialized?4u:0u) |
+           (sess->delta_observer || sess->delta_observer_build ||
+           sess->delta_observer_prepare?8u:0u);
 }
 
 unsigned
@@ -16392,6 +16500,42 @@ wl_columnar_session_retirement_begin_failure_drive(wl_col_session_t *sess,
     return rc;
 }
 
+/* Admission-only recognition of genuine quiescent rollback debt. The actual
+ * claim/reader/retirement owners still prove and perform every cleanup step.
+ * No receipt, forward permission or control epoch is synthesized here. */
+static bool
+wl_columnar_session_general_rollback_pending(const wl_col_session_t *sess,
+    const wl_columnar_controlled_step_t *step, bool original_stale)
+{
+    if (!original_stale || !step || sess->controlled_step != step ||
+        !step->general_observed || !step->transaction_initialized ||
+        !step->operation_active || !step->operation_id ||
+        !step->operation_identity || step->snapshot_owned)return false;
+    const wl_columnar_session_observed_transaction_t *tx = step->transaction;
+    if (!tx || !tx->rollback)return false;
+    if (tx->rollback_result <= 0 || tx->phase < WL_SESSION_OBSERVED_CLAIMS ||
+        tx->phase > WL_SESSION_OBSERVED_CUTOFF || step->transaction_discard ||
+        tx->committed || step->published || tx->child_active ||
+        tx->receipt_pending ||
+        tx->receipt_ack || !tx->generation ||
+        tx->generation != tx->closed_generation ||
+        tx->rollback_index > tx->old_count || tx->old_registry != sess->rels ||
+        tx->old_count != sess->nrels)return false;
+    if (sess->cleanup_active || sess->cleanup_pending ||
+        step->join_cleanup.kind ||
+        step->unary_cleanup.registered ||
+        step->native_error_phase != WL_COLUMNAR_SESSION_NATIVE_ERROR_INERT ||
+        step->finish_source_pending || step->staging_cancel_pending ||
+        step->retirement_begin_failure_pending)return false;
+    if (tx->maintenance){
+        if (!tx->maintenance_id ||
+            tx->maintenance == sess->base.evaluation_control ||
+            wl_evaluation_control_active_attempt_id(tx->maintenance) !=
+            tx->maintenance_id) return false;
+    }else if (tx->maintenance_id || tx->rollback_index)return false;
+    return true;
+}
+
 static int
 col_controlled_step_drive(wl_col_session_t *sess,
     wl_columnar_controlled_step_t *step, bool teardown)
@@ -16419,6 +16563,7 @@ col_controlled_step_drive(wl_col_session_t *sess,
         int rc = begin.protocol;
         if (rc) {
             wl_columnar_session_observed_transaction_t *tx = step->transaction;
+
             if (rc == EOVERFLOW && step->retirement_native_count
                 && step->general_observed && tx && step->transaction_initialized
                 && !tx->committed && !tx->child_active && !sess->cleanup_active
@@ -16458,6 +16603,11 @@ col_controlled_step_drive(wl_col_session_t *sess,
          * Only the existing maintenance owner may retire the old storage;
          * neither END nor a successor grants permission for forward work. */
         wl_columnar_session_observed_transaction_t *tx = step->transaction;
+        /* This enclosing branch already established saved Original mismatch.
+         * Only real maintenance rollback may run; forward work stays excluded. */
+        if (wl_columnar_session_general_rollback_pending(sess, step, true))
+            return wl_columnar_session_observed_drive(sess, step);
+
         if (step->general_observed && step->transaction_initialized && tx
             && step->transaction_discard && !tx->committed
             && !tx->child_active && !tx->receipt_pending && !tx->receipt_ack
@@ -17378,6 +17528,43 @@ col_session_controlled_step_state(const wl_session_t *session)
     }
     return step->refused ? WL_CONTROLLED_STEP_IDLE
         : WL_CONTROLLED_STEP_PENDING;
+}
+
+/* The optional handoff interface is paired even for a state-only observer.
+ * No completion ticket is ever selected; consuming one is a protocol
+ * violation, not a no-op acknowledgement. */
+static void
+wl_columnar_session_state_only_completion_commit(wl_session_t *session,
+    const wl_backend_controlled_completion_t *completion)
+{
+    (void)session; (void)completion;
+    abort();
+}
+
+/* Generic STEP calls this existing optional observation interface after its
+ * SOURCE scope has been restored. State-only: selected_out remains untouched,
+ * and no completion ticket or native permission is produced. SOURCE state
+ * admission continues to use the unchanged getter above. */
+static int
+wl_columnar_session_controlled_step_observe(const wl_session_t *session,
+    wl_backend_controlled_completion_kind_t kind, bool dispatched,
+    wl_backend_controlled_completion_t *selected_out)
+{
+    (void)selected_out;
+    wl_controlled_step_state_t state =
+        col_session_controlled_step_state(session);
+    if (kind != WL_BACKEND_CONTROLLED_COMPLETION_STEP || !dispatched ||
+        state != WL_CONTROLLED_STEP_PENDING)return state;
+    const wl_col_session_t *sess = COL_SESSION((wl_session_t *)session);
+    const wl_columnar_controlled_step_t *step = sess->controlled_step;
+    if (!step || !step->general_observed || !step->transaction_initialized ||
+        !step->transaction || !step->transaction->rollback)return state;
+    bool stale =
+        wl_evaluation_control_active_attempt_id(session->evaluation_control) !=
+        step->operation_id;
+    if (wl_columnar_session_general_rollback_pending(sess, step, stale))
+        return WL_CONTROLLED_STEP_NATIVE_ERROR_CLEANUP_PENDING;
+    return state;
 }
 
 static int
@@ -18828,6 +19015,10 @@ static const wl_compute_backend_t col_backend = {
     .session_budget_denied = wl_columnar_session_budget_denied,
     .session_budget_denial_clear = col_session_budget_denial_clear,
     .session_controlled_step_state = col_session_controlled_step_state,
+    .session_controlled_step_observe =
+        wl_columnar_session_controlled_step_observe,
+    .session_controlled_completion_commit =
+        wl_columnar_session_state_only_completion_commit,
     .session_controlled_step_authorize_insert =
         col_session_controlled_step_authorize_insert,
     .session_controlled_mutation_admit =
