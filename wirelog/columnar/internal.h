@@ -4923,9 +4923,29 @@ int wl_columnar_relation_scalar_source_shape_attempt_controlled(
 int wl_columnar_relation_scalar_source_gather_attempt_controlled(
     wl_columnar_relation_scalar_source_t *source, uint32_t row,
     int64_t *values, uint32_t width);
+/* Source-derived private empty input; declaration pointer is compatibility
+ * context only, never a physical schema recipe. Preserves original readers,
+ * graph/declaration header and physical width. outNULL bootstrap, saved-ID
+ * final publication, private mandatory cleanup pre-admitted before ownership. */
+int wl_columnar_relation_new_empty_input_operator_attempt_controlled(
+    const char *, const col_rel_t *, const wirelog_column_type_t *,
+    wl_columnar_memory_governor_ref_t *, col_rel_t **,
+    wl_evaluation_control_t *, uint64_t);
+#ifdef WL_SESSION_TEST_HOOKS
+extern void (*wl_columnar_relation_test_empty_input_checkpoint)(
+    wl_evaluation_control_t *, unsigned);
+#endif
+/* Same source-derived empty-input contract, additionally preserving actual
+ * timestamp presence under its own source readers and paid phase636. */
+int wl_columnar_relation_new_empty_timestamp_input_operator_attempt_controlled(
+    const char *, const col_rel_t *, const wirelog_column_type_t *,
+    wl_columnar_memory_governor_ref_t *, col_rel_t **,
+    wl_evaluation_control_t *, uint64_t);
 /* Exclusive empty out; single outNULL bootstrap. Already-held readers protect
  * recipe pointers; no reacquisition. Failed private local is checked-destroyed
- * or fail-stopped, not retained by a stillNULL external/frame slot. */
+ * or fail-stopped, not retained by a stillNULL external/frame slot.
+ * All scalar new-like siblings pay an additional256 after their original
+ * LIKE128 tail to preserve the physical graph-lane output bound. */
 int wl_columnar_relation_scalar_source_new_like_attempt_controlled(
     wl_columnar_relation_scalar_source_t *source, const char *name,
     wl_columnar_memory_governor_ref_t *governor, col_rel_t **out);
@@ -4935,6 +4955,15 @@ int wl_columnar_relation_scalar_source_new_like_attempt_controlled(
 int wl_columnar_relation_scalar_source_new_like_operator_attempt_controlled(
     wl_columnar_relation_scalar_source_t *source, const char *name,
     wl_columnar_memory_governor_ref_t *governor, col_rel_t **out);
+/* ANTI's ungoverned legacy pointer factory maps invalid graph output to
+ * ENOMEM; governed checked output keeps EINVAL. Control/authority errors win. */
+int wl_columnar_relation_scalar_source_new_like_anti_operator_attempt_controlled
+(
+    wl_columnar_relation_scalar_source_t *, const char *,
+    wl_columnar_memory_governor_ref_t *, col_rel_t **);
+int wl_columnar_relation_empty_source_new_like_anti_operator_attempt_controlled(
+    wl_columnar_relation_empty_source_t *, const char *,
+    wl_columnar_memory_governor_ref_t *, col_rel_t **);
 /* Both original held sources stay protected through synchronous construction.
  * selected_types is NULL or original immutable native lanes from held left or
  * right of identical width. Names/graph/declared width always come from left. */
@@ -8170,6 +8199,11 @@ int wl_columnar_filter_op_attempt_ack_owned(
 
 int wl_columnar_eval_stack_unary_input_owned(
     wl_columnar_eval_stack_cleanup_frame_t *, const col_rel_t **, const void *);
+/* Exclusive/disjoint outputs, unchanged on error. Actual protected unary
+ * original relation and ownership, with the same owner/thread/attempt guards. */
+int wl_columnar_eval_stack_unary_input_info_owned(
+    wl_columnar_eval_stack_cleanup_frame_t *, const col_rel_t **, bool *,
+    const void *);
 int wl_columnar_eval_stack_unary_output_owned(
     wl_columnar_eval_stack_cleanup_frame_t *, col_rel_t ***, const void *);
 int wl_columnar_eval_stack_unary_commit_attempt_owned(

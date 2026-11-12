@@ -228,7 +228,7 @@ These exist so struct fields can be declared portably; the audit in
 
 Every `atomic_*` call site in `wirelog/` production sources. Counted
 mechanically by `scripts/ci/check-threading-doc.sh`; row count must
-match the script's count (currently **560**).
+match the script's count (currently **563**).
 
 Format: `file:function[#N]` | field | operation | order | justification.
 
@@ -670,7 +670,7 @@ concurrent alias removals cannot underflow the count.
 | `session.c:session_pool_rel_promote#3` | `src->storage_alias_borrows` | `atomic_store_explicit` | relaxed | Leave the closed pool tombstone with no child aliases |
 
 112 + 21 + 37 = **170 atomic call sites** in the summarized groups; the full
-symbol-anchored inventory below covers 560 sites.
+symbol-anchored inventory below covers 563 sites.
 
 The `#N` suffix counts all atomic sites in a symbol, regardless of operation;
 the first site remains unsuffixed. `scripts/ci/check-threading-doc.sh` uses
@@ -1779,7 +1779,7 @@ DONE. If a stop leaves the receipt holding a claim, its caller preserves that
 receipt and resumes with a fresh live maintenance attempt; it cannot abandon or
 reinitialize the receipt/token while the claim remains held.
 
-The complete current atomic-source inventory contains 560 call sites.
+The complete current atomic-source inventory contains 563 call sites.
 
 ### Caller-attempt-bound single mutation admission
 
@@ -2655,6 +2655,9 @@ physical storage and returning its exact credit.
 | Source anchor | Object | Atomic operation | Ordering | Synchronization purpose |
 | --- | --- | --- | --- | --- |
 | `session.c:wl_columnar_session_test_committed_metadata_bytes` | `token->state` | `atomic_load_explicit` | acquire | Test-only read authenticates the actual retained RESERVED metadata token under quiescent session ownership; it grants no cleanup or admission authority |
+| `session.c:wl_columnar_session_test_pending_source_bytes` | `metadata->state` | `atomic_load_explicit` | acquire | Test-only quiescent inspection authenticates the real retained RESERVED metadata credit; no authority escapes |
+| `session.c:wl_columnar_session_test_pending_source_bytes#2` | `image->state` | `atomic_load_explicit` | acquire | Test-only quiescent inspection authenticates the real retained RESERVED image credit; no authority escapes |
+| `relation.c:wl_columnar_relation_empty_input_acquire` | `src->storage_alias_borrows` | `atomic_load_explicit` | acquire | Require no storage alias borrows while genuine descriptor and owner readers protect the bare source recipe |
 | `session.c:wl_columnar_session_scalar_view_allocate` | `token->state` | `atomic_load_explicit` | acquire | Require the coordinator's final-address arena token to be EMPTY before real governor admission |
 | `session.c:wl_columnar_session_scalar_view_release` | `token->state` | `atomic_load_explicit` | acquire | Verify COMMITTED arena authority before physical storage is freed and its credit released |
 | `session.c:wl_columnar_session_scalar_view_release#2` | `token->owner_bits` | `atomic_load_explicit` | acquire | Verify that the actual committed reservation names this arena allocation before destruction |

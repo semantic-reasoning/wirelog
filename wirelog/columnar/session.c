@@ -9979,6 +9979,66 @@ wl_columnar_session_test_committed_metadata_bytes(const wl_col_session_t *sess,
     return 0;
 }
 
+/* Read-only observation of genuine resumable pre-child source ownership.
+ * Test instrumentation only: no token, reader, receipt or authority escapes. */
+int
+wl_columnar_session_test_pending_source_bytes(const wl_col_session_t *sess,
+    uint64_t *bytes)
+{
+    if (!sess || !bytes) return EINVAL;
+    *bytes = 0;
+    const wl_columnar_controlled_step_t *step = sess->controlled_step;
+    const wl_columnar_session_observed_transaction_t *tx =
+        step ? step->transaction : NULL;
+    if (!step || !step->transaction_initialized || !tx ||
+        tx->committed) return 0;
+    if (!step->general_observed || step->transaction_discard ||
+        tx->child_active ||
+        tx->phase != WL_SESSION_OBSERVED_SCHEMA || tx->receipt_pending ||
+        tx->differential.started || tx->append_active || tx->frontier_started ||
+        !tx->metadata_admitted || !tx->image_admitted || !tx->entries ||
+        !tx->heads ||
+        !tx->image || (tx->old_count && !tx->originals) ||
+        !sess->memory_governor ||
+        tx->old_registry_held || tx->old_hash_held) return EINVAL;
+    const wl_columnar_memory_reservation_t *metadata = &tx->metadata_credit;
+    const wl_columnar_memory_reservation_t *image = &tx->image_credit;
+    wl_columnar_memory_governor_t *g =
+        wl_columnar_memory_governor_ref_get(sess->memory_governor);
+    if (metadata->identity != metadata || image->identity != image ||
+        metadata->governor != g || image->governor != g ||
+        atomic_load_explicit(&metadata->state,
+        memory_order_acquire) != WL_COLUMNAR_MEMORY_RESERVATION_RESERVED ||
+        atomic_load_explicit(&image->state,
+        memory_order_acquire) != WL_COLUMNAR_MEMORY_RESERVATION_RESERVED)
+        return EINVAL;
+    uint64_t expected = sizeof(*tx) + (uint64_t)tx->count *
+        sizeof(*tx->entries) +
+        (uint64_t)tx->head_count *
+        (sizeof(*tx->heads) + sizeof(*tx->overrides)) +
+        (uint64_t)tx->old_count * sizeof(*tx->originals) +
+        (uint64_t)tx->op_count *
+        (sizeof(*tx->ops) + sizeof(*tx->frontier_sources));
+    if (metadata->bytes != expected ||
+        image->bytes !=
+        (uint64_t)tx->image_cap * sizeof(*tx->image)) return EINVAL;
+    for (uint32_t i = 0; i < tx->old_count; ++i) {
+        const wl_columnar_session_observed_original_t *o = &tx->originals[i];
+        const wl_columnar_relation_reader_step_t *r = &o->reader;
+        if (!o->relation || r->identity != (uintptr_t)r ||
+            r->relation != o->relation ||
+            !r->descriptor_held || r->token.identity != (uintptr_t)&r->token ||
+            r->token.owner != &o->relation->source_access ||
+            r->token.secondary_owner != &o->relation->descriptor_access ||
+            !r->token.transferable || r->token.thread_valid ||
+            !wl_columnar_relation_snapshot_equal(o->snapshot,
+            wl_columnar_relation_snapshot(o->relation)))
+            return EINVAL;
+    }
+    *bytes = metadata->bytes + image->bytes;
+    return 0;
+}
+
 unsigned
 wl_columnar_session_test_cleanup_owners(const wl_col_session_t *sess)
 {
@@ -13204,19 +13264,6 @@ col_controlled_step_current_relation(wl_col_session_t *sess,
     return 0;
 }
 
-/* A private empty input: typed when types is non-NULL, else untyped. */
-static int
-wl_columnar_session_observed_empty_input(wl_col_session_t *sess,
-    const char *name, uint32_t width, const wirelog_column_type_t *types,
-    col_rel_t **out, wl_evaluation_control_t *control, uint64_t id)
-{
-    if (types)
-        return wl_columnar_relation_new_typed_operator_attempt_controlled(
-            name, width, types, sess->memory_governor, out, control, id);
-    return wl_columnar_relation_new_auto_operator_attempt_controlled(name,
-               width, 1, sess->memory_governor, out, control, id);
-}
-
 static bool
 wl_columnar_session_observed_untyped_lane(wirelog_column_type_t type)
 {
@@ -14075,15 +14122,11 @@ wl_columnar_session_observed_action(wl_col_session_t *sess,
             if ((!r->ncols && width) || !r->schema_ok) {
                 if (r->nrows) return ENOTSUP;
                 col_rel_t *empty = NULL;
-                /* Session creation gives an EDB with a FLOAT or STRING
-                 * lane, or an INLINE compound column and no SIDE column,
-                 * its lane types. An EDB without lane types gets an untyped
-                 * private empty, as the uncontrolled session reads it
-                 * (#2301). */
-                rc = wl_columnar_session_observed_empty_input(sess,
-                        tx->entries[i].name, width, r->column_types
-                        ? plan->edb_column_types[i] : NULL, &empty, control,
-                        step->operation_id);
+                rc =
+                    wl_columnar_relation_new_empty_input_operator_attempt_controlled
+                    (
+                    tx->entries[i].name, r, plan->edb_column_types[i],
+                    sess->memory_governor, &empty, control, step->operation_id);
                 if (rc) return rc;
                 tx->entries[i].relation = empty;
             }

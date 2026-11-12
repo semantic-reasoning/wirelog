@@ -7509,3 +7509,13 @@ expression_schema_exe = executable('test_evaluation_expression_schema',
 )
 test('evaluation_expression_schema', expression_schema_exe,
   suite: ['unit', 'tsan'], timeout: 120)
+
+empty_expression_sources_exe = executable('test_evaluation_empty_expression_sources',
+  files('test_evaluation_empty_expression_sources.c'),
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  c_args: ['-DWL_SESSION_TEST_HOOKS=1'],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
+  link_with: [testlib_prod],
+)
+test('evaluation_empty_expression_sources', empty_expression_sources_exe,
+  suite: ['unit', 'tsan'], timeout: 120)
