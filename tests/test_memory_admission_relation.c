@@ -4947,9 +4947,124 @@ cleanup:
     }
 }
 
+/* A missing timestamp source supplies default provenance, just as row append
+ * does. Poison addressable spare slots so this fails deterministically before
+ * the fix, independently of allocator contents. */
+static bool
+bulk_stamp_equal(col_delta_timestamp_t a, col_delta_timestamp_t b)
+{
+    return a.iteration == b.iteration && a.stratum == b.stratum
+           && a.worker == b.worker && a._reserved == b._reserved
+           && a.multiplicity == b.multiplicity;
+}
+
+static void
+test_bulk_timestamp_defaults(void)
+{
+    for (unsigned mode = 0; mode < 4; ++mode) {
+        for (unsigned width = 0; width < 2; ++width) {
+            for (unsigned grow = 0; grow < 2; ++grow) {
+                for (unsigned source_ts = 0; source_ts < 2; ++source_ts) {
+                    wl_columnar_memory_resolution_t resolution;
+                    make_resolution(&resolution, UINT64_C(1) << 24);
+                    wl_columnar_memory_governor_ref_t *ref = mode == 1
+                        ? wl_columnar_memory_governor_ref_create(&resolution)
+                        : NULL;
+                    delta_pool_t *pool = mode == 2
+                        ? delta_pool_create(1, sizeof(col_rel_t), 4096) : NULL;
+                    wl_arena_t *arena = mode ==
+                        2 ? wl_arena_create(4096) : NULL;
+                    col_rel_t *owner = NULL;
+                    col_rel_t *dst = mode == 2
+                        ? col_rel_pool_new_auto(pool, arena, "bulk-dst", width)
+                        : col_rel_new_auto("bulk-dst", width);
+                    col_rel_t *src = col_rel_new_auto("bulk-src", width);
+                    CHECK(dst && src && (mode != 1 || ref)
+                        && (mode != 2 || (pool && arena)), "bulk TS setup");
+                    if (!dst || !src || (mode == 1 && !ref)) abort();
+                    uint32_t prefix = grow ? COL_REL_INIT_CAP - 1 : 1;
+                    int64_t value = 17;
+                    for (uint32_t i = 0; i < prefix; ++i)
+                        CHECK(!col_rel_append_row(dst, &value), "bulk prefix");
+                    if (mode == 3) {
+                        owner = dst;
+                        dst = col_rel_new_auto("bulk-view", width);
+                        CHECK(dst && !col_rel_enable_timestamps(dst)
+                            && !col_rel_install_shared_view(dst, owner),
+                            "bulk actual shared view");
+                    }
+                    int enable_rc = col_rel_enable_timestamps(dst);
+                    CHECK(!enable_rc && dst->timestamps, "bulk TS enable");
+                    if (enable_rc || !dst->timestamps) {
+                        fprintf(stderr,
+                            "bulk mode%u width%u grow%u TS enable%d cap%u\n",
+                            mode, width, grow, enable_rc, dst->capacity);
+                        abort();
+                    }
+                    if (ref) CHECK(!col_rel_attach_memory_governor(dst, ref),
+                            "bulk governor attach");
+                    col_delta_timestamp_t old = { 11, 7, 3, 0, -5 };
+                    col_delta_timestamp_t poison = { 91, 92, 93, 0, -94 };
+                    for (uint32_t i = 0; i < dst->timestamp_capacity; ++i)
+                        dst->timestamps[i] = i < prefix ? old : poison;
+                    uint32_t old_ts_capacity = dst->timestamp_capacity;
+                    for (unsigned i = 0; i < 3; ++i)
+                        CHECK(!col_rel_append_row(src, &value), "bulk source");
+                    col_delta_timestamp_t copied = { 21, 22, 23, 0, -24 };
+                    if (source_ts) {
+                        CHECK(!col_rel_enable_timestamps(src), "source TS");
+                        for (uint32_t i = 0; i < src->nrows; ++i)
+                            src->timestamps[i] = copied;
+                    }
+                    CHECK(!col_rel_append_all(dst, src, arena), "bulk append");
+                    CHECK(dst->nrows == prefix + 3, "bulk rows published");
+                    for (uint32_t i = 0; i < dst->nrows; ++i) {
+                        col_delta_timestamp_t expected = i < prefix ? old
+                            : source_ts ? copied : (col_delta_timestamp_t){0};
+                        CHECK(bulk_stamp_equal(dst->timestamps[i], expected),
+                            "bulk timestamp prefix/copy/default provenance");
+                        if (width) CHECK(dst->columns[0][i] == value,
+                                "bulk values preserved");
+                    }
+                    if (!grow) {
+                        for (uint32_t i = dst->nrows; i < old_ts_capacity; ++i)
+                            CHECK(bulk_stamp_equal(dst->timestamps[i], poison),
+                                "bulk untouched spare timestamps preserved");
+                    }
+                    col_rel_t *untracked = col_rel_new_auto("bulk-untracked",
+                            width);
+                    CHECK(untracked && !col_rel_append_all(untracked, src, NULL)
+                        && !untracked->timestamps && untracked->nrows == 3,
+                        "bulk does not enable destination timestamps");
+                    col_rel_destroy(untracked);
+                    uint32_t rows = dst->nrows;
+                    col_rel_destroy(src);
+                    src = col_rel_new_auto("bulk-empty", width);
+                    CHECK(src != NULL, "bulk empty source setup");
+                    CHECK(!col_rel_append_all(dst, src, arena)
+                        && dst->nrows == rows, "empty source unchanged");
+                    col_rel_destroy(src);
+                    if (mode == 2) col_rel_free_contents(dst);
+                    else col_rel_destroy(dst);
+                    col_rel_destroy(owner);
+                    if (pool) delta_pool_destroy(pool);
+                    if (arena) wl_arena_free(arena);
+                    if (ref) {
+                        CHECK(!wl_columnar_memory_reserved(
+                                wl_columnar_memory_governor_ref_get(ref)),
+                            "bulk timestamp governor teardown");
+                        wl_columnar_memory_governor_ref_release(ref);
+                    }
+                }
+            }
+        }
+    }
+}
+
 int
 main(void)
 {
+    test_bulk_timestamp_defaults();
     test_timestamp_growth_provenance();
     test_no_growth_admission_provenance();
     test_growth_error_provenance();

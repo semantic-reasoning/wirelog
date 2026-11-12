@@ -8098,10 +8098,16 @@ col_rel_append_all_impl(col_rel_t *dst, const col_rel_t *src,
     }
     dst->nrows = new_nrows;
 
-    /* Copy timestamps if both have tracking enabled */
-    if (src->timestamps && dst->timestamps)
-        memcpy(&dst->timestamps[dst_base], src->timestamps,
-            src->nrows * sizeof(col_delta_timestamp_t));
+    /* A source without tracking supplies default provenance, just as row
+     * append does. Spare destination entries may be stale or uninitialized. */
+    if (dst->timestamps) {
+        if (src->timestamps)
+            memcpy(&dst->timestamps[dst_base], src->timestamps,
+                src->nrows * sizeof(col_delta_timestamp_t));
+        else
+            memset(&dst->timestamps[dst_base], 0,
+                src->nrows * sizeof(col_delta_timestamp_t));
+    }
 
     wl_columnar_relation_touch_view(dst);
 
