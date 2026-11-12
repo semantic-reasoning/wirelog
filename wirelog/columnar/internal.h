@@ -2822,6 +2822,9 @@ extern uint64_t (*wl_columnar_session_test_observer_resource_limit)(
 extern void (*wl_columnar_session_test_observer_resource_finished)(
     const struct wl_col_session_t *, unsigned, wl_evaluation_control_report_t,
     int);
+extern void (*wl_columnar_session_test_observer_finance_phase)(
+    struct wl_col_session_t *, wl_evaluation_control_t *, uint64_t,
+    unsigned, bool, int);
 int wl_columnar_session_test_observer_resource_view(
     const struct wl_col_session_t *, uint64_t[12]);
 extern void (*wl_columnar_session_test_observer_parent_free)(

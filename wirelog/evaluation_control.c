@@ -1209,6 +1209,10 @@ wl_evaluation_control_source_bank_run(
 /* Synchronous SOURCE constructor activation. The canonical context never
  * leaves this stack; its lane association is cleared under the same mutex
  * after real phase settlement, including failed admissions/actions. */
+#ifdef WL_SESSION_TEST_HOOKS
+bool wl_evaluation_control_test_source_lexical_cancel_after_action;
+#endif
+
 wl_evaluation_control_source_phase_result_t
 wl_evaluation_control_source_bank_run_lexical(
     wl_evaluation_control_source_bank_t *bank,
@@ -1261,6 +1265,13 @@ wl_evaluation_control_source_bank_run_lexical(
         wl_evaluation_control_source_bank_unlock(bank);
         result.action_result = action(payload);
         result.action_called = true;
+#ifdef WL_SESSION_TEST_HOOKS
+        if (wl_evaluation_control_test_source_lexical_cancel_after_action) {
+            wl_evaluation_control_test_source_lexical_cancel_after_action =
+                false;
+            wl_evaluation_control_request_cancel(lane->control);
+        }
+#endif
         if (wl_evaluation_control_source_bank_lock(bank)) abort();
         lane->callback_active = false;
         rc = wl_evaluation_control_source_bank_charge(lane, policy->close_work);
@@ -2617,6 +2628,22 @@ wl_evaluation_control_finish_attempt(wl_evaluation_control_t *control,
     out.report_valid = true;
     wl_mutex_unlock(&control->mutex);
     return out;
+}
+
+int
+wl_evaluation_control_detach_attempt(wl_evaluation_control_t *control,
+    const void *owner, uint64_t expected_id)
+{
+    if (!control || !owner || !expected_id) return EINVAL;
+    wl_mutex_lock(&control->mutex);
+    int rc = control->owner != owner ? EINVAL
+        : control->attempt_id != expected_id ? EBUSY
+        : control->active ? EBUSY
+        : control->completed.attempt_id != expected_id ? EINVAL : 0;
+    if (!rc) control->owner = NULL;
+    wl_mutex_unlock(&control->mutex);
+    if (!rc) wl_evaluation_control_release(control);
+    return rc;
 }
 
 /* Fully counted sibling. The produced ID is copied before mutex release. */

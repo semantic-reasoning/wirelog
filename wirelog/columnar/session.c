@@ -370,6 +370,9 @@ typedef struct {
     bool native, begun, acknowledged, finished;
     wl_evaluation_control_t *funding;
     uint64_t funding_id;
+    wl_evaluation_control_report_t close_report;
+    unsigned close_phase;
+    bool close_report_valid, close_busy;
     int protocol;
     bool action_done, barrier_only;
     unsigned action;
@@ -15423,43 +15426,117 @@ uint64_t (*wl_columnar_session_test_observer_resource_limit)(
 void (*wl_columnar_session_test_observer_resource_finished)(
     const wl_col_session_t *, unsigned, wl_evaluation_control_report_t, int);
 void (*wl_columnar_session_test_observer_parent_free)(wl_col_session_t *);
+void (*wl_columnar_session_test_observer_finance_phase)(wl_col_session_t *,
+    wl_evaluation_control_t *, uint64_t, unsigned, bool, int);
 
 #endif
 
-/* The controller is a real Step-attached owner, retained until its actual
-* generation is inactive. A foreign successor is never finished for it. */
+enum {
+    WL_SESSION_OBSERVER_CLOSE_FINISH = 1,
+    WL_SESSION_OBSERVER_CLOSE_DETACH,
+    WL_SESSION_OBSERVER_CLOSE_RELEASE,
+    WL_SESSION_OBSERVER_CLOSE_CONSUME,
+    WL_SESSION_OBSERVER_CLOSE_OBSERVED
+};
+
+/* This payload borrows the canonical Step only for one synchronous BANK
+ * callback. Progress and the genuine report live in the Step, not here. */
+typedef struct {
+    wl_columnar_controlled_step_t *step;
+} wl_columnar_session_observer_close_context_t;
+
+static int
+wl_columnar_session_observer_close_action(void *payload)
+{
+    wl_columnar_session_observer_close_context_t *ctx = payload;
+    wl_columnar_controlled_step_t *step = ctx->step;
+    wl_columnar_session_observed_observer_t *j = &step->observed_observer;
+    switch (j->close_phase) {
+    case WL_SESSION_OBSERVER_CLOSE_FINISH: {
+        wl_evaluation_control_attempt_finish_result_t result =
+            wl_evaluation_control_finish_attempt(j->funding, step,
+                j->funding_id, 0, 0);
+        if (result.protocol || !result.report_valid
+            || (result.kind != WL_EVALUATION_CONTROL_ATTEMPT_FINISH_OWN_FINISHED
+            && result.kind !=
+            WL_EVALUATION_CONTROL_ATTEMPT_FINISH_ALREADY_ENDED)
+            || result.report.attempt_id != j->funding_id) return EAGAIN;
+        j->close_report = result.report;
+        j->close_report_valid = true;
+        j->close_phase = WL_SESSION_OBSERVER_CLOSE_DETACH;
+        return 0;
+    }
+    case WL_SESSION_OBSERVER_CLOSE_DETACH: {
+        if (!j->close_report_valid) return EINVAL;
+        int rc = wl_evaluation_control_detach_attempt(j->funding, step,
+                j->funding_id);
+        if (rc) return rc;
+        j->close_phase = WL_SESSION_OBSERVER_CLOSE_RELEASE;
+        return 0;
+    }
+    case WL_SESSION_OBSERVER_CLOSE_RELEASE: {
+        wl_evaluation_control_t *funding = j->funding;
+        if (!funding || !j->close_report_valid) return EINVAL;
+        /* No returning check separates loss of the creation obligation from
+         * its physical release. No later stage follows this old pointer. */
+        j->funding = NULL;
+        j->funding_id = 0;
+        j->close_phase = WL_SESSION_OBSERVER_CLOSE_CONSUME;
+        wl_evaluation_control_release(funding);
+        return 0;
+    }
+    case WL_SESSION_OBSERVER_CLOSE_CONSUME:
+        if (j->funding || !j->close_report_valid) return EINVAL;
+        j->close_phase = WL_SESSION_OBSERVER_CLOSE_OBSERVED;
+        return 0;
+    case WL_SESSION_OBSERVER_CLOSE_OBSERVED:
+        /* A refused BANK footer after CONSUME retries only its observation. */
+        return j->funding || !j->close_report_valid ? EINVAL : 0;
+    default:
+        return EINVAL;
+    }
+}
+
+/* Each call advances at most one actual metadata action. BANK settlement
+ * cannot erase progress, even after final creation-reference release. */
 static int
 wl_columnar_session_observed_observer_finance_close(wl_col_session_t *sess,
     wl_columnar_controlled_step_t *step)
 {
     wl_columnar_session_observed_observer_t *j = &step->observed_observer;
-    wl_evaluation_control_t *funding = j->funding;
-    uint64_t active = wl_evaluation_control_active_attempt_id(funding);
-    if (active && active != j->funding_id) return EAGAIN;
-    wl_evaluation_control_report_t report = {0};
-    bool own = false;
-    if (active) {
-        wl_evaluation_control_attempt_finish_result_t result =
-            wl_evaluation_control_finish_attempt(funding, step, j->funding_id,
-                0, 0);
-        if (result.protocol || result.kind ==
-            WL_EVALUATION_CONTROL_ATTEMPT_FINISH_REJECTED) return EAGAIN;
-        if (wl_evaluation_control_active_attempt_id(funding)) return EAGAIN;
-        own = result.report_valid && result.report.attempt_id == j->funding_id;
-        if (own) report = result.report;
-    } else own = !wl_evaluation_control_report(funding, &report)
-            && report.attempt_id == j->funding_id;
-    int protocol = j->protocol;
-    if (!own) protocol = protocol ? protocol : EINVAL;
-    else if (report.result && !protocol) protocol = report.result;
-    if (wl_evaluation_control_detach(funding, step)) return EAGAIN;
-    j->funding = NULL; j->funding_id = 0;
-    wl_evaluation_control_release(funding);
+    if (j->close_busy || !j->close_phase) return EBUSY;
+    j->close_busy = true;
 #ifdef WL_SESSION_TEST_HOOKS
-    if (own && wl_columnar_session_test_observer_resource_finished)
+    if (wl_columnar_session_test_observer_finance_phase)
+        wl_columnar_session_test_observer_finance_phase(sess, j->funding,
+            j->funding_id, j->close_phase, false, 0);
+#endif
+    wl_columnar_session_observer_close_context_t context = {step};
+    wl_evaluation_control_source_phase_result_t phase =
+        wl_session_source_operator_close_metadata(&sess->base,
+            wl_columnar_session_observer_close_action, &context);
+#ifdef WL_SESSION_TEST_HOOKS
+    if (wl_columnar_session_test_observer_finance_phase)
+        wl_columnar_session_test_observer_finance_phase(sess, j->funding,
+            j->funding_id, j->close_phase, true, phase.financial_result);
+#endif
+    if (phase.financial_result || !phase.action_called || phase.action_result
+        || j->close_phase != WL_SESSION_OBSERVER_CLOSE_OBSERVED) {
+        j->close_busy = false;
+        return EAGAIN;
+    }
+    const wl_evaluation_control_report_t report = j->close_report;
+    int protocol = j->protocol ? j->protocol : report.result;
+    /* Consume once before the diagnostic hook; busy retains reentry
+    * protection until all parent-result publication is complete. */
+    j->close_phase = 0;
+    j->close_report_valid = false;
+#ifdef WL_SESSION_TEST_HOOKS
+    if (wl_columnar_session_test_observer_resource_finished)
         wl_columnar_session_test_observer_resource_finished(sess,
             j->action, report, protocol);
 #endif
+    j->close_busy = false;
     if (protocol) return EAGAIN;
     if (j->action_done) {
         j->finished = true;
@@ -15476,7 +15553,9 @@ wl_columnar_session_observed_observer_resources(wl_col_session_t *sess,
 {
     wl_columnar_session_observed_transaction_t *tx = step->transaction;
     wl_columnar_session_observed_observer_t *j = &step->observed_observer;
-    if (j->funding) return wl_columnar_session_observed_observer_finance_close(
+    if (j->close_busy) return EBUSY;
+    if (j->funding || j->close_phase)
+        return wl_columnar_session_observed_observer_finance_close(
             sess, step);
     if (j->identity == j && j->finished) return j->transaction ? EINVAL : 0;
     if (!tx->observer_started || tx->committed) {
@@ -15510,6 +15589,8 @@ wl_columnar_session_observed_observer_resources(wl_col_session_t *sess,
     }
     j->funding = funding;
     j->funding_id = wl_evaluation_control_active_attempt_id(funding);
+    j->close_phase = WL_SESSION_OBSERVER_CLOSE_FINISH;
+    j->close_report_valid = false;
     j->protocol = 0; j->action_done = j->barrier_only = false;
     if (!j->identity) {
         rc = wl_evaluation_control_charge_attempt(funding, j->funding_id, 128);
@@ -15576,7 +15657,8 @@ wl_columnar_session_observed_origin_forget_ready(
     const wl_columnar_controlled_step_t *step)
 {
     const wl_columnar_session_observed_observer_t *j = &step->observed_observer;
-    return !j->funding && (!j->identity || (j->finished && !j->transaction
+    return !j->funding && !j->close_phase && !j->close_busy
+           && (!j->identity || (j->finished && !j->transaction
            && !j->resource.identity && !j->resource.session &&
            !j->resource.busy));
 }
@@ -17480,7 +17562,8 @@ static int
 col_controlled_step_drive(wl_col_session_t *sess,
     wl_columnar_controlled_step_t *step, bool teardown)
 {
-    if (step->native_error_busy || step->retirement_begin_busy
+    if (step->native_error_busy || step->observed_observer.close_busy
+        || step->retirement_begin_busy
         || step->retirement_busy || step->observed_observer.resource.busy)
         return EBUSY;
     if (sess->base.source_c1_admission
@@ -18048,6 +18131,7 @@ col_controlled_step(wl_col_session_t *sess,
 {
     if (sess->controlled_step &&
         (sess->controlled_step->native_error_busy
+        || sess->controlled_step->observed_observer.close_busy
         || sess->controlled_step->observed_observer.resource.busy
         || sess->controlled_step->join_cleanup.busy
         || sess->controlled_step->unary_cleanup.busy
@@ -18308,6 +18392,7 @@ col_session_step_body(wl_session_t *session)
     wl_col_session_t *sess = COL_SESSION(session);
     if (sess->controlled_step &&
         (sess->controlled_step->native_error_busy
+        || sess->controlled_step->observed_observer.close_busy
         || sess->controlled_step->observed_observer.resource.busy
         || sess->controlled_step->join_cleanup.busy
         || sess->controlled_step->unary_cleanup.busy
