@@ -7529,3 +7529,13 @@ seed_physical_exe = executable('test_evaluation_seed_physical',
 )
 test('evaluation_seed_physical', seed_physical_exe,
   suite: ['unit', 'tsan'], timeout: 120)
+
+seed_private_compact_exe = executable('test_evaluation_seed_private_compact',
+  files('test_evaluation_seed_private_compact.c'),
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  c_args: ['-DWL_SESSION_TEST_HOOKS=1', '-DWL_TEST_RELATION_RESIZE_HOOK=1'],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
+  link_with: [testlib_prod],
+)
+test('evaluation_seed_private_compact', seed_private_compact_exe,
+  suite: ['unit', 'tsan'], timeout: 120)

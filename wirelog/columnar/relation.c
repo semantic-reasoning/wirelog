@@ -26480,6 +26480,83 @@ typedef struct {
     bool detached, installed, old_schema_ok;
 } wl_columnar_session_seed_metadata_t;
 
+typedef enum {
+    WL_COLUMNAR_SESSION_SEED_Q_AUTH,
+    WL_COLUMNAR_SESSION_SEED_Q_OWNER,
+    WL_COLUMNAR_SESSION_SEED_Q_GATES,
+    WL_COLUMNAR_SESSION_SEED_Q_AUX,
+    WL_COLUMNAR_SESSION_SEED_Q_READERS,
+    WL_COLUMNAR_SESSION_SEED_Q_LANES,
+    WL_COLUMNAR_SESSION_SEED_Q_SHAPE,
+    WL_COLUMNAR_SESSION_SEED_Q_OLD_GRID,
+    WL_COLUMNAR_SESSION_SEED_Q_OLD_BYTES,
+    WL_COLUMNAR_SESSION_SEED_Q_OLD_TABLE,
+    WL_COLUMNAR_SESSION_SEED_Q_OLD_TS,
+    WL_COLUMNAR_SESSION_SEED_Q_SCRATCH,
+    WL_COLUMNAR_SESSION_SEED_Q_OLD_FINAL,
+    WL_COLUMNAR_SESSION_SEED_Q_CREDIT,
+    WL_COLUMNAR_SESSION_SEED_Q_CREDIT_OWNER,
+    WL_COLUMNAR_SESSION_SEED_Q_CREDIT_STATE,
+    WL_COLUMNAR_SESSION_SEED_Q_TIGHT,
+    WL_COLUMNAR_SESSION_SEED_Q_NEW_GRID,
+    WL_COLUMNAR_SESSION_SEED_Q_NEW_BYTES,
+    WL_COLUMNAR_SESSION_SEED_Q_NEW_TABLE,
+    WL_COLUMNAR_SESSION_SEED_Q_NEW_TS,
+    WL_COLUMNAR_SESSION_SEED_Q_FINAL,
+    WL_COLUMNAR_SESSION_SEED_Q_AGGREGATE,
+    WL_COLUMNAR_SESSION_SEED_Q_GROW,
+    WL_COLUMNAR_SESSION_SEED_Q_VERDICT,
+    WL_COLUMNAR_SESSION_SEED_Q_TABLE,
+    WL_COLUMNAR_SESSION_SEED_Q_ZERO_TABLE,
+    WL_COLUMNAR_SESSION_SEED_Q_ALLOC_LANES,
+    WL_COLUMNAR_SESSION_SEED_Q_COPY_LANES,
+    WL_COLUMNAR_SESSION_SEED_Q_ALLOC_TS,
+    WL_COLUMNAR_SESSION_SEED_Q_COPY_TS,
+    WL_COLUMNAR_SESSION_SEED_Q_ZERO_TS,
+    WL_COLUMNAR_SESSION_SEED_Q_COMMIT_HOOK,
+    WL_COLUMNAR_SESSION_SEED_Q_PREPARE,
+    WL_COLUMNAR_SESSION_SEED_Q_PUBLISH,
+    WL_COLUMNAR_SESSION_SEED_Q_CLAMP_SORTED,
+    WL_COLUMNAR_SESSION_SEED_Q_CLAMP_BASE,
+    WL_COLUMNAR_SESSION_SEED_Q_DONE,
+    WL_COLUMNAR_SESSION_SEED_Q_EMPTY_LANES,
+    WL_COLUMNAR_SESSION_SEED_Q_EMPTY_TABLE,
+    WL_COLUMNAR_SESSION_SEED_Q_EMPTY_TS,
+    WL_COLUMNAR_SESSION_SEED_Q_EMPTY_HEADER,
+    WL_COLUMNAR_SESSION_SEED_Q_EMPTY_CREDIT,
+    WL_COLUMNAR_SESSION_SEED_Q_EMPTY_RESET,
+    WL_COLUMNAR_SESSION_SEED_Q_FREE_OLD_LANES,
+    WL_COLUMNAR_SESSION_SEED_Q_FREE_OLD_TABLE,
+    WL_COLUMNAR_SESSION_SEED_Q_FREE_OLD_TS,
+    WL_COLUMNAR_SESSION_SEED_Q_DOWNSIZE,
+    WL_COLUMNAR_SESSION_SEED_Q_DOWNSIZE_STEP,
+    WL_COLUMNAR_SESSION_SEED_Q_CANCEL,
+    WL_COLUMNAR_SESSION_SEED_Q_FREE_NEW_LANES,
+    WL_COLUMNAR_SESSION_SEED_Q_FREE_NEW_TABLE,
+    WL_COLUMNAR_SESSION_SEED_Q_FREE_NEW_TS,
+    WL_COLUMNAR_SESSION_SEED_Q_ROLLBACK,
+    WL_COLUMNAR_SESSION_SEED_Q_REFUND,
+    WL_COLUMNAR_SESSION_SEED_Q_RETRY_NOTICE
+} wl_columnar_session_seed_compact_phase_t;
+typedef struct {
+    wl_columnar_session_seed_compact_phase_t phase;
+    col_rel_t *target;
+    uint32_t selected, width, rows, old_capacity, old_ts_capacity, tight;
+    uint32_t lane, allocated, zeroed, old_lane;
+    uint64_t byte, old_bytes, incoming, final_bytes, aggregate, scratch;
+    uint64_t lane_bytes, ts_bytes, entry_storage;
+    int64_t **columns, **old_columns;
+    col_delta_timestamp_t *timestamps, *old_timestamps;
+    wl_columnar_memory_admission_status_t status;
+    wl_columnar_memory_governor_growth_commit_prepared_t prepared;
+    wl_columnar_memory_growth_refund_attempt_t refund;
+    wl_columnar_memory_downsize_attempt_t downsize;
+    bool active, done, cleanup, empty, changed, had_ts, published;
+    bool prepare_ready, refund_live, downsize_live, retry_claim;
+    bool growth_attempted, release_done;
+    int result, last_result;
+} wl_columnar_session_seed_compact_t;
+
 struct wl_columnar_session_seed {
     struct wl_columnar_session_seed *identity;
     wl_evaluation_control_t *control;
@@ -26524,6 +26601,7 @@ struct wl_columnar_session_seed {
     wl_columnar_session_seed_base_t base_build;
     wl_columnar_session_seed_resize_t resize;
     wl_columnar_session_seed_metadata_t metadata;
+    wl_columnar_session_seed_compact_t compact;
     bool resize_resetting;
     uint64_t resize_reset_byte;
     unsigned pending_cleanup;
@@ -26535,6 +26613,9 @@ struct wl_columnar_session_seed {
     bool begun[2], retired[2];
     unsigned owner, retire_stage;
 };
+
+static int wl_columnar_session_seed_compact_cleanup(
+    wl_columnar_session_seed_t *, wl_evaluation_control_t *, uint64_t);
 
 #ifdef WL_SESSION_TEST_HOOKS
 void (*wl_columnar_session_seed_test_checkpoint)(
@@ -28242,6 +28323,8 @@ wl_columnar_session_seed_maintenance_step(wl_columnar_session_seed_t *a,
     rc = wl_columnar_session_seed_cut(a, funding, id, 1500);
     if (rc) return rc;
     bool done = false;
+    if (a->compact.active && a->compact.cleanup)
+        return wl_columnar_session_seed_compact_cleanup(a, funding, id);
     if (a->base_build.active)
         return wl_columnar_session_seed_base_cleanup_step(a, funding, id,
                    &done);
@@ -28363,6 +28446,8 @@ wl_columnar_session_seed_drain(wl_columnar_session_seed_t *a,
 {
     *done = false;
     int rc;
+    if (a->compact.active)
+        return wl_columnar_session_seed_compact_cleanup(a, funding, id);
     if (a->cleanup_stage == 0) {
         if (a->base_build.active || a->resize.active || a->resize_resetting ||
             a->batch_initialized || a->batch_resetting || a->pending_cleanup)
@@ -28939,6 +29024,596 @@ wl_columnar_session_seed_test_admission(const wl_columnar_session_seed_t *a,
     out[3] = atomic_load_explicit(&token->owner_bits, memory_order_acquire);
     out[4] = a->resize.prepared.phase; out[5] = a->resize.refund.phase;
     out[6] = a->resize.downsize.phase; out[7] = token->bytes;
+    return 0;
+}
+#endif
+
+/* Optional final payload compaction. Each phase owns one actual256 action;
+* the prepared governor child retains its existing228 fee and128 source bound.
+* The64 external-slot reservation is not a canonical caller certificate. */
+static void
+wl_columnar_session_seed_compact_cleanup_needed(wl_columnar_session_seed_t *a,
+    wl_columnar_session_seed_compact_phase_t phase)
+{
+    a->compact.phase = phase; a->compact.cleanup = true;
+    a->progress = WL_COLUMNAR_SESSION_SEED_NEEDS_CLEANUP;
+}
+
+/* Explicit byte leaves keep the new copy interval count independent of a
+ * loop-index model. At most eight initialized source bytes are ever read. */
+static void
+wl_columnar_session_seed_compact_copy8(void *to, const void *from,
+    uint64_t bytes,
+    uint64_t *cursor)
+{
+    uint64_t at = *cursor, n = bytes-at;
+    if (n > 8)n = 8;
+    unsigned char *d = (unsigned char *)to+at;
+    if (from) {
+        const unsigned char *s = (const unsigned char *)from+at;
+        if (n > 0)d[0] = s[0];
+        if (n > 1)d[1] = s[1];
+        if (n > 2)d[2] = s[2];
+        if (n > 3)d[3] = s[3];
+        if (n > 4)d[4] = s[4];
+        if (n > 5)d[5] = s[5];
+        if (n > 6)d[6] = s[6];
+        if (n > 7)d[7] = s[7];
+    } else {
+        if (n > 0)d[0] = 0;
+        if (n > 1)d[1] = 0;
+        if (n > 2)d[2] = 0;
+        if (n > 3)d[3] = 0;
+        if (n > 4)d[4] = 0;
+        if (n > 5)d[5] = 0;
+        if (n > 6)d[6] = 0;
+        if (n > 7)d[7] = 0;
+    }
+    *cursor = at+n;
+}
+
+int
+wl_columnar_session_seed_compact_final_step(wl_columnar_session_seed_t *a,
+    bool *ready)
+{
+    if (!ready || !a) return EINVAL;
+    *ready = false;
+    wl_columnar_session_seed_compact_t *q = &a->compact;
+    int rc = wl_columnar_session_seed_cut(a, a->control, a->id,
+            1800+(unsigned)q->phase);
+    if (rc) return rc;
+    if (a->ending || (a->progress != WL_COLUMNAR_SESSION_SEED_RESULT_READY &&
+        a->progress != WL_COLUMNAR_SESSION_SEED_COMPACTING)) return EBUSY;
+    if (q->done) {
+        *ready = !q->result; return q->result;
+    }
+    if (q->last_result) return q->last_result;
+    col_rel_t *r = q->target;
+    switch (q->phase) {
+    case WL_COLUMNAR_SESSION_SEED_Q_AUTH:
+        if (a->cleanup_stage < 12 || a->batch_initialized ||
+            a->batch_resetting || a->pending_cleanup) return EBUSY;
+        q->selected = a->normalized_result ? 1u : 0u;
+        r = q->selected ? a->normalized : a->working;
+        if (!r || !a->owned[q->selected] ||
+            a->begun[q->selected]) return EINVAL;
+        q->target = r; q->active = true;
+        a->progress = WL_COLUMNAR_SESSION_SEED_COMPACTING;
+        q->phase = r->ncols ? WL_COLUMNAR_SESSION_SEED_Q_OWNER :
+            WL_COLUMNAR_SESSION_SEED_Q_DONE;
+        return 0;
+    case WL_COLUMNAR_SESSION_SEED_Q_OWNER:
+        if (r->storage_owner != r || !r->relation_identity ||
+            r->storage_owner_identity != r->relation_identity ||
+            r->storage_owner_generation != r->storage_generation ||
+            !wl_columnar_relation_generation_valid(r->storage_generation) ||
+            r->memory_governor != a->governor) return EBUSY;
+        q->phase++; return 0;
+    case WL_COLUMNAR_SESSION_SEED_Q_GATES:
+        if (wl_columnar_source_access_gate_busy(&r->descriptor_access) ||
+            wl_columnar_source_access_gate_busy(
+                &r->source_access)) return EBUSY;
+        q->phase++; return 0;
+    case WL_COLUMNAR_SESSION_SEED_Q_AUX:
+        if (col_rel_storage_alias_borrow_count(r) || r->mem_ledger ||
+            r->col_shared || r->arena_owned || r->pool_owned ||
+            r->compound_kind ||
+            r->merge_columns || r->merge_buf_cap || r->retract_backup_columns ||
+            r->retract_backup_timestamps) return EBUSY;
+        if (a->source_initialized[0] || a->source_initialized[1] ||
+            a->source_initialized[2] || a->source_initialized[3]) return EBUSY;
+        q->lane = 0; q->phase++; return 0;
+    case WL_COLUMNAR_SESSION_SEED_Q_READERS:
+    {
+        const wl_columnar_relation_reader_step_t *reader = q->lane == 0 ?
+            &a->target_reader : q->lane ==
+            1 ? &a->shadow_reader : &a->rule_reader;
+        if (reader->descriptor_held || reader->token.owner) return EBUSY;
+        if (++q->lane == 3) {
+            q->lane = 0; q->phase++;
+        }
+        return 0;
+    }
+    case WL_COLUMNAR_SESSION_SEED_Q_LANES:
+        if (!col_rel_timestamp_shape_valid(r) || r->nrows > r->capacity ||
+            (r->capacity && !r->columns) ||
+            (!r->capacity && r->columns)) return EBUSY;
+        if (r->capacity && q->lane < r->ncols) {
+            if (!r->columns[q->lane++]) return EBUSY;
+            return 0;
+        }
+        q->lane = 0; q->phase++; return 0;
+    case WL_COLUMNAR_SESSION_SEED_Q_SHAPE:
+        q->width = r->ncols; q->rows = r->nrows;
+        q->old_capacity = r->capacity;
+        q->old_ts_capacity = r->timestamp_capacity;
+        q->had_ts = r->timestamps != NULL;
+        q->entry_storage = r->storage_generation;
+        q->empty = !r->nrows; q->changed = r->columns || r->timestamps;
+        q->old_columns = r->columns; q->old_timestamps = r->timestamps;
+        q->phase++; return 0;
+    case WL_COLUMNAR_SESSION_SEED_Q_OLD_GRID:
+        if (!wl_columnar_memory_size_mul(q->width, q->old_capacity,
+            &q->old_bytes)) return EOVERFLOW;
+        q->phase++; return 0;
+    case WL_COLUMNAR_SESSION_SEED_Q_OLD_BYTES:
+        if (!wl_columnar_memory_size_mul(q->old_bytes, sizeof(int64_t),
+            &q->old_bytes)) return EOVERFLOW;
+        q->phase++; return 0;
+    case WL_COLUMNAR_SESSION_SEED_Q_OLD_TABLE:
+        if (!wl_columnar_memory_size_add(q->old_bytes, q->old_columns ?
+            (uint64_t)q->width*sizeof(int64_t *) : 0,
+            &q->old_bytes)) return EOVERFLOW;
+        q->phase++; return 0;
+    case WL_COLUMNAR_SESSION_SEED_Q_OLD_TS:
+        if (!wl_columnar_memory_size_add(q->old_bytes, q->had_ts ?
+            (uint64_t)q->old_ts_capacity*sizeof(col_delta_timestamp_t) : 0,
+            &q->old_bytes)) return EOVERFLOW;
+        q->phase++; return 0;
+    case WL_COLUMNAR_SESSION_SEED_Q_SCRATCH:
+        q->scratch = r->row_scratch ? (uint64_t)q->width*sizeof(int64_t) : 0;
+        q->phase++; return 0;
+    case WL_COLUMNAR_SESSION_SEED_Q_OLD_FINAL:
+        if (!wl_columnar_memory_size_add(q->old_bytes, q->scratch,
+            &q->old_bytes)) return EOVERFLOW;
+        if (a->governor &&
+            q->old_bytes != r->retained_reserved_bytes) return EBUSY;
+        q->phase++; return 0;
+    case WL_COLUMNAR_SESSION_SEED_Q_CREDIT:
+        if (a->governor &&
+            (r->retained_reservation.identity != &r->retained_reservation ||
+            r->retained_reservation.bytes != q->old_bytes ||
+            r->retained_reservation.governor != (q->old_bytes ?
+            wl_columnar_memory_governor_ref_get(a->governor) :
+            NULL))) return EBUSY;
+        q->phase++; return 0;
+    case WL_COLUMNAR_SESSION_SEED_Q_CREDIT_OWNER:
+        if (a->governor &&
+            atomic_load_explicit(&r->retained_reservation.owner_bits,
+            memory_order_acquire) !=
+            (q->old_bytes ? (uint64_t)(uintptr_t)r : 0))
+            return EBUSY;
+        q->phase++; return 0;
+    case WL_COLUMNAR_SESSION_SEED_Q_CREDIT_STATE:
+        if (a->governor) {
+            uint64_t state =
+                atomic_load_explicit(&r->retained_reservation.state,
+                    memory_order_acquire);
+            if (!q->old_bytes) {
+                if (state != WL_COLUMNAR_MEMORY_RESERVATION_EMPTY ||
+                    r->retained_reservation.replacement_bytes ||
+                    r->retained_reservation.transition_kind !=
+                    WL_COLUMNAR_MEMORY_TRANSITION_NONE)
+                    return EBUSY;
+            } else if (state == WL_COLUMNAR_MEMORY_RESERVATION_COMMITTED) {
+                if (r->retained_reservation.transition_kind !=
+                    WL_COLUMNAR_MEMORY_TRANSITION_NONE ||
+                    r->retained_reservation.replacement_bytes) return EBUSY;
+            } else if (q->empty ||
+                state != WL_COLUMNAR_MEMORY_RESERVATION_REPLACING ||
+                r->retained_reservation.transition_kind !=
+                WL_COLUMNAR_MEMORY_TRANSITION_GROWTH)
+                return EBUSY;
+        }
+        q->phase++; return 0;
+    case WL_COLUMNAR_SESSION_SEED_Q_TIGHT:
+        if (q->empty) {
+            q->final_bytes = q->scratch;
+            wl_columnar_session_seed_compact_cleanup_needed(a,
+                WL_COLUMNAR_SESSION_SEED_Q_EMPTY_LANES);
+            return 0;
+        }
+        if (q->old_capacity <= (uint64_t)q->rows*4) {
+            /* This actor's earlier EAGAIN retains its phase/claim; no live
+             * replacement can be concealed by this fresh shape skip. */
+            if (a->governor &&
+                atomic_load_explicit(&r->retained_reservation.state,
+                memory_order_acquire) ==
+                WL_COLUMNAR_MEMORY_RESERVATION_REPLACING){
+                wl_columnar_session_seed_compact_cleanup_needed(a,
+                    WL_COLUMNAR_SESSION_SEED_Q_ROLLBACK);
+            } else q->phase = WL_COLUMNAR_SESSION_SEED_Q_CLAMP_SORTED;
+            return 0;
+        }
+        q->tight = q->rows*2;
+        if (q->tight < q->rows) q->tight = UINT32_MAX;
+        if (q->tight < COL_REL_INIT_CAP) q->tight = COL_REL_INIT_CAP;
+        q->phase++; return 0;
+    case WL_COLUMNAR_SESSION_SEED_Q_NEW_GRID:
+        if (!wl_columnar_memory_size_mul(q->width, q->tight,
+            &q->incoming)) return EOVERFLOW;
+        q->phase++; return 0;
+    case WL_COLUMNAR_SESSION_SEED_Q_NEW_BYTES:
+        if (!wl_columnar_memory_size_mul(q->incoming, sizeof(int64_t),
+            &q->incoming)) return EOVERFLOW;
+        q->lane_bytes = (uint64_t)q->tight*sizeof(int64_t); q->phase++;
+        return 0;
+    case WL_COLUMNAR_SESSION_SEED_Q_NEW_TABLE:
+        if (!wl_columnar_memory_size_add(q->incoming,
+            (uint64_t)q->width*sizeof(int64_t *),
+            &q->incoming)) return EOVERFLOW;
+        q->phase++; return 0;
+    case WL_COLUMNAR_SESSION_SEED_Q_NEW_TS:
+        q->ts_bytes = q->had_ts ? (uint64_t)q->tight*
+            sizeof(col_delta_timestamp_t) : 0;
+        if (!wl_columnar_memory_size_add(q->incoming, q->ts_bytes,
+            &q->incoming)) return EOVERFLOW;
+        q->phase++; return 0;
+    case WL_COLUMNAR_SESSION_SEED_Q_FINAL:
+        if (!wl_columnar_memory_size_add(q->incoming, q->scratch,
+            &q->final_bytes) ||
+            q->final_bytes > SIZE_MAX) return EOVERFLOW;
+        q->phase++; return 0;
+    case WL_COLUMNAR_SESSION_SEED_Q_AGGREGATE:
+        if (!wl_columnar_memory_size_add(q->old_bytes, q->incoming,
+            &q->aggregate)) return EOVERFLOW;
+        q->phase++; return 0;
+    case WL_COLUMNAR_SESSION_SEED_Q_GROW:
+        if (!a->governor) {
+            q->phase = WL_COLUMNAR_SESSION_SEED_Q_TABLE; return 0;
+        }
+        if (!r->retained_reserved_bytes) return EBUSY;
+        if (atomic_load_explicit(&r->retained_reservation.state,
+            memory_order_acquire) ==
+            WL_COLUMNAR_MEMORY_RESERVATION_REPLACING) {
+            if (r->retained_reservation.transition_kind !=
+                WL_COLUMNAR_MEMORY_TRANSITION_GROWTH ||
+                r->retained_reservation.replacement_bytes !=
+                q->incoming) return EBUSY;
+            if (wl_columnar_source_access_gate_busy(&r->descriptor_access) ||
+                wl_columnar_source_access_gate_busy(
+                    &r->source_access)) return EBUSY;
+            q->retry_claim = false; q->result = 0;
+            q->phase = WL_COLUMNAR_SESSION_SEED_Q_TABLE; return 0;
+        }
+        q->growth_attempted = true;
+        q->phase = WL_COLUMNAR_SESSION_SEED_Q_VERDICT;
+        return (q->last_result =
+               wl_columnar_memory_governor_begin_growth_attempt_controlled(
+                   &r->retained_reservation, q->incoming, &q->status,
+                   a->control,
+                   a->id));
+    case WL_COLUMNAR_SESSION_SEED_Q_VERDICT:
+        q->phase = q->status == WL_COLUMNAR_MEMORY_ADMISSION_OK ||
+            q->status == WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY ?
+            WL_COLUMNAR_SESSION_SEED_Q_TABLE :
+            WL_COLUMNAR_SESSION_SEED_Q_CLAMP_SORTED;
+        return 0;
+    case WL_COLUMNAR_SESSION_SEED_Q_TABLE:
+#ifdef WL_TEST_RELATION_RESIZE_HOOK
+        if (wl_columnar_relation_test_fail_prepare_resize) {
+            wl_columnar_relation_test_fail_prepare_resize = false;
+            wl_columnar_session_seed_compact_cleanup_needed(a,
+                WL_COLUMNAR_SESSION_SEED_Q_CANCEL); return 0;
+        }
+#endif
+        q->columns = (int64_t **)wl_columnar_relation_constructor_allocate(
+            (uint64_t)q->width*sizeof(int64_t *), false);
+        if (!q->columns) {
+            wl_columnar_session_seed_compact_cleanup_needed(a,
+                WL_COLUMNAR_SESSION_SEED_Q_CANCEL); return 0;
+        }
+        q->phase++; return 0;
+    case WL_COLUMNAR_SESSION_SEED_Q_ZERO_TABLE:
+        if (q->zeroed < q->width) {
+            q->columns[q->zeroed++] = NULL; return 0;
+        }
+        q->phase++; return 0;
+    case WL_COLUMNAR_SESSION_SEED_Q_ALLOC_LANES:
+        if (q->allocated < q->width) {
+            q->columns[q->allocated] =
+                wl_columnar_relation_constructor_allocate(q->lane_bytes, false);
+            if (!q->columns[q->allocated]) {
+                wl_columnar_session_seed_compact_cleanup_needed(a,
+                    WL_COLUMNAR_SESSION_SEED_Q_CANCEL); return 0;
+            }
+            q->allocated++; return 0;
+        }
+        q->lane = 0; q->phase++; return 0;
+    case WL_COLUMNAR_SESSION_SEED_Q_COPY_LANES:
+        if (q->lane < q->width) {
+            wl_columnar_session_seed_compact_copy8(q->columns[q->lane],
+                r->columns[q->lane],
+                (uint64_t)q->rows*sizeof(int64_t), &q->byte);
+            if (q->byte == (uint64_t)q->rows*sizeof(int64_t)) {
+                q->byte = 0; q->lane++;
+            }
+            return 0;
+        }
+        q->phase++; return 0;
+    case WL_COLUMNAR_SESSION_SEED_Q_ALLOC_TS:
+        if (q->had_ts) {
+            q->timestamps =
+                wl_columnar_relation_constructor_allocate(q->ts_bytes, false);
+            if (!q->timestamps) {
+                wl_columnar_session_seed_compact_cleanup_needed(a,
+                    WL_COLUMNAR_SESSION_SEED_Q_CANCEL); return 0;
+            }
+        }
+        q->phase++; return 0;
+    case WL_COLUMNAR_SESSION_SEED_Q_COPY_TS:
+        if (q->had_ts &&
+            q->byte < (uint64_t)q->rows*sizeof(col_delta_timestamp_t)){
+            wl_columnar_session_seed_compact_copy8(q->timestamps, r->timestamps,
+                (uint64_t)q->rows*sizeof(col_delta_timestamp_t), &q->byte);
+            return 0;
+        }
+        q->phase++; return 0;
+    case WL_COLUMNAR_SESSION_SEED_Q_ZERO_TS:
+        if (q->had_ts && q->byte < q->ts_bytes) {
+            wl_columnar_session_seed_compact_copy8(q->timestamps, NULL,
+                q->ts_bytes,
+                &q->byte); return 0;
+        }
+        q->byte = 0; q->phase++; return 0;
+    case WL_COLUMNAR_SESSION_SEED_Q_COMMIT_HOOK:
+#ifdef WL_TEST_RELATION_RESIZE_HOOK
+        if (a->governor && wl_columnar_relation_test_fail_compact_commit) {
+            wl_columnar_relation_test_fail_compact_commit = false;
+            q->result = EFAULT;
+            wl_columnar_session_seed_compact_cleanup_needed(a,
+                WL_COLUMNAR_SESSION_SEED_Q_CANCEL); return 0;
+        }
+#endif
+        q->phase++; return 0;
+    case WL_COLUMNAR_SESSION_SEED_Q_PREPARE:
+        q->phase = WL_COLUMNAR_SESSION_SEED_Q_PUBLISH;
+        if (!a->governor) return 0;
+        return (q->last_result =
+               wl_columnar_memory_governor_growth_commit_prepare_attempt_controlled
+               (
+                   &r->retained_reservation,
+                   wl_columnar_memory_governor_ref_get(a->governor),
+                   r, &q->prepared, &q->prepare_ready, a->control, a->id));
+    case WL_COLUMNAR_SESSION_SEED_Q_PUBLISH:
+        if (a->governor && !q->prepare_ready) return EINVAL;
+        if (!a->owned[q->selected] ||
+            (q->selected ? a->normalized : a->working) != r ||
+            r->columns != q->old_columns ||
+            r->timestamps != q->old_timestamps ||
+            r->nrows != q->rows || r->capacity != q->old_capacity ||
+            r->timestamp_capacity != q->old_ts_capacity ||
+            r->storage_generation != q->entry_storage) return EBUSY;
+        if (r->storage_owner != r ||
+            r->storage_owner_identity != r->relation_identity ||
+            r->storage_owner_generation != r->storage_generation ||
+            col_rel_storage_alias_borrow_count(r) ||
+            wl_columnar_source_access_gate_busy(&r->descriptor_access) ||
+            wl_columnar_source_access_gate_busy(
+                &r->source_access)) return EBUSY;
+        rc = wl_evaluation_control_charge_attempt(a->control, a->id, 0);
+        if (rc) return rc;
+        if (a->governor &&
+            wl_columnar_memory_governor_growth_commit_finish(
+                &q->prepared)) abort();
+        r->columns = q->columns; r->timestamps = q->timestamps;
+        r->capacity = q->tight;
+        r->timestamp_capacity = q->had_ts ? q->tight : 0;
+        wl_columnar_relation_touch_storage(r);
+        r->retained_reserved_bytes = a->governor ? q->aggregate : 0;
+        q->columns = NULL; q->timestamps = NULL; q->allocated = 0;
+        q->published = true;
+        wl_columnar_session_seed_compact_cleanup_needed(a,
+            WL_COLUMNAR_SESSION_SEED_Q_FREE_OLD_LANES);
+        return 0;
+    case WL_COLUMNAR_SESSION_SEED_Q_CLAMP_SORTED:
+        if (r->sorted_nrows > r->nrows) r->sorted_nrows = r->nrows;
+        q->phase++; return 0;
+    case WL_COLUMNAR_SESSION_SEED_Q_CLAMP_BASE:
+        if (r->base_nrows > r->nrows) r->base_nrows = r->nrows;
+        q->phase++; return 0;
+    case WL_COLUMNAR_SESSION_SEED_Q_DONE:
+        q->done = true; q->active = false;
+        if (!q->result) a->progress = WL_COLUMNAR_SESSION_SEED_RESULT_READY;
+        *ready = !q->result; return q->result;
+    case WL_COLUMNAR_SESSION_SEED_Q_RETRY_NOTICE:
+        q->phase = WL_COLUMNAR_SESSION_SEED_Q_GROW;
+        return EAGAIN;
+    default: return EBUSY;
+    }
+}
+
+/* All physical/credit cleanup uses a genuinely distinct live funder. */
+static int
+wl_columnar_session_seed_compact_cleanup(wl_columnar_session_seed_t *a,
+    wl_evaluation_control_t *funding, uint64_t id)
+{
+    wl_columnar_session_seed_compact_t *q = &a->compact;
+    int rc = wl_columnar_session_seed_cut(a, funding, id,
+            1900+(unsigned)q->phase);
+    if (rc) return rc;
+    col_rel_t *r = q->target;
+    if (!q->active) return 0;
+    if (a->ending && !q->cleanup) {
+        if (q->empty && q->phase >= WL_COLUMNAR_SESSION_SEED_Q_EMPTY_LANES &&
+            q->phase <=
+            WL_COLUMNAR_SESSION_SEED_Q_EMPTY_RESET) q->cleanup = true;
+        else {
+            q->phase = WL_COLUMNAR_SESSION_SEED_Q_CANCEL; q->cleanup = true;
+        }
+        return 0;
+    }
+    switch (q->phase) {
+    case WL_COLUMNAR_SESSION_SEED_Q_EMPTY_LANES:
+        if (q->old_columns && q->old_lane < q->width) {
+            free(q->old_columns[q->old_lane]);
+            q->old_columns[q->old_lane++] = NULL; return 0;
+        }
+        q->phase++; return 0;
+    case WL_COLUMNAR_SESSION_SEED_Q_EMPTY_TABLE:
+        free((void *)q->old_columns); q->old_columns = NULL; q->phase++;
+        return 0;
+    case WL_COLUMNAR_SESSION_SEED_Q_EMPTY_TS:
+        free(q->old_timestamps); q->old_timestamps = NULL; q->phase++; return 0;
+    case WL_COLUMNAR_SESSION_SEED_Q_EMPTY_HEADER:
+        r->columns = NULL; r->capacity = 0; r->timestamps = NULL;
+        r->timestamp_capacity = 0; r->arena_owned = false;
+        r->sorted_nrows = 0; r->base_nrows = 0;
+        if (q->changed) wl_columnar_relation_touch_storage(r);
+        q->published = true; q->phase++; return 0;
+    case WL_COLUMNAR_SESSION_SEED_Q_EMPTY_CREDIT:
+        if (!a->governor || !q->old_bytes) {
+            q->phase = WL_COLUMNAR_SESSION_SEED_Q_CLAMP_SORTED; break;
+        }
+        if (q->final_bytes) {
+            q->phase = WL_COLUMNAR_SESSION_SEED_Q_DOWNSIZE; return 0;
+        }
+        rc =
+            wl_columnar_memory_reservation_finish_step(&r->retained_reservation,
+                false, &q->release_done);
+        if (rc && rc != EAGAIN) return rc;
+        if (q->release_done) q->phase = WL_COLUMNAR_SESSION_SEED_Q_EMPTY_RESET;
+        return 0;
+    case WL_COLUMNAR_SESSION_SEED_Q_EMPTY_RESET:
+        wl_columnar_memory_reservation_init(&r->retained_reservation);
+        r->retained_reserved_bytes = 0;
+        q->phase = WL_COLUMNAR_SESSION_SEED_Q_CLAMP_SORTED; break;
+    case WL_COLUMNAR_SESSION_SEED_Q_FREE_OLD_LANES:
+        if (q->old_columns && q->old_lane < q->width) {
+            free(q->old_columns[q->old_lane]);
+            q->old_columns[q->old_lane++] = NULL; return 0;
+        }
+        q->phase++; return 0;
+    case WL_COLUMNAR_SESSION_SEED_Q_FREE_OLD_TABLE:
+        free((void *)q->old_columns); q->old_columns = NULL; q->phase++;
+        return 0;
+    case WL_COLUMNAR_SESSION_SEED_Q_FREE_OLD_TS:
+        free(q->old_timestamps); q->old_timestamps = NULL; q->phase++; return 0;
+    case WL_COLUMNAR_SESSION_SEED_Q_DOWNSIZE:
+        if (!a->governor) {
+            q->phase = WL_COLUMNAR_SESSION_SEED_Q_CLAMP_SORTED; break;
+        }
+        if (r->retained_reserved_bytes == q->final_bytes) {
+            q->phase = WL_COLUMNAR_SESSION_SEED_Q_CLAMP_SORTED; break;
+        }
+        rc = wl_columnar_memory_downsize_attempt_begin(&r->retained_reservation,
+                r, q->final_bytes, &q->downsize);
+        if (!rc) {
+            q->downsize_live = true; q->phase++;
+        }
+        return rc;
+    case WL_COLUMNAR_SESSION_SEED_Q_DOWNSIZE_STEP:
+        rc = wl_columnar_memory_downsize_attempt_advance(&q->downsize);
+        if (rc && rc != EAGAIN) return rc;
+        if (q->downsize.phase == WL_COLUMNAR_MEMORY_DOWNSIZE_DONE) {
+            r->retained_reserved_bytes = q->final_bytes;
+            q->phase = WL_COLUMNAR_SESSION_SEED_Q_CLAMP_SORTED;
+        }
+        return 0;
+    case WL_COLUMNAR_SESSION_SEED_Q_CANCEL:
+        if (q->prepared.phase ==
+            WL_COLUMNAR_MEMORY_GOVERNOR_GROWTH_COMMIT_CLAIMED ||
+            q->prepared.phase ==
+            WL_COLUMNAR_MEMORY_GOVERNOR_GROWTH_COMMIT_READY)
+            return wl_columnar_memory_governor_growth_commit_cancel(
+                &q->prepared);
+        q->phase++; return 0;
+    case WL_COLUMNAR_SESSION_SEED_Q_FREE_NEW_LANES:
+        if (q->allocated) {
+            free(q->columns[--q->allocated]); q->columns[q->allocated] = NULL;
+            return 0;
+        }
+        q->phase++; return 0;
+    case WL_COLUMNAR_SESSION_SEED_Q_FREE_NEW_TABLE:
+        free((void *)q->columns); q->columns = NULL; q->zeroed = 0; q->phase++;
+        return 0;
+    case WL_COLUMNAR_SESSION_SEED_Q_FREE_NEW_TS:
+        free(q->timestamps); q->timestamps = NULL; q->byte = 0; q->lane = 0;
+        q->phase++; return 0;
+    case WL_COLUMNAR_SESSION_SEED_Q_ROLLBACK:
+        if (a->governor && atomic_load_explicit(&r->retained_reservation.state,
+            memory_order_acquire) == WL_COLUMNAR_MEMORY_RESERVATION_REPLACING) {
+            if (r->retained_reservation.transition_kind !=
+                WL_COLUMNAR_MEMORY_TRANSITION_GROWTH ||
+                (q->incoming &&
+                r->retained_reservation.replacement_bytes !=
+                q->incoming)) return EBUSY;
+#ifdef WL_TEST_RELATION_RESIZE_HOOK
+            if (!a->ending && wl_columnar_relation_test_fail_compact_rollback) {
+                wl_columnar_relation_test_fail_compact_rollback = false;
+                q->retry_claim = true;
+                q->phase = WL_COLUMNAR_SESSION_SEED_Q_RETRY_NOTICE;
+                break;
+            }
+#endif
+            rc =
+                wl_columnar_memory_growth_refund_attempt_begin(
+                &r->retained_reservation, r, &q->refund);
+            if (!rc) {
+                q->refund_live = true; q->phase++;
+            }
+            return rc;
+        }
+        q->phase = WL_COLUMNAR_SESSION_SEED_Q_CLAMP_SORTED; break;
+    case WL_COLUMNAR_SESSION_SEED_Q_REFUND:
+        rc = wl_columnar_memory_growth_refund_attempt_advance(&q->refund);
+        if (rc && rc != EAGAIN) return rc;
+        if (q->refund.phase == WL_COLUMNAR_MEMORY_GROWTH_REFUND_DONE)
+            q->phase = WL_COLUMNAR_SESSION_SEED_Q_CLAMP_SORTED;
+        return 0;
+    case WL_COLUMNAR_SESSION_SEED_Q_CLAMP_SORTED:
+        if (r->sorted_nrows > r->nrows) r->sorted_nrows = r->nrows;
+        q->phase++; return 0;
+    case WL_COLUMNAR_SESSION_SEED_Q_CLAMP_BASE:
+        if (r->base_nrows > r->nrows) r->base_nrows = r->nrows;
+        q->phase++; return 0;
+    default:
+        if (a->ending) {
+            q->active = false; q->cleanup = false; return 0;
+        }
+        q->cleanup = false; a->progress = WL_COLUMNAR_SESSION_SEED_COMPACTING;
+        return 0;
+    }
+    if (!a->ending) {
+        q->cleanup = false; a->progress = WL_COLUMNAR_SESSION_SEED_COMPACTING;
+    }
+    return 0;
+}
+
+#ifdef WL_SESSION_TEST_HOOKS
+int
+wl_columnar_session_seed_test_compact_view(const wl_columnar_session_seed_t *a,
+    uint64_t out[16])
+{
+    if (!a || a->identity != a || !out) return EINVAL;
+    const wl_columnar_session_seed_compact_t *q = &a->compact;
+    out[0] = q->phase; out[1] = q->active; out[2] = q->cleanup;
+    out[3] = q->byte; out[4] = q->lane; out[5] = q->allocated;
+    out[6] = q->old_lane; out[7] = q->incoming; out[8] = q->status;
+    out[9] = q->prepared.phase; out[10] = q->refund.phase;
+    out[11] = q->downsize.phase; out[12] = q->published;
+    out[13] = q->retry_claim;
+    /* A real retirement may have freed the descriptor before its remaining
+     * credit receipt closes. Never inspect that descriptor or a taken slot. */
+    bool live = q->target && a->owned[q->selected] &&
+        !a->begun[q->selected];
+    out[14] =
+        live ? atomic_load_explicit(&q->target->retained_reservation.state,
+            memory_order_acquire) : 0;
+    out[15] =
+        live ?
+        atomic_load_explicit(&q->target->retained_reservation.owner_bits,
+            memory_order_acquire) : 0;
     return 0;
 }
 #endif

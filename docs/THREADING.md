@@ -228,7 +228,7 @@ These exist so struct fields can be declared portably; the audit in
 
 Every `atomic_*` call site in `wirelog/` production sources. Counted
 mechanically by `scripts/ci/check-threading-doc.sh`; row count must
-match the script's count (currently **570**).
+match the script's count (currently **577**).
 
 Format: `file:function[#N]` | field | operation | order | justification.
 
@@ -670,7 +670,7 @@ concurrent alias removals cannot underflow the count.
 | `session.c:session_pool_rel_promote#3` | `src->storage_alias_borrows` | `atomic_store_explicit` | relaxed | Leave the closed pool tombstone with no child aliases |
 
 112 + 21 + 37 = **170 atomic call sites** in the summarized groups; the full
-symbol-anchored inventory below covers 570 sites.
+symbol-anchored inventory below covers 577 sites.
 
 The `#N` suffix counts all atomic sites in a symbol, regardless of operation;
 the first site remains unsuffixed. `scripts/ci/check-threading-doc.sh` uses
@@ -1779,7 +1779,7 @@ DONE. If a stop leaves the receipt holding a claim, its caller preserves that
 receipt and resumes with a fresh live maintenance attempt; it cannot abandon or
 reinitialize the receipt/token while the claim remains held.
 
-The complete current atomic-source inventory contains 570 call sites.
+The complete current atomic-source inventory contains 577 call sites.
 
 ### Caller-attempt-bound single mutation admission
 
@@ -2884,3 +2884,10 @@ performs those atomic operations.
 | `relation.c:wl_columnar_session_seed_test_base_geometry#2` | `r->retained_reservation.owner_bits` | `atomic_load_explicit` | acquire | Read-only test observation verifies the actual retained token owner is the bound private base descriptor before reporting its bytes; the caller still must obey actor serialization and lifetime |
 | `relation.c:wl_columnar_session_seed_test_admission` | `token->state` | `atomic_load_explicit` | acquire | Read-only test observation verifies the actual denied seed admission leaves its selected real token empty/released, or preserves the committed old growth token; this observation grants no source, native or cleanup permission |
 | `relation.c:wl_columnar_session_seed_test_admission#2` | `token->owner_bits` | `atomic_load_explicit` | acquire | Read-only test observation captures the actual selected token owner after DENIED status so tests can distinguish released staging from the still-owned old growth image before real cleanup |
+| `relation.c:wl_columnar_session_seed_compact_final_step` | `r->retained_reservation.owner_bits` | `atomic_load_explicit` | acquire | Verify the actual private selected payload token owner, including owner zero for a genuine zero-payload EMPTY token, before compaction can mutate storage |
+| `relation.c:wl_columnar_session_seed_compact_final_step#2` | `r->retained_reservation.state` | `atomic_load_explicit` | acquire | Verify real EMPTY/no-claim zero payload or COMMITTED/compatible GROWTH state in addition to actual private ownership, geometry and quiescent source gates; state alone grants no Native access |
+| `relation.c:wl_columnar_session_seed_compact_final_step#3` | `r->retained_reservation.state` | `atomic_load_explicit` | acquire | Observe an existing replacement before a shape skip so an actual live GROWTH claim reaches bounded refund rather than being hidden by ready success |
+| `relation.c:wl_columnar_session_seed_compact_final_step#4` | `r->retained_reservation.state` | `atomic_load_explicit` | acquire | Reuse only the actual matching GROWTH overlap on raw EAGAIN retry; validate its real kind and incoming bytes instead of refunding and reserving another claim |
+| `relation.c:wl_columnar_session_seed_compact_cleanup` | `r->retained_reservation.state` | `atomic_load_explicit` | acquire | Select real unpublished growth refund only after its staged physical prefix is freed; an already live refund follows its actual receipt until DONE even after token state changes |
+| `relation.c:wl_columnar_session_seed_test_compact_view` | `q->target->retained_reservation.state` | `atomic_load_explicit` | acquire | Privileged read-only test observation of the actual still-owned selected token; skip taken or already-retiring descriptors and grant no Source or cleanup authority |
+| `relation.c:wl_columnar_session_seed_test_compact_view#2` | `q->target->retained_reservation.owner_bits` | `atomic_load_explicit` | acquire | Observe actual committed owner bits for real gate/alias negative tests; this telemetry neither transfers result ownership nor establishes Native permission |
