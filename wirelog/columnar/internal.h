@@ -4819,6 +4819,14 @@ int wl_columnar_relation_empty_source_step(
 int wl_columnar_relation_empty_source_end(
     wl_columnar_relation_empty_source_t *, wl_evaluation_control_t *, uint64_t,
     bool *);
+/* Begin, then step to HELD on the original attempt. *initialized is set from
+ * the record right after begin, also when begin fails, so the caller can end
+ * a record that needs it. Returns the first nonzero result of begin or step;
+ * otherwise EINVAL unless the record is HELD, not ending, and bound to
+ * control/id. Charges are those of begin and step. */
+int wl_columnar_relation_empty_source_hold_attempt_controlled(
+    wl_columnar_relation_empty_source_t *, const col_rel_t *,
+    wl_evaluation_control_t *, uint64_t, bool *initialized);
 /* Private forced-empty clone from real HELD original metadata, live through
  * return. Output slot is exclusive/disjoint and initially NULL. Fresh owned
  * initialized physical width0; declared metadata supplies no lanes. Future

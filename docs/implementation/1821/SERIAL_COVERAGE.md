@@ -76,11 +76,11 @@ expressions. The numeric/composed child validation remains authoritative.
 | ID / family / operator | Controlled destination and variants | Entry level, bound, owner | Evidence / gap |
 |---|---|---|---|
 | O01 / S01 / VARIABLE | `wl_columnar_eval_plan_numeric_source_step`; full versus delta selection, missing/empty source, registry/name lookup, scalar materialization | Session/frame restricted; A lookup and Q256 relation lanes, nested representation setup U; F | `evaluation_numeric_plan`: `test_source_delta_modes`, `test_source_long_names`, `test_source_scan_stops`; representation/config qualification G5/G6; an INLINE compound EDB is admitted (#2301), `evaluation_compound_sources` |
-| O02 / S02 / FILTER | `wl_columnar_filter_op_attempt_start_owned`; predicate decode, accepted/rejected rows, empty input | Session/frame; A decode bytes/instructions/row tails; allocation/cleanup U; F | `test_entry_generated_filter_work_boundary`, `test_controlled_observed_filter_stops`; general expression domains G5 |
-| O03 / S02 / MAP | `wl_columnar_filter_map_attempt_start_owned`; projection and numeric expression output, INT64/FLOAT, integer CRC/hash | Session/frame; A decode/evaluation/copy, nested allocation U; F | `test_entry_generated_map_work_limit`, `test_entry_generated_integer_crc`, `test_entry_generated_integer_hash`; unsupported expression families G5; an INLINE compound input is admitted and yields a NONE output (#2301), `evaluation_compound_sources` |
+| O02 / S02 / FILTER | `wl_columnar_filter_op_attempt_start_owned`; predicate decode, accepted/rejected rows, empty input | Session/frame; A decode bytes/instructions/row tails; allocation/cleanup U; F | `test_entry_generated_filter_work_boundary`, `test_controlled_observed_filter_stops`; general expression domains G5; a never-inserted EDB input (#2301), `evaluation_empty_edb_sources` |
+| O03 / S02 / MAP | `wl_columnar_filter_map_attempt_start_owned`; projection and numeric expression output, INT64/FLOAT, integer CRC/hash | Session/frame; A decode/evaluation/copy, nested allocation U; F | `test_entry_generated_map_work_limit`, `test_entry_generated_integer_crc`, `test_entry_generated_integer_hash`; unsupported expression families G5; an INLINE compound input is admitted and yields a NONE output (#2301), `evaluation_compound_sources`; a never-inserted EDB input (#2301), `evaluation_empty_edb_sources` |
 | O04 / S03 / JOIN | `wl_columnar_join_op_attempt_start_owned`; product/keyed, collisions, right predicate, projection; non-materialized ordinary route | Session/frame; A hash/probe/candidate/right-filter tails, nested source/scratch U; F | `test_controlled_session_join_step`, `test_entry_generated_right_filter_collisions_and_stop`, `test_entry_generated_right_filter_product_work_boundary`; materialized/differential/batch alternatives F01–F05 |
 | O05 / S04 / ANTIJOIN | `wl_columnar_join_probe_op_attempt_start_owned`; membership/nonmembership child | Session enum admitted, private scalar child restrictions; A child charges, whole host/config bound U; F | `test_entry_generated_operators`; complete predicate/type/fallback session matrix missing, G5 |
-| O06 / S02 / REDUCE | `wl_columnar_ops_reduce_attempt_start_owned`; grouped/ungrouped COUNT and numeric aggregates | Session/frame restricted; charged input/group/sort/projection; whole region U; F | `test_entry_generated_reduce_work_limit`, `test_entry_generated_grouped_count_work_limit`, `test_entry_generated_grouped_numeric_reduce_work_limit`; remaining aggregate/type/error matrix G5 |
+| O06 / S02 / REDUCE | `wl_columnar_ops_reduce_attempt_start_owned`; grouped/ungrouped COUNT and numeric aggregates | Session/frame restricted; charged input/group/sort/projection; whole region U; F | `test_entry_generated_reduce_work_limit`, `test_entry_generated_grouped_count_work_limit`, `test_entry_generated_grouped_numeric_reduce_work_limit`; remaining aggregate/type/error matrix G5; a never-inserted EDB input (#2301), `evaluation_empty_edb_sources` |
 | O07 / S05 / CONCAT | Composed dispatcher → `wl_columnar_merge_concat_attempt_start_owned`; stack union inputs | Session/frame; charged source/copy/handoff; Q256 managed copies, complete ownership combinations U; F | `test_generated_union`, `test_entry_generated_operators`; owned/borrowed/segmented/typed combinations G5; UNION bodies whose branch reads an INLINE EDB (#2301), `evaluation_compound_sources`; CONCAT inputs there are MAP outputs with no compound layout, so direct compound, segmented, timestamped and spill inputs stay open |
 | O08 / S05 / CONSOLIDATE | `wl_columnar_filter_consolidate_attempt_start_owned`; sort/dedup, ordinary versus differential selection | Session/frame ordinary; charged comparison/copy, cleanup U; F | `evaluation_consolidate`, `evaluation_numeric_plan`: `test_owned_consolidate_successor`; differential branch F04, remaining representations G5/G6; the same compound-sourced UNION and single-rule bodies (#2301), with NONE inputs |
 | O09 / S04 / SEMIJOIN | Same owned probe child as ANTIJOIN, membership output | Session enum admitted, restricted scalar child; A child charges, whole host/config bound U; F | `test_entry_generated_operators`; SIP/predicate/fallback session qualification G5 |
@@ -125,7 +125,7 @@ references, not interruption evidence.
 | F05a | Ordinary keyed persistent arrangement/probe bundle versus ephemeral hash; cached right filter versus operation-owned filtered relation | General serial STEP owns a private native index registry for full-right public EDB INT64 JOIN, with bounded creation/reuse/probes and a common head/index cutoff. Existing pins/pending/deferred entries refuse replacement. Filtered/private-head/batch representations retain their previous controlled disposition; this does not qualify raw cache alternatives, G5/G6 |
 | F06a | LFTJ cache/probe versus owned source rebuild and raw output callback versus private owned-row append | Controlled session uses per-attempt bounded rebuild, no unlimited raw fallback; actual writer/ROW/ACK/drain ownership and precommit/postcutoff delivery qualified | Host failure/native/microsteps/policy and `test_lftj_postcut_delivery`; current-generation raw probe/pin checks; [source map](../2298/LFTJ_SOURCE_ACCOUNTING.md) |
 | F07a | Scalar-source compound kind NONE versus INLINE/SIDE, declared schema/type validity, timestamps and row weights | Admission predicates differ by child; no cross-operator representation support inferred. Managed copies/readers can be bounded while a surrounding child refuses the representation; G5. #2301: VARIABLE and MAP admit compound_kind INLINE after a metered arity-map check; FILTER and JOIN keep a tested ENOTSUP for an INLINE input; compound_kind SIDE stays ENOTSUP |
-| F07b | Retained/borrowed/owned, contiguous/segmented/spill-backed storage and empty/nullary/wide rows | Source reader/descriptor and copy helpers must preserve representation and governor state; capacity/overflow errors remain errors. Enumerated qualification combinations, not an invitation to raw fallback; G5/G6. #2301: borrowed public INLINE descriptors, empty, wide and arity-1 INLINE layouts; controlled sessions refuse cold (spill-backed) sources at seal |
+| F07b | Retained/borrowed/owned, contiguous/segmented/spill-backed storage and empty/nullary/wide rows | Source reader/descriptor and copy helpers must preserve representation and governor state; capacity/overflow errors remain errors. Enumerated qualification combinations, not an invitation to raw fallback; G5/G6. #2301: borrowed public INLINE descriptors, empty, wide and arity-1 INLINE layouts; controlled sessions refuse cold (spill-backed) sources at seal; a never-inserted EDB through MAP, FILTER and REDUCE on the unobserved STEP |
 
 ## Configuration predicates
 
@@ -2676,3 +2676,65 @@ to CONCAT and CONSOLIDATE; cold sources in controlled sessions, which
 `wl_columnar_session_cold_mode` excludes when an evaluation control is attached;
 and lazy-owner descriptors, which the reader refuses with ENOTSUP and whose
 session reachability was not traced. #2301 is not closed by this bundle.
+
+### Never-inserted EDB sources through MAP, FILTER and REDUCE (#2301)
+
+Session creation gives an EDB a schema when one of its columns is FLOAT or
+STRING or it has an INLINE compound column and no SIDE column. Any other EDB
+that never received a row has no physical schema: width 0, `schema_ok` false.
+Controlled sessions reach such a source by three routes:
+
+| Route | Taken by | First consumer sees |
+|---|---|---|
+| Unobserved STEP | a STEP without a delta callback, for which `wl_columnar_session_general_shape_read` records no general shape | VARIABLE's borrowed bare descriptor (#2297) |
+| Observed specialized STEP | observed bodies that the specialized shape check admits (VARIABLE, MAP, CONSOLIDATE) | the public EDB after `col_rel_set_schema(source, 1, NULL)` |
+| General observed transaction | other observed bodies, among them a single-rule body with a FILTER, every SNAPSHOT, and an unobserved STEP for which that read records a general shape, as for some recursive strata | a private typed empty relation from the declaration |
+
+Before this unit the unobserved STEP returned ENOTSUP for these bodies: the
+first consumer's scalar reader refuses `!schema_ok`. MAP, FILTER and REDUCE
+now recognise the borrowed bare descriptor (no schema, no columns, no rows,
+owned entry; for MAP and FILTER also not a stream frame) and hold it with the
+authentic empty-source reader, as ordinary JOIN already does; the
+begin-and-step sequence is the shared
+`wl_columnar_relation_empty_source_hold_attempt_controlled`, which JOIN now
+also calls with the same charges. The consumer reads width 0 and no rows. MAP
+output has `project_count` columns whose types come from the map expression
+table with no source types, as in the uncontrolled MAP. FILTER builds
+`$filter` with the empty-source operator new-like, so a graph declaration
+keeps the uncontrolled EINVAL. REDUCE allows a group-by over the width-0
+source, as the uncontrolled REDUCE does, and its group columns are INT64.
+
+The empty-source END is authenticated for MAP and FILTER only at their SOURCE
+stage with no join decision and no join operation; JOIN, SEMIJOIN, ANTIJOIN
+and REDUCE keep the existing join-decision binding. A finished END moves MAP
+and FILTER to DECIDE and the join family to JOIN_DECIDE. The unary
+registered-cleanup latch still refuses a bare source. Unary cleanup is
+registered only for the general observed transaction, which replaces a bare
+EDB with a typed private relation before any consumer runs, and the test
+checks that no observed or SNAPSHOT cell publishes a bare input. A native
+join-class cleanup of a bare MAP, FILTER or REDUCE goes through the join-class
+latch, which reports a bare END; no test here drives that route, and it is
+left open. END work is paid on the host's separate funding, as for JOIN
+(#2297); the SOURCE lifecycle slot that MAP and FILTER pre-pay goes unused on
+this path.
+
+`evaluation_empty_edb_sources` runs single-rule, UNION (either or both
+branches never inserted), FILTER, ungrouped and grouped COUNT, two-column,
+INT32 and FLOAT bodies through controlled and uncontrolled sessions for STEP
+and SNAPSHOT, observed and unobserved. On the unobserved STEP it checks that
+two empty-source records held the source, that the consumer published once per
+bare EDB with that EDB as input, and that the EDB stays bare; it then repeats
+the STEP and inserts the first rows. It stops at each empty-source step while
+VARIABLE and the consumer hold the EDB, and at the MAP or FILTER output or the
+`$concat` publication, with cancellation and with work exhaustion, and checks
+the unchanged head and EDB, the report, reset and retry, and the first insert
+after the stop. The observed STEP of the single-rule body is checked to give
+the EDB a schema, and that of the FILTER body, which takes the general
+observed transaction, to leave it without one.
+
+Measured and left open: the observed STEP and SNAPSHOT of a never-inserted
+INT32 EDB give an INT32 head where the uncontrolled session gives INT64, also
+in a build without this unit; once an INT32 EDB has rows, the controlled
+observed STEP, SNAPSHOT and successor STEP return ENOTSUP. CONSOLIDATE,
+CONCAT and the framed materialization keep their refusal of a bare input; in
+the generated bodies exercised here each UNION branch ends in MAP.

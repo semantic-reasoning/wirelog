@@ -2921,24 +2921,41 @@ wl_columnar_ops_reduce_attempt_start_owned(const wl_plan_op_t *op,
     rc = wl_columnar_ops_reduce_attempt_charge(control, id,
             WL_COLUMNAR_OPS_REDUCE_ATTEMPT_WORK);
     if (rc) goto done;
-    rc =
-        wl_columnar_relation_scalar_source_init_attempt_controlled(&ctx->source,
-            &ctx->source_initialized, control, id);
-    rc = wl_columnar_ops_reduce_attempt_return(control, id, rc);
-    if (rc) goto done;
+    /* The bare descriptor that VARIABLE borrowed from a never-inserted EDB
+     * without a schema is held by the authentic empty-source reader and
+     * read as width 0 with no rows (#2301). */
+    const bool bare = owner && !left->schema_ok && !left->ncols
+        && !left->nrows;
+    if (!bare) {
+        rc = wl_columnar_relation_scalar_source_init_attempt_controlled(
+            &ctx->source, &ctx->source_initialized, control, id);
+        rc = wl_columnar_ops_reduce_attempt_return(control, id, rc);
+        if (rc) goto done;
+    }
     rc = wl_columnar_ops_reduce_attempt_charge(control, id,
             WL_COLUMNAR_OPS_REDUCE_ATTEMPT_WORK);
     if (rc) goto done;
-    rc =
-        wl_columnar_relation_scalar_source_begin_attempt_controlled(
-        &ctx->source, left, false);
+    if (bare) {
+        ctx->source_bare = true;
+        rc = wl_columnar_relation_empty_source_hold_attempt_controlled(
+            &ctx->source_empty_reader, left, control, id,
+            &ctx->source_initialized);
+        if (!ctx->source_initialized) ctx->source_bare = false;
+    } else {
+        rc = wl_columnar_relation_scalar_source_begin_attempt_controlled(
+            &ctx->source, left, false);
+    }
     rc = wl_columnar_ops_reduce_attempt_return(control, id, rc);
     if (rc) goto done;
+    const uint32_t source_width = bare ? 0 : ctx->source.width;
+    const uint32_t source_rows = bare ? 0 : ctx->source.nrows;
+    const wirelog_column_type_t *source_types = bare ? NULL
+        : ctx->source.types;
     rc = wl_columnar_ops_reduce_attempt_charge(control, id,
             WL_COLUMNAR_OPS_REDUCE_ATTEMPT_WORK);
     if (rc) goto done;
     uint32_t gc = op->group_by_count;
-    bool shaped = gc != UINT32_MAX && (!gc || ctx->source.width);
+    bool shaped = gc != UINT32_MAX && (!gc || source_width || bare);
     rc = wl_columnar_ops_reduce_attempt_tail(control, id, 30, gc);
     if (rc > 0 || shaped) {
         if (rc) goto done;
@@ -2951,8 +2968,7 @@ wl_columnar_ops_reduce_attempt_start_owned(const wl_plan_op_t *op,
     wl_columnar_memory_governor_ref_t *governor = session->memory_governor
         ? session->memory_governor : left->memory_governor;
     uint32_t capacity = 1;
-    uint64_t desired = (uint64_t)(ctx->source.nrows ? ctx->source.nrows : 1) *
-        2u;
+    uint64_t desired = (uint64_t)(source_rows ? source_rows : 1) * 2u;
     while ((uint64_t)capacity < desired) {
         rc = wl_columnar_ops_reduce_attempt_charge(control, id,
                 WL_COLUMNAR_OPS_REDUCE_ATTEMPT_CELL_WORK);
@@ -2972,11 +2988,11 @@ wl_columnar_ops_reduce_attempt_start_owned(const wl_plan_op_t *op,
     uint64_t slot_bytes = 0, group_bytes = 0, lanes = 0, workspace = 0;
     bool sized = wl_columnar_memory_size_mul(capacity,
             sizeof(reduce_group_slot_t), &slot_bytes)
-        && wl_columnar_memory_size_mul(ctx->source.nrows,
+        && wl_columnar_memory_size_mul(source_rows,
             sizeof(wl_columnar_ops_reduce_group_t), &group_bytes)
         && wl_columnar_memory_size_mul(width, 2u, &lanes)
         && wl_columnar_memory_size_add(lanes,
-            expression ? ctx->source.width : 0u, &lanes)
+            expression ? source_width : 0u, &lanes)
         && wl_columnar_memory_size_mul(lanes, sizeof(int64_t), &workspace)
         && slot_bytes <= SIZE_MAX && group_bytes <= SIZE_MAX
         && workspace <= SIZE_MAX;
@@ -3012,17 +3028,17 @@ wl_columnar_ops_reduce_attempt_start_owned(const wl_plan_op_t *op,
             ? op->group_by_indices[key] : key;
         types[c] = c ==
             ai ? (floating ? WIRELOG_TYPE_FLOAT : WIRELOG_TYPE_INT64)
-            : source < ctx->source.width && ctx->source.types
-            ? ctx->source.types[source] : WIRELOG_TYPE_INT64;
+            : source < source_width && source_types
+            ? source_types[source] : WIRELOG_TYPE_INT64;
         rc = wl_columnar_ops_reduce_attempt_tail(control, id, 33, c);
         if (rc) goto done;
     }
     rc = wl_columnar_ops_reduce_attempt_charge(control, id,
             WL_COLUMNAR_OPS_REDUCE_ATTEMPT_WORK);
     if (rc) goto done;
-    uint32_t initial = governor && ctx->source.nrows < COL_REL_INIT_CAP
-        ? ctx->source.nrows : COL_REL_INIT_CAP;
-    ctx->width = width; ctx->nrows = ctx->source.nrows;
+    uint32_t initial = governor && source_rows < COL_REL_INIT_CAP
+        ? source_rows : COL_REL_INIT_CAP;
+    ctx->width = width; ctx->nrows = source_rows;
     rc = wl_columnar_relation_new_typed_codes_operator_attempt_controlled(
         "$reduce", width, initial, types, governor, out_slot, control, id);
     ctx->output = *out_slot; ctx->private_output = *out_slot;
@@ -3057,7 +3073,9 @@ wl_columnar_ops_reduce_attempt_start_owned(const wl_plan_op_t *op,
         if (rc) goto done;
     }
     uint32_t group_count = 0;
-    for (uint32_t r = 0; r < ctx->source.nrows; ++r) {
+    /* Rows and groups are both zero for a bare source, so the source
+     * columns below are read only through the scalar reader. */
+    for (uint32_t r = 0; r < source_rows; ++r) {
         rc = wl_columnar_ops_reduce_attempt_charge(control, id,
                 WL_COLUMNAR_OPS_REDUCE_ATTEMPT_CELL_WORK);
         if (rc) goto done;
