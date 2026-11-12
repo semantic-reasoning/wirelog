@@ -2279,3 +2279,29 @@ with missing parent consumption. Every failed construction leaves the output
 NULL, closes real ownership, preserves successor consumption0 and admits a
 fresh retry. Typed schema binding, comparison, caller finance and recursive runtime
 admission remain separate obligations.
+
+### CI regression prerequisite: controlled append timestamp defaults
+
+The admitted no-growth controlled append route now matches raw append when the
+destination tracks timestamps and the source does not: exactly the newly
+logical timestamp range defaults to zero. It reuses the existing five-field
+controlled zero helper after cell copies and before final publication. The live
+prefix and remaining spare cells retain their values; timestamp padding remains
+unspecified. Tracked-source copying and the unsupported growth/sourceNoTS guard
+retain their existing behavior. No allocation, credit or schema policy changes.
+
+The helper buys5 per appended row, in chunks of at most51 rows/255 work. The
+three-row raw/control typed/untyped parity oracle therefore adds15 whenever the
+destination tracks timestamps. Independent51/52-row cases test the first255
+and final5 packets, exact and one-short refusal, cancellation at each real tail,
+unchanged logical rows/generation/credits/source/live prefix and untouched spare
+canaries, followed by a genuine reset and exact-limit retry. Empty source adds
+no timestamp packet or spare rewrite. A real growth/sourceNoTS case still
+returns ENOTSUP after the existing two gate purchases.
+
+This unit fixes the native-reproduced controlled timestamp mismatch. The separate
+CONSOLIDATE ordered-literal regression remains known and unfixed here: two
+existing256 graph/input guards are absent from that test's independent oracle
+(expected50869 versus actual51381 for width0/rows0). Its test-only correction is
+the separately approved next unit. Passing this scoped unit is not a full CI or
+remote TSan success receipt, and does not activate a canonical seed route.

@@ -12034,6 +12034,10 @@ failed:
     return rc;
 }
 
+static int
+wl_columnar_relation_zero_timestamp_tail_controlled(
+    col_delta_timestamp_t *, uint32_t, uint32_t, wl_evaluation_control_t *);
+
 int
 wl_columnar_relation_append_all_controlled(col_rel_t *dst,
     const col_rel_t *src, wl_arena_t *arena, wl_evaluation_control_t *control)
@@ -12297,10 +12301,15 @@ wl_columnar_relation_append_all_controlled(col_rel_t *dst,
         if (rc != 0)
             goto done;
     }
-    if (src->timestamps && output_timestamps) {
-        rc = wl_columnar_relation_copy_timestamps_controlled(output_timestamps +
-                base,
-                src->timestamps, count, control);
+    if (output_timestamps) {
+        if (src->timestamps)
+            rc =
+                wl_columnar_relation_copy_timestamps_controlled(
+                output_timestamps +
+                base, src->timestamps, count, control);
+        else
+            rc = wl_columnar_relation_zero_timestamp_tail_controlled(
+                output_timestamps, base, base + count, control);
         if (rc != 0)
             goto done;
     }

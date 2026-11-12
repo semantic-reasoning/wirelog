@@ -451,8 +451,8 @@ test_raw_parity(bool typed, bool source_ts, bool destination_ts)
         dst->columns[0][0] = raw->columns[0][0] =
             wl_columnar_float_to_bits(1.5);
     }
-    /* Poison spare timestamp cells: one-sided timestamp tracking preserves
-     * their prior contents, just as the raw append does. */
+    /* Newly logical tracked rows default to zero without source timestamps;
+     * the remaining spare cells retain their canaries. */
     if (destination_ts) {
         for (uint32_t row = 1; row < 8; row++) {
             col_delta_timestamp_t value = { 7, 3, 2, 0, -9 };
@@ -468,7 +468,7 @@ test_raw_parity(bool typed, bool source_ts, bool destination_ts)
     uint64_t reserved = atomic_load_explicit(&governor->reserved_bytes,
             memory_order_relaxed);
     uint64_t cost = 2 + 1 + 3 + (typed ? 6 : 0)
-        + (source_ts && destination_ts ? 15 : 0);
+        + (destination_ts ? 15 : 0);
     wl_evaluation_control_t *c = control(cost);
     CHECK(col_rel_append_all(raw, src, NULL) == 0);
     CHECK(wl_columnar_relation_append_all_controlled(dst, src, NULL, c) == 0);
@@ -491,8 +491,133 @@ test_raw_parity(bool typed, bool source_ts, bool destination_ts)
             CHECK(a->multiplicity == b->multiplicity);
         }
     }
+    if (destination_ts) {
+        CHECK(dst->timestamps[0].iteration == 0 &&
+            dst->timestamps[0].stratum == 1 && dst->timestamps[0].worker == 2 &&
+            dst->timestamps[0]._reserved == 0 &&
+            dst->timestamps[0].multiplicity == 0);
+        for (uint32_t row = 4; row < 8; row++) {
+            CHECK(dst->timestamps[row].iteration == 7 &&
+                dst->timestamps[row].stratum == 3 &&
+                dst->timestamps[row].worker == 2 &&
+                dst->timestamps[row]._reserved == 0 &&
+                dst->timestamps[row].multiplicity == -9);
+        }
+    } else CHECK(!dst->timestamps);
     released(src); released(dst); released(raw);
     release(c); destroy(raw); destroy(dst); destroy(src);
+}
+
+/* Source-derived packets: reader1 + writer1 + width1 + copied cellsN,
+ * then five timestamp fields per newly logical row, at most51 rows per chunk.
+ * No measured whole-call consumption supplies this oracle. */
+static void
+test_default_timestamp_packets(uint32_t count, unsigned mode)
+{
+    col_rel_t *src = relation(1, count + 1, count, false, NULL);
+    col_rel_t *dst = relation(1, count + 4, 1, true, src->memory_governor);
+    const col_delta_timestamp_t poison = {7, 3, 2, 0, -9};
+    for (uint32_t row = 1; row < dst->timestamp_capacity; row++)
+        dst->timestamps[row] = poison;
+    const uint64_t prefix = 3 + count, total = prefix + 5u*count;
+    const uint64_t first = (count > 51?51:count)*5u;
+    uint64_t limit = mode == 1?prefix + first - 1:
+        mode == 2?total - 1:mode >= 3?0:total;
+    wl_evaluation_control_t *c = control(limit);
+    if (mode >= 3) cancel_at = mode == 3?prefix + first:total;
+    uint64_t generation = dst->view_generation;
+    uint64_t storage = dst->storage_generation;
+    wl_columnar_memory_governor_t *g =
+        wl_columnar_memory_governor_ref_get(src->memory_governor);
+    uint64_t reserved = wl_columnar_memory_reserved(g);
+    unsigned char token[sizeof(dst->retained_reservation)],
+        metadata[sizeof(dst->metadata_reservation)];
+    memcpy(token, &dst->retained_reservation, sizeof(token));
+    memcpy(metadata, &dst->metadata_reservation, sizeof(metadata));
+    int expected = mode == 1 || mode == 2?WL_EVALUATION_CONTROL_WORK_LIMIT:
+        mode >= 3?WL_EVALUATION_CONTROL_CANCELLED:0;
+    CHECK(wl_columnar_relation_append_all_controlled(dst, src, NULL,
+        c) == expected);
+    uint64_t consumed = mode == 1?prefix:mode == 2?prefix + 255:
+        mode == 3?prefix + first:total;
+    CHECK(finish(c, expected) == consumed && seen == consumed);
+    CHECK(max_chunk <= 255);
+    CHECK(dst->nrows == (expected?1:1 + count));
+    CHECK(dst->view_generation == generation + (!expected && count != 0));
+    CHECK(dst->storage_generation == storage && !src->timestamps);
+    CHECK(src->nrows == count && wl_columnar_memory_reserved(g) == reserved);
+    for (uint32_t row = 0; row < count;
+        row++) CHECK(src->columns[0][row] == row);
+    CHECK(dst->columns[0][0] == 0);
+    CHECK(dst->timestamps[0].iteration == 0 &&
+        dst->timestamps[0].stratum == 1 &&
+        dst->timestamps[0].worker == 2 && dst->timestamps[0]._reserved == 0 &&
+        dst->timestamps[0].multiplicity == 0);
+    unsigned char actual[sizeof(dst->retained_reservation)],
+        actual_metadata[sizeof(dst->metadata_reservation)];
+    memcpy(actual, &dst->retained_reservation, sizeof(actual));
+    memcpy(actual_metadata, &dst->metadata_reservation,
+        sizeof(actual_metadata));
+    CHECK(!memcmp(token, actual, sizeof(token)) &&
+        !memcmp(metadata, actual_metadata, sizeof(metadata)));
+    uint32_t written = mode == 1?0:(mode == 2 || mode == 3)?
+        (count > 51?51:count):count;
+    for (uint32_t row = 1; row < dst->timestamp_capacity; row++) {
+        const col_delta_timestamp_t *v = &dst->timestamps[row];
+        if (row <= written) CHECK(!v->iteration && !v->stratum && !v->worker &&
+                !v->_reserved && !v->multiplicity);
+        else CHECK(v->iteration == 7 && v->stratum == 3 && v->worker == 2 &&
+                !v->_reserved && v->multiplicity == -9);
+    }
+    released(src); released(dst);
+    if (expected) {
+        retry(c, total);
+        CHECK(!wl_columnar_relation_append_all_controlled(dst, src, NULL, c));
+        CHECK(finish(c, 0) == total && seen == total);
+        CHECK(dst->nrows == count + 1 &&
+            dst->view_generation == generation + 1);
+        for (uint32_t row = 1; row <= count; row++) {
+            const col_delta_timestamp_t *v = &dst->timestamps[row];
+            CHECK(!v->iteration && !v->stratum && !v->worker &&
+                !v->_reserved && !v->multiplicity);
+        }
+        CHECK(wl_columnar_memory_reserved(g) == reserved);
+        for (uint32_t row = count + 1; row < dst->timestamp_capacity; row++) {
+            const col_delta_timestamp_t *v = &dst->timestamps[row];
+            CHECK(v->iteration == 7 && v->stratum == 3 && v->worker == 2 &&
+                !v->_reserved && v->multiplicity == -9);
+        }
+        released(src); released(dst);
+    }
+    release(c); destroy(dst); destroy(src);
+}
+
+static void
+test_default_timestamp_growth_refused(void)
+{
+    col_rel_t *src = relation(1, 3, 3, false, NULL);
+    col_rel_t *dst = relation(1, 2, 1, true, src->memory_governor);
+    col_delta_timestamp_t spare = {7, 3, 2, 0, -9};
+    dst->timestamps[1] = spare;
+    uint64_t generation = dst->view_generation,
+        storage = dst->storage_generation;
+    wl_columnar_memory_governor_t *g =
+        wl_columnar_memory_governor_ref_get(src->memory_governor);
+    uint64_t reserved = wl_columnar_memory_reserved(g);
+    wl_evaluation_control_t *c = control(0);
+    CHECK(wl_columnar_relation_append_all_controlled(dst, src, NULL,
+        c) == ENOTSUP);
+    CHECK(finish(c, ENOTSUP) == 2 && seen == 2);
+    CHECK(dst->nrows == 1 && dst->capacity == 2 && src->nrows == 3);
+    CHECK(dst->view_generation == generation &&
+        dst->storage_generation == storage);
+    CHECK(wl_columnar_memory_reserved(g) == reserved);
+    CHECK(dst->timestamps[1].iteration == 7 &&
+        dst->timestamps[1].stratum == 3 &&
+        dst->timestamps[1].worker == 2 && !dst->timestamps[1]._reserved &&
+        dst->timestamps[1].multiplicity == -9);
+    released(src); released(dst);
+    release(c); destroy(dst); destroy(src);
 }
 
 static wl_columnar_source_access_reader_t peer;
@@ -5542,6 +5667,12 @@ main(void)
     test_controlled_batch_saved_generation();
     test_controlled_batch_end_authority();
     test_controlled_batch_seams();
+    test_default_timestamp_growth_refused();
+    test_default_timestamp_packets(0, 0);
+    for (unsigned mode = 0; mode < 5; mode++) {
+        if (mode != 2) test_default_timestamp_packets(51, mode);
+        test_default_timestamp_packets(52, mode);
+    }
     test_controlled_batch_renew_authority();
     test_controlled_batch_new_types();
     test_controlled_batch_resources();
