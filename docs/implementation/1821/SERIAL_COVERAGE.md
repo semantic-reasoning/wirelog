@@ -2720,17 +2720,17 @@ this path.
 
 `evaluation_empty_edb_sources` runs single-rule, UNION (either or both
 branches never inserted), FILTER, ungrouped and grouped COUNT, two-column,
-INT32 and FLOAT bodies through controlled and uncontrolled sessions for STEP
-and SNAPSHOT, observed and unobserved. On the unobserved STEP it checks that
-two empty-source records held the source, that the consumer published once per
-bare EDB with that EDB as input, and that the EDB stays bare; it then repeats
-the STEP and inserts the first rows. It stops at each empty-source step while
-VARIABLE and the consumer hold the EDB, and at the MAP or FILTER output or the
-`$concat` publication, with cancellation and with work exhaustion, and checks
-the unchanged head and EDB, the report, reset and retry, and the first insert
-after the stop. The observed STEP of the single-rule body is checked to give
-the EDB a schema, and that of the FILTER body, which takes the general
-observed transaction, to leave it without one.
+integer MAP expression, INT32 and FLOAT bodies through controlled and
+uncontrolled sessions for STEP and SNAPSHOT, observed and unobserved. On the
+unobserved STEP it checks that two empty-source records held the source, that
+the consumer published once per bare EDB with that EDB as input, and that the
+EDB stays bare; it then repeats the STEP and inserts the first rows. It stops
+at each empty-source step while VARIABLE and the consumer hold the EDB, and at
+the MAP or FILTER output or the `$concat` publication, with cancellation and
+with work exhaustion, and checks the unchanged head and EDB, the report, reset
+and retry, and the first insert after the stop. The observed STEP of the
+single-rule body is checked to give the EDB a schema, and that of the FILTER
+body, which takes the general observed transaction, to leave it without one.
 
 The int32-declared body is covered in all four columns, with no type
 exception; see the next section. CONSOLIDATE, CONCAT and the framed
@@ -2766,3 +2766,21 @@ comparing head rows, width and type, the evaluating SNAPSHOT image and the
 observed STEP events with the uncontrolled session. The parser takes no
 uint32, uint64 or bool declaration, so the test also runs both checks with the
 plan's int32 lane of the EDB rewritten to UINT32, UINT64 and BOOL.
+
+### Integer MAP expressions in observed steps (#2301)
+
+A single-rule body over one INT64 EDB, made of VARIABLE, a one-column MAP and
+CONSOLIDATE, was classified for the legacy observed route whenever its MAP
+projected column 0. That route reads a MAP with no expression or with the
+single expression `col0` and refuses any other, so an observed STEP or
+SNAPSHOT of `out(x + 1) :- a(x).` returned ENOTSUP, with rows and without,
+while the uncontrolled session succeeded. A MAP over a single-column FLOAT
+EDB, such as `out(x + 1.25) :- a(x).`, and a body with a FILTER already went
+to the general observed transaction. The shape check now sends such a MAP to
+the general observed transaction; the legacy route keeps the bodies it read
+before.
+
+`evaluation_empty_edb_sources` adds that body, never inserted, in all four
+columns with the stops of the other bodies, and runs it through the
+`untyped_rows` rounds, comparing head rows, width and type, the SNAPSHOT image
+and the observed STEP events with the uncontrolled session.
