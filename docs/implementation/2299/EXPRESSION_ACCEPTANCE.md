@@ -2122,3 +2122,26 @@ They are reused rather than adding assignment-mirror tests. Serial, expression,
 empty-source and native/snapshot recovery regressions remain required because
 the primitive is shared. Typed bottom transport and ordinary prechild finish
 integration are subsequent units; this scalarization alone grants neither.
+
+
+### Bulk-append default timestamp prerequisite
+
+A real inline-seed growth oracle exposed uninitialized timestamp metadata in
+raw bulk append. The destination's timestamp buffer could contain uninitialized
+new capacity or stale spare entries; append copied provenance only when the
+source also carried timestamps. Newly appended rows from an untracked source
+now receive zero provenance, matching row and atomic-row append. Existing live
+prefixes, source timestamps and unused spare entries are preserved. Allocation,
+admission, COW and schema preparation still finish before this nonfallible write.
+No resize helper, capacity policy or allocator ordinal changes.
+
+The registered memory-admission relation test poisons actual spare entries and
+checks default provenance, exact tracked-source copies, old prefix, untouched
+remaining spare fields, values, empty-source behavior and untracked destination
+behavior. It crosses heap, retained-governor, unmanaged arena and actual shared
+view ownership, growth/no-growth and nullary/scalar widths. The stale-slot test
+fails deterministically before the fix. Existing allocation/admission/ownership
+failure tests are retained. Timestamp capacity proves addressability, not that
+all spare entries carry initialized provenance; seed composition must not read
+unknown spare slots or restore stale provenance over newly appended defaults.
+This prerequisite alone does not activate the inline-seed or recursive host.
