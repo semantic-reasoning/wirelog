@@ -502,7 +502,7 @@ oracle_literal_constructor(
 {
 #define L(v) oracle_literal_add(literal, (v))
 #define R(v, n) oracle_literal_repeat(literal, (v), (n))
-    L(128); L(128); L(128); L(192);
+    L(128); L(256); L(128); L(128); L(192); /* LIKE, graph, RECIPE, build. */
     R(96, 8); /* "$filter", including its terminator. */
     R(96, 6); L(96);
     if (typed && width) R(96, 2);
@@ -627,7 +627,7 @@ literal_schedule(uint32_t width, uint32_t rows)
 #define L(v) oracle_literal_add(&literal, (v))
 #define R(v, n) oracle_literal_repeat(&literal, (v), (n))
     L(224); R(192, 10); L(192); R(192, 2); L(192);
-    L(160); L(128); L(256); L(192); L(192);
+    L(160); L(128); L(256); L(192); L(256); L(192); /* Unary; INPUT; guard; OUTPUT. */
     L(192); L(192); L(256); L(192); L(256);
     L(96); L(144); L(224); L(96); L(144); L(224);
     L(192); R(224, (width + 7u) / 8u);

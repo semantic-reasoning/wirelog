@@ -2305,3 +2305,25 @@ existing256 graph/input guards are absent from that test's independent oracle
 (expected50869 versus actual51381 for width0/rows0). Its test-only correction is
 the separately approved next unit. Passing this scoped unit is not a full CI or
 remote TSan success receipt, and does not activate a canonical seed route.
+
+### CI regression prerequisite: ordered CONSOLIDATE literal guards
+
+The independent CONSOLIDATE schedule now includes the two graph/input guards
+already present in production: INPUT192, guard256, OUTPUT192 after the unary child and before the finite
+value scan, and LIKE128, graph256, RECIPE128 before output construction. Each
+guard executes once on these ordinary fixtures, including width0/rows0; the
+source-derived total increase is256+256. No production tariff or guard changes.
+
+The existing complete width0/rows0 exact/one-short prefix matrix and selected
+width0/1/17 nonempty prefix matrices retain their exact packet order, raw result,
+resource and acknowledgement assertions. The two added packets are exercised
+as distinct admissions rather than an appended measured512 adjustment. This
+closes the separately recorded literal baseline failure; final-head remote CI
+and the remaining canonical/typed/recursive integration still require evidence.
+
+The initial proposed oracle placed the input packet at the later SHAPE192/128
+pair. Although its total was correct, the complete prefix test rejected that
+ordering. The corrected sequence places it after unary child160/128/256 and
+INPUT192: independently derived prefix3648, guard256, exact3904 or one-short
+3903 with consumed3648. The later SHAPE192/128 pair stays unchanged. The failed
+candidate, initial review and diagnostic are retained in the workflow artifacts.
