@@ -2523,7 +2523,13 @@ test_controlled_recursive_two_join_step(void)
      * skip BEGIN in the empty-frontier seed round, then begin in each of
      * the two later rounds:4+6+6=16. Width2 never uses wide capture and
      * these outputs fit initial capacity, so no renewal is added. */
-    const uint64_t expected_work = UINT64_C(1271246) + UINT64_C(6) * 3328
+    /* Every round constructs CONCAT, CONSOLIDATE and the detached framed
+     * result through scalar-source newlike siblings (merge.c, filter.c and
+     * eval_serial.c FRAMED_NEW). Each now pays physical graph guard256.
+     * CONSOLIDATE also pays its new authentic input-info256. MAP and ordinary
+     * JOIN constructors use different recipes. */
+    const uint64_t expected_work = UINT64_C(1271246) + UINT64_C(3) * 4 * 256
+        + UINT64_C(6) * 3328
         + UINT64_C(16) * (853 - 498)
         + 3u * recursive_capture_scan_work(plan, "path")
         + UINT64_C(3) * 224
@@ -2677,7 +2683,9 @@ test_controlled_recursive_step_publication_and_stops(void)
      * per eight-byte chunk. Both sizes include ABI-dependent thread IDs. */
     /* Four common writers per round plus JOIN on the three nonempty
      * frontiers:4+5+5+5=19 actual BEGINs, each now853 rather than498. */
-    const uint64_t expected_work = UINT64_C(1391081) + UINT64_C(4) * 3328
+    /* Three newlike guards plus authentic CONSOL input-info: four256 per round. */
+    const uint64_t expected_work = UINT64_C(1391081) + UINT64_C(4) * 4 * 256
+        + UINT64_C(4) * 3328
         + UINT64_C(19) * (853 - 498)
         + 4u * recursive_capture_scan_work(plan, "path")
         + UINT64_C(4) * 224
@@ -2880,7 +2888,9 @@ test_controlled_recursive_step_after_public_edge_append(void)
      * with five operator descriptors per round, using the tariffs above. */
     /* Four common writers in all five rounds; JOIN skips only seed:
      * 4+5+5+5+5=24 BEGINs, with no wide capture or renewed capacity. */
-    const uint64_t successor_work = UINT64_C(1859706) + UINT64_C(5) * 3328
+    /* Three newlike guards and CONSOL input-info256 in each of five rounds. */
+    const uint64_t successor_work = UINT64_C(1859706) + UINT64_C(5) * 4 * 256
+        + UINT64_C(5) * 3328
         + UINT64_C(24) * (853 - 498)
         + 5u * recursive_capture_scan_work(plan, "path")
         + UINT64_C(5) * 224
@@ -2926,7 +2936,9 @@ test_controlled_recursive_successor_work_boundaries(void)
     wl_evaluation_control_t *control = NULL;
     wl_session_t *session = controlled_recursive_session(edges, 3, &plan,
             &program, &control);
-    const uint64_t successor_work = UINT64_C(1859706) + UINT64_C(5) * 3328
+    /* Three newlike guards and CONSOL input-info256 in each of five rounds. */
+    const uint64_t successor_work = UINT64_C(1859706) + UINT64_C(5) * 4 * 256
+        + UINT64_C(5) * 3328
         + UINT64_C(24) * (853 - 498)
         + 5u * recursive_capture_scan_work(plan, "path")
         + UINT64_C(5) * 224

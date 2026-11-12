@@ -1818,7 +1818,8 @@ wl_columnar_filter_test_literal_constructor(
 {
 #define L(v) wl_columnar_filter_test_literal_add(literal, (v))
 #define R(v, n) wl_columnar_filter_test_literal_repeat(literal, (v), (n))
-    L(128); L(128); L(128); L(192);
+    L(128); L(256); /* Precise physical graph-output guard. */
+    L(128); L(128); L(192);
     R(96, 8); /* "$filter", including its terminator. */
     R(96, 6); L(96);
     if (typed && width) R(96, 2);
@@ -3330,7 +3331,7 @@ map_whole_scalar_schema(void)
                     col_rel_t *raw_input = NULL;
                     CHECK(!col_rel_deep_copy(input, &raw_input, NULL));
                     CHECK(!eval_stack_push(&raw, raw_input, true));
-                    for (unsigned chain = 0; chain < (rows ? 2u : 1u);
+                    for (unsigned chain = 0; chain < 2;
                         ++chain){
                         wl_columnar_filter_test_scenario_t *scenario = calloc(1,
                                 sizeof(*scenario));
@@ -3352,7 +3353,11 @@ map_whole_scalar_schema(void)
                         col_rel_t *result =
                             wl_columnar_eval_stack_cleanup_stack(
                             scenario->filter.frame)->items[0].rel;
-                        CHECK(!col_op_map(&op, &raw, raw_session));
+                        int raw_rc = col_op_map(&op, &raw, raw_session);
+                        if (raw_rc) fprintf(stderr,
+                                "raw schema width%u kind%u order%u rows%u chain%u rc%d\n",
+                                width, kind, order, rows, chain, raw_rc);
+                        CHECK(!raw_rc);
                         wl_columnar_filter_test_equal(result, raw.items[0].rel);
                         CHECK(result->ncols == 2 && result->nrows == rows);
                         if (!chain) {
@@ -3367,8 +3372,8 @@ map_whole_scalar_schema(void)
                                     1 ? WIRELOG_TYPE_INT64 :
                                     WIRELOG_TYPE_STRING));
                             }
-                            if (rows) CHECK(!col_rel_deep_copy(result, &input,
-                                    NULL));
+                            CHECK(!col_rel_deep_copy(result, &input,
+                                NULL));
                         }
                         wl_columnar_filter_test_complete(scenario);
                         free(scenario);
@@ -4717,6 +4722,11 @@ typedef int (*reduce_child_callback_t)(reduce_fixture_t *);
 static int
 reduce_start_child(reduce_fixture_t *f)
 {
+    if (f->op.op == WL_PLAN_OP_CONSOLIDATE)
+        return wl_columnar_filter_consolidate_attempt_start_owned(&f->op,
+                   f->frame, f->session, f->operation, f->operation_id,
+                   &f->status,
+                   f->owner);
     return wl_columnar_ops_reduce_attempt_start_owned(&f->op, f->frame,
                f->session, f->operation, f->operation_id, &f->status, f->owner);
 }
@@ -4828,6 +4838,288 @@ reduce_fixture_close(reduce_fixture_t *f, bool input_owned)
     wl_columnar_memory_governor_ref_release(f->session->memory_governor);
     free(f->session);
     if (!input_owned) col_rel_destroy(f->input);
+}
+
+static col_rel_t *
+consol_future_source(bool timestamped)
+{
+    col_rel_t *bare = NULL, *source = NULL;
+    CHECK(!col_rel_alloc(&bare, "missing"));
+    bare->declared_ncols = 2; bare->has_graph_column = true;
+    bare->graph_col_idx = 1;
+    int owner = 0;
+    wl_evaluation_control_t *c = wl_columnar_filter_test_control(0, &owner);
+    CHECK(!wl_columnar_relation_new_empty_input_operator_attempt_controlled(
+            "future", bare, NULL, NULL, &source, c,
+            wl_evaluation_control_active_attempt_id(c)) && source);
+    CHECK(!wl_evaluation_control_finish(c, &owner, 0,
+        0) && !wl_evaluation_control_detach(c, &owner));
+    wl_evaluation_control_release(c); CHECK(!col_rel_destroy_checked(bare));
+    if (timestamped)CHECK(!col_rel_enable_timestamps(source));
+    return source;
+}
+static void
+consol_future_graph_matrix(void)
+{
+    for (unsigned timestamped = 0; timestamped < 2; ++timestamped)
+        for (unsigned owned = 0; owned < 2; ++owned)for (unsigned claim = 0;
+                claim < 2;
+                ++claim){
+                col_rel_t *input = consol_future_source(timestamped != 0);
+                col_rel_t *reference = consol_future_source(timestamped != 0);
+                wl_col_session_t *raw_session =
+                    wl_columnar_filter_test_session();
+                eval_stack_t raw = {0};
+                CHECK(!eval_stack_push(&raw, reference, owned != 0));
+                int expected = col_op_consolidate(&raw, raw_session);
+                CHECK(expected == (timestamped && !owned?EINVAL:0));
+                bool expected_ts = !expected &&
+                    raw.items[0].rel->timestamps != NULL;
+                reduce_fixture_t f;
+                reduce_fixture_init(&f, input, owned != 0, 0, claim != 0);
+                f.op.op = WL_PLAN_OP_CONSOLIDATE;
+                col_relation_snapshot_t before =
+                    wl_columnar_relation_snapshot(input);
+                reduce_run(&f);
+                CHECK(f.status.semantic_result == expected &&
+                    !f.status.cleanup_result);
+                eval_stack_t *stack =
+                    wl_columnar_eval_stack_cleanup_stack(f.frame);
+                CHECK(stack->top == 1);
+                if (!expected) {
+                    CHECK(f.status.committed && stack->items[0].owned);
+                    col_rel_t *out = stack->items[0].rel;
+                    CHECK(out->schema_ok && !out->ncols && !out->nrows &&
+                        out->declared_ncols == 2 &&
+                        out->has_graph_column && out->graph_col_idx == 1 &&
+                        (out->timestamps != NULL) == expected_ts);
+                    if (expected_ts) CHECK(out->timestamp_capacity >=
+                            out->nrows);
+                    wl_columnar_filter_test_equal(out, raw.items[0].rel);
+                }else CHECK(!f.status.committed &&
+                        stack->items[0].rel == input &&
+                        wl_columnar_relation_snapshot_equal(before,
+                        wl_columnar_relation_snapshot(input)));
+                CHECK(!eval_stack_drain(&raw));
+                if (!owned) CHECK(!col_rel_destroy_checked(reference));
+                CHECK(!wl_columnar_filter_test_reserved(raw_session));
+                wl_columnar_memory_governor_ref_release(
+                    raw_session->memory_governor); free(raw_session);
+                reduce_fixture_close(&f, owned != 0);
+            }
+}
+static void
+consol_input_info_prices(void)
+{
+    /* Actual START before INPUT: ENTRY224, lifecycle10*192, INIT192,
+     * unary retirement2*192, UNARY_BEGIN192, child160/128/256,
+     * INPUT192 =3648. The new authentic-info packet is256. */
+    for (unsigned claim = 0; claim < 2; ++claim)for (unsigned below = 0;
+            below < 2;
+            ++below){
+            col_rel_t *input = consol_future_source(false); reduce_fixture_t f;
+            reduce_fixture_init(&f, input, true, 3648+256-below, claim != 0);
+            f.op.op = WL_PLAN_OP_CONSOLIDATE;
+            col_relation_snapshot_t before =
+                wl_columnar_relation_snapshot(input);
+            reduce_run(&f);
+            CHECK(f.status.semantic_result ==
+                WL_EVALUATION_CONTROL_WORK_LIMIT && !f.status.committed);
+            eval_stack_t *stack = wl_columnar_eval_stack_cleanup_stack(f.frame);
+            CHECK(stack->top == 1 && stack->items[0].rel == input &&
+                wl_columnar_relation_snapshot_equal(before,
+                wl_columnar_relation_snapshot(input)));
+            uint64_t used = 99;
+            CHECK(!wl_evaluation_control_test_active_consumed(f.operation,
+                f.operation_id, &used) &&
+                used == (below?3648u:3904u));
+            reduce_fixture_close(&f, true);
+        }
+}
+
+static reduce_fixture_t *consol_observe;
+static bool consol_expected_owned, consol_info_seen, consol_interrupt;
+static unsigned consol_stop_mode, consol_stop_phase;
+static uint64_t consol_successor;
+static bool consol_ts_copy_active; static unsigned consol_ts_copy_steps;
+static wl_evaluation_control_report_t consol_frozen;
+typedef struct {wl_columnar_eval_stack_cleanup_frame_t *frame;
+                const void *owner; int rc;} consol_getter_thread_t;
+static void *consol_getter_foreign(void *data) {
+    consol_getter_thread_t *t = data;
+    const col_rel_t *out = (const col_rel_t *)(uintptr_t)1; bool owned = false;
+    t->rc = wl_columnar_eval_stack_unary_input_info_owned(t->frame, &out,
+            &owned, t->owner);
+    CHECK(t->rc && out == (const col_rel_t *)(uintptr_t)1 && !owned);
+    return NULL;
+}
+static void consol_stop_original(reduce_fixture_t *f) {
+    consol_info_seen = true;
+    if (!consol_stop_mode)wl_evaluation_control_request_cancel(f->operation);
+    else if (consol_stop_mode == 1 || consol_stop_mode == 4)
+        CHECK(wl_evaluation_control_charge(f->operation, UINT64_MAX) ==
+            (consol_stop_mode == 1?WL_EVALUATION_CONTROL_WORK_LIMIT:EOVERFLOW));
+    else {
+        CHECK(!wl_evaluation_control_finish(f->operation, &f->operation_owner,
+            0, 0));
+        CHECK(!wl_evaluation_control_report(f->operation, &consol_frozen));
+        if (consol_stop_mode == 3) {
+            CHECK(!wl_evaluation_control_reset(f->operation) &&
+                !wl_evaluation_control_begin(f->operation,
+                &f->operation_owner));
+            consol_successor =
+                wl_evaluation_control_active_attempt_id(f->operation);
+        }
+    }
+}
+/* Read-only test observations of actual snapshot authority, excluded testhook
+* bodies; production still performs its single authentic getter afterwards. */
+static void consol_info_checkpoint(wl_evaluation_control_t *c, unsigned phase,
+    uint64_t progress) {
+    (void)progress; reduce_fixture_t *f = consol_observe;
+    if (!f || c != f->operation || phase != 638)return;
+    const col_rel_t *out = NULL; bool owned = !consol_expected_owned;
+    CHECK(!wl_columnar_eval_stack_unary_input_info_owned(f->frame, &out, &owned,
+        f->owner) &&
+        out == f->input && owned == consol_expected_owned);
+    int wrong_owner = 0; out = (const col_rel_t *)(uintptr_t)1; owned = false;
+    CHECK(wl_columnar_eval_stack_unary_input_info_owned(f->frame, &out, &owned,
+        &wrong_owner) &&
+        out == (const col_rel_t *)(uintptr_t)1 && !owned);
+    CHECK(wl_columnar_eval_stack_unary_input_info_owned(f->frame, NULL, &owned,
+        f->owner) == EINVAL && !owned);
+    CHECK(wl_columnar_eval_stack_unary_input_info_owned(f->frame, &out, NULL,
+        f->owner) == EINVAL &&
+        out == (const col_rel_t *)(uintptr_t)1);
+    CHECK(wl_columnar_eval_stack_unary_input_info_owned(NULL, &out, &owned,
+        f->owner) == EINVAL &&
+        out == (const col_rel_t *)(uintptr_t)1 && !owned);
+    consol_getter_thread_t t = {f->frame, f->owner, 0}; wl_thread_t thread;
+    CHECK(!wl_thread_create(&thread, consol_getter_foreign,
+        &t) && !wl_thread_join(&thread) && t.rc);
+    if (consol_interrupt)consol_stop_original(f);
+    else consol_info_seen = true;
+}
+static void consol_source_checkpoint(wl_evaluation_control_t *c,
+    unsigned phase) {
+    if (consol_observe && c == consol_observe->operation && phase == 636 &&
+        consol_stop_phase == 637){
+        consol_ts_copy_active = true; consol_ts_copy_steps = 0;
+    }
+    if (consol_observe && c == consol_observe->operation &&
+        phase == consol_stop_phase && !consol_info_seen)
+        consol_stop_original(consol_observe);
+}
+/* The actual TS constructor has descriptor ceil(sizeof/8) zero packets,
+ * then one $consol name-copy packet before its192 timestamp zero packets.
+ * Interrupt at the actual midpoint timestamp packet, not a timer estimate. */
+static void consol_ts_copy_checkpoint(wl_evaluation_control_t *c,
+    uint64_t work) {
+    if (consol_observe && c == consol_observe->operation &&
+        consol_ts_copy_active &&
+        !consol_info_seen && work == 224 && ++consol_ts_copy_steps ==
+        (sizeof(col_rel_t)+7u)/8u+1u+(64u*sizeof(col_delta_timestamp_t)+15u)/
+        16u)
+        consol_stop_original(consol_observe);
+}
+static bool consol_report_equal(const wl_evaluation_control_report_t *a,
+    const wl_evaluation_control_report_t *b) {
+    return a->attempt_id == b->attempt_id && a->limit == b->limit &&
+           a->consumed == b->consumed &&
+           a->result == b->result &&
+           a->execution_status == b->execution_status &&
+           a->cleanup_status == b->cleanup_status &&
+           a->stop_reason == b->stop_reason;
+}
+static void consol_getter_and_source_stops(void) {
+    const unsigned phases[] = {638, 620, 622, 623, 627, 629, 636, 637, 631,
+                               632};
+    for (unsigned claim = 0; claim < 2; ++claim)for (unsigned timestamped = 0;
+            timestamped < 2; ++timestamped)
+            for (size_t k = 0; k < sizeof(phases)/sizeof(*phases); ++k) {
+                if (!timestamped &&
+                    (phases[k] == 636 || phases[k] == 637)) continue;
+                for (consol_stop_mode = 0; consol_stop_mode < 5;
+                    ++consol_stop_mode){
+                    col_rel_t *input = consol_future_source(timestamped != 0);
+                    reduce_fixture_t f;
+                    reduce_fixture_init(&f, input, true,
+                        consol_stop_mode == 1?UINT64_MAX:0, claim != 0);
+                    f.op.op = WL_PLAN_OP_CONSOLIDATE;
+                    col_relation_snapshot_t before =
+                        wl_columnar_relation_snapshot(input);
+                    consol_observe = &f; consol_expected_owned = true;
+                    consol_info_seen = false;
+                    consol_interrupt = phases[k] == 638;
+                    consol_stop_phase = phases[k]; consol_successor = 0;
+                    consol_ts_copy_active = false; consol_ts_copy_steps = 0;
+                    if (consol_interrupt)
+                        wl_columnar_filter_test_attempt_checkpoint =
+                            consol_info_checkpoint;
+                    else wl_columnar_relation_test_empty_input_checkpoint =
+                            consol_source_checkpoint;
+                    if (phases[k] ==
+                        637) wl_columnar_relation_test_work_checkpoint =
+                            consol_ts_copy_checkpoint;
+                    reduce_run(&f);
+                    wl_columnar_filter_test_attempt_checkpoint = NULL;
+                    wl_columnar_relation_test_empty_input_checkpoint = NULL;
+                    wl_columnar_relation_test_work_checkpoint = NULL;
+                    consol_observe = NULL;
+                    int expected = consol_stop_mode ==
+                        0?WL_EVALUATION_CONTROL_CANCELLED:
+                        consol_stop_mode ==
+                        1?WL_EVALUATION_CONTROL_WORK_LIMIT:consol_stop_mode ==
+                        4?EOVERFLOW:EINVAL;
+                    CHECK(consol_info_seen &&
+                        f.status.semantic_result == expected &&
+                        !f.status.committed && !f.status.cleanup_result);
+                    eval_stack_t *stack =
+                        wl_columnar_eval_stack_cleanup_stack(f.frame);
+                    CHECK(stack->top == 1 && stack->items[0].rel == input &&
+                        stack->items[0].owned &&
+                        wl_columnar_relation_snapshot_equal(before,
+                        wl_columnar_relation_snapshot(input)));
+                    if (consol_stop_mode == 2 || consol_stop_mode == 3) {
+                        wl_evaluation_control_report_t report;
+                        CHECK(!wl_evaluation_control_report(f.operation,
+                            &report) && consol_report_equal(&report,
+                            &consol_frozen));
+                        if (consol_stop_mode == 3) {
+                            uint64_t used = 99;
+                            CHECK(!wl_evaluation_control_test_active_consumed(
+                                    f.operation, consol_successor,
+                                    &used) && !used);
+                            CHECK(!wl_evaluation_control_finish(f.operation,
+                                &f.operation_owner, 0, 0));
+                        }
+                    }
+                    reduce_fixture_close(&f, true);
+                }
+            }
+    /* Both ownership values and genuine numeric-owner variant observed; also
+     * prove the getter refuses the post-ACK phase with unchanged outputs. */
+    for (unsigned owned = 0; owned < 2; ++owned)for (unsigned claim = 0;
+            claim < 2;
+            ++claim) {
+            col_rel_t *input = consol_future_source(false); reduce_fixture_t f;
+            reduce_fixture_init(&f, input, owned != 0, 0, claim != 0);
+            f.op.op = WL_PLAN_OP_CONSOLIDATE;
+            consol_observe = &f; consol_expected_owned = owned != 0;
+            consol_interrupt = false; consol_info_seen = false;
+            wl_columnar_filter_test_attempt_checkpoint = consol_info_checkpoint;
+            reduce_run(&f);
+            wl_columnar_filter_test_attempt_checkpoint = NULL;
+            consol_observe = NULL;
+            CHECK(consol_info_seen && !f.status.semantic_result &&
+                f.status.committed);
+            const col_rel_t *out = (const col_rel_t *)(uintptr_t)1;
+            bool is_owned = false;
+            CHECK(wl_columnar_eval_stack_unary_input_info_owned(f.frame, &out,
+                &is_owned, f.owner) &&
+                out == (const col_rel_t *)(uintptr_t)1 && !is_owned);
+            reduce_fixture_close(&f, owned != 0);
+        }
 }
 
 static col_rel_t *
@@ -6367,6 +6659,107 @@ concat_literal_matrix(void)
                     left, right, (left + 1) % 2, (right + 1) % 2);
 }
 
+/* Newly legal scalar HELD future-graph inputs must retain raw CONCAT's
+ * new-like output EINVAL. Use an actual source-derived constructor result,
+ * real CONCAT START/STEP/ACK and original stack entries, never a fake HELD. */
+static col_rel_t *
+concat_future_graph_source(binary_fixture_t *b)
+{
+    col_rel_t *bare = NULL, *source = NULL;
+    CHECK(!col_rel_alloc(&bare, "missing graph"));
+    bare->declared_ncols = 2; bare->has_graph_column = true;
+    bare->graph_col_idx = 1;
+    CHECK(!wl_columnar_relation_new_empty_input_operator_attempt_controlled(
+            "future graph", bare, NULL, NULL, &source, b->operation,
+            b->operation_id) && source);
+    CHECK(!col_rel_destroy_checked(bare));
+    CHECK(source->schema_ok && !source->ncols && !source->nrows &&
+        source->declared_ncols == 2 && source->has_graph_column &&
+        source->graph_col_idx == 1);
+    return source;
+}
+static void
+concat_future_graph_error(void)
+{
+    for (unsigned owned = 0; owned < 2; ++owned)for (unsigned bound = 0;
+            bound < 2;
+            ++bound) {
+            concat_fixture_t f;
+            concat_fixture_init(&f, 0, 0, 0, -1, -1, owned != 0, false, 0);
+            binary_fixture_t *b = &f.binary;
+            eval_stack_t *stack =
+                wl_columnar_eval_stack_cleanup_stack(b->frame);
+            col_rel_destroy(b->inputs[1]);
+            b->inputs[1] = concat_future_graph_source(b);
+            stack->items[1].rel = b->inputs[1]; b->before[1] = stack->items[1];
+            col_relation_snapshot_t old =
+                wl_columnar_relation_snapshot(b->inputs[1]);
+            col_rel_t *a = concat_future_graph_source(b),
+                *right = concat_source(0, 0, -1, 1);
+            eval_stack_t raw = {0};
+            CHECK(!eval_stack_push(&raw, a, false) && !eval_stack_push(&raw,
+                right, false));
+            CHECK(col_op_concat(&raw, b->session) == EINVAL);
+            CHECK(!eval_stack_drain(&raw)); col_rel_destroy(a);
+            col_rel_destroy(right);
+            if (bound) {
+                b->bound = true;
+                CHECK(!wl_columnar_eval_plan_numeric_stack_attempt_begin(
+                        &b->record, &b->plan, 0, 1,
+                        b->frame, b->session, 3, b->operation, b->operation_id,
+                        b->funding, b->funding_id));
+            }
+            concat_run(&f);
+            CHECK(b->status.semantic_result == EINVAL && !b->status.committed &&
+                !b->status.cleanup_result);
+            binary_assert_originals(b);
+            CHECK(wl_columnar_relation_snapshot_equal(old,
+                wl_columnar_relation_snapshot(b->inputs[1])));
+            wl_columnar_source_access_writer_t writer = {0};
+            CHECK(!wl_columnar_source_access_writer_acquire(
+                    &b->inputs[1]->descriptor_access, &writer) &&
+                !wl_columnar_source_access_writer_release(&writer));
+            CHECK(!wl_columnar_source_access_writer_acquire(
+                    &b->inputs[1]->source_access, &writer) &&
+                !wl_columnar_source_access_writer_release(&writer));
+            if (!bound) {
+                /* Same real frame and operator after ERROR ACK, corrected inputs
+                 * and a new Original; no pending native owner is cleared by hand. */
+                CHECK(wl_evaluation_control_finish(b->operation,
+                    &b->operation_owner, EINVAL, 0) == EINVAL);
+                CHECK(!wl_evaluation_control_reset(b->operation) &&
+                    !wl_evaluation_control_begin(b->operation,
+                    &b->operation_owner));
+                b->operation_id =
+                    wl_evaluation_control_active_attempt_id(b->operation);
+                for (unsigned side = 0; side < 2; ++side) {
+                    unsigned i = side+1;
+                    col_rel_destroy(b->inputs[i]);
+                    b->inputs[i] = concat_source(2, 1, -1, side);
+                    stack->items[i].rel = b->inputs[i];
+                    stack->items[i].seg_boundaries[1] = 1;
+                    b->before[i] = stack->items[i];
+                }
+                f.phase = 0; f.pending = false; f.child_calls = f.consumes = 0;
+                a = concat_source(2, 1, -1, 0);
+                right = concat_source(2, 1, -1, 1);
+                CHECK(!eval_stack_push(&raw, a, false) && !eval_stack_push(&raw,
+                    right, false) &&
+                    !col_op_concat(&raw, b->session));
+                concat_run(&f);
+                CHECK(!b->status.semantic_result && b->status.committed &&
+                    !b->status.cleanup_result);
+                concat_literal_result(&f, 2, 1, 1, -1, -1);
+                wl_columnar_filter_test_equal(stack->items[1].rel,
+                    raw.items[0].rel);
+                CHECK(!eval_stack_drain(&raw)); col_rel_destroy(a);
+                col_rel_destroy(right);
+            }
+            binary_fixture_close(b, !bound);
+            if (bound) concat_parity_case(2, 1, 1, -1, -1, owned != 0, true);
+        }
+}
+
 static unsigned concat_stop_phase;
 static bool concat_stop_hit;
 static void
@@ -6869,7 +7262,8 @@ main(void)
     concat_inert_ack_funding();
     concat_raw_single_marker(); concat_authority_and_reserve_stop();
     concat_quota_retry(); concat_nested_host_funding();
-    concat_literal_matrix(); concat_stop_and_failure();
+    concat_literal_matrix(); concat_future_graph_error();
+    concat_stop_and_failure();
     concat_retained_and_turnover(); concat_resource_and_compatibility();
     test_binary_replacement(); binary_test_native_and_lifo();
     binary_test_turnover();
@@ -6877,6 +7271,8 @@ main(void)
     reduce_collisions(); reduce_owned_authority();
     reduce_allocation_and_domains(); reduce_retained_resources();
     reduce_shape_and_expression(); reduce_wide_and_float_overflow();
+    consol_future_graph_matrix(); consol_input_info_prices();
+    consol_getter_and_source_stops();
     reduce_group_native_types(); reduce_entry_limits();
     reduce_batch_and_entry_stops(); reduce_quota_retry();
     reduce_all_reached_allocations();

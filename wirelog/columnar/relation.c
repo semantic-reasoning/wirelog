@@ -18135,6 +18135,277 @@ wl_columnar_relation_new_auto_operator_attempt_controlled(
     return rc;
 }
 
+/* Empty observed input is copied from its actual physical schema, never
+ * synthesized from a declaration. All source reads hold two real independent
+ * readers. INIT256 includes current196 + future mandatory drain22 + outer
+ * output unwind18 + ownership markers2 + phase-hook front2 =240 before any ownership acquisition.
+ * Each header chunk <=219/256; run record178/224. Recipe200/256. Final215/256
+ * includes the actual SCHEMA parent handoff; no source read follows drain.
+ * Existing narrow constructor physical/token retirement interiors are retained.
+ */
+#ifdef WL_SESSION_TEST_HOOKS
+void (*wl_columnar_relation_test_empty_input_checkpoint)(
+    wl_evaluation_control_t *, unsigned);
+#endif
+static int
+wl_columnar_relation_empty_input_region(wl_evaluation_control_t *control,
+    uint64_t id, unsigned phase, uint64_t work)
+{
+    int rc = wl_columnar_relation_constructor_attempt_charge(control, id, work);
+    if (rc) return rc;
+#ifdef WL_SESSION_TEST_HOOKS
+    if (wl_columnar_relation_test_empty_input_checkpoint)
+        wl_columnar_relation_test_empty_input_checkpoint(control, phase);
+#else
+    (void)phase;
+#endif
+    return wl_columnar_relation_constructor_attempt_tail(control, id, work);
+}
+
+static int
+wl_columnar_relation_empty_input_acquire(const col_rel_t *src,
+    wl_columnar_relation_constructor_attempt_source_t *source,
+    wl_evaluation_control_t *control, uint64_t id)
+{
+    int rc = wl_columnar_relation_empty_input_region(control, id, 621, 256);
+    if (rc) return rc; /* No initialized record or ownership to drain. */
+    wl_columnar_relation_constructor_attempt_reader_inert(
+        &source->descriptor_reader);
+    source->descriptor_reader.acquire_stage = 0;
+    source->descriptor_reader.release_stage = 0;
+    wl_columnar_relation_constructor_attempt_reader_inert(
+        &source->owner_reader);
+    source->owner_reader.acquire_stage = 0;
+    source->owner_reader.release_stage = 0;
+    source->descriptor = src; source->owner = NULL;
+    source->recipe.names = NULL; source->recipe.types = NULL;
+    source->recipe.type_codes = NULL; source->recipe.has_graph_column = false;
+    source->recipe.graph_col_idx = 0; source->recipe.declared_ncols = 0;
+    source->recipe.view_generation = 0; source->recipe.storage_generation = 0;
+    source->width = 0; source->snapshot_nrows = 0;
+    source->snapshot_capacity = 0; source->snapshot_timestamp_capacity = 0;
+    source->output_timestamps = false;
+    source->phase = WL_COLUMNAR_RELATION_CONSTRUCTOR_SOURCE_INERT;
+    rc = wl_columnar_relation_reader_acquire_attempt_controlled(
+        (wl_columnar_source_access_gate_t *)&src->descriptor_access,
+        &source->descriptor_reader, control, id);
+    if (rc) goto done;
+    rc = wl_columnar_relation_empty_input_region(control, id, 622, 256);
+    if (rc) goto done;
+    source->phase = WL_COLUMNAR_RELATION_CONSTRUCTOR_SOURCE_DESCRIPTOR;
+    if (!src->storage_owner ||
+        src->compound_kind != WIRELOG_COMPOUND_KIND_NONE){
+        rc = ENOTSUP; goto done;
+    }
+    if (src->compound_count || src->compound_arity_map ||
+        src->compound_arity_len || src->inline_physical_offset){
+        rc = EINVAL; goto done;
+    }
+    rc = col_rel_storage_owner_resolve(src, &source->owner);
+    if (rc) goto done;
+    rc = wl_columnar_relation_reader_acquire_attempt_controlled(
+        &source->owner->source_access, &source->owner_reader, control, id);
+    if (rc) goto done;
+    /* Expanded scalar owner/identity/shape predicates80, controllers106,
+     * next42 and caller20 =248<=256; graph/header has its own627 packet. */
+    rc = wl_columnar_relation_empty_input_region(control, id, 623, 256);
+    if (rc) goto done;
+    source->phase = WL_COLUMNAR_RELATION_CONSTRUCTOR_SOURCE_READERS;
+    const col_rel_t *owner = source->owner;
+    if (!src->relation_identity || src->relation_identity == UINT64_MAX ||
+        !owner->relation_identity || owner->relation_identity == UINT64_MAX ||
+        !wl_columnar_relation_generation_valid(src->view_generation) ||
+        !wl_columnar_relation_generation_valid(src->storage_generation) ||
+        !wl_columnar_relation_generation_valid(owner->storage_generation) ||
+        owner->storage_owner != owner ||
+        owner->storage_owner_identity != owner->relation_identity ||
+        owner->storage_owner_generation != owner->storage_generation ||
+        src->storage_owner != owner ||
+        src->storage_owner_identity != owner->relation_identity ||
+        src->storage_owner_generation != owner->storage_generation ||
+        src->nrows > src->capacity) {
+        rc = EINVAL; goto done;
+    }
+    if (src->nrows || (!src->schema_ok && src->ncols)) {
+        rc = ENOTSUP; goto done;
+    }
+    if (!src->schema_ok) {
+        rc = wl_columnar_relation_empty_input_region(control, id, 624, 256);
+        if (rc) goto done;
+        if (src->capacity ||
+            src->columns ||
+            src->column_types ||
+            src->col_names ||
+            src->schema.release ||
+            src->schema.format ||
+            src->schema.name ||
+            src->schema.metadata ||
+            src->schema.flags ||
+            src->schema.n_children ||
+            src->schema.children ||
+            src->schema.dictionary ||
+            src->schema.private_data ||
+            src->sorted_nrows ||
+            src->merge_columns ||
+            src->merge_buf_cap) {
+            rc = EINVAL; goto done;
+        }
+        rc = wl_columnar_relation_empty_input_region(control, id, 625, 256);
+        if (rc) goto done;
+        if (src->base_nrows ||
+            src->timestamps ||
+            src->timestamp_capacity ||
+            src->pool_owned ||
+            src->arena_owned ||
+            src->mem_ledger ||
+            src->metadata_reserved_bytes ||
+            src->pool_name_reserved_bytes ||
+            src->dedup_reserved_bytes ||
+            src->retained_reserved_bytes ||
+            src->ledger_ts_bytes ||
+            src->row_scratch ||
+            src->retract_backup_columns ||
+            src->retract_backup_timestamps ||
+            src->retract_backup_timestamp_capacity ||
+            src->retract_backup_nrows) {
+            rc = EINVAL; goto done;
+        }
+        rc = wl_columnar_relation_empty_input_region(control, id, 626, 256);
+        if (rc) goto done;
+        if (src->retract_backup_base_nrows ||
+            src->retract_backup_capacity ||
+            src->retract_backup_sorted_nrows ||
+            src->col_shared ||
+            src->run_count ||
+            src->retract_backup_run_count ||
+            src->dedup_slots ||
+            src->dedup_cap ||
+            src->dedup_count ||
+            src->compound_count ||
+            src->compound_arity_map ||
+            src->compound_arity_len ||
+            src->inline_physical_offset ||
+            src->deferred_relation_next ||
+            src->deferred_relation_session ||
+            src->compound_kind != WIRELOG_COMPOUND_KIND_NONE ||
+            atomic_load_explicit(&src->storage_alias_borrows,
+            memory_order_acquire)){
+            rc = EINVAL; goto done;
+        }
+    }
+    /* Separate funded graph/header decision preserves ample common-identity
+     * margin. The bare path retains its ordered literal627 then628 schedule. */
+    rc = wl_columnar_relation_empty_input_region(control, id, 627, 256);
+    if (rc) goto done;
+    if ((!src->schema_ok && (src->ncols || src->nrows)) ||
+        (src->has_graph_column && src->graph_col_idx >= src->ncols &&
+        (src->ncols || src->nrows ||
+        src->graph_col_idx >= src->declared_ncols))) {
+        rc = EINVAL; goto done;
+    }
+    if (!src->schema_ok) {
+        for (unsigned run = 0; run < COL_MAX_RUNS; ++run) {
+            rc = wl_columnar_relation_empty_input_region(control, id, 628, 224);
+            if (rc) goto done;
+            if (src->run_ends[run] || src->retract_backup_run_ends[run]) {
+                rc = EINVAL; goto done;
+            }
+        }
+    }
+    rc = wl_columnar_relation_empty_input_region(control, id, 629, 256);
+    if (rc) goto done;
+    source->width = src->ncols; source->snapshot_nrows = src->nrows;
+    source->snapshot_capacity = src->capacity;
+    source->snapshot_timestamp_capacity = src->timestamp_capacity;
+    source->output_timestamps = false;
+    source->recipe.names = (const char *const *)src->col_names;
+    source->recipe.types = src->column_types; source->recipe.type_codes = NULL;
+    source->recipe.has_graph_column = src->has_graph_column;
+    source->recipe.graph_col_idx = src->graph_col_idx;
+    source->recipe.declared_ncols = src->declared_ncols;
+    source->recipe.view_generation = 2u + (source->recipe.types != NULL);
+    source->recipe.storage_generation = 1;
+    source->phase = WL_COLUMNAR_RELATION_CONSTRUCTOR_SOURCE_RECIPE;
+    return 0;
+done:
+    /* INIT pre-admitted this mandatory drain; no new Original poll. */
+    wl_columnar_relation_constructor_attempt_source_drain(source);
+    return rc;
+}
+
+int
+wl_columnar_relation_new_empty_input_operator_attempt_controlled(
+    const char *name, const col_rel_t *src,
+    const wirelog_column_type_t *declared_types,
+    wl_columnar_memory_governor_ref_t *governor, col_rel_t **out,
+    wl_evaluation_control_t *control, uint64_t id)
+{
+    if (out) *out = NULL;
+    int rc = wl_columnar_relation_empty_input_region(control, id, 620, 256);
+    if (rc) return rc;
+    /* Declaration compatibility is already checked by the caller. It never
+     * supplies physical lanes or schema for a zero-width source. */
+    (void)declared_types;
+    if (!name || !src || !out) return EINVAL;
+    wl_columnar_relation_constructor_attempt_source_t source;
+    rc = wl_columnar_relation_empty_input_acquire(src, &source, control, id);
+    if (rc) return rc;
+    col_rel_t *local = NULL;
+    rc = wl_columnar_relation_constructor_attempt_build_operator(name,
+            source.width, COL_REL_INIT_CAP, false, governor, &source.recipe,
+            &local, control, id);
+    if (!rc) rc = wl_columnar_relation_empty_input_region(control, id, 631,
+                256);
+    /* Normal631 or INIT's reserved22 pays these release fronts. */
+    wl_columnar_relation_constructor_attempt_source_drain(&source);
+    if (!rc) rc = wl_columnar_relation_empty_input_region(control, id, 632,
+                256);
+    if (!rc) *out = local;
+    else if (local && col_rel_destroy_checked(local) != 0) abort();
+    return rc;
+}
+
+/* Timestamp-preserving empty-input sibling. Only a schema-valid, row-empty
+ * actual source can carry timestamps through acquisition. INIT retains the
+ * same prepaid drain/unwind shares;636 owns its mode checks/stores. Existing
+ * true-mode builder pays every timestamp allocation/zero chunk separately. */
+int
+wl_columnar_relation_new_empty_timestamp_input_operator_attempt_controlled(
+    const char *name, const col_rel_t *src,
+    const wirelog_column_type_t *declared_types,
+    wl_columnar_memory_governor_ref_t *governor, col_rel_t **out,
+    wl_evaluation_control_t *control, uint64_t id)
+{
+    if (out) *out = NULL;
+    int rc = wl_columnar_relation_empty_input_region(control, id, 620, 256);
+    if (rc) return rc;
+    (void)declared_types;
+    if (!name || !src || !out) return EINVAL;
+    wl_columnar_relation_constructor_attempt_source_t source;
+    rc = wl_columnar_relation_empty_input_acquire(src, &source, control, id);
+    if (rc) return rc;
+    col_rel_t *local = NULL;
+    rc = wl_columnar_relation_empty_input_region(control, id, 636, 256);
+    if (rc) goto drain;
+    if (!src->timestamps) {
+        rc = EINVAL; goto drain;
+    }
+    source.output_timestamps = true;
+    source.recipe.storage_generation = 2;
+    rc = wl_columnar_relation_constructor_attempt_build_operator(name,
+            source.width, COL_REL_INIT_CAP, true, governor, &source.recipe,
+            &local, control, id);
+    if (!rc) rc = wl_columnar_relation_empty_input_region(control, id, 631,
+                256);
+drain:
+    wl_columnar_relation_constructor_attempt_source_drain(&source);
+    if (!rc) rc = wl_columnar_relation_empty_input_region(control, id, 632,
+                256);
+    if (!rc) *out = local;
+    else if (local && col_rel_destroy_checked(local) != 0) abort();
+    return rc;
+}
+
 /* Typed noTS operator recipe; legacy operator construction stays unchanged. */
 int
 wl_columnar_relation_new_typed_operator_attempt_controlled(
@@ -19048,11 +19319,13 @@ wl_columnar_relation_scalar_source_admit_attempt_controlled(
         || relation->storage_owner_identity != owner->relation_identity
         || relation->storage_owner_generation != owner->storage_generation
         || relation->nrows > relation->capacity
-        || (relation->ncols && !relation->columns)
+        || (relation->ncols && relation->capacity && !relation->columns)
         || (relation->timestamps &&
         relation->timestamp_capacity < relation->nrows)
         || (relation->has_graph_column &&
-        relation->graph_col_idx >= relation->ncols))
+        relation->graph_col_idx >= relation->ncols &&
+        (relation->ncols || relation->nrows ||
+        relation->graph_col_idx >= relation->declared_ncols)))
         rc = EINVAL;
     else rc = 0;
     tail = wl_columnar_relation_constructor_attempt_tail(control, id,
@@ -19092,7 +19365,7 @@ wl_columnar_relation_scalar_source_admit_attempt_controlled(
     if (tail){
         rc = tail; goto done;
     }
-    while (column < source->width) {
+    while (column < source->width && source->capacity) {
         rc = wl_columnar_relation_constructor_attempt_charge(control, id,
                 WL_COLUMNAR_RELATION_SCALAR_SOURCE_COLUMN_WORK);
         if (rc)
@@ -19195,6 +19468,15 @@ wl_columnar_relation_scalar_source_new_like_attempt_controlled(
     if (tail > 0 || valid) {
         if (tail) return tail;
     } else return EINVAL;
+    /* Source admission permits a future graph lane on a real empty input.
+     * Output new-like must retain raw FILTER/CONCAT's physical-lane guard.
+     * Same next-charge front after LIKE128; new predicate paid separately. */
+    rc = wl_columnar_relation_constructor_attempt_charge(control, id, 256);
+    if (rc) return rc;
+    valid = !source->has_graph_column || source->graph_col_idx < source->width;
+    tail = wl_columnar_relation_constructor_attempt_tail(control, id, 256);
+    if (tail) return tail;
+    if (!valid) return EINVAL;
     rc = wl_columnar_relation_constructor_attempt_charge(control, id,
             WL_COLUMNAR_RELATION_SCALAR_SOURCE_RECIPE_WORK);
     if (rc) return rc;
@@ -20246,6 +20528,15 @@ wl_columnar_relation_scalar_source_new_like_operator_attempt_controlled(
     if (tail > 0 || valid) {
         if (tail) return tail;
     } else return EINVAL;
+    /* Source admission permits a future graph lane on a real empty input.
+     * Output new-like must retain raw FILTER/CONCAT's physical-lane guard.
+     * Same next-charge front after LIKE128; new predicate paid separately. */
+    rc = wl_columnar_relation_constructor_attempt_charge(control, id, 256);
+    if (rc) return rc;
+    valid = !source->has_graph_column || source->graph_col_idx < source->width;
+    tail = wl_columnar_relation_constructor_attempt_tail(control, id, 256);
+    if (tail) return tail;
+    if (!valid) return EINVAL;
     rc = wl_columnar_relation_constructor_attempt_charge(control, id,
             WL_COLUMNAR_RELATION_SCALAR_SOURCE_RECIPE_WORK);
     if (rc) return rc;
@@ -20289,6 +20580,95 @@ wl_columnar_relation_empty_source_new_like_operator_attempt_controlled(
             WL_COLUMNAR_RELATION_SCALAR_SOURCE_LIKE_WORK);
     if (rc) return rc;
     if (!valid) return EINVAL;
+    rc = wl_columnar_relation_constructor_attempt_charge(control, id,
+            WL_COLUMNAR_RELATION_SCALAR_SOURCE_RECIPE_WORK);
+    if (rc) return rc;
+    wl_columnar_relation_constructor_recipe_t recipe = {
+        .names = NULL, .types = NULL, .type_codes = NULL,
+        .has_graph_column = false, .graph_col_idx = source->graph_col_idx,
+        .declared_ncols = source->declared_ncols,
+        .view_generation = 2, .storage_generation = 1
+    };
+    rc = wl_columnar_relation_constructor_attempt_tail(control, id,
+            WL_COLUMNAR_RELATION_SCALAR_SOURCE_RECIPE_WORK);
+    if (rc) return rc;
+    return wl_columnar_relation_source_like_operator_build(name, 0, false,
+               governor, &recipe, out, control, id);
+}
+
+/* ANTI alone uses a legacy pointer-return factory without a governor.
+ * Explicit twins preserve every original caller front and control error;
+ * only the paid, tail-guarded graph rejection maps to raw pointer-API ENOMEM. */
+int
+wl_columnar_relation_scalar_source_new_like_anti_operator_attempt_controlled(
+    wl_columnar_relation_scalar_source_t *source, const char *name,
+    wl_columnar_memory_governor_ref_t *governor, col_rel_t **out)
+{
+    if (out) *out = NULL;
+    int rc = wl_columnar_relation_scalar_source_check(source,
+            WL_COLUMNAR_RELATION_SCALAR_SOURCE_HELD);
+    if (rc) return rc;
+    wl_evaluation_control_t *const control = source->control;
+    const uint64_t id = source->attempt_id;
+    rc = wl_columnar_relation_constructor_attempt_charge(control, id,
+            WL_COLUMNAR_RELATION_SCALAR_SOURCE_LIKE_WORK);
+    if (rc) return rc;
+    bool valid = name && out;
+    int tail = wl_columnar_relation_constructor_attempt_tail(control, id,
+            WL_COLUMNAR_RELATION_SCALAR_SOURCE_LIKE_WORK);
+    if (tail > 0 || valid) {
+        if (tail) return tail;
+    } else return EINVAL;
+    /* Source admission permits a future graph lane on a real empty input.
+     * Output new-like must retain raw FILTER/CONCAT's physical-lane guard.
+     * Same next-charge front after LIKE128; new predicate paid separately. */
+    rc = wl_columnar_relation_constructor_attempt_charge(control, id, 256);
+    if (rc) return rc;
+    valid = !source->has_graph_column || source->graph_col_idx < source->width;
+    tail = wl_columnar_relation_constructor_attempt_tail(control, id, 256);
+    if (tail) return tail;
+    if (!valid) return governor ? EINVAL : ENOMEM;
+    rc = wl_columnar_relation_constructor_attempt_charge(control, id,
+            WL_COLUMNAR_RELATION_SCALAR_SOURCE_RECIPE_WORK);
+    if (rc) return rc;
+    wl_columnar_relation_constructor_recipe_t recipe;
+    recipe.names = source->names; recipe.types = source->types;
+    recipe.type_codes = NULL;
+    recipe.has_graph_column = source->has_graph_column;
+    recipe.graph_col_idx = source->graph_col_idx;
+    recipe.declared_ncols = source->declared_ncols;
+    recipe.view_generation = 2u + (source->types != NULL);
+    bool ts = source->preserve_timestamps && source->timestamps;
+    recipe.storage_generation = 1u + ts;
+    rc = wl_columnar_relation_constructor_attempt_tail(control, id,
+            WL_COLUMNAR_RELATION_SCALAR_SOURCE_RECIPE_WORK);
+    if (rc) return rc;
+    return wl_columnar_relation_source_like_operator_build(name, source->width,
+               ts, governor, &recipe, out, control, id);
+}
+
+int
+wl_columnar_relation_empty_source_new_like_anti_operator_attempt_controlled(
+    wl_columnar_relation_empty_source_t *source, const char *name,
+    wl_columnar_memory_governor_ref_t *governor, col_rel_t **out)
+{
+    if (!source || source->identity != source || !name || !out || *out
+        || source->phase != WL_COLUMNAR_RELATION_EMPTY_SOURCE_HELD
+        || source->ending) return EINVAL;
+    bool held = false;
+    int rc = wl_columnar_relation_empty_source_step(source, &held);
+    if (rc || !held) return rc ? rc : EBUSY;
+    wl_evaluation_control_t *control = source->control;
+    uint64_t id = source->attempt_id;
+    rc = wl_columnar_relation_constructor_attempt_charge(control, id,
+            WL_COLUMNAR_RELATION_SCALAR_SOURCE_LIKE_WORK);
+    if (rc) return rc;
+    /* Raw new-like cannot clone a future graph lane at physical width0. */
+    bool valid = !source->has_graph_column;
+    rc = wl_columnar_relation_constructor_attempt_tail(control, id,
+            WL_COLUMNAR_RELATION_SCALAR_SOURCE_LIKE_WORK);
+    if (rc) return rc;
+    if (!valid) return governor ? EINVAL : ENOMEM;
     rc = wl_columnar_relation_constructor_attempt_charge(control, id,
             WL_COLUMNAR_RELATION_SCALAR_SOURCE_RECIPE_WORK);
     if (rc) return rc;
@@ -25822,6 +26202,15 @@ wl_columnar_relation_scalar_source_new_like_typed_operator_attempt_controlled(
     if (tail > 0 || valid) {
         if (tail) return tail;
     } else return EINVAL;
+    /* Source admission permits a future graph lane on a real empty input.
+     * Output new-like must retain raw FILTER/CONCAT's physical-lane guard.
+     * Same next-charge front after LIKE128; new predicate paid separately. */
+    rc = wl_columnar_relation_constructor_attempt_charge(control, id, 256);
+    if (rc) return rc;
+    valid = !source->has_graph_column || source->graph_col_idx < source->width;
+    tail = wl_columnar_relation_constructor_attempt_tail(control, id, 256);
+    if (tail) return tail;
+    if (!valid) return EINVAL;
     for (uint32_t c = 0; selected_types && c < source->width; ++c) {
         rc = wl_columnar_relation_constructor_attempt_charge(control, id,
                 WL_COLUMNAR_RELATION_AUTO_ATTEMPT_PREPARE_WORK);

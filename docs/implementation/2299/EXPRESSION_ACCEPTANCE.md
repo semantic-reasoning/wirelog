@@ -1727,3 +1727,144 @@ column buffers; that exact empty-chain adapter remains an integration test
 requirement for the next source unit. This primitive does not yet repair the general
 bridge's first-missing source reification; the physical source adapter remains
 a separate integration unit, including future graph-lane semantics.
+
+## Completion: actual empty physical source and graph header
+
+Observed SCHEMA now substitutes a source-derived private constructor for its
+old declared-width constructor. Declaration validation stays in its existing
+caller; the same seven arguments replace an already-local width with the
+already-local original pointer. New header reads occur after the child's
+positive ENTRY. The real source's physical width, names/types and graph/declared
+header supply the recipe. Bare INT64 input remains physical width0, with a
+schema-valid private descriptor; no declared lane is synthesized. The public
+original remains the EDB image, preserving later schema establishment and
+insertion validation. Eager STRING/FLOAT and established empty inputs keep
+their actual schemas. No shadow schema/provenance accessor was introduced.
+
+The child acquires independent genuine descriptor and storage-owner readers.
+INIT621 explicitly initializes the nonmoving record and pre-admits mandatory
+reader-release fronts22 and post-build outer unwind18 before either ownership
+is acquired:196+22+18+markers2+new phase-hook front2=240<=256. Normal631 separately
+pays normal release; failed631 or earlier errors use INIT's unused reserve.
+Builder failure retains its own partial-allocation disposal; successful install
+transfers the fully built private relation to the outer local. Failed outer
+publication disposes that actual local exactly once using the pre-admitted
+outer fronts and the existing constructor's narrow mandatory physical/token
+retirement boundary. No stopped Original or successor is polled for cleanup.
+After drain the code reads only saved control/id/locals before final632.
+
+New620 ENTRY,621 INIT,622 owner resolution,623 identity,624..626 bare-header
+chunks,627 graph/header decision,629 recipe,631 normal drain and632 final each
+pay256. Each actual run-array record628 separately pays224. Owner resolution/identity fit248,
+header chunks219, graph/header228, run178, recipe200 and final215 in their
+respective packets, including the new phase-hook fronts. No whole-header clear
+or hidden run-array traversal occurs. Source leases and guarded publication
+retain the same parent handoff; no SCHEMA logical1 retrospectively funds new
+header work. Existing per-byte/record constructor and reader prices remain
+separate. The four independent literal constructor vectors test every positive
+exact/one-short cut: empty name35724/36616 and `input`36204/37096 for ungoverned/
+governed outputs on the current944-byte descriptor ABI. Tests express descriptor
+copy geometry with sizeof and eight-byte224 packets; other prices are numeric
+literals, not production constants or measured host totals.
+
+Scalar source validation permits a future graph lane only with physical0,
+rows0 and index<declared width under genuine held readers. Its expanded fixed
+predicate remains218<=VALIDATE224. Actual raw direct MAP succeeds on this
+compiler-produced placeholder; raw FILTER new-like returns EINVAL. All three
+scalar new-like siblings (legacy, operator and typed CONCAT) therefore pay a
+new256 packet after their existing LIKE128 tail for the precise physical graph
+output guard. Original name/out validation and hook remain. The bare-empty
+sibling's prior graph refusal remains unchanged. Each new output guard has an
+independent128/256 exact/one-short oracle after an actual1632 source open,
+compared with the raw new-like result. Positive typed CONCAT remains covered.
+
+A genuine empty MAP result deep copy has nonzero schema width, zero capacity
+and no column table. Raw subsequent MAP accepts it. Scalar source admission now
+requires the table only with positive capacity and omits lane reads at capacity0;
+nrows<=capacity and gather's row<nrows guard prohibit nonexistent-row access.
+SNAPSHOT remains163<=192, and positive-capacity lane validation204<=224. Tests
+exercise both empty and populated two-MAP chains, whole UNKNOWN in either
+column order, and the existing positive-capacity invalid-table/lane controls.
+An initial failing empty-chain test had reused a freed fixture input; the copy
+is now unconditional, and independent raw-only chaining confirmed the contract.
+
+The registered empty_expression_sources target proves actual first-missing,
+eager STRING/FLOAT, typed/later-empty and future-insert/remove/noop behavior,
+constant/numeric controls, exact MAP UNKNOWN and private/public graph headers,
+real authenticated unary frame/private binding/receipt/owner2, and graph FILTER
+error followed by valid retry and a rejected row. It checks actual source
+constructor allocation failures and governor denial with repeated recovery.
+All new source phases, both reader acquisitions and before-release hook exercise
+cancel, work denial, END alone, END+successor and overflow. Actual session stops
+preserve original snapshots and relation-qualified old committed images/events;
+Original reports remain frozen and successor consumption0. Final plan/session/
+intern-owner teardown returns the governor to0.
+
+WORK_LIMIT intentionally retains the existing pre-child observed transaction
+for raised-limit retry. Tests authenticate its actual metadata/image reservation
+identities, governor and RESERVED states, exact layout-derived bytes, original
+reader identities/gates and captured snapshots. Reservation growth must equal
+these real tokens, with no fixed tolerance; repeated same-frontier stops cannot
+grow it. Other errors discard the transaction. This does not alter the existing
+retention policy or treat its original readers as leaked constructor readers.
+Completed controlled STEP still rejects unsupported insertion shapes with its
+existing ENOTSUP admission status; raw insertion reports declaration EINVAL.
+Both preserve the original. No previously invalid declaration domain is enabled.
+
+Actual CONCAT tests pass a constructor-produced future-graph placeholder
+through raw evaluation and genuine controlled START/STEP/ACK. They retain
+identical refusal, untouched inputs and no output, and retry corrected physical
+inputs on the same unbound frame and fresh authenticated bound context. ANTI
+and SEMI missing-right controls keep the original input before malformed keys,
+projection or right-predicate decoding; this includes owned/borrowed timestamped
+future-graph inputs.
+
+CONSOLIDATE has a distinct raw empty-input contract. Non-timestamped inputs,
+and genuinely owned timestamped inputs, preserve a future graph header without
+new-like emission. Borrowed timestamped inputs retain raw refusal. A new unary
+info getter reads ownership from the actual protected frame snapshot, with the
+existing numeric-writable and unary-forward guards. Its expanded getter costs93;
+the whole caller interval costs229 including the hook, paid by a separate256
+before the getter. The original INPUT192 interval remains67. An independent
+3904 exact/3903 one-short oracle includes this packet, without inferring prices
+from measured host totals.
+
+The timestamp-preserving empty-source sibling keeps the same seven-argument
+interface and genuine source readers. Phase636 pays256 before timestamp
+inspection; the existing builder allocates and initializes the actual64-cell
+timestamp lane. Independent literal vectors are77212/78502 for `$consol` and
+77020/78310 for `input` on the current ABI, ungoverned/governed. Every positive
+cut has exact/one-short checks. Allocation failures, governor denial and retries
+cover all four allocations. Actual CONSOLIDATE tests cross ownership, timestamp
+presence and authenticated numeric-owner binding, check the real getter's phase,
+owner and thread guards, and inject cancel/work/END/successor/overflow at new
+source phases, input-info and halfway through timestamp initialization. They
+retain source snapshots, frozen Original reports, successor0 and closed real
+readers, native frames and reservations.
+
+Shared constructor tariff changes are reflected in independent existing host
+oracles: ANTI output adds256 while SEMI's typed constructor is unchanged. Each
+recursive serial round has three new-like guards (CONCAT, CONSOLIDATE and the
+detached FRAMED_NEW output), plus CONSOLIDATE input-info, totaling four new256
+packets. Existing successful, exact/one-short, denial and raised-retry assertions
+remain in place. Historical unit6 review findings require actual CONCAT coverage
+and both shared-oracle corrections; they are fixed rather than overruled.
+
+ANTI output additionally preserves the raw legacy error distinction: with no
+output governor its pointer-return new-like factory maps graph refusal to
+ENOMEM; an actual session/left/right output governor selects checked EINVAL.
+Explicit internal scalar/empty ANTI twins change only this paid semantic guard,
+with identical caller fronts and positive fee vectors. Actual pool/fallback,
+owned/borrowed and timestamp/no-timestamp combinations cover all four governor
+placements. The scalar graph interval remains184<=256 and empty invalid path
+124<=128. All four scalar graph guards return any saved tail stop before graph
+refusal; cancel/work/END/successor/overflow injection proves that semantic errno
+does not hide control status. Default scalar and empty constructors retain
+EINVAL, and missing-right probes retain their earlier passthrough.
+
+This unit closes observed first-missing schema transport. Initial-missing
+identity and computed expressions now succeed with an observer in actual
+raw/control checks; identity remains a regression control for its narrow route.
+The reproduced no-observer missing-source admission gap remains an explicit next
+adapter; populated C1 and worker-control ownership are not reclassified here. Recursive actual-tape scheduling and typed SCC integration
+also remain open work rather than certified expression-host rows.

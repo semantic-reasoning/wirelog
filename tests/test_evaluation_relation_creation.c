@@ -2923,6 +2923,14 @@ scalar_source_like_literal(void)
     /* Empty recipe and no TS exactly match independent auto builder inputs.
      * Same three128 caller phases and external128, but no new source readers. */
     auto_literal_t literal; auto_literal("protected", 0, true, &literal);
+    CHECK(literal.prefix[0] == 128);
+    memmove(literal.prefix + 2, literal.prefix + 1,
+        (literal.count - 1) * sizeof(*literal.prefix));
+    ++literal.count; literal.prefix[1] = 384;
+    for (size_t n = 2; n < literal.count; ++n) literal.prefix[n] += 256;
+    for (size_t n = 0; n < literal.allocation_count;
+        ++n) literal.allocations[n] += 256;
+    literal.total += 256;
     for (size_t i = 0; i < literal.count; i++)
         for (unsigned below = 0; below < 2; below++) {
             wl_evaluation_control_t *c = control(1632+literal.prefix[i]-below);

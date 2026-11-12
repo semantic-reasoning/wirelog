@@ -2658,9 +2658,22 @@ wl_columnar_filter_consolidate_attempt_start_owned(const wl_plan_op_t *op,
             WL_COLUMNAR_FILTER_ATTEMPT_INPUT_WORK);
     if (rc)
         goto done;
+    /* INPUT192 funds this new admission front67. Actual numeric_writable38,
+     * unary_forward43, two-field getter93 and both full caller controllers
+     * make229<=256 (including hook front2) through the next OUTPUT payment.
+     * No duplicated getter. */
+    rc = wl_columnar_filter_attempt_charge(control, attempt_id, 256);
+    if (rc) goto done;
+#ifdef WL_SESSION_TEST_HOOKS
+    if (wl_columnar_filter_test_attempt_checkpoint)
+        wl_columnar_filter_test_attempt_checkpoint(control, 638, 0);
+#endif
+
     const col_rel_t *input = NULL;
     col_rel_t **out_slot = NULL;
-    rc = wl_columnar_eval_stack_unary_input_owned(frame, &input, owner);
+    bool input_owned = false;
+    rc = wl_columnar_eval_stack_unary_input_info_owned(frame, &input,
+            &input_owned, owner);
     rc = wl_columnar_filter_attempt_return(control, attempt_id, rc);
     if (rc)
         goto done;
@@ -2774,9 +2787,32 @@ wl_columnar_filter_consolidate_attempt_start_owned(const wl_plan_op_t *op,
             WL_COLUMNAR_FILTER_ATTEMPT_NEWLIKE_WORK);
     if (rc)
         goto done;
-    rc =
-        wl_columnar_relation_scalar_source_new_like_operator_attempt_controlled(
-        &ctx->source, "$consol", ctx->governor, out_slot);
+    /* Raw empty future-graph CONSOLIDATE succeeds without a newlike emit
+    * for non-timestamped input, and for genuinely owned timestamped input.
+    * Borrowed timestamped input retains raw newlike EINVAL. The actual unary
+    * snapshot supplies ownership; no source/refcount inference grants it.
+    * Existing NEWLIKE192 funds fronts169; return/discovery remains61. */
+    if (!ctx->source.width && ctx->source.has_graph_column &&
+        (!timestamped || input_owned)) {
+        if (timestamped)
+            rc =
+                wl_columnar_relation_new_empty_timestamp_input_operator_attempt_controlled
+                (
+                "$consol", ctx->source.descriptor, NULL, ctx->governor,
+                out_slot,
+                control, attempt_id);
+        else
+            rc =
+                wl_columnar_relation_new_empty_input_operator_attempt_controlled
+                (
+                "$consol", ctx->source.descriptor, NULL, ctx->governor,
+                out_slot,
+                control, attempt_id);
+    } else
+        rc =
+            wl_columnar_relation_scalar_source_new_like_operator_attempt_controlled
+            (
+            &ctx->source, "$consol", ctx->governor, out_slot);
     /* Original frame slot ownership bookkeeping precedes stale-ID arbitration. */
     ctx->output = *out_slot;
     ctx->private_output = *out_slot;

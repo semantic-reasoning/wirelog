@@ -807,7 +807,7 @@ wl_columnar_join_schema_attempt_step(wl_columnar_join_schema_attempt_t *a,
         col_rel_t **out = a->output_slot;
         if (a->op->op == WL_PLAN_OP_ANTIJOIN)
             rc =
-                wl_columnar_relation_scalar_source_new_like_operator_attempt_controlled
+                wl_columnar_relation_scalar_source_new_like_anti_operator_attempt_controlled
                 (
                 a->left, a->name, a->governor, out);
         else rc =
@@ -7151,12 +7151,12 @@ wl_columnar_join_probe_op_attempt_start_owned_initialize(const wl_plan_op_t *op,
             "$semijoin", ctx->width, types, governor, out_slot, control, id);
     else if (ctx->source_bare)
         rc =
-            wl_columnar_relation_empty_source_new_like_operator_attempt_controlled
+            wl_columnar_relation_empty_source_new_like_anti_operator_attempt_controlled
             (
             &ctx->source_empty_reader, "$antijoin", governor, out_slot);
     else
         rc =
-            wl_columnar_relation_scalar_source_new_like_operator_attempt_controlled
+            wl_columnar_relation_scalar_source_new_like_anti_operator_attempt_controlled
             (
             &ctx->source, "$antijoin", governor, out_slot);
     ctx->output = *out_slot; ctx->private_output = *out_slot;

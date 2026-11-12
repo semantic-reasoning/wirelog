@@ -1,5 +1,6 @@
 /* #1821 ordinary JOIN: raw parity, original ownership and paid host turns. */
 #include "../wirelog/columnar/internal.h"
+#include "../wirelog/columnar/delta_pool.h"
 #include "../wirelog/exec_plan_gen.h"
 #include "../wirelog/wirelog.h"
 #include <errno.h>
@@ -1577,7 +1578,9 @@ probe_literal_prefixes(void)
             ++b)
             for (unsigned minus = 0; minus < 2; ++minus) {
                 uint64_t h = 28476u + (853u - 498u) + typed_constructor_two() +
-                    (anti ? 1248u : 608u);
+                    /* ANTI uses scalar-source newlike: its new physical graph
+                     * guard adds256. SEMI still uses typed auto construction. */
+                    (anti ? 1248u + 256u : 608u);
                 fixture_t f;
                 fixture_init(&f, 2, 3, 5, h + boundaries[b] - minus);
                 f.op.op = anti ? WL_PLAN_OP_ANTIJOIN : WL_PLAN_OP_SEMIJOIN;
@@ -2395,12 +2398,139 @@ right_filter_credit_retained_case(void)
     wl_columnar_memory_governor_ref_release(governor);
 }
 
+static col_rel_t *
+probe_future_graph_source(fixture_t *f, bool timestamped)
+{
+    col_rel_t *bare = NULL, *out = NULL;
+    CHECK(!col_rel_alloc(&bare, "missing graph"));
+    bare->declared_ncols = 2; bare->has_graph_column = true;
+    bare->graph_col_idx = 1;
+    CHECK(!wl_columnar_relation_new_empty_input_operator_attempt_controlled(
+            "future graph", bare, NULL, NULL, &out, f->operation,
+            f->operation_id) && out);
+    CHECK(!col_rel_destroy_checked(bare));
+    if (timestamped) {
+        CHECK(!col_rel_enable_timestamps(out));
+    }
+    return out;
+}
+static void
+probe_future_graph_order(void)
+{
+    for (unsigned semi = 0; semi < 2; ++semi)for (unsigned timestamped = 0;
+            timestamped < 2; ++timestamped)
+            for (unsigned owned = 0; owned < 2; ++owned) {
+                fixture_t f; fixture_init(&f, 0, 0, 0, 0);
+                col_rel_destroy(f.left);
+                f.left = probe_future_graph_source(&f, timestamped != 0);
+                eval_stack_t *actual =
+                    wl_columnar_eval_stack_cleanup_stack(f.frame);
+                actual->items[0].rel = f.left;
+                actual->items[0].owned = owned != 0; f.owns_left = owned != 0;
+                f.op.op = semi?WL_PLAN_OP_SEMIJOIN:WL_PLAN_OP_ANTIJOIN;
+                f.op.right_relation = "missing";
+                const char *key = "col99"; f.op.key_count = 1;
+                f.op.left_keys = &key; f.op.right_keys = &key;
+                uint32_t projection = 99; f.op.project_count = 1;
+                f.op.project_indices = &projection;
+                f.op.right_filter_expr = (wl_plan_expr_buffer_t){NULL, 1};
+                col_rel_t *reference = probe_future_graph_source(&f,
+                        timestamped != 0);
+                wl_col_session_t raw_session = {0};
+                raw_session.rels = f.registry; raw_session.nrels = 1;
+                wl_mem_ledger_init(&raw_session.mem_ledger, 0);
+                eval_stack_t raw = {0};
+                CHECK(!eval_stack_push(&raw, reference, owned != 0));
+                CHECK(!(semi?col_op_semijoin(&f.op, &raw,
+                    &raw_session):col_op_antijoin(&f.op, &raw, &raw_session)));
+                CHECK(raw.top == 1 && raw.items[0].rel == reference);
+                col_relation_snapshot_t before =
+                    wl_columnar_relation_snapshot(f.left);
+                run(&f);
+                CHECK(!f.status.semantic_result && !f.status.committed &&
+                    !f.status.cleanup_result &&
+                    actual->top == 1 && actual->items[0].rel == f.left &&
+                    actual->items[0].owned == (owned != 0) &&
+                    wl_columnar_relation_snapshot_equal(before,
+                    wl_columnar_relation_snapshot(f.left)) &&
+                    f.left->has_graph_column && f.left->graph_col_idx == 1 &&
+                    f.left->declared_ncols == 2 &&
+                    (f.left->timestamps != NULL) == (timestamped != 0));
+                CHECK(!eval_stack_drain(&raw));
+                if (!owned) CHECK(!col_rel_destroy_checked(reference));
+                raw_registry_clear(&raw_session); fixture_close(&f);
+            }
+    /* Actual governor precedence, pool fallback and original ownership. */
+    for (unsigned placement = 0; placement < 4; ++placement)
+        for (unsigned pooled = 0; pooled < 2; ++pooled)
+            for (unsigned timestamped = 0; timestamped < 2; ++timestamped)
+                for (unsigned owned = 0; owned < 2; ++owned) {
+                    fixture_t f; fixture_init(&f, 0, 0, 0, 0);
+                    col_rel_destroy(f.left);
+                    f.left = probe_future_graph_source(&f, timestamped != 0);
+                    eval_stack_t *actual =
+                        wl_columnar_eval_stack_cleanup_stack(f.frame);
+                    actual->items[0].rel = f.left;
+                    actual->items[0].owned = owned != 0;
+                    f.owns_left = owned != 0;
+                    f.op.op = WL_PLAN_OP_ANTIJOIN;
+                    col_rel_t *reference = probe_future_graph_source(&f,
+                            timestamped != 0);
+                    wl_columnar_memory_resolution_t resolution =
+                    {.budget_bytes = UINT64_C(128)<<20,
+                            .usable_bytes
+                         = UINT64_C(128)<<20,
+                            .mode = WL_COLUMNAR_MEMORY_MODE_ENFORCING};
+                    wl_columnar_memory_governor_ref_t *g =
+                        wl_columnar_memory_governor_ref_create(&resolution);
+                    CHECK(g);
+                    if (placement == 1) f.session.memory_governor = g;
+                    if (placement == 2) {
+                        CHECK(!col_rel_attach_memory_governor(f.left, g));
+                        CHECK(!col_rel_attach_memory_governor(reference, g));
+                    }
+                    if (placement ==
+                        3) CHECK(!col_rel_attach_memory_governor(f.registry[0],
+                            g));
+                    delta_pool_t *pool = pooled?delta_pool_create(8,
+                            sizeof(col_rel_t), 4096):NULL;
+                    CHECK(!pooled || pool); f.session.delta_pool = pool;
+                    eval_stack_t raw = {0};
+                    CHECK(!eval_stack_push(&raw, reference, owned != 0));
+                    wl_col_session_t raw_session = {0};
+                    raw_session.rels = f.registry; raw_session.nrels = 1;
+                    raw_session.memory_governor = placement == 1?g:NULL;
+                    raw_session.delta_pool = pool;
+                    wl_mem_ledger_init(&raw_session.mem_ledger, 0);
+                    int expected = placement?EINVAL:ENOMEM;
+                    CHECK(col_op_antijoin(&f.op, &raw,
+                        &raw_session) == expected);
+                    col_relation_snapshot_t before =
+                        wl_columnar_relation_snapshot(f.left);
+                    run(&f);
+                    CHECK(f.status.semantic_result == expected &&
+                        !f.status.committed && !f.status.cleanup_result &&
+                        actual->items[0].rel == f.left &&
+                        actual->items[0].owned == (owned != 0) &&
+                        wl_columnar_relation_snapshot_equal(before,
+                        wl_columnar_relation_snapshot(f.left)));
+                    CHECK(!eval_stack_drain(&raw));
+                    if (!owned) CHECK(!col_rel_destroy_checked(reference));
+                    raw_registry_clear(&raw_session); fixture_close(&f);
+                    delta_pool_destroy(pool);
+                    CHECK(!wl_columnar_memory_reserved(
+                            wl_columnar_memory_governor_ref_get(g)));
+                    wl_columnar_memory_governor_ref_release(g);
+                }
+}
+
 int
 main(void)
 {
     probe_semantics(); probe_metadata(); probe_float_keys(); probe_rejections();
     probe_interrupts();
     probe_allocations_and_quota(); probe_literal_prefixes();
+    probe_future_graph_order();
     probe_no_output_work(); probe_owned_authority(); probe_retained_credit();
     standalone_raw_case();
     parity_cases(); generated_case(false); generated_case(true); limit_cases();

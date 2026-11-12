@@ -1233,6 +1233,23 @@ wl_columnar_eval_stack_unary_input_owned(
     return 0;
 }
 
+/* Same actual authority/forward guards as input_owned, returning only two
+ * scalar fields of the protected original. No snapshot copy or stack peek. */
+int
+wl_columnar_eval_stack_unary_input_info_owned(
+    wl_columnar_eval_stack_cleanup_frame_t *frame, const col_rel_t **out,
+    bool *owned_out, const void *owner)
+{
+    int authority = wl_columnar_eval_stack_numeric_writable(frame, owner);
+    if (authority) return authority;
+    if (!out || !owned_out) return EINVAL;
+    int rc = wl_columnar_eval_stack_unary_forward(frame);
+    if (rc) return rc;
+    *out = frame->unary_snapshot.rel;
+    *owned_out = frame->unary_snapshot.owned;
+    return 0;
+}
+
 int
 wl_columnar_eval_stack_unary_output(
     wl_columnar_eval_stack_cleanup_frame_t *frame, col_rel_t ***out_slot)
