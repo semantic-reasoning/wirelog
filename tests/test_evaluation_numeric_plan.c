@@ -14610,6 +14610,42 @@ test_abort_scan_semantics_and_boundaries(void)
     free(deep);
 }
 
+/* Probe-only admission has an independent literal tariff. Existing JOIN
+ * and numeric plans retain OP64; each existence probe additionally pays128. */
+static void
+test_abort_scan_probe_boundaries(void)
+{
+    for (unsigned semi = 0; semi < 2; ++semi) {
+        wl_plan_op_t ops[] = {{.op = WL_PLAN_OP_VARIABLE},
+                              {.op = WL_PLAN_OP_JOIN},
+                              {.op =
+                                   semi ? WL_PLAN_OP_SEMIJOIN :
+                                   WL_PLAN_OP_ANTIJOIN},
+                              {.op = WL_PLAN_OP_CONSOLIDATE}};
+        wl_plan_relation_t plan = {.ops = ops, .op_count = 4};
+        const uint64_t fees[] = {33, 64, 64, 64, 128, 64, 17};
+        uint64_t prefix = 0;
+        for (unsigned i = 0; i < sizeof(fees)/sizeof(fees[0]); ++i) {
+            abort_scan_case(&plan, 0, 4, prefix + fees[i] - 1,
+                WL_EVALUATION_CONTROL_WORK_LIMIT, false, prefix);
+            prefix += fees[i];
+        }
+        CHECK(prefix == 434);
+        abort_scan_case(&plan, 0, 4, 434, 0, true, 434);
+        bool supported = false;
+        CHECK(!wl_columnar_eval_plan_numeric_composed_abort_supported(
+                &plan, 0, 4, &supported) && supported);
+        ops[2].materialized = true;
+        CHECK(!wl_columnar_eval_plan_numeric_composed_abort_supported(
+                &plan, 0, 4, &supported) && !supported);
+        abort_scan_case(&plan, 0, 4, 0, 0, false, 353);
+        ops[2].materialized = false;
+        CHECK(wl_columnar_eval_plan_numeric_composed_abort_supported(
+                &plan, 2, 3, &supported) == EINVAL && !supported);
+        abort_scan_case(&plan, 2, 3, 0, EINVAL, false, 225);
+    }
+}
+
 static void
 test_abort_scan_generated_and_saved_id(void)
 {
@@ -16431,6 +16467,7 @@ int
 main(void)
 {
     test_abort_scan_semantics_and_boundaries();
+    test_abort_scan_probe_boundaries();
     test_abort_scan_generated_and_saved_id();
     test_prepared_join_chained_delta();
     test_prepared_join_early_stop_turnover();

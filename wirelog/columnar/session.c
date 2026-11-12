@@ -9818,7 +9818,10 @@ wl_columnar_session_join_cleanup_register(wl_col_session_t *sess,
         switch (plan->ops[op].op) {
         case WL_PLAN_OP_VARIABLE: case WL_PLAN_OP_FILTER: case WL_PLAN_OP_MAP:
         case WL_PLAN_OP_CONCAT: break;
-        case WL_PLAN_OP_JOIN: joined = true; break;
+        /* Grouped alternatives add at most4 fixed dispatch actions to the
+         * existing250 complete fresh-birth interval:254<=256. */
+        case WL_PLAN_OP_JOIN: case WL_PLAN_OP_ANTIJOIN:
+        case WL_PLAN_OP_SEMIJOIN: joined = true; break;
         case WL_PLAN_OP_CONSOLIDATE: eligible = op == plan->op_count-1; break;
         default: eligible = false; break;
         }
@@ -13435,8 +13438,9 @@ wl_columnar_session_head_scalar_classify(wl_col_session_t *sess,
                 op->filter_expr.data, op->filter_expr.size, &scalar, control,
                 id);
             if (rc) return rc;
-        } else if (op->op == WL_PLAN_OP_JOIN && op->right_filter_expr.size) {
-            /* Phase561 covers fixed JOIN dispatch208<=224 including child
+        } else if ((op->op == WL_PLAN_OP_JOIN || op->op == WL_PLAN_OP_ANTIJOIN
+            || op->op == WL_PLAN_OP_SEMIJOIN) && op->right_filter_expr.size) {
+            /* Phase561 covers fixed JOIN/probe dispatch212<=224 including child
              * return/next front; the readonly child pays its own traversal.
              * This description selects finance, never native permission. */
             rc = wl_columnar_expr_requires_scalar_attempt_controlled(

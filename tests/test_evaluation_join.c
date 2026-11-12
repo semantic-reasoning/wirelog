@@ -1375,6 +1375,11 @@ probe_rejections(void)
                 fixture_close(&f);
                 continue;
             }
+            if (mode == 5) {
+                /* A bounded numeric right predicate is now supported. */
+                probe_compare(&f, anti ? 3u : 0u);
+                fixture_close(&f); continue;
+            }
             eval_entry_t before =
                 wl_columnar_eval_stack_cleanup_stack(f.frame)->items[0];
             run(&f);
@@ -1915,6 +1920,81 @@ right_filter(uint8_t *bytes, uint8_t mode)
     return (wl_plan_expr_buffer_t){bytes, sizeof(unsupported)};
 }
 
+/* Internal-plan probe edge contracts complement actual compiler hosts. */
+static void
+probe_right_filter_edges(void)
+{
+    for (unsigned anti = 0; anti < 2; ++anti) {
+        for (unsigned keyed = 0; keyed < 2; ++keyed)
+            for (unsigned mode = 0; mode < 3; ++mode) {
+                fixture_t f; fixture_init(&f, 2, 3, 9, 0);
+                f.op.op = anti?WL_PLAN_OP_ANTIJOIN:WL_PLAN_OP_SEMIJOIN;
+                f.op.key_count = keyed; uint8_t bytes[32];
+                f.op.right_filter_expr = right_filter(bytes, (uint8_t)mode);
+                unsigned matches = mode == 2?0u:keyed?(mode == 1?3u:2u):3u;
+                probe_compare(&f, anti?3u-matches:matches); fixture_close(&f);
+            }
+        fixture_t missing; fixture_init(&missing, 2, 3, 5, 0);
+        missing.op.op = anti?WL_PLAN_OP_ANTIJOIN:WL_PLAN_OP_SEMIJOIN;
+        missing.op.right_relation = "absent";
+        missing.op.project_count = 1; uint32_t project = 1;
+        missing.op.project_indices = &project;
+        missing.op.right_filter_expr = (wl_plan_expr_buffer_t){NULL, 1};
+        eval_entry_t before =
+            wl_columnar_eval_stack_cleanup_stack(missing.frame)->items[0];
+        eval_stack_t raw = {0};
+        CHECK(!eval_stack_push(&raw, missing.left, false));
+        CHECK(!probe_raw(&missing.op, &raw,
+            &missing.session) && raw.top == 1 &&
+            raw.items[0].rel == missing.left);
+        CHECK(!eval_stack_drain(&raw)); run(&missing);
+        const eval_entry_t *after =
+            &wl_columnar_eval_stack_cleanup_stack(missing.frame)->items[0];
+        CHECK(!missing.status.semantic_result && !missing.status.committed &&
+            after->rel == before.rel && after->owned == before.owned &&
+            after->is_delta == before.is_delta &&
+            after->seg_boundaries == before.seg_boundaries &&
+            after->seg_count == before.seg_count);
+        fixture_close(&missing);
+        for (unsigned mode = 0; mode < 2; ++mode) {
+            fixture_t f; fixture_init(&f, 2, 3, 5, 0);
+            f.op.op = anti?WL_PLAN_OP_ANTIJOIN:WL_PLAN_OP_SEMIJOIN;
+            f.op.key_count = 1; uint8_t bytes[32];
+            f.op.right_filter_expr = right_filter(bytes, mode?1:2);
+            wirelog_column_type_t types[] = {WIRELOG_TYPE_FLOAT,
+                                             WIRELOG_TYPE_INT64};
+            col_rel_destroy(f.registry[0]);
+            f.registry[0] = relation_new("right", 2, 0);
+            CHECK(!col_rel_set_column_types(f.registry[0], types, 2));
+            for (unsigned r = 0; r < 5; ++r) {
+                int64_t row[] = {wl_columnar_float_to_bits((double)r), r+1};
+                CHECK(!col_rel_append_row(f.registry[0], row));
+            }
+            eval_stack_t raw = {0};
+            CHECK(!eval_stack_push(&raw, f.left, false));
+            CHECK(probe_raw(&f.op, &raw, &f.session) == EINVAL);
+            CHECK(!eval_stack_drain(&raw));
+            run(&f);
+            CHECK(f.status.semantic_result == EINVAL && !f.status.committed);
+            CHECK(wl_columnar_eval_stack_cleanup_stack(f.frame)->items[0].rel ==
+                f.left);
+            fixture_close(&f);
+            fixture_t nullary; fixture_init(&nullary, 0, 3, 5, 0);
+            nullary.op.op = anti?WL_PLAN_OP_ANTIJOIN:WL_PLAN_OP_SEMIJOIN;
+            nullary.op.key_count = 1;
+            nullary.op.right_filter_expr = right_filter(bytes, mode?1:2);
+            raw = (eval_stack_t){0};
+            CHECK(!eval_stack_push(&raw, nullary.left, false));
+            CHECK(probe_raw(&nullary.op, &raw, &nullary.session) == EINVAL);
+            CHECK(!eval_stack_drain(&raw));
+            run(&nullary);
+            CHECK(nullary.status.semantic_result == EINVAL &&
+                !nullary.status.committed);
+            fixture_close(&nullary);
+        }
+    }
+}
+
 static void
 right_filter_cases(void)
 {
@@ -1953,17 +2033,14 @@ right_filter_cases(void)
         fixture_close(&boundary);
     }
 
-    fixture_t unsupported; fixture_init(&unsupported, 2, 3, 5, 0);
-    unsupported.op.right_filter_expr = right_filter(bytes, 3);
-    eval_entry_t before = wl_columnar_eval_stack_cleanup_stack(
-        unsupported.frame)->items[0];
-    run(&unsupported);
-    CHECK(unsupported.status.semantic_result == ENOTSUP &&
-        !unsupported.status.committed);
-    CHECK(wl_columnar_eval_stack_cleanup_stack(unsupported.frame)->top == 1 &&
-        wl_columnar_eval_stack_cleanup_stack(unsupported.frame)->items[0].rel ==
-        before.rel);
-    fixture_close(&unsupported);
+    fixture_t scalar; fixture_init(&scalar, 2, 3, 5, 0);
+    scalar.op.right_filter_expr = right_filter(bytes, 3);
+    /* The scalar actor now accepts a string constant. With no intern table
+     * the raw and controlled semantic failure both reject every row. */
+    compare_raw(&scalar);
+    CHECK(!wl_columnar_eval_stack_cleanup_stack(
+            scalar.frame)->items[0].rel->nrows);
+    fixture_close(&scalar);
 
     fixture_t truncated; fixture_init(&truncated, 2, 3, 5, 0);
     truncated.op.right_filter_expr = (wl_plan_expr_buffer_t){bytes, 1};
@@ -2332,6 +2409,7 @@ main(void)
     keyed_cases(); key_grammar_cases(); key_empty_and_type_cases();
     key_interrupt_cases(); key_governor_cases(); key_literal_prefixes();
     hash_literal_prefixes(); batch_knob_refused_case();
+    probe_right_filter_edges();
     right_filter_cases();
     right_filter_owned_storage_case();
     right_filter_owned_refusal_retry_case();
