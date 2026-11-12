@@ -3934,17 +3934,59 @@ wl_columnar_filter_registered_cleanup_latch_owned(
     if (&parent->child != r) return EINVAL;
     rc = wl_evaluation_control_charge_attempt(funding, id, 112);
     if (rc) return rc;
+    /* Unconditional independent shape packet, including mixed JOIN cleanup.
+     * Previous112 suffix8 + rc2 + call4 + controller42 + refusal2 =58.
+     * Expanded context64/thread28/recognition18/shape48/tail24/next24 plus
+     * controller42 =248<=256. No context inspection precedes this debit. */
+    rc = wl_evaluation_control_charge_attempt(funding, id, 256);
+    if (rc) return rc;
     wl_columnar_filter_context_t *ctx = NULL;
     rc = wl_columnar_eval_stack_filter_context_owned(frame, &ctx, owner);
     if (rc) return rc;
     rc = wl_columnar_filter_attempt_context_valid(frame, ctx);
     if (rc) return rc;
     if (ctx->stage == WL_COLUMNAR_FILTER_STAGE_RUNNING) return EBUSY;
-    if (unary && (ctx->join_initialized || ctx->join_right_initialized
-        || ctx->join_decision_pending || ctx->source_bare
-        || r->cursor >= r->end || r->cursor >= r->plan->op_count
-        || (r->plan->ops[r->cursor].op != WL_PLAN_OP_FILTER
-        && r->plan->ops[r->cursor].op != WL_PLAN_OP_MAP))) return EINVAL;
+    if (unary) {
+        if (r->cursor >= r->end || r->cursor >= r->plan->op_count)
+            return EINVAL;
+        const wl_plan_op_t *op = &r->plan->ops[r->cursor];
+        if (op->op == WL_PLAN_OP_REDUCE) {
+            if (ctx->join_right_initialized || ctx->join_right_bare
+                || ctx->source_bare) return EINVAL;
+            bool initialized, postdecision = false;
+            switch (ctx->stage) {
+            case WL_COLUMNAR_FILTER_STAGE_JOIN_BATCH:
+            case WL_COLUMNAR_FILTER_STAGE_JOIN_RIGHT_SOURCE:
+            case WL_COLUMNAR_FILTER_STAGE_JOIN_PHYSICAL:
+            case WL_COLUMNAR_FILTER_STAGE_JOIN_CREDIT:
+            case WL_COLUMNAR_FILTER_STAGE_JOIN_REFERENCE:
+            case WL_COLUMNAR_FILTER_STAGE_JOIN_CLEAR:
+                initialized = true; break;
+            case WL_COLUMNAR_FILTER_STAGE_PROGRAM:
+            case WL_COLUMNAR_FILTER_STAGE_PHYSICAL:
+            case WL_COLUMNAR_FILTER_STAGE_CREDIT:
+            case WL_COLUMNAR_FILTER_STAGE_REFERENCE:
+            case WL_COLUMNAR_FILTER_STAGE_SOURCE:
+            case WL_COLUMNAR_FILTER_STAGE_JOIN_DECIDE:
+                initialized = false; break;
+            case WL_COLUMNAR_FILTER_STAGE_CONTROL:
+            case WL_COLUMNAR_FILTER_STAGE_FINISH:
+            case WL_COLUMNAR_FILTER_STAGE_RESET:
+            case WL_COLUMNAR_FILTER_STAGE_DONE:
+                initialized = false; postdecision = true; break;
+            default: return EINVAL;
+            }
+            /* JOIN_CLEAR retires scratch; JOIN_DECIDE alone retires the
+             * operation identity. No old control/pin is read after CONTROL. */
+            if (ctx->join_initialized != initialized
+                || ctx->join_decision_pending == postdecision
+                || ctx->join_operation != (postdecision ? NULL : op))
+                return EINVAL;
+        } else if (ctx->join_initialized || ctx->join_right_initialized
+            || ctx->join_decision_pending || ctx->source_bare
+            || (op->op != WL_PLAN_OP_FILTER && op->op != WL_PLAN_OP_MAP))
+            return EINVAL;
+    }
     /* Same-call routing only. The selected End callee still proves its real
      * source, cursor, owner and generation before any resource mutation. */
     if (bare_end) *bare_end =

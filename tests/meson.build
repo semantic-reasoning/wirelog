@@ -7489,3 +7489,13 @@ expression_hosts_exe = executable('test_evaluation_expression_hosts',
 )
 test('evaluation_expression_hosts', expression_hosts_exe,
   suite: ['unit', 'tsan'], timeout: 120)
+
+expression_reduce_exe = executable('test_evaluation_expression_reduce',
+  files('test_evaluation_expression_reduce.c'),
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  c_args: ['-DWL_SESSION_TEST_HOOKS=1'],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
+  link_with: [testlib_prod],
+)
+test('evaluation_expression_reduce', expression_reduce_exe,
+  suite: ['unit', 'tsan'], timeout: 120)

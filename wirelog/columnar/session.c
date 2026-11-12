@@ -9243,7 +9243,7 @@ col_controlled_step_grant_begin(wl_col_session_t *sess,
         && limit < 3072)
         limit = 3072;
     /* One unary retirement cell: two independent1088 owner proofs plus
-     * facade384, framed384, child128, latch200 and dispatch32 =3304.
+     * facade384, framed384, child128, latch456 and dispatch32 =3560.
      * Capacity is not charged work and never finances another drain cell. */
     if (action == WL_COLUMNAR_EVAL_SERIAL_FRAMED_NATIVE_CLEANUP
         && step->unary_cleanup.registered && limit < 4096) limit = 4096;
@@ -9701,6 +9701,7 @@ wl_columnar_session_unary_cleanup_register(wl_col_session_t *sess,
         if (rc) return rc;
         switch (plan->ops[i].op) {
         case WL_PLAN_OP_VARIABLE: case WL_PLAN_OP_FILTER: case WL_PLAN_OP_MAP:
+        case WL_PLAN_OP_REDUCE:
         case WL_PLAN_OP_CONSOLIDATE: break;
         default: eligible = false; break;
         }
@@ -9817,9 +9818,11 @@ wl_columnar_session_join_cleanup_register(wl_col_session_t *sess,
         if (rc) return rc;
         switch (plan->ops[op].op) {
         case WL_PLAN_OP_VARIABLE: case WL_PLAN_OP_FILTER: case WL_PLAN_OP_MAP:
+        case WL_PLAN_OP_REDUCE:
         case WL_PLAN_OP_CONCAT: break;
         /* Grouped alternatives add at most4 fixed dispatch actions to the
-         * existing250 complete fresh-birth interval:254<=256. */
+         * existing250 complete fresh-birth interval:254<=256.
+         * REDUCE no-op alternative adds2:256<=256. */
         case WL_PLAN_OP_JOIN: case WL_PLAN_OP_ANTIJOIN:
         case WL_PLAN_OP_SEMIJOIN: joined = true; break;
         case WL_PLAN_OP_CONSOLIDATE: eligible = op == plan->op_count-1; break;
@@ -13462,6 +13465,14 @@ wl_columnar_session_head_scalar_classify(wl_col_session_t *sess,
                     if (rc) return rc;
                 }
             }
+        } else if (op->op == WL_PLAN_OP_REDUCE
+            && op->agg_fn != WIRELOG_AGG_COUNT && op->agg_expr.size) {
+            /* Post-probe branch chain plus REDUCE/COUNT/size tests and both
+             * controllers/caller fronts:220<=224. COUNT never decodes its
+             * ignored operand. This is descriptive, never native authority. */
+            rc = wl_columnar_expr_requires_scalar_attempt_controlled(
+                op->agg_expr.data, op->agg_expr.size, &scalar, control, id);
+            if (rc) return rc;
         }
     }
     rc = wl_columnar_session_head_scalar_region(control, id, 564, 0);

@@ -14615,12 +14615,12 @@ test_abort_scan_semantics_and_boundaries(void)
 static void
 test_abort_scan_probe_boundaries(void)
 {
-    for (unsigned semi = 0; semi < 2; ++semi) {
+    const wl_plan_op_type_t owned[] = {WL_PLAN_OP_ANTIJOIN,
+                                       WL_PLAN_OP_SEMIJOIN, WL_PLAN_OP_REDUCE};
+    for (unsigned index = 0; index < sizeof(owned)/sizeof(owned[0]); ++index) {
         wl_plan_op_t ops[] = {{.op = WL_PLAN_OP_VARIABLE},
                               {.op = WL_PLAN_OP_JOIN},
-                              {.op =
-                                   semi ? WL_PLAN_OP_SEMIJOIN :
-                                   WL_PLAN_OP_ANTIJOIN},
+                              {.op = owned[index]},
                               {.op = WL_PLAN_OP_CONSOLIDATE}};
         wl_plan_relation_t plan = {.ops = ops, .op_count = 4};
         const uint64_t fees[] = {33, 64, 64, 64, 128, 64, 17};
@@ -14644,6 +14644,55 @@ test_abort_scan_probe_boundaries(void)
                 &plan, 2, 3, &supported) == EINVAL && !supported);
         abort_scan_case(&plan, 2, 3, 0, EINVAL, false, 225);
     }
+}
+
+static void
+test_abort_scan_generated_reduce(void)
+{
+    const char *functions[] = {"sum", "min", "max", "count"};
+    for (unsigned fn = 0; fn < 4; ++fn)for (unsigned mixed = 0; mixed < 2;
+            ++mixed) {
+            char source[512]; snprintf(source, sizeof(source),
+                ".decl input(k:int64,s:string)\n.decl gate(k:int64)\n.decl output(v:int64)\noutput(%s(strlen(s))):-input(k,s)%s.\n",
+                functions[fn], mixed?",gate(k)":"");
+            wirelog_error_t error;
+            wirelog_program_t *program = wirelog_parse_string(source, &error);
+            wl_plan_t *compiled = NULL;
+            CHECK(program && !wl_plan_from_program(program, &compiled));
+            wl_plan_relation_t body = probe_generated_body(compiled);
+            unsigned reducers = 0, joins = 0;
+            uint64_t prefix = 0;
+            /* Literal ENTRY33, each ordinary OP64, extra128 for REDUCE,
+             * FINAL17. Generated physical grammar is independently asserted. */
+            abort_scan_case(&body, 0, body.op_count, 32,
+                WL_EVALUATION_CONTROL_WORK_LIMIT, false, 0); prefix = 33;
+            for (unsigned i = 0; i < body.op_count; ++i) {
+                CHECK(body.ops[i].op == WL_PLAN_OP_VARIABLE ||
+                    body.ops[i].op == WL_PLAN_OP_MAP ||
+                    body.ops[i].op == WL_PLAN_OP_JOIN ||
+                    body.ops[i].op == WL_PLAN_OP_REDUCE ||
+                    body.ops[i].op == WL_PLAN_OP_CONSOLIDATE);
+                abort_scan_case(&body, 0, body.op_count, prefix+63,
+                    WL_EVALUATION_CONTROL_WORK_LIMIT, false, prefix);
+                prefix += 64;
+                if (body.ops[i].op == WL_PLAN_OP_REDUCE) {
+                    ++reducers;
+                    CHECK(body.ops[i].agg_fn ==
+                        (fn == 0?WIRELOG_AGG_SUM:fn == 1?WIRELOG_AGG_MIN:fn ==
+                        2?WIRELOG_AGG_MAX:WIRELOG_AGG_COUNT));
+                    abort_scan_case(&body, 0, body.op_count, prefix+127,
+                        WL_EVALUATION_CONTROL_WORK_LIMIT, false, prefix);
+                    prefix += 128;
+                }
+                joins += body.ops[i].op == WL_PLAN_OP_JOIN;
+            }
+            CHECK(reducers == 1 && joins == mixed);
+            abort_scan_case(&body, 0, body.op_count, prefix+16,
+                WL_EVALUATION_CONTROL_WORK_LIMIT, false, prefix);
+            abort_scan_case(&body, 0, body.op_count, prefix+17, 0, true,
+                prefix+17);
+            wl_plan_free(compiled); wirelog_program_free(program);
+        }
 }
 
 static void
@@ -16468,6 +16517,7 @@ main(void)
 {
     test_abort_scan_semantics_and_boundaries();
     test_abort_scan_probe_boundaries();
+    test_abort_scan_generated_reduce();
     test_abort_scan_generated_and_saved_id();
     test_prepared_join_chained_delta();
     test_prepared_join_early_stop_turnover();

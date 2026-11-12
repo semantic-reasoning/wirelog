@@ -1566,3 +1566,66 @@ stops for all three actor kinds: cancel, work denial, END alone, END+successor
 and overflow. Frozen Original reports, successor0, immutable committed images,
 retry, native ACK and governed teardown0 remain mandatory. Classification
 selects finance; it never grants cleanup authority.
+
+## Completion: scalar REDUCE operands and unary retirement
+
+Generated SUM/MIN/MAX over `strlen(s)` now retain numeric-first compilation and
+use the bounded scalar actor for nonnumeric bytecode. Explicit intern-only
+context matches raw eval_i64: configured/active workers1, no extension snapshot,
+scalar-result permission, parallel execution or session key. Semantic failure
+remains ERANGE; existing subsequent nonfinite/type checks remain in place.
+COUNT still does not classify or evaluate its ignored operand, including
+malformed bytecode. No aggregate algorithm or extension-aggregate language
+permission changes. A valid parsed direct extension FILTER is transplanted into
+aggregate IR and rejected by the exact aggregate capability diagnostic.
+
+REDUCE's saved-ID guard followed by ordinary charge differs from JOIN's
+charge_attempt wrapper. The actual guard24 + controller42 envelope is66;
+scalar compile2*66+16+51=199<=256 and context2*66+7+16+51=206<=256. FINAL88,
+result publication12, guard/zero66, caller12, next positive front66 and reserve20
+fit176<=198. No callback occurs between saved-ID validation and ordinary charge.
+The scalar program joins the existing PROGRAM owner and84 retirement payments;
+it does not acquire a second workspace owner.
+
+The abort grammar now recognizes owned REDUCE under the same extra128 cut as
+probes. Every visited REDUCE, including numeric/COUNT, adds128 to OP64; ordinary
+JOIN and unrelated numeric schedules are unchanged. Non-COUNT aggregate
+operands also acquire their actual readonly descriptor classification fees.
+The post-probe REDUCE descriptor branch fits220<=224; COUNT takes no classifier
+child. Generated SUM/MIN/MAX/COUNT and mixed JOIN bodies have independent
+ENTRY33/OP64/REDUCE128/FINAL17 exact and every-one-short schedules. Actual numeric
+SUM(k) VARcol0 classification has13 literal positive cuts totaling12*224+192=2880.
+
+Reducer-only scalar heads use genuine unary owner2; mixed JOIN+REDUCE uses
+owner1 only with a real JOIN. The mixed birth grammar's extra no-op REDUCE label
+fits256 exactly and grants no joined fact. The unary per-op birth scan fits
+158<=256 with its grouped no-op REDUCE label. All existing frame, private binding,
+transaction/generation and full receipt authentication remains mandatory.
+Actual later-row END exposed a unary latch that allowed only FILTER/MAP and
+rejected REDUCE's legitimate shared scratch flags. The new REDUCE-specific
+shape authenticates the exact current operation throughout scratch and
+pre-decision epochs. JOIN_CLEAR genuinely retires scratch; JOIN_DECIDE alone
+clears operation/pending state. CONTROL/FINISH/RESET permit that retired state
+without reading a dormant old control. Unary JOIN/probe substitution, foreign
+operation, early NULL/pending and inappropriate stages remain rejected.
+
+Registered cleanup latches now take an unconditional independent256 packet
+immediately after existing112, before context/shape inspection, for unary and
+mixed actors alike. Old112 suffix8+rc2+call4+controller42+refusal2=58<=112;
+expanded context/recognition/epoch/tail/next fronts fit248<=256. This explicitly
+reprices native retirement, including existing FILTER/MAP, without changing
+Original expression fees. The actual unary retirement cell is3560<=4096 and
+mixed dynamic cell2104<=3072; tests assert real financier reports and identity.
+SOURCE2048 is a distinct outer financier and unchanged. The directly
+authenticated latch's literal88+(5*192+128)+112+256=1544 schedule is tested at
+1543 (consumed1288, no shape mutation) and1544 through scratch, PROGRAM/SOURCE,
+JOIN_DECIDE and post-decision epochs, with protected mismatch controls.
+
+The registered evaluation_expression_reduce target compares exact typed cells
+and signed events for grouped/ungrouped unary/mixed SUM/MIN/MAX, deletion,
+reinsertion and no-op. It covers COUNT ignored scalar/malformed/over-stack-cap operands and empty input,
+later-row decimal overflow ERANGE and correction, repeated workspace/program
+ENOMEM and retry, actual compiler capability rejection, native receipt ACK,
+and governed final0. Deterministic decode/eval/FINAL and pre-frame description
+stops exercise cancel, work denial, END alone, END+successor and overflow with
+frozen Original, successor0 and immutable committed pointers/generations/events.
