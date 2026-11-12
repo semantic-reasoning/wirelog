@@ -826,7 +826,9 @@ typedef struct {
 typedef struct {
     uint32_t stratum_index, relation_index, original_op_index;
     uint32_t first_branch, branch_count;
-    const wl_plan_op_t *origin_fused, *terminal_exchange;
+    const wl_plan_op_t *origin_fused;
+    /* NULL means the actual origin has no terminal EXCHANGE. */
+    const wl_plan_op_t *terminal_exchange;
     wl_plan_scalar_merge_t merge;
 } wl_plan_scalar_group_t;
 

@@ -43,13 +43,19 @@ wl_plan_scalar_view_group_measure(const wl_plan_stratum_t *stratum,
 {
     *branches = 0; *ops = 0;
     if (!stratum->is_recursive || stratum->has_aggregate
-        || relation->recursive_agg.has_spec || relation->op_count != 2
-        || !relation->ops || relation->ops[0].op != WL_PLAN_OP_K_FUSION
-        || relation->ops[1].op != WL_PLAN_OP_EXCHANGE) return 0;
+        || relation->recursive_agg.has_spec
+        || (relation->op_count != 1 && relation->op_count != 2)
+        || !relation->ops || relation->ops[0].op != WL_PLAN_OP_K_FUSION)
+        return 0;
+    bool serial = relation->op_count == 1;
+    if (!serial && relation->ops[1].op != WL_PLAN_OP_EXCHANGE) return 0;
     const wl_plan_op_k_fusion_t *meta = relation->ops[0].opaque_data;
-    const wl_plan_op_exchange_t *exchange = relation->ops[1].opaque_data;
-    if (!meta || !exchange) return EINVAL;
-    if (exchange->num_workers) return 0;
+    if (!meta) return EINVAL;
+    if (!serial) {
+        const wl_plan_op_exchange_t *exchange = relation->ops[1].opaque_data;
+        if (!exchange) return EINVAL;
+        if (exchange->num_workers) return 0;
+    }
     if (meta->k < 2 || !meta->k_ops || !meta->k_op_counts) return EINVAL;
     if (!wl_plan_scalar_view_extent(meta->k, sizeof(*meta->k_ops))
         || !wl_plan_scalar_view_extent(meta->k, sizeof(*meta->k_op_counts)))
@@ -83,7 +89,7 @@ wl_plan_scalar_view_group_measure(const wl_plan_stratum_t *stratum,
             }
         }
     }
-    if (materialized) {
+    if (serial || materialized) {
         *branches = meta->k; *ops = total;
     }
     return 0;
@@ -200,7 +206,8 @@ wl_plan_scalar_view_build(const wl_plan_t *origin,
             relations[relation_index - 1].group_index = group_index;
             groups[group_index] = (wl_plan_scalar_group_t){
                 s, r, 0, branch_index, group_branches,
-                &relation->ops[0], &relation->ops[1],
+                &relation->ops[0],
+                relation->op_count == 2 ? &relation->ops[1] : NULL,
                 WL_PLAN_SCALAR_MERGE_SORTED_UNION_AFTER_ALL
             };
             for (uint32_t d = 0; d < group_branches; ++d) {
