@@ -1868,3 +1868,94 @@ raw/control checks; identity remains a regression control for its narrow route.
 The reproduced no-observer missing-source admission gap remains an explicit next
 adapter; populated C1 and worker-control ownership are not reclassified here. Recursive actual-tape scheduling and typed SCC integration
 also remain open work rather than certified expression-host rows.
+
+## Completion: callback-free first-missing input and late rollback
+
+Fresh callback-free plans with one nonrecursive EDB/head and a
+VARIABLE,[FILTER],MAP,CONSOLIDATE tape now select the existing private
+transaction for a real bare input instead of returning ENOTSUP. Two fixed readonly routing
+actions inspect metadata86 and header38 within96 each. They read no name or
+expression bytes and borrow no reader. The whole new block is restricted by
+the already-local DIRECT mode before state initialization: SOURCE/C1 skips
+both actions entirely, adding no208 read. Observed metadata returns false before
+source-header access, preserving the previously successful observed identity
+and computed routes. Populated, typed-empty and batch controls keep their old
+selection. The STEP keeps observed=false; no callback
+or observer object is manufactured to choose private execution.
+
+The hint permits one public original, or two with an actual graph flag on the
+bare first source. Actual compiler graph input has one EDB and two public
+originals because it creates `__graph_metadata`. The pointer at registry slot0
+is only a routing hint. Charged full-name matching, original readers/snapshots,
+private binding generations and genuine frame/numeric owner proofs still select
+and authorize the source. Unknown VARIABLE remains raw/control ENOENT2, never
+an ordinal fallback. A malformed bare capacity reaches real child readers and
+is refused before any native frame or expression; correcting it permits retry.
+Actual copied typed-empty zero-capacity inputs remain on their existing route.
+
+The automatic auxiliary original is captured under its real reader, preserved
+exactly once in the coordinated registry image and released by its real owner.
+Graph FILTER retains raw EINVAL22 before a valid insertion; direct MAP succeeds.
+The registered tests check real original/auxiliary pointers and snapshots,
+zero observer state, raw operator UNKNOWN/known schema and effective types,
+signed delete/reinsert, no-op and invalid insertion, real native frame/bindings/
+receipt proofs, all source cutpoints and repeated allocation/governor failures.
+WORK_LIMIT accounting still authenticates the exact actual metadata/image
+credits and both original readers, without fixed byte tolerances.
+
+An independent graph-minus-plain pricing oracle derives ZERO's64-byte chunks
+from actual original-record ABI geometry. On the current1224-byte record it
+adds19*64=1216. The auxiliary LOOKUP adds9, its two real reader steps add4,
+the second declaration lane adds1, registry/release/claim actions add3, and
+cutoff19->20 adds1. The body additionally visits the actual auxiliary once in
+framed target lookup and once in composed VARIABLE DELTA lookup,128 each.
+Total Original delta1490 spans38 extra positive cuts; maintenance's two actual
+reader-release payments are separate. First occurrences of PLAN/LEASES/SCHEMA/
+EVALUATE/RELEASE/CLAIMS/CUTOFF/RETIRE/FINISH compare independently derived offsets,
+with genuine slot/source-count/frame witnesses. No observed full-host total is
+used to invent a normative budget. An earlier1234 draft omitted the two128 body
+visits; that source derivation and approval were withdrawn and corrected.
+
+Late END testing exposed a baseline general-transaction defect in both numeric
+and scalar, observed and unobserved controls: after a precommit claim/CUTOFF
+failure, the real transaction marked rollback but stale-ID entry recognized
+only its later discard phase. Public STEP returned EIO, repeated calls rejected
+EINVAL without draining, and destruction failed. The new narrow readonly
+selector recognizes genuine quiescent rollback with saved positive error,
+CLAIMS..CUTOFF phase, closed generation, current registry/count and operation
+identity, no competing frame/receipt/native owner, and real saved maintenance
+when present (absent only before the first rollback iteration). Existing claim
+cancellation, retirement and reader validators remain the cleanup authority.
+The selector does not create a receipt, edit an owner or grant forward execution.
+
+The original SOURCE state getter is byte-for-byte unchanged. An existing
+optional post-STEP state-only observer runs after generic SOURCE-scope restoration
+and protects this actual rollback continuation. Matched direct observation fits
+213<=256; stale entry to the first funded maintenance action fits206<=256.
+All old SOURCE160 native-state families therefore gain zero predicates or fees.
+The existing interface requires an observer/commit pair even for state-only use:
+the paired commit endpoint fail-stops if called. The observer never returns
+COMPLETION_READY or reads/writes selected_out, so ordinary flow cannot invoke
+that endpoint. Global pair validation and generic EAGAIN invariants remain.
+Real rollback transitions into the existing discard path and only finishes the
+saved old ID after actual disposal; an ended Original or successor is never
+charged or rewritten.
+
+Forty-eight registered late-END histories cross scalar/numeric expressions,
+observer on/off, graph/plain originals, preclaim/after-ready-claim/CUTOFF and
+END alone/with successor. Twelve additional observed two-head histories prove
+cancellation after the first genuine READY claim and with two public-head
+claims before cutoff. Every public cleanup
+turn checks frozen Original, successor0, old head/input/auxiliary images and
+signed events; valid insert/remove/snapshot/callback replacement stay busy.
+Actual retirement/rollback/discard/maintenance progress is observed through
+existing readonly test seams. Terminal EINVAL follows real closure, then raised
+retry matches raw and successful destruction returns the governor to0. Backend
+pair negatives and untouched completion sentinels cover state-only handoff.
+Long-name32/240 fixtures reach charged byte matching with the same first-NAMES
+prefix and demonstrate no new preattempt name traversal.
+
+This closes the qualified ordinary first-missing callback-free adapter and its
+exposed late rollback debt. Inferred inline schemas, preserved inline IDB seeds,
+actual recursive tapes/effect scheduling and typed SCC transport remain concrete
+following units; this row does not certify their completion or worker ownership.

@@ -8,7 +8,15 @@
 #include <string.h>
 #define CHECK(x) do { if (!(x)) { fprintf(stderr, "%s:%d: %s\n", __FILE__, \
                                       __LINE__,#x); abort(); } } while (0)
+extern void (*wl_columnar_session_test_observed_transaction_checkpoint)(
+    wl_evaluation_control_t *, unsigned, uint32_t,
+    const wl_columnar_eval_private_bindings_t *);
 extern void (*wl_columnar_filter_test_map_schema)(const col_rel_t *, bool);
+extern size_t wl_columnar_session_test_general_original_bytes(void);
+extern int wl_columnar_session_test_general_maintenance_consumed(
+    const wl_col_session_t *, uint64_t *);
+extern unsigned wl_columnar_session_test_general_route_flags(
+    const wl_col_session_t *);
 extern unsigned wl_columnar_session_test_cleanup_owners(
     const wl_col_session_t *);
 extern int wl_columnar_session_test_pending_source_bytes(
@@ -286,12 +294,31 @@ typedef struct {
     wl_evaluation_control_t *control; wl_columnar_memory_governor_ref_t *g;
     col_rel_t *input; uint32_t width; bool graph, filter, constant, numeric;
     unsigned source_calls, metadata, unknown, bodies, events;
-    bool background; unsigned base_events; int base_balance[4]; int64_t balance;
+    bool empty_known; unsigned numeric_frames; bool no_observer;
+    bool background;
+    unsigned base_events;
+    int base_balance[4]; int64_t balance;
     unsigned stop; bool did_stop; uint64_t next;
     unsigned fail_constructor; bool deny_constructor;
     wl_evaluation_control_report_t original_report;
 } fixture_t;
 static fixture_t *active;
+static bool graph_fee_active;
+static unsigned graph_source_witness, graph_framed_aux_witness;
+static uint32_t graph_source_count;
+extern void (*wl_columnar_eval_serial_test_framed_checkpoint)(
+    wl_columnar_eval_serial_framed_attempt_t *);
+static void graph_framed_visit(wl_columnar_eval_serial_framed_attempt_t *ctx) {
+    if (!graph_fee_active || !active ||
+        ctx->session != COL_SESSION(active->controlled) ||
+        ctx->control != active->control) return;
+    if (ctx->phase == WL_COLUMNAR_EVAL_SERIAL_FRAMED_LOOKUP &&
+        ctx->registry_slot < ctx->session->nrels && ctx->name_byte == 0 &&
+        !strcmp(ctx->session->rels[ctx->registry_slot]->name,
+        "__graph_metadata") && !strcmp(ctx->plan->name,
+        "out")) ++graph_framed_aux_witness;
+}
+
 static int complete(wl_session_t *s) {
     for (unsigned i = 0; i < 100000; ++i) {
         int rc = wl_session_step(s); if (rc != EAGAIN) return rc;
@@ -312,18 +339,44 @@ static void events(const char *name, const int64_t *row, uint32_t width,
 static void schema(const col_rel_t *r, bool known) {
     if (!active)return;
     if (active->background && known)return; /* Numeric base head; out stays UNKNOWN. */
-    bool expected = active->input->ncols || active->constant || active->numeric;
+    bool expected = active->input->ncols || active->constant ||
+        active->numeric || active->empty_known;
     CHECK(known == expected && r && r->ncols == 1);
+    if (active->no_observer){
+        wl_col_session_t *session = COL_SESSION(active->controlled);
+        wl_columnar_eval_serial_framed_attempt_t *ctx = NULL;
+        CHECK(session->cleanup_active &&
+            !wl_columnar_eval_stack_framed_context(session->cleanup_active,
+            session, &ctx));
+        CHECK(!wl_columnar_eval_stack_framed_authenticate(ctx->frame, session,
+            ctx) &&
+            ctx->capture_only && ctx->private_bindings &&
+            ctx->abort_supported && ctx->cleanup_receipt_key.receipt_id &&
+            wl_columnar_session_observed_bindings_authorized(session,
+            ctx->private_bindings) &&
+            wl_columnar_eval_plan_numeric_owner_valid(&ctx->child,
+            ctx->frame) &&
+            !wl_columnar_eval_stack_numeric_owner(ctx->frame, &ctx->child) &&
+            wl_columnar_session_test_general_route_flags(session) == 5u);
+        ++active->numeric_frames;
+    }
+
     if (!known) {
         CHECK(!r->column_types); ++active->unknown;
     }
 }
+static void session_source(wl_evaluation_control_t *, unsigned);
 static void expression(wl_evaluation_control_t *c, unsigned phase,
     uint64_t progress, bool failed) {
     (void)progress; (void)failed;
     fixture_t *f = active;
     if (!f || c != f->control || (phase != 610 && phase != 83)) return;
     wl_col_session_t *session = COL_SESSION(f->controlled);
+    if (f->no_observer)CHECK(!session->delta_cb && !session->delta_observer &&
+            !session->delta_observer_build &&
+            !session->delta_observer_prepare &&
+            wl_columnar_session_test_general_route_flags(session) == 5u);
+
     wl_columnar_eval_serial_framed_attempt_t *ctx = NULL;
     CHECK(session->cleanup_active && !wl_columnar_eval_stack_framed_context(
             session->cleanup_active, session, &ctx));
@@ -335,6 +388,17 @@ static void expression(wl_evaluation_control_t *c, unsigned phase,
         ctx->private_bindings) &&
         wl_columnar_session_test_cleanup_owners(session) == 2);
     if (phase == 610) {
+        if (graph_fee_active) {
+            CHECK(ctx->child.private_bindings == ctx->private_bindings &&
+                ctx->child.cursor == 1 &&
+                ctx->child.source_count ==
+                ctx->private_bindings->count+session->nrels &&
+                ctx->child.source_slot == ctx->child.source_count &&
+                !ctx->child.source_delta);
+            graph_source_count = ctx->child.source_count;
+            ++graph_source_witness;
+        }
+
         wl_columnar_filter_context_t *map = NULL;
         CHECK(!wl_columnar_eval_stack_filter_context_owned(ctx->frame, &map,
             &ctx->child));
@@ -346,6 +410,8 @@ static void expression(wl_evaluation_control_t *c, unsigned phase,
                 map->source.descriptor->schema_ok && !map->source.nrows);
         ++f->metadata;
     }else ++f->bodies;
+    if (f->no_observer && f->stop == phase)session_source(c, phase);
+
 }
 static void session_source(wl_evaluation_control_t *c, unsigned phase) {
     fixture_t *f = active; if (!f || c != f->control)return;
@@ -417,6 +483,13 @@ static fixture_t create(const char *type, const char *output, const char *expr,
 }
 static void bind(fixture_t *f) {
     active = f; wl_session_set_delta_cb(f->controlled, events, f);
+    wl_columnar_filter_test_map_schema = schema;
+    wl_columnar_expr_test_checkpoint = expression;
+    wl_columnar_relation_test_empty_input_checkpoint = session_source;
+}
+static void bind_unobserved(fixture_t *f) {
+    f->no_observer = true; active = f;
+    CHECK(!COL_SESSION(f->controlled)->delta_cb);
     wl_columnar_filter_test_map_schema = schema;
     wl_columnar_expr_test_checkpoint = expression;
     wl_columnar_relation_test_empty_input_checkpoint = session_source;
@@ -582,74 +655,115 @@ static void session_matrix(void) {
 static void session_stops(void) {
     const unsigned phases[] = {620, 621, 622, 623, 624, 625, 626, 627, 628, 629,
                                631, 632};
-    for (size_t k = 0; k < sizeof(phases)/sizeof(*phases); ++k)for (action = 0;
-            action < 5; ++action) {
-            fixture_t f = create("int64", "string", "to_string(x)", false,
-                    false); bind(&f);
-            col_relation_snapshot_t before =
-                wl_columnar_relation_snapshot(f.input);
-            uint64_t baseline = reserved(f.g); f.stop = phases[k];
-            CHECK(!wl_evaluation_control_configure(f.control,
-                action == 1?UINT64_MAX:0));
-            int expected = action == 0?WL_EVALUATION_CONTROL_CANCELLED:
-                action == 1?WL_EVALUATION_CONTROL_WORK_LIMIT:action ==
-                4?EOVERFLOW:EINVAL;
-            CHECK(complete(f.controlled) == expected && f.did_stop &&
-                !f.events &&
-                !session_find_rel(COL_SESSION(f.controlled), "out"));
-            closed(&f);
-            uint64_t retained = 0;
-            CHECK(!wl_columnar_session_test_pending_source_bytes(COL_SESSION(
-                    f.controlled), &retained));
-            CHECK(wl_columnar_relation_snapshot_equal(before,
-                wl_columnar_relation_snapshot(f.input)) &&
-                !f.input->ncols && !f.input->schema_ok &&
-                f.input->declared_ncols == 1);
-            CHECK(reserved(f.g) == baseline+retained);
-            CHECK((retained != 0) == (action == 1));
-            closed(&f); wl_evaluation_control_report_t report;
-            CHECK(!wl_evaluation_control_report(f.control, &report));
-            if (action == 2 || action == 3) {
-                CHECK(reports_equal(&report, &f.original_report));
-                if (action == 3) {
-                    uint64_t used = 99;
-                    CHECK(!wl_evaluation_control_test_active_consumed(f.control,
-                        f.next, &used) && !used);
-                    wl_evaluation_control_attempt_finish_result_t end =
-                        wl_evaluation_control_finish_attempt(
-                        f.control, f.controlled->operation_admission, f.next, 0,
-                        0);
-                    CHECK(!end.protocol && end.report_valid &&
-                        !end.report.consumed);
-                }
-            }else CHECK(report.result == expected && !report.cleanup_status);
-
-            if (action == 1)for (unsigned repeat = 0; repeat < 2; ++repeat) {
-                    f.did_stop = false;
-                    CHECK(!wl_evaluation_control_reset(f.control) &&
-                        !wl_evaluation_control_configure(f.control,
-                        UINT64_MAX));
-                    CHECK(complete(f.controlled) ==
-                        WL_EVALUATION_CONTROL_WORK_LIMIT && f.did_stop &&
-                        !f.events);
-                    closed(&f); uint64_t again = 0;
+    for (unsigned graph = 0; graph < 2; ++graph)
+        for (unsigned unobserved = 0; unobserved < 2; ++unobserved)
+            for (size_t k = 0; k < sizeof(phases)/sizeof(*phases);
+                ++k) for (action = 0;
+                    action < 5; ++action) {
+                    fixture_t f = create("int64", "string", "to_string(x)",
+                            graph != 0,
+                            false);
+                    if (unobserved) bind_unobserved(&f); else bind(&f);
+                    col_relation_snapshot_t before =
+                        wl_columnar_relation_snapshot(f.input);
+                    uint64_t baseline = reserved(f.g); f.stop = phases[k];
+                    col_rel_t *aux =
+                        graph?COL_SESSION(f.controlled)->rels[1]:NULL;
+                    col_relation_snapshot_t aux_before =
+                        aux?wl_columnar_relation_snapshot(aux):
+                        (col_relation_snapshot_t){0};
+                    CHECK(!wl_evaluation_control_configure(f.control,
+                        action == 1?UINT64_MAX:0));
+                    int expected = action == 0?WL_EVALUATION_CONTROL_CANCELLED:
+                        action == 1?WL_EVALUATION_CONTROL_WORK_LIMIT:action ==
+                        4?EOVERFLOW:EINVAL;
+                    CHECK(complete(f.controlled) == expected && f.did_stop &&
+                        !f.events &&
+                        !session_find_rel(COL_SESSION(f.controlled), "out"));
+                    closed(&f);
+                    uint64_t retained = 0;
                     CHECK(!wl_columnar_session_test_pending_source_bytes(
-                            COL_SESSION(f.controlled), &again) &&
-                        again == retained && reserved(f.g) == baseline+again &&
-                        wl_columnar_relation_snapshot_equal(before,
-                        wl_columnar_relation_snapshot(f.input)));
+                            COL_SESSION(
+                                f.controlled), &retained));
+                    CHECK(wl_columnar_relation_snapshot_equal(before,
+                        wl_columnar_relation_snapshot(f.input)) &&
+                        !f.input->ncols && !f.input->schema_ok &&
+                        f.input->declared_ncols == f.width);
+                    CHECK(reserved(f.g) == baseline+retained);
+                    CHECK((retained != 0) == (action == 1));
+                    if (aux) {
+                        CHECK(wl_columnar_relation_snapshot_equal(aux_before,
+                            wl_columnar_relation_snapshot(aux)));
+                        if (retained) {
+                            wl_columnar_source_access_writer_t w = {0};
+                            CHECK(wl_columnar_source_access_writer_acquire(
+                                    &aux->descriptor_access, &w) == EBUSY);
+                        }else gates_free(aux);
+                    }
+
+                    closed(&f); wl_evaluation_control_report_t report;
+                    CHECK(!wl_evaluation_control_report(f.control, &report));
+                    if (action == 2 || action == 3) {
+                        CHECK(reports_equal(&report, &f.original_report));
+                        if (action == 3) {
+                            uint64_t used = 99;
+                            CHECK(!wl_evaluation_control_test_active_consumed(
+                                    f.control,
+                                    f.next, &used) && !used);
+                            wl_evaluation_control_attempt_finish_result_t end =
+                                wl_evaluation_control_finish_attempt(
+                                f.control, f.controlled->operation_admission,
+                                f.next, 0,
+                                0);
+                            CHECK(!end.protocol && end.report_valid &&
+                                !end.report.consumed);
+                        }
+                    }else CHECK(report.result == expected &&
+                            !report.cleanup_status);
+
+                    if (action == 1) for (unsigned repeat = 0; repeat < 2;
+                            ++repeat) {
+                            f.did_stop = false;
+                            CHECK(!wl_evaluation_control_reset(f.control) &&
+                                !wl_evaluation_control_configure(f.control,
+                                UINT64_MAX));
+                            CHECK(complete(f.controlled) ==
+                                WL_EVALUATION_CONTROL_WORK_LIMIT &&
+                                f.did_stop &&
+                                !f.events);
+                            closed(&f); uint64_t again = 0;
+                            CHECK(
+                                !wl_columnar_session_test_pending_source_bytes(
+                                    COL_SESSION(f.controlled), &again) &&
+                                again == retained &&
+                                reserved(f.g) == baseline+again &&
+                                wl_columnar_relation_snapshot_equal(before,
+                                wl_columnar_relation_snapshot(f.input)));
+                        }
+                    f.stop = 0;
+                    CHECK(!wl_evaluation_control_reset(f.control) &&
+                        !wl_evaluation_control_configure(f.control, 0));
+                    CHECK(!complete(f.controlled) && !complete(f.raw));
+                    equal(&f);
+                    CHECK(f.unknown && !f.events);
+                    insert(&f, 2, false);
+                    CHECK(!wl_evaluation_control_reset(f.control));
+                    CHECK(!complete(f.controlled) && !complete(f.raw));
+                    equal(&f);
+                    CHECK(f.balance == (unobserved?0:1));
+                    if (aux) {
+                        unsigned count = 0; for (uint32_t j = 0;
+                            j < COL_SESSION(f.controlled)->nrels;
+                            ++j) count += COL_SESSION(f.controlled)->rels[j] ==
+                                aux;
+                        CHECK(count == 1 &&
+                            wl_columnar_relation_snapshot_equal(aux_before,
+                            wl_columnar_relation_snapshot(aux)));
+                        gates_free(aux);
+                    }
+
+                    destroy(&f);
                 }
-            f.stop = 0;
-            CHECK(!wl_evaluation_control_reset(f.control) &&
-                !wl_evaluation_control_configure(f.control, 0));
-            CHECK(!complete(f.controlled) && !complete(f.raw)); equal(&f);
-            CHECK(f.unknown && !f.events);
-            insert(&f, 2, false);
-            CHECK(!wl_evaluation_control_reset(f.control));
-            CHECK(!complete(f.controlled) && !complete(f.raw)); equal(&f);
-            CHECK(f.balance == 1);
-            destroy(&f);
-        }
 }
 
 static void old_public_image_stops(void) {
@@ -725,37 +839,721 @@ static void old_public_image_stops(void) {
 }
 
 static void session_resources(void) {
-    for (unsigned allocation = 1; allocation <= 4; ++allocation) {
-        fixture_t f = create("int64", "string", "to_string(x)", false, false);
-        bind(&f);
-        col_relation_snapshot_t before = wl_columnar_relation_snapshot(f.input);
-        uint64_t baseline = reserved(f.g);
-        for (unsigned repeat = 0; repeat < 2; ++repeat) {
-            f.fail_constructor = allocation < 4?allocation:0;
-            f.deny_constructor = allocation == 4;
-            int expected = allocation == 4?ENOSPC:ENOMEM;
-            CHECK(complete(f.controlled) == expected && !f.fail_constructor &&
-                !f.deny_constructor &&
-                !wl_columnar_relation_test_constructor_fail_allocation &&
-                f.source_calls && !f.events);
-            closed(&f);
-            CHECK(!session_find_rel(COL_SESSION(f.controlled),
-                "out") && reserved(f.g) == baseline &&
-                wl_columnar_relation_snapshot_equal(before,
-                wl_columnar_relation_snapshot(f.input)));
-            wl_evaluation_control_report_t report;
-            CHECK(!wl_evaluation_control_report(f.control, &report) &&
-                report.execution_status == expected && !report.cleanup_status);
-            atomic_store(&wl_columnar_memory_governor_ref_get(
-                    f.g)->usable_bytes, UINT64_C(128)<<20);
+    for (unsigned unobserved = 0; unobserved < 2; ++unobserved)
+        for (unsigned allocation = 1; allocation <= 4; ++allocation) {
+            fixture_t f = create("int64", "string", "to_string(x)", false,
+                    false);
+            if (unobserved) bind_unobserved(&f); else bind(&f);
+            col_relation_snapshot_t before =
+                wl_columnar_relation_snapshot(f.input);
+            uint64_t baseline = reserved(f.g);
+            for (unsigned repeat = 0; repeat < 2; ++repeat) {
+                f.fail_constructor = allocation < 4?allocation:0;
+                f.deny_constructor = allocation == 4;
+                int expected = allocation == 4?ENOSPC:ENOMEM;
+                CHECK(complete(f.controlled) == expected &&
+                    !f.fail_constructor &&
+                    !f.deny_constructor &&
+                    !wl_columnar_relation_test_constructor_fail_allocation &&
+                    f.source_calls && !f.events);
+                closed(&f);
+                CHECK(!session_find_rel(COL_SESSION(f.controlled),
+                    "out") && reserved(f.g) == baseline &&
+                    wl_columnar_relation_snapshot_equal(before,
+                    wl_columnar_relation_snapshot(f.input)));
+                wl_evaluation_control_report_t report;
+                CHECK(!wl_evaluation_control_report(f.control, &report) &&
+                    report.execution_status == expected &&
+                    !report.cleanup_status);
+                atomic_store(&wl_columnar_memory_governor_ref_get(
+                        f.g)->usable_bytes, UINT64_C(128)<<20);
+                CHECK(!wl_evaluation_control_reset(f.control));
+            }
+            CHECK(!complete(f.controlled) && !complete(f.raw)); equal(&f);
+            CHECK(f.unknown && !f.events);
+            insert(&f, 2, false);
             CHECK(!wl_evaluation_control_reset(f.control));
+            CHECK(!complete(f.controlled) && !complete(f.raw)); equal(&f);
+            CHECK(f.balance == (unobserved?0:1));
+            destroy(&f);
         }
+}
+
+extern int wl_columnar_session_test_retirement_view(const wl_col_session_t *,
+    uint64_t out[16]);
+static unsigned late_epoch;
+static void late_matrix_stop(wl_evaluation_control_t *c, unsigned phase,
+    uint32_t progress,
+    const wl_columnar_eval_private_bindings_t *bindings) {
+    (void)bindings;
+    fixture_t *f = active; if (!f || c != f->control || f->did_stop)return;
+    wl_col_session_t *session = COL_SESSION(f->controlled);
+    bool match = late_epoch == 0?(phase == 13 && progress == 0):
+        late_epoch == 1?(phase == 13 && progress == session->nrels):phase == 14;
+    if (!match)return;
+    uint64_t view[16];
+    CHECK(!wl_columnar_session_test_retirement_view(session, view));
+    CHECK(view[1] == wl_evaluation_control_active_attempt_id(c) &&
+        view[3] == phase && !view[5]);
+    if (late_epoch) {
+        CHECK(view[0]); /* Genuine registered reversible public-head claim. */
+        col_rel_t *old = session_find_rel(session, "out"); CHECK(old);
+        wl_columnar_source_access_writer_t writer = {0};
+        CHECK(wl_columnar_source_access_writer_acquire(&old->descriptor_access,
+            &writer) == EBUSY);
+    }
+    session_source(c, 2100+late_epoch);
+}
+static void assert_original_frozen(fixture_t *f) {
+    wl_evaluation_control_report_t report;
+    CHECK(!wl_evaluation_control_report(f->control,
+        &report) && reports_equal(&report, &f->original_report));
+    if (f->next) {
+        uint64_t used = 99;
+        CHECK(!wl_evaluation_control_test_active_consumed(f->control, f->next,
+            &used) && !used);
+    }
+}
+static void snapshot_must_not_run(const char *name, const int64_t *row,
+    uint32_t width, void *data) {
+    (void)name; (void)row; (void)width; (void)data; CHECK(false);
+}
+static void observe_sentinel(wl_session_t *session) {
+    wl_backend_controlled_completion_t out, before;
+    memset(&out, 0xa5, sizeof(out)); out.selected = false;
+    out.kind = WL_BACKEND_CONTROLLED_COMPLETION_CLOSE;
+    out.state = WL_CONTROLLED_STEP_DIRTY;
+    memcpy(&before, &out, sizeof(out));
+    const wl_compute_backend_t *backend = session->backend;
+    int state = backend->session_controlled_step_observe(session,
+            WL_BACKEND_CONTROLLED_COMPLETION_STEP, true, &out);
+    CHECK(state != WL_BACKEND_CONTROLLED_OBSERVATION_COMPLETION_READY &&
+        !memcmp(&out, &before, sizeof(out)));
+    state = backend->session_controlled_step_observe(session,
+            WL_BACKEND_CONTROLLED_COMPLETION_STEP, false, &out);
+    CHECK(state == (int)backend->session_controlled_step_state(session) &&
+        !memcmp(&out, &before, sizeof(out)));
+    state = backend->session_controlled_step_observe(session,
+            WL_BACKEND_CONTROLLED_COMPLETION_SNAPSHOT, true, &out);
+    CHECK(state == (int)backend->session_controlled_step_state(session) &&
+        !memcmp(&out, &before, sizeof(out)));
+}
+static void state_only_backend_pair(void) {
+    fixture_t f = create("int64", "string", "to_string(x)", false, false);
+    const wl_compute_backend_t *backend = wl_backend_columnar();
+    CHECK(backend->session_controlled_step_observe &&
+        backend->session_controlled_completion_commit);
+    observe_sentinel(f.controlled);
+    uint64_t baseline = reserved(f.g);
+    for (unsigned controlled = 0; controlled < 2;
+        ++controlled) for (unsigned missing =
+            0;
+            missing < 2; ++missing){
+            wl_compute_backend_t bad = *backend;
+            if (missing) bad.session_controlled_step_observe = NULL;
+            else bad.session_controlled_completion_commit = NULL;
+            wl_session_options_t options; wl_session_options_init(&options);
+            options.memory_governor = f.g;
+            options.evaluation_control = controlled?f.control:NULL;
+            wl_session_t *out = NULL;
+            CHECK(wl_session_create_with_options(&bad, f.plan, 1, &options,
+                &out) == EINVAL && !out && reserved(f.g) == baseline);
+        }
+    destroy(&f);
+}
+static void late_two_head_stop(wl_evaluation_control_t *c, unsigned phase,
+    uint32_t progress,
+    const wl_columnar_eval_private_bindings_t *bindings) {
+    (void)bindings; fixture_t *f = active;
+    if (!f || c != f->control || f->did_stop) return;
+    bool match = late_epoch == 0?(phase == 13 &&
+        progress == 0):late_epoch == 1?(phase == 13 &&
+        progress == 3):phase == 14;
+    if (!match)return;
+    uint64_t view[16];
+    CHECK(!wl_columnar_session_test_retirement_view(COL_SESSION(f->controlled),
+        view));
+    CHECK(COL_SESSION(f->controlled)->nrels == 4 && view[3] == phase);
+    if (late_epoch == 1)CHECK(view[0] == 1 && view[15]);
+    if (late_epoch == 2)CHECK(view[0] == 2);
+    session_source(c, 2200+late_epoch);
+}
+static void late_two_head_matrix(void) {
+    for (unsigned numeric = 0; numeric < 2; ++numeric)for (late_epoch = 0;
+            late_epoch < 3; ++late_epoch)
+            for (action = 2; action <= 3; ++action) {
+                fixture_t f = {0}; f.g = governor(); f.width = 1;
+                f.background = true; f.numeric = numeric != 0;
+                char text[512];
+                snprintf(text, sizeof(text),
+                    ".decl input(x:int64)\n.decl other(x:int64)\n.decl out(y:%s)\n.decl base(y:int64)\nout(%s):-input(x).\nbase(x):-other(x).\n",
+                    numeric?"int64":"string", numeric?"x+1":"to_string(x)");
+                create_sessions(&f, text); bind(&f); insert(&f, 1, false);
+                int64_t one = 1, two = 2;
+                CHECK(!wl_session_insert(f.controlled, "other", &one, 1,
+                    1) && !wl_session_insert(f.raw, "other", &one, 1, 1));
+                CHECK(!complete(f.controlled) && !complete(f.raw)); equal(&f);
+                col_rel_t *old_out = session_find_rel(COL_SESSION(f.controlled),
+                        "out"),
+                    *old_base = session_find_rel(COL_SESSION(f.controlled),
+                        "base"),
+                    *other = session_find_rel(COL_SESSION(f.controlled),
+                        "other");
+                CHECK(old_out && old_base && other && f.events == 1 &&
+                    f.base_events == 1);
+                col_relation_snapshot_t out_before =
+                    wl_columnar_relation_snapshot(old_out),
+                    base_before = wl_columnar_relation_snapshot(old_base);
+                insert(&f, 2, false);
+                CHECK(!wl_session_insert(f.controlled, "other", &two, 1,
+                    1) && !wl_session_insert(f.raw, "other", &two, 1, 1));
+                CHECK(!wl_evaluation_control_reset(f.control));
+                col_relation_snapshot_t input_before =
+                    wl_columnar_relation_snapshot(f.input),
+                    other_before = wl_columnar_relation_snapshot(other);
+                f.stop = 2200+late_epoch;
+                wl_columnar_session_test_observed_transaction_checkpoint =
+                    late_two_head_stop;
+                unsigned turns = 0; int rc = EAGAIN; bool discarded = false;
+                for (; turns < 10000; ++turns) {
+                    if (f.did_stop) assert_original_frozen(&f);
+                    rc = wl_session_step(f.controlled);
+                    if (f.did_stop) {
+                        assert_original_frozen(&f); uint64_t view[16];
+                        CHECK(!wl_columnar_session_test_retirement_view(
+                                COL_SESSION(f.controlled), view));
+                        discarded |= (view[5]&2) != 0;
+                        CHECK(old_out ==
+                            session_find_rel(COL_SESSION(f.controlled),
+                            "out") &&
+                            old_base ==
+                            session_find_rel(COL_SESSION(f.controlled),
+                            "base") &&
+                            wl_columnar_relation_snapshot_equal(out_before,
+                            wl_columnar_relation_snapshot(old_out)) &&
+                            wl_columnar_relation_snapshot_equal(base_before,
+                            wl_columnar_relation_snapshot(old_base)) &&
+                            wl_columnar_relation_snapshot_equal(input_before,
+                            wl_columnar_relation_snapshot(f.input)) &&
+                            wl_columnar_relation_snapshot_equal(other_before,
+                            wl_columnar_relation_snapshot(other)) &&
+                            f.events == 1 && f.base_events == 1 &&
+                            f.balance == 1 && f.base_balance[1] == 1 &&
+                            !f.base_balance[2]);
+                        if (rc == EAGAIN) CHECK(wl_session_insert(f.controlled,
+                                "other", &two, 1, 1) == EBUSY);
+                    }
+                    if (rc != EAGAIN) break;
+                }
+                CHECK(turns < 10000 && f.did_stop && discarded && rc == EINVAL);
+                uint64_t closed[16];
+                CHECK(!wl_columnar_session_test_retirement_view(COL_SESSION(
+                        f.controlled), closed) && !closed[0] && !closed[1]);
+                gates_free(old_out); gates_free(old_base); gates_free(f.input);
+                gates_free(other);
+                wl_columnar_session_test_observed_transaction_checkpoint = NULL;
+                f.stop = 0;
+                if (f.next) {
+                    wl_evaluation_control_attempt_finish_result_t end =
+                        wl_evaluation_control_finish_attempt(f.control,
+                            f.controlled->operation_admission, f.next, 0, 0);
+                    CHECK(!end.protocol && end.report_valid &&
+                        !end.report.consumed);
+                }
+                CHECK(!wl_evaluation_control_reset(f.control) &&
+                    !complete(f.controlled) && !complete(f.raw)); equal(&f);
+                CHECK(f.events == 2 && f.base_events == 2 &&
+                    f.base_balance[1] == 1 && f.base_balance[2] == 1);
+                col_rel_t *a = session_find_rel(COL_SESSION(f.controlled),
+                        "base"),
+                    *b = session_find_rel(COL_SESSION(f.raw), "base");
+                CHECK(a && b && a->ncols == 1 && b->ncols == 1 &&
+                    a->nrows == 2 && b->nrows == 2);
+                for (uint32_t i = 0; i < 2;
+                    ++i) CHECK(a->columns[0][i] == b->columns[0][i]);
+                CHECK(!wl_session_try_destroy(&f.controlled) && !f.controlled);
+                destroy(&f);
+            }
+}
+
+static void late_end_matrix(void) {
+    /* Numeric x+1 selects the genuine general host in both observer modes.
+     * Single-head observed identity retains its separate narrow-route control. */
+    for (unsigned numeric = 0; numeric < 2; ++numeric)for (unsigned observed =
+            0;
+            observed < 2; ++observed)
+            for (unsigned graph = 0; graph < 2; ++graph) for (late_epoch = 0;
+                    late_epoch < 3; ++late_epoch)
+                    for (action = 2; action <= 3; ++action) {
+                        fixture_t f = create("int64", numeric?"int64":"string",
+                                numeric?"x+1":"to_string(x)", graph != 0,
+                                false);
+                        if (observed) bind(&f); else bind_unobserved(&f);
+                        CHECK(!complete(f.controlled) && !complete(f.raw));
+                        equal(&f);
+                        insert(&f, 1, false);
+                        CHECK(!wl_evaluation_control_reset(f.control));
+                        CHECK(!complete(f.controlled) && !complete(f.raw));
+                        equal(&f);
+                        col_rel_t *old =
+                            session_find_rel(COL_SESSION(f.controlled), "out");
+                        col_rel_t *aux =
+                            graph?session_find_rel(COL_SESSION(f.controlled),
+                                "__graph_metadata"):NULL;
+                        CHECK(old && (!graph || aux));
+                        col_relation_snapshot_t old_before =
+                            wl_columnar_relation_snapshot(old);
+                        col_relation_snapshot_t aux_before =
+                            aux?wl_columnar_relation_snapshot(aux):
+                            (col_relation_snapshot_t){0};
+                        insert(&f, 2, false);
+                        CHECK(!wl_evaluation_control_reset(f.control));
+                        col_relation_snapshot_t input_before =
+                            wl_columnar_relation_snapshot(f.input);
+                        unsigned events_before = f.events;
+                        int64_t balance_before = f.balance;
+                        f.stop = 2100+late_epoch;
+                        wl_columnar_session_test_observed_transaction_checkpoint
+                            = late_matrix_stop;
+                        unsigned turns = 0, drain = 0;
+                        bool rollback = false, discard = false,
+                            maintenance = false;
+                        int rc = EAGAIN;
+                        for (; turns < 10000; ++turns) {
+                            if (f.did_stop) assert_original_frozen(&f);
+                            rc = wl_session_step(f.controlled);
+                            if (f.did_stop) {
+                                ++drain; assert_original_frozen(&f);
+                                CHECK(old ==
+                                    session_find_rel(COL_SESSION(f.controlled),
+                                    "out") &&
+                                    wl_columnar_relation_snapshot_equal(
+                                        old_before,
+                                        wl_columnar_relation_snapshot(old)) &&
+                                    wl_columnar_relation_snapshot_equal(
+                                        input_before,
+                                        wl_columnar_relation_snapshot(
+                                            f.input)) &&
+                                    f.events == events_before &&
+                                    f.balance == balance_before);
+                                if (aux) CHECK(aux ==
+                                        session_find_rel(COL_SESSION(
+                                            f.controlled),
+                                        "__graph_metadata") &&
+                                        wl_columnar_relation_snapshot_equal(
+                                            aux_before,
+                                            wl_columnar_relation_snapshot(
+                                                aux)));
+                                uint64_t view[16];
+                                CHECK(!wl_columnar_session_test_retirement_view(
+                                        COL_SESSION(f.controlled), view));
+                                rollback |= (view[5]&1) != 0;
+                                discard |= (view[5]&2) != 0;
+                                maintenance |= view[6] != 0;
+                                observe_sentinel(f.controlled);
+                                if (rc == EAGAIN) {
+                                    int64_t row[] = {2, 9};
+                                    CHECK(wl_session_insert(f.controlled,
+                                        "input", row, 1, f.width) == EBUSY);
+                                    CHECK(wl_session_remove(f.controlled,
+                                        "input", row, 1, f.width) == EBUSY);
+                                    CHECK(wl_session_snapshot(f.controlled,
+                                        snapshot_must_not_run, NULL) == EBUSY);
+                                    wl_session_set_delta_cb(f.controlled,
+                                        observed?NULL:events, &f);
+                                    CHECK(COL_SESSION(f.controlled)->delta_cb ==
+                                        (observed?events:NULL));
+                                    if (observed) CHECK(COL_SESSION(
+                                                f.controlled)->delta_data ==
+                                            &f);
+                                    assert_original_frozen(&f);
+                                }
+                            }
+                            if (rc != EAGAIN) break;
+                        }
+                        CHECK(turns < 10000 && f.did_stop && drain &&
+                            rollback && discard && maintenance && rc == EINVAL);
+                        CHECK(!COL_SESSION(f.controlled)->cleanup_active &&
+                            !COL_SESSION(f.controlled)->cleanup_pending &&
+                            !COL_SESSION(f.controlled)->delta_observer &&
+                            !wl_columnar_session_test_cleanup_owners(
+                                COL_SESSION(f.controlled)));
+                        uint64_t closed[16];
+                        CHECK(!wl_columnar_session_test_retirement_view(
+                                COL_SESSION(f.controlled),
+                                closed) && !closed[0] && !closed[1]);
+                        gates_free(old); gates_free(f.input);
+                        if (aux) gates_free(aux);
+                        wl_columnar_session_test_observed_transaction_checkpoint
+                            = NULL; f.stop = 0;
+                        if (f.next) {
+                            wl_evaluation_control_attempt_finish_result_t end =
+                                wl_evaluation_control_finish_attempt(
+                                f.control, f.controlled->operation_admission,
+                                f.next, 0, 0);
+                            CHECK(!end.protocol && end.report_valid &&
+                                !end.report.consumed);
+                        }
+                        CHECK(!wl_evaluation_control_reset(f.control) &&
+                            !wl_evaluation_control_configure(f.control, 0));
+                        CHECK(!complete(f.controlled) && !complete(f.raw));
+                        equal(&f);
+                        CHECK(f.events == (observed?2u:0u));
+                        CHECK(!wl_session_try_destroy(&f.controlled) &&
+                            !f.controlled); destroy(&f);
+                    }
+}
+
+static uint64_t graph_fee_entry[18], graph_fee_maintenance;
+static unsigned graph_fee_seen;
+static unsigned name_visits;
+static uint64_t names_first_debit;
+static void unobserved_transaction(wl_evaluation_control_t *c, unsigned phase,
+    uint32_t progress, const wl_columnar_eval_private_bindings_t *bindings) {
+    (void)bindings;
+    if (!active || !active->no_observer || c != active->control)return;
+    if (graph_fee_active && phase < 18 && !(graph_fee_seen&(1u<<phase))) {
+        uint64_t used = 0;
+        CHECK(!wl_evaluation_control_test_active_consumed(c,
+            wl_evaluation_control_active_attempt_id(c), &used));
+        graph_fee_seen |= 1u<<phase; graph_fee_entry[phase] = used;
+        if (phase ==
+            16) CHECK(!wl_columnar_session_test_general_maintenance_consumed(
+                    COL_SESSION(active->controlled), &graph_fee_maintenance));
+    }
+    if (phase == 4 && progress == 0) {
+        if (!name_visits) {
+            uint64_t used = 0;
+            CHECK(!wl_evaluation_control_test_active_consumed(c,
+                wl_evaluation_control_active_attempt_id(c), &used) && used);
+            names_first_debit = used;
+        }
+        ++name_visits;
+    }
+    if (active->stop == 1000+phase)session_source(c, 1000+phase);
+}
+static void unobserved_stop_report(fixture_t *f, int expected) {
+    wl_evaluation_control_report_t report;
+    CHECK(!wl_evaluation_control_report(f->control, &report));
+    if (action == 2 || action == 3) {
+        CHECK(reports_equal(&report, &f->original_report));
+        if (action == 3) {
+            uint64_t used = 99;
+            CHECK(!wl_evaluation_control_test_active_consumed(f->control,
+                f->next, &used) && !used);
+            wl_evaluation_control_attempt_finish_result_t end =
+                wl_evaluation_control_finish_attempt(f->control,
+                    f->controlled->operation_admission, f->next, 0, 0);
+            CHECK(!end.protocol && end.report_valid && !end.report.consumed);
+        }
+    }else CHECK(report.result == expected && !report.cleanup_status);
+}
+static void unobserved_body_final_stops(void) {
+    const unsigned phases[] = {610, 83, 1014};
+    for (unsigned k = 0; k < 3; ++k)for (action = 0; action < 5; ++action) {
+            fixture_t f = create("int64", "string", "to_string(x)", false,
+                    false); bind_unobserved(&f);
+            CHECK(!complete(f.controlled) && !complete(f.raw)); equal(&f);
+            col_rel_t *old = session_find_rel(COL_SESSION(f.controlled), "out");
+            col_relation_snapshot_t old_image =
+                wl_columnar_relation_snapshot(old);
+            insert(&f, 2, false);
+            CHECK(!wl_evaluation_control_reset(f.control));
+            col_relation_snapshot_t input_image =
+                wl_columnar_relation_snapshot(f.input);
+            f.stop = phases[k]; name_visits = 0;
+            wl_columnar_session_test_observed_transaction_checkpoint =
+                unobserved_transaction;
+            CHECK(!wl_evaluation_control_configure(f.control,
+                action == 1?UINT64_MAX:0));
+            int expected = action == 0?WL_EVALUATION_CONTROL_CANCELLED:action ==
+                1?WL_EVALUATION_CONTROL_WORK_LIMIT:action == 4?EOVERFLOW:EINVAL;
+            int result = complete(f.controlled);
+            if (result != expected || !f.did_stop ||
+                session_find_rel(COL_SESSION(f.controlled),
+                "out") != old || !wl_columnar_relation_snapshot_equal(old_image,
+                wl_columnar_relation_snapshot(old)) ||
+                !wl_columnar_relation_snapshot_equal(input_image,
+                wl_columnar_relation_snapshot(f.input)))
+                fprintf(stderr,
+                    "unobserved stop phase%u action%u result%d expected%d hit%d oldptr%d oldsnapshot%d input%d\n",
+                    f.stop, action, result, expected, f.did_stop,
+                    session_find_rel(COL_SESSION(f.controlled), "out") == old,
+                    wl_columnar_relation_snapshot_equal(old_image,
+                    wl_columnar_relation_snapshot(old)),
+                    wl_columnar_relation_snapshot_equal(input_image,
+                    wl_columnar_relation_snapshot(f.input)));
+            CHECK(result == expected && f.did_stop &&
+                !f.events &&
+                session_find_rel(COL_SESSION(f.controlled), "out") == old &&
+                wl_columnar_relation_snapshot_equal(old_image,
+                wl_columnar_relation_snapshot(old)) &&
+                wl_columnar_relation_snapshot_equal(input_image,
+                wl_columnar_relation_snapshot(f.input)) &&
+                !COL_SESSION(f.controlled)->delta_observer);
+            unobserved_stop_report(&f, expected);
+            if (action == 1) {
+                uint64_t held = reserved(f.g);
+                for (unsigned repeat = 0; repeat < 2; ++repeat) {
+                    f.did_stop = false;
+                    CHECK(!wl_evaluation_control_reset(f.control) &&
+                        !wl_evaluation_control_configure(f.control,
+                        UINT64_MAX));
+                    CHECK(complete(f.controlled) == expected && f.did_stop &&
+                        reserved(f.g) == held &&
+                        session_find_rel(COL_SESSION(f.controlled),
+                        "out") == old);
+                }
+            }
+            f.stop = 0;
+            wl_columnar_session_test_observed_transaction_checkpoint = NULL;
+            CHECK(!wl_evaluation_control_reset(f.control) &&
+                !wl_evaluation_control_configure(f.control, 0));
+            CHECK(!complete(f.controlled) && !complete(f.raw)); equal(&f);
+            CHECK(f.numeric_frames && f.metadata && f.bodies && !f.events);
+            destroy(&f);
+        }
+}
+static void unobserved_long_names(void) {
+    uint64_t first = 0;
+    for (unsigned length = 32; length <= 240; length += 208) {
+        char name[241], text[768]; memset(name, 'a', length); name[length] = 0;
+        snprintf(text, sizeof(text),
+            ".decl %s(x:int64)\n.decl out(y:string)\nout(to_string(x)):-%s(x).\n",
+            name, name);
+        fixture_t f = {0}; f.g = governor(); f.width = 1;
+        wirelog_error_t error; f.program = wirelog_parse_string(text, &error);
+        CHECK(f.program && !wl_plan_from_program(f.program, &f.plan));
+        wl_session_options_t options; wl_session_options_init(&options);
+        options.memory_governor = f.g;
+        CHECK(!wl_session_create_with_options(wl_backend_columnar(), f.plan, 1,
+            &options, &f.raw));
+        CHECK(!wl_evaluation_control_create(0, &f.control));
+        options.evaluation_control = f.control;
+        CHECK(!wl_session_create_with_options(wl_backend_columnar(), f.plan, 1,
+            &options, &f.controlled));
+        f.input = session_find_rel(COL_SESSION(f.controlled), name);
+        CHECK(f.input); bind_unobserved(&f);
+        name_visits = 0; names_first_debit = 0;
+        wl_columnar_session_test_observed_transaction_checkpoint =
+            unobserved_transaction;
         CHECK(!complete(f.controlled) && !complete(f.raw)); equal(&f);
-        CHECK(f.unknown && !f.events);
+        CHECK(name_visits >= length+1 && names_first_debit && f.source_calls &&
+            f.metadata && f.numeric_frames && !f.events);
+        if (first)CHECK(first == names_first_debit);
+        else first = names_first_debit;
+        wl_columnar_session_test_observed_transaction_checkpoint = NULL;
+        destroy(&f);
+    }
+}
+
+static void unobserved_graph_fee_oracle(void) {
+    uint64_t entries[2][18], maintenance[2], totals[2];
+    unsigned metadata[2], frames[2], sources[2], source_witness[2],
+        aux_visits[2];
+    uint32_t source_counts[2];
+    for (unsigned graph = 0; graph < 2; ++graph) {
+        fixture_t f = create("int64", "string", "to_string(x)", graph != 0,
+                false); bind_unobserved(&f);
+        if (graph)CHECK(!strcmp(COL_SESSION(f.controlled)->rels[1]->name,
+                "__graph_metadata"));
+        graph_fee_active = true; graph_fee_seen = 0; graph_fee_maintenance = 0;
+        graph_source_witness = graph_framed_aux_witness = graph_source_count =
+            0;
+        wl_columnar_eval_serial_test_framed_checkpoint = graph_framed_visit;
+        name_visits = 0;
+        memset(graph_fee_entry, 0, sizeof(graph_fee_entry));
+        wl_columnar_session_test_observed_transaction_checkpoint =
+            unobserved_transaction;
+        CHECK(!complete(f.controlled) && !complete(f.raw)); equal(&f);
+        const unsigned phases[] = {3, 6, 7, 8, 12, 13, 14, 15, 16};
+        for (unsigned k = 0; k < sizeof(phases)/sizeof(*phases);
+            ++k) CHECK(graph_fee_seen&(1u<<phases[k]));
+        memcpy(entries[graph], graph_fee_entry, sizeof(graph_fee_entry));
+        maintenance[graph] = graph_fee_maintenance;
+        wl_evaluation_control_report_t report;
+        CHECK(!wl_evaluation_control_report(f.control, &report));
+        totals[graph] = report.consumed;
+        metadata[graph] = f.metadata; frames[graph] = f.numeric_frames;
+        sources[graph] = f.source_calls;
+        source_witness[graph] = graph_source_witness;
+        aux_visits[graph] = graph_framed_aux_witness;
+        source_counts[graph] = graph_source_count;
+        wl_columnar_eval_serial_test_framed_checkpoint = NULL;
+        graph_fee_active = false;
+        wl_columnar_session_test_observed_transaction_checkpoint = NULL;
+        destroy(&f);
+    }
+    /* Only ABI geometry comes from the real private record. Prices64,9,4,
+     * per-lane/action1, cutoff19->20 and two real128 aux visits (framed head
+     * lookup and composed VARIABLE DELTA lookup) are source-derived literals.
+     * No observed whole-host total is used to choose a work budget. */
+    uint64_t bytes = wl_columnar_session_test_general_original_bytes();
+    uint64_t zero = 64u*((2u*bytes+63u)/64u-(bytes+63u)/64u);
+    const unsigned phases[] = {3, 6, 7, 8, 12, 13, 14, 15, 16};
+    const uint64_t suffix[] = {0, 9, 13, 14, 271, 272, 273, 274, 274};
+    for (unsigned k = 0; k < sizeof(phases)/sizeof(*phases); ++k) {
+        unsigned phase = phases[k];
+        CHECK(entries[1][phase] >= entries[0][phase]);
+        CHECK(entries[1][phase]-entries[0][phase] == zero+suffix[k]);
+    }
+    CHECK(totals[1]-totals[0] == zero+274 &&
+        maintenance[1]-maintenance[0] == 2);
+    CHECK(metadata[0] && metadata[0] == metadata[1] && frames[0] &&
+        frames[0] == frames[1] && sources[0] && sources[0] == sources[1]);
+    CHECK(source_witness[0] && source_witness[0] == source_witness[1] &&
+        source_counts[0] == 3 && source_counts[1] == 4 && aux_visits[0] == 0 &&
+        aux_visits[1] == 1);
+    if (bytes == 1224)CHECK(zero == 1216 && totals[1]-totals[0] == 1490);
+}
+
+static void unobserved_missing_matrix(void) {
+    const char *exprs[] = {"x", "x+1", "to_string(x)", "strlen(to_string(x))",
+                           "\"constant\""};
+    for (unsigned k = 0; k < 5; ++k) {
+        fixture_t f = create("int64", k == 2 || k == 4?"string":"int64",
+                exprs[k], false, false);
+        CHECK(COL_SESSION(f.controlled)->nrels == 1 && !f.input->ncols &&
+            !f.input->schema_ok);
+        col_relation_snapshot_t before = wl_columnar_relation_snapshot(f.input);
+        /* Actual raw MAP is the operator schema oracle, before session
+        * effective/public type defaults can hide an UNKNOWN result. */
+        eval_stack_t raw_map = {0};
+        CHECK(!eval_stack_push(&raw_map,
+            session_find_rel(COL_SESSION(f.raw), "input"), false));
+        CHECK(!col_op_map(&f.plan->strata[0].relations[0].ops[1], &raw_map,
+            COL_SESSION(f.raw)));
+        CHECK(raw_map.top == 1 && raw_map.items[0].rel->ncols == 1 &&
+            !raw_map.items[0].rel->nrows);
+        f.empty_known = raw_map.items[0].rel->column_types != NULL;
+        CHECK(!eval_stack_drain(&raw_map)); bind_unobserved(&f);
+        CHECK(!complete(f.controlled) && !complete(f.raw)); equal(&f);
+        CHECK(f.source_calls && f.numeric_frames && !f.events &&
+            wl_columnar_session_test_general_route_flags(COL_SESSION(
+                f.controlled)) == 5u &&
+            wl_columnar_relation_snapshot_equal(before,
+            wl_columnar_relation_snapshot(f.input)));
         insert(&f, 2, false); CHECK(!wl_evaluation_control_reset(f.control));
         CHECK(!complete(f.controlled) && !complete(f.raw)); equal(&f);
-        CHECK(f.balance == 1);
+        CHECK((k < 2 || f.bodies) && !f.events && !f.balance);
+        insert(&f, 2, true); CHECK(!wl_evaluation_control_reset(f.control));
+        CHECK(!complete(f.controlled) && !complete(f.raw)); equal(&f);
+        insert(&f, 2, false); CHECK(!wl_evaluation_control_reset(f.control));
+        CHECK(!complete(f.controlled) && !complete(f.raw)); equal(&f);
+        CHECK(!wl_evaluation_control_reset(f.control));
+        CHECK(!complete(f.controlled) && !complete(f.raw)); equal(&f);
+        int64_t wrong[] = {9, 8};
+        CHECK(wl_session_insert(f.controlled, "input", wrong, 1, 2) == ENOTSUP);
+        CHECK(wl_session_insert(f.raw, "input", wrong, 1, 2) == EINVAL);
+        CHECK(f.input == session_find_rel(COL_SESSION(f.controlled), "input") &&
+            f.input->declared_ncols == 1 && !f.events &&
+            !COL_SESSION(f.controlled)->delta_observer);
         destroy(&f);
+    }
+    for (unsigned graph = 0; graph < 2; ++graph)for (unsigned filter = 0;
+            filter < 2;
+            ++filter) {
+            fixture_t f = create("int64", "string", "to_string(x)", graph != 0,
+                    filter != 0);
+            uint32_t initial = COL_SESSION(f.controlled)->nrels;
+            CHECK(initial == (graph?2u:1u));
+            col_rel_t *aux = graph?COL_SESSION(f.controlled)->rels[1]:NULL;
+            col_relation_snapshot_t aux_before =
+                aux?wl_columnar_relation_snapshot(aux):
+                (col_relation_snapshot_t){0};
+            bind_unobserved(&f); int expected = graph && filter?EINVAL:0;
+            CHECK(complete(f.raw) == expected &&
+                complete(f.controlled) == expected);
+            if (!expected) equal(&f);
+            CHECK(!f.events && !f.input->ncols && !f.input->schema_ok &&
+                f.input->has_graph_column == (graph != 0));
+            insert(&f, 2, false);
+            CHECK(!wl_evaluation_control_reset(f.control));
+            CHECK(!complete(f.controlled) && !complete(f.raw)); equal(&f);
+            CHECK(!f.events && f.metadata && f.bodies);
+            if (aux) {
+                unsigned count = 0; for (uint32_t i = 0;
+                    i < COL_SESSION(f.controlled)->nrels;
+                    ++i) count += COL_SESSION(f.controlled)->rels[i] == aux;
+                CHECK(count == 1 &&
+                    wl_columnar_relation_snapshot_equal(aux_before,
+                    wl_columnar_relation_snapshot(aux))); gates_free(aux);
+            }
+            destroy(&f);
+        }
+}
+
+static void unobserved_selector_controls(void) {
+    /* Real copied typed-empty sources are outside the new bare hint. */
+    const char *types[] = {"int64", "string", "float"};
+    for (unsigned kind = 0; kind < 3; ++kind){
+        fixture_t f = create(types[kind], "string",
+                kind == 1?"cat(x,\"!\")":"to_string(x)", false, false);
+        wl_session_t *sessions[] = {f.raw, f.controlled};
+        for (unsigned n = 0; n < 2; ++n){
+            wl_col_session_t *session = COL_SESSION(sessions[n]);
+            col_rel_t *old = session_find_rel(session, "input"), *seed = old,
+                *copy = NULL;
+            int64_t type = kind == 0?WIRELOG_TYPE_INT64:kind ==
+                1?WIRELOG_TYPE_STRING:WIRELOG_TYPE_FLOAT;
+            wl_evaluation_control_t *setup = begin(0); seed = NULL;
+            CHECK(
+                !
+                wl_columnar_relation_new_typed_codes_operator_attempt_controlled
+                    ("input", 1, 0, &type, f.g, &seed, setup,
+                wl_evaluation_control_active_attempt_id(setup)) && seed);
+            finish(setup, 0);
+            int copy_rc = wl_columnar_relation_deep_copy_governed(seed, &copy,
+                    f.g);
+            CHECK(!copy_rc && copy && copy->ncols == 1 && !copy->nrows &&
+                !copy->capacity && copy->schema_ok);
+            if (seed != old)CHECK(!col_rel_destroy_checked(seed));
+            session_rel_free_hash(session);
+            CHECK(session->nrels == 1 && session->rels[0] == old);
+            session->rels[0] = copy;
+            CHECK(!col_rel_destroy_checked(old)); if (n)f.input = copy;
+        }
+        active = &f; wl_columnar_filter_test_map_schema = schema;
+        CHECK(!complete(f.controlled) && !complete(f.raw)); equal(&f);
+        CHECK(!(wl_columnar_session_test_general_route_flags(COL_SESSION(
+                f.controlled))&1u) && !f.events &&
+            !COL_SESSION(f.controlled)->delta_cb &&
+            !COL_SESSION(f.controlled)->delta_observer);
+        destroy(&f);
+    }
+    /* A routing hint cannot bless malformed physical metadata. Real child
+     * readers reject the noncanonical bare capacity before any frame is born. */
+    fixture_t f = create("int64", "string", "to_string(x)", false, false);
+    bind_unobserved(&f);
+    uint64_t baseline = reserved(f.g); f.input->capacity = 1;
+    col_relation_snapshot_t before = wl_columnar_relation_snapshot(f.input);
+    CHECK(complete(f.controlled) == EINVAL && f.source_calls && !f.metadata &&
+        !f.bodies && !f.events &&
+        !session_find_rel(COL_SESSION(f.controlled),
+        "out") && f.input->capacity == 1 && reserved(f.g) == baseline &&
+        wl_columnar_relation_snapshot_equal(before,
+        wl_columnar_relation_snapshot(f.input)));
+    closed(&f); f.input->capacity = 0;
+    CHECK(!wl_evaluation_control_reset(f.control) && !complete(f.controlled) &&
+        !complete(f.raw)); equal(&f);
+    CHECK(f.metadata && f.numeric_frames && !f.events); destroy(&f);
+}
+
+static void unobserved_unknown_variable(void) {
+    for (unsigned observed = 0; observed < 2; ++observed) {
+        fixture_t f = create("int64", "string", "to_string(x)", false, false);
+        wl_plan_op_t *var =
+            (wl_plan_op_t *)&f.plan->strata[0].relations[0].ops[0];
+        const char *name = var->relation_name;
+        var->relation_name = "not_the_registered_edb";
+        if (observed)bind(&f); else bind_unobserved(&f);
+        col_relation_snapshot_t before = wl_columnar_relation_snapshot(f.input);
+        CHECK(complete(f.raw) == ENOENT && complete(f.controlled) == ENOENT);
+        CHECK(!f.events && !f.metadata && !f.bodies &&
+            !session_find_rel(COL_SESSION(f.controlled), "out") &&
+            wl_columnar_relation_snapshot_equal(before,
+            wl_columnar_relation_snapshot(f.input)));
+        var->relation_name = name; destroy(&f);
     }
 }
 
@@ -1076,6 +1874,11 @@ static void timestamp_constructor_resources(void) {
     wl_columnar_memory_governor_ref_release(g);
 }
 int main(void) {
+    state_only_backend_pair(); late_end_matrix(); late_two_head_matrix();
+    unobserved_graph_fee_oracle();
+    unobserved_missing_matrix(); unobserved_unknown_variable();
+    unobserved_selector_controls();
+    unobserved_body_final_stops(); unobserved_long_names();
     anti_bare_graph_errors();
     anti_graph_control_priority();
     primitive_prices(); timestamp_constructor_prices();
