@@ -88,7 +88,8 @@ equal_capture(capture_t *a, capture_t *b, const char *what, unsigned kind)
 
 enum {
     K_SINGLE, K_UNION_A, K_UNION_C, K_UNION_BOTH, K_FILTER, K_COUNT,
-    K_GROUPED, K_TWO_COL, K_INT32, K_FLOAT, K_FLOAT_EXPR, K_COUNT_KINDS
+    K_GROUPED, K_TWO_COL, K_INT32, K_UINT32, K_UINT64, K_BOOL, K_FLOAT,
+    K_FLOAT_EXPR, K_COUNT_KINDS
 };
 
 #define UNION_TEXT ".decl a(x:int64)\n.decl c(x:int64)\n.decl out(x:int64)\n" \
@@ -115,6 +116,14 @@ static const struct {
       { "a", NULL }, NULL, WL_PLAN_OP_REDUCE, "$reduce" },
     { ".decl a(x:int64,y:int64)\n.decl out(y:int64,x:int64)\n"
       "out(y,x) :- a(x,y).\n",
+      { "a", NULL }, NULL, WL_PLAN_OP_MAP, "$map" },
+    { ".decl a(x:int32)\n.decl out(x:int32)\nout(x) :- a(x).\n",
+      { "a", NULL }, NULL, WL_PLAN_OP_MAP, "$map" },
+    /* The parser takes no uint32, uint64 or bool declaration; the fixture
+     * rewrites the plan's int32 lane of `a` to that type (lane_type). */
+    { ".decl a(x:int32)\n.decl out(x:int32)\nout(x) :- a(x).\n",
+      { "a", NULL }, NULL, WL_PLAN_OP_MAP, "$map" },
+    { ".decl a(x:int32)\n.decl out(x:int32)\nout(x) :- a(x).\n",
       { "a", NULL }, NULL, WL_PLAN_OP_MAP, "$map" },
     { ".decl a(x:int32)\n.decl out(x:int32)\nout(x) :- a(x).\n",
       { "a", NULL }, NULL, WL_PLAN_OP_MAP, "$map" },
@@ -240,6 +249,37 @@ step(wl_session_t *s)
 
 /* ---- fixture --------------------------------------------------------------- */
 
+/* Declares the lane of `a` as UINT32, UINT64 or BOOL for those kinds, in
+ * both the plan's lane types and its declaration schema. */
+static void
+lane_type(wl_plan_t *plan, unsigned kind)
+{
+    wirelog_column_type_t type;
+    if (kind == K_UINT32)
+        type = WIRELOG_TYPE_UINT32;
+    else if (kind == K_UINT64)
+        type = WIRELOG_TYPE_UINT64;
+    else if (kind == K_BOOL)
+        type = WIRELOG_TYPE_BOOL;
+    else
+        return;
+    unsigned found = 0;
+    for (uint32_t i = 0; i < plan->edb_count; i++) {
+        if (strcmp(plan->edb_relations[i], "a"))
+            continue;
+        CHECK(plan->edb_column_types && plan->edb_column_types[i]
+            && plan->edb_column_type_counts[i] == 1
+            && plan->edb_column_types[i][0] == WIRELOG_TYPE_INT32);
+        ((wirelog_column_type_t *)plan->edb_column_types[i])[0] = type;
+        if (plan->edb_schemas && plan->edb_schemas[i].columns) {
+            CHECK(plan->edb_schemas[i].column_count == 1);
+            ((wirelog_column_t *)plan->edb_schemas[i].columns)[0].type = type;
+        }
+        found++;
+    }
+    CHECK(found == 1);
+}
+
 typedef struct {
     wirelog_program_t *program;
     wl_plan_t *plan;
@@ -255,6 +295,7 @@ fixture(fixture_t *f, unsigned kind)
     wirelog_error_t error;
     f->program = wirelog_parse_string(cases[kind].text, &error);
     CHECK(f->program && !wl_plan_from_program(f->program, &f->plan));
+    lane_type(f->plan, kind);
     check_body(f->plan, kind);
     wl_columnar_memory_resolution_t resolution = {
         .budget_bytes = WL_COLUMNAR_MEMORY_MIN_BUDGET,
@@ -349,25 +390,7 @@ same_head(const fixture_t *f, unsigned kind)
     }
 }
 
-/* The open INT32 divergence: the controlled head is INT32 where the
- * uncontrolled head is INT64. A fix fails this check, so the ledger entry
- * cannot go stale silently. */
-static void
-int32_head_open(const fixture_t *f)
-{
-    col_rel_t *a = session_find_rel((wl_col_session_t *)f->s, "out");
-    col_rel_t *b = session_find_rel((wl_col_session_t *)f->raw, "out");
-    CHECK(a && b && a->ncols == 1 && b->ncols == 1 && a->nrows == b->nrows);
-    CHECK(a->column_types && a->column_types[0] == WIRELOG_TYPE_INT32);
-    CHECK((b->column_types ? b->column_types[0] : WIRELOG_TYPE_INT64)
-        == WIRELOG_TYPE_INT64);
-}
-
-/* The head's rows read from the relation itself. The STEPs that produce it
- * stay unobserved: an INT32 EDB with rows gets ENOTSUP from the observed and
- * SNAPSHOT routes. A controlled successor STEP after rows reach an INT32 EDB
- * also gets ENOTSUP, also when those rows were inserted before the first
- * STEP, so the bare path is not involved; those cases stop at the insert. */
+/* The head's rows read from the relation itself. */
 static void
 head_capture(wl_session_t *s, capture_t *c)
 {
@@ -425,7 +448,9 @@ run_cell(unsigned kind, bool snapshot, bool observed)
      * other routes publish no bare input: the observed specialized STEP of
      * single gives the public EDB a schema first, and the general route,
      * which also serves the observed filter body, substitutes a private
-     * typed empty relation. */
+     * empty relation, typed when session creation gave the EDB lane types
+     * (a FLOAT or STRING column, or an INLINE compound column and no SIDE
+     * column). */
     unsigned bare = bare_count(kind);
     if (!snapshot && !observed) {
         if (record_count != (bare ? 2u : 0u) || bare_published != bare)
@@ -454,17 +479,10 @@ run_cell(unsigned kind, bool snapshot, bool observed)
         if (kind != K_COUNT && kind != K_GROUPED)
             equal_capture(&ev, &want, "events", kind);
     }
-    /* The observed STEP and SNAPSHOT of a never-inserted INT32 EDB leave an
-     * INT32 head where the uncontrolled session has INT64. Those routes do
-     * not reach the bare consumers, and a build without them gives the same
-     * types. Those cells pin the divergence (#2301 open item). */
-    if (kind != K_INT32 || (!observed && !snapshot))
-        same_head(&f, kind);
-    else
-        int32_head_open(&f);
+    same_head(&f, kind);
 
     /* Later operations: repeat with nothing new, then the first rows. */
-    if (!snapshot && !observed && kind != K_INT32) {
+    if (!snapshot && !observed) {
         CHECK(!step(f.s) && !step(f.raw));
         still_bare(&f, kind, images);
         const int64_t rows[] = {5, 6, 7, 8};
@@ -545,16 +563,59 @@ stopped(unsigned kind, unsigned mode, const char *at, unsigned empty_at)
         width));
     CHECK(!wl_session_insert(f.raw, cases[kind].bare[0], rows, 2 / width,
         width));
-    if (kind == K_INT32) {
-        fixture_destroy(&f);
-        return;
-    }
     CHECK(!step(f.s) && !step(f.raw));
     capture_t a = {0}, b = {0};
     head_capture(f.s, &a);
     head_capture(f.raw, &b);
     equal_capture(&a, &b, "head after a stop", kind);
     CHECK(a.count > 0);
+    fixture_destroy(&f);
+}
+
+/* An EDB declared with INT32, UINT32, UINT64 or BOOL lanes, and no FLOAT,
+ * STRING or compound column, is untyped once it has rows, as in the
+ * uncontrolled session: the first call sees rows inserted before it, the
+ * next a further insert with one repeated row, the last nothing new. The
+ * head matches the uncontrolled session in rows, width and type. */
+static void
+untyped_rows(unsigned kind, bool snapshot, bool observed)
+{
+    fixture_t f;
+    fixture(&f, kind);
+    where = snapshot ? "untyped rows snapshot" : "untyped rows step";
+    capture_t ev = {0}, raw_ev = {0};
+    if (observed) {
+        wl_session_set_delta_cb(f.s, on_delta, &ev);
+        wl_session_set_delta_cb(f.raw, on_delta, &raw_ev);
+    }
+    const int64_t rows[] = {1, 0, 1};
+    for (unsigned round = 0; round < 3; round++) {
+        if (round < 2) {
+            const int64_t *r = round ? rows + 1 : rows;
+            uint32_t n = round ? 2u : 1u;
+            CHECK(!wl_session_insert(f.s, "a", r, n, 1));
+            CHECK(!wl_session_insert(f.raw, "a", r, n, 1));
+        }
+        capture_t image = {0}, raw_image = {0};
+        int rc = snapshot ? wl_session_snapshot(f.s, on_tuple, &image)
+            : step(f.s);
+        int raw_rc = snapshot ? wl_session_snapshot(f.raw, on_tuple,
+                &raw_image) : step(f.raw);
+        if (rc || raw_rc)
+            fprintf(stderr, "%s kind%u observed%u round %u: rc %d, raw %d\n",
+                where, kind, observed, round, rc, raw_rc);
+        CHECK(!rc && !raw_rc);
+        if (snapshot)
+            equal_capture(&image, &raw_image, "untyped image", kind);
+        capture_t a = {0}, b = {0};
+        head_capture(f.s, &a);
+        head_capture(f.raw, &b);
+        equal_capture(&a, &b, "untyped head", kind);
+        CHECK(a.count == (round ? 2u : 1u));
+        same_head(&f, kind);
+    }
+    if (observed && !snapshot)
+        equal_capture(&ev, &raw_ev, "untyped events", kind);
     fixture_destroy(&f);
 }
 
@@ -579,6 +640,10 @@ main(void)
         for (unsigned snapshot = 0; snapshot < 2; snapshot++)
             for (unsigned observed = 0; observed < 2; observed++)
                 run_cell(kind, snapshot, observed);
+    for (unsigned kind = K_INT32; kind < K_FLOAT; kind++)
+        for (unsigned snapshot = 0; snapshot < 2; snapshot++)
+            for (unsigned observed = 0; observed < 2; observed++)
+                untyped_rows(kind, snapshot, observed);
     for (unsigned kind = 0; kind < K_FLOAT; kind++)
         for (unsigned mode = 1; mode < 3; mode++) {
             /* At the consumer's publication, or at CONCAT for a UNION. */

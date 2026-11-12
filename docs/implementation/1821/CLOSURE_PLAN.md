@@ -560,4 +560,8 @@ never-inserted EDB that session creation left without a schema with the
 authentic empty-source reader, so the unobserved controlled STEP no longer
 returns ENOTSUP for those bodies over such an EDB; the ledger section
 "Never-inserted EDB sources through MAP, FILTER and REDUCE (#2301)" lists the
-routes, the evidence and the INT32 head-type and refusal items left open.
+routes and the evidence. A last unit lets the general observed transaction
+read an EDB declared with int32 or int64 columns only, and no compound column,
+as the uncontrolled session does, untyped with int64 lanes, both with rows and
+never inserted; see "Int32-declared EDBs in the general observed transaction
+(#2301)".
