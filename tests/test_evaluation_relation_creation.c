@@ -2620,6 +2620,252 @@ scalar_source_seams(void)
     CHECK(col_rel_destroy_checked(r) == 0);
 }
 
+/* #2301: opt-in INLINE admission. Physical lanes stay ordinary int64
+ * columns; admit 0 keeps the old refusal and schedule. */
+#define INL(a) { WIRELOG_COMPOUND_KIND_INLINE, (a), 1u }
+#define SCA { WIRELOG_COMPOUND_KIND_NONE, 0u, 0u }
+static const col_rel_logical_col_t inline_pair[] = { SCA, INL(2) };
+static const col_rel_logical_col_t inline_box[] = { INL(1) };
+static const col_rel_logical_col_t inline_wide[] = {
+    SCA, INL(4), SCA, SCA, SCA, SCA, SCA, SCA, SCA, SCA
+};
+static const col_rel_logical_col_t inline_side[] = {
+    INL(2), { WIRELOG_COMPOUND_KIND_SIDE, 2u, 1u }
+};
+static const struct {
+    const col_rel_logical_col_t *cols;
+    uint32_t len, width;
+} inline_layouts[] = {
+    { inline_pair, 2, 3 }, { inline_box, 1, 1 }, { inline_wide, 10, 13 },
+    { inline_side, 2, 3 },
+};
+#undef INL
+#undef SCA
+
+static col_rel_t *
+inline_source(size_t layout, uint32_t nrows)
+{
+    col_rel_t *r = new_like_source(inline_layouts[layout].width, true, true,
+            1);
+    CHECK(col_rel_apply_compound_schema(r, inline_layouts[layout].cols,
+        inline_layouts[layout].len) == 0);
+    CHECK(r->compound_kind == WIRELOG_COMPOUND_KIND_INLINE
+        && r->compound_arity_len == inline_layouts[layout].len
+        && r->ncols == inline_layouts[layout].width);
+    CHECK(nrows <= r->nrows);
+    r->nrows = nrows;
+    return r;
+}
+
+static int
+inline_open(wl_columnar_relation_scalar_source_t *s, col_rel_t *r,
+    uint32_t admit, wl_evaluation_control_t *c, bool *initialized)
+{
+    int rc = wl_columnar_relation_scalar_source_init_attempt_controlled(s,
+            initialized, c, wl_evaluation_control_active_attempt_id(c));
+    if (!rc)
+        rc = wl_columnar_relation_scalar_source_admit_attempt_controlled(
+            s, r, true, admit);
+    return rc;
+}
+
+static void
+inline_source_prefixes(size_t layout, uint32_t nrows)
+{
+    static const uint64_t fixed[] = {256, 256, 96, 144, 224, 96, 144, 224};
+    col_rel_t *r = inline_source(layout, nrows);
+    const uint32_t len = r->compound_arity_len, width = r->ncols;
+    uint64_t fees[64];
+    size_t count = sizeof(fixed) / sizeof(fixed[0]);
+    memcpy(fees, fixed, sizeof(fixed));
+    for (uint32_t i = 0; i < len; i += 8) fees[count++] = 88;
+    fees[count++] = 192;
+    for (uint32_t i = 0; i < width; i += 8) fees[count++] = 224;
+    uint64_t baseline = wl_columnar_memory_reserved(
+        wl_columnar_memory_governor_ref_get(r->memory_governor));
+    /* Without the bit, the old refusal after RESOLVE and its exact charge. */
+    {
+        wl_evaluation_control_t *c = control(0);
+        uint64_t id = wl_evaluation_control_active_attempt_id(c);
+        wl_columnar_relation_scalar_source_t s; bool initialized = false;
+        CHECK(inline_open(&s, r, 0, c, &initialized) == ENOTSUP);
+        CHECK(initialized && s.phase ==
+            WL_COLUMNAR_RELATION_SCALAR_SOURCE_DRAINED);
+        CHECK(!s.descriptor_reader.owner && !s.owner_reader.owner);
+        scalar_source_report(c, id, ENOTSUP, 256 + 256 + 96 + 144 + 224);
+        release(c);
+    }
+    uint64_t prefix = 0;
+    for (size_t i = 0; i < count; i++) {
+        uint64_t previous = prefix; prefix += fees[i];
+        for (unsigned below = 0; below < 2; below++) {
+            wl_evaluation_control_t *c = control(prefix - below);
+            uint64_t id = wl_evaluation_control_active_attempt_id(c);
+            wl_columnar_relation_scalar_source_t s;
+            bool initialized = true;
+            int rc = inline_open(&s, r,
+                    WL_COLUMNAR_RELATION_SOURCE_ADMIT_INLINE, c, &initialized);
+            int expected = !below && i + 1 == count
+                ? 0 : WL_EVALUATION_CONTROL_WORK_LIMIT;
+            CHECK(rc == expected);
+            CHECK(initialized == (i != 0 || !below));
+            if (initialized) {
+                CHECK(wl_columnar_relation_scalar_source_end(&s, rc) == rc);
+                CHECK(s.phase == WL_COLUMNAR_RELATION_SCALAR_SOURCE_DRAINED);
+                CHECK(!s.descriptor_reader.owner && !s.owner_reader.owner);
+            }
+            scalar_source_report(c, id, rc, below ? previous : prefix);
+            new_like_released(r);
+            CHECK(wl_columnar_memory_reserved(
+                    wl_columnar_memory_governor_ref_get(r->memory_governor))
+                == baseline);
+            release(c);
+        }
+    }
+    CHECK(col_rel_destroy_checked(r) == 0);
+}
+
+static void
+inline_source_reads(size_t layout, uint32_t nrows)
+{
+    col_rel_t *r = inline_source(layout, nrows);
+    const uint32_t width = r->ncols;
+    uint32_t *map = r->compound_arity_map;
+    wl_evaluation_control_t *c = control(0);
+    wl_columnar_relation_scalar_source_t s; bool initialized = false;
+    CHECK(inline_open(&s, r, WL_COLUMNAR_RELATION_SOURCE_ADMIT_INLINE, c,
+        &initialized) == 0 && initialized);
+    CHECK(s.phase == WL_COLUMNAR_RELATION_SCALAR_SOURCE_HELD);
+    /* The writer that would replace the map is excluded while HELD. */
+    CHECK(col_rel_apply_compound_schema(r, inline_layouts[layout].cols,
+        inline_layouts[layout].len) == EBUSY);
+    CHECK(r->compound_arity_map == map
+        && r->compound_kind == WIRELOG_COMPOUND_KIND_INLINE);
+    uint32_t got_width = 99, rows = 99; bool ts = false;
+    CHECK(wl_columnar_relation_scalar_source_shape_attempt_controlled(&s,
+        &got_width, &rows, &ts) == 0);
+    CHECK(got_width == width && rows == nrows && ts);
+    int64_t values[16];
+    CHECK(width <= 16);
+    for (uint32_t row = 0; row < rows; row++) {
+        CHECK(wl_columnar_relation_scalar_source_gather_attempt_controlled(&s,
+            row, values, width) == 0);
+        for (uint32_t col = 0; col < width; col++)
+            CHECK(values[col] == (int64_t)(col + row));
+    }
+    CHECK(wl_columnar_relation_scalar_source_end(&s, 0) == 0);
+    CHECK(s.phase == WL_COLUMNAR_RELATION_SCALAR_SOURCE_DRAINED);
+    CHECK(!s.descriptor_reader.owner && !s.owner_reader.owner);
+    CHECK(finish(c, 0) > 0);
+    release(c);
+    new_like_released(r);
+    CHECK(col_rel_destroy_checked(r) == 0);
+}
+
+static int
+inline_tampered(col_rel_t *r, uint32_t admit)
+{
+    wl_evaluation_control_t *c = control(0);
+    wl_columnar_relation_scalar_source_t s; bool initialized = false;
+    int rc = inline_open(&s, r, admit, c, &initialized);
+    CHECK(initialized && s.phase == (rc
+        ? WL_COLUMNAR_RELATION_SCALAR_SOURCE_DRAINED
+        : WL_COLUMNAR_RELATION_SCALAR_SOURCE_HELD));
+    if (!rc) CHECK(wl_columnar_relation_scalar_source_end(&s, 0) == 0);
+    CHECK(!s.descriptor_reader.owner && !s.owner_reader.owner);
+    (void)finish(c, rc > 0 ? rc : 0);
+    release(c);
+    new_like_released(r);
+    return rc;
+}
+
+static void
+inline_source_malformed(void)
+{
+    const uint32_t admit = WL_COLUMNAR_RELATION_SOURCE_ADMIT_INLINE;
+    col_rel_t *r = inline_source(2, 2);
+    uint32_t *map = r->compound_arity_map;
+    const uint32_t len = r->compound_arity_len, count = r->compound_count;
+    const uint32_t offset = r->inline_physical_offset;
+    CHECK(inline_tampered(r, admit) == 0);
+    /* An entry past the first chunk of eight, so the second chunk decides. */
+    map[9] = 0; CHECK(inline_tampered(r, admit) == EINVAL);
+    map[9] = 2; CHECK(inline_tampered(r, admit) == EINVAL);
+    map[9] = 1;
+    map[1] = 5; CHECK(inline_tampered(r, admit) == EINVAL);
+    map[1] = 3; CHECK(inline_tampered(r, admit) == EINVAL);
+    map[1] = 4;
+    /* Maps whose entries still sum to the width: a zero entry, and an entry
+     * that wraps the running width, are each refused on their own. */
+    CHECK(map[2] == 1);
+    map[9] = 0; map[1] = 5; CHECK(inline_tampered(r, admit) == EINVAL);
+    map[9] = 1; map[1] = UINT32_MAX; map[2] = 6;
+    CHECK(inline_tampered(r, admit) == EINVAL);
+    map[1] = 4; map[2] = 1;
+    r->compound_arity_len = len - 1; CHECK(inline_tampered(r, admit) == EINVAL);
+    r->compound_arity_len = len;
+    r->compound_count = 0; CHECK(inline_tampered(r, admit) == EINVAL);
+    r->compound_count = len + 1; CHECK(inline_tampered(r, admit) == EINVAL);
+    r->compound_count = count;
+    r->inline_physical_offset = r->ncols;
+    CHECK(inline_tampered(r, admit) == EINVAL);
+    r->inline_physical_offset = offset;
+    r->compound_kind = WIRELOG_COMPOUND_KIND_SIDE;
+    CHECK(inline_tampered(r, admit) == ENOTSUP);
+    r->compound_kind = (wirelog_compound_kind_t)99;
+    CHECK(inline_tampered(r, admit) == EINVAL);
+    r->compound_kind = WIRELOG_COMPOUND_KIND_INLINE;
+    CHECK(inline_tampered(r, admit) == 0);
+    CHECK(inline_tampered(r, 0) == ENOTSUP);
+    CHECK(col_rel_destroy_checked(r) == 0);
+}
+
+static void
+inline_source_seams(void)
+{
+    /* VALIDATE ends at 1440; each map chunk then charges 88. */
+    static const uint64_t prefixes[] = {1440 + 88, 1440 + 176};
+    col_rel_t *r = inline_source(2, 2);
+    wl_columnar_relation_test_work_checkpoint = scalar_source_checkpoint;
+    for (scalar_fault_mode = 0; scalar_fault_mode < 3; scalar_fault_mode++)
+        for (size_t i = 0; i < sizeof(prefixes)/sizeof(prefixes[0]); i++) {
+            wl_evaluation_control_t *c = control(0);
+            uint64_t id = wl_evaluation_control_active_attempt_id(c);
+            attempt_restarted = false; attempt_successor_callbacks = 0;
+            scalar_fault_at = prefixes[i];
+            wl_columnar_relation_scalar_source_t s; bool initialized = false;
+            int expected = scalar_fault_mode == 0
+                ? WL_EVALUATION_CONTROL_CANCELLED
+                : scalar_fault_mode == 1 ? EOVERFLOW : EINVAL;
+            CHECK(inline_open(&s, r, WL_COLUMNAR_RELATION_SOURCE_ADMIT_INLINE,
+                c, &initialized) == expected);
+            CHECK(initialized && wl_columnar_relation_scalar_source_end(&s,
+                expected) == expected);
+            CHECK(!s.descriptor_reader.owner && !s.owner_reader.owner);
+            new_like_released(r);
+            if (attempt_restarted) {
+                CHECK(attempt_old_report.attempt_id == id
+                    && attempt_old_report.consumed == prefixes[i]);
+                CHECK(attempt_successor_callbacks == 0);
+                scalar_source_report(c,
+                    wl_evaluation_control_active_attempt_id(c), 0, 0);
+            } else scalar_source_report(c, id, expected, prefixes[i]);
+            release(c);
+        }
+    wl_columnar_relation_test_work_checkpoint = checkpoint;
+    attempt_restarted = false;
+    /* A stopped attempt leaves nothing behind: a fresh one still admits. */
+    wl_evaluation_control_t *c = control(0);
+    wl_columnar_relation_scalar_source_t s; bool initialized = false;
+    CHECK(inline_open(&s, r, WL_COLUMNAR_RELATION_SOURCE_ADMIT_INLINE, c,
+        &initialized) == 0);
+    CHECK(wl_columnar_relation_scalar_source_end(&s, 0) == 0);
+    CHECK(finish(c, 0) == 1440 + 176 + 192 + 448);
+    release(c);
+    new_like_released(r);
+    CHECK(col_rel_destroy_checked(r) == 0);
+}
+
 static void
 scalar_source_gather_prefixes(void)
 {
@@ -3795,6 +4041,14 @@ main(void)
             scalar_source_twins(17, typed != 0, ts != 0, true);
         }
     scalar_source_twins(300, true, true, false);
+    for (size_t i = 0; i < sizeof(inline_layouts)/sizeof(inline_layouts[0]);
+        i++)
+        for (uint32_t rows = 0; rows <= 2; rows += 2) {
+            inline_source_prefixes(i, rows);
+            inline_source_reads(i, rows);
+        }
+    inline_source_malformed();
+    inline_source_seams();
     operator_init_boundaries();
     operator_reserve_boundaries();
     operator_install_boundaries();

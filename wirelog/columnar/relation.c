@@ -18444,6 +18444,7 @@ enum {
     WL_COLUMNAR_RELATION_SCALAR_SOURCE_TS_READ_WORK = 128,
     WL_COLUMNAR_RELATION_SCALAR_SOURCE_ROW_RETURN_WORK = 256,
     WL_COLUMNAR_RELATION_SCALAR_SOURCE_TS_WRITE_WORK = 128,
+    WL_COLUMNAR_RELATION_SCALAR_SOURCE_COMPOUND_WORK = 88,
 };
 
 typedef char wl_columnar_relation_scalar_source_tariffs_bound[
@@ -18484,6 +18485,8 @@ typedef char wl_columnar_relation_scalar_source_tariffs_bound[
         && WL_COLUMNAR_RELATION_SCALAR_SOURCE_ROW_RETURN_WORK <=
         WL_EVALUATION_CONTROL_QUANTUM
         && WL_COLUMNAR_RELATION_SCALAR_SOURCE_TS_WRITE_WORK <=
+        WL_EVALUATION_CONTROL_QUANTUM
+        && WL_COLUMNAR_RELATION_SCALAR_SOURCE_COMPOUND_WORK <=
         WL_EVALUATION_CONTROL_QUANTUM) ? 1 : -1];
 
 typedef char wl_columnar_relation_scalar_source_init_bound[
@@ -18493,6 +18496,14 @@ typedef char wl_columnar_relation_scalar_source_init_bound[
 typedef char wl_columnar_relation_scalar_source_column_bound[
         (UINT64_C(208) <=
         WL_COLUMNAR_RELATION_SCALAR_SOURCE_COLUMN_WORK) ? 1 : -1];
+
+/* One admitted INLINE map chunk: charge dispatch and result 2, header
+ * predicates 5 (first chunk only), chunk size 3, eight entries of load,
+ * two predicates, add, step and loop test 48, final width test and store 3,
+ * tail dispatch and result 3, continuation test 1: 65 slots. */
+typedef char wl_columnar_relation_scalar_source_compound_bound[
+        (UINT64_C(65) <=
+        WL_COLUMNAR_RELATION_SCALAR_SOURCE_COMPOUND_WORK) ? 1 : -1];
 
 typedef char wl_columnar_relation_scalar_source_cell_bound[
         (UINT64_C(128) <=
@@ -18893,6 +18904,53 @@ wl_columnar_relation_scalar_source_begin_attempt_controlled(
     wl_columnar_relation_scalar_source_t *source, const col_rel_t *relation,
     bool preserve_timestamps)
 {
+    return wl_columnar_relation_scalar_source_admit_attempt_controlled(
+        source, relation, preserve_timestamps, 0u);
+}
+
+/* Validates a held INLINE descriptor's arity map in metered chunks of eight
+ * logical entries, with the same predicates as
+ * col_rel_compound_map_valid_for(). The map is read only while both reader
+ * gates are held; col_rel_apply_compound_schema() needs the writer. */
+static int
+wl_columnar_relation_scalar_source_compound_check(
+    wl_evaluation_control_t *control, uint64_t id, const col_rel_t *relation)
+{
+    const uint32_t ncols = relation->ncols;
+    const uint32_t len = relation->compound_arity_len;
+    bool ok = false;
+    uint32_t entry = 0, width = 0;
+    do {
+        int rc = wl_columnar_relation_constructor_attempt_charge(control, id,
+                WL_COLUMNAR_RELATION_SCALAR_SOURCE_COMPOUND_WORK);
+        if (rc)
+            return rc;
+        if (!entry)
+            ok = len != 0 && relation->compound_count != 0
+                && relation->compound_count <= len && len <= ncols
+                && relation->inline_physical_offset < ncols;
+        uint32_t count = ok ? len - entry : 0;
+        if (count > 8) count = 8;
+        for (uint32_t i = 0; i < count && ok; i++) {
+            uint32_t arity = relation->compound_arity_map[entry + i];
+            if (arity == 0 || arity > ncols - width) ok = false;
+            else width += arity;
+        }
+        entry += count;
+        if (ok && entry == len) ok = width == ncols;
+        int tail = wl_columnar_relation_constructor_attempt_tail(control, id,
+                WL_COLUMNAR_RELATION_SCALAR_SOURCE_COMPOUND_WORK);
+        if (tail > 0 || (!tail && !ok))
+            return tail > 0 ? tail : EINVAL;
+    } while (entry < len);
+    return 0;
+}
+
+int
+wl_columnar_relation_scalar_source_admit_attempt_controlled(
+    wl_columnar_relation_scalar_source_t *source, const col_rel_t *relation,
+    bool preserve_timestamps, uint32_t admit)
+{
     int rc = wl_columnar_relation_scalar_source_check(source,
             WL_COLUMNAR_RELATION_SCALAR_SOURCE_INERT);
     if (rc)
@@ -18928,7 +18986,10 @@ wl_columnar_relation_scalar_source_begin_attempt_controlled(
             || (relation->compound_kind != WIRELOG_COMPOUND_KIND_NONE
             && relation->compound_kind != WIRELOG_COMPOUND_KIND_INLINE
             && relation->compound_kind != WIRELOG_COMPOUND_KIND_SIDE);
-        if (!invalid) {
+        bool inline_admitted = relation->compound_kind
+            == WIRELOG_COMPOUND_KIND_INLINE
+            && (admit & WL_COLUMNAR_RELATION_SOURCE_ADMIT_INLINE);
+        if (!invalid && !inline_admitted) {
             unsupported = relation->compound_kind != WIRELOG_COMPOUND_KIND_NONE;
             if (!unsupported)
                 invalid = relation->compound_count ||
@@ -18981,6 +19042,12 @@ wl_columnar_relation_scalar_source_begin_attempt_controlled(
     if (tail > 0 || !rc) rc = tail;
     if (rc)
         goto done;
+    if (relation->compound_kind == WIRELOG_COMPOUND_KIND_INLINE) {
+        rc = wl_columnar_relation_scalar_source_compound_check(control, id,
+                relation);
+        if (rc)
+            goto done;
+    }
     rc = wl_columnar_relation_constructor_attempt_charge(control, id,
             WL_COLUMNAR_RELATION_SCALAR_SOURCE_SNAPSHOT_WORK);
     if (rc)
