@@ -2042,3 +2042,55 @@ while raw evaluation produces exactly reach{1,2,3}. No recursive scheduler,
 native frame classifier, SOURCE authority or projection restriction changes.
 Runtime raw-tape/epoch/seed-skip, typed SCC and seed effects remain separate
 integration obligations.
+
+### Completion unit 10: pipeline library and extension lifetime qualification
+
+The existing joined string tests already qualify actual numeric-prefix
+EXCHANGED/ACK, scalar FILTER/REPLACE suffixes, full/delta selectors, strict and
+output policies, signed deletion/no-op and terminal recovery. Additional cases
+now use real generated SHA256 and direct STRING-argument extension MAPs through
+that same pipeline. Actual dispatch tags, prefix EXCHANGED/ACK and authenticated
+current framed/native child ownership prove the selected context. Every output
+cell and effective type is compared with raw execution, including rejected
+numeric-filter rows. Crypto preserves its known three-column schema; extension
+whole-MAP UNKNOWN remains NULL even with an INT64-result descriptor.
+
+The extension registry is unregistered and its external snapshot released
+before execution. Real plan/session retention keeps the descriptor alive;
+actual callback leases and TLS depth are observed at the appropriate boundaries.
+Callbacks validate complete argument bytes, configured/active workers1,
+nonparallel execution and actual session key. try_destroy remains EBUSY in the
+callback. The destructor runs exactly once only after the genuine retained
+owners close. A second-row callback failure preserves its precise existing
+CALLBACK_FAILURE status, prior callback effects, old public output and no signed
+events; retry and raw parity then succeed.
+
+Forty-eight enabled and thirty-eight disabled histories cover observer on/off
+positives, deletion/reinsert/no-op, prelease521/511, acquired-lease512 before
+invoke, post mandatory-release/TLS-pop513 and prepublication515. At each selected
+boundary cancellation, work exhaustion, overflow, END and END-with-successor
+preserve all three public relation pointers/snapshots and frozen Original on
+EVERY public drain turn; successor consumption remains0. Preinvoke stops have
+zero callback effects, postinvoke stops one; cleanup never reinvokes callbacks.
+One callback-free END-with-successor control verifies that context separately.
+
+A raw-valid601-byte literal extension argument supplies runtime-copy cuts at
+byte200, after actual literal81 and prefix ACK. Phase81 is after credit
+admission but before allocation; the subsequent byte-copy43 proves successful
+allocation and copying. This excludes earlier bytecode copying even though the
+literal makes bytecode exceed200. Direct VAR_STRING supplies a held span and is
+not falsely counted as a copy. Nested function syntax inside an extension
+argument was rejected by the existing parser and is not added as a feature.
+
+Enabled crypto tests stop at provider setup203 and AFTER synchronous digest
+computation204, not a fictitious digest-block midpoint. Existing primitive
+oracles retain engine byte traversal and library-boundary evidence. Disabled
+crypto reaches actual dispatch206, matches raw ERANGE without compute204 or
+public output/events, and closes its real owners. No new pipeline implementation,
+worker authority, host allowance or library cooperation claim is introduced.
+Final resource checks require actual frame cleanup, callback leases/TLS0,
+session destruction and governor0. The independent primitive tariff vectors
+remain authoritative; host reports are not used to invent expected prices.
+
+Seed composition and actual recursive epoch/typed transport remain separate
+integration obligations; this qualification grants no multiworker permission.

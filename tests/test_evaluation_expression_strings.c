@@ -8,6 +8,8 @@
 #include "../wirelog/passes/sip.h"
 #include "../wirelog/wirelog.h"
 #include "../wirelog/crc32.h"
+#include "../wirelog/wirelog-extension.h"
+#include "../wirelog/extension_registry_private.h"
 #include <xxhash.h>
 #include <locale.h>
 #include <stdio.h>
@@ -47,7 +49,8 @@ typedef struct {
     wl_session_t *session;
     wl_evaluation_control_t *control;
 } fixture_t;
-static fixture_t create(const char *source, bool passes) {
+static fixture_t create_common(const char *source, bool passes,
+    wirelog_extension_snapshot_t *snapshot) {
     fixture_t f = {0};
     wirelog_error_t error;
     f.program = wirelog_parse_string(source, &error);
@@ -59,14 +62,21 @@ static fixture_t create(const char *source, bool passes) {
         wl_jpp_apply(f.program, NULL);
         wl_sip_apply(f.program, NULL);
     }
-    CHECK(!wl_plan_from_program(f.program, &f.plan));
+    CHECK(!(snapshot?wl_plan_from_program_with_snapshot(f.program, snapshot,
+        &f.plan):wl_plan_from_program(f.program, &f.plan)));
     CHECK(!wl_evaluation_control_create(0, &f.control));
     wl_session_options_t options;
     wl_session_options_init(&options);
     options.evaluation_control = f.control;
-    CHECK(!wl_session_create_with_options(wl_backend_columnar(), f.plan, 1,
-        &options, &f.session));
+    CHECK(!(snapshot?
+        wl_session_create_with_snapshot_options(wl_backend_columnar(),
+        f.plan, 1, snapshot, &options, &f.session):
+        wl_session_create_with_options(wl_backend_columnar(), f.plan, 1,
+        &options, &f.session)));
     return f;
+}
+static fixture_t create(const char *source, bool passes) {
+    return create_common(source, passes, NULL);
 }
 static void destroy(fixture_t *f) {
     wl_session_destroy(f->session);
@@ -3310,7 +3320,425 @@ static void joined_strings(void) {
             wl_columnar_memory_governor_ref_release(g);
         }
 }
+/* Additional real pipeline domains. Existing joined_strings owns general
+ * numeric-prefix/strict/output/delete qualification; these cover library and
+ * retained extension context around the actual scalar suffix. */
+extern uint32_t wl_columnar_expr_test_callback_depth(void);
+extern void (*wl_columnar_filter_test_map_schema)(const col_rel_t *, bool);
+typedef struct {
+    wl_session_t *active;
+    unsigned calls, destroyed;
+    bool fail;
+} pipe_context_t;
+static fixture_t *pipe_fixture;
+static wirelog_extension_registry_t *pipe_registry;
+static unsigned pipe_exchange, pipe_ack, pipe_unknown, pipe_events, pipe_pos,
+    pipe_neg;
+static int64_t pipe_event_rows[8][3];
+static int32_t pipe_event_diffs[8];
+static unsigned pipe_phase, pipe_action, pipe_forward, pipe_dispatch,
+    pipe_computed;
+static uint64_t pipe_progress, pipe_successor;
+static bool pipe_stopped, pipe_copy_started;
+static wl_evaluation_control_report_t pipe_report;
+static int pipe_callback(const wirelog_extension_value_t *args, uint32_t count,
+    wirelog_extension_value_t *out, void *data) {
+    pipe_context_t *ctx = data;
+    CHECK(ctx->active && count == 1 &&
+        args[0].type == WIRELOG_EXTENSION_VALUE_STRING);
+    wl_col_session_t *session = COL_SESSION(ctx->active);
+    CHECK(session->callback_configured_workers == 1 &&
+        session->callback_active_workers == 1 &&
+        !session->callback_parallel_execution &&
+        session->callback_session_key == session);
+    wl_session_t *same = ctx->active;
+    CHECK(wl_session_try_destroy(&same) == EBUSY && same == ctx->active);
+    size_t n = args[0].as.string_value.length;
+    const char *text = args[0].as.string_value.data;
+    CHECK(text && (n == 600 || n == 1 || n == 601));
+    CHECK(text[0] == (n == 1?'b':'a'));
+    if (n >= 600)for (size_t i = 0; i < 600; ++i)CHECK(text[i] == 'a');
+    if (n == 601)CHECK(text[n-1] == '!');
+    ++ctx->calls;
+    out->type = WIRELOG_EXTENSION_VALUE_INT64;
+    out->size = sizeof(int64_t); out->as.int64_value = (int64_t)n;
+    return ctx->fail && ctx->calls == 2?-1:0;
+}
+static void pipe_destroy_context(void *data) {
+    pipe_context_t *ctx = data; ++ctx->destroyed;
+}
+static void pipe_delta(const char *name, const int64_t *row, uint32_t width,
+    int32_t diff, void *data) {
+    (void)data; CHECK(!strcmp(name, "out") && row && width == 3 &&
+        (diff == 1 || diff == -1));
+    CHECK(pipe_events < 8);
+    for (unsigned i = 0; i < 3; ++i)pipe_event_rows[pipe_events][i] = row[i];
+    pipe_event_diffs[pipe_events++] = diff;
+    pipe_pos += diff == 1; pipe_neg += diff == -1;
+}
+static void pipe_route(wl_evaluation_control_t *c, unsigned event,
+    uint64_t generation, uint32_t extent, uint64_t work) {
+    (void)generation; (void)extent; (void)work;
+    if (!pipe_fixture || c != pipe_fixture->control)return;
+    if (event == WL_COLUMNAR_JOIN_PIPELINE_TEST_EXCHANGED)++pipe_exchange;
+    if (event == WL_COLUMNAR_JOIN_PIPELINE_TEST_AFTER_ACK)++pipe_ack;
+    if (pipe_stopped && pipe_action >= 2 &&
+        (event == WL_COLUMNAR_JOIN_PIPELINE_TEST_PRODUCE ||
+        event == WL_COLUMNAR_JOIN_PIPELINE_TEST_AFTER_ACK))++pipe_forward;
+}
+static void pipe_schema(const col_rel_t *out, bool known) {
+    CHECK(!known && !out->column_types); ++pipe_unknown;
+}
+static void pipe_stop(wl_evaluation_control_t *c, unsigned phase,
+    uint64_t progress, bool failed) {
+    (void)failed;
+    if (pipe_fixture && c == pipe_fixture->control &&
+        (phase == 206 || phase == 500)) {
+        CHECK(progress == (phase == 206?WL_PLAN_EXPR_ARITH_SHA256_S:
+            WL_PLAN_EXPR_EXTENSION_CALL));
+        CHECK(pipe_exchange && pipe_ack);
+        wl_col_session_t *session = COL_SESSION(pipe_fixture->session);
+        wl_columnar_eval_serial_framed_attempt_t *frame = NULL;
+        CHECK(session->cleanup_active &&
+            !wl_columnar_eval_stack_framed_context(session->cleanup_active,
+            session, &frame) &&
+            !wl_columnar_eval_stack_framed_authenticate(frame->frame, session,
+            frame) &&
+            !wl_columnar_eval_stack_numeric_owner(frame->frame, &frame->child));
+        ++pipe_dispatch;
+    }
+    if (pipe_fixture && c == pipe_fixture->control &&
+        phase == 204) ++pipe_computed;
+    if (pipe_fixture && c == pipe_fixture->control && phase == 81 &&
+        progress == 601) pipe_copy_started = true;
+    if (pipe_phase == 43 && !pipe_copy_started)return;
+    if (!pipe_fixture || c != pipe_fixture->control || pipe_stopped ||
+        phase != pipe_phase || progress < pipe_progress)return;
+    CHECK(pipe_exchange && pipe_ack);
+    wl_col_session_t *session = COL_SESSION(pipe_fixture->session);
+    wl_columnar_eval_serial_framed_attempt_t *frame = NULL;
+    CHECK(session->cleanup_active &&
+        !wl_columnar_eval_stack_framed_context(session->cleanup_active, session,
+        &frame) &&
+        !wl_columnar_eval_stack_framed_authenticate(frame->frame, session,
+        frame) &&
+        !wl_columnar_eval_stack_numeric_owner(frame->frame, &frame->child));
+    if (phase == 512)CHECK(pipe_registry->active_leases == 1 &&
+            wl_columnar_expr_test_callback_depth() == 1);
+    if (phase == 521 || phase == 511 || phase == 513 || phase == 515 ||
+        phase == 43)CHECK(!pipe_registry->active_leases);
+    pipe_stopped = true;
+    if (!pipe_action)wl_evaluation_control_request_cancel(c);
+    else if (pipe_action == 1 || pipe_action == 4)
+        CHECK(wl_evaluation_control_charge(c, UINT64_MAX) ==
+            (pipe_action == 1?WL_EVALUATION_CONTROL_WORK_LIMIT:EOVERFLOW));
+    else {
+        uint64_t id = wl_evaluation_control_active_attempt_id(c);
+        wl_evaluation_control_attempt_finish_result_t end =
+            wl_evaluation_control_finish_attempt(c,
+                pipe_fixture->session->operation_admission, id, 0, 0);
+        CHECK(!end.protocol && end.report_valid); pipe_report = end.report;
+        if (pipe_action == 3) {
+            CHECK(!wl_evaluation_control_reset(c));
+            wl_evaluation_control_attempt_begin_result_t next =
+                wl_evaluation_control_begin_attempt(c,
+                    pipe_fixture->session->operation_admission);
+            CHECK(!next.protocol && next.attempt_id != id);
+            pipe_successor = next.attempt_id;
+        }
+    }
+}
+
+static col_rel_t *pipe_public[3];
+static col_relation_snapshot_t pipe_images[3];
+static bool pipe_same_report(const wl_evaluation_control_report_t *a,
+    const wl_evaluation_control_report_t *b) {
+    return a->attempt_id == b->attempt_id && a->limit == b->limit &&
+           a->consumed == b->consumed && a->result == b->result &&
+           a->stop_reason == b->stop_reason &&
+           a->execution_status == b->execution_status &&
+           a->cleanup_status == b->cleanup_status;
+}
+static int pipe_control_complete(void) {
+    fixture_t *f = pipe_fixture;
+    const char *names[] = {"a", "b", "out"};
+    for (unsigned turn = 0; turn < 10000; ++turn) {
+        int rc = wl_session_step(f->session);
+        if (pipe_stopped) {
+            for (unsigned i = 0; i < 3; ++i)
+                CHECK(session_find_rel(COL_SESSION(f->session), names[i]) ==
+                    pipe_public[i] && wl_columnar_relation_snapshot_equal(
+                        pipe_images[i],
+                        wl_columnar_relation_snapshot(pipe_public[i])));
+            CHECK(!pipe_events && !pipe_registry->active_leases &&
+                !wl_columnar_expr_test_callback_depth());
+            if (pipe_action == 2 || pipe_action == 3) {
+                wl_evaluation_control_report_t report;
+                CHECK(!wl_evaluation_control_report(f->control, &report) &&
+                    pipe_same_report(&report, &pipe_report));
+                if (pipe_action == 3) {
+                    uint64_t used = 1;
+                    CHECK(!wl_evaluation_control_test_active_consumed(
+                            f->control,
+                            pipe_successor, &used) && !used);
+                }
+            }
+        }
+        if (rc != EAGAIN)return rc;
+    }
+    CHECK(false); return EAGAIN;
+}
+static void pipe_equal(fixture_t *f, wl_session_t *raw, uint32_t count) {
+    col_rel_t *a = session_find_rel(COL_SESSION(f->session), "out"),
+        *b = session_find_rel(COL_SESSION(raw), "out");
+    CHECK(a && b && a->ncols == 3 && b->ncols == 3 &&
+        a->nrows == count && b->nrows == count);
+    for (uint32_t col = 0; col < 3; ++col)
+        CHECK((a->column_types?a->column_types[col]:WIRELOG_TYPE_INT64) ==
+            (b->column_types?b->column_types[col]:WIRELOG_TYPE_INT64));
+    for (uint32_t i = 0; i < count; ++i) {
+        unsigned matches = 0;
+        for (uint32_t j = 0; j < count; ++j)
+            matches += a->columns[0][i] == b->columns[0][j] &&
+                a->columns[1][i] == b->columns[1][j] &&
+                a->columns[2][i] == b->columns[2][j];
+        CHECK(matches == 1);
+    }
+}
+static void joined_library_case(unsigned domain, unsigned observed,
+    unsigned phase, unsigned action) {
+    const char *sources[] = {
+        ".decl a(k:int64,x:string)\n.decl b(k:int64,n:int64)\n"
+        ".decl out(x:string,y:int64,n:int64)\n"
+        "out(x,sha256(x),n):-a(k,x),b(k,n),n>0.\n",
+        ".decl a(k:int64,x:string)\n.decl b(k:int64,n:int64)\n"
+        ".decl out(x:string,y:int64,n:int64)\n"
+        "out(x,@call(\"test.pipe\",x),n):-a(k,x),b(k,n),n>0.\n",
+    };
+    pipe_context_t ctx = {0};
+    wirelog_extension_registry_t *registry =
+        wirelog_extension_registry_create();
+    uint32_t type = WIRELOG_EXTENSION_VALUE_STRING;
+    wirelog_extension_descriptor_t descriptor = {
+        .abi_version = WIRELOG_EXTENSION_ABI_VERSION,
+        .size = sizeof(descriptor),
+        .name = "test.pipe", .arity = 1, .argument_types = &type,
+        .result_type = WIRELOG_EXTENSION_VALUE_INT64,
+        .invoke = pipe_callback, .user_data = &ctx,
+        .destroy = pipe_destroy_context
+    };
+    CHECK(registry && !wirelog_extension_register(registry, &descriptor));
+    wirelog_extension_snapshot_t *snapshot =
+        wirelog_extension_snapshot_acquire(registry);
+    CHECK(snapshot);
+    char literal[602], literal_source[1024];
+    memset(literal, 'a', 600); literal[600] = '!'; literal[601] = 0;
+    CHECK(snprintf(literal_source, sizeof(literal_source),
+        ".decl a(k:int64,x:string)\n.decl b(k:int64,n:int64)\n"
+        ".decl out(x:string,y:int64,n:int64)\n"
+        "out(x,@call(\"test.pipe\",\"%s\"),n):-a(k,x),b(k,n),n>0.\n", literal)
+        < (int)sizeof(literal_source));
+    fixture_t f = create_common(domain == 2?literal_source:sources[domain],
+            false, snapshot);
+    wl_session_options_t options; wl_session_options_init(&options);
+    options.memory_governor = COL_SESSION(f.session)->memory_governor;
+    wl_session_t *raw = NULL;
+    CHECK(!wl_session_create_with_snapshot_options(wl_backend_columnar(),
+        f.plan, 1, snapshot, &options, &raw));
+    COL_SESSION(f.session)->join_batch_bytes = 128;
+    COL_SESSION(raw)->join_batch_bytes = 128;
+    pipe_fixture = &f; pipe_registry = registry;
+    pipe_exchange = pipe_ack = pipe_events = pipe_unknown = pipe_forward = 0;
+    pipe_pos = pipe_neg = 0;
+    pipe_phase = phase; pipe_action = action; pipe_progress = phase == 43?200:0;
+    pipe_successor = 0; pipe_stopped = false; pipe_copy_started = false;
+    pipe_dispatch = pipe_computed = 0;
+    if (observed)wl_session_set_delta_cb(f.session, pipe_delta, &f);
+    wl_columnar_join_pipeline_test_numeric_checkpoint = pipe_route;
+    CHECK(!step_complete(f.session) && !step_complete(raw) && !ctx.calls &&
+        !pipe_events);
+    col_rel_t *old = session_find_rel(COL_SESSION(f.session), "out");
+    col_relation_snapshot_t image = wl_columnar_relation_snapshot(old);
+    CHECK(old && !old->nrows);
+    CHECK(!wirelog_extension_unregister(registry, "test.pipe"));
+    wirelog_extension_snapshot_release(snapshot); snapshot = NULL;
+    CHECK(!ctx.destroyed);
+    char long_text[601]; memset(long_text, 'a', 600); long_text[600] = 0;
+    int64_t rows[] = {1, wl_intern_put(f.plan->intern, long_text),
+                      2, wl_intern_put(f.plan->intern, "b"), 3,
+                      wl_intern_put(f.plan->intern, "b")};
+    int64_t keys[] = {1, 1, 2, 1, 3, 0};
+    CHECK(!wl_session_insert(f.session, "a", rows, 3, 2) &&
+        !wl_session_insert(raw, "a", rows, 3, 2) &&
+        !wl_session_insert(f.session, "b", keys, 3, 2) &&
+        !wl_session_insert(raw, "b", keys, 3, 2));
+    const char *public_names[] = {"a", "b", "out"};
+    for (unsigned i = 0; i < 3; ++i) {
+        pipe_public[i] = session_find_rel(COL_SESSION(f.session),
+                public_names[i]);
+        CHECK(pipe_public[i]);
+        pipe_images[i] = wl_columnar_relation_snapshot(pipe_public[i]);
+    }
+    pipe_exchange = pipe_ack = 0;
+    if (domain)wl_columnar_filter_test_map_schema = pipe_schema;
+    wl_columnar_expr_test_checkpoint = pipe_stop;
+    ctx.fail = phase == 999;
+    CHECK(!wl_evaluation_control_reset(f.control) &&
+        !wl_evaluation_control_configure(f.control, action == 1?UINT64_MAX:0));
+    ctx.active = f.session; int result = pipe_control_complete();
+    wl_columnar_expr_test_checkpoint = NULL;
+    wl_columnar_filter_test_map_schema = NULL;
+    CHECK(pipe_exchange && pipe_ack && !pipe_forward && !ctx.destroyed &&
+        !registry->active_leases && !wl_columnar_expr_test_callback_depth());
+    if (phase == 999) {
+        CHECK(result == WL_COLUMNAR_EXPR_CALLBACK_FAILURE && ctx.calls == 2 &&
+            !pipe_events &&
+            session_find_rel(COL_SESSION(f.session), "out") == old &&
+            wl_columnar_relation_snapshot_equal(image,
+            wl_columnar_relation_snapshot(old)));
+        ctx.calls = 0; ctx.active = raw;
+        CHECK(step_complete(raw) == WL_COLUMNAR_EXPR_CALLBACK_FAILURE &&
+            ctx.calls == 2 &&
+            !ctx.destroyed &&
+            !registry->active_leases &&
+            !wl_columnar_expr_test_callback_depth());
+        ctx.fail = false; ctx.calls = 0; ctx.active = f.session;
+        CHECK(!wl_evaluation_control_reset(f.control));
+        result = step_complete(f.session);
+    } else if (phase) {
+        int expected = action == 0?WL_EVALUATION_CONTROL_CANCELLED:
+            action == 1?WL_EVALUATION_CONTROL_WORK_LIMIT:action ==
+            4?EOVERFLOW:EINVAL;
+        CHECK(result == expected && pipe_stopped && !pipe_events &&
+            session_find_rel(COL_SESSION(f.session), "out") == old &&
+            wl_columnar_relation_snapshot_equal(image,
+            wl_columnar_relation_snapshot(old)));
+        if (domain)CHECK(ctx.calls == ((phase == 513 || phase == 515)?1u:0u));
+        if (action == 2 || action == 3) {
+            wl_evaluation_control_report_t report;
+            CHECK(!wl_evaluation_control_report(f.control, &report) &&
+                report.attempt_id == pipe_report.attempt_id &&
+                report.consumed == pipe_report.consumed &&
+                report.result == pipe_report.result &&
+                report.limit == pipe_report.limit &&
+                report.stop_reason == pipe_report.stop_reason &&
+                report.execution_status == pipe_report.execution_status &&
+                report.cleanup_status == pipe_report.cleanup_status);
+            if (action == 3) {
+                uint64_t used = 1;
+                CHECK(!wl_evaluation_control_test_active_consumed(f.control,
+                    pipe_successor, &used) && !used);
+                wl_evaluation_control_attempt_finish_result_t end =
+                    wl_evaluation_control_finish_attempt(f.control,
+                        f.session->operation_admission, pipe_successor, 0, 0);
+                CHECK(!end.protocol && end.report_valid &&
+                    !end.report.consumed);
+            }
+        }
+        CHECK(!wl_evaluation_control_reset(f.control) &&
+            !wl_evaluation_control_configure(f.control, 0));
+        ctx.calls = 0; ctx.active = f.session; pipe_stopped = false;
+        unsigned target = pipe_phase; pipe_phase = 0;
+        wl_columnar_expr_test_checkpoint = pipe_stop;
+        result = step_complete(f.session);
+        wl_columnar_expr_test_checkpoint = NULL; pipe_phase = target;
+    }
+    CHECK(pipe_dispatch);
+    unsigned controlled_calls = ctx.calls;
+    ctx.calls = 0; ctx.active = raw; int raw_result = step_complete(raw);
+#ifndef WL_MBEDTLS_ENABLED
+    if (!domain)CHECK(result == ERANGE && raw_result == ERANGE &&
+            !pipe_computed &&
+            !pipe_events &&
+            session_find_rel(COL_SESSION(f.session), "out") == old &&
+            wl_columnar_relation_snapshot_equal(image,
+            wl_columnar_relation_snapshot(old)));
+    else
+#endif
+    {
+        CHECK(!result && !raw_result && pipe_events == (observed?2u:0u) &&
+            pipe_pos == (observed?2u:0u) && !pipe_neg);
+        pipe_equal(&f, raw, 2);
+        if (!domain) {
+            col_rel_t *out = session_find_rel(COL_SESSION(f.session), "out");
+            CHECK(pipe_computed && out->column_types &&
+                out->column_types[0] == WIRELOG_TYPE_STRING &&
+                out->column_types[1] == WIRELOG_TYPE_INT64 &&
+                out->column_types[2] == WIRELOG_TYPE_INT64);
+        }
+        if (domain)CHECK(controlled_calls == 2 && ctx.calls == 2 &&
+                pipe_unknown);
+        unsigned prior = pipe_events; ctx.active = f.session;
+        CHECK(!step_complete(f.session) && pipe_events == prior);
+        if (!phase) {
+            int64_t removed[] = {2, rows[3]};
+            CHECK(!wl_session_remove(f.session, "a", removed, 1, 2) &&
+                !wl_session_remove(raw, "a", removed, 1, 2));
+            ctx.active = f.session; CHECK(!step_complete(f.session));
+            ctx.active = raw; CHECK(!step_complete(raw));
+            pipe_equal(&f, raw, 1);
+            CHECK(pipe_events == prior+(observed?1u:0u) &&
+                pipe_pos == (observed?2u:0u) && pipe_neg == (observed?1u:0u));
+            unsigned event = observed &&
+                pipe_event_rows[0][0] == removed[1]?0u:1u;
+            if (observed) {
+                CHECK(pipe_event_diffs[event] == 1 &&
+                    pipe_event_diffs[2] == -1 &&
+                    pipe_event_rows[event][0] == removed[1]);
+                for (unsigned col = 0; col < 3; ++col)
+                    CHECK(pipe_event_rows[2][col] ==
+                        pipe_event_rows[event][col]);
+            }
+            CHECK(!wl_session_insert(f.session, "a", removed, 1, 2) &&
+                !wl_session_insert(raw, "a", removed, 1, 2));
+            ctx.active = f.session; CHECK(!step_complete(f.session));
+            ctx.active = raw; CHECK(!step_complete(raw));
+            pipe_equal(&f, raw, 2);
+            CHECK(pipe_events == prior+(observed?2u:0u) &&
+                pipe_pos == (observed?3u:0u) && pipe_neg == (observed?1u:0u));
+            if (observed) {
+                CHECK(pipe_event_diffs[3] == 1);
+                for (unsigned col = 0; col < 3; ++col)
+                    CHECK(pipe_event_rows[3][col] ==
+                        pipe_event_rows[event][col]);
+            }
+        }
+    }
+    CHECK(!COL_SESSION(f.session)->cleanup_active &&
+        !COL_SESSION(f.session)->cleanup_pending &&
+        !COL_SESSION(f.session)->cleanup_reserved_bytes &&
+        !registry->active_leases);
+    pipe_fixture = NULL; pipe_registry = NULL;
+    wl_columnar_join_pipeline_test_numeric_checkpoint = NULL;
+    wl_columnar_memory_governor_ref_t *g = options.memory_governor;
+    wl_columnar_memory_governor_ref_retain(g);
+    wl_session_destroy(raw); destroy(&f);
+    CHECK(ctx.destroyed == 1 &&
+        !wl_columnar_memory_reserved(wl_columnar_memory_governor_ref_get(g)));
+    CHECK(!wirelog_extension_registry_destroy(registry));
+    wl_columnar_memory_governor_ref_release(g);
+}
+static void joined_libraries(void) {
+    for (unsigned domain = 0; domain < 3; ++domain)
+        for (unsigned observed = 0; observed < 2; ++observed)
+            joined_library_case(domain, observed, 0, 0);
+    joined_library_case(1, 1, 999, 0);
+    joined_library_case(1, 0, 512, 3);
+    const unsigned ext_phases[] = {521, 511, 512, 513, 515};
+    for (unsigned i = 0; i < sizeof(ext_phases)/sizeof(*ext_phases); ++i)
+        for (unsigned action = 0; action < 5; ++action)
+            joined_library_case(1, 1, ext_phases[i], action);
+    for (unsigned action = 0; action < 5; ++action)
+        joined_library_case(2, 1, 43, action);
+#ifdef WL_MBEDTLS_ENABLED
+    for (unsigned phase = 203; phase <= 204; ++phase)
+        for (unsigned action = 0; action < 5; ++action)
+            joined_library_case(0, 1, phase, action);
+#endif
+}
+
 int main(void) {
+    joined_libraries();
     joined_strings();
     replace_sizes(); replace_parity(); replace_resources(); replace_budget();
     session_replace();
