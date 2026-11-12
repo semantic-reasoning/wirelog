@@ -1717,7 +1717,7 @@ typedef struct {
     void *storage;
     size_t bytes;
     unsigned allocations, releases;
-    bool fail, misalign;
+    bool fail, misalign, null_success;
 } scalar_view_storage_t;
 
 static int
@@ -1727,6 +1727,7 @@ scalar_view_allocate(void *data, size_t bytes, void **out)
     ++storage->allocations;
     *out = NULL;
     if (storage->fail) return ENOMEM;
+    if (storage->null_success) return 0;
     if (bytes == SIZE_MAX) return EOVERFLOW;
     storage->storage = malloc(bytes + 1);
     if (!storage->storage) return ENOMEM;
@@ -2021,6 +2022,150 @@ test_scalar_view_no_group(void)
     wl_plan_free(plan); wirelog_program_free(program); PASS();
 }
 
+static const char scalar_serial_source[] =
+    ".decl input(x:int64)\n.decl reach(x:int64)\n"
+    "reach(x):-input(x).\n"
+    "reach(x+1):-reach(x),reach(y),x<3,y<3.\n";
+static void
+test_scalar_serial_view(void)
+{
+    TEST("actual serial K view preserves tapes without execution authority");
+    wirelog_error_t error;
+    wirelog_program_t *program = wirelog_parse_string(scalar_serial_source,
+            &error);
+    wl_plan_t *plan = NULL;
+    ASSERT(program && !wl_plan_from_program(program, &plan), "actual compiler");
+    const wl_plan_relation_t *origin = NULL;
+    for (uint32_t s = 0; s < plan->stratum_count; ++s)
+        for (uint32_t r = 0; r < plan->strata[s].relation_count; ++r)
+            if (plan->strata[s].is_recursive)origin =
+                    &plan->strata[s].relations[r];
+    ASSERT(origin && origin->op_count == 1 &&
+        origin->ops[0].op == WL_PLAN_OP_K_FUSION, "actual single K tape");
+    const wl_plan_op_k_fusion_t *meta = origin->ops[0].opaque_data;
+    ASSERT(meta && meta->k == 2, "two actual alternatives");
+    unsigned hints[4] = {0}; uint32_t total = 0;
+    for (uint32_t d = 0; d < meta->k; ++d) {
+        ASSERT(meta->k_op_counts[d] >= 2, "actual backed branch");
+        total += meta->k_op_counts[d];
+        for (uint32_t i = 0; i < meta->k_op_counts[d]; ++i) {
+            const wl_plan_op_t *op = &meta->k_ops[d][i];
+            ASSERT(!op->materialized && !op->opaque_data,
+                "ordinary nonmaterialized scalar descriptors");
+            if (op->delta_mode == WL_DELTA_FORCE_DELTA)++hints[0];
+            if (op->delta_mode == WL_DELTA_FORCE_FULL)++hints[1];
+            if (op->delta_mode == WL_DELTA_FORCE_EMPTY_AFTER_SEED)++hints[2];
+            if (op->op == WL_PLAN_OP_CONSOLIDATE)++hints[3];
+        }
+    }
+    ASSERT(hints[0] && hints[1] && hints[2] && hints[3] >= 4,
+        "actual compiler modes and repeated consolidates");
+    uint64_t hash = scalar_view_origin_hash(plan);
+    scalar_view_storage_t storage = {0};
+    wl_plan_scalar_view_allocator_t allocator = {
+        &storage, scalar_view_allocate, scalar_view_release
+    };
+    for (unsigned pass = 0; pass < 2; ++pass) {
+        wl_plan_scalar_view_t *view = NULL;
+        ASSERT(!wl_plan_scalar_view_create(plan, &allocator, &view) && view &&
+            view->group_count == 1 && view->branch_count == 2 &&
+            view->op_count == total && view->storage_bytes == storage.bytes,
+            "one checked arena");
+        const wl_plan_scalar_group_t *group = &view->groups[0];
+        ASSERT(group->origin_fused == &origin->ops[0] &&
+            !group->terminal_exchange && !group->original_op_index &&
+            group->merge == WL_PLAN_SCALAR_MERGE_SORTED_UNION_AFTER_ALL,
+            "actual absent exchange, unchanged after-all boundary");
+        uint32_t offset = 0;
+        for (uint32_t d = 0; d < meta->k; ++d) {
+            const wl_plan_scalar_branch_t *branch = &view->branches[d];
+            ASSERT(branch->branch_index == d && !branch->group_index &&
+                branch->origin_ops == meta->k_ops[d] &&
+                branch->op_count == meta->k_op_counts[d] &&
+                branch->first_op == offset &&
+                branch->scalar_relation.ops == view->ops+offset,
+                "actual origin/order/range");
+            for (uint32_t i = 0; i < branch->op_count; ++i)
+                ASSERT(scalar_view_op_equal(&branch->scalar_relation.ops[i],
+                    &meta->k_ops[d][i]),
+                    "all descriptor fields/payload pointers");
+            offset += branch->op_count;
+        }
+        wl_plan_scalar_view_destroy(view);
+        ASSERT(scalar_view_origin_hash(plan) == hash && !storage.storage &&
+            storage.allocations == pass+1 && storage.releases == pass+1,
+            "one release, origin remains valid");
+    }
+    wl_plan_scalar_view_t *view = NULL;
+    storage.fail = true;
+    ASSERT(wl_plan_scalar_view_create(plan, &allocator, &view) == ENOMEM &&
+        !view && storage.allocations == 3 && storage.releases == 2,
+        "serial allocation failure");
+    storage.fail = false; storage.null_success = true;
+    ASSERT(wl_plan_scalar_view_create(plan, &allocator, &view) == ENOMEM &&
+        !view && storage.allocations == 4 && storage.releases == 2,
+        "successful NULL has no owned arena");
+    storage.null_success = false; storage.misalign = true;
+    ASSERT(wl_plan_scalar_view_create(plan, &allocator, &view) == EINVAL &&
+        !view && storage.allocations == 5 && storage.releases == 3,
+        "misalignment releases actual arena");
+    ASSERT(scalar_view_origin_hash(plan) == hash, "failure preserves origin");
+    wl_plan_free(plan); wirelog_program_free(program); PASS();
+}
+
+static void test_scalar_serial_view_negatives(void) {
+    TEST("single K malformed and unsupported metadata stay allocation-free");
+    wl_plan_op_t dummy = {.op = WL_PLAN_OP_VARIABLE};
+    wl_plan_op_t *pointers[] = {&dummy, &dummy};
+    uint32_t counts[] = {1, 1};
+    wl_plan_op_k_fusion_t meta = {.k = 2, .k_ops = pointers,
+                                  .k_op_counts = counts};
+    wl_plan_op_exchange_t exchange = {0};
+    wl_plan_op_t top[] = {{.op = WL_PLAN_OP_K_FUSION, .opaque_data = &meta},
+                          {.op = WL_PLAN_OP_EXCHANGE, .opaque_data = &exchange},
+                          {0}};
+    wl_plan_relation_t relation = {.name = "backed", .ops = top, .op_count = 1};
+    wl_plan_stratum_t stratum = {.is_recursive = true, .relations = &relation,
+                                 .relation_count = 1};
+    wl_plan_t plan = {.strata = &stratum, .stratum_count = 1};
+    scalar_view_storage_t storage = {0};
+    wl_plan_scalar_view_allocator_t allocator = {
+        &storage, scalar_view_allocate, scalar_view_release
+    };
+    wl_plan_scalar_view_t *view = NULL;
+#define NO_VIEW(rc) ASSERT(wl_plan_scalar_view_create(&plan, &allocator, \
+            &view) == (rc) && !view && !storage.allocations && \
+            !storage.releases, \
+            "unselected/invalid before allocation")
+    relation.op_count = 0; NO_VIEW(0);
+    relation.op_count = 3; NO_VIEW(0);
+    relation.op_count = 1; relation.ops = NULL; NO_VIEW(0);
+    relation.ops = top; top[0].op = WL_PLAN_OP_MAP; NO_VIEW(0);
+    top[0].op = WL_PLAN_OP_K_FUSION; top[0].opaque_data = NULL; NO_VIEW(EINVAL);
+    top[0].opaque_data = &meta; meta.k = 1; NO_VIEW(EINVAL);
+    meta.k = 2; meta.k_ops = NULL; NO_VIEW(EINVAL);
+    meta.k_ops = pointers; meta.k_op_counts = NULL; NO_VIEW(EINVAL);
+    meta.k_op_counts = counts; counts[0] = 0; NO_VIEW(EINVAL);
+    counts[0] = UINT32_MAX; NO_VIEW(EOVERFLOW);
+    counts[0] = 1; pointers[0] = NULL; NO_VIEW(EINVAL);
+    pointers[0] = &dummy;
+    const wl_plan_op_type_t unsupported[] = {WL_PLAN_OP_K_FUSION,
+                                             WL_PLAN_OP_EXCHANGE,
+                                             WL_PLAN_OP_REDUCE,
+                                             WL_PLAN_OP_LFTJ};
+    for (unsigned i = 0; i < sizeof(unsupported)/sizeof(*unsupported); ++i) {
+        dummy.op = unsupported[i]; NO_VIEW(0);
+    }
+    dummy.op = WL_PLAN_OP_VARIABLE; dummy.opaque_data = &meta; NO_VIEW(0);
+    dummy.opaque_data = NULL;
+    relation.op_count = 2; NO_VIEW(0); /* legacy nonmaterialized gate */
+    exchange.num_workers = 2; NO_VIEW(0);
+    exchange.num_workers = 0; top[1].opaque_data = NULL; NO_VIEW(EINVAL);
+    top[1].opaque_data = &exchange; top[1].op = WL_PLAN_OP_MAP; NO_VIEW(0);
+#undef NO_VIEW
+    PASS();
+}
+
 int
 main(void)
 {
@@ -2052,6 +2197,8 @@ main(void)
     test_extension_call_unsupported_contexts_rejected();
     test_optimized_flatmap_extension_filter_rejected();
     test_extension_right_filters_rejected();
+    test_scalar_serial_view_negatives();
+    test_scalar_serial_view();
     test_scalar_view_owned_branches();
     test_scalar_view_failures();
     test_scalar_view_no_group();

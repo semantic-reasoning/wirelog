@@ -2009,3 +2009,36 @@ Existing compile/evaluate/final and late claim/rollback qualifications remain.
 This unit closes inferred physical input handling. Preserved inline IDB seeds,
 actual recursive scheduling/typed SCC transport and worker qualification remain
 separate obligations and are not certified by this row.
+
+### Completion unit 9: immutable serial K branch views
+
+The immutable scalar view now recognizes actual recursive single-K_FUSION
+origin tapes, in addition to the existing K_FUSION/zero-worker EXCHANGE form.
+The new serial shape does not require materialized JOIN; the legacy two-op
+shape retains that requirement and its existing validation/error behavior.
+An absent terminal EXCHANGE is represented by NULL, without forming ops[1].
+Actual origin descriptors, branch order, delta modes, expression/key pointers
+and repeated terminal CONSOLIDATE operations are copied verbatim into one
+checked arena. Origin plans/payloads remain borrowed; destruction releases only
+the arena once. Malformed count/extent checks precede branch descriptor reads.
+Unsupported nested/opaque/aggregate branch operations remain unselected.
+
+The real compiler nonlinear reach fixture proves one K_FUSION with two
+nonmaterialized alternatives before inspecting the view. Tests compare all
+copied descriptor fields and deep origin hashes across repeated create/destroy,
+allocator failure, successful NULL and misalignment. Backed malformed/overflow
+metadata and legacy worker/materialization controls remain allocation-free.
+Session tests intercept the actual newly eligible view arena malloc, preserve
+a committed peer reservation, retry, and verify zero attempt/report during
+immutable preparation. Actual governor refusal preserves its precise
+WL_ERR_MEMORY_BUDGET outcome and retries after raising the budget. Program-owned
+intern attachment is explicitly detached through its real API before testing
+the isolated governor denial; final plan/program disposal releases all credits.
+
+This is synchronous session preparation, with honest arena reservation and
+ownership, not free per-STEP work or an execution permission. The actual serial
+fixture still returns ENOTSUP through its existing controlled runtime gate,
+while raw evaluation produces exactly reach{1,2,3}. No recursive scheduler,
+native frame classifier, SOURCE authority or projection restriction changes.
+Runtime raw-tape/epoch/seed-skip, typed SCC and seed effects remain separate
+integration obligations.
