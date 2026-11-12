@@ -2244,3 +2244,38 @@ and overflow cuts. Its raw comparison uses the actual append/consolidate/compact
 helpers on that actual peer rather than modifying a session registry or clearing
 a type pointer. Read-only test observers report actual denied token state and
 never confer source or cleanup authority.
+
+
+### Capacity-one typed operator constructor prerequisite
+
+The internal capacity-one typed operator constructor copies the existing typed
+operator's allocation, ownership, failure and saved-attempt behavior, changing
+only the requested capacity from64 to1. The existing entry point and all runtime
+callers remain unchanged. This supplies a real empty typed-bottom primitive;
+it does not enable typed SCC scheduling or grant a native recovery context.
+
+The registered relation-creation test uses actual compiled IDB schema vectors
+for integer, STRING, FLOAT, normalized int32 and17 mixed lanes. The output owns
+its own type vector and survives destruction of the actual plan and program.
+Physical capacity is1, timestamps are absent, declared input arity remains0,
+and the actual Arrow representation follows the original helper: FLOAT g and
+other types l. Zero-width NULL and non-NULL type-vector cases retain their
+separate existing semantics. Append/clear is compared against the raw relation
+and raw type installer, including actual stored values and ownership tokens.
+
+An independent literal packet sequence uses8-byte copy chunks and8-pointer
+chunks. The positive typed surcharge is304+320 per lane; a non-NULL zero-width
+vector costs192 and a NULL zero-width vector adds0. Complete ordered packets,
+exact funding and one-short refusal are tested at widths0,1,4,17, with real
+allocator failure at every allocation ordinal and actual governor rejection
+at each reserve. Boundary type enums, invalid arguments and inactive/stale
+attempt identities preserve the original constructor contract.
+
+Selected genuine entry, enumeration, allocation, commit, installation and
+external boundaries exercise cancellation, work exhaustion, overflow, END and
+END with a successor. Checks use independently calculated prefixes and frozen
+semantic report fields; they do not equate a missing prepaid COMMIT tail hook
+with missing parent consumption. Every failed construction leaves the output
+NULL, closes real ownership, preserves successor consumption0 and admits a
+fresh retry. Typed schema binding, comparison, caller finance and recursive runtime
+admission remain separate obligations.
