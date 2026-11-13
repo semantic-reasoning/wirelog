@@ -125,6 +125,33 @@ int wl_columnar_mem_ledger_publication_try_commit_described_controlled(
     wl_columnar_mem_ledger_description_t *, const void *,
     wl_evaluation_control_t *, uint64_t);
 
+/* Final-address parent journal. Capture only the actual completed COMMIT
+ * report, before another generation can overwrite it. The parent pins this
+ * record, ledger and controller allocation until its separately funded ACK.
+ * Neither a captured report nor this journal supplies Native permission.
+ * report is immutable while report_valid. */
+typedef struct {
+    wl_columnar_mem_ledger_description_t description;
+    wl_evaluation_control_report_t report;
+    bool report_valid;
+} wl_columnar_mem_ledger_retirement_journal_t;
+
+int wl_columnar_mem_ledger_retirement_capture_owned(
+    wl_columnar_mem_ledger_retirement_journal_t *, const void *,
+    wl_evaluation_control_t *, uint64_t);
+/* The authentic serialized parent must have admitted its existing metadata
+ * action on this actual active funding generation before calling. This fixed
+ * completion consumes that admission; it creates no ACK tariff/prepayment.
+ * The parent has already consumed COMMIT's financial/Source receipt and must
+ * settle this ACK action's own report before advancing another resource.
+ * Output is disjoint from the journal, ledger and full opaque control extent
+ * (the latter extent proof belongs to the parent). Refusal preserves journal
+ * and output. Success returns applied once and invalidates only inert header
+ * fields; dormant request/actor/report bytes are not resource owners. */
+int wl_columnar_mem_ledger_retirement_ack_prepaid_owned(
+    wl_columnar_mem_ledger_retirement_journal_t *, const void *,
+    wl_evaluation_control_t *, uint64_t, bool *);
+
 enum {
     WL_COLUMNAR_MEM_LEDGER_PUBLICATION_ARGUMENTS = 1,
     WL_COLUMNAR_MEM_LEDGER_PUBLICATION_PREPARED,

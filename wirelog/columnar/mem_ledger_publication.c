@@ -512,6 +512,70 @@ wl_columnar_mem_ledger_publication_try_commit_described_controlled(
     return 0;
 }
 
+int
+wl_columnar_mem_ledger_retirement_capture_owned(
+    wl_columnar_mem_ledger_retirement_journal_t *j, const void *parent,
+    wl_evaluation_control_t *control, uint64_t completed_id)
+{
+    if (!j || !completed_id
+        || !wl_columnar_mem_ledger_description_owned(&j->description, parent,
+        control)
+        || j->description.phase != WL_COLUMNAR_MEM_LEDGER_DESCRIPTION_CONSUMED
+        || j->description.attempted_id != completed_id
+        || wl_evaluation_control_active_attempt_id(control)) return EINVAL;
+    wl_evaluation_control_report_t report;
+    if (wl_evaluation_control_report(control, &report)
+        || report.attempt_id != completed_id) return EINVAL;
+    if (j->report_valid) {
+        const wl_evaluation_control_report_t *saved = &j->report;
+        return saved->attempt_id == report.attempt_id
+               && saved->limit == report.limit
+               && saved->consumed == report.consumed
+               && saved->stop_reason == report.stop_reason
+               && saved->execution_status == report.execution_status
+               && saved->cleanup_status == report.cleanup_status
+               && saved->result == report.result ? 0 : EINVAL;
+    }
+    j->report = report;
+    j->report_valid = true;
+    return 0;
+}
+
+int
+wl_columnar_mem_ledger_retirement_ack_prepaid_owned(
+    wl_columnar_mem_ledger_retirement_journal_t *j, const void *parent,
+    wl_evaluation_control_t *control, uint64_t id, bool *applied)
+{
+    if (!j || !applied || !id
+        || wl_columnar_mem_ledger_description_overlap(j, sizeof(*j), applied,
+        sizeof(*applied))
+        || !wl_columnar_mem_ledger_description_owned(&j->description, parent,
+        control)) return EINVAL;
+    wl_columnar_mem_ledger_description_t *d = &j->description;
+    if (wl_columnar_mem_ledger_description_overlap(d->ledger,
+        sizeof(*d->ledger), applied, sizeof(*applied))
+        || wl_columnar_mem_ledger_description_overlap(control, 1, applied,
+        sizeof(*applied))
+        || d->phase != WL_COLUMNAR_MEM_LEDGER_DESCRIPTION_CONSUMED
+        || !d->attempted_id || !j->report_valid
+        || j->report.attempt_id != d->attempted_id
+        || id <= d->attempted_id
+        || wl_evaluation_control_active_attempt_id(control) != id)
+        return EINVAL;
+    /* A refused ACK generation may itself have replaced completed. The
+     * actual captured COMMIT report remains authoritative in this pinned
+     * original-address journal; it is never recaptured from that later ACK. */
+    bool performed = d->applied;
+    d->identity = NULL;
+    d->parent = NULL; d->ledger = NULL; d->control = NULL;
+    d->control_identity = d->attempted_id = 0;
+    d->count = 0; d->thread_valid = false; d->applied = false;
+    d->phase = WL_COLUMNAR_MEM_LEDGER_DESCRIPTION_INERT;
+    j->report_valid = false;
+    *applied = performed;
+    return 0;
+}
+
 /* Finite sibling for three ordered events on at most two actual ledgers.
  * Future capacities are actually paid before READY; none is a fake counter.
  * Existing max2 publication record, tariffs and source bodies stay unchanged.
