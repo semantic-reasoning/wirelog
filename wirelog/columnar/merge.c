@@ -4648,6 +4648,377 @@ wl_columnar_managed_candidate_merge_ack(
     return 0;
 }
 
+/* Additive private-parent ACK. Raw synchronous ACK above remains unchanged. */
+static bool
+wl_columnar_managed_ack_disjoint(const void *a, size_t an,
+    const void *b, size_t bn)
+{
+    uintptr_t x = (uintptr_t)a, y = (uintptr_t)b;
+    return a && b && x <= UINTPTR_MAX - an && y <= UINTPTR_MAX - bn
+           && (x < y ? y - x >= an : x - y >= bn);
+}
+
+static bool
+wl_columnar_managed_ack_gate_inert(
+    const wl_columnar_source_access_gate_round_t *g)
+{
+    if (g->identity || g->thread_valid || g->terminal_consume_armed
+        || g->request_count || g->acquired_count) return false;
+    for (unsigned i = 0; i < WL_COLUMNAR_SOURCE_ACCESS_GATE_ROUND_MAX; ++i)
+        if (g->requests[i].gate || g->requests[i].mode) return false;
+    /* owner_thread is historical when thread_valid is false. */
+    return true;
+}
+
+static bool
+wl_columnar_managed_ack_common(const wl_columnar_managed_candidate_merge_t *a)
+{
+    if (a->identity != (uintptr_t)a ||
+        a->phase != WL_COLUMNAR_MANAGED_CANDIDATE_DONE
+        || a->cleanup_index != 3 || a->replacement_build.relation
+        || a->scratch_build.relation || a->delta_build.relation
+        || !wl_columnar_managed_ack_gate_inert(&a->input_gates)) return false;
+    for (unsigned i = 0; i < 3; ++i)
+        if ((a->retirement_started[i] && a->retirements[i].phase !=
+            WL_COLUMNAR_RELATION_MANAGED_RETIREMENT_DONE)
+            || (!a->retirement_started[i] && a->retirements[i].identity))
+            return false;
+    return true;
+}
+
+static bool
+wl_columnar_managed_ack_retirement(
+    const wl_columnar_managed_candidate_merge_t *a,
+    unsigned i)
+{
+    const wl_columnar_relation_managed_retirement_t *r = &a->retirements[i];
+    if (!a->retirement_started[i]) {
+        /* Raw-zero construction never initialized these token payloads.
+         * Meaningful inert headers suffice; no token/receipt atomic read. */
+        return !r->identity && !r->relation && !r->original_relation_address
+               && !r->governor && !r->governor_ref
+               && r->phase == WL_COLUMNAR_RELATION_MANAGED_RETIREMENT_INERT
+               && wl_columnar_managed_ack_gate_inert(&r->gate_round);
+    }
+    return r->identity == (uintptr_t)r && !r->relation && !r->governor
+           && !r->governor_ref && r->original_relation_address
+           && r->phase == WL_COLUMNAR_RELATION_MANAGED_RETIREMENT_DONE
+           && wl_columnar_managed_ack_gate_inert(&r->gate_round);
+}
+
+static bool
+wl_columnar_managed_ack_receipt_inert(
+    const wl_columnar_memory_retirement_receipt_t *r)
+{
+    return !r->identity && !r->token && !r->expected_governor
+           && !r->captured_governor && !r->thread_valid
+           && r->phase == WL_COLUMNAR_MEMORY_RETIREMENT_EMPTY;
+}
+
+static bool
+wl_columnar_managed_ack_token(const wl_columnar_managed_candidate_merge_t *a,
+    unsigned ri, unsigned ti)
+{
+    if (!a->retirement_started[ri]) return true;
+    /* Only genuinely begun retirements initialized all four token atomics. */
+    const wl_columnar_relation_managed_retirement_t *r = &a->retirements[ri];
+    const wl_columnar_memory_reservation_t *t = &r->tokens[ti];
+    uint64_t state = atomic_load_explicit(&t->state, memory_order_acquire);
+    if (t->identity != t || t->replacement_bytes
+        || t->transition_kind != WL_COLUMNAR_MEMORY_TRANSITION_NONE
+        || !wl_columnar_managed_ack_receipt_inert(
+            &r->receipts[ti])) return false;
+    if (r->token_empty[ti])
+        return state == WL_COLUMNAR_MEMORY_RESERVATION_EMPTY
+               && !r->receipt_started[ti] && !t->governor && !t->bytes
+               && !atomic_load_explicit(&t->owner_bits, memory_order_acquire);
+    /* RELEASED deliberately retains historical governor/bytes/owner_bits.
+     * They are neither followed nor required zero; the actual terminal state
+     * and acknowledged receipt prove no credit/claim remains. */
+    return state == WL_COLUMNAR_MEMORY_RESERVATION_RELEASED
+           && r->receipt_started[ti];
+}
+
+static bool
+wl_columnar_managed_ack_actor(
+    const wl_columnar_managed_candidate_merge_ack_progress_t *p)
+{
+#if defined(WL_HAVE_C11_THREADS)
+    return thrd_equal(p->actor, thrd_current());
+#elif defined(_WIN32) || defined(_WIN64)
+    return p->actor == GetCurrentThreadId();
+#else
+    return pthread_equal(p->actor, pthread_self());
+#endif
+}
+
+/* These exact member spans partition ordinary bytes from all inline atomic
+ * storage. No atomic object is passed to the ordinary byte-zero primitive. */
+/* Typedef guards also execute in MSVC default C mode. */
+typedef char wl_columnar_managed_ack_first_identity_chunk[
+        (offsetof(wl_columnar_managed_candidate_merge_t, identity) == 0
+        && sizeof(((wl_columnar_managed_candidate_merge_t *)0)->identity) <= 64)
+    ? 1 : -1];
+typedef char wl_columnar_managed_ack_retirement_extent[
+        (sizeof(((wl_columnar_managed_candidate_merge_t *)0)->retirements)
+        / sizeof(wl_columnar_relation_managed_retirement_t) == 3) ? 1 : -1];
+typedef char wl_columnar_managed_ack_token_extent[
+        (sizeof(((wl_columnar_relation_managed_retirement_t *)0)->tokens)
+        / sizeof(wl_columnar_memory_reservation_t) == 4) ? 1 : -1];
+typedef char wl_columnar_managed_ack_atomic_member_order[
+        (offsetof(wl_columnar_memory_reservation_t, owner_bits)
+        + sizeof(((wl_columnar_memory_reservation_t *)0)->owner_bits)
+        <= offsetof(wl_columnar_memory_reservation_t, state)) ? 1 : -1];
+typedef char wl_columnar_managed_ack_complete_atomic_member[
+        (offsetof(wl_columnar_memory_reservation_t, state)
+        + sizeof(((wl_columnar_memory_reservation_t *)0)->state)
+        <= sizeof(wl_columnar_memory_reservation_t)) ? 1 : -1];
+typedef char wl_columnar_managed_ack_token_array_bounds[
+        (offsetof(wl_columnar_relation_managed_retirement_t, tokens)
+        + sizeof(((wl_columnar_relation_managed_retirement_t *)0)->tokens)
+        <= sizeof(wl_columnar_relation_managed_retirement_t)) ? 1 : -1];
+typedef char wl_columnar_managed_ack_retirement_array_bounds[
+        (offsetof(wl_columnar_managed_candidate_merge_t, retirements)
+        + sizeof(((wl_columnar_managed_candidate_merge_t *)0)->retirements)
+        <= sizeof(wl_columnar_managed_candidate_merge_t)) ? 1 : -1];
+static size_t
+wl_columnar_managed_ack_atomic_offset(unsigned index)
+{
+    return offsetof(wl_columnar_managed_candidate_merge_t, retirements)
+           + (index / 8u) * sizeof(wl_columnar_relation_managed_retirement_t)
+           + offsetof(wl_columnar_relation_managed_retirement_t, tokens)
+           + ((index % 8u) / 2u) * sizeof(wl_columnar_memory_reservation_t)
+           + (index % 2u ? offsetof(wl_columnar_memory_reservation_t, state)
+                     : offsetof(wl_columnar_memory_reservation_t, owner_bits));
+}
+
+static bool
+wl_columnar_managed_ack_clear_cursor(
+    const wl_columnar_managed_candidate_merge_ack_progress_t *p)
+{
+    if (p->clear_atomic_index > 24 || p->clear_offset > sizeof(*p->target))
+        return false;
+    size_t lower = p->clear_atomic_index
+        ? wl_columnar_managed_ack_atomic_offset(p->clear_atomic_index - 1)
+        + sizeof(wl_atomic_u64) : 0;
+    size_t upper = p->clear_atomic_index < 24
+        ? wl_columnar_managed_ack_atomic_offset(p->clear_atomic_index)
+        : sizeof(*p->target);
+    return lower <= p->clear_offset && p->clear_offset <= upper;
+}
+
+static int
+wl_columnar_managed_ack_prove(
+    const wl_columnar_managed_candidate_merge_ack_progress_t *p,
+    const void *parent, const wl_columnar_managed_candidate_merge_t *target)
+{
+    if (!p || p->identity != p || !parent || p->parent != parent
+        || !target || p->target != target) return EINVAL;
+    if (!wl_columnar_managed_ack_actor(p) || p->busy) return EBUSY;
+    if (!wl_columnar_managed_ack_clear_cursor(p) || p->retirement_index > 3
+        || p->token_index >= 4 ||
+        p->phase <= WL_COLUMNAR_MANAGED_MERGE_ACK_INERT
+        || p->phase > WL_COLUMNAR_MANAGED_MERGE_ACK_COMPLETE) return EINVAL;
+    /* A valid terminal validation cursor3 is not an array subscript. Reject
+    * phase/cursor mismatches before any intact-target validation access. */
+    switch (p->phase) {
+    case WL_COLUMNAR_MANAGED_MERGE_ACK_RETIREMENTS:
+        if (p->retirement_index >= 3 || p->token_index || p->clear_offset
+            || p->clear_atomic_index || p->physical_done) return EINVAL;
+        break;
+    case WL_COLUMNAR_MANAGED_MERGE_ACK_TOKENS:
+        if (p->retirement_index >= 3 || p->clear_offset
+            || p->clear_atomic_index || p->physical_done) return EINVAL;
+        break;
+    case WL_COLUMNAR_MANAGED_MERGE_ACK_CLEAR:
+        if (p->retirement_index != 3 || p->token_index || p->physical_done)
+            return EINVAL;
+        break;
+    case WL_COLUMNAR_MANAGED_MERGE_ACK_COMPLETE:
+        if (p->retirement_index != 3 || p->token_index || !p->physical_done
+            || p->clear_atomic_index != 24
+            || p->clear_offset != sizeof(*target)) return EINVAL;
+        break;
+    default: return EINVAL;
+    }
+    return 0;
+}
+
+static bool
+wl_columnar_managed_ack_output(
+    const wl_columnar_managed_candidate_merge_ack_progress_t *p,
+    const wl_columnar_managed_candidate_merge_t *target, const bool *out)
+{
+    return wl_columnar_managed_ack_disjoint(p, sizeof(*p), target,
+               sizeof(*target))
+           && wl_columnar_managed_ack_disjoint(p, sizeof(*p), out, sizeof(*out))
+           && wl_columnar_managed_ack_disjoint(target, sizeof(*target), out,
+               sizeof(*out));
+}
+
+#ifdef WL_SESSION_TEST_HOOKS
+void (*wl_columnar_managed_candidate_merge_test_ack_checkpoint)(
+    wl_columnar_managed_candidate_merge_ack_progress_t *,
+    wl_evaluation_control_t *, uint64_t);
+#endif
+
+static int
+wl_columnar_managed_ack_record(
+    wl_columnar_managed_candidate_merge_ack_progress_t *p,
+    wl_evaluation_control_t *support, uint64_t id, int result)
+{
+    p->support = support; p->support_id = id;
+    p->support_identity = wl_evaluation_control_identity(support);
+    p->performed = p->report_pending = p->ack_prepaid = true;
+    p->busy = false;
+#ifdef WL_SESSION_TEST_HOOKS
+    if (wl_columnar_managed_candidate_merge_test_ack_checkpoint)
+        wl_columnar_managed_candidate_merge_test_ack_checkpoint(p, support, id);
+#endif
+    int footer = wl_evaluation_control_charge_attempt(support, id, 0);
+    return result ? result : footer;
+}
+
+bool
+wl_columnar_managed_candidate_merge_ack_pending(
+    const wl_columnar_managed_candidate_merge_ack_progress_t *p)
+{
+    return p && p->identity != NULL;
+}
+
+int
+wl_columnar_managed_candidate_merge_ack_begin_owned(
+    wl_columnar_managed_candidate_merge_ack_progress_t *p, const void *parent,
+    wl_columnar_managed_candidate_merge_t *target,
+    wl_evaluation_control_t *support,
+    uint64_t id, bool *selected)
+{
+    if (!p || !parent || !target || !selected) return EINVAL;
+    if (p->identity) return EBUSY; /* Before any target/header inspection. */
+    if (!wl_columnar_managed_ack_output(p, target, selected)
+        || !wl_columnar_managed_ack_common(target)) return EINVAL;
+    /* Real positive Native admission includes this packet's fixed delayed
+     * report/ACK proof and caller/return obligation. No fit is inferred from
+     * capacity256; exact full caller/ABI qualification remains mandatory. */
+    int rc = wl_evaluation_control_charge_attempt(support, id, 256);
+    if (rc) return rc;
+    p->parent = parent; p->target = target;
+    p->clear_offset = 0; p->clear_atomic_index = 0;
+    p->retirement_index = p->token_index = 0;
+    p->phase = WL_COLUMNAR_MANAGED_MERGE_ACK_RETIREMENTS;
+#if defined(WL_HAVE_C11_THREADS)
+    p->actor = thrd_current();
+#elif defined(_WIN32) || defined(_WIN64)
+    p->actor = GetCurrentThreadId();
+#else
+    p->actor = pthread_self();
+#endif
+    p->physical_done = false; p->busy = true;
+    p->identity = p; *selected = true;
+    return wl_columnar_managed_ack_record(p, support, id, 0);
+}
+
+int
+wl_columnar_managed_candidate_merge_ack_step_owned(
+    wl_columnar_managed_candidate_merge_ack_progress_t *p, const void *parent,
+    wl_columnar_managed_candidate_merge_t *target,
+    wl_evaluation_control_t *support,
+    uint64_t id, bool *done)
+{
+    int rc = wl_columnar_managed_ack_prove(p, parent, target);
+    if (rc) return rc;
+    if (!done || !wl_columnar_managed_ack_output(p, target,
+        done)) return EINVAL;
+    if (p->report_pending || p->physical_done) return EBUSY;
+    rc = wl_evaluation_control_charge_attempt(support, id, 256);
+    if (rc) return rc;
+    p->busy = true; *done = false;
+    switch (p->phase) {
+    case WL_COLUMNAR_MANAGED_MERGE_ACK_RETIREMENTS:
+        if (!wl_columnar_managed_ack_retirement(target, p->retirement_index))
+            rc = EINVAL;
+        else if (++p->retirement_index == 3) {
+            p->retirement_index = 0;
+            p->phase = WL_COLUMNAR_MANAGED_MERGE_ACK_TOKENS;
+        }
+        break;
+    case WL_COLUMNAR_MANAGED_MERGE_ACK_TOKENS:
+        if (!wl_columnar_managed_ack_token(target, p->retirement_index,
+            p->token_index))
+            rc = EINVAL;
+        else if (++p->token_index == 4) {
+            p->token_index = 0;
+            if (++p->retirement_index == 3)
+                p->phase = WL_COLUMNAR_MANAGED_MERGE_ACK_CLEAR;
+        }
+        break;
+    case WL_COLUMNAR_MANAGED_MERGE_ACK_CLEAR: {
+        /* After the first chunk, no target typed field is ever interpreted. */
+        if (!p->clear_offset && !wl_columnar_managed_ack_common(target)) {
+            rc = EINVAL; break;
+        }
+        size_t boundary = p->clear_atomic_index < 24
+            ? wl_columnar_managed_ack_atomic_offset(p->clear_atomic_index)
+            : sizeof(*target);
+        if (p->clear_offset == boundary && p->clear_atomic_index < 24) {
+            unsigned ri = p->clear_atomic_index / 8u;
+            unsigned ti = (p->clear_atomic_index % 8u) / 2u;
+            /* Exclusive terminal storage only. This does not construct a
+             * reservation or publish token identity/EMPTY authority. No
+             * unstarted token value is read to select this operation. */
+            if (p->clear_atomic_index % 2u)
+                atomic_init(&target->retirements[ri].tokens[ti].state,
+                    UINT64_C(0));
+            else
+                atomic_init(&target->retirements[ri].tokens[ti].owner_bits,
+                    UINT64_C(0));
+            p->clear_offset = boundary + sizeof(wl_atomic_u64);
+            p->clear_atomic_index = p->clear_atomic_index + 1;
+        } else {
+            size_t bytes = boundary - p->clear_offset;
+            if (bytes > 64) bytes = 64;
+            memset((unsigned char *)target + p->clear_offset, 0, bytes);
+            p->clear_offset = p->clear_offset + bytes;
+        }
+        if (p->clear_offset == sizeof(*target) && p->clear_atomic_index == 24) {
+            p->physical_done = true; *done = true;
+            p->phase = WL_COLUMNAR_MANAGED_MERGE_ACK_COMPLETE;
+        }
+        break;
+    }
+    default: rc = EINVAL; break;
+    }
+    return wl_columnar_managed_ack_record(p, support, id, rc);
+}
+
+int
+wl_columnar_managed_candidate_merge_ack_action_ack_owned(
+    wl_columnar_managed_candidate_merge_ack_progress_t *p, const void *parent,
+    wl_evaluation_control_t *support, uint64_t id)
+{
+    if (!p) return EINVAL;
+    int rc = wl_columnar_managed_ack_prove(p, parent, p->target);
+    if (rc) return rc;
+    if (!p->report_pending || !p->performed || !p->ack_prepaid
+        || p->support != support || p->support_id != id
+        || wl_evaluation_control_identity(support) != p->support_identity
+        || wl_evaluation_control_active_attempt_id(support)) return EBUSY;
+    wl_evaluation_control_report_t report;
+    rc = wl_evaluation_control_report(support, &report);
+    if (rc || report.attempt_id != id || report.consumed != 256
+        || report.execution_status || report.cleanup_status) return EINVAL;
+    /* Only the already prepaid fixed metadata suffix remains. No byte clear,
+     * token initialization/ref/resource/Original/financial action occurs. */
+    p->report_pending = p->performed = p->ack_prepaid = false;
+    p->support = NULL;
+    if (p->physical_done) {
+        p->parent = NULL; p->target = NULL;
+        p->phase = WL_COLUMNAR_MANAGED_MERGE_ACK_INERT;
+        p->identity = NULL;
+    }
+    return 0;
+}
+
 /* --- Private original-attempt scalar CONCAT (#1821) --- */
 enum {
     WL_COLUMNAR_MERGE_CONCAT_WORK = 192,
