@@ -4077,39 +4077,82 @@ wl_columnar_arrangement_diff_finish_credit(
     return rc ? rc : done ? 0 : EAGAIN;
 }
 
+enum {
+    WL_COLUMNAR_ARRANGEMENT_DIFF_RETIRE_SNAPSHOT,
+    WL_COLUMNAR_ARRANGEMENT_DIFF_RETIRE_HEAD_FREE,
+    WL_COLUMNAR_ARRANGEMENT_DIFF_RETIRE_NEXT_FREE,
+    WL_COLUMNAR_ARRANGEMENT_DIFF_RETIRE_KEYS_FREE,
+    WL_COLUMNAR_ARRANGEMENT_DIFF_RETIRE_HEADER_FREE,
+    WL_COLUMNAR_ARRANGEMENT_DIFF_RETIRE_LEDGER,
+    WL_COLUMNAR_ARRANGEMENT_DIFF_RETIRE_CREDIT,
+    WL_COLUMNAR_ARRANGEMENT_DIFF_RETIRE_GOVERNOR,
+    WL_COLUMNAR_ARRANGEMENT_DIFF_RETIRE_ACK,
+};
+
+enum {
+    WL_COLUMNAR_ARRANGEMENT_DIFF_TAIL_ARRAY_FREE,
+    WL_COLUMNAR_ARRANGEMENT_DIFF_TAIL_ARRAY_LEDGER,
+    WL_COLUMNAR_ARRANGEMENT_DIFF_TAIL_ARRAY_CREDIT,
+    WL_COLUMNAR_ARRANGEMENT_DIFF_TAIL_SLOTS_FREE,
+    WL_COLUMNAR_ARRANGEMENT_DIFF_TAIL_SLOTS_LEDGER,
+    WL_COLUMNAR_ARRANGEMENT_DIFF_TAIL_SLOTS_CREDIT,
+    WL_COLUMNAR_ARRANGEMENT_DIFF_TAIL_ACK,
+};
+
 static int
 wl_columnar_arrangement_diff_retire(wl_columnar_arrangement_diff_attempt_t *tx)
 {
     col_diff_arrangement_t *arr = tx->retiring;
-    if (tx->retire_phase < 5 && !arr) return EINVAL;
+    if (tx->retire_phase <= WL_COLUMNAR_ARRANGEMENT_DIFF_RETIRE_HEADER_FREE &&
+        !arr) return EINVAL;
     switch (tx->retire_phase) {
-    case 0:
+    case WL_COLUMNAR_ARRANGEMENT_DIFF_RETIRE_SNAPSHOT:
         tx->retire_governor = arr->memory_governor;
         tx->retire_ledger = arr->ledger;
         tx->retire_bytes = col_diff_arrangement_bytes(arr);
         if (arr->reservation.identity && arr->reservation.bytes
             && !wl_columnar_memory_reservation_move(&tx->retire_credit,
             &arr->reservation)) return EBUSY;
-        tx->retire_phase = 1; return EAGAIN;
-    case 1: free(arr->ht_head); arr->ht_head = NULL;
-        tx->retire_phase = 2; return EAGAIN;
-    case 2: free(arr->ht_next); arr->ht_next = NULL;
-        tx->retire_phase = 3; return EAGAIN;
-    case 3: free(arr->key_cols); arr->key_cols = NULL;
-        tx->retire_phase = 4; return EAGAIN;
-    case 4: free(arr); tx->retiring = NULL;
+        tx->retire_phase = WL_COLUMNAR_ARRANGEMENT_DIFF_RETIRE_HEAD_FREE;
+        return EAGAIN;
+    case WL_COLUMNAR_ARRANGEMENT_DIFF_RETIRE_HEAD_FREE: free(arr->ht_head);
+        arr->ht_head = NULL;
+        tx->retire_phase = WL_COLUMNAR_ARRANGEMENT_DIFF_RETIRE_NEXT_FREE;
+        return EAGAIN;
+    case WL_COLUMNAR_ARRANGEMENT_DIFF_RETIRE_NEXT_FREE: free(arr->ht_next);
+        arr->ht_next = NULL;
+        tx->retire_phase = WL_COLUMNAR_ARRANGEMENT_DIFF_RETIRE_KEYS_FREE;
+        return EAGAIN;
+    case WL_COLUMNAR_ARRANGEMENT_DIFF_RETIRE_KEYS_FREE: free(arr->key_cols);
+        arr->key_cols = NULL;
+        tx->retire_phase = WL_COLUMNAR_ARRANGEMENT_DIFF_RETIRE_HEADER_FREE;
+        return EAGAIN;
+    case WL_COLUMNAR_ARRANGEMENT_DIFF_RETIRE_HEADER_FREE: free(arr);
+        tx->retiring = NULL;
+        /* The external journal, rather than the freed descriptor, owns all
+         * remaining accounting, credit and governor obligations. */
+        tx->retire_phase = WL_COLUMNAR_ARRANGEMENT_DIFF_RETIRE_LEDGER;
+        return EAGAIN;
+    case WL_COLUMNAR_ARRANGEMENT_DIFF_RETIRE_LEDGER:
         if (tx->retire_ledger) wl_mem_ledger_free(tx->retire_ledger,
                 WL_MEM_SUBSYS_ARRANGEMENT, tx->retire_bytes);
-        tx->retire_phase = 5; return EAGAIN;
-    case 5: {
+        tx->retire_ledger = NULL; tx->retire_bytes = 0;
+        tx->retire_phase = WL_COLUMNAR_ARRANGEMENT_DIFF_RETIRE_CREDIT;
+        return EAGAIN;
+    case WL_COLUMNAR_ARRANGEMENT_DIFF_RETIRE_CREDIT: {
         int rc = wl_columnar_arrangement_diff_finish_credit(&tx->retire_credit);
         if (rc) return rc;
-        tx->retire_phase = 6; return EAGAIN;
+        tx->retire_phase = WL_COLUMNAR_ARRANGEMENT_DIFF_RETIRE_GOVERNOR;
+        return EAGAIN;
     }
-    case 6:
+    case WL_COLUMNAR_ARRANGEMENT_DIFF_RETIRE_GOVERNOR:
         wl_columnar_memory_governor_ref_release(tx->retire_governor);
-        tx->retire_governor = NULL; tx->retire_ledger = NULL;
-        tx->retire_phase = 0; return 0;
+        tx->retire_governor = NULL;
+        tx->retire_phase = WL_COLUMNAR_ARRANGEMENT_DIFF_RETIRE_ACK;
+        return EAGAIN;
+    case WL_COLUMNAR_ARRANGEMENT_DIFF_RETIRE_ACK:
+        tx->retire_phase = WL_COLUMNAR_ARRANGEMENT_DIFF_RETIRE_SNAPSHOT;
+        return 0;
     default: return EINVAL;
     }
 }
@@ -4170,30 +4213,55 @@ wl_columnar_arrangement_diff_attempt_drain(
         tx->cleanup_phase = 0; ++tx->cleanup_index;
         return EAGAIN;
     }
-    if (tx->cleanup_phase == 0) {
+    if (tx->cleanup_phase == WL_COLUMNAR_ARRANGEMENT_DIFF_TAIL_ARRAY_FREE) {
         if (tx->committed) {
             free(tx->original); tx->original = NULL;
+        } else {
+            free(tx->image); tx->image = NULL;
+        }
+        tx->cleanup_phase = WL_COLUMNAR_ARRANGEMENT_DIFF_TAIL_ARRAY_LEDGER;
+        return EAGAIN;
+    }
+    if (tx->cleanup_phase == WL_COLUMNAR_ARRANGEMENT_DIFF_TAIL_ARRAY_LEDGER) {
+        if (tx->committed) {
             wl_mem_ledger_free(&sess->mem_ledger, WL_MEM_SUBSYS_ARRANGEMENT,
                 tx->old_bytes);
         } else {
-            free(tx->image); tx->image = NULL;
             if (tx->image_charged) wl_mem_ledger_free(&sess->mem_ledger,
                     WL_MEM_SUBSYS_ARRANGEMENT,
                     tx->array_bytes + tx->metadata_bytes);
+            tx->image_charged = false;
         }
-        tx->cleanup_phase = 1; return EAGAIN;
+        tx->cleanup_phase = WL_COLUMNAR_ARRANGEMENT_DIFF_TAIL_ARRAY_CREDIT;
+        return EAGAIN;
     }
-    if (tx->cleanup_phase == 1) {
+    if (tx->cleanup_phase == WL_COLUMNAR_ARRANGEMENT_DIFF_TAIL_ARRAY_CREDIT) {
         rc = wl_columnar_arrangement_diff_finish_credit(tx->committed
                 ? &tx->old_credit : &tx->image_credit);
         if (rc) return rc;
+        tx->cleanup_phase = WL_COLUMNAR_ARRANGEMENT_DIFF_TAIL_SLOTS_FREE;
+        return EAGAIN;
+    }
+    if (tx->cleanup_phase == WL_COLUMNAR_ARRANGEMENT_DIFF_TAIL_SLOTS_FREE) {
         free(tx->slots); tx->slots = NULL;
+        tx->cleanup_phase = WL_COLUMNAR_ARRANGEMENT_DIFF_TAIL_SLOTS_LEDGER;
+        return EAGAIN;
+    }
+    if (tx->cleanup_phase == WL_COLUMNAR_ARRANGEMENT_DIFF_TAIL_SLOTS_LEDGER) {
         if (tx->slots_charged) wl_mem_ledger_free(&sess->mem_ledger,
                 WL_MEM_SUBSYS_ARRANGEMENT, tx->slots_bytes);
-        tx->cleanup_phase = 2; return EAGAIN;
+        tx->slots_charged = false;
+        tx->cleanup_phase = WL_COLUMNAR_ARRANGEMENT_DIFF_TAIL_SLOTS_CREDIT;
+        return EAGAIN;
     }
-    rc = wl_columnar_arrangement_diff_finish_credit(&tx->slots_credit);
-    if (rc) return rc;
+    if (tx->cleanup_phase == WL_COLUMNAR_ARRANGEMENT_DIFF_TAIL_SLOTS_CREDIT) {
+        rc = wl_columnar_arrangement_diff_finish_credit(&tx->slots_credit);
+        if (rc) return rc;
+        tx->cleanup_phase = WL_COLUMNAR_ARRANGEMENT_DIFF_TAIL_ACK;
+        return EAGAIN;
+    }
+    if (tx->cleanup_phase !=
+        WL_COLUMNAR_ARRANGEMENT_DIFF_TAIL_ACK) return EINVAL;
     if (sess->diff_txn_count != 1) return EINVAL;
     sess->diff_txn_count = 0; tx->drained = true;
     return 0;
