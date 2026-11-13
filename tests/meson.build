@@ -7261,8 +7261,32 @@ test_evaluation_empty_edb_sources_exe = executable(
   c_args: ['-DWL_SESSION_TEST_HOOKS=1'],
   link_with: [testlib_prod],
 )
+# Run the complete coverage with: meson test --suite evaluation_empty_edb_sources
+# Each stop kind retains both modes and every discovered checkpoint. Splitting
+# the exhaustive fixture keeps the existing 60-second watchdog on CI runners.
 test('evaluation_empty_edb_sources', test_evaluation_empty_edb_sources_exe,
-     suite: ['unit', 'tsan'], timeout: 60)
+     args: ['--matrix'],
+     suite: ['unit', 'tsan', 'evaluation_empty_edb_sources'], timeout: 60)
+foreach stop_case : [
+  ['single', '0'],
+  ['union_a', '1'],
+  ['union_c', '2'],
+  ['union_both', '3'],
+  ['filter', '4'],
+  ['count', '5'],
+  ['grouped', '6'],
+  ['two_col', '7'],
+  ['int_expr', '8'],
+  ['int32', '9'],
+  ['uint32', '10'],
+  ['uint64', '11'],
+  ['bool', '12'],
+]
+  test('evaluation_empty_edb_sources_stops_' + stop_case[0],
+       test_evaluation_empty_edb_sources_exe,
+       args: ['--stops', stop_case[1]],
+       suite: ['unit', 'tsan', 'evaluation_empty_edb_sources'], timeout: 60)
+endforeach
 
 test_evaluation_physical_retirement_exe = executable(
   'test_evaluation_physical_retirement', files('test_evaluation_physical_retirement.c'),
