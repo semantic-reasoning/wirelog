@@ -274,13 +274,14 @@ static void primitive_resources(void) {
         }
     wl_columnar_memory_governor_t *budget =
         wl_columnar_memory_governor_ref_get(g);
-    atomic_store(&budget->usable_bytes, 0);
+    atomic_store_explicit(&budget->usable_bytes, 0, memory_order_seq_cst);
     wl_evaluation_control_t *c = begin(0); col_rel_t *out = NULL;
     CHECK(wl_columnar_relation_new_empty_input_operator_attempt_controlled(
             "input", r, NULL, g, &out, c,
             wl_evaluation_control_active_attempt_id(c)) == ENOSPC && !out);
     gates_free(r); CHECK(!reserved(g)); finish(c, ENOSPC);
-    atomic_store(&budget->usable_bytes, UINT64_C(128)<<20);
+    atomic_store_explicit(&budget->usable_bytes, UINT64_C(128)<<20,
+        memory_order_seq_cst);
     c = begin(0);
     CHECK(!wl_columnar_relation_new_empty_input_operator_attempt_controlled(
             "input", r, NULL, g, &out, c,
@@ -426,7 +427,8 @@ static void session_source(wl_evaluation_control_t *c, unsigned phase) {
     if (phase == 629 && f->deny_constructor) {
         wl_columnar_memory_governor_t *g =
             wl_columnar_memory_governor_ref_get(f->g);
-        atomic_store(&g->usable_bytes, wl_columnar_memory_reserved(g));
+        atomic_store_explicit(&g->usable_bytes, wl_columnar_memory_reserved(g),
+            memory_order_seq_cst);
         f->deny_constructor = false;
     }
 
@@ -867,8 +869,9 @@ static void session_resources(void) {
                 CHECK(!wl_evaluation_control_report(f.control, &report) &&
                     report.execution_status == expected &&
                     !report.cleanup_status);
-                atomic_store(&wl_columnar_memory_governor_ref_get(
-                        f.g)->usable_bytes, UINT64_C(128)<<20);
+                atomic_store_explicit(&wl_columnar_memory_governor_ref_get(
+                        f.g)->usable_bytes, UINT64_C(128)<<20,
+                    memory_order_seq_cst);
                 CHECK(!wl_evaluation_control_reset(f.control));
             }
             CHECK(!complete(f.controlled) && !complete(f.raw)); equal(&f);
@@ -1853,7 +1856,7 @@ static void timestamp_constructor_resources(void) {
     }
     wl_columnar_memory_governor_t *budget =
         wl_columnar_memory_governor_ref_get(g);
-    atomic_store(&budget->usable_bytes, 0);
+    atomic_store_explicit(&budget->usable_bytes, 0, memory_order_seq_cst);
     wl_evaluation_control_t *c = begin(0); col_rel_t *out = NULL;
     CHECK(
         wl_columnar_relation_new_empty_timestamp_input_operator_attempt_controlled
@@ -1862,7 +1865,8 @@ static void timestamp_constructor_resources(void) {
             wl_evaluation_control_active_attempt_id(c)) == ENOSPC && !out &&
         !reserved(g));
     gates_free(input); finish(c, ENOSPC);
-    atomic_store(&budget->usable_bytes, UINT64_C(128)<<20);
+    atomic_store_explicit(&budget->usable_bytes, UINT64_C(128)<<20,
+        memory_order_seq_cst);
     c = begin(0);
     CHECK(
         !

@@ -4098,10 +4098,12 @@ static void typed_one_shape(col_rel_t *r, uint32_t width,
         for (unsigned i = 0; i < 3; ++i) {
             CHECK(tokens[i]->identity == tokens[i] &&
                 tokens[i]->bytes == bytes[i]);
-            CHECK(atomic_load(&tokens[i]->state) == (bytes[i]?
+            CHECK(atomic_load_explicit(&tokens[i]->state,
+                memory_order_seq_cst) == (bytes[i]?
                 WL_COLUMNAR_MEMORY_RESERVATION_COMMITTED:
                 WL_COLUMNAR_MEMORY_RESERVATION_EMPTY));
-            CHECK(atomic_load(&tokens[i]->owner_bits) ==
+            CHECK(atomic_load_explicit(&tokens[i]->owner_bits,
+                memory_order_seq_cst) ==
                 (bytes[i]?(uint64_t)(uintptr_t)r:0));
         }
     }
@@ -4224,8 +4226,8 @@ static unsigned typed_one_reserve, typed_one_deny;
 static void typed_one_denial(wl_evaluation_control_t *c, uint64_t work) {
     checkpoint(c, work);
     if (work == 160 && ++typed_one_reserve == typed_one_deny)
-        atomic_store(&wl_columnar_memory_governor_ref_get(
-                watched)->usable_bytes, reserved());
+        atomic_store_explicit(&wl_columnar_memory_governor_ref_get(
+                watched)->usable_bytes, reserved(), memory_order_seq_cst);
 }
 
 static unsigned typed_one_action, typed_one_late;
@@ -4423,9 +4425,9 @@ static void typed_one_cases(void) {
                         wl_evaluation_control_active_attempt_id(c)) == ENOSPC &&
                         !out);
                     wl_columnar_relation_test_work_checkpoint = checkpoint;
-                    atomic_store(&wl_columnar_memory_governor_ref_get(
+                    atomic_store_explicit(&wl_columnar_memory_governor_ref_get(
                             watched)->usable_bytes,
-                        WL_COLUMNAR_MEMORY_MIN_BUDGET);
+                        WL_COLUMNAR_MEMORY_MIN_BUDGET, memory_order_seq_cst);
                     finish(c, ENOSPC); CHECK(reserved() == baseline);
                     release(c);
                 }
