@@ -290,10 +290,103 @@ test(unsigned scenario)
     wl_evaluation_control_release(c);
 }
 
+static void
+test_retirement_journal(unsigned scenario)
+{
+    wl_mem_ledger_t ledger;
+    wl_mem_ledger_init(&ledger, 0);
+    wl_mem_ledger_alloc(&ledger, WL_MEM_SUBSYS_RELATION, 100);
+    wl_columnar_mem_ledger_retirement_journal_t j = {0};
+    wl_columnar_mem_ledger_publication_request_t request = {
+        WL_MEM_SUBSYS_RELATION, WL_COLUMNAR_MEM_LEDGER_PUBLICATION_FREE, 37
+    };
+    wl_evaluation_control_t *c = create(109);
+    uint64_t id = wl_evaluation_control_active_attempt_id(c);
+    CHECK(!wl_columnar_mem_ledger_publication_describe_controlled(
+            &j.description, &owner, &ledger, &request, 1, c, id));
+    CHECK(finish(c, 0).consumed == 109);
+    id = begin(c, scenario == 1 ? 165 : scenario == 2 ? 193 : 256);
+    wl_evaluation_control_t *peer = NULL;
+    wl_columnar_mem_ledger_publication_prepared_t held = {0};
+    if (scenario == 3) {
+        peer = create(512);
+        CHECK(!wl_columnar_mem_ledger_publication_prepare_controlled(&ledger,
+            NULL, 0, &held, peer)
+            && !wl_columnar_mem_ledger_publication_try_acquire_controlled(
+                &held));
+    }
+    int rc = wl_columnar_mem_ledger_publication_try_commit_described_controlled(
+        &j.description, &owner, c, id);
+    CHECK(rc == (scenario == 1 || scenario == 2 ?
+        WL_EVALUATION_CONTROL_WORK_LIMIT : scenario == 3 ? EAGAIN : 0));
+    CHECK(wl_columnar_mem_ledger_retirement_capture_owned(&j, &owner, c, id)
+        == EINVAL && !j.report_valid);
+    if (peer) {
+        CHECK(!wl_columnar_mem_ledger_publication_cancel(&held));
+        finish(peer, 0);
+        CHECK(!wl_evaluation_control_detach(peer, &owner));
+        wl_evaluation_control_release(peer);
+    }
+    wl_evaluation_control_report_t commit = finish(c, rc);
+    CHECK(commit.consumed == (scenario == 1 ? 0 : scenario == 2 ? 166 : 194));
+    CHECK(wl_columnar_mem_ledger_retirement_capture_owned(&j, &other, c, id)
+        == EINVAL && !j.report_valid);
+    CHECK(!wl_columnar_mem_ledger_retirement_capture_owned(&j, &owner, c, id)
+        && j.report_valid
+        && !memcmp(&commit, &j.report, sizeof(commit)));
+    CHECK(!wl_columnar_mem_ledger_retirement_capture_owned(&j, &owner, c, id));
+    wl_columnar_mem_ledger_retirement_journal_t copied = j;
+    CHECK(wl_columnar_mem_ledger_retirement_capture_owned(&copied, &owner,
+        c, id) == EINVAL);
+    /* Actual metadata refusal overwrites completed with a DIFFERENT report.
+     * The captured COMMIT must survive; do not recapture that later receipt. */
+    uint64_t ack_id = begin(c, 127);
+    CHECK(wl_evaluation_control_charge_attempt(c, ack_id, 128)
+        == WL_EVALUATION_CONTROL_WORK_LIMIT);
+    finish(c, WL_EVALUATION_CONTROL_WORK_LIMIT);
+    CHECK(wl_columnar_mem_ledger_retirement_capture_owned(&j, &owner, c, id)
+        == EINVAL && !memcmp(&commit, &j.report, sizeof(commit)));
+    ack_id = begin(c, 128);
+    CHECK(!wl_evaluation_control_charge_attempt(c, ack_id, 128));
+    bool applied = true;
+    CHECK(wl_columnar_mem_ledger_retirement_ack_prepaid_owned(&copied,
+        &owner, c, ack_id, &applied) == EINVAL && applied);
+    CHECK(wl_columnar_mem_ledger_retirement_ack_prepaid_owned(&j,
+        &other, c, ack_id, &applied) == EINVAL && applied);
+    CHECK(wl_columnar_mem_ledger_retirement_ack_prepaid_owned(&j,
+        &owner, c, ack_id, &j.report_valid) == EINVAL && j.report_valid);
+    CHECK(!wl_columnar_mem_ledger_retirement_ack_prepaid_owned(&j,
+        &owner, c, ack_id, &applied) && applied == (scenario == 0)
+        && !j.report_valid && !j.description.identity);
+    wl_evaluation_control_request_cancel(c);
+    CHECK(wl_evaluation_control_charge_attempt(c, ack_id, 0)
+        == WL_EVALUATION_CONTROL_CANCELLED);
+    CHECK(finish(c, WL_EVALUATION_CONTROL_CANCELLED).consumed == 128);
+    /* A late footer cannot ACK twice or replay the ledger decrement. */
+    ack_id = begin(c, 128);
+    CHECK(!wl_evaluation_control_charge_attempt(c, ack_id, 128));
+    bool unchanged = applied;
+    CHECK(wl_columnar_mem_ledger_retirement_ack_prepaid_owned(&j,
+        &owner, c, ack_id, &applied) == EINVAL && applied == unchanged);
+    finish(c, 0);
+    wl_mem_ledger_snapshot_t snapshot;
+    wl_mem_ledger_snapshot(&ledger, &snapshot);
+    CHECK(!gate(&ledger) && snapshot.current_bytes == (scenario ? 100 : 63));
+    if (scenario) {
+        publish(&j.description, c, &ledger, &request, 1);
+        wl_mem_ledger_snapshot(&ledger, &snapshot);
+        CHECK(snapshot.current_bytes == 63);
+    }
+    CHECK(!wl_evaluation_control_detach(c, &owner));
+    wl_evaluation_control_release(c);
+}
+
 int
 main(void)
 {
     for (unsigned scenario = 0; scenario < 11; ++scenario) test(scenario);
+    for (unsigned scenario = 0; scenario < 4; ++scenario)
+        test_retirement_journal(scenario);
     puts(
         "ledger description: finite independent grants and one-shot publication passed");
     return 0;
