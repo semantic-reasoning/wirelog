@@ -7149,6 +7149,18 @@ test_trace_store_exe = executable(
   link_with: [testlib_prod],
 )
 test('trace_store', test_trace_store_exe, suite: ['unit', 'tsan'], timeout: 120)
+# The real private image journals physical frees separately from attribution,
+# credit return and the final transaction acknowledgement.
+test_arrangement_diff_drain_exe = executable(
+  'test_arrangement_diff_drain', files('test_arrangement_diff_drain.c'),
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
+  c_args: ['-DWL_SESSION_TEST_HOOKS=1'],
+  link_with: [testlib_prod],
+)
+test('arrangement_diff_drain', test_arrangement_diff_drain_exe,
+     suite: ['unit', 'tsan', 'evaluation_differential'], timeout: 30)
+
 # #2296: scalar source selectors and legal differential/removal routes.
 test_evaluation_differential_exe = executable(
   'test_evaluation_differential', files('test_evaluation_differential.c'),
