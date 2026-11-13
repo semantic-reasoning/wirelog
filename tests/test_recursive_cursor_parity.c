@@ -266,7 +266,8 @@ int main(int argc, char **argv){
     scalar_controls();
     effect_controls();
     CHECK(!fflush(capture)); rewind(capture);
-    FILE *expected = fopen(argv[1], "rb"); CHECK(expected);
+    /* Text mode folds a CRLF checkout (core.autocrlf on Windows) to LF. */
+    FILE *expected = fopen(argv[1], "r"); CHECK(expected);
     size_t offset = 0;
     for (;;) {
         int actual = fgetc(capture), reference = fgetc(expected);
