@@ -693,8 +693,8 @@ empty_calls_of(unsigned kind, unsigned *constructor_calls)
     return n;
 }
 
-int
-main(void)
+static void
+run_matrix(void)
 {
     for (unsigned kind = 0; kind < K_COUNT_KINDS; kind++)
         for (unsigned snapshot = 0; snapshot < 2; snapshot++)
@@ -707,26 +707,61 @@ main(void)
     for (unsigned snapshot = 0; snapshot < 2; snapshot++)
         for (unsigned observed = 0; observed < 2; observed++)
             untyped_rows(K_INT_EXPR, snapshot, observed);
-    for (unsigned kind = 0; kind < K_FLOAT; kind++)
-        for (unsigned mode = 1; mode < 3; mode++) {
-            /* At the consumer's publication, or at CONCAT for a UNION. */
-            if (cases[kind].first != WL_PLAN_OP_REDUCE)
-                stopped(kind, mode, is_union(kind) ? "$concat"
+}
+
+static void
+run_stops(unsigned kind)
+{
+    for (unsigned mode = 1; mode < 3; mode++) {
+        /* At the consumer's publication, or at CONCAT for a UNION. */
+        if (cases[kind].first != WL_PLAN_OP_REDUCE)
+            stopped(kind, mode, is_union(kind) ? "$concat"
                     : cases[kind].output, 0, 0);
-            unsigned constructor_calls = 0;
-            unsigned n = empty_calls_of(kind, &constructor_calls);
-            if (private_empty_step(kind)) {
-                CHECK(n == 0 && constructor_calls > 0);
-                /* Stop each real source/recipe/drain/output boundary. */
-                for (unsigned at = 1; at <= constructor_calls; at++)
-                    stopped(kind, mode, NULL, 0, at);
-            } else {
-                CHECK(constructor_calls == 0 && n >= 2 * bare_count(kind));
-                /* VARIABLE and the consumer still hold the real bare EDB. */
-                for (unsigned at = 1; at <= n; at++)
-                    stopped(kind, mode, NULL, at, 0);
-            }
+        unsigned constructor_calls = 0;
+        unsigned n = empty_calls_of(kind, &constructor_calls);
+        if (private_empty_step(kind)) {
+            CHECK(n == 0 && constructor_calls > 0);
+            /* Stop each real source/recipe/drain/output boundary. */
+            for (unsigned at = 1; at <= constructor_calls; at++)
+                stopped(kind, mode, NULL, 0, at);
+        } else {
+            CHECK(constructor_calls == 0 && n >= 2 * bare_count(kind));
+            /* VARIABLE and the consumer still hold the real bare EDB. */
+            for (unsigned at = 1; at <= n; at++)
+                stopped(kind, mode, NULL, at, 0);
         }
+    }
+}
+
+static int
+usage(const char *program)
+{
+    fprintf(stderr, "usage: %s [--matrix | --stops KIND(0..12)]\n", program);
+    return 2;
+}
+
+int
+main(int argc, char **argv)
+{
+    if (argc == 1) {
+        run_matrix();
+        for (unsigned kind = 0; kind < K_FLOAT; ++kind)
+            run_stops(kind);
+    } else if (argc == 2 && !strcmp(argv[1], "--matrix")) {
+        run_matrix();
+    } else if (argc == 3 && !strcmp(argv[1], "--stops")) {
+        /* Accept at most two decimal digits, before creating any fixture. */
+        const char *value = argv[2];
+        if (value[0] < '0' || value[0] > '9') return usage(argv[0]);
+        unsigned kind = (unsigned)(value[0] - '0');
+        if (value[1]) {
+            if (value[1] < '0' || value[1] > '9' || value[2])
+                return usage(argv[0]);
+            kind = kind * 10u + (unsigned)(value[1] - '0');
+        }
+        if (kind >= K_FLOAT) return usage(argv[0]);
+        run_stops(kind);
+    } else return usage(argv[0]);
     puts("evaluation_empty_edb_sources: OK");
     return 0;
 }
