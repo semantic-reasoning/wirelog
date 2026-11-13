@@ -6911,6 +6911,23 @@ test_evaluation_output_materialization_exe = executable(
 test('evaluation_output_materialization', test_evaluation_output_materialization_exe,
      suite: ['unit', 'tsan'], timeout: 60)
 
+# Unfunded description and callback-free one-CAS publication under separate
+# finite grants. Existing prepared publication remains an independent target.
+test_mem_ledger_description_exe = executable(
+  'test_mem_ledger_description',
+  files('test_mem_ledger_description.c',
+        '../wirelog/columnar/mem_ledger_publication.c',
+        '../wirelog/columnar/mem_ledger.c',
+        '../wirelog/columnar/memory_governor.c',
+        '../wirelog/evaluation_control.c'),
+  thread_src,
+  c_args: ['-DWL_COLUMNAR_MEM_LEDGER_PUBLICATION_TEST_HOOKS=1', '-DWL_SESSION_TEST_HOOKS=1'],
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [threads_dep], install: false,
+)
+test('mem_ledger_description', test_mem_ledger_description_exe,
+     suite: ['unit', 'tsan'], timeout: 60)
+
 # Finite three-event/two-ledger sibling; old max2 target remains unchanged.
 test_mem_ledger_transfer_exe = executable(
   'test_mem_ledger_transfer',
