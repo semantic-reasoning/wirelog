@@ -1707,8 +1707,8 @@ MSVC uses Interlocked observation/release; C11 retains acquire-load/release-stor
 | `mem_ledger_publication.c:wl_columnar_mem_ledger_publication_gate_read#2` | ledger writer gate | `atomic_load_explicit` | acquire | C11 observation under original authority |
 | `mem_ledger_publication.c:wl_columnar_mem_ledger_publication_strong` | ledger writer gate | `atomic_compare_exchange_weak_explicit` | acquire/relaxed | MSVC shim is a nonspurious single Interlocked CAS |
 | `mem_ledger_publication.c:wl_columnar_mem_ledger_publication_strong#2` | ledger writer gate | `atomic_compare_exchange_strong_explicit` | acquire/relaxed | One admitted nonspurious C11 acquisition attempt |
-| `mem_ledger_publication.c:wl_columnar_mem_ledger_publication_release` | ledger writer gate | `atomic_exchange_explicit` | release | MSVC publishes finite current-counter updates before consuming original record |
-| `mem_ledger_publication.c:wl_columnar_mem_ledger_publication_release#2` | ledger writer gate | `atomic_store_explicit` | release | C11 publishes finite current-counter updates before consuming original record |
+| `mem_ledger_publication.c:wl_columnar_mem_ledger_publication_gate_release` | ledger writer gate | `atomic_exchange_explicit` | release | MSVC publishes finite current-counter updates before consuming the actual prepared or described record |
+| `mem_ledger_publication.c:wl_columnar_mem_ledger_publication_gate_release#2` | ledger writer gate | `atomic_store_explicit` | release | C11 publishes finite current-counter updates before consuming the actual prepared or described record |
 
 ### Caller-attempt-bound governor admission
 
