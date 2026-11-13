@@ -7567,3 +7567,14 @@ radix_workspace_attempt_exe = executable('test_evaluation_radix_workspace',
   link_with: [radix_workspace_hook_lib])
 test('evaluation_radix_workspace', radix_workspace_attempt_exe,
   suite: ['unit', 'tsan'], timeout: 120)
+
+# Captured before the cursor refactor through actual raw compiler/session paths.
+recursive_cursor_parity_exe = executable('test_recursive_cursor_parity',
+  files('test_recursive_cursor_parity.c'),
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  c_args: ['-DWL_SESSION_TEST_HOOKS=1'],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
+  link_with: [testlib_prod])
+test('recursive_cursor_parity', recursive_cursor_parity_exe,
+  args: files('data/recursive_cursor_baseline.txt'),
+  suite: ['unit', 'tsan'], timeout: 120)
