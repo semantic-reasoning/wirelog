@@ -483,7 +483,7 @@ static fixture_t create(const char *type, const char *output, const char *expr,
     create_sessions(&f, text);
     return f;
 }
-static void bind(fixture_t *f) {
+static void hook(fixture_t *f) {
     active = f; wl_session_set_delta_cb(f->controlled, events, f);
     wl_columnar_filter_test_map_schema = schema;
     wl_columnar_expr_test_checkpoint = expression;
@@ -562,7 +562,7 @@ static void session_matrix(void) {
                            "cat(x,\"!\")", "to_string(x)"};
     for (unsigned kind = 0; kind < 6; ++kind) {
         fixture_t f = create(types[kind], outputs[kind], exprs[kind], false,
-                false); bind(&f);
+                false); hook(&f);
         col_relation_snapshot_t before = wl_columnar_relation_snapshot(f.input);
         uint32_t width = f.input->ncols; bool ok = f.input->schema_ok;
         CHECK(!complete(f.controlled) && !complete(f.raw)); equal(&f);
@@ -624,7 +624,7 @@ static void session_matrix(void) {
             filter < 2;
             ++filter) {
             fixture_t f = create("int64", "string", "to_string(x)", graph != 0,
-                    filter != 0); bind(&f);
+                    filter != 0); hook(&f);
             CHECK(!f.input->ncols && !f.input->schema_ok &&
                 f.input->declared_ncols == f.width &&
                 f.input->has_graph_column == (graph != 0));
@@ -665,7 +665,7 @@ static void session_stops(void) {
                     fixture_t f = create("int64", "string", "to_string(x)",
                             graph != 0,
                             false);
-                    if (unobserved) bind_unobserved(&f); else bind(&f);
+                    if (unobserved) bind_unobserved(&f); else hook(&f);
                     col_relation_snapshot_t before =
                         wl_columnar_relation_snapshot(f.input);
                     uint64_t baseline = reserved(f.g); f.stop = phases[k];
@@ -774,7 +774,7 @@ static void old_public_image_stops(void) {
         "out(to_string(x)):-input(x).\nbase(x):-other(x).\n";
     for (action = 0; action < 5; ++action) {
         fixture_t f = {0}; f.width = 1; f.background = true;
-        create_sessions(&f, text); bind(&f);
+        create_sessions(&f, text); hook(&f);
         int64_t value = 1;
         CHECK(!wl_session_insert(f.controlled, "other", &value, 1, 1) &&
             !wl_session_insert(f.raw, "other", &value, 1, 1));
@@ -845,7 +845,7 @@ static void session_resources(void) {
         for (unsigned allocation = 1; allocation <= 4; ++allocation) {
             fixture_t f = create("int64", "string", "to_string(x)", false,
                     false);
-            if (unobserved) bind_unobserved(&f); else bind(&f);
+            if (unobserved) bind_unobserved(&f); else hook(&f);
             col_relation_snapshot_t before =
                 wl_columnar_relation_snapshot(f.input);
             uint64_t baseline = reserved(f.g);
@@ -990,7 +990,7 @@ static void late_two_head_matrix(void) {
                 snprintf(text, sizeof(text),
                     ".decl input(x:int64)\n.decl other(x:int64)\n.decl out(y:%s)\n.decl base(y:int64)\nout(%s):-input(x).\nbase(x):-other(x).\n",
                     numeric?"int64":"string", numeric?"x+1":"to_string(x)");
-                create_sessions(&f, text); bind(&f); insert(&f, 1, false);
+                create_sessions(&f, text); hook(&f); insert(&f, 1, false);
                 int64_t one = 1, two = 2;
                 CHECK(!wl_session_insert(f.controlled, "other", &one, 1,
                     1) && !wl_session_insert(f.raw, "other", &one, 1, 1));
@@ -1090,7 +1090,7 @@ static void late_end_matrix(void) {
                         fixture_t f = create("int64", numeric?"int64":"string",
                                 numeric?"x+1":"to_string(x)", graph != 0,
                                 false);
-                        if (observed) bind(&f); else bind_unobserved(&f);
+                        if (observed) hook(&f); else bind_unobserved(&f);
                         CHECK(!complete(f.controlled) && !complete(f.raw));
                         equal(&f);
                         insert(&f, 1, false);
@@ -1548,7 +1548,7 @@ static void unobserved_unknown_variable(void) {
             (wl_plan_op_t *)&f.plan->strata[0].relations[0].ops[0];
         const char *name = var->relation_name;
         var->relation_name = "not_the_registered_edb";
-        if (observed)bind(&f); else bind_unobserved(&f);
+        if (observed)hook(&f); else bind_unobserved(&f);
         col_relation_snapshot_t before = wl_columnar_relation_snapshot(f.input);
         CHECK(complete(f.raw) == ENOENT && complete(f.controlled) == ENOENT);
         CHECK(!f.events && !f.metadata && !f.bodies &&

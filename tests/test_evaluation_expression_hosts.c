@@ -267,7 +267,7 @@ static void map_schema(const col_rel_t *r, bool known){
                 r->column_types[0] == active->map_type);
     }
 }
-static void bind(host_t *f){
+static void hook(host_t *f){
     active = f; wl_columnar_filter_test_map_schema = map_schema;
     wl_session_set_delta_cb(f->session, event, f);
     wl_columnar_expr_test_checkpoint = observe;
@@ -349,7 +349,7 @@ static void numeric_right_oracle(void){
 static void positives(void){
     for (unsigned numeric = 0; numeric < 2; ++numeric)for (unsigned product = 0;
             product < 2; ++product){
-            host_t f = create(numeric, product); bind(&f); left(&f);
+            host_t f = create(numeric, product); hook(&f); left(&f);
             add(&f, 1, true); add(&f, 2, false); add(&f, 3, true);
             CHECK(!complete(f.session) && !wl_session_step(f.raw)); compare(&f);
             CHECK(f.events == (product?8u:2u) && f.selected == 2);
@@ -372,7 +372,7 @@ static void positives(void){
 }
 static void empty_and_invalid(void){
     for (unsigned empty = 0; empty < 2; ++empty) {
-        host_t f = create(false, false); bind(&f); left(&f); add(&f, 1, true);
+        host_t f = create(false, false); hook(&f); left(&f); add(&f, 1, true);
         if (empty) {
             int64_t row[] = {1, wl_intern_put(f.plan->intern, "yes")};
             CHECK(!wl_session_remove(f.session, "right", row, 1,
@@ -454,7 +454,7 @@ static void probe_positives(void){
             numeric < 2;
             ++numeric)
             for (unsigned keyless = 0; keyless < 2; ++keyless) {
-                host_t f = create_kind(numeric, keyless, kind); bind(&f);
+                host_t f = create_kind(numeric, keyless, kind); hook(&f);
                 left(&f);
                 add(&f, 1, false); add(&f, 1, true); add(&f, 2, false);
                 add(&f, 3, true); add(&f, 3, false);
@@ -493,7 +493,7 @@ static void probe_empty(void){
             keyless < 2;
             ++keyless)
             for (unsigned empty = 0; empty < 2; ++empty) {
-                host_t f = create_kind(false, keyless, kind); bind(&f);
+                host_t f = create_kind(false, keyless, kind); hook(&f);
                 left(&f);
                 add(&f, 1, false); add(&f, 2, false);
                 if (empty) {
@@ -512,7 +512,7 @@ static void probe_empty(void){
 }
 static void probe_collisions(void){
     for (unsigned kind = 1; kind < 3; ++kind) {
-        host_t f = create_kind(false, false, kind); bind(&f); left(&f);
+        host_t f = create_kind(false, false, kind); hook(&f); left(&f);
         const col_rel_t *r = session_find_rel(COL_SESSION(f.session), "right");
         uint32_t bucket = wl_columnar_hash_value(2166136261u, r, 0, 1)&15u;
         unsigned excluded[2], found = 0;
@@ -589,7 +589,7 @@ static void stops(void){
         for (unsigned product = 0; product < 2; ++product) for (unsigned p = 0;
                 p < sizeof(phases)/sizeof(phases[0]); ++p) for (action = 0;
                     action < 5; ++action) {
-                    host_t f = create_kind(false, product, kind); bind(&f);
+                    host_t f = create_kind(false, product, kind); hook(&f);
                     left(&f);
                     add(&f, 1, true);
                     CHECK(!complete(f.session) && !wl_session_step(f.raw));
@@ -704,7 +704,7 @@ static void map_positives(void){
     for (unsigned kind = 0; kind < 4; ++kind) {
         host_t f = create_map("int64", kind == 1?"string":"int64",
                 expressions[kind], false, NULL); f.numeric = kind == 2;
-        bind(&f);
+        hook(&f);
         /* Genuine typed-empty source. First-missing logical schema has a
          * separate concrete adapter obligation, recorded in the ledger. */
         map_input(&f, 1, false); map_input(&f, 1, true);
@@ -745,7 +745,7 @@ static void map_positives(void){
         CHECK(!wl_session_step(f.session) && f.events == events); destroy(&f);
     }
     host_t f = create_map("int64", "int64", "strlen(to_string(x))", true, NULL);
-    bind(&f);
+    hook(&f);
     CHECK(!complete(f.session) && !wl_session_step(f.raw)); compare(&f);
     CHECK(f.auth && f.compile && f.balance[1] == 1);
     map_input(&f, 12, false);
@@ -765,7 +765,7 @@ static void map_snapshot(const char *name, const int64_t *row, uint32_t width,
 }
 static void map_errors(void){
     host_t f = create_map("string", "int64", "to_number(x)", false, NULL);
-    bind(&f);
+    hook(&f);
     int64_t two = wl_intern_put(f.plan->intern, "2"),
         three = wl_intern_put(f.plan->intern, "3");
     map_input(&f, two, false); map_input(&f, three, false);
@@ -789,7 +789,7 @@ static void map_errors(void){
     CHECK(!wl_evaluation_control_reset(f.control) && !complete(f.session) &&
         !wl_session_step(f.raw)); compare(&f); destroy(&f);
     f = create_map("int64", "int64", "strlen(to_string(x))", false, NULL);
-    bind(&f); map_input(&f, 1, false);
+    hook(&f); map_input(&f, 1, false);
     CHECK(!complete(f.session) && !wl_session_step(f.raw)); compare(&f);
     map_input(&f, 12, false);
     old = session_find_rel(COL_SESSION(f.session), "out");
@@ -845,7 +845,7 @@ static void map_extension(void){
     wirelog_extension_snapshot_t *snapshot =
         wirelog_extension_snapshot_acquire(registry); CHECK(snapshot);
     host_t f = create_map("string", "int64", "@call(\"test.map\",x)", false,
-            snapshot); bind(&f);
+            snapshot); hook(&f);
     CHECK(!wirelog_extension_unregister(registry, "test.map"));
     wirelog_extension_snapshot_release(snapshot);
     CHECK(!map_extension_destroyed);
@@ -887,7 +887,7 @@ static void map_extension(void){
 static void map_empty_stops(void){
     for (action = 0; action < 5; ++action) {
         host_t f = create_map("int64", "string", "to_string(x)", false, NULL);
-        bind(&f);
+        hook(&f);
         map_input(&f, 1, false); map_input(&f, 1, true);
         col_rel_t *old = session_find_rel(COL_SESSION(f.session), "out");
         col_relation_snapshot_t before =
@@ -924,7 +924,7 @@ static void map_empty_stops(void){
 }
 static void map_identity_forms(void){
     for (unsigned form = 0; form < 4; ++form) {
-        host_t f = create_map("int64", "int64", "x", false, NULL); bind(&f);
+        host_t f = create_map("int64", "int64", "x", false, NULL); hook(&f);
         wl_plan_op_t *map =
             (wl_plan_op_t *)&f.plan->strata[0].relations[0].ops[1];
         wl_plan_expr_buffer_t *original_array = map->map_exprs;
@@ -958,7 +958,7 @@ static void map_unobserved(void){
     for (unsigned kind = 0; kind < 4; ++kind) {
         host_t f = create_map("int64", kind == 1?"string":"int64",
                 expressions[kind], false, NULL); f.numeric = kind == 2;
-        f.map_unobserved = true; bind(&f);
+        f.map_unobserved = true; hook(&f);
         wl_session_set_delta_cb(f.session, NULL, NULL);
         map_input(&f, 1, false); map_input(&f, 12, false);
         CHECK(!complete(f.session) && !wl_session_step(f.raw)); compare(&f);
@@ -979,7 +979,7 @@ static void map_stops(void){
             0;
             action < 5; ++action) {
             host_t f = create_map("int64", "int64", "strlen(to_string(x))",
-                    false, NULL); bind(&f); map_input(&f, 1, false);
+                    false, NULL); hook(&f); map_input(&f, 1, false);
             CHECK(!complete(f.session) && !wl_session_step(f.raw)); compare(&f);
             col_rel_t *old = session_find_rel(COL_SESSION(f.session), "out");
             col_relation_snapshot_t old_image =

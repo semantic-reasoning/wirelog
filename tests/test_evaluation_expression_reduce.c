@@ -193,7 +193,7 @@ static void grant_finished(const wl_col_session_t *session,
             (unsigned long long)report.consumed, (unsigned long long)expected);
     CHECK(report.consumed == expected); ++actual_latch_cells;
 }
-static void bind(fixture_t *f){
+static void hook(fixture_t *f){
     active = f; actual_latch_cells = 0;
     wl_columnar_session_test_framed_grant_limit = grant_limit;
     wl_columnar_session_test_framed_grant_finished = grant_finished;
@@ -263,7 +263,7 @@ static void positives(void){
             ++grouped) for (unsigned mixed = 0;
                 mixed < 2; ++mixed){
                 fixture_t f = create(functions[fn], grouped, mixed,
-                        "strlen(s)"); bind(&f); gate(&f); add(&f, 1, "a");
+                        "strlen(s)"); hook(&f); gate(&f); add(&f, 1, "a");
                 add(&f, 1, "bb"); add(&f, 2, "ccc");
                 CHECK(!complete(&f) && !wl_session_step(f.raw)); compare(&f);
                 CHECK(f.compile && f.eval && f.auth);
@@ -345,7 +345,7 @@ static void stops(void){
     for (unsigned mixed = 0; mixed < 2; ++mixed)for (unsigned p = 0;
             p < sizeof(phases)/sizeof(phases[0]); ++p) for (action = 0;
                 action < 5; ++action){
-                fixture_t f = create("sum", true, mixed, "strlen(s)"); bind(&f);
+                fixture_t f = create("sum", true, mixed, "strlen(s)"); hook(&f);
                 gate(&f); add(&f, 1, "a");
                 CHECK(!complete(&f) && !wl_session_step(f.raw)); compare(&f);
                 col_rel_t *old = session_find_rel(COL_SESSION(f.bounded),
@@ -408,7 +408,7 @@ static void stops(void){
 }
 static void ignored_count(void){
     for (unsigned malformed = 0; malformed < 2; ++malformed) {
-        fixture_t f = create("count", true, false, "strlen(s)"); bind(&f);
+        fixture_t f = create("count", true, false, "strlen(s)"); hook(&f);
         if (malformed)for (unsigned i = 0; i < f.plan->stratum_count; ++i)
                 for (unsigned j = 0; j < f.plan->strata[i].relation_count;
                     ++j){
@@ -433,7 +433,7 @@ static void ignored_count(void){
     }
 }
 static void errors_and_allocations(void){
-    fixture_t f = create("sum", true, false, "to_number(s)"); bind(&f);
+    fixture_t f = create("sum", true, false, "to_number(s)"); hook(&f);
     add(&f, 1, "2"); add(&f, 1, "3");
     CHECK(!complete(&f) && !wl_session_step(f.raw)); compare(&f);
     CHECK(f.balance[1][5] == 1);
@@ -453,7 +453,7 @@ static void errors_and_allocations(void){
     CHECK(!wl_evaluation_control_reset(f.control) && !complete(&f) &&
         !wl_session_step(f.raw)); compare(&f); destroy(&f);
     for (unsigned family = 0; family < 2; ++family) {
-        f = create("sum", true, false, "strlen(s)"); bind(&f); add(&f, 1, "a");
+        f = create("sum", true, false, "strlen(s)"); hook(&f); add(&f, 1, "a");
         CHECK(!complete(&f) && !wl_session_step(f.raw)); compare(&f);
         add(&f, 2, "bb");
         old = session_find_rel(COL_SESSION(f.bounded), "out");
