@@ -2433,6 +2433,9 @@ typedef struct {
     col_diff_arrangement_t *building, *retiring;
     wl_columnar_memory_governor_ref_t *retire_governor;
     struct wl_mem_ledger *retire_ledger;
+    /* Survives physical arrangement/header and array destruction. Only the
+     * finite parent adapter uses this original-address report/ACK journal. */
+    wl_columnar_mem_ledger_retirement_journal_t ledger_journal;
     bool started, ready, committed, drained, building_initialized;
     bool image_charged, slots_charged, prepared;
 } wl_columnar_arrangement_diff_attempt_t;
@@ -8249,6 +8252,19 @@ void wl_columnar_arrangement_diff_attempt_commit(
 int wl_columnar_arrangement_diff_attempt_drain(
     wl_columnar_arrangement_diff_attempt_t *, wl_col_session_t *,
     wl_evaluation_control_t *, uint64_t);
+/* One actual finite parent action, without the generic128 prefix on ledger
+ * DESCRIBE109/COMMIT194. The real parent pins the same control allocation and
+ * this record until every action's actual FINISH/report/Source receipt/ACK.
+ * Capture a consumed COMMIT report before starting another generation. The
+ * next drain uses its existing metadata128 action for the prepaid fixed ACK;
+ * applied=false retries fresh DESCRIBE only after that ACK. Legacy raw drain
+ * is unchanged and cannot be interleaved while this journal is live. */
+int wl_columnar_arrangement_diff_attempt_drain_finite(
+    wl_columnar_arrangement_diff_attempt_t *, wl_col_session_t *,
+    wl_evaluation_control_t *, uint64_t);
+int wl_columnar_arrangement_diff_attempt_ledger_capture_owned(
+    wl_columnar_arrangement_diff_attempt_t *, wl_evaluation_control_t *,
+    uint64_t);
 #ifdef WL_SESSION_TEST_HOOKS
 extern void (*wl_columnar_arrangement_test_diff_checkpoint)(
     wl_evaluation_control_t *, unsigned, uint64_t);
