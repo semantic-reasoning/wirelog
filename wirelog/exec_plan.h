@@ -623,6 +623,13 @@ typedef struct {
  *            @op_count is 0.
  * @op_count: Number of operators.
  */
+typedef enum {
+    WL_PLAN_BODY_LINEAGE_NONE = 0,
+    WL_PLAN_BODY_LINEAGE_LOWERED,
+    WL_PLAN_BODY_LINEAGE_OTHER_REWRITE,
+    WL_PLAN_BODY_LINEAGE_K_FUSION_EQUIVALENT
+} wl_plan_body_lineage_t;
+
 typedef struct {
     const wl_plan_op_t *ops;
     uint32_t op_count;
@@ -630,6 +637,12 @@ typedef struct {
      * hand-built bodies leave declared_int64 false. No allocation ownership. */
     uint32_t declared_width;
     bool declared_int64;
+    /* Compiler provenance within the existing immutable-plan contract. The
+     * exact generated K-fusion object is borrowed, never freed by this body.
+     * Zero/hand-built bodies claim no rewritten-body equivalence. */
+    wl_plan_body_lineage_t lineage;
+    const void *equivalent_k_fusion_opaque;
+    uint32_t equivalent_k;
 } wl_plan_body_t;
 
 /**

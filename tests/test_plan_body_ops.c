@@ -20,6 +20,7 @@
 
 #include "../wirelog/exec_plan.h"
 #include "../wirelog/exec_plan_gen.h"
+#include "../wirelog/columnar/columnar_nanoarrow.h"
 #include "../wirelog/passes/sip.h"
 #include "../wirelog/wirelog.h"
 #include "plan_fixture.h"
@@ -252,6 +253,10 @@ test_chain(void)
         const wl_plan_relation_t *rp = &plan->strata[si].relations[ri];
         if (!has_op(rp->ops, rp->op_count, WL_PLAN_OP_LFTJ))
             why = "the chain was not rewritten to LFTJ";
+        const wl_plan_body_t *body = &plan->strata[si].bodies[ri];
+        if (body->lineage != WL_PLAN_BODY_LINEAGE_OTHER_REWRITE
+            || body->equivalent_k_fusion_opaque || body->equivalent_k)
+            why = "LFTJ retained a false unchanged-body lineage";
     }
     wl_plan_free(plan);
     if (why) {
@@ -445,9 +450,67 @@ test_count_result_domains(void)
     }
 }
 
+static void
+test_materialized_body_lineage(void)
+{
+    ++tests_run;
+    printf("  compiler-bound materialized body lineage");
+    wl_plan_t *plan = build(
+        ".decl edge(x:int64,y:int64)\n.decl path(x:int64,y:int64)\n"
+        ".decl plain(x:int64,y:int64)\nplain(x,y):-edge(x,y).\n"
+        "path(x,y):-edge(x,y).\n"
+        "path(x,z):-path(x,y),path(y,w),path(w,z).\n");
+    if (!plan) {
+        FAIL("natural plan missing"); return;
+    }
+    const char *why = NULL;
+    uint32_t si, ri;
+    if (!find_relation(plan, "path", &si, &ri)) why = "path missing";
+    else {
+        const wl_plan_relation_t *relation = &plan->strata[si].relations[ri];
+        const wl_plan_body_t *body = &plan->strata[si].bodies[ri];
+        const wl_plan_op_k_fusion_t *fusion = NULL;
+        unsigned fused = 0, hinted = 0;
+        for (uint32_t i = 0; i < relation->op_count; ++i)
+            if (relation->ops[i].op == WL_PLAN_OP_K_FUSION) {
+                ++fused; fusion = relation->ops[i].opaque_data;
+            }
+        if (fused != 1 || !fusion || fusion->k != 3 || !fusion->k_ops
+            || !fusion->k_op_counts ||
+            body->lineage != WL_PLAN_BODY_LINEAGE_K_FUSION_EQUIVALENT
+            || body->equivalent_k_fusion_opaque != fusion ||
+            body->equivalent_k != 3)
+            why = "actual generated fusion is not tied to its preserved body";
+        if (!why) {
+            for (uint32_t k = 0; k < fusion->k; ++k)
+                for (uint32_t o = 0; o < fusion->k_op_counts[k]; ++o)
+                    hinted += fusion->k_ops[k][o].op == WL_PLAN_OP_JOIN
+                        && fusion->k_ops[k][o].materialized;
+            if (hinted !=
+                3) why = "materialized compiler destination not reached";
+            for (uint32_t o = 0; o < body->op_count; ++o)
+                if (body->ops[o].opaque_data || body->ops[o].materialized)
+                    why = "preserved body contains rewritten materialization";
+        }
+    }
+    if (!why && !find_relation(plan, "plain", &si, &ri)) why = "plain missing";
+    else if (!why) {
+        const wl_plan_body_t *body = &plan->strata[si].bodies[ri];
+        if (body->lineage != WL_PLAN_BODY_LINEAGE_LOWERED
+            || body->equivalent_k_fusion_opaque || body->equivalent_k)
+            why = "unrewritten body falsely claims a fusion identity";
+    }
+    wl_plan_free(plan); /* The body borrows the meta; this frees it once. */
+    if (why) {
+        FAIL(why); return;
+    }
+    ++tests_passed; printf(" ... PASS\n");
+}
+
 int
 main(void)
 {
+    test_materialized_body_lineage();
     test_count_result_domains();
     test_existence_bodies();
     printf("test_plan_body_ops (Issue #2114)\n");
