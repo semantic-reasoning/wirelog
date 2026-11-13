@@ -1061,6 +1061,35 @@ typedef struct wl_columnar_managed_candidate_merge {
     bool result_transferred;
 } wl_columnar_managed_candidate_merge_t;
 
+/* Parent-owned sibling, never inside the inline target being cleared. Raw
+ * APIs remain synchronous; the private parent must exclude every raw target
+ * entry/reset/free while this actual action/report owner is pending. */
+typedef enum {
+    WL_COLUMNAR_MANAGED_MERGE_ACK_INERT,
+    WL_COLUMNAR_MANAGED_MERGE_ACK_RETIREMENTS,
+    WL_COLUMNAR_MANAGED_MERGE_ACK_TOKENS,
+    WL_COLUMNAR_MANAGED_MERGE_ACK_CLEAR,
+    WL_COLUMNAR_MANAGED_MERGE_ACK_COMPLETE
+} wl_columnar_managed_merge_ack_phase_t;
+typedef struct wl_columnar_managed_candidate_merge_ack_progress {
+    struct wl_columnar_managed_candidate_merge_ack_progress *identity;
+    const void *parent;
+    wl_columnar_managed_candidate_merge_t *target;
+    wl_evaluation_control_t *support;
+    uint64_t support_identity, support_id;
+    size_t clear_offset;
+    unsigned retirement_index, token_index, clear_atomic_index;
+    wl_columnar_managed_merge_ack_phase_t phase;
+#if defined(WL_HAVE_C11_THREADS)
+    thrd_t actor;
+#elif defined(_WIN32) || defined(_WIN64)
+    DWORD actor;
+#else
+    pthread_t actor;
+#endif
+    bool busy, performed, report_pending, ack_prepaid, physical_done;
+} wl_columnar_managed_candidate_merge_ack_progress_t;
+
 /* A resumable, private incremental consolidation. Initialize the object with
  * { 0 } before begin. The object and its writer are address- and thread-bound;
  * keep it in one frame and pass by pointer.
@@ -3920,6 +3949,29 @@ wl_columnar_managed_candidate_merge_status(
 int
 wl_columnar_managed_candidate_merge_ack(
     wl_columnar_managed_candidate_merge_t *attempt);
+/* Genuine finite support owns proof/body/footer AND the one-use delayed
+* financial ACK suffix. Caller proves full current private parent/target/
+* controller allocation lineage and disjointness before every invocation.
+* No output is published on an unselected/protocol/refused admission. */
+int wl_columnar_managed_candidate_merge_ack_begin_owned(
+    wl_columnar_managed_candidate_merge_ack_progress_t *, const void *,
+    wl_columnar_managed_candidate_merge_t *, wl_evaluation_control_t *,
+    uint64_t, bool *);
+int wl_columnar_managed_candidate_merge_ack_step_owned(
+    wl_columnar_managed_candidate_merge_ack_progress_t *, const void *,
+    wl_columnar_managed_candidate_merge_t *, wl_evaluation_control_t *,
+    uint64_t, bool *);
+int wl_columnar_managed_candidate_merge_ack_action_ack_owned(
+    wl_columnar_managed_candidate_merge_ack_progress_t *, const void *,
+    wl_evaluation_control_t *, uint64_t);
+bool wl_columnar_managed_candidate_merge_ack_pending(
+    const wl_columnar_managed_candidate_merge_ack_progress_t *);
+#ifdef WL_SESSION_TEST_HOOKS
+extern void (*wl_columnar_managed_candidate_merge_test_ack_checkpoint)(
+    wl_columnar_managed_candidate_merge_ack_progress_t *,
+    wl_evaluation_control_t *, uint64_t);
+#endif
+
 uint64_t
 col_rel_owned_ledger_bytes(const col_rel_t *r);
 /* Checked flat-grid size for ncols pointer slots and owned INT64 lanes. */

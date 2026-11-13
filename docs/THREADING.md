@@ -228,7 +228,7 @@ These exist so struct fields can be declared portably; the audit in
 
 Every `atomic_*` call site in `wirelog/` production sources. Counted
 mechanically by `scripts/ci/check-threading-doc.sh`; row count must
-match the script's count (currently **581**).
+match the script's count (currently **585**).
 
 Format: `file:function[#N]` | field | operation | order | justification.
 
@@ -670,7 +670,7 @@ concurrent alias removals cannot underflow the count.
 | `session.c:session_pool_rel_promote#3` | `src->storage_alias_borrows` | `atomic_store_explicit` | relaxed | Leave the closed pool tombstone with no child aliases |
 
 112 + 21 + 37 = **170 atomic call sites** in the summarized groups; the full
-symbol-anchored inventory below covers 581 sites.
+symbol-anchored inventory below covers 585 sites.
 
 The `#N` suffix counts all atomic sites in a symbol, regardless of operation;
 the first site remains unsuffixed. `scripts/ci/check-threading-doc.sh` uses
@@ -1781,7 +1781,7 @@ DONE. If a stop leaves the receipt holding a claim, its caller preserves that
 receipt and resumes with a fresh live maintenance attempt; it cannot abandon or
 reinitialize the receipt/token while the claim remains held.
 
-The complete current atomic-source inventory contains 581 call sites.
+The complete current atomic-source inventory contains 585 call sites.
 
 ### Caller-attempt-bound single mutation admission
 
@@ -2896,3 +2896,33 @@ performs those atomic operations.
 
 | `relation.c:wl_columnar_relation_radix_workspace_attempt_end_step` | `w->admission.state` | `atomic_load_explicit` | acquire | After actual scratch frees, discover the initialized canonical workspace token's real RESERVED state even if Original stopped after reserve but before verdict publication; select actual rollback receipt without reading old source or granting Native access |
 | `relation.c:wl_columnar_relation_radix_workspace_attempt_test_view` | `a->workspace.admission.state` | `atomic_load_explicit` | acquire | Read-only observation of the actually initialized canonical workspace token; an uninitialized slot reports a sentinel and grants no ownership or source permission |
+
+
+### Inactive finite managed-merge acknowledgement
+
+The additive owned ACK validates genuinely started retirement tokens while the
+complete merge remains intact and private. Never-started retirement payloads
+are not atomic-loaded. Actual EMPTY or RELEASED state and acknowledged receipt
+headers are prerequisites; RELEASED history may retain nonzero owner bits and
+stale governor pointers, which are never followed. The parent must exclude all
+concurrent/stale target access and every raw entry/reset/free until the external
+progress and final report/Source/prepaid Native acknowledgement are discharged.
+An address token alone does not prove that private ownership.
+
+After validation, ordinary clear packets stop before every inline atomic span.
+Each typed scalar initialization is a separate packet, under that same genuine
+exclusive quiescence, for both previously initialized terminal and unused
+atomic storage. It creates no reservation identity, governor reference or live
+credit. Later addresses derive solely from exact member lineage and external
+cursors, never partially cleared target fields. Atomic semantic zero is the
+portable postcondition; ordinary bytes are checked separately. These four
+sites do not certify complete Native caller/ABI/Source packet bounds or activate
+the component in Session. Reached constructor and actual Windows qualification
+remain separate obligations.
+
+| Stable anchor | Field | Operation | Order | Ownership and purpose |
+|---|---|---|---|---|
+| `merge.c:wl_columnar_managed_ack_token` | `t->state` | `atomic_load_explicit` | acquire | Inspect only genuinely initialized private retirement tokens before destructive clearing; unstarted payloads are skipped |
+| `merge.c:wl_columnar_managed_ack_token#2` | `t->owner_bits` | `atomic_load_explicit` | acquire | Validate actual EMPTY slots while intact; RELEASED historical owner bits are neither followed nor required zero |
+| `merge.c:wl_columnar_managed_candidate_merge_ack_step_owned` | `target->retirements[ri].tokens[ti].state` | `atomic_init` | exclusive initialization | Reset exactly one scalar under genuine private quiescence, never publish reservation authority; external progress retains ownership through actual final report/ACK |
+| `merge.c:wl_columnar_managed_candidate_merge_ack_step_owned#2` | `target->retirements[ri].tokens[ti].owner_bits` | `atomic_init` | exclusive initialization | Reset exactly one scalar without reading never-started payload; ordinary byte clearing excludes the whole atomic span |
