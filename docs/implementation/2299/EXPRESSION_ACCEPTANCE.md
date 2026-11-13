@@ -2491,3 +2491,43 @@ observes allocator calls rather than an inactive counter. This counter supplies
 no work-price oracle. Rejected v1 candidate/review/source receipts remain
 preserved under `/tmp/2299-radix-workspace-*-v1` and the archive manifest; this
 correction requires a fresh exact raw review and final gates.
+
+### Actual raw recursive cursor before controlled activation
+
+The serial recursive branch now immediately drains a private stack-owned cursor.
+The existing raw caller uses it in the same invocation; it does not introduce a
+public yield, a heap cursor, a new control permission or a controlled fallback.
+Setup, source-reader/pool/sort/merge blocks and K alternatives remain synchronous
+raw work in this stage. The original attached-control refusal and nonrecursive
+entry stay byte-identical. No native raw helper is certified bounded by moving
+it behind a cursor phase.
+
+The cursor separates outer/sub-pass selection, actual selected-head call and
+completion, round delta work, error exits and final teardown. The real raw head
+still appends FULL before the next head is selected. Old DELTA registration and
+best-effort mid-pass removal retain their original order; strict terminal
+removal still preserves the first refusal while completing teardown. The
+reservation is initialized at its final embedded address and is never copied.
+Reader, clone and workspace locals stay inside a single synchronous transition.
+Retained cleanup_pending still releases only bookkeeping, preserving the actual
+registered delta/cache owners. Aggregate failure retains its distinct cleanup.
+
+The registered recursive_cursor_parity fixture compares 24 actual compiler and
+session executions with immutable output from implementation0057d753: ordered
+cell bits, schemas, timestamp fields, generations, event order, cap/finality and
+pending state. It covers the default limit and multi-head caps1/2 with retry, INT64/STRING/FLOAT
+projection SCCs, asserted compiler-selected K, recursive string MAP/FILTER,
+actual arithmetic error, typed empty/missing input and extension context/effects.
+The extension seed runs once on success, is not replayed by a no-op, and runs
+again only on the actual failed-attempt retry; its descriptor remains alive
+until real session/plan cleanup. Original18 witnesses were frozen before this
+refactor, then independently reproduced byte-identically on untouched0057d753;
+six extra controls were captured on that same immutable implementation. The
+fixture never calls the new cursor as its reference evaluator or compares
+addresses, padding or timing. current_iteration is the last entered sub-pass,
+which may differ from the last fact-producing total_iterations.
+
+This stage supplies the real raw schedule seam. Bounded actual delta/radix/run
+and pool continuations, authenticated recursive source/frame ownership, typed
+controlled transport and ordinary/K expression activation remain separate
+integration work. The cursor alone does not close those acceptance rows.
