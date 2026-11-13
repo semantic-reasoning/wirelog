@@ -3391,6 +3391,38 @@ rewrite_multiway_delta(wl_plan_t *plan)
                         k, &new_count);
 #endif
                 if (new_ops) {
+                    wl_plan_body_t *body = st->bodies ? &st->bodies[r] : NULL;
+                    if (body) {
+                        bool equivalent = body->lineage ==
+                            WL_PLAN_BODY_LINEAGE_LOWERED
+                            && body->op_count == rel->op_count && body->ops;
+                        for (uint32_t o = 0; equivalent && o < rel->op_count;
+                            ++o)
+                            equivalent = !rel->ops[o].opaque_data
+                                && rel->ops[o].op != WL_PLAN_OP_K_FUSION
+                                && rel->ops[o].op != WL_PLAN_OP_LFTJ
+                                && rel->ops[o].op != WL_PLAN_OP_EXCHANGE;
+                        body->lineage = WL_PLAN_BODY_LINEAGE_OTHER_REWRITE;
+                        body->equivalent_k_fusion_opaque = NULL;
+                        body->equivalent_k = 0;
+#if ENABLE_K_FUSION
+                        if (equivalent && new_count == 1
+                            && new_ops[0].op == WL_PLAN_OP_K_FUSION
+                            && new_ops[0].opaque_data) {
+                            /* This exact successful expansion consumed the
+                             * unchanged lowered list. Later project fusion
+                             * changes its children in place; EXCHANGE insertion
+                             * preserves this same plan-owned meta identity. */
+                            body->lineage =
+                                WL_PLAN_BODY_LINEAGE_K_FUSION_EQUIVALENT;
+                            body->equivalent_k_fusion_opaque =
+                                new_ops[0].opaque_data;
+                            body->equivalent_k = k;
+                        }
+#else
+                        (void)equivalent;
+#endif
+                    }
                     for (uint32_t o = 0; o < rel->op_count; o++)
                         free_op((wl_plan_op_t *)&rel->ops[o]);
                     free((void *)rel->ops);
@@ -4155,6 +4187,11 @@ rewrite_lftj_chains(wl_plan_t *plan)
             }
 
             /* Swap in the rewritten op list */
+            if (st->bodies) {
+                st->bodies[r].lineage = WL_PLAN_BODY_LINEAGE_OTHER_REWRITE;
+                st->bodies[r].equivalent_k_fusion_opaque = NULL;
+                st->bodies[r].equivalent_k = 0;
+            }
             for (uint32_t o = 0; o < rel->op_count; o++)
                 free_op((wl_plan_op_t *)&rel->ops[o]);
             free((void *)rel->ops);
@@ -4343,6 +4380,7 @@ plan_stratum_record_bodies(wl_plan_stratum_t *st, const wirelog_program_t *prog)
             bodies[r].declared_int64 = scalar;
             break;
         }
+        bodies[r].lineage = WL_PLAN_BODY_LINEAGE_LOWERED;
     }
 
     st->bodies = bodies;
