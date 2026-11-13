@@ -4157,12 +4157,142 @@ wl_columnar_arrangement_diff_retire(wl_columnar_arrangement_diff_attempt_t *tx)
     }
 }
 
-int
-wl_columnar_arrangement_diff_attempt_drain(
+/* These selectors never follow an arrangement or registry after its physical
+ * free. The actual serialized parent proves the owning Tx before entry. */
+typedef enum {
+    WL_COLUMNAR_ARRANGEMENT_DIFF_LEDGER_NONE,
+    WL_COLUMNAR_ARRANGEMENT_DIFF_LEDGER_RETIRED,
+    WL_COLUMNAR_ARRANGEMENT_DIFF_LEDGER_ARRAY,
+    WL_COLUMNAR_ARRANGEMENT_DIFF_LEDGER_SLOTS
+} wl_columnar_arrangement_diff_ledger_target_t;
+
+static wl_columnar_arrangement_diff_ledger_target_t
+wl_columnar_arrangement_diff_ledger_target(
+    const wl_columnar_arrangement_diff_attempt_t *tx)
+{
+    uint32_t count = tx->committed ? tx->old_count : tx->count;
+    if (((tx->building && tx->building_initialized)
+        || (tx->cleanup_index < count && tx->cleanup_phase == 1))
+        && tx->retire_phase == WL_COLUMNAR_ARRANGEMENT_DIFF_RETIRE_LEDGER)
+        return WL_COLUMNAR_ARRANGEMENT_DIFF_LEDGER_RETIRED;
+    if (tx->building || tx->cleanup_index != count)
+        return WL_COLUMNAR_ARRANGEMENT_DIFF_LEDGER_NONE;
+    if (tx->cleanup_phase == WL_COLUMNAR_ARRANGEMENT_DIFF_TAIL_ARRAY_LEDGER)
+        return WL_COLUMNAR_ARRANGEMENT_DIFF_LEDGER_ARRAY;
+    if (tx->cleanup_phase == WL_COLUMNAR_ARRANGEMENT_DIFF_TAIL_SLOTS_LEDGER)
+        return WL_COLUMNAR_ARRANGEMENT_DIFF_LEDGER_SLOTS;
+    return WL_COLUMNAR_ARRANGEMENT_DIFF_LEDGER_NONE;
+}
+
+static void
+wl_columnar_arrangement_diff_ledger_advance(
+    wl_columnar_arrangement_diff_attempt_t *tx,
+    wl_columnar_arrangement_diff_ledger_target_t target)
+{
+    if (target == WL_COLUMNAR_ARRANGEMENT_DIFF_LEDGER_RETIRED) {
+        tx->retire_ledger = NULL; tx->retire_bytes = 0;
+        tx->retire_phase = WL_COLUMNAR_ARRANGEMENT_DIFF_RETIRE_CREDIT;
+    } else if (target == WL_COLUMNAR_ARRANGEMENT_DIFF_LEDGER_ARRAY) {
+        if (!tx->committed) tx->image_charged = false;
+        tx->cleanup_phase = WL_COLUMNAR_ARRANGEMENT_DIFF_TAIL_ARRAY_CREDIT;
+    } else {
+        tx->slots_charged = false;
+        tx->cleanup_phase = WL_COLUMNAR_ARRANGEMENT_DIFF_TAIL_SLOTS_CREDIT;
+    }
+}
+
+static int
+wl_columnar_arrangement_diff_ledger_finite(
     wl_columnar_arrangement_diff_attempt_t *tx, wl_col_session_t *sess,
+    wl_columnar_arrangement_diff_ledger_target_t target,
     wl_evaluation_control_t *control, uint64_t id)
 {
+    wl_mem_ledger_t *ledger = &sess->mem_ledger;
+    uint64_t bytes;
+    if (target == WL_COLUMNAR_ARRANGEMENT_DIFF_LEDGER_RETIRED) {
+        ledger = tx->retire_ledger; bytes = tx->retire_bytes;
+    } else if (target == WL_COLUMNAR_ARRANGEMENT_DIFF_LEDGER_ARRAY) {
+        bytes = tx->committed ? tx->old_bytes : tx->image_charged
+            ? tx->array_bytes + tx->metadata_bytes : 0;
+    } else bytes = tx->slots_charged ? tx->slots_bytes : 0;
+    wl_columnar_mem_ledger_retirement_journal_t *j = &tx->ledger_journal;
+    wl_columnar_mem_ledger_description_t *d = &j->description;
+    if (!ledger || !bytes) {
+        if (d->identity || j->report_valid) return EINVAL;
+        int rc = wl_columnar_arrangement_diff_pay(control, id,
+                tx->committed ? 17 : 16, tx->cleanup_index);
+        if (rc) return rc;
+        wl_columnar_arrangement_diff_ledger_advance(tx, target);
+        return EAGAIN;
+    }
+    wl_columnar_mem_ledger_publication_request_t request = {
+        WL_MEM_SUBSYS_ARRANGEMENT,
+        WL_COLUMNAR_MEM_LEDGER_PUBLICATION_FREE, bytes
+    };
+    if (d->phase == WL_COLUMNAR_MEM_LEDGER_DESCRIPTION_INERT) {
+        if (j->report_valid) return EINVAL;
+        int rc = wl_columnar_mem_ledger_publication_describe_controlled(d,
+                tx, ledger, &request, 1, control, id);
+        return rc ? rc : EAGAIN;
+    }
+    if (d->identity != d || d->parent != tx || d->ledger != ledger
+        || d->control != control || d->count != 1
+        || d->requests[0].subsystem != request.subsystem
+        || d->requests[0].kind != request.kind
+        || d->requests[0].bytes != request.bytes) return EINVAL;
+    if (d->phase == WL_COLUMNAR_MEM_LEDGER_DESCRIPTION_DESCRIBED) {
+        if (j->report_valid) return EINVAL;
+        int rc =
+            wl_columnar_mem_ledger_publication_try_commit_described_controlled(
+            d, tx, control, id);
+        return rc ? rc : EAGAIN;
+    }
+    if (d->phase != WL_COLUMNAR_MEM_LEDGER_DESCRIPTION_CONSUMED
+        || !j->report_valid) return EBUSY;
+    /* This is the existing physical/metadata128 action, now exclusively
+     * completing the real prior ledger report. No128 surrounds COMMIT194. */
+    int rc = wl_columnar_arrangement_diff_pay(control, id,
+            tx->committed ? 17 : 16, tx->cleanup_index);
+    if (rc) return rc;
+    bool applied;
+    rc = wl_columnar_mem_ledger_retirement_ack_prepaid_owned(j, tx, control,
+            id, &applied);
+    if (rc) return rc;
+    if (applied) wl_columnar_arrangement_diff_ledger_advance(tx, target);
+    return EAGAIN;
+}
+
+int
+wl_columnar_arrangement_diff_attempt_ledger_capture_owned(
+    wl_columnar_arrangement_diff_attempt_t *tx,
+    wl_evaluation_control_t *control, uint64_t completed_id)
+{
+    if (!tx) return EINVAL;
+    wl_columnar_mem_ledger_retirement_journal_t *j = &tx->ledger_journal;
+    if (!tx->started || tx->drained)
+        return j->description.identity || j->report_valid ? EINVAL : 0;
+    if (j->description.phase != WL_COLUMNAR_MEM_LEDGER_DESCRIPTION_CONSUMED)
+        return 0;
+    return wl_columnar_mem_ledger_retirement_capture_owned(j, tx, control,
+               completed_id);
+}
+
+static int
+wl_columnar_arrangement_diff_attempt_drain_internal(
+    wl_columnar_arrangement_diff_attempt_t *tx, wl_col_session_t *sess,
+    wl_evaluation_control_t *control, uint64_t id, bool finite)
+{
     if (!tx->started || tx->drained) return 0;
+    if (finite) {
+        wl_columnar_arrangement_diff_ledger_target_t target =
+            wl_columnar_arrangement_diff_ledger_target(tx);
+        if (target != WL_COLUMNAR_ARRANGEMENT_DIFF_LEDGER_NONE)
+            return wl_columnar_arrangement_diff_ledger_finite(tx, sess,
+                       target, control, id);
+        if (tx->ledger_journal.description.identity
+            || tx->ledger_journal.report_valid) return EBUSY;
+    } else if (tx->ledger_journal.description.identity
+        || tx->ledger_journal.report_valid) return EBUSY;
     int rc = wl_columnar_arrangement_diff_pay(control, id,
             tx->committed ? 17 : 16, tx->cleanup_index);
     if (rc) return rc;
@@ -4265,4 +4395,22 @@ wl_columnar_arrangement_diff_attempt_drain(
     if (sess->diff_txn_count != 1) return EINVAL;
     sess->diff_txn_count = 0; tx->drained = true;
     return 0;
+}
+
+int
+wl_columnar_arrangement_diff_attempt_drain(
+    wl_columnar_arrangement_diff_attempt_t *tx, wl_col_session_t *sess,
+    wl_evaluation_control_t *control, uint64_t id)
+{
+    return wl_columnar_arrangement_diff_attempt_drain_internal(tx, sess,
+               control, id, false);
+}
+
+int
+wl_columnar_arrangement_diff_attempt_drain_finite(
+    wl_columnar_arrangement_diff_attempt_t *tx, wl_col_session_t *sess,
+    wl_evaluation_control_t *control, uint64_t id)
+{
+    return wl_columnar_arrangement_diff_attempt_drain_internal(tx, sess,
+               control, id, true);
 }
