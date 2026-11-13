@@ -2957,7 +2957,9 @@ wl_columnar_ops_reduce_attempt_start_owned(const wl_plan_op_t *op,
             WL_COLUMNAR_OPS_REDUCE_ATTEMPT_WORK);
     if (rc) goto done;
     uint32_t gc = op->group_by_count;
-    bool shaped = gc != UINT32_MAX && (!gc || source_width || bare);
+    /* An authenticated schema-valid nullary empty is also legal: raw
+     * grouped reduction reads no key lanes when there are no input rows. */
+    bool shaped = gc != UINT32_MAX && (!gc || source_width || !source_rows);
     rc = wl_columnar_ops_reduce_attempt_tail(control, id, 30, gc);
     if (rc > 0 || shaped) {
         if (rc) goto done;

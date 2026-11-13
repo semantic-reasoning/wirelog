@@ -2,10 +2,10 @@
  *
  * Session creation gives no schema to an EDB without a FLOAT, STRING or
  * INLINE column, so until its first row VARIABLE borrows its descriptor
- * with width 0 and schema_ok false (#2297). The unobserved STEP hands that
- * descriptor to the first consumer of the rule body, which now holds it
- * with the authentic empty-source reader: MAP, FILTER and REDUCE. Observed
- * STEP and SNAPSHOT take other routes and are checked for parity. Each
+ * with width 0 and schema_ok false (#2297). Depending on the compiled body,
+ * unobserved STEP either lends it to authentic empty-source readers or
+ * constructs an authenticated private empty input. Both routes, observed
+ * STEP and SNAPSHOT are checked for parity. Each
  * controlled result is compared with an uncontrolled session over the same
  * plan. */
 #include "../wirelog/columnar/internal.h"
@@ -145,6 +145,16 @@ is_union(unsigned kind)
     return kind == K_UNION_A || kind == K_UNION_C || kind == K_UNION_BOTH;
 }
 
+/* The sole-EDB VARIABLE,[FILTER],MAP,CONSOLIDATE missing-source route.
+ * UNION and REDUCE retain their real bare-source readers on unobserved STEP. */
+static bool
+private_empty_step(unsigned kind)
+{
+    return kind == K_SINGLE || kind == K_FILTER || kind == K_TWO_COL
+           || kind == K_INT_EXPR || kind == K_INT32 || kind == K_UINT32
+           || kind == K_UINT64 || kind == K_BOOL;
+}
+
 static unsigned
 bare_count(unsigned kind)
 {
@@ -226,6 +236,39 @@ publication(wl_col_session_t *s, const col_rel_t *in, const col_rel_t *out)
 static const void *records[8];
 static unsigned record_count, empty_calls, empty_stop_at;
 static wl_evaluation_control_t *empty_control;
+static unsigned private_calls, private_stop_at, private_phases[64];
+
+/* Source-derived constructor vector: INIT, descriptor/owner/header/recipe,
+ * each real fixed run slot, then source drain and output publication. */
+static void
+private_trace(unsigned inputs)
+{
+    unsigned at = 0;
+    for (unsigned input = 0; input < inputs; ++input) {
+        for (unsigned phase = 620; phase <= 627; ++phase) {
+            CHECK(at < private_calls && private_phases[at] == phase); ++at;
+        }
+        for (unsigned run = 0; run < COL_MAX_RUNS; ++run) {
+            CHECK(at < private_calls && private_phases[at] == 628); ++at;
+        }
+        const unsigned final[] = {629, 631, 632};
+        for (unsigned i = 0; i < 3; ++i) {
+            CHECK(at < private_calls && private_phases[at] == final[i]); ++at;
+        }
+    }
+    CHECK(at == private_calls);
+}
+
+static void
+private_checkpoint(wl_evaluation_control_t *control, unsigned phase)
+{
+    if (control != empty_control) return;
+    CHECK(wl_evaluation_control_active_attempt_id(control));
+    CHECK(private_calls < sizeof(private_phases) / sizeof(private_phases[0]));
+    private_phases[private_calls++] = phase;
+    if (private_calls == private_stop_at && stop_mode && !stop_hit)
+        request_stop(control);
+}
 
 static void
 empty_checkpoint(const wl_columnar_relation_empty_source_t *a)
@@ -342,6 +385,7 @@ fixture_destroy(fixture_t *f)
 {
     wl_columnar_eval_stack_test_physical_publication = NULL;
     wl_columnar_relation_test_empty_source_checkpoint = NULL;
+    wl_columnar_relation_test_empty_input_checkpoint = NULL;
     CHECK(!wl_session_try_destroy(&f->s));
     wl_session_destroy(f->raw);
     wl_evaluation_control_release(f->control);
@@ -432,39 +476,37 @@ run_cell(unsigned kind, bool snapshot, bool observed)
             images[i] = wl_columnar_relation_snapshot(bare_rel[i]);
     active = f.s; bare_published = 0;
     record_count = empty_calls = empty_stop_at = 0; stop_mode = 0;
+    private_calls = private_stop_at = 0;
     empty_control = f.control;
     wl_columnar_eval_stack_test_physical_publication = publication;
     wl_columnar_relation_test_empty_source_checkpoint = empty_checkpoint;
+    wl_columnar_relation_test_empty_input_checkpoint = private_checkpoint;
     int rc = snapshot ? wl_session_snapshot(f.s, on_tuple, &image)
         : step(f.s);
     wl_columnar_eval_stack_test_physical_publication = NULL;
     wl_columnar_relation_test_empty_source_checkpoint = NULL;
+    wl_columnar_relation_test_empty_input_checkpoint = NULL;
     if (rc)
         fprintf(stderr, "kind%u snapshot%u observed%u: rc %d\n", kind,
             snapshot, observed, rc);
     CHECK(rc == 0);
     CHECK(!(snapshot ? wl_session_snapshot(f.raw, on_tuple, &raw_image)
         : step(f.raw)));
-    /* Only the unobserved STEP hands the bare descriptor to the consumer.
-     * There two empty-source records hold it, VARIABLE's and the consumer's
-     * (a UNION reuses both for its second branch), the consumer publishes
-     * once per bare EDB with that EDB as input, and the EDB stays bare. The
-     * other routes publish no bare input: the observed specialized STEP of
-     * single gives the public EDB a schema first, and the general route,
-     * which also serves the observed filter body, substitutes a private
-     * empty relation, typed when session creation gave the EDB lane types
-     * (a FLOAT or STRING column, or an INLINE compound column and no SIDE
-     * column). */
     unsigned bare = bare_count(kind);
     if (!snapshot && !observed) {
-        if (record_count != (bare ? 2u : 0u) || bare_published != bare)
-            fprintf(stderr, "kind%u: %u empty records, %u bare publications, "
-                "%u bare EDBs\n", kind, record_count, bare_published, bare);
-        CHECK(record_count == (bare ? 2u : 0u));
-        CHECK(bare_published == bare);
+        if (private_empty_step(kind)) {
+            CHECK(record_count == 0 && bare_published == 0);
+            private_trace(1);
+        } else {
+            CHECK(private_calls == 0);
+            CHECK(record_count == (bare ? 2u : 0u));
+            CHECK(bare_published == bare);
+        }
         still_bare(&f, kind, images);
     } else {
-        CHECK(!bare_published);
+        CHECK(!bare_published && !record_count);
+        if (bare && (snapshot || kind != K_SINGLE)) private_trace(bare);
+        else CHECK(private_calls == 0);
         if (!snapshot && (kind == K_SINGLE || kind == K_FILTER)) {
             col_rel_t *a = session_find_rel((wl_col_session_t *)f.s, "a");
             CHECK(kind == K_SINGLE ? a->ncols == 1 && a->schema_ok
@@ -518,7 +560,8 @@ run_cell(unsigned kind, bool snapshot, bool observed)
 /* ---- deterministic stops on the unobserved STEP ---------------------------- */
 
 static void
-stopped(unsigned kind, unsigned mode, const char *at, unsigned empty_at)
+stopped(unsigned kind, unsigned mode, const char *at, unsigned empty_at,
+    unsigned private_at)
 {
     fixture_t f;
     fixture(&f, kind);
@@ -531,18 +574,23 @@ stopped(unsigned kind, unsigned mode, const char *at, unsigned empty_at)
     col_relation_snapshot_t old_image = wl_columnar_relation_snapshot(old);
     active = f.s; bare_published = 0;
     record_count = empty_calls = 0; empty_stop_at = empty_at;
+    private_calls = 0; private_stop_at = private_at;
     empty_control = f.control;
     stop_mode = mode; stop_at = at; stop_hit = false;
     wl_columnar_eval_stack_test_physical_publication = publication;
     wl_columnar_relation_test_empty_source_checkpoint = empty_checkpoint;
+    wl_columnar_relation_test_empty_input_checkpoint = private_checkpoint;
     int rc = step(f.s);
     wl_columnar_eval_stack_test_physical_publication = NULL;
     wl_columnar_relation_test_empty_source_checkpoint = NULL;
+    wl_columnar_relation_test_empty_input_checkpoint = NULL;
     int expected = mode == 1 ? WL_EVALUATION_CONTROL_CANCELLED
         : WL_EVALUATION_CONTROL_WORK_LIMIT;
     if (rc != expected || !stop_hit)
-        fprintf(stderr, "kind%u stop%u at %s/%u: rc %d hit %d\n", kind, mode,
-            at ? at : "-", empty_at, rc, stop_hit);
+        fprintf(stderr,
+            "kind%u stop%u at %s/reader%u/private%u: rc %d hit %d\n", kind,
+            mode,
+            at ? at : "-", empty_at, private_at, rc, stop_hit);
     CHECK(stop_hit && rc == expected);
     still_bare(&f, kind, images);
     CHECK(session_find_rel((wl_col_session_t *)f.s, "out") == old);
@@ -625,15 +673,22 @@ untyped_rows(unsigned kind, bool snapshot, bool observed)
 }
 
 static unsigned
-empty_calls_of(unsigned kind)
+empty_calls_of(unsigned kind, unsigned *constructor_calls)
 {
     fixture_t f;
     fixture(&f, kind);
     record_count = empty_calls = empty_stop_at = 0; stop_mode = 0;
+    private_calls = private_stop_at = 0; empty_control = f.control;
     wl_columnar_relation_test_empty_source_checkpoint = empty_checkpoint;
+    wl_columnar_relation_test_empty_input_checkpoint = private_checkpoint;
     CHECK(!step(f.s));
     wl_columnar_relation_test_empty_source_checkpoint = NULL;
+    wl_columnar_relation_test_empty_input_checkpoint = NULL;
     unsigned n = empty_calls;
+    *constructor_calls = private_calls;
+    if (private_empty_step(kind)) {
+        CHECK(n == 0 && record_count == 0); private_trace(1);
+    } else CHECK(private_calls == 0);
     fixture_destroy(&f);
     return n;
 }
@@ -657,13 +712,20 @@ main(void)
             /* At the consumer's publication, or at CONCAT for a UNION. */
             if (cases[kind].first != WL_PLAN_OP_REDUCE)
                 stopped(kind, mode, is_union(kind) ? "$concat"
-                    : cases[kind].output, 0);
-            /* At each empty-source step: VARIABLE's and the consumer's,
-             * while they hold the EDB. */
-            unsigned n = empty_calls_of(kind);
-            CHECK(n >= 2 * bare_count(kind));
-            for (unsigned at = 1; at <= n; at++)
-                stopped(kind, mode, NULL, at);
+                    : cases[kind].output, 0, 0);
+            unsigned constructor_calls = 0;
+            unsigned n = empty_calls_of(kind, &constructor_calls);
+            if (private_empty_step(kind)) {
+                CHECK(n == 0 && constructor_calls > 0);
+                /* Stop each real source/recipe/drain/output boundary. */
+                for (unsigned at = 1; at <= constructor_calls; at++)
+                    stopped(kind, mode, NULL, 0, at);
+            } else {
+                CHECK(constructor_calls == 0 && n >= 2 * bare_count(kind));
+                /* VARIABLE and the consumer still hold the real bare EDB. */
+                for (unsigned at = 1; at <= n; at++)
+                    stopped(kind, mode, NULL, at, 0);
+            }
         }
     puts("evaluation_empty_edb_sources: OK");
     return 0;
