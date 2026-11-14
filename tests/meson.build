@@ -7262,8 +7262,10 @@ test_evaluation_empty_edb_sources_exe = executable(
   link_with: [testlib_prod],
 )
 # Run the complete coverage with: meson test --suite evaluation_empty_edb_sources
-# Each stop kind retains both modes and every discovered checkpoint. Splitting
-# the exhaustive fixture keeps the existing 60-second watchdog on CI runners.
+# Each stop kind cancels and exhausts the work limit at every discovered
+# checkpoint of its borrowed and private-empty STEP stops, and at sampled work
+# tails of the general route's private empty input. Splitting by kind keeps the
+# existing 60-second watchdog on CI runners.
 test('evaluation_empty_edb_sources', test_evaluation_empty_edb_sources_exe,
      args: ['--matrix'],
      suite: ['unit', 'tsan', 'evaluation_empty_edb_sources'], timeout: 60)
