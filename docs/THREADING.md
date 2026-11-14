@@ -228,7 +228,7 @@ These exist so struct fields can be declared portably; the audit in
 
 Every `atomic_*` call site in `wirelog/` production sources. Counted
 mechanically by `scripts/ci/check-threading-doc.sh`; row count must
-match the script's count (currently **579**).
+match the script's count (currently **621**).
 
 Format: `file:function[#N]` | field | operation | order | justification.
 
@@ -670,7 +670,7 @@ concurrent alias removals cannot underflow the count.
 | `session.c:session_pool_rel_promote#3` | `src->storage_alias_borrows` | `atomic_store_explicit` | relaxed | Leave the closed pool tombstone with no child aliases |
 
 112 + 21 + 37 = **170 atomic call sites** in the summarized groups; the full
-symbol-anchored inventory below covers 579 sites.
+symbol-anchored inventory below covers 621 sites.
 
 The `#N` suffix counts all atomic sites in a symbol, regardless of operation;
 the first site remains unsuffixed. `scripts/ci/check-threading-doc.sh` uses
@@ -786,6 +786,8 @@ release to be retried without retaining freed storage.
 | `eval_delta.c:wl_columnar_eval_delta_observer_release_credit` | `token->state` | `atomic_load_explicit` | acquire | Observe reservation state before checked retirement; preserve the original token when release refuses |
 | `eval_delta.c:wl_columnar_eval_delta_release_token` | `token->state` | `atomic_load_explicit` | acquire | Observe temporary scratch reservation state before its local release path |
 | `eval_delta.c:wl_columnar_eval_delta_observer_discard` | `sess->delta_observer_retirement_metadata.state` | `atomic_load_explicit` | acquire | Check the session-owned metadata token before retrying observer retirement |
+| `eval_delta.c:wl_columnar_eval_delta_resource_credit` | `token->state` | `atomic_load_explicit` | acquire | Select and retain the actual reservation rollback/finish mode; recognize EMPTY/RELEASED without copying the token |
+| `eval_delta.c:wl_columnar_eval_delta_resource_progress_value` | `p->credit->state` | `atomic_load_explicit` | acquire | Observe progress of the selected still-live credit receipt on a refused return; conveys no Native authority |
 | `eval_delta.c:wl_retraction_stage_prepare` | `r->retained_reservation.state` | `atomic_load_explicit` | acquire | Validate the committed payload token under the relation writer before staging a second physical image |
 | `eval_delta.c:wl_retraction_stage_prepare#2` | `r->retained_reservation.owner_bits` | `atomic_load_explicit` | acquire | Confirm the token is still bound to the canonical relation before growing its charge |
 
@@ -1079,7 +1081,7 @@ have been destroyed. A worker-held lookup pointer must not span a coordinator
 growth replacement. Enforcement and deterministic fault-injection coverage
 for this window are tracked separately in #1423.
 
-- `wirelog/columnar/kfusion.c:561-569` (K-fusion path):
+- `wirelog/columnar/kfusion.c:561-570` (K-fusion path):
   ```c
   if (sess->coordinator == NULL
       && sess->compound_arena && sess->rotation_ops
@@ -1488,7 +1490,7 @@ finish. This does not keep a program or nested intern references alive.
   the rationale comment block citing the DDISASM K = 3 measurement.
 - `wirelog/columnar/kfusion.c:609-623` — K-fusion parallel-dispatch
   gate.
-- `wirelog/columnar/kfusion.c:561-569` — compound-arena gate (K-fusion
+- `wirelog/columnar/kfusion.c:561-570` — compound-arena gate (K-fusion
   side).
 - `wirelog/columnar/eval_serial.c:788-791` — compound-arena gate (eval-
   stratum side).
@@ -1560,11 +1562,35 @@ externally serialize
 every session call entry against destruction; the admission mutex does not
 pin a raw session handle before the call begins. Such callers use the checked
 internal `wl_session_try_destroy` API: it returns `EBUSY` without consuming
-the session slot while a lease or controlled STEP continuation remains, then
-destroys and clears a quiescent slot after ACK/completion. Calling the legacy
-internal `wl_session_destroy` with either parked state is a fatal contract
-violation. Neither API makes arbitrary writes
-through borrowed internal relation or plan pointers safe; those retain their
+the session slot while a lease or controlled STEP continuation remains.
+For a backend with `session_destroy_prepare`, a quiescent checked close claims
+PREPARING under the admission mutex. Its returning backend preparation and
+actual BANK retirement precede slot removal. A Source refusal returns `EAGAIN`
+with the same slot and a PARKED close request: forward calls remain closed,
+and a later checked close resumes the actual remaining work. PARKED retains
+no automatic preparer pointer or foreign thread cookie. A protected creator
+can resume checked destruction without giving a foreign caller Native access.
+
+After preparation, Original ownership transfers atomically under its own
+mutex from admission to the actual lexical commit owner. A concurrent BEGIN
+either wins before this seal, leaving the prepared Session/slot intact, or
+fails the old-owner check afterward. The transferred attachment pins Original
+through backend storage release; the new owner detaches exactly once before
+admission is freed. Successful prepared commit clears the slot and performs
+no further BANK operation. The prepared marker follows real cleanup; it does
+not authorize skipping a live frame, reader, observer or resource obligation.
+Legacy close claims its wait ownership in the same critical section as its
+parked-state check, so an old unclaimed waiter cannot steal a failed checked
+request. Calling it with a live or PARKED request remains fatal.
+
+A NULL preparation callback retains its established void compatibility path,
+including the old CLOSE Scope/BANK and admission-owned Original BEGIN/FINISH
+through the backend callback. Only captured owners are used after that
+callback frees Session: previous TLS is restored, BANK is retired and strict
+late Original transfer/detach completes before admission free. A late refusal
+is fatal; it cannot return a dangling Session as a PARKED request. This path
+has no new graceful financial-refusal guarantee. Neither API makes arbitrary
+writes through borrowed relation or plan pointers safe; those retain their
 existing immutability contract.
 Refused evaluator-stack ownership and K-Fusion cleanup remain open in #1647,
 #1648 and #1765. K-Fusion is the one evaluator that still drains an unframed
@@ -1705,8 +1731,8 @@ MSVC uses Interlocked observation/release; C11 retains acquire-load/release-stor
 | `mem_ledger_publication.c:wl_columnar_mem_ledger_publication_gate_read#2` | ledger writer gate | `atomic_load_explicit` | acquire | C11 observation under original authority |
 | `mem_ledger_publication.c:wl_columnar_mem_ledger_publication_strong` | ledger writer gate | `atomic_compare_exchange_weak_explicit` | acquire/relaxed | MSVC shim is a nonspurious single Interlocked CAS |
 | `mem_ledger_publication.c:wl_columnar_mem_ledger_publication_strong#2` | ledger writer gate | `atomic_compare_exchange_strong_explicit` | acquire/relaxed | One admitted nonspurious C11 acquisition attempt |
-| `mem_ledger_publication.c:wl_columnar_mem_ledger_publication_release` | ledger writer gate | `atomic_exchange_explicit` | release | MSVC publishes finite current-counter updates before consuming original record |
-| `mem_ledger_publication.c:wl_columnar_mem_ledger_publication_release#2` | ledger writer gate | `atomic_store_explicit` | release | C11 publishes finite current-counter updates before consuming original record |
+| `mem_ledger_publication.c:wl_columnar_mem_ledger_publication_gate_release` | ledger writer gate | `atomic_exchange_explicit` | release | MSVC publishes finite current-counter updates before consuming the actual prepared or described record |
+| `mem_ledger_publication.c:wl_columnar_mem_ledger_publication_gate_release#2` | ledger writer gate | `atomic_store_explicit` | release | C11 publishes finite current-counter updates before consuming the actual prepared or described record |
 
 ### Caller-attempt-bound governor admission
 
@@ -1779,7 +1805,7 @@ DONE. If a stop leaves the receipt holding a claim, its caller preserves that
 receipt and resumes with a fresh live maintenance attempt; it cannot abandon or
 reinitialize the receipt/token while the claim remains held.
 
-The complete current atomic-source inventory contains 579 call sites.
+The complete current atomic-source inventory contains 621 call sites.
 
 ### Caller-attempt-bound single mutation admission
 
@@ -1848,9 +1874,9 @@ supply the ownership contract.
 
 | Anchor | Object | Operation | Ordering | Purpose |
 |--------|--------|-----------|----------|---------|
-| `relation.c:wl_columnar_relation_reader_acquire_attempt_controlled` | `gate->state` | `atomic_load_explicit` | acquire | Paid original-attempt schema-clone/copy observation; copy retains its original source pair through last gather, never an allocation lifetime pin |
-| `relation.c:wl_columnar_relation_reader_acquire_attempt_controlled#2` | `gate->state` | `atomic_compare_exchange_weak_explicit` | acquire/relaxed | MSVC strong reader claim; owner marker precedes callback and stale cleanup uses the same original token |
-| `relation.c:wl_columnar_relation_reader_acquire_attempt_controlled#3` | `gate->state` | `atomic_compare_exchange_strong_explicit` | acquire/relaxed | Non-MSVC reader retry charged separately and guarded against a successor attempt |
+| `relation.c:wl_columnar_relation_reader_acquire_mode` | `gate->state` | `atomic_load_explicit` | acquire | Paid schema-clone/copy and retained scalar-source observation; the legacy wrapper drains on error while retained BEGIN leaves actual acquired reader debt with its parent |
+| `relation.c:wl_columnar_relation_reader_acquire_mode#2` | `gate->state` | `atomic_compare_exchange_weak_explicit` | acquire/relaxed | MSVC strong reader claim; the genuine token is initialized before returning checks and retain_on_error preserves it for finite parent cleanup |
+| `relation.c:wl_columnar_relation_reader_acquire_mode#3` | `gate->state` | `atomic_compare_exchange_strong_explicit` | acquire/relaxed | Non-MSVC reader retry charged separately and guarded against a successor attempt; successful claims retain their actual token when requested |
 | `relation.c:wl_columnar_relation_constructor_attempt_identity` | `wl_next_relation_identity` | `atomic_load_explicit` | relaxed | Original-attempt paid observation; uniqueness alone publishes no payload |
 | `relation.c:wl_columnar_relation_constructor_attempt_identity#2` | `wl_next_relation_identity` | `atomic_compare_exchange_weak_explicit` | relaxed/relaxed | MSVC strong identity reservation; no counter rewind after cancellation or stale return |
 | `relation.c:wl_columnar_relation_constructor_attempt_identity#3` | `wl_next_relation_identity` | `atomic_compare_exchange_strong_explicit` | relaxed/relaxed | Non-MSVC separately admitted strong identity retry, with original-ID guard after the before-CAS seam |
@@ -2800,10 +2826,12 @@ order. At the time of that repair, the inventory remained518.
 | `relation.c:wl_columnar_relation_cache_constructor_build#19` | `retained destination.state` | `atomic_store_explicit` | release | Publish the complete moved reservation at its final address in the private scalar-copy constructor |
 | `relation.c:wl_columnar_relation_cache_constructor_build#20` | `constructor token2.owner_bits` | `atomic_store_explicit` | relaxed | Clear transferred source owner payload before publishing EMPTY in the private scalar-copy constructor |
 | `relation.c:wl_columnar_relation_cache_constructor_build#21` | `constructor token2.state` | `atomic_store_explicit` | release | Publish EMPTY after source payload and ownership have been cleared in the private scalar-copy constructor |
-| `relation.c:wl_columnar_relation_cache_copy_end` | `retirement.tokens[0].state` | `atomic_store_explicit` | relaxed | Initialize EMPTY at the final token address after this activation clears the complete managed record |
-| `relation.c:wl_columnar_relation_cache_copy_end#2` | `retirement.tokens[1].state` | `atomic_store_explicit` | relaxed | Initialize EMPTY at the final token address after this activation clears the complete managed record |
-| `relation.c:wl_columnar_relation_cache_copy_end#3` | `retirement.tokens[2].state` | `atomic_store_explicit` | relaxed | Initialize EMPTY at the final token address after this activation clears the complete managed record |
-| `relation.c:wl_columnar_relation_cache_copy_end#4` | `retirement.tokens[3].state` | `atomic_store_explicit` | relaxed | Initialize EMPTY at the final token address after this activation clears the complete managed record |
+
+
+Cache-copy retirement restores one token per turn through the existing
+`wl_columnar_memory_reservation_init` atomic site after its complete staged
+raw clear. It publishes the retirement header only after all four tokens are
+initialized.
 
 
 ### Private financial SOURCE bank
@@ -2839,7 +2867,7 @@ outcomes; elapsed time is only the existing test watchdog.
 
 Fresh initialization occurs before pointer publication. Published updates
 retain their actual controller/BANK locks and saved-generation checks. No
-reference observation grants resource access. The exact inventory has554
+reference observation grants resource access. The exact inventory has584
 sites, including the following financial lifecycle observations. Obsolete
 scalar-capture anchors are removed because that earlier handoff no longer
 performs those atomic operations.
@@ -2894,3 +2922,199 @@ performs those atomic operations.
 
 | `relation.c:wl_columnar_relation_radix_workspace_attempt_end_step` | `w->admission.state` | `atomic_load_explicit` | acquire | After actual scratch frees, discover the initialized canonical workspace token's real RESERVED state even if Original stopped after reserve but before verdict publication; select actual rollback receipt without reading old source or granting Native access |
 | `relation.c:wl_columnar_relation_radix_workspace_attempt_test_view` | `a->workspace.admission.state` | `atomic_load_explicit` | acquire | Read-only observation of the actually initialized canonical workspace token; an uninitialized slot reports a sentinel and grants no ownership or source permission |
+
+### Observed parent terminal reservation transfer
+
+The authenticated final-address terminal receipt outlives the transaction header.
+REGISTER checks its historical token is inert before initialization; after all
+array storage is retired, METADATA_MOVE transfers the actual header reservation
+without releasing credit. TX_FREE clears header borrowers before physical free.
+CREDIT subsequently returns only the moved reservation's own credit. Both reads
+occur under the proved terminal creator and session admission; neither read is
+permission to free storage or observe a different operation's token.
+
+| Source anchor | Object | Atomic operation | Ordering | Synchronization purpose |
+| --- | --- | --- | --- | --- |
+| `session.c:wl_columnar_session_terminal_action` | `o->terminal_credit.state` | `atomic_load_explicit` | acquire | Require the retained final-address destination token to be EMPTY or RELEASED before initialization |
+| `session.c:wl_columnar_session_terminal_action#2` | `tx->metadata_credit.state` | `atomic_load_explicit` | acquire | Distinguish actual RESERVED and COMMITTED header credit before moving its address-bound obligation; refund follows physical header free |
+
+
+### Exact completed private-financier generation reuse
+
+A retained Normal financial allocation may renew only after its actual owner,
+allocation identity and completed generation agree under the same mutex. Both
+real references remain owned, and its caller proves all Native borrowers have
+returned. The transition preserves the last completed report and monotone
+attempt counter; it does not inherit the sealed BANK class's rearm exception.
+
+| Source anchor | Object | Atomic operation | Ordering | Synchronization purpose |
+| --- | --- | --- | --- | --- |
+| `evaluation_control.c:wl_evaluation_control_private_financier_rebegin` | `control->active_attempt_id` | `atomic_load_explicit` | acquire | Require no actual active publication before renewing the exact owned completed financial generation |
+| `evaluation_control.c:wl_evaluation_control_private_financier_rebegin#2` | `control->references` | `atomic_load_explicit` | acquire | Require the actual private creation and attachment pair before any configure or cancellation reset |
+| `evaluation_control.c:wl_evaluation_control_private_financier_rebegin#3` | `control->cancelled` | `atomic_exchange_explicit` | relaxed | Clear sticky cancellation only after the exact owned inactive generation and private lifetime have been proved |
+| `evaluation_control.c:wl_evaluation_control_private_financier_rebegin#4` | `control->active_attempt_id` | `atomic_exchange_explicit` | release | Publish the genuine next monotone Normal attempt after fixed financial initialization under the same mutex |
+| `evaluation_control.c:wl_evaluation_control_private_financier_parked_owned` | `control->active_attempt_id` | `atomic_load_explicit` | acquire | Read-only proof that the exact owned completed financial generation has no active publication before callback-free adoption |
+| `evaluation_control.c:wl_evaluation_control_private_financier_parked_owned#2` | `control->references` | `atomic_load_explicit` | acquire | Require the actual creation and attachment pair without retaining, renewing or changing financial state |
+
+### Financial completion publication
+
+| Anchor (`file:function[#N]`) | Field | Op | Order | Justification |
+|---|---|---|---|---|
+| `evaluation_control.c:wl_evaluation_control_financier_publish_inactive` | `control->active_attempt_id` | `atomic_store_explicit` | release | Publish inactive only after the actual matching completion report is durable under its owning financial exclusion (controller mutex for Normal, validated BANK-only exclusion for issued Source); MSVC uses the exact-width InterlockedExchange64 with equivalent or stronger ordering and the existing uint64 width/alignment assertions |
+
+| `evaluation_control.c:wl_evaluation_control_construction_error_finish_commit` | `control->active_attempt_id` | `atomic_store_explicit` | release | Publish the actual positive constructor completion after the matching Normal owner/generation report under its mutex; the inline MSVC exact-width exchange provides equivalent or stronger ordering |
+
+### Sealed metadata startup and first-check refusal
+
+The admitted BANK lane holds its mutex while one controller critical section
+proves the actual Source class, owner, creation/attachment reference pair,
+quiescence and prior verified report. Only that sealed class may reset its
+private counter. Real BEGIN publishes the complete active generation before
+the actual locked zero check. Cancellation stays sticky. A refused initial
+check completes the actual seven-field report and publishes inactive before
+unlocking; no automatic context or positive coupon was published. Normal and
+Original controllers do not acquire this private rearm exception. The shared
+inactive publisher above has the same locked single-writer/report-before-release
+contract for this Source lane. These are ordinary counted financial operations;
+this synchronization audit does not certify their Source/cap bounds.
+
+| Source anchor | Object | Atomic operation | Ordering | Synchronization purpose |
+| --- | --- | --- | --- | --- |
+| `evaluation_control.c:wl_evaluation_control_source_metadata_start` | `control->references` | `atomic_fetch_add_explicit` | acquire | MSVC neutral read proves the actual Source creation and attachment pair before any private counter reset under BANK and controller locks |
+| `evaluation_control.c:wl_evaluation_control_source_metadata_start#2` | `control->references` | `atomic_load_explicit` | acquire | C11 read proves the actual Source creation and attachment pair before any private counter reset under BANK and controller locks |
+| `evaluation_control.c:wl_evaluation_control_source_metadata_start#3` | `control->active_attempt_id` | `atomic_exchange_explicit` | release | Publish the actual begun Source generation after its state is initialized, before the same-lock initial zero; no controller or id is loaned to Native work |
+
+### Issued Source entry under BANK exclusion
+
+The new private issued entry accepts only the actual live admission-owned
+BANK and fresh disjoint automatic context. It keeps BANK locked for class,
+owner, ref2, inactive, capacity and verified-lineage checks, real BEGIN and
+first zero. All non-atomic access to these private controllers is funneled
+through BANK; ordinary unlocked callbacks retain context/running/callback
+markers and cannot loan a controller. Their after-action cancellation may
+run unlocked but touches only the atomic cancelled field. Generic controller
+and checked BANK methods retain their own locks and report readbacks. No
+Normal/Original controller acquires this specialization.
+
+On initial cancellation the seven actual completion fields follow directly
+from exclusive fresh initialization and the actual cancel observation. The
+private entry stores that complete report before release-publishing inactive;
+no callback or non-atomic writer intervenes. Existing report APIs still read
+all seven stored fields, and generic verification is unchanged. The Source
+context is published only on a true initial success and is never loaned to
+Native/user code. Session integration and Source/cap proofs are separate.
+
+| Source anchor | Object | Atomic operation | Ordering | Synchronization purpose |
+| --- | --- | --- | --- | --- |
+| `evaluation_control.c:wl_evaluation_control_source_metadata_enter_issued` | `control->references` | `atomic_load_explicit` | acquire | Read the actual private Source creation/attachment pair under BANK exclusion before any counter reset; MSVC uses exact-width InterlockedCompareExchange64 with acquire-or-stronger ordering |
+| `evaluation_control.c:wl_evaluation_control_source_metadata_enter_issued#2` | `control->active_attempt_id` | `atomic_store_explicit` | release | Publish the actual initialized issued Source generation; MSVC exact-width InterlockedExchange64 supplies equivalent or stronger ordering |
+| `evaluation_control.c:wl_evaluation_control_source_metadata_enter_issued#3` | `control->cancelled` | `atomic_fetch_add_explicit` | relaxed | Observe actual sticky cancellation for the fresh zero-work check; MSVC uses exact-width InterlockedExchangeAdd64 without a non-atomic read |
+| `evaluation_control.c:wl_evaluation_control_source_metadata_enter_issued#4` | `control->active_attempt_id` | `atomic_store_explicit` | release | Publish actual inactive after the exclusive issued initial-cancel report writes under BANK; MSVC uses the same exact-width InterlockedExchange64 field and equivalent-or-stronger ordering |
+
+The fixed CLOSE entry uses the same BANK-exclusive Source ownership contract
+on the actual CLOSE lane. It neither relabels an OP context nor changes generic
+Normal/Original controller synchronization. Its continuation authenticates that
+exact lane/context association until actual FINISH/report settlement.
+
+| Source anchor | Object | Atomic operation | Ordering | Synchronization purpose |
+| --- | --- | --- | --- | --- |
+| `evaluation_control.c:wl_evaluation_control_source_metadata_enter_close_owned` | `control->references` | `atomic_load_explicit` | acquire | Prove the actual private CLOSE creation/attachment pair under BANK exclusion; MSVC uses exact-width InterlockedCompareExchange64 |
+| `evaluation_control.c:wl_evaluation_control_source_metadata_enter_close_owned#2` | `control->active_attempt_id` | `atomic_store_explicit` | release | Publish the actual fixed CLOSE Source generation after exclusive initialization; MSVC uses exact-width InterlockedExchange64 |
+| `evaluation_control.c:wl_evaluation_control_source_metadata_enter_close_owned#3` | `control->cancelled` | `atomic_fetch_add_explicit` | relaxed | Observe actual sticky CLOSE cancellation at its first zero; MSVC uses exact-width InterlockedExchangeAdd64 |
+| `evaluation_control.c:wl_evaluation_control_source_metadata_enter_close_owned#4` | `control->active_attempt_id` | `atomic_store_explicit` | release | Publish actual inactive after the complete seven-field CLOSE cancellation report; MSVC uses exact-width InterlockedExchange64 |
+
+
+### Scoped fixed ordinary observation generation
+
+The private ordinary STEP observation family retains its real OP generation
+through same-frame polls. OPEN performs real first0/fixed10/post10zero before
+publishing context. Poll and END admit no additional work; a financial stop
+settles the exact seven-field report and invalidates that owner once. The
+private lane class rejects generic metadata continuations that try to adopt
+this context. No mutex spans backend work, and no controller/id is loaned to
+Native work. Caller/issuer/return and monetary qualification remains separate.
+
+The additive retained family has a separate closed STANDBY invariant. Only
+checked `source_standby_prepare_owned` enters STANDBY with an actual active
+uncharged generation, no context, no callback, no verified report and zero
+accounting error. Its zero observer preserves those facts or leaves STANDBY for
+STOPPED. Ordinary attach leaves it for FRAME and charges its actual ten;
+`source_metadata_attach_retained_owned` instead performs a saved-generation zero
+and leaves it for METADATA without that charge. Full retained metadata entry
+requires QUIESCENT, and its continuations independently prove the live tuple
+before positive work and leave METADATA for FINISH_PENDING. Handoff leaves
+STANDBY/STOPPED for a real FINISH report, then ACK reaches QUIESCENT. None of
+these transitions writes the closed uncharged extent while remaining STANDBY.
+
+All legacy issuer/rearm funnels, BANK destruction and named configuration,
+owner, report and counter fault mutators require QUIESCENT before changing those
+facts. The live retained rejection fixture changes only the required runtime
+class/owner/ref/saved-id/current-id/control guards under external serialization
+and restores them before returning; it never corrupts projected extent or
+context invariants. No API exports a BANK control/owner/id funding tuple.
+Atomic cancellation is permitted and every attach observes it under the same
+BANK lock before publishing its exact automatic context. Birth-slot identity,
+class, owner, ref2, variant and actual saved/current generation remain runtime
+checks in the zero-only conversion; the closed invariant is not Native authority.
+
+| Source anchor | Object | Atomic operation | Ordering | Rationale |
+|---|---|---|---|---|
+| `evaluation_control.c:wl_evaluation_control_source_observation_zero_locked` | `control->cancelled` | `atomic_fetch_add_explicit` | relaxed | Observe the actual unloaned fixed family's sticky cancellation while BANK serializes all other state; MSVC uses exact-width InterlockedExchangeAdd64 |
+| `evaluation_control.c:wl_evaluation_control_source_observation_open` | `control->references` | `atomic_load_explicit` | acquire | Prove the actual private creation/attachment pair before first0; MSVC uses exact-width InterlockedCompareExchange64 |
+| `evaluation_control.c:wl_evaluation_control_source_observation_open#2` | `control->active_attempt_id` | `atomic_store_explicit` | release | Publish the actual OP observation generation before its real first check; MSVC uses exact-width InterlockedExchange64 |
+| `evaluation_control.c:wl_evaluation_control_source_retained_lock` | `control->references` | `atomic_load_explicit` | acquire | Authenticate the birth-slot-owned BANK and its actual private creation/attachment pair before a retained financial transition; no controller or generation is loaned |
+| `evaluation_control.c:wl_evaluation_control_source_standby_prepare_owned` | `control->active_attempt_id` | `atomic_store_explicit` | release | Publish the genuine uncharged standby generation under BANK exclusion before its first cancellation observation; report ACK precedes reuse |
+| `evaluation_control.c:wl_evaluation_control_source_metadata_enter_retained_owned` | `control->active_attempt_id` | `atomic_store_explicit` | release | Publish the actual retained metadata generation after initialization and before its initial zero; a refused zero retains its real active owner without an automatic context |
+| `evaluation_control.c:wl_evaluation_control_source_retained_metadata_valid` | `control->references` | `atomic_load_explicit` | acquire | Reauthenticate the actual private creation and attachment pair before a retained metadata continuation or owned-error settlement; legacy contexts cannot consume this family |
+| `evaluation_control.c:wl_evaluation_control_source_standby_observe_owned` | `control->references` | `atomic_load_explicit` | acquire | Recheck the actual private creation/attachment pair on every zero-only observation; the closed STANDBY invariant cannot substitute for this reference check |
+| `evaluation_control.c:wl_evaluation_control_source_standby_observe_owned#2` | `control->active_attempt_id` | `atomic_load_explicit` | acquire | Read the actual aligned64-bit published generation before its zero; MSVC uses exact-width InterlockedCompareExchange64 with acquire-or-stronger ordering, and the saved-id comparison rejects inactive0 |
+| `evaluation_control.c:wl_evaluation_control_source_metadata_attach_retained_owned` | `control->references` | `atomic_load_explicit` | acquire | Recheck the private creation and attachment pair before converting the genuine uncharged standby generation into its metadata family; the closed extent invariant does not replace this guard |
+| `evaluation_control.c:wl_evaluation_control_source_metadata_attach_retained_owned#2` | `control->active_attempt_id` | `atomic_load_explicit` | acquire | Acquire the actual aligned64-bit saved generation before the same-lock metadata zero and context publication; MSVC uses exact-width InterlockedCompareExchange64 |
+| `evaluation_control.c:wl_evaluation_control_source_financial_progress_owned` | `control->references` | `atomic_load_explicit` | acquire | Reauthenticate the private creation and attachment pair on each persistent financial packet before report build, publication, readback or ACK |
+| `evaluation_control.c:wl_evaluation_control_source_financial_progress_owned#2` | `control->active_attempt_id` | `atomic_load_explicit` | acquire | Prove the actual saved generation is active1 during frozen BUILD or inactive0 during published readback and ACK; MSVC uses the exact-width Interlocked compare-exchange |
+| `evaluation_control.c:wl_evaluation_control_test_source_retained_rejection` | `control->active_attempt_id` | `atomic_exchange_explicit` | release | Externally serialized named test fixture changes only a required runtime guard to prove current-generation refusal; it exports no control and never changes invariant-owned extent/context/report fields |
+| `evaluation_control.c:wl_evaluation_control_test_source_retained_rejection#2` | `control->active_attempt_id` | `atomic_exchange_explicit` | release | Restore the actual pre-fixture generation after the real observer refusal, before exposing the BANK to another operation |
+
+
+### Inactive finite managed-merge acknowledgement
+
+The additive owned ACK validates genuinely started retirement tokens while the
+complete merge remains intact and private. Never-started retirement payloads
+are not atomic-loaded. Actual EMPTY or RELEASED state and acknowledged receipt
+headers are prerequisites; RELEASED history may retain nonzero owner bits and
+stale governor pointers, which are never followed. The parent must exclude all
+concurrent/stale target access and every raw entry/reset/free until the external
+progress and final report/Source/prepaid Native acknowledgement are discharged.
+An address token alone does not prove that private ownership.
+
+After validation, ordinary clear packets stop before every inline atomic span.
+Each typed scalar initialization is a separate packet, under that same genuine
+exclusive quiescence, for both previously initialized terminal and unused
+atomic storage. It creates no reservation identity, governor reference or live
+credit. Later addresses derive solely from exact member lineage and external
+cursors, never partially cleared target fields. Atomic semantic zero is the
+portable postcondition; ordinary bytes are checked separately. These four
+sites do not certify complete Native caller/ABI/Source packet bounds or activate
+the component in Session. Reached constructor and actual Windows qualification
+remain separate obligations.
+
+| Stable anchor | Field | Operation | Order | Ownership and purpose |
+|---|---|---|---|---|
+| `merge.c:wl_columnar_managed_ack_token` | `t->state` | `atomic_load_explicit` | acquire | Inspect only genuinely initialized private retirement tokens before destructive clearing; unstarted payloads are skipped |
+| `merge.c:wl_columnar_managed_ack_token#2` | `t->owner_bits` | `atomic_load_explicit` | acquire | Validate actual EMPTY slots while intact; RELEASED historical owner bits are neither followed nor required zero |
+| `merge.c:wl_columnar_managed_candidate_merge_ack_step_owned` | `target->retirements[ri].tokens[ti].state` | `atomic_init` | exclusive initialization | Reset exactly one scalar under genuine private quiescence, never publish reservation authority; external progress retains ownership through actual final report/ACK |
+| `merge.c:wl_columnar_managed_candidate_merge_ack_step_owned#2` | `target->retirements[ri].tokens[ti].owner_bits` | `atomic_init` | exclusive initialization | Reset exactly one scalar without reading never-started payload; ordinary byte clearing excludes the whole atomic span |
+
+### Retained prepared observer CLOSE validation
+
+The genuine exclusive CLOSE owner validates one prepared observer packet per
+paid MAIN turn before publishing its separate retirement lease. These loads
+observe existing transferable readers and reservation tokens under that
+lifetime and exclusion; they neither acquire a reader nor refund credit.
+
+| Source anchor | Object | Atomic operation | Ordering | Synchronization purpose |
+| --- | --- | --- | --- | --- |
+| `eval_delta.c:wl_columnar_eval_delta_close_stream` | relation source gate | `atomic_load_explicit` | acquire | Confirm the retained transferable stream reader remains live |
+| `eval_delta.c:wl_columnar_eval_delta_close_stream#2` | relation descriptor gate | `atomic_load_explicit` | acquire | Confirm the same retained reader protects the descriptor |
+| `eval_delta.c:wl_columnar_eval_delta_close_credit` | reservation state | `atomic_load_explicit` | acquire | Validate the prepared token state before inspecting its live payload |
+| `eval_delta.c:wl_columnar_eval_delta_close_credit#2` | reservation owner | `atomic_load_explicit` | acquire | Confirm the prepared observer owns committed credit without following released history |

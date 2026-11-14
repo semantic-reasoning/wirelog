@@ -885,6 +885,16 @@ int wl_columnar_relation_scalar_retirement_prepare_finite(
 int wl_columnar_relation_scalar_retirement_ledger_step_finite(
     wl_columnar_relation_scalar_retirement_t *, wl_evaluation_control_t *,
     uint64_t);
+/* Address-stable parent ledger journal across separate real grants. Never
+ * wrap DESCRIBE/COMMIT in the old metadata128 prefix. The ACK/no-ledger branch
+ * alone owns that extracted metadata action; actual caller/return bounds
+ * remain the enabling parent's qualification obligation. Capture COMMIT's
+ * actual report before the next generation, using retirement_capture_owned.
+ * The relation descriptor stays alive until applied ACK advances phase12. */
+int wl_columnar_relation_scalar_retirement_ledger_step_described(
+    wl_columnar_relation_scalar_retirement_t *,
+    wl_columnar_mem_ledger_retirement_journal_t *, const void *,
+    wl_evaluation_control_t *, uint64_t);
 int wl_columnar_relation_scalar_retirement_cancel(
     wl_columnar_relation_scalar_retirement_t *);
 int wl_columnar_relation_scalar_retirement_commit(
@@ -893,14 +903,17 @@ int wl_columnar_relation_scalar_retirement_step(
     wl_columnar_relation_scalar_retirement_t *, wl_evaluation_control_t *,
     uint64_t);
 
-/* Additive metered scalar initialization. Actual parent owns target lifetime,
+/* Metered asynchronous scalar initialization. Actual parent owns target lifetime,
  * scalar storage and original control ref, freezes selection before BOOT hooks,
- * and proves no live scalar receipt is overwritten. This initializer owns no
+ * and proves no live scalar receipt is overwritten. ZERO clears64 bytes per
+ * step, TOKENS initializes one reservation, and BIND publishes identity last.
+ * This initializer owns no
  * relation/ref/gate; DONE means genuinely BEGUN, never READY. Parent latches
  * begun ownership immediately at BIND, before separately funded RESET. */
 typedef enum {
     WL_COLUMNAR_RELATION_SCALAR_INIT_INERT,
     WL_COLUMNAR_RELATION_SCALAR_INIT_ZERO,
+    WL_COLUMNAR_RELATION_SCALAR_INIT_TOKENS,
     WL_COLUMNAR_RELATION_SCALAR_INIT_BIND,
     WL_COLUMNAR_RELATION_SCALAR_INIT_DONE
 } wl_columnar_relation_scalar_retirement_init_phase_t;
@@ -917,6 +930,8 @@ typedef struct wl_columnar_relation_scalar_retirement_initializer {
     pthread_t owner_thread;
 #endif
     bool thread_valid, busy;
+    size_t zero_offset;
+    unsigned token_index;
     wl_columnar_relation_scalar_retirement_init_phase_t phase;
 } wl_columnar_relation_scalar_retirement_initializer_t;
 int wl_columnar_relation_scalar_retirement_init_begin(
@@ -945,6 +960,9 @@ int wl_columnar_relation_scalar_retirement_release_claims_controlled(
 extern void (*wl_columnar_relation_scalar_retirement_init_test_checkpoint)(
     wl_columnar_relation_scalar_retirement_initializer_t *,
     wl_evaluation_control_t *, unsigned);
+extern void (*wl_columnar_relation_scalar_retirement_init_test_after_step)(
+    wl_columnar_relation_scalar_retirement_initializer_t *,
+    wl_evaluation_control_t *);
 #endif
 
 /* One-funded-action-at-a-time builder for a private, unnamed binary INT64
@@ -1060,6 +1078,35 @@ typedef struct wl_columnar_managed_candidate_merge {
     bool retirement_started[3];
     bool result_transferred;
 } wl_columnar_managed_candidate_merge_t;
+
+/* Parent-owned sibling, never inside the inline target being cleared. Raw
+ * APIs remain synchronous; the private parent must exclude every raw target
+ * entry/reset/free while this actual action/report owner is pending. */
+typedef enum {
+    WL_COLUMNAR_MANAGED_MERGE_ACK_INERT,
+    WL_COLUMNAR_MANAGED_MERGE_ACK_RETIREMENTS,
+    WL_COLUMNAR_MANAGED_MERGE_ACK_TOKENS,
+    WL_COLUMNAR_MANAGED_MERGE_ACK_CLEAR,
+    WL_COLUMNAR_MANAGED_MERGE_ACK_COMPLETE
+} wl_columnar_managed_merge_ack_phase_t;
+typedef struct wl_columnar_managed_candidate_merge_ack_progress {
+    struct wl_columnar_managed_candidate_merge_ack_progress *identity;
+    const void *parent;
+    wl_columnar_managed_candidate_merge_t *target;
+    wl_evaluation_control_t *support;
+    uint64_t support_identity, support_id;
+    size_t clear_offset;
+    unsigned retirement_index, token_index, clear_atomic_index;
+    wl_columnar_managed_merge_ack_phase_t phase;
+#if defined(WL_HAVE_C11_THREADS)
+    thrd_t actor;
+#elif defined(_WIN32) || defined(_WIN64)
+    DWORD actor;
+#else
+    pthread_t actor;
+#endif
+    bool busy, performed, report_pending, ack_prepaid, physical_done;
+} wl_columnar_managed_candidate_merge_ack_progress_t;
 
 /* A resumable, private incremental consolidation. Initialize the object with
  * { 0 } before begin. The object and its writer are address- and thread-bound;
@@ -2166,10 +2213,12 @@ typedef enum {
     WL_COLUMNAR_RELATION_CACHE_COPY_END,
     WL_COLUMNAR_RELATION_CACHE_COPY_END_CLEAR,
     WL_COLUMNAR_RELATION_CACHE_COPY_RETIRE_ZERO,
+    WL_COLUMNAR_RELATION_CACHE_COPY_RETIRE_TOKENS,
     WL_COLUMNAR_RELATION_CACHE_COPY_RETIRE_BEGIN,
     WL_COLUMNAR_RELATION_CACHE_COPY_RETIRE_PREPARE,
     WL_COLUMNAR_RELATION_CACHE_COPY_RETIRE_COMMIT,
     WL_COLUMNAR_RELATION_CACHE_COPY_RETIRE_STEP,
+    WL_COLUMNAR_RELATION_CACHE_COPY_RETIRE_CLEAR,
     WL_COLUMNAR_RELATION_CACHE_COPY_READY_OUTPUT,
     WL_COLUMNAR_RELATION_CACHE_COPY_TAKEN,
     WL_COLUMNAR_RELATION_CACHE_COPY_DISCARDED
@@ -2192,6 +2241,8 @@ typedef struct wl_columnar_relation_cache_scalar_copy_attempt {
     wl_columnar_source_access_reader_t reader;
     col_relation_snapshot_t snapshot;
     bool held, run_valid, retirement_started;
+    size_t retirement_offset;
+    unsigned retirement_token_index;
     wl_columnar_memory_governor_ref_t *governor;
     col_rel_t *output;
     uint32_t width, rows, capacity, column, row, run, previous_end;
@@ -2233,6 +2284,9 @@ int wl_columnar_relation_cache_scalar_copy_ack(
 extern void (*wl_columnar_relation_cache_scalar_copy_test_checkpoint)(
     wl_columnar_relation_cache_scalar_copy_attempt_t *,
     wl_evaluation_control_t *, unsigned);
+extern void (*wl_columnar_relation_cache_scalar_copy_test_after_action)(
+    wl_columnar_relation_cache_scalar_copy_attempt_t *,
+    wl_evaluation_control_t *, wl_columnar_relation_cache_scalar_copy_phase_t);
 #endif
 
 /* ======================================================================== */
@@ -2433,6 +2487,9 @@ typedef struct {
     col_diff_arrangement_t *building, *retiring;
     wl_columnar_memory_governor_ref_t *retire_governor;
     struct wl_mem_ledger *retire_ledger;
+    /* Survives physical arrangement/header and array destruction. Only the
+     * finite parent adapter uses this original-address report/ACK journal. */
+    wl_columnar_mem_ledger_retirement_journal_t ledger_journal;
     bool started, ready, committed, drained, building_initialized;
     bool image_charged, slots_charged, prepared;
 } wl_columnar_arrangement_diff_attempt_t;
@@ -2612,12 +2669,139 @@ typedef struct wl_columnar_eval_delta_observer_build
 typedef struct wl_columnar_eval_delta_observer_prepare
     wl_columnar_eval_delta_observer_prepare_t;
 
+enum wl_columnar_eval_delta_close_validation_call {
+    WL_COLUMNAR_EVAL_DELTA_CLOSE_VALIDATE_BEGIN,
+    WL_COLUMNAR_EVAL_DELTA_CLOSE_VALIDATE_STEP,
+    WL_COLUMNAR_EVAL_DELTA_CLOSE_VALIDATE_READY
+};
+
+enum wl_columnar_eval_delta_close_validation_phase {
+    WL_COLUMNAR_EVAL_DELTA_CLOSE_VALIDATION_HEADER = 1,
+    WL_COLUMNAR_EVAL_DELTA_CLOSE_VALIDATION_ENTRIES,
+    WL_COLUMNAR_EVAL_DELTA_CLOSE_VALIDATION_STREAM,
+    WL_COLUMNAR_EVAL_DELTA_CLOSE_VALIDATION_CREDITS,
+    WL_COLUMNAR_EVAL_DELTA_CLOSE_VALIDATION_READY
+};
+
+/* Private CLOSE validation storage is outside the observer. The real Session
+ * caller pins both allocations and settles each MAIN report/Source receipt
+ * before invoking the next packet or publishing a distinct Native lease.
+ * This descriptor and its ready flag never themselves confer DISCARD access. */
+typedef struct wl_columnar_eval_delta_observer_close_validation {
+    struct wl_columnar_eval_delta_observer_close_validation *identity;
+    struct wl_col_session_t *session;
+    const void *parent;
+    wl_columnar_eval_delta_observer_t *observer;
+    size_t extent;
+    uint32_t count, index, credit;
+    enum wl_columnar_eval_delta_close_validation_phase phase;
+#if defined(WL_HAVE_C11_THREADS)
+    thrd_t actor;
+#elif defined(_WIN32) || defined(_WIN64)
+    DWORD actor;
+#else
+    pthread_t actor;
+#endif
+    bool actor_valid, busy, ready;
+} wl_columnar_eval_delta_observer_close_validation_t;
+
+/* Canonical caller proof supplies validation-only Native lifetime/exclusion.
+ * It authenticates the real CLOSE scope, private slot/actor and already
+ * settled financial wake. It cannot be replaced by an address/report token. */
+int wl_columnar_session_observer_close_validation_prove(
+    const struct wl_col_session_t *, const void *,
+    const wl_columnar_eval_delta_observer_close_validation_t *,
+    wl_evaluation_control_t *, uint64_t, unsigned);
+int wl_columnar_eval_delta_observer_close_validation_begin_owned(
+    struct wl_col_session_t *, const void *,
+    wl_columnar_eval_delta_observer_close_validation_t *,
+    wl_evaluation_control_t *, uint64_t);
+int wl_columnar_eval_delta_observer_close_validation_step_owned(
+    struct wl_col_session_t *, const void *,
+    wl_columnar_eval_delta_observer_close_validation_t *,
+    wl_evaluation_control_t *, uint64_t);
+/* Called inside the separately paid LEASE_PUBLISH packet; no admission or
+ * resource mutation is appended by this read-only final validation. */
+int wl_columnar_eval_delta_observer_close_validation_ready_owned(
+    const struct wl_col_session_t *, const void *,
+    const wl_columnar_eval_delta_observer_close_validation_t *,
+    wl_evaluation_control_t *, uint64_t);
+#ifdef WL_SESSION_TEST_HOOKS
+extern void (*wl_columnar_eval_delta_test_close_validation_checkpoint)(
+    struct wl_col_session_t *,
+    const wl_columnar_eval_delta_observer_close_validation_t *,
+    wl_evaluation_control_t *, uint64_t);
+#endif
+
 typedef enum {
     WL_COLUMNAR_EVAL_DELTA_OBSERVER_RETIRE_NONE = 0,
     WL_COLUMNAR_EVAL_DELTA_OBSERVER_RETIRE_BEGIN_ABORT,
     WL_COLUMNAR_EVAL_DELTA_OBSERVER_RETIRE_COMPLETED_STEP,
     WL_COLUMNAR_EVAL_DELTA_OBSERVER_RETIRE_DISCARD,
 } wl_columnar_eval_delta_observer_retire_t;
+
+enum wl_columnar_eval_delta_resource_phase {
+    WL_COLUMNAR_EVAL_DELTA_RESOURCE_INERT,
+    WL_COLUMNAR_EVAL_DELTA_RESOURCE_BUILD_READER,
+    WL_COLUMNAR_EVAL_DELTA_RESOURCE_PREPARE_READER,
+    WL_COLUMNAR_EVAL_DELTA_RESOURCE_STREAM_READER,
+    WL_COLUMNAR_EVAL_DELTA_RESOURCE_ENTRY_READER,
+    WL_COLUMNAR_EVAL_DELTA_RESOURCE_READERS_DONE,
+    WL_COLUMNAR_EVAL_DELTA_RESOURCE_CURRENT,
+    WL_COLUMNAR_EVAL_DELTA_RESOURCE_EVENTS,
+    WL_COLUMNAR_EVAL_DELTA_RESOURCE_STAGING,
+    WL_COLUMNAR_EVAL_DELTA_RESOURCE_PREPARE_FREE,
+    WL_COLUMNAR_EVAL_DELTA_RESOURCE_ROWS, WL_COLUMNAR_EVAL_DELTA_RESOURCE_NAME,
+    WL_COLUMNAR_EVAL_DELTA_RESOURCE_PAYLOAD,
+    WL_COLUMNAR_EVAL_DELTA_RESOURCE_HOLD,
+    WL_COLUMNAR_EVAL_DELTA_RESOURCE_METADATA_MOVE,
+    WL_COLUMNAR_EVAL_DELTA_RESOURCE_OBSERVER_FREE,
+    WL_COLUMNAR_EVAL_DELTA_RESOURCE_METADATA,
+    WL_COLUMNAR_EVAL_DELTA_RESOURCE_GOVERNOR,
+    WL_COLUMNAR_EVAL_DELTA_RESOURCE_BUILD_METADATA,
+    WL_COLUMNAR_EVAL_DELTA_RESOURCE_BUILD_GOVERNOR,
+    WL_COLUMNAR_EVAL_DELTA_RESOURCE_BUILD_FREE,
+    WL_COLUMNAR_EVAL_DELTA_RESOURCE_GC,
+    WL_COLUMNAR_EVAL_DELTA_RESOURCE_DONE, WL_COLUMNAR_EVAL_DELTA_RESOURCE_CLEAR
+};
+
+/* Selected finite observer resource continuation. Actual ownership comes from
+ * its caller's live Session and canonical slots, never this phase or quote.
+ * It remains outside observer/build/prepare allocations through final ACK. */
+typedef struct {
+    const void *identity;
+    struct wl_col_session_t *session;
+    wl_compound_arena_t *arena;
+    wl_columnar_eval_delta_observer_t *observer;
+    wl_columnar_eval_delta_observer_build_t *build;
+    wl_columnar_eval_delta_observer_prepare_t *prepare;
+#if defined(WL_HAVE_C11_THREADS)
+    thrd_t thread;
+#elif defined(_WIN32) || defined(_WIN64)
+    DWORD thread;
+#else
+    pthread_t thread;
+#endif
+    bool thread_valid, busy;
+    unsigned phase, index, count, token_phase;
+    size_t extent, initialized_bytes, clear_offset;
+    wl_columnar_eval_delta_observer_retire_t disposition;
+    bool build_owned, partial, readers_done, rollback, token_mode_set;
+    wl_arena_compound_arena_hold_release_t hold;
+    wl_arena_compound_arena_gc_step_t gc;
+} wl_columnar_eval_delta_observer_resource_t;
+
+typedef struct {
+    int protocol;
+    unsigned action;
+    uint64_t work;
+    bool readers_done, done;
+} wl_columnar_eval_delta_observer_resource_quote_t;
+typedef struct {
+    int protocol;
+    unsigned action;
+    bool progressed, readers_done, done;
+} wl_columnar_eval_delta_observer_resource_reply_t;
 
 enum wl_columnar_eval_delta_observer_retire_credit {
     WL_COLUMNAR_EVAL_DELTA_OBSERVER_CREDIT_STAGING = 1,
@@ -2698,9 +2882,207 @@ typedef struct wl_columnar_session_cold_relation {
 struct wl_columnar_kfusion_cohort;
 typedef struct wl_columnar_eval_tdd_run wl_columnar_eval_tdd_run_t;
 typedef struct wl_columnar_controlled_step wl_columnar_controlled_step_t;
+
+typedef enum {
+    WL_COLUMNAR_EVAL_DELTA_RESOURCE_CALL_BEGIN,
+    WL_COLUMNAR_EVAL_DELTA_RESOURCE_CALL_OBSERVE,
+    WL_COLUMNAR_EVAL_DELTA_RESOURCE_CALL_STEP,
+    WL_COLUMNAR_EVAL_DELTA_RESOURCE_CALL_ACK,
+    WL_COLUMNAR_EVAL_DELTA_RESOURCE_CALL_FINISH
+} wl_columnar_eval_delta_resource_call_t;
+
+typedef struct {
+    int protocol;
+    wl_columnar_eval_delta_observer_retire_t disposition;
+    bool *acknowledged;
+    bool acked;
+} wl_columnar_session_observed_observer_permit_t;
+
+wl_columnar_session_observed_observer_permit_t
+    wl_columnar_session_observed_observer_prove(struct wl_col_session_t *,
+    wl_columnar_controlled_step_t *, wl_columnar_eval_delta_resource_call_t,
+    wl_columnar_eval_delta_observer_resource_t *, wl_evaluation_control_t *,
+    uint64_t);
+/* Separate canonical MAIN recipient proof, never the legacy abort-financier
+ * proof or a copied financial record. It performs no positive admission. */
+wl_columnar_session_observed_observer_permit_t
+    wl_columnar_session_observed_observer_main_prove(struct wl_col_session_t *,
+    wl_columnar_controlled_step_t *, wl_columnar_eval_delta_resource_call_t,
+    wl_columnar_eval_delta_observer_resource_t *, wl_evaluation_control_t *,
+    uint64_t);
+bool wl_columnar_session_observed_observer_pending(
+    const struct wl_col_session_t *);
+
+wl_columnar_eval_delta_observer_resource_reply_t
+    wl_columnar_eval_delta_observer_resource_begin_owned(
+    struct wl_col_session_t *, wl_columnar_controlled_step_t *,
+    wl_columnar_eval_delta_observer_resource_t *, wl_evaluation_control_t *,
+    uint64_t);
+wl_columnar_eval_delta_observer_resource_quote_t
+    wl_columnar_eval_delta_observer_resource_observe_owned(
+    struct wl_col_session_t *, wl_columnar_controlled_step_t *,
+    wl_columnar_eval_delta_observer_resource_t *, wl_evaluation_control_t *,
+    uint64_t);
+wl_columnar_eval_delta_observer_resource_reply_t
+    wl_columnar_eval_delta_observer_resource_step_owned(
+    struct wl_col_session_t *, wl_columnar_controlled_step_t *,
+    wl_columnar_eval_delta_observer_resource_t *, wl_evaluation_control_t *,
+    uint64_t);
+wl_columnar_eval_delta_observer_resource_reply_t
+    wl_columnar_eval_delta_observer_resource_ack_owned(
+    struct wl_col_session_t *, wl_columnar_controlled_step_t *,
+    wl_columnar_eval_delta_observer_resource_t *, wl_evaluation_control_t *,
+    uint64_t);
+
+/* One MAIN action each. BEGIN/STEP/ACK keep the actual leaf admission;
+ * OBSERVE/FINISH extract the existing parent metadata action. No combined
+ * OBSERVE+STEP, late factory or financier alias. Whole Native caller/return
+ * qualification remains required before activating the corresponding parent. */
+wl_columnar_eval_delta_observer_resource_reply_t
+    wl_columnar_eval_delta_observer_resource_begin_main_owned(
+    struct wl_col_session_t *, wl_columnar_controlled_step_t *,
+    wl_columnar_eval_delta_observer_resource_t *, wl_evaluation_control_t *,
+    uint64_t);
+wl_columnar_eval_delta_observer_resource_quote_t
+    wl_columnar_eval_delta_observer_resource_observe_main_owned(
+    struct wl_col_session_t *, wl_columnar_controlled_step_t *,
+    wl_columnar_eval_delta_observer_resource_t *, wl_evaluation_control_t *,
+    uint64_t);
+wl_columnar_eval_delta_observer_resource_reply_t
+    wl_columnar_eval_delta_observer_resource_step_main_owned(
+    struct wl_col_session_t *, wl_columnar_controlled_step_t *,
+    wl_columnar_eval_delta_observer_resource_t *, wl_evaluation_control_t *,
+    uint64_t);
+wl_columnar_eval_delta_observer_resource_reply_t
+    wl_columnar_eval_delta_observer_resource_finish_main_owned(
+    struct wl_col_session_t *, wl_columnar_controlled_step_t *,
+    wl_columnar_eval_delta_observer_resource_t *, wl_evaluation_control_t *,
+    uint64_t);
+wl_columnar_eval_delta_observer_resource_reply_t
+    wl_columnar_eval_delta_observer_resource_ack_main_owned(
+    struct wl_col_session_t *, wl_columnar_controlled_step_t *,
+    wl_columnar_eval_delta_observer_resource_t *, wl_evaluation_control_t *,
+    uint64_t);
+
+#ifdef WL_SESSION_TEST_HOOKS
+enum {
+    WL_COLUMNAR_EVAL_DELTA_TEST_RESOURCE_BEGIN = 1,
+    WL_COLUMNAR_EVAL_DELTA_TEST_RESOURCE_ACK,
+    WL_COLUMNAR_EVAL_DELTA_TEST_RESOURCE_STEP_BASE = 256
+};
+extern void (*wl_columnar_eval_delta_test_resource_prefooter)(
+    wl_evaluation_control_t *, uint64_t, unsigned);
+extern void (*wl_columnar_eval_delta_test_observer_advanced)(
+    struct wl_col_session_t *);
+int wl_columnar_eval_delta_test_observer_resource_view(
+    const struct wl_col_session_t *, uint64_t[16]);
+extern uint64_t (*wl_columnar_session_test_observer_resource_limit)(
+    const struct wl_col_session_t *, uint64_t);
+extern void (*wl_columnar_session_test_observer_resource_finished)(
+    const struct wl_col_session_t *, unsigned, wl_evaluation_control_report_t,
+    int);
+extern void (*wl_columnar_session_test_observer_finance_phase)(
+    struct wl_col_session_t *, wl_evaluation_control_t *, uint64_t,
+    unsigned, bool, int);
+extern void (*wl_columnar_session_test_terminal_advanced)(
+    struct wl_col_session_t *, wl_evaluation_control_t *, uint64_t,
+    unsigned, unsigned, int);
+extern uint64_t (*wl_columnar_session_test_terminal_limit)(
+    const struct wl_col_session_t *, uint64_t);
+extern void (*wl_columnar_session_test_terminal_finance_phase)(
+    struct wl_col_session_t *, bool, wl_evaluation_control_t *, uint64_t,
+    unsigned, bool, int);
+extern void (*wl_columnar_session_test_terminal_finished)(
+    const struct wl_col_session_t *, unsigned, bool,
+    wl_evaluation_control_report_t);
+enum {
+    WL_COLUMNAR_SESSION_TEST_SNAPSHOT_OUTER_RESET = 1,
+    WL_COLUMNAR_SESSION_TEST_SNAPSHOT_OUTER_BEFORE_SELECTED,
+    WL_COLUMNAR_SESSION_TEST_SNAPSHOT_OUTER_AFTER_SELECTED
+};
+extern void (*wl_columnar_session_test_snapshot_finish_outer_phase)(
+    struct wl_col_session_t *, unsigned);
+int wl_columnar_session_test_snapshot_finish_retained_view(
+    const struct wl_col_session_t *, uint64_t out[12]);
+extern void (*wl_columnar_session_test_snapshot_finish_phase)(
+    struct wl_col_session_t *, unsigned, bool, int, bool);
+int wl_columnar_session_test_snapshot_finish_view(
+    const struct wl_col_session_t *, uint64_t out[8]);
+int wl_columnar_session_test_snapshot_prior_view(
+    const struct wl_col_session_t *, uint64_t out[8]);
+/* Outside BANK, under real admission and bind busy. The generation fields
+ * describe actual Step/payload state and convey no controller/Native loan. */
+extern void (*wl_columnar_session_test_metadata_bind_phase)(
+    struct wl_col_session_t *, unsigned, bool, int, bool, uint64_t, uint64_t,
+    bool);
+int wl_columnar_session_test_metadata_candidate(const struct wl_col_session_t *,
+    uint64_t out[5]);
+int wl_columnar_session_test_metadata_bind_view(
+    const struct wl_col_session_t *, uint64_t out[10]);
+extern void (*wl_columnar_session_test_constructor_error_phase)(
+    struct wl_col_session_t *, unsigned, bool, int, bool);
+extern void (*wl_columnar_session_test_constructor_outer_source_phase)(
+    struct wl_col_session_t *, unsigned, bool, uint64_t, int, bool);
+extern void (*wl_columnar_session_test_financier_outer_source_phase)(
+    struct wl_col_session_t *, unsigned, unsigned, unsigned, bool, uint64_t,
+    int, bool);
+bool wl_columnar_session_test_bootstrap_finance_pending(
+    const struct wl_col_session_t *);
+int wl_columnar_session_test_constructor_error_view(
+    const struct wl_col_session_t *, uint64_t out[8]);
+int wl_columnar_session_test_producer_disposition_view(
+    const struct wl_col_session_t *, uint64_t out[6]);
+int wl_columnar_session_test_producer_view(const struct wl_col_session_t *,
+    uint64_t out[6]);
+/* Quiescent test observation of retained WORK ownership; no Native permit. */
+int wl_columnar_session_test_retained_work_owner(
+    const struct wl_col_session_t *,
+    uint64_t out[8]);
+int wl_columnar_session_test_terminal_view(const struct wl_col_session_t *,
+    uint64_t[16]);
+/* Descriptive MAIN protocol observations, never a Native permission. */
+int wl_columnar_session_test_main_view(const struct wl_col_session_t *,
+    uint64_t[16]);
+extern void (*wl_columnar_session_test_main_birth)(
+    const struct wl_col_session_t *, bool, wl_evaluation_control_t *,
+    uint64_t, uint64_t, int);
+extern void (*wl_columnar_session_test_main_report_finished)(
+    const struct wl_col_session_t *, wl_evaluation_control_t *, uint64_t,
+    wl_evaluation_control_report_t);
+extern uint64_t (*wl_columnar_session_test_main_limit)(
+    const struct wl_col_session_t *, unsigned, unsigned, uint64_t);
+extern void (*wl_columnar_session_test_main_finance_phase)(
+    struct wl_col_session_t *, wl_evaluation_control_t *, uint64_t,
+    unsigned, unsigned, unsigned, bool, int);
+extern void (*wl_columnar_session_test_main_action_report)(
+    const struct wl_col_session_t *, unsigned, unsigned,
+    wl_evaluation_control_report_t, int);
+extern void (*wl_columnar_session_test_main_action_advanced)(
+    struct wl_col_session_t *, wl_evaluation_control_t *, uint64_t,
+    unsigned, unsigned, unsigned, int);
+int wl_columnar_session_test_observer_main_view(
+    const struct wl_col_session_t *, uint64_t[16]);
+bool wl_columnar_session_test_terminal_credit(const struct wl_col_session_t *,
+    const wl_columnar_memory_reservation_t *);
+bool wl_columnar_session_test_terminal_physical_pending(
+    const struct wl_col_session_t *);
+bool wl_columnar_session_test_terminal_busy(const struct wl_col_session_t *);
+struct wl_columnar_relation_scalar_source;
+bool wl_columnar_session_test_frontier_source_current(
+    const struct wl_col_session_t *,
+    const struct wl_columnar_relation_scalar_source *);
+int wl_columnar_session_test_observer_resource_view(
+    const struct wl_col_session_t *, uint64_t[12]);
+extern void (*wl_columnar_session_test_observer_parent_free)(
+    struct wl_col_session_t *);
+
+#endif
+
+struct wl_columnar_eval_private_bindings;
 bool wl_columnar_session_controlled_batch_authorized(
     const struct wl_col_session_t *, const wl_evaluation_control_t *,
-    uint64_t, uint64_t);
+    uint64_t, uint64_t, const wl_plan_relation_t *,
+    const struct wl_columnar_eval_private_bindings *);
 typedef struct wl_columnar_tdd_owner_lifetime {
     uint32_t worker_count;
     uint32_t relation_count;
@@ -2720,6 +3102,51 @@ typedef struct wl_columnar_tdd_owner_lifetime {
      * at w * relation_count. */
     col_rel_t *relations[];
 } wl_columnar_eval_tdd_owner_lifetime_t;
+
+typedef enum {
+    WL_COLUMNAR_SESSION_STEP_RESET_NONE,
+    WL_COLUMNAR_SESSION_STEP_RESET_CLEAR,
+    WL_COLUMNAR_SESSION_STEP_RESET_RESTORE,
+    WL_COLUMNAR_SESSION_STEP_RESET_BIND,
+    WL_COLUMNAR_SESSION_STEP_RESET_READY,
+    WL_COLUMNAR_SESSION_STEP_RESET_HANDOFF,
+    WL_COLUMNAR_SESSION_STEP_RESET_DELIVERY
+} wl_columnar_session_step_reset_phase_t;
+
+typedef enum {
+    WL_COLUMNAR_SESSION_STEP_RESET_COMMITTED_DIRTY = 1,
+    WL_COLUMNAR_SESSION_STEP_RESET_FAILED_RETRY,
+    WL_COLUMNAR_SESSION_STEP_RESET_FAILED_RETRY_STARTED_NO_NATIVE
+} wl_columnar_session_step_reset_origin_t;
+
+/* This owner lives outside the descriptor whose metadata it clears. No
+ * Native resource, financial grant or synchronous Snapshot address is copied. */
+typedef struct {
+    const void *identity;
+    struct wl_col_session_t *session;
+    wl_columnar_controlled_step_t *target;
+    wl_evaluation_control_t *control;
+    uint64_t control_identity, operation_id, operation_identity;
+    col_rel_t *append_source;
+    uint64_t append_identity;
+    uint32_t append_begin;
+    size_t byte;
+    unsigned restore;
+    wl_columnar_session_step_reset_phase_t phase;
+    wl_columnar_session_step_reset_origin_t origin;
+    bool operation_active, observed, general, append_proven, busy;
+    bool old_observed, old_published, ended_valid;
+    int ended_result;
+    wl_backend_controlled_completion_t completion;
+    bool thread_valid;
+#if defined(WL_HAVE_C11_THREADS)
+    thrd_t thread;
+#elif defined(_WIN32) || defined(_WIN64)
+    DWORD thread;
+#else
+    pthread_t thread;
+#endif
+} wl_columnar_session_step_reset_t;
 
 typedef struct wl_col_session_t {
     wl_session_t base;         /* MUST be first field (vtable dispatch)  */
@@ -2770,6 +3197,9 @@ typedef struct wl_col_session_t {
     /* Framed controlled initial STEP continuation; opaque to the session
      * layout so its host protocol types remain declared below. */
     wl_columnar_controlled_step_t *controlled_step;
+    wl_columnar_session_step_reset_t controlled_step_reset;
+    bool destroy_prepared;
+    bool destroy_controlled_prepared;
     /* Issue #2092, #2348: how many leading strata a plain step or a snapshot
      * that has not committed evaluated, including one that failed (saturating).
      * Their heads may hold rows no commit accounts for, so the next plain step,
@@ -3336,6 +3766,16 @@ wl_columnar_session_copy_without_ledger(wl_col_session_t *destination,
     memcpy((unsigned char *)destination + end,
         (const unsigned char *)source + end, sizeof(*source) - end);
     destination->controlled_scalar_view = NULL;
+    destination->controlled_step = NULL;
+    destination->base.source_financial_head = NULL;
+    destination->controlled_step_reset.identity = NULL;
+    destination->controlled_step_reset.phase =
+        WL_COLUMNAR_SESSION_STEP_RESET_NONE;
+    destination->controlled_step_reset.busy = false;
+    destination->controlled_step_reset.thread_valid = false;
+    destination->controlled_step_reset.completion.selected = false;
+    destination->destroy_prepared = false;
+    destination->destroy_controlled_prepared = false;
     wl_columnar_memory_reservation_init(
         &destination->controlled_scalar_view_reservation);
     /* Worker wrappers never inherit the coordinator's pending owners. */
@@ -3783,6 +4223,29 @@ wl_columnar_managed_candidate_merge_status(
 int
 wl_columnar_managed_candidate_merge_ack(
     wl_columnar_managed_candidate_merge_t *attempt);
+/* Genuine finite support owns proof/body/footer AND the one-use delayed
+* financial ACK suffix. Caller proves full current private parent/target/
+* controller allocation lineage and disjointness before every invocation.
+* No output is published on an unselected/protocol/refused admission. */
+int wl_columnar_managed_candidate_merge_ack_begin_owned(
+    wl_columnar_managed_candidate_merge_ack_progress_t *, const void *,
+    wl_columnar_managed_candidate_merge_t *, wl_evaluation_control_t *,
+    uint64_t, bool *);
+int wl_columnar_managed_candidate_merge_ack_step_owned(
+    wl_columnar_managed_candidate_merge_ack_progress_t *, const void *,
+    wl_columnar_managed_candidate_merge_t *, wl_evaluation_control_t *,
+    uint64_t, bool *);
+int wl_columnar_managed_candidate_merge_ack_action_ack_owned(
+    wl_columnar_managed_candidate_merge_ack_progress_t *, const void *,
+    wl_evaluation_control_t *, uint64_t);
+bool wl_columnar_managed_candidate_merge_ack_pending(
+    const wl_columnar_managed_candidate_merge_ack_progress_t *);
+#ifdef WL_SESSION_TEST_HOOKS
+extern void (*wl_columnar_managed_candidate_merge_test_ack_checkpoint)(
+    wl_columnar_managed_candidate_merge_ack_progress_t *,
+    wl_evaluation_control_t *, uint64_t);
+#endif
+
 uint64_t
 col_rel_owned_ledger_bytes(const col_rel_t *r);
 /* Checked flat-grid size for ncols pointer slots and owned INT64 lanes. */
@@ -4860,13 +5323,15 @@ typedef enum {
     WL_COLUMNAR_RELATION_SCALAR_SOURCE_INERT,
     WL_COLUMNAR_RELATION_SCALAR_SOURCE_DESCRIPTOR,
     WL_COLUMNAR_RELATION_SCALAR_SOURCE_HELD,
+    WL_COLUMNAR_RELATION_SCALAR_SOURCE_ENDING,
     WL_COLUMNAR_RELATION_SCALAR_SOURCE_DRAINED
 } wl_columnar_relation_scalar_source_phase_t;
 
 typedef struct wl_columnar_relation_scalar_source {
     struct wl_columnar_relation_scalar_source *identity;
     wl_evaluation_control_t *control;
-    uint64_t attempt_id;
+    uint64_t attempt_id, control_identity, end_attempt_id;
+    unsigned end_cursor;
     wl_columnar_relation_scalar_source_phase_t phase;
 #if defined(WL_HAVE_C11_THREADS)
     thrd_t owner_thread;
@@ -4916,6 +5381,13 @@ int wl_columnar_relation_scalar_source_begin_attempt_controlled(
 int wl_columnar_relation_scalar_source_admit_attempt_controlled(
     wl_columnar_relation_scalar_source_t *source, const col_rel_t *relation,
     bool preserve_timestamps, uint32_t admit);
+/* Retained failures keep actual acquired claims and enter ENDING. Only the
+ * genuine initialized source may then be driven through finite funded END. */
+int wl_columnar_relation_scalar_source_begin_retained_attempt_controlled(
+    wl_columnar_relation_scalar_source_t *, const col_rel_t *, bool);
+/* The same opt-in representation check, retaining acquired readers on error. */
+int wl_columnar_relation_scalar_source_admit_retained_attempt_controlled(
+    wl_columnar_relation_scalar_source_t *, const col_rel_t *, bool, uint32_t);
 int wl_columnar_relation_scalar_source_validate_attempt_controlled(
     const wl_columnar_relation_scalar_source_t *, wl_evaluation_control_t *,
     uint64_t);
@@ -5065,6 +5537,17 @@ int wl_columnar_relation_append_batch_mark_sorted_operator_controlled(
     wl_columnar_relation_append_batch_t *, wl_evaluation_control_t *, uint64_t);
 int wl_columnar_relation_scalar_source_end(
     wl_columnar_relation_scalar_source_t *source, int initiating_result);
+/* One finite reader/metadata action. Protocol is separate from first_result;
+ * ENDING blocks forward access. Progress survives a stopped financier footer.
+ * The caller owns source storage until done and keeps its cleanup grants live. */
+int wl_columnar_relation_scalar_source_end_step(
+    wl_columnar_relation_scalar_source_t *, int,
+    wl_evaluation_control_t *, uint64_t, bool *);
+#ifdef WL_SESSION_TEST_HOOKS
+extern void (*wl_columnar_relation_test_scalar_end_checkpoint)(
+    const wl_columnar_relation_scalar_source_t *, wl_evaluation_control_t *,
+    uint64_t, unsigned);
+#endif
 
 /* Fresh private scalar construction. Same strict non-NULL name/governor/out
 * domain as raw; NULL control delegates raw. The name remains immutable for
@@ -5310,6 +5793,10 @@ typedef struct {
 int wl_columnar_relation_reader_step(const col_rel_t *relation,
     wl_columnar_relation_reader_step_t *record, bool release,
     wl_evaluation_control_t *control, uint64_t attempt_id);
+/* Read-only shape proof shared with finite CLOSE validation. The caller
+ * supplies real relation lifetime and Native permission; no gate action. */
+int wl_columnar_relation_reader_step_validate(const col_rel_t *,
+    const wl_columnar_relation_reader_step_t *);
 int col_rel_source_reader_release(wl_columnar_source_access_reader_t *);
 int col_rel_source_writer_acquire(const col_rel_t *,
     wl_columnar_source_access_writer_t *);
@@ -5966,6 +6453,11 @@ int wl_columnar_expr_cstr_length_attempt_controlled(const char *, size_t *,
     wl_evaluation_control_t *, uint64_t);
 int wl_columnar_expr_bytes_compare_attempt_controlled(const uint8_t *,
     const uint8_t *, size_t, int *, wl_evaluation_control_t *, uint64_t);
+/* Compare real intern rank/lexical values without normalizing invalid IDs.
+ * Outputs publish only after the last actual saved-generation observation. */
+int wl_columnar_expr_intern_rank_compare_attempt_controlled(const wl_intern_t *,
+    int64_t, int64_t, int *, bool *, bool *, wl_evaluation_control_t *,
+    uint64_t);
 int wl_columnar_expr_bytes_copy_attempt_controlled(uint8_t *, const uint8_t *,
     size_t, size_t *, wl_evaluation_control_t *, uint64_t);
 int wl_columnar_expr_bytes_hash_attempt_controlled(const uint8_t *, size_t,
@@ -8090,6 +8582,19 @@ void wl_columnar_arrangement_diff_attempt_commit(
 int wl_columnar_arrangement_diff_attempt_drain(
     wl_columnar_arrangement_diff_attempt_t *, wl_col_session_t *,
     wl_evaluation_control_t *, uint64_t);
+/* One actual finite parent action, without the generic128 prefix on ledger
+ * DESCRIBE109/COMMIT194. The real parent pins the same control allocation and
+ * this record until every action's actual FINISH/report/Source receipt/ACK.
+ * Capture a consumed COMMIT report before starting another generation. The
+ * next drain uses its existing metadata128 action for the prepaid fixed ACK;
+ * applied=false retries fresh DESCRIBE only after that ACK. Legacy raw drain
+ * is unchanged and cannot be interleaved while this journal is live. */
+int wl_columnar_arrangement_diff_attempt_drain_finite(
+    wl_columnar_arrangement_diff_attempt_t *, wl_col_session_t *,
+    wl_evaluation_control_t *, uint64_t);
+int wl_columnar_arrangement_diff_attempt_ledger_capture_owned(
+    wl_columnar_arrangement_diff_attempt_t *, wl_evaluation_control_t *,
+    uint64_t);
 #ifdef WL_SESSION_TEST_HOOKS
 extern void (*wl_columnar_arrangement_test_diff_checkpoint)(
     wl_evaluation_control_t *, unsigned, uint64_t);
@@ -8192,11 +8697,33 @@ int wl_columnar_filter_batch_end_step_owned_funded(
     const void *, wl_evaluation_control_t *, uint64_t);
 /* Exact owned ordinary JOIN cleanup only. Queries refuse all stream hosts;
  * actual END uses distinct supplied funding after the parent dispatch1. */
+typedef enum {
+    WL_COLUMNAR_FILTER_SOURCE_END_NONE,
+    WL_COLUMNAR_FILTER_SOURCE_END_EMPTY_LEFT,
+    WL_COLUMNAR_FILTER_SOURCE_END_EMPTY_RIGHT,
+    WL_COLUMNAR_FILTER_SOURCE_END_SCALAR_LEFT,
+    WL_COLUMNAR_FILTER_SOURCE_END_SCALAR_RIGHT
+} wl_columnar_filter_source_end_kind_t;
+int wl_columnar_filter_source_end_pending_owned(
+    wl_columnar_eval_stack_cleanup_frame_t *, const void *,
+    wl_evaluation_control_t *, uint64_t,
+    wl_columnar_filter_source_end_kind_t *);
+int wl_columnar_filter_source_end_step_owned(
+    wl_columnar_eval_stack_cleanup_frame_t *, wl_columnar_filter_status_t *,
+    const void *, wl_evaluation_control_t *, uint64_t);
 int wl_columnar_filter_empty_end_pending_owned(
     wl_columnar_eval_stack_cleanup_frame_t *, const void *, bool *);
 int wl_columnar_filter_empty_end_step_owned(
     wl_columnar_eval_stack_cleanup_frame_t *, wl_columnar_filter_status_t *,
     const void *, wl_evaluation_control_t *, uint64_t);
+int wl_columnar_eval_stack_scalar_source_begin_owned(
+    wl_columnar_eval_stack_cleanup_frame_t *, const void *,
+    const wl_plan_op_t *,
+    wl_columnar_relation_scalar_source_t *, const col_rel_t *, bool);
+int wl_columnar_eval_stack_scalar_source_admit_owned(
+    wl_columnar_eval_stack_cleanup_frame_t *, const void *,
+    const wl_plan_op_t *,
+    wl_columnar_relation_scalar_source_t *, const col_rel_t *, bool, uint32_t);
 int wl_columnar_eval_stack_filter_context_nonstream_owned(
     wl_columnar_eval_stack_cleanup_frame_t *, wl_columnar_filter_context_t **,
     const void *);
@@ -8705,7 +9232,7 @@ typedef struct wl_columnar_eval_serial_framed_attempt {
     bool candidate_owned, materialized, committed, pending_inner_consume;
     bool close_proven, abort_supported, abort_requested;
     bool native_cleanup;
-    bool unary_native_cleanup;
+    bool unary_native_cleanup, observed_native_cleanup;
     bool controlled_materialized_batch_fallback;
     const wl_columnar_eval_private_bindings_t *private_bindings;
     col_rel_t **capture_out;
@@ -8797,6 +9324,7 @@ typedef struct wl_columnar_eval_stack_unary_prepared {
     wl_evaluation_control_t *control;
     uint64_t control_identity, attempt_id;
     wl_columnar_eval_stack_unary_prepared_work_t work;
+    /* alias_cursor is a byte offset only in the two CLEAR_WORK phases. */
     uint32_t numeric_cursor, top, index, alias_cursor;
     wl_columnar_eval_plan_numeric_phase_t numeric_phase;
     wl_columnar_eval_stack_unary_prepared_phase_t phase;
@@ -8831,13 +9359,50 @@ typedef struct {
 int wl_columnar_eval_stack_unary_prepared_begin(
     wl_columnar_eval_stack_unary_prepared_t *,
     wl_columnar_eval_stack_cleanup_frame_t *,
-    const wl_columnar_eval_plan_numeric_attempt_t *);
+    const wl_columnar_eval_plan_numeric_attempt_t *, bool *);
 /* Normal ordinary JOIN context at its real JOIN_DECIDE boundary. This
  * primitive does not itself select or own an automatic session driver. */
 int wl_columnar_eval_stack_unary_prepared_join_begin(
     wl_columnar_eval_stack_unary_prepared_t *,
     wl_columnar_eval_stack_cleanup_frame_t *,
-    const wl_columnar_eval_plan_numeric_attempt_t *);
+    const wl_columnar_eval_plan_numeric_attempt_t *, bool *);
+typedef enum {
+    WL_COLUMNAR_EVAL_STACK_PREPARED_INIT_INERT,
+    WL_COLUMNAR_EVAL_STACK_PREPARED_INIT_CAPTURE,
+    WL_COLUMNAR_EVAL_STACK_PREPARED_INIT_ADMIT,
+    WL_COLUMNAR_EVAL_STACK_PREPARED_INIT_CLEAR,
+    WL_COLUMNAR_EVAL_STACK_PREPARED_INIT_RESTORE,
+    WL_COLUMNAR_EVAL_STACK_PREPARED_INIT_PUBLISH,
+    WL_COLUMNAR_EVAL_STACK_PREPARED_INIT_CANCEL,
+    WL_COLUMNAR_EVAL_STACK_PREPARED_INIT_PUBLISHED,
+    WL_COLUMNAR_EVAL_STACK_PREPARED_INIT_CANCELLED
+} wl_columnar_eval_stack_prepared_init_phase_t;
+typedef struct {
+    wl_columnar_eval_stack_prepared_init_phase_t phase, action;
+    const void *target, *numeric, *operation;
+    uint64_t original_identity, original_id, support_identity, support_id;
+    uint32_t cursor;
+    wl_columnar_eval_cleanup_receipt_key_t key;
+    int semantic_cause;
+    bool action_pending, performed, physical_published, physical_cancelled,
+        launch_consumed;
+} wl_columnar_eval_stack_prepared_init_view_t;
+typedef struct {
+    int semantic_cause;
+    bool selected, performed, published, cancelled, needs_ack, launch_consumed;
+} wl_columnar_eval_stack_prepared_init_action_outcome_t;
+int wl_columnar_eval_stack_unary_prepared_init_step_owned(
+    wl_columnar_eval_stack_cleanup_frame_t *,
+    const wl_columnar_eval_plan_numeric_attempt_t *,
+    wl_evaluation_control_t *, uint64_t, bool *);
+int wl_columnar_eval_stack_unary_prepared_init_cancel_owned(
+    wl_columnar_eval_stack_cleanup_frame_t *,
+    const wl_columnar_eval_plan_numeric_attempt_t *,
+    wl_evaluation_control_t *, uint64_t, bool *);
+int wl_columnar_eval_stack_unary_prepared_init_action_ack_owned(
+    wl_columnar_eval_stack_cleanup_frame_t *,
+    const wl_columnar_eval_plan_numeric_attempt_t *,
+    wl_evaluation_control_t *, uint64_t);
 /* Rebind a genuine ACKED receipt at actual quiescent ordinary JOIN FINISH.
  * Only distinct cleanup funding is charged. These typed steps may make multiple
  * genuine subadmissions; no whole-call256 bound is implied. Decline is legal
@@ -8906,6 +9471,8 @@ typedef struct {
     unsigned phase, receipt_phase, parent_phase, numeric_phase, cursor;
     int launch_protocol, first_result;
     bool busy, committed, finish, abort_requested;
+    bool initializer_pending;
+    wl_columnar_eval_stack_prepared_init_phase_t initializer_phase;
 } wl_columnar_eval_stack_test_auto_observation_t;
 int wl_columnar_eval_stack_test_auto_observe(
     const wl_columnar_eval_stack_cleanup_frame_t *, const wl_col_session_t *,
@@ -8938,7 +9505,7 @@ typedef struct {
     const void *plan, *session, *control, *private_bindings, *capture_out;
     uint64_t attempt_id, operation_identity;
     bool capture_only, controlled_materialized_batch_fallback, abort_supported;
-    bool prepared_unary_present;
+    bool prepared_unary_present, prepared_initializer_pending;
     wl_columnar_eval_cleanup_receipt_key_t cleanup_receipt_key;
     wl_columnar_eval_serial_framed_status_t status;
 } wl_columnar_eval_serial_framed_view_t;
@@ -9026,6 +9593,20 @@ int wl_columnar_eval_stack_cleanup_receipt_host(const wl_plan_relation_t *,
     wl_col_session_t *, bool,
     const wl_columnar_eval_serial_framed_host_request_t *);
 
+bool wl_columnar_eval_stack_auto_initializer_pending(
+    const wl_columnar_eval_stack_cleanup_frame_t *);
+int wl_columnar_eval_stack_auto_initializer_inspect(
+    const wl_columnar_eval_stack_cleanup_frame_t *, const wl_col_session_t *,
+    wl_columnar_eval_stack_prepared_init_view_t *);
+int wl_columnar_eval_stack_auto_initializer_action_owned(
+    wl_col_session_t *, wl_columnar_eval_stack_cleanup_frame_t *,
+    const wl_columnar_eval_serial_framed_host_request_t *,
+    wl_evaluation_control_t *, uint64_t,
+    wl_columnar_eval_stack_prepared_init_action_outcome_t *);
+int wl_columnar_eval_stack_auto_initializer_action_ack_owned(
+    wl_col_session_t *, wl_columnar_eval_stack_cleanup_frame_t *,
+    const wl_columnar_eval_serial_framed_host_request_t *,
+    wl_evaluation_control_t *, uint64_t);
 /* Actual framed owner only. These adapters never lend a mutable receipt. */
 int wl_columnar_eval_stack_auto_select(
     wl_columnar_eval_serial_framed_attempt_t *, wl_evaluation_control_t *,
@@ -9078,6 +9659,75 @@ typedef enum {
     WL_COLUMNAR_SESSION_NATIVE_ERROR_FINAL,
     WL_COLUMNAR_SESSION_NATIVE_ERROR_DONE
 } wl_columnar_session_native_error_phase_t;
+
+enum {
+    WL_COLUMNAR_SESSION_SNAPSHOT_FINISH_PENDING = 1,
+    WL_COLUMNAR_SESSION_SNAPSHOT_FINISH_SELECTED
+};
+
+enum {
+    WL_COLUMNAR_SESSION_CONSTRUCTOR_GUARD = 1,
+    WL_COLUMNAR_SESSION_CONSTRUCTOR_QUIET,
+    WL_COLUMNAR_SESSION_CONSTRUCTOR_FINISH,
+    WL_COLUMNAR_SESSION_CONSTRUCTOR_RESET,
+    WL_COLUMNAR_SESSION_CONSTRUCTOR_READY,
+    WL_COLUMNAR_SESSION_CONSTRUCTOR_QUIET_BORROWS,
+    WL_COLUMNAR_SESSION_CONSTRUCTOR_REPORT
+};
+
+typedef enum {
+    WL_COLUMNAR_SESSION_PRODUCER_NONE,
+    WL_COLUMNAR_SESSION_PRODUCER_OWN_FORWARD_ERROR,
+    WL_COLUMNAR_SESSION_PRODUCER_MATCHING_ORIGINAL_ENDED,
+    WL_COLUMNAR_SESSION_FRONTIER_MATCHING_ORIGINAL_ENDED
+} wl_columnar_session_producer_disposition_t;
+
+typedef enum {
+    WL_COLUMNAR_SESSION_TERMINAL_NORMAL = 1,
+    WL_COLUMNAR_SESSION_TERMINAL_C1,
+    WL_COLUMNAR_SESSION_TERMINAL_JOIN,
+    WL_COLUMNAR_SESSION_TERMINAL_UNARY,
+    WL_COLUMNAR_SESSION_TERMINAL_SNAPSHOT,
+    WL_COLUMNAR_SESSION_TERMINAL_SNAPSHOT_PRIOR,
+    WL_COLUMNAR_SESSION_TERMINAL_BEGIN_FAILURE,
+    WL_COLUMNAR_SESSION_TERMINAL_COMPLETED,
+    WL_COLUMNAR_SESSION_TERMINAL_ENDED_PRODUCER,
+    WL_COLUMNAR_SESSION_TERMINAL_ENDED_FRONTIER
+} wl_columnar_session_terminal_route_t;
+
+typedef enum {
+    WL_COLUMNAR_SESSION_TERMINAL_REGISTER = 1,
+    WL_COLUMNAR_SESSION_TERMINAL_OLD_REGISTRY,
+    WL_COLUMNAR_SESSION_TERMINAL_OLD_HASH_HEAD,
+    WL_COLUMNAR_SESSION_TERMINAL_OLD_HASH_NEXT,
+    WL_COLUMNAR_SESSION_TERMINAL_OLD_REGISTRY_CREDIT,
+    WL_COLUMNAR_SESSION_TERMINAL_OLD_HASH_CREDIT,
+    WL_COLUMNAR_SESSION_TERMINAL_IMAGE,
+    WL_COLUMNAR_SESSION_TERMINAL_IMAGE_CREDIT,
+    WL_COLUMNAR_SESSION_TERMINAL_ENTRIES,
+    WL_COLUMNAR_SESSION_TERMINAL_HEADS,
+    WL_COLUMNAR_SESSION_TERMINAL_ORIGINALS,
+    WL_COLUMNAR_SESSION_TERMINAL_OVERRIDES,
+    WL_COLUMNAR_SESSION_TERMINAL_OPS,
+    WL_COLUMNAR_SESSION_TERMINAL_FRONTIER_SOURCES,
+    WL_COLUMNAR_SESSION_TERMINAL_RETRY,
+    WL_COLUMNAR_SESSION_TERMINAL_MAINTENANCE,
+    WL_COLUMNAR_SESSION_TERMINAL_METADATA_MOVE,
+    WL_COLUMNAR_SESSION_TERMINAL_TX_FREE,
+    WL_COLUMNAR_SESSION_TERMINAL_CREDIT,
+    WL_COLUMNAR_SESSION_TERMINAL_HANDOFF
+} wl_columnar_session_terminal_phase_t;
+
+typedef enum {
+    WL_COLUMNAR_SESSION_FINANCE_CLOSE_FINISH = 1,
+    WL_COLUMNAR_SESSION_FINANCE_CLOSE_DETACH,
+    WL_COLUMNAR_SESSION_FINANCE_CLOSE_RELEASE,
+    WL_COLUMNAR_SESSION_FINANCE_CLOSE_CONSUME,
+    WL_COLUMNAR_SESSION_FINANCE_CLOSE_OBSERVED,
+    WL_COLUMNAR_SESSION_FINANCE_REBEGIN,
+    WL_COLUMNAR_SESSION_FINANCE_CLOSE_REPORT,
+    WL_COLUMNAR_SESSION_FINANCE_COLD_BIRTH
+} wl_columnar_session_finance_close_phase_t;
 #ifdef WL_SESSION_TEST_HOOKS
 wl_columnar_session_native_error_phase_t
 wl_columnar_session_test_native_error_phase(const wl_col_session_t *);
@@ -9110,6 +9760,10 @@ int wl_columnar_eval_stack_cleanup_receipt_find_frame_attempt(
 int wl_columnar_eval_stack_cleanup_receipt_frame_index_bind(
     wl_columnar_eval_stack_cleanup_frame_t *, uint32_t,
     const wl_columnar_eval_cleanup_receipt_key_t *);
+int wl_columnar_eval_stack_cleanup_receipt_frame_birth_index_bind(
+    wl_columnar_eval_stack_cleanup_frame_t *,
+    const wl_columnar_eval_cleanup_receipt_key_t *);
+
 int wl_columnar_eval_stack_cleanup_receipt_index_key_for_frame(
     wl_columnar_eval_stack_cleanup_frame_t *, uint32_t,
     wl_columnar_eval_cleanup_receipt_key_t *);
@@ -9126,6 +9780,52 @@ int wl_columnar_session_unary_cleanup_register(wl_col_session_t *,
     wl_columnar_eval_serial_framed_attempt_t *, wl_evaluation_control_t *,
     uint64_t,
     uint32_t, bool);
+typedef enum {
+    WL_COLUMNAR_EVAL_PLAN_CLEANUP_JOIN,
+    WL_COLUMNAR_EVAL_PLAN_CLEANUP_UNARY,
+    WL_COLUMNAR_EVAL_PLAN_CLEANUP_OBSERVED
+} wl_columnar_eval_plan_cleanup_kind_t;
+typedef struct {
+    bool handled;
+    int protocol, execution_result, cleanup_result;
+    bool committed;
+} wl_columnar_session_observed_ack_result_t;
+wl_columnar_session_observed_ack_result_t
+    wl_columnar_session_observed_ack_resume(wl_col_session_t *,
+    const wl_columnar_eval_cleanup_receipt_key_t *, wl_evaluation_control_t *,
+    uint64_t);
+typedef struct {
+    int protocol, cause;
+    bool provisional;
+} wl_columnar_session_observed_cleanup_result_t;
+wl_columnar_session_observed_cleanup_result_t
+    wl_columnar_session_observed_cleanup_prove(
+    const wl_columnar_eval_serial_framed_attempt_t *, wl_evaluation_control_t *,
+    uint64_t, wl_session_source_finance_t *);
+wl_columnar_session_observed_cleanup_result_t
+    wl_columnar_session_observed_cleanup_frame_prove(const wl_col_session_t *,
+    const wl_columnar_eval_stack_cleanup_frame_t *, wl_evaluation_control_t *,
+    uint64_t, wl_session_source_finance_t *);
+wl_columnar_session_observed_cleanup_result_t
+    wl_columnar_session_observed_cleanup_receipt_prove(const wl_col_session_t *,
+    const wl_columnar_eval_cleanup_receipt_key_t *, wl_evaluation_control_t *,
+    uint64_t, wl_session_source_finance_t *);
+int wl_columnar_eval_plan_observed_native_cleanup_step(
+    wl_columnar_eval_serial_framed_attempt_t *, wl_evaluation_control_t *,
+    uint64_t);
+int wl_columnar_eval_plan_observed_native_cleanup_consume(
+    wl_columnar_eval_serial_framed_attempt_t *, int, wl_evaluation_control_t *,
+    uint64_t);
+int wl_columnar_eval_plan_observed_native_cleanup_ack(
+    wl_columnar_eval_serial_framed_attempt_t *, wl_evaluation_control_t *,
+    uint64_t);
+int wl_columnar_filter_observed_native_cleanup_latch_owned(
+    wl_columnar_eval_stack_cleanup_frame_t *, const void *,
+    wl_evaluation_control_t *,
+    uint64_t, bool *);
+int wl_columnar_filter_observed_neverborn_owned(
+    wl_columnar_eval_stack_cleanup_frame_t *,
+    const void *, bool *);
 int wl_columnar_session_unary_cleanup_prove(
     const wl_columnar_eval_serial_framed_attempt_t *, wl_evaluation_control_t *,
     uint64_t, wl_session_source_finance_t *, int *);
@@ -9284,6 +9984,8 @@ extern void (*wl_columnar_session_test_filter_append_checkpoint)(
     wl_evaluation_control_t *, unsigned, bool);
 extern void (*wl_columnar_session_test_head_scalar_checkpoint)(
     wl_evaluation_control_t *, unsigned, uint32_t);
+extern void (*wl_columnar_session_test_frontier_build_checkpoint)(
+    wl_col_session_t *, bool, int);
 extern void (*wl_columnar_session_test_join_birth_checkpoint)(
     wl_columnar_eval_serial_framed_attempt_t *, wl_evaluation_control_t *,
     uint64_t, unsigned, uint32_t, bool);
@@ -9333,6 +10035,18 @@ int wl_columnar_eval_serial_framed_attempt_close(
 extern void (*wl_columnar_eval_serial_test_framed_checkpoint)(
     wl_columnar_eval_serial_framed_attempt_t *);
 extern int wl_columnar_eval_serial_test_framed_fail_allocation;
+typedef struct {
+    unsigned phase, finance_kind;
+    uint64_t ticket, operation_identity, original_attempt_id;
+    wl_evaluation_control_report_t report;
+    bool finance_consumed, local_reset_completed, actor_current;
+    bool invocation_accepted, backend_active, endpoint_busy, source_ready;
+    bool ack_paid, ack_prepared, transaction_present, main_pending,
+        parent_pending;
+} wl_columnar_session_test_completed_view_t;
+/* Plain descriptive snapshot only; no owner, controller or resource loan. */
+int wl_columnar_session_test_completed_view(const wl_col_session_t *,
+    wl_columnar_session_test_completed_view_t *);
 #endif
 
 /* Retire workers a failed attempt retained.  They can borrow coordinator heads,

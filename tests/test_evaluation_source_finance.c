@@ -1198,13 +1198,60 @@ early_close_cases(wl_session_t *session)
     CHECK(!old.protocol && old.closed); /* Old inactive positive remains valid. */
 }
 
+/* Genuine public OP/CLOSE scopes distinguish the two actual bank lanes. */
+static void
+observation_footer_cases(wl_session_t *session)
+{
+    wl_session_t copy = *session;
+    CHECK(wl_session_source_footer(NULL) == EINVAL
+        && wl_session_source_footer(&copy) == EINVAL);
+    wl_evaluation_control_t *original = session->evaluation_control;
+    uint64_t id = wl_evaluation_control_active_attempt_id(original), used = 0;
+    if (id) CHECK(!wl_evaluation_control_test_active_consumed(original, id,
+            &used));
+    wl_evaluation_control_report_t frozen, after;
+    int prior = wl_evaluation_control_report(original, &frozen);
+    CHECK(!prior || prior == ENOENT);
+    unsigned stops = close_calls ? 1 : 4;
+    for (unsigned stop = 0; stop < stops; ++stop) {
+        if (!close_calls)
+            wl_evaluation_control_test_source_metadata_cancel_at = stop;
+        CHECK(wl_session_source_footer(session)
+            == (stop ? WL_EVALUATION_CONTROL_CANCELLED : 0));
+        wl_evaluation_control_report_t bank;
+        CHECK(!wl_session_test_source_early_report(session, &bank)
+            && bank.attempt_id == 1 && bank.limit == 768
+            && bank.consumed == (close_calls ? 452u :
+            stop == 1 || stop == 2 ? 0u : 10u)
+            && bank.result == (stop ? WL_EVALUATION_CONTROL_CANCELLED : 0)
+            && bank.stop_reason == bank.result
+            && !bank.execution_status && !bank.cleanup_status);
+        if (stop) CHECK(!wl_session_test_source_final_reset_cancel(session));
+        CHECK(wl_evaluation_control_active_attempt_id(original) == id
+            && wl_evaluation_control_report(original, &after) == prior);
+        if (!prior) report_same(frozen, after);
+        if (id) {
+            uint64_t current = 0;
+            CHECK(!wl_evaluation_control_test_active_consumed(original, id,
+                &current)
+                && current == used);
+        }
+    }
+}
+
 static void
 finance_cases(wl_session_t *session)
 {
+    /* Ordinary operation and final/raw CLOSE callbacks do not have the
+     * checked prepare claim, even when their Source lane is CLOSE. */
+    CHECK(!wl_session_source_checked_close_scope_owned(session));
+    CHECK(wl_session_source_close_scope_owned(session) == (close_calls != 0));
     CHECK(wl_session_source_operation_scope_owned(session) ==
         (close_calls == 0));
     wl_session_t placement_copy = *session;
     CHECK(!wl_session_source_operation_scope_owned(&placement_copy));
+    CHECK(!wl_session_source_close_scope_owned(&placement_copy));
+    observation_footer_cases(session);
     early_close_cases(session);
     early_finance_cases(session);
     early_birth_rejections(session);

@@ -763,6 +763,84 @@ static void private_financier_birth(void) {
 }
 
 static void
+private_financier_rebegin(void)
+{
+    int owner, wrong_owner;
+    wl_evaluation_control_lexical_finance_birth_result_t born =
+        wl_evaluation_control_private_financier_birth_try(128, &owner);
+    CHECK(!born.protocol && born.control && born.id && born.identity);
+    wl_evaluation_control_t *c = born.control;
+    CHECK(!wl_evaluation_control_charge_attempt(c, born.id, 128));
+    wl_evaluation_control_request_cancel(c);
+    CHECK(wl_evaluation_control_charge_attempt(c, born.id, 0)
+        == WL_EVALUATION_CONTROL_CANCELLED);
+    CHECK(wl_evaluation_control_finish(c, &owner, 0, 0)
+        == WL_EVALUATION_CONTROL_CANCELLED);
+    wl_evaluation_control_report_t old, report;
+    CHECK(!wl_evaluation_control_report(c, &old));
+    wl_evaluation_control_attempt_begin_result_t next =
+        wl_evaluation_control_private_financier_rebegin(c, &wrong_owner,
+            born.identity, born.id, 256);
+    CHECK(next.protocol == EINVAL && !next.attempt_id);
+    next = wl_evaluation_control_private_financier_rebegin(c, &owner,
+            born.identity + 1, born.id, 256);
+    CHECK(next.protocol == EINVAL && !next.attempt_id);
+    CHECK(!wl_evaluation_control_retain_try(c));
+    next = wl_evaluation_control_private_financier_rebegin(c, &owner,
+            born.identity, born.id, 256);
+    CHECK(next.protocol == EBUSY && !next.attempt_id);
+    wl_evaluation_control_release(c);
+    next = wl_evaluation_control_private_financier_rebegin(c, &owner,
+            born.identity, born.id, 127);
+    CHECK(!next.protocol && next.attempt_id == born.id + 1);
+    CHECK(!wl_evaluation_control_report(c, &report)
+        && report.attempt_id == old.attempt_id
+        && report.limit == old.limit && report.consumed == old.consumed
+        && report.stop_reason == old.stop_reason
+        && report.execution_status == old.execution_status
+        && report.cleanup_status == old.cleanup_status
+        && report.result == old.result);
+    CHECK(wl_evaluation_control_charge_attempt(c, next.attempt_id, 128)
+        == WL_EVALUATION_CONTROL_WORK_LIMIT);
+    wl_evaluation_control_attempt_begin_result_t stale =
+        wl_evaluation_control_private_financier_rebegin(c, &owner,
+            born.identity, born.id, 256);
+    CHECK(stale.protocol == EINVAL && !stale.attempt_id);
+    CHECK(wl_evaluation_control_finish(c, &owner, 0, 0)
+        == WL_EVALUATION_CONTROL_WORK_LIMIT);
+    CHECK(!wl_evaluation_control_report(c, &report)
+        && report.attempt_id == next.attempt_id && report.limit == 127
+        && !report.consumed &&
+        report.result == WL_EVALUATION_CONTROL_WORK_LIMIT);
+    stale = wl_evaluation_control_private_financier_rebegin(c, &owner,
+            born.identity, born.id, 256);
+    CHECK(stale.protocol == EINVAL && !stale.attempt_id);
+    wl_evaluation_control_attempt_begin_result_t exact =
+        wl_evaluation_control_private_financier_rebegin(c, &owner,
+            born.identity, next.attempt_id, 128);
+    CHECK(!exact.protocol && exact.attempt_id == next.attempt_id + 1
+        && !wl_evaluation_control_charge_attempt(c, exact.attempt_id, 128));
+    CHECK(!wl_evaluation_control_finish(c, &owner, 0, 0));
+    CHECK(!wl_evaluation_control_report(c, &report)
+        && report.attempt_id == exact.attempt_id && report.limit == 128
+        && report.consumed == 128 && !report.result);
+    CHECK(!wl_evaluation_control_test_seed_attempt_id(c, &owner,
+        UINT64_MAX - 1));
+    CHECK(!wl_evaluation_control_begin(c, &owner)
+        && wl_evaluation_control_active_attempt_id(c) == UINT64_MAX);
+    CHECK(!wl_evaluation_control_charge_attempt(c, UINT64_MAX, 1)
+        && !wl_evaluation_control_finish(c, &owner, 0, 0));
+    exact = wl_evaluation_control_private_financier_rebegin(c, &owner,
+            born.identity, UINT64_MAX, 128);
+    CHECK(exact.protocol == EOVERFLOW && !exact.attempt_id);
+    CHECK(!wl_evaluation_control_report(c, &report)
+        && report.attempt_id == UINT64_MAX && report.consumed == 1
+        && !report.result && !wl_evaluation_control_active_attempt_id(c));
+    CHECK(!wl_evaluation_control_detach(c, &owner));
+    wl_evaluation_control_release(c);
+}
+
+static void
 financial_finish_refused(
     wl_evaluation_control_lexical_finance_finish_result_t result,
     int protocol)
@@ -1111,9 +1189,194 @@ nonfinal_release_attachment(void)
     }
 }
 
+/* Tight metadata APIs preserve the real generic FINISH distinctions. Outputs
+ * live in ordinary disjoint caller storage, as required by the internal API. */
+static void
+financial_commit_and_report(void)
+{
+    unsigned owner = 0, wrong = 0;
+    for (unsigned mode = 0; mode < 6; ++mode) {
+        wl_evaluation_control_t *c = NULL;
+        CHECK(!wl_evaluation_control_create(mode >= 4 ? 0 : 3, &c));
+        CHECK(!wl_evaluation_control_attach(c, &owner));
+        CHECK(!wl_evaluation_control_begin(c, &owner));
+        uint64_t id = wl_evaluation_control_active_attempt_id(c);
+        wl_evaluation_control_report_t out = {.attempt_id = UINT64_MAX};
+        CHECK(wl_evaluation_control_financier_report_owned(c, &owner, id,
+            &out) == EBUSY && out.attempt_id == UINT64_MAX);
+        CHECK(wl_evaluation_control_financier_finish_commit(c, &wrong, id)
+            == EINVAL && wl_evaluation_control_active_attempt_id(c) == id);
+        if (mode >= 4) {
+            CHECK(!wl_evaluation_control_charge_attempt(c, id, UINT64_MAX));
+            CHECK(wl_evaluation_control_charge_attempt(c, id, 1) == EOVERFLOW);
+        } else CHECK(!wl_evaluation_control_charge_attempt(c, id, 2));
+        if (mode == 1 || mode == 2 || mode == 5)
+            wl_evaluation_control_request_cancel(c);
+        if (mode == 2) CHECK(wl_evaluation_control_charge_attempt(c, id, 0)
+                == WL_EVALUATION_CONTROL_CANCELLED);
+        if (mode == 3) CHECK(wl_evaluation_control_charge_attempt(c, id, 2)
+                == WL_EVALUATION_CONTROL_WORK_LIMIT);
+        CHECK(!wl_evaluation_control_financier_finish_commit(c, &owner, id));
+        CHECK(!wl_evaluation_control_active_attempt_id(c));
+        CHECK(!wl_evaluation_control_financier_report_owned(c, &owner, id,
+            &out));
+        int expected = mode >= 4 ? EOVERFLOW : mode == 2
+            ? WL_EVALUATION_CONTROL_CANCELLED : mode == 3
+            ? WL_EVALUATION_CONTROL_WORK_LIMIT : 0;
+        CHECK(out.attempt_id == id && out.result == expected
+            && out.consumed == (mode >= 4 ? UINT64_MAX : 2)
+            && out.execution_status == (mode >= 4 ? EOVERFLOW : 0)
+            && !out.cleanup_status);
+        CHECK(out.stop_reason == (mode == 2 ? WL_EVALUATION_CONTROL_CANCELLED
+            : mode == 3 ? WL_EVALUATION_CONTROL_WORK_LIMIT : 0));
+        CHECK(!wl_evaluation_control_financier_finish_commit(c, &owner, id));
+        wl_evaluation_control_report_t frozen;
+        CHECK(!wl_evaluation_control_report(c, &frozen)
+            && frozen.result == out.result && frozen.consumed == out.consumed
+            && frozen.stop_reason == out.stop_reason);
+        CHECK(!wl_evaluation_control_reset(c));
+        CHECK(!wl_evaluation_control_begin(c, &owner));
+        uint64_t next = wl_evaluation_control_active_attempt_id(c);
+        CHECK(next != id);
+        out.attempt_id = UINT64_MAX;
+        CHECK(wl_evaluation_control_financier_finish_commit(c, &owner, id)
+            == EBUSY && wl_evaluation_control_active_attempt_id(c) == next);
+        CHECK(wl_evaluation_control_financier_report_owned(c, &owner, id,
+            &out) == EBUSY && out.attempt_id == UINT64_MAX);
+        CHECK(!wl_evaluation_control_finish(c, &owner, 0, 0));
+        CHECK(wl_evaluation_control_financier_finish_commit(c, &owner, id)
+            == EBUSY);
+        CHECK(wl_evaluation_control_financier_report_owned(c, &owner, id,
+            &out) == EBUSY && out.attempt_id == UINT64_MAX);
+        CHECK(!wl_evaluation_control_detach(c, &owner));
+        wl_evaluation_control_release(c);
+    }
+    wl_evaluation_control_t *c = NULL;
+    CHECK(!wl_evaluation_control_create(0, &c));
+    CHECK(!wl_evaluation_control_attach(c, &owner));
+    CHECK(!wl_evaluation_control_retain(c)); /* Original may have extra refs. */
+    CHECK(!wl_evaluation_control_begin(c, &owner));
+    uint64_t id = wl_evaluation_control_active_attempt_id(c);
+    CHECK(!wl_evaluation_control_charge_attempt(c, id, UINT64_MAX));
+    CHECK(wl_evaluation_control_charge_attempt(c, id, 1) == EOVERFLOW);
+    wl_evaluation_control_request_cancel(c);
+    CHECK(wl_evaluation_control_construction_error_finish_commit(c, &wrong,
+        id, ENOMEM) == -EINVAL);
+    CHECK(wl_evaluation_control_construction_error_finish_commit(c, &owner,
+        id, ENOMEM) == WL_EVALUATION_CONTROL_ATTEMPT_FINISH_OWN_FINISHED);
+    wl_evaluation_control_report_t out;
+    CHECK(!wl_evaluation_control_financier_report_owned(c, &owner, id, &out)
+        && out.result == ENOMEM && out.execution_status == ENOMEM);
+    CHECK(wl_evaluation_control_construction_error_finish_commit(c, &owner,
+        id, EINVAL) == WL_EVALUATION_CONTROL_ATTEMPT_FINISH_ALREADY_ENDED);
+    CHECK(!wl_evaluation_control_financier_report_owned(c, &owner, id, &out)
+        && out.result == ENOMEM && out.execution_status == ENOMEM);
+    CHECK(!wl_evaluation_control_reset(c));
+    CHECK(!wl_evaluation_control_begin(c, &owner));
+    uint64_t next = wl_evaluation_control_active_attempt_id(c);
+    CHECK(wl_evaluation_control_construction_error_finish_commit(c, &owner,
+        id, ENOMEM) == WL_EVALUATION_CONTROL_ATTEMPT_FINISH_SUCCESSOR_MISMATCH
+        && wl_evaluation_control_active_attempt_id(c) == next);
+    CHECK(!wl_evaluation_control_finish(c, &owner, 0, 0));
+    CHECK(wl_evaluation_control_construction_error_finish_commit(c, &owner,
+        id, ENOMEM) == WL_EVALUATION_CONTROL_ATTEMPT_FINISH_SUCCESSOR_MISMATCH);
+    CHECK(!wl_evaluation_control_report(c, &out)
+        && out.attempt_id == next && !out.result && !out.consumed);
+    CHECK(!wl_evaluation_control_detach(c, &owner));
+    wl_evaluation_control_release(c);
+    wl_evaluation_control_release(c);
+}
+
+static void
+parked_report_same(const wl_evaluation_control_report_t *a,
+    const wl_evaluation_control_report_t *b)
+{
+    CHECK(a->attempt_id == b->attempt_id && a->limit == b->limit
+        && a->consumed == b->consumed && a->stop_reason == b->stop_reason
+        && a->execution_status == b->execution_status
+        && a->cleanup_status == b->cleanup_status && a->result == b->result);
+}
+
+static void
+private_financier_parked(void)
+{
+    int owner = 0, other = 0;
+    CHECK(wl_evaluation_control_private_financier_parked_owned(NULL,
+        &owner, 1, 1) == EINVAL);
+    for (unsigned unlimited = 0; unlimited != 2; ++unlimited) {
+        wl_evaluation_control_lexical_finance_birth_result_t born =
+            wl_evaluation_control_private_financier_birth_try(
+            unlimited ? 0 : 256, &owner);
+        CHECK(!born.protocol && born.control && born.id && born.identity);
+        wl_evaluation_control_t *c = born.control;
+        CHECK(wl_evaluation_control_private_financier_parked_owned(c,
+            NULL, born.identity, born.id) == EINVAL);
+        CHECK(wl_evaluation_control_private_financier_parked_owned(c,
+            &owner, 0, born.id) == EINVAL);
+        CHECK(wl_evaluation_control_private_financier_parked_owned(c,
+            &owner, born.identity, 0) == EINVAL);
+        CHECK(!wl_evaluation_control_charge_attempt(c, born.id, 7));
+        wl_evaluation_control_request_cancel(c);
+        CHECK(wl_evaluation_control_private_financier_parked_owned(c,
+            &owner, born.identity, born.id) == EBUSY);
+        uint64_t used = UINT64_MAX;
+        CHECK(!wl_evaluation_control_test_active_consumed(c, born.id, &used)
+            && used == 7);
+        CHECK(!wl_evaluation_control_financier_finish_commit(c, &owner,
+            born.id));
+        wl_evaluation_control_report_t saved, actual;
+        CHECK(!wl_evaluation_control_financier_report_owned(c, &owner,
+            born.id, &saved));
+        /* A read-only probe must not observe the pending cancellation. */
+        CHECK(!saved.result && !saved.stop_reason && saved.consumed == 7);
+        CHECK(wl_evaluation_control_private_financier_parked_owned(c,
+            &other, born.identity, born.id) == EINVAL);
+        CHECK(wl_evaluation_control_private_financier_parked_owned(c,
+            &owner, born.identity + 1, born.id) == EINVAL);
+        CHECK(wl_evaluation_control_private_financier_parked_owned(c,
+            &owner, born.identity, born.id + 1) == EINVAL);
+        for (unsigned repeated = 0; repeated != 3; ++repeated)
+            CHECK(wl_evaluation_control_private_financier_parked_owned(c,
+                &owner, born.identity, born.id) == (unlimited ? EINVAL : 0));
+        CHECK(!wl_evaluation_control_retain(c));
+        CHECK(wl_evaluation_control_private_financier_parked_owned(c,
+            &owner, born.identity, born.id) == EBUSY);
+        wl_evaluation_control_release(c);
+        CHECK(wl_evaluation_control_private_financier_parked_owned(c,
+            &owner, born.identity, born.id) == (unlimited ? EINVAL : 0));
+        CHECK(!wl_evaluation_control_report(c, &actual));
+        parked_report_same(&saved, &actual);
+        CHECK(!wl_evaluation_control_active_attempt_id(c));
+        if (!unlimited) {
+            wl_evaluation_control_attempt_begin_result_t next =
+                wl_evaluation_control_private_financier_rebegin(c, &owner,
+                    born.identity, born.id, 256);
+            CHECK(!next.protocol && next.attempt_id == born.id + 1);
+            CHECK(wl_evaluation_control_private_financier_parked_owned(c,
+                &owner, born.identity, born.id) == EBUSY);
+            CHECK(!wl_evaluation_control_report(c, &actual));
+            parked_report_same(&saved, &actual);
+            CHECK(!wl_evaluation_control_charge_attempt(c, next.attempt_id, 3));
+            CHECK(!wl_evaluation_control_financier_finish_commit(c, &owner,
+                next.attempt_id));
+            CHECK(wl_evaluation_control_private_financier_parked_owned(c,
+                &owner, born.identity, born.id) == EINVAL);
+            CHECK(!wl_evaluation_control_private_financier_parked_owned(c,
+                &owner, born.identity, next.attempt_id));
+            CHECK(!wl_evaluation_control_report(c, &actual)
+                && actual.attempt_id == next.attempt_id && actual.limit == 256
+                && actual.consumed == 3 && !actual.result);
+            born.id = next.attempt_id;
+        }
+        CHECK(!wl_evaluation_control_detach_attempt(c, &owner, born.id));
+        wl_evaluation_control_release(c);
+    }
+}
+
 int
 main(void)
 {
+    financial_commit_and_report();
     nonfinal_release_attachment();
     completion_generation_observation();
     active_consumed_observation();
@@ -1128,6 +1391,8 @@ main(void)
     lexical_finance_birth();
     bounded_references();
     private_financier_birth();
+    private_financier_rebegin();
+    private_financier_parked();
     lexical_finance_finish();
     lexical_finance_retire();
     lexical_finance_checkpoint();

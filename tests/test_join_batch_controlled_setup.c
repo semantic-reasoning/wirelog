@@ -340,7 +340,7 @@ prepare_drain(wl_columnar_join_batch_prepare_t *a)
 {
     int owner;
     wl_evaluation_control_t *funding = NULL;
-    bool done = false, tried[4] = {false};
+    bool done = false, tried[WL_COLUMNAR_RELATION_SCALAR_INIT_DONE+1] = {false};
     retirement_parent = a;
     memset(retirement_callbacks, 0, sizeof(retirement_callbacks));
     wl_columnar_relation_scalar_retirement_init_test_checkpoint =
@@ -353,7 +353,9 @@ prepare_drain(wl_columnar_join_batch_prepare_t *a)
         if (short_grant) {
             tried[phase] = true;
             limit = phase == WL_COLUMNAR_RELATION_SCALAR_INIT_ZERO ? 255
-                : phase == WL_COLUMNAR_RELATION_SCALAR_INIT_BIND ? 191 : 127;
+                : (phase == WL_COLUMNAR_RELATION_SCALAR_INIT_BIND
+                || phase ==
+                WL_COLUMNAR_RELATION_SCALAR_INIT_TOKENS) ? 191 : 127;
         }
         CHECK(!wl_evaluation_control_create(limit, &funding));
         CHECK(!wl_evaluation_control_attach(funding, &owner));

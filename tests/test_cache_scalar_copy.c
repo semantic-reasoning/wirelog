@@ -725,6 +725,178 @@ test_constructor_refund_boundaries(bool allocation_failure)
     col_rel_destroy(source); wl_columnar_memory_governor_ref_release(g);
 }
 
+static bool chunk_armed, chunk_after;
+static unsigned chunk_stop_kind, chunk_stops;
+
+static void
+chunk_stop(copy_t *a, wl_evaluation_control_t *funding)
+{
+    CHECK(a->busy && chunk_armed);
+    chunk_armed = false; ++chunk_stops;
+    reenter(a, funding, 3);
+    if (!chunk_stop_kind) wl_evaluation_control_request_cancel(funding);
+    else CHECK(wl_evaluation_control_charge_attempt(funding,
+            wl_evaluation_control_active_attempt_id(funding), UINT64_C(1000000))
+            == WL_EVALUATION_CONTROL_WORK_LIMIT);
+}
+
+static void
+chunk_before(copy_t *a, wl_evaluation_control_t *funding, unsigned api)
+{
+    (void)api;
+    if (chunk_armed && !chunk_after) chunk_stop(a, funding);
+}
+
+static void
+chunk_after_action(copy_t *a, wl_evaluation_control_t *funding,
+    wl_columnar_relation_cache_scalar_copy_phase_t phase)
+{
+    (void)phase;
+    if (chunk_armed && chunk_after) chunk_stop(a, funding);
+}
+
+static void
+test_retirement_chunk_stops(void)
+{
+    const unsigned chunks = (sizeof(wl_columnar_relation_scalar_retirement_t)+
+        63)/64;
+    for (unsigned original_mode = 0; original_mode < 3; ++original_mode)
+        for (unsigned financial_mode = 0; financial_mode < 4;
+            ++financial_mode){
+            wl_columnar_memory_governor_ref_t *g = governor_new(UINT64_MAX);
+            col_rel_t *source = relation_new(3, 2);
+            col_relation_snapshot_t source_snapshot =
+                wl_columnar_relation_snapshot(source);
+            copy_t a = {0}; int owner = 0; bool done = false;
+            wl_evaluation_control_t *original =
+                control_new(UINT64_C(1000000000), &owner);
+            uint64_t original_id =
+                wl_evaluation_control_active_attempt_id(original);
+            CHECK(!wl_columnar_relation_cache_scalar_copy_begin(&a, source, g,
+                original, original_id));
+            ready(&a); drain(&a, false);
+            CHECK(a.output && !a.held && !a.source);
+            memset(&a.retirement, 0xa5, sizeof(a.retirement));
+            wl_evaluation_control_report_t frozen = {0}; uint64_t successor = 0;
+            if (original_mode) {
+                CHECK(wl_evaluation_control_finish(original, &owner, 7, 0) == 7
+                    && !wl_evaluation_control_report(original, &frozen));
+                if (original_mode == 2) {
+                    CHECK(!wl_evaluation_control_begin(original, &owner));
+                    successor =
+                        wl_evaluation_control_active_attempt_id(original);
+                }
+            }
+            CHECK(!turn(&a, 4, 128, NULL, &done, NULL)
+                && a.phase == WL_COLUMNAR_RELATION_CACHE_COPY_RETIRE_ZERO &&
+                !done);
+            unsigned zeros = 0, tokens = 0, headers = 0, clears = 0;
+            chunk_stops = 0; chunk_stop_kind = financial_mode%2;
+            chunk_after = financial_mode >= 2;
+            wl_columnar_relation_cache_scalar_copy_test_checkpoint =
+                chunk_before;
+            wl_columnar_relation_cache_scalar_copy_test_after_action =
+                chunk_after_action;
+            for (unsigned call = 0; !done; ++call) {
+                CHECK(call < 10000);
+                wl_columnar_relation_cache_scalar_copy_phase_t phase = a.phase;
+                bool target = phase ==
+                    WL_COLUMNAR_RELATION_CACHE_COPY_RETIRE_ZERO
+                    || phase == WL_COLUMNAR_RELATION_CACHE_COPY_RETIRE_TOKENS
+                    || phase == WL_COLUMNAR_RELATION_CACHE_COPY_RETIRE_BEGIN
+                    || phase == WL_COLUMNAR_RELATION_CACHE_COPY_RETIRE_CLEAR;
+                uint64_t fee = phase ==
+                    WL_COLUMNAR_RELATION_CACHE_COPY_RETIRE_TOKENS ? 192
+                    : target ? 256 : 1024;
+                size_t offset = a.retirement_offset;
+                unsigned token = a.retirement_token_index;
+                col_rel_t *output = a.output;
+                wl_columnar_relation_scalar_retirement_t image;
+                if (target) memcpy(&image, &a.retirement, sizeof(image));
+                chunk_armed = target;
+                uint64_t used = UINT64_MAX;
+                int rc = turn(&a, 3, fee, NULL, &done, &used);
+                CHECK(!chunk_armed);
+                if (target) {
+                    CHECK(rc ==
+                        (chunk_stop_kind ? WL_EVALUATION_CONTROL_WORK_LIMIT
+                        : WL_EVALUATION_CONTROL_CANCELLED));
+                    if (!chunk_after) {
+                        CHECK(!used && !done && a.phase == phase
+                            && a.retirement_offset == offset &&
+                            a.retirement_token_index == token
+                            && a.output == output && !memcmp(&image,
+                            &a.retirement, sizeof(image)));
+                        CHECK(!turn(&a, 3, fee, NULL, &done, &used));
+                    }
+                    CHECK(used == fee);
+                    if (phase == WL_COLUMNAR_RELATION_CACHE_COPY_RETIRE_ZERO) {
+                        ++zeros;
+                        size_t expected = offset+64;
+                        if (expected >
+                            sizeof(a.retirement)) expected =
+                                sizeof(a.retirement);
+                        CHECK(a.retirement_offset == expected &&
+                            !a.retirement_started && a.output);
+                        const unsigned char *bytes =
+                            (const unsigned char *)&a.retirement;
+                        for (size_t byte = 0; byte < sizeof(a.retirement);
+                            ++byte)
+                            CHECK(bytes[byte] == (byte < expected ? 0 : 0xa5));
+                    } else if (phase ==
+                        WL_COLUMNAR_RELATION_CACHE_COPY_RETIRE_TOKENS) {
+                        ++tokens;
+                        CHECK(a.retirement_token_index == token+1 &&
+                            !a.retirement_started
+                            && !a.retirement.storage.identity && a.output);
+                    } else if (phase ==
+                        WL_COLUMNAR_RELATION_CACHE_COPY_RETIRE_BEGIN) {
+                        ++headers;
+                        CHECK(a.retirement_started && a.output &&
+                            a.retirement.storage.identity
+                            == (uintptr_t)&a.retirement.storage);
+                    } else {
+                        ++clears;
+                        CHECK(!a.output && !a.held && !a.source
+                            && !wl_columnar_memory_reserved(
+                                wl_columnar_memory_governor_ref_get(g)));
+                        CHECK(done == (clears == chunks)
+                            && a.retirement_started == !done);
+                    }
+                } else CHECK(!rc);
+                CHECK(wl_columnar_relation_snapshot_equal(source_snapshot,
+                    wl_columnar_relation_snapshot(source)));
+                if (original_mode) {
+                    wl_evaluation_control_report_t report;
+                    CHECK(!wl_evaluation_control_report(original, &report)
+                        && !memcmp(&report, &frozen, sizeof(report)));
+                    if (successor) CHECK(
+                            !wl_evaluation_control_test_active_consumed(
+                                original, successor, &used) && !used);
+                }
+            }
+            wl_columnar_relation_cache_scalar_copy_test_checkpoint = NULL;
+            wl_columnar_relation_cache_scalar_copy_test_after_action = NULL;
+            CHECK(zeros == chunks && tokens == 4 && headers == 1 &&
+                clears == chunks
+                && chunk_stops == zeros+tokens+headers+clears
+                && a.phase == WL_COLUMNAR_RELATION_CACHE_COPY_DISCARDED
+                && !a.retirement_offset && !a.retirement_token_index &&
+                !a.semantic_result);
+            CHECK(!turn(&a, 6, 128, NULL, NULL, NULL));
+            if (original_mode) {
+                wl_evaluation_control_report_t report;
+                CHECK(!wl_evaluation_control_report(original, &report)
+                    && !memcmp(&report, &frozen, sizeof(report)));
+            }
+            control_close(original, &owner, 0);
+            col_rel_destroy(source);
+            CHECK(!wl_columnar_memory_reserved(
+                    wl_columnar_memory_governor_ref_get(g)));
+            wl_columnar_memory_governor_ref_release(g);
+        }
+}
+
 static void
 test_retirement_funding(void)
 {
@@ -747,9 +919,12 @@ test_retirement_funding(void)
     for (unsigned n = 0; !done; ++n) {
         CHECK(n < 10000);
         uint64_t fee = 128, consumed = 0;
-        if (a.phase == WL_COLUMNAR_RELATION_CACHE_COPY_RETIRE_ZERO) {
+        if (a.phase == WL_COLUMNAR_RELATION_CACHE_COPY_RETIRE_ZERO
+            || a.phase == WL_COLUMNAR_RELATION_CACHE_COPY_RETIRE_CLEAR) {
             fee = 256;
-            saw_init = true;
+            saw_init |= a.phase == WL_COLUMNAR_RELATION_CACHE_COPY_RETIRE_ZERO;
+        } else if (a.phase == WL_COLUMNAR_RELATION_CACHE_COPY_RETIRE_TOKENS) {
+            fee = 192;
         } else if (a.phase == WL_COLUMNAR_RELATION_CACHE_COPY_RETIRE_BEGIN) {
             fee = 256; saw_begin = true;
         } else if (a.phase == WL_COLUMNAR_RELATION_CACHE_COPY_RETIRE_PREPARE) {
@@ -861,7 +1036,8 @@ main(int argc, char **argv)
     }else if (!strcmp(argv[1], "failures")) {
         test_failures(); test_constructor_refund_boundaries(false);
         test_constructor_refund_boundaries(true);
-        test_retirement_funding(); test_debt_boundaries();
+        test_retirement_funding(); test_retirement_chunk_stops();
+        test_debt_boundaries();
         test_unsupported_boundary();
     }else if (!strcmp(argv[1], "authority")) {
         test_aliases(); test_authority();

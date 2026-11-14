@@ -30,6 +30,7 @@ extern "C" {
 #include "exec_plan.h"
 #include "columnar/memory_governor.h"
 #include "session_options.h"
+#include "thread.h"
 #include "wirelog/wirelog-types.h"
 
 #include <stdint.h>
@@ -43,6 +44,37 @@ extern "C" {
  * Opaque handle to an active execution session.
  */
 typedef struct wl_session wl_session_t;
+struct wl_session_source_metadata_recipe;
+struct wl_session_source_metadata_preparation;
+#if defined(WL_HAVE_C11_THREADS)
+typedef thrd_t wl_backend_financial_actor_t;
+#elif defined(_WIN32) || defined(_WIN64)
+typedef DWORD wl_backend_financial_actor_t;
+#else
+typedef pthread_t wl_backend_financial_actor_t;
+#endif
+/* Canonical financial description, not a control/generation or Native loan.
+ * Actor and busy point at actual stable storage; recipe publishes last. */
+typedef struct wl_backend_financial_offer {
+    const struct wl_backend_financial_offer *identity;
+    const wl_session_t *session;
+    const struct wl_session_source_metadata_recipe *recipe;
+    const wl_backend_financial_actor_t *actor;
+    const bool *busy;
+    int pending_result, foreign_result;
+} wl_backend_financial_offer_t;
+typedef struct {
+    const void *root;
+    int refusal;
+} wl_backend_pending_bind_t;
+
+/* Read-only financial candidate transport; negative errno means rejection. */
+enum {
+    WL_BACKEND_FINANCIAL_NONE,
+    WL_BACKEND_FINANCIAL_SELECTED,
+    WL_BACKEND_FINANCIAL_BEGIN_FAILURE,
+    WL_BACKEND_FINANCIAL_REFUSED_BEGIN_FAILURE
+};
 
 /* Permit callback replacement from the callback thread while retaining the
  * ordinary session admission gate for every other caller. */
@@ -76,16 +108,33 @@ typedef enum {
     WL_BACKEND_CONTROLLED_COMPLETION_SNAPSHOT,
     WL_BACKEND_CONTROLLED_COMPLETION_CLOSE
 } wl_backend_controlled_completion_kind_t;
+typedef enum {
+    WL_BACKEND_CONTROLLED_COMPLETION_RESET = 0,
+    WL_BACKEND_CONTROLLED_COMPLETION_POST_FINISH_TX
+} wl_backend_controlled_completion_domain_t;
+typedef enum {
+    WL_BACKEND_COMPLETED_SOURCE_UNKNOWN = 0,
+    WL_BACKEND_COMPLETED_SOURCE_NOT_REQUIRED,
+    WL_BACKEND_COMPLETED_SOURCE_OBSERVATION
+} wl_backend_completed_source_kind_t;
 typedef struct {
     uint64_t operation_identity, ticket;
+    uint64_t completed_attempt_id;
+    wl_backend_controlled_completion_domain_t domain;
     wl_backend_controlled_completion_kind_t kind;
     wl_controlled_step_state_t state;
     int result;
     bool selected;
+    /* Per actual dispatched call, never a Native resource permission or an
+     * immutable ticket field. False for foreign/refused invocation paths. */
+    bool invocation_accepted;
 } wl_backend_controlled_completion_t;
 
 /* Distinct from every logical STEP state; never a public state value. */
-enum { WL_BACKEND_CONTROLLED_OBSERVATION_COMPLETION_READY = -1 };
+enum {
+    WL_BACKEND_CONTROLLED_OBSERVATION_COMPLETION_READY = -1,
+    WL_BACKEND_CONTROLLED_OBSERVATION_COMPLETED_OWNER_PENDING = -2
+};
 
 /* Host source inspection request (Issue #2321).  ADMIT checks only the
  * session state; VALIDATE also selects and checks the relation's source
@@ -183,10 +232,26 @@ typedef struct {
      * closed between stopped attempts; COMPLETE rejects later mutations. */
     wl_controlled_step_state_t (*session_controlled_step_state)(
         const wl_session_t *session);
+    /* Canonical financial-only candidate under actual admission. A nonNULL
+     * offer leaves pending_out untouched; EVERY NULL return writes both
+     * fields (NONE, eligible canonical Root, or positive errno refusal).
+     * pending_out must be accessible even though offered callers never read
+     * it. No allocation, busy/result mutation or Native work. */
+    const wl_backend_financial_offer_t *(*session_controlled_financial_offer)(
+        const wl_session_t *, wl_backend_pending_bind_t *pending_out);
+    /* Immutable identity of the backend's canonical financial producer.
+     * NULL retains the conservative policy for compatibility resolvers. */
+    int (*session_source_metadata_canonical_resolver)(
+        const struct wl_session_source_metadata_recipe *, unsigned,
+        struct wl_session_source_metadata_preparation *);
+    /* Optional bootstrap continuation for a selected pending Root. */
+    int (*session_controlled_metadata_bind_continue)(wl_session_t *,
+        const void *canonical_root);
     /* Optional paired handoff. Observe returns a truthful logical state and
-     * leaves selected_out untouched, OR returns COMPLETION_READY and writes
-     * the entire matching receipt. Selection requires dispatched=true.
-     * Neither ordinary callers nor observers may read selected_out.
+     * leaves selected_out untouched, OR a distinct completion discriminator
+     * with the entire matching receipt. Selection requires dispatched=true.
+     * COMPLETED_OWNER_PENDING retains admission; only COMPLETION_READY may
+     * commit a final result. Ordinary state returns carry no receipt.
      * Commit consumes the matching ticket under admission lock before its
      * lifetime reservation is dropped; no allocation, callback or failure. */
     int (*session_controlled_step_observe)(const wl_session_t *,
@@ -194,6 +259,12 @@ typedef struct {
         wl_backend_controlled_completion_t *selected_out);
     void (*session_controlled_completion_commit)(wl_session_t *,
         const wl_backend_controlled_completion_t *);
+    /* Descriptive current-call Source consume event. The caller has ended
+     * the actual observation with its context cleared and still owns the
+     * admission reservation. Never transport automatic Source storage. */
+    void (*session_controlled_completed_source_end)(wl_session_t *,
+        const wl_backend_controlled_completion_t *,
+        wl_backend_completed_source_kind_t, int source_result);
     /* Pure preauthorization for the narrowly supported input append that can
      * follow a completed controlled STEP. Called with a public operation
      * reservation active and without the admission mutex held. */
@@ -220,6 +291,15 @@ typedef struct {
     wirelog_source_query_status_t (*session_source_query)(
         wl_session_t *session, const struct wl_source_query *query,
         struct wl_source_query_result *result);
+
+    /* Optional checked destruction opt-in. Complete all returning controlled
+    * and Source obligations without freeing the Session. Success makes the
+    * later void commit independent of BANK/Original ownership. Admission
+    * remains closed across a refused prepare and a genuine checked retry. */
+    int (*session_destroy_prepare)(wl_session_t *session);
+    /* Immutable opt-in: Session's descriptive financial head accounts for
+    * every offered recipe, pending binder and canonical ready receipt. */
+    bool session_controlled_financial_head_complete;
 } wl_compute_backend_t;
 
 /**

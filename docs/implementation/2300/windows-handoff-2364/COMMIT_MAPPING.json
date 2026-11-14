@@ -1,0 +1,82 @@
+[
+  {
+    "old": "29c9fa4be6b79f50dd06b873761d66ad39546753",
+    "new": "fdf971fc3f2f52b290ef81353ba4f7454fe0574a",
+    "subject": "join: evaluate numeric right filters in controlled membership probes"
+  },
+  {
+    "old": "51cd875c13a48df84595574084b43cffcb8f9c7a",
+    "new": "c84650b09975a8e5da6a5846b2f3a87f2cfb6a56",
+    "subject": "test: qualify filtered probe session recovery and accounting"
+  },
+  {
+    "old": "bf7079d70e760eb62a021748388ed054dcbe9d30",
+    "new": "c480aad8d3e376202a77b641ff9452aafc4e5b43",
+    "subject": "join: evaluate scalar right predicates with retained bounded owners"
+  },
+  {
+    "old": "e4385f37e66a85f79836338b587dea851ee3aa3e",
+    "new": "041d875a54222d652db2157133c35b5963f57a03",
+    "subject": "reduce: evaluate scalar operands and bound intern-ranked aggregates"
+  },
+  {
+    "old": "9bd344375b4933c50a2f5acf55a2af69eaacc9d5",
+    "new": "5b21542043bde1739b8b2930b2bf02fec982c9a9",
+    "subject": "session: retain canonical observed cleanup across ended attempts"
+  },
+  {
+    "old": "c912d27058a55cfb709c140543b8f05a9f8401c5",
+    "new": "865fd2aab6ea56d78feedfd6a74060b58272ae4c",
+    "subject": "columnar: retain scalar source acquisition and retire it in finite steps"
+  },
+  {
+    "old": "b43f9cf7af293950b4bb5e72b0811950c8991bc2",
+    "new": "7772e4662b57233a95a246c2f8b700869311ce12",
+    "subject": "columnar: preserve prepared JOIN finish during observed native recovery"
+  },
+  {
+    "old": "99b11597362710708da531e30f2cad732a3f733b",
+    "new": "a0ae1f1d27b190f07b70cd6db19f13e41f648e3c",
+    "subject": "session: retire observed abort resources through canonical finite steps"
+  },
+  {
+    "old": "51bee69d3daec6c7f320f3e7ff7aece2ef5e0cb3",
+    "new": "103b6c41c9b9e7aff7158f72ef97ea1824ac4ad8",
+    "subject": "session: retain phased settlement of observed cleanup grants"
+  },
+  {
+    "old": "cfd229e35bd081352040bf6bf6e1993e1bd5b8a9",
+    "new": "4d86426353d624545c0468c9decb93ae0112fe69",
+    "subject": "docs: synchronize retained-reader and observer atomic audit"
+  },
+  {
+    "old": "fd612edea8cfa260712815f0cde095de4b503a9a",
+    "new": "719bc1c15fe31c9ee52ab4619f883b648beed48b",
+    "subject": "plan: bind preserved bodies to their generated K-fusion lineage"
+  },
+  {
+    "old": "9904a8bf88a089ee196574de7d51e63c1fcd7baf",
+    "new": "6ad3f8c9084754682b79af2add5d5911646dfa41",
+    "subject": "columnar: separate ledger description from one-shot publication"
+  },
+  {
+    "old": "226fb72cbb9daa679ae9037ce2c20c0a221f6b4b",
+    "new": "6a81b972f116034500f34720bf1e3e69371d0bd2",
+    "subject": "columnar: journal differential physical retirement before credit return"
+  },
+  {
+    "old": "6f864f4edd3b1ba0332438258bce7e6011e07f08",
+    "new": "ef2ea9d36aa1be270a1ba48500c0d15020862765",
+    "subject": "columnar: retain commit reports through ledger retirement acknowledgement"
+  },
+  {
+    "old": "679396e0aa7a7dbd60f0b86a7a43a0bdaf793cac",
+    "new": "349ab169841203014e80fcf21346e205b616d044",
+    "subject": "columnar: settle differential ledger retirement through finite report acknowledgements"
+  },
+  {
+    "old": "9914e9b4b4f8d9d8f1aad5b4c8af9ce1aed504f9",
+    "new": "93bd499a018801aeb6cb75a20a22e046783e385e",
+    "subject": "columnar: stage managed merge acknowledgement through finite retirement"
+  }
+]

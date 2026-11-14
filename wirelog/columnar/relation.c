@@ -1672,11 +1672,10 @@ col_rel_source_reader_release(wl_columnar_source_access_reader_t *token)
 }
 
 int
-wl_columnar_relation_reader_step(const col_rel_t *rel,
-    wl_columnar_relation_reader_step_t *record, bool release,
-    wl_evaluation_control_t *control, uint64_t attempt_id)
+wl_columnar_relation_reader_step_validate(const col_rel_t *rel,
+    const wl_columnar_relation_reader_step_t *record)
 {
-    if (!rel || !record || (!control && !release))
+    if (!rel || !record)
         return EINVAL;
     if (rel->storage_owner != rel || !rel->relation_identity
         || rel->relation_identity == UINT64_MAX
@@ -1688,7 +1687,7 @@ wl_columnar_relation_reader_step(const col_rel_t *rel,
         (wl_columnar_source_access_gate_t *)&rel->descriptor_access;
     wl_columnar_source_access_gate_t *owner =
         (wl_columnar_source_access_gate_t *)&rel->source_access;
-    wl_columnar_source_access_reader_t *token = &record->token;
+    const wl_columnar_source_access_reader_t *token = &record->token;
     bool live = record->descriptor_held;
     if ((live &&
         (record->identity != (uintptr_t)record || record->relation != rel))
@@ -1701,6 +1700,24 @@ wl_columnar_relation_reader_step(const col_rel_t *rel,
         || (!token->owner && (token->identity || token->secondary_owner
         || token->transferable)))
         return EINVAL;
+    return 0;
+}
+
+int
+wl_columnar_relation_reader_step(const col_rel_t *rel,
+    wl_columnar_relation_reader_step_t *record, bool release,
+    wl_evaluation_control_t *control, uint64_t attempt_id)
+{
+    if (!rel || !record || (!control && !release))
+        return EINVAL;
+    int proof = wl_columnar_relation_reader_step_validate(rel, record);
+    if (proof) return proof;
+    wl_columnar_source_access_gate_t *descriptor =
+        (wl_columnar_source_access_gate_t *)&rel->descriptor_access;
+    wl_columnar_source_access_gate_t *owner =
+        (wl_columnar_source_access_gate_t *)&rel->source_access;
+    wl_columnar_source_access_reader_t *token = &record->token;
+    bool live = record->descriptor_held;
     if (control && (!attempt_id
         || wl_evaluation_control_active_attempt_id(control) != attempt_id))
         return EINVAL;
@@ -4580,26 +4597,21 @@ wl_columnar_relation_scalar_retirement_begin(
     return wl_columnar_relation_managed_retirement_begin(&s->storage, relation);
 }
 
-/* Parent-bound additive initialization: fixed BOOT128, one whole-scalar
- * ZERO256, then BIND192 with real four token initializers, and RESET128.
- * BOOT's read-only address/inert protocol refusal is <=128, including three
- * overflow-safe overlap checks. Paid meaningful binding/native/parent tail64
- * fits128. ZERO: actual984B clear123 + helper/parent guard/phase/tail<=128
- * =251. BIND: token4*(88B clear11+guard/identity/atomic/return4)=60,
- * loop10+managed fields/return10+helper/parent caller96=176<=192. RESET's
- * native/identity/funding/pointer-clear/parent tail<=112. All callbacks and
- * control internals keep established boundaries; no optimizer-elided clear.
- * Unlike raw scalar_begin, this sibling does not clear managed storage twice.
- * Existing raw primitive APIs/fees and unit18 copy initialization stay exact. */
+/* The asynchronous initializer clears at most64 bytes per ZERO turn and
+ * initializes one real reservation per TOKENS turn. The full native actor
+ * stays in the external initializer; scalar identity publishes last. These
+ * layout checks describe the operations below, not a whole caller certificate. */
 typedef char wl_columnar_relation_scalar_init_layout_bound[
-        ((sizeof(wl_columnar_relation_scalar_retirement_t)+7u)/8u+128u <= 256u
-        && 4u*((sizeof(wl_columnar_memory_reservation_t)+7u)/8u+4u)+116u <=
-        192u)
+        (8u+128u <= 256u
+        && (sizeof(wl_columnar_memory_reservation_t)+7u)/8u+116u <= 192u)
         ? 1 : -1];
 #ifdef WL_SESSION_TEST_HOOKS
 void (*wl_columnar_relation_scalar_retirement_init_test_checkpoint)(
     wl_columnar_relation_scalar_retirement_initializer_t *,
     wl_evaluation_control_t *, unsigned);
+void (*wl_columnar_relation_scalar_retirement_init_test_after_step)(
+    wl_columnar_relation_scalar_retirement_initializer_t *,
+    wl_evaluation_control_t *);
 #define WL_COLUMNAR_RELATION_SCALAR_INIT_HOOK(i, c, api) do { \
             if (wl_columnar_relation_scalar_retirement_init_test_checkpoint) \
             wl_columnar_relation_scalar_retirement_init_test_checkpoint(i, c, \
@@ -4662,7 +4674,7 @@ wl_columnar_relation_scalar_retirement_init_begin(
     if (i->busy) return EBUSY;
     if (i->identity && i->identity != i) return EINVAL;
     if (i->identity || i->parent || i->retirement || i->relation ||
-        i->thread_valid
+        i->thread_valid || i->zero_offset || i->token_index
         || i->phase != WL_COLUMNAR_RELATION_SCALAR_INIT_INERT) return EBUSY;
     if (!parent || !s || !relation || !control || !id
         || wl_columnar_relation_scalar_init_overlap(i, sizeof(*i), s,
@@ -4676,8 +4688,8 @@ wl_columnar_relation_scalar_retirement_init_begin(
     WL_COLUMNAR_RELATION_SCALAR_INIT_HOOK(i, control, 1);
     int rc = wl_evaluation_control_charge_attempt(control, id, 128);
     if (rc) return wl_columnar_relation_scalar_init_leave(i, rc);
-    i->identity = i; i->parent = parent; i->retirement = s;
-    i->relation = relation;
+    i->parent = parent; i->retirement = s;
+    i->relation = relation; i->zero_offset = 0; i->token_index = 0;
 #if defined(WL_HAVE_C11_THREADS)
     i->owner_thread = thrd_current();
 #elif defined(_WIN32) || defined(_WIN64)
@@ -4686,6 +4698,7 @@ wl_columnar_relation_scalar_retirement_init_begin(
     i->owner_thread = pthread_self();
 #endif
     i->thread_valid = true; i->phase = WL_COLUMNAR_RELATION_SCALAR_INIT_ZERO;
+    i->identity = i;
     return wl_columnar_relation_scalar_init_leave(i, 0);
 }
 
@@ -4705,6 +4718,7 @@ wl_columnar_relation_scalar_retirement_init_step(
         sizeof(*done)))
         return wl_columnar_relation_scalar_init_leave(i, EINVAL);
     if (i->phase != WL_COLUMNAR_RELATION_SCALAR_INIT_ZERO
+        && i->phase != WL_COLUMNAR_RELATION_SCALAR_INIT_TOKENS
         && i->phase != WL_COLUMNAR_RELATION_SCALAR_INIT_BIND)
         return wl_columnar_relation_scalar_init_leave(i, EBUSY);
     *done = false;
@@ -4713,21 +4727,37 @@ wl_columnar_relation_scalar_retirement_init_step(
     rc = wl_evaluation_control_charge_attempt(control, id, zero ? 256 : 192);
     if (rc) return wl_columnar_relation_scalar_init_leave(i, rc);
     if (zero) {
-        /* Parent's authentic no-live-receipt state authorizes historic bytes;
-         * no indeterminate scalar identity is examined before this real clear. */
-        memset(s, 0, sizeof(*s));
-        i->phase = WL_COLUMNAR_RELATION_SCALAR_INIT_BIND;
+        if (i->zero_offset >= sizeof(*s))
+            return wl_columnar_relation_scalar_init_leave(i, EINVAL);
+        size_t count = sizeof(*s)-i->zero_offset;
+        if (count > 64) count = 64;
+        memset((unsigned char *)s+i->zero_offset, 0, count);
+        i->zero_offset += count;
+        if (i->zero_offset == sizeof(*s))
+            i->phase = WL_COLUMNAR_RELATION_SCALAR_INIT_TOKENS;
+    } else if (i->phase == WL_COLUMNAR_RELATION_SCALAR_INIT_TOKENS) {
+        if (i->zero_offset != sizeof(*s) || i->token_index >= 4)
+            return wl_columnar_relation_scalar_init_leave(i, EINVAL);
+        wl_columnar_memory_reservation_init(&s->storage.tokens[i->token_index]);
+        ++i->token_index;
+        if (i->token_index ==
+            4) i->phase = WL_COLUMNAR_RELATION_SCALAR_INIT_BIND;
     } else {
-        s->storage.identity = (uintptr_t)&s->storage;
+        if (i->zero_offset != sizeof(*s) || i->token_index != 4)
+            return wl_columnar_relation_scalar_init_leave(i, EINVAL);
         s->storage.relation = relation;
         s->storage.original_relation_address = (uintptr_t)relation;
         s->storage.phase =
             WL_COLUMNAR_RELATION_MANAGED_RETIREMENT_ACQUIRE_WRITERS;
-        for (unsigned token = 0; token < 4; ++token)
-            wl_columnar_memory_reservation_init(&s->storage.tokens[token]);
+        s->storage.identity = (uintptr_t)&s->storage;
         i->phase = WL_COLUMNAR_RELATION_SCALAR_INIT_DONE; *done = true;
     }
-    return wl_columnar_relation_scalar_init_leave(i, 0);
+#ifdef WL_SESSION_TEST_HOOKS
+    if (wl_columnar_relation_scalar_retirement_init_test_after_step)
+        wl_columnar_relation_scalar_retirement_init_test_after_step(i, control);
+#endif
+    rc = wl_evaluation_control_charge_attempt(control, id, 0);
+    return wl_columnar_relation_scalar_init_leave(i, rc);
 }
 
 int
@@ -4747,7 +4777,8 @@ wl_columnar_relation_scalar_retirement_init_reset(
      * claims. No target relation or scalar storage is dereferenced here. */
     i->identity = NULL; i->parent = NULL; i->retirement = NULL;
     i->relation = NULL;
-    i->thread_valid = false; i->phase = WL_COLUMNAR_RELATION_SCALAR_INIT_INERT;
+    i->thread_valid = false; i->zero_offset = 0; i->token_index = 0;
+    i->phase = WL_COLUMNAR_RELATION_SCALAR_INIT_INERT;
     return wl_columnar_relation_scalar_init_leave(i, 0);
 }
 
@@ -5320,6 +5351,74 @@ wl_columnar_relation_scalar_retirement_ledger_step_finite(
         if (wl_columnar_mem_ledger_publication_apply(&ledger)
             || wl_columnar_mem_ledger_publication_release(&ledger)) abort();
     }
+    r->ledger_ts_bytes = 0; r->mem_ledger = NULL; s->ledger = NULL;
+    s->ledger_bytes = s->ledger_timestamp_bytes = 0;
+    s->phase = 10;
+    return EAGAIN;
+}
+
+int
+wl_columnar_relation_scalar_retirement_ledger_step_described(
+    wl_columnar_relation_scalar_retirement_t *s,
+    wl_columnar_mem_ledger_retirement_journal_t *j, const void *parent,
+    wl_evaluation_control_t *control, uint64_t id)
+{
+    if (!s || !j || !parent || !control || !id
+        || s->storage.identity != (uintptr_t)&s->storage
+        || !s->committed || s->phase != 12 || !s->storage.relation
+        || !s->storage.gate_round.thread_valid
+        || !wl_columnar_source_access_gate_round_thread_equal(
+            &s->storage.gate_round)) return EINVAL;
+    col_rel_t *r = s->storage.relation;
+    wl_columnar_mem_ledger_description_t *d = &j->description;
+    if (s->ledger && (s->ledger_bytes || s->ledger_timestamp_bytes)) {
+        wl_columnar_mem_ledger_publication_request_t requests[2] = {
+            {WL_MEM_SUBSYS_RELATION, WL_COLUMNAR_MEM_LEDGER_PUBLICATION_FREE,
+             s->ledger_bytes},
+            {WL_MEM_SUBSYS_TIMESTAMP, WL_COLUMNAR_MEM_LEDGER_PUBLICATION_FREE,
+             s->ledger_timestamp_bytes}
+        };
+        unsigned count = s->ledger_timestamp_bytes ? 2 : 1;
+        if (d->phase == WL_COLUMNAR_MEM_LEDGER_DESCRIPTION_INERT) {
+            if (j->report_valid) return EINVAL;
+            int rc = wl_columnar_mem_ledger_publication_describe_controlled(d,
+                    parent, s->ledger, requests, count, control, id);
+            return rc ? rc : EAGAIN;
+        }
+        if (d->identity != d || d->parent != parent
+            || d->ledger != s->ledger || d->control != control
+            || d->count != count
+            || d->requests[0].subsystem != requests[0].subsystem
+            || d->requests[0].kind != requests[0].kind
+            || d->requests[0].bytes != requests[0].bytes
+            || (count == 2 && (d->requests[1].subsystem != requests[1].subsystem
+            || d->requests[1].kind != requests[1].kind
+            || d->requests[1].bytes != requests[1].bytes))) return EINVAL;
+        if (d->phase == WL_COLUMNAR_MEM_LEDGER_DESCRIPTION_DESCRIBED) {
+            if (j->report_valid) return EINVAL;
+            int rc =
+                wl_columnar_mem_ledger_publication_try_commit_described_controlled
+                (
+                d, parent, control, id);
+            return rc ? rc : EAGAIN;
+        }
+        if (d->phase != WL_COLUMNAR_MEM_LEDGER_DESCRIPTION_CONSUMED
+            || !j->report_valid) return EBUSY;
+        /* Extract the former parent metadata128 into its OWN ACK action.
+         * There is no such debit before109 or194 in this adapter. */
+        int rc = wl_evaluation_control_charge_attempt(control, id, 128);
+        if (rc) return rc;
+        bool applied;
+        rc = wl_columnar_mem_ledger_retirement_ack_prepaid_owned(j, parent,
+                control, id, &applied);
+        if (rc || !applied) return rc ? rc : EAGAIN;
+    } else {
+        if (d->identity || j->report_valid) return EINVAL;
+        int rc = wl_evaluation_control_charge_attempt(control, id, 128);
+        if (rc) return rc;
+    }
+    /* The actual phase12 writer still owns the LIVE descriptor. The ledger
+     * attribution is already applied/released and acknowledged exactly once. */
     r->ledger_ts_bytes = 0; r->mem_ledger = NULL; s->ledger = NULL;
     s->ledger_bytes = s->ledger_timestamp_bytes = 0;
     s->phase = 10;
@@ -8149,6 +8248,12 @@ col_rel_append_all(col_rel_t *dst, const col_rel_t *src, wl_arena_t *arena)
 }
 
 #ifdef WL_SESSION_TEST_HOOKS
+void (*wl_columnar_source_access_test_before_reader_release_cas)(
+    const wl_columnar_source_access_reader_t *,
+    wl_columnar_source_access_gate_t *, uint64_t);
+void (*wl_columnar_relation_test_scalar_end_checkpoint)(
+    const wl_columnar_relation_scalar_source_t *, wl_evaluation_control_t *,
+    uint64_t, unsigned);
 void (*wl_columnar_relation_test_before_reader_cas)(
     wl_evaluation_control_t *, wl_columnar_source_access_gate_t *, uint64_t);
 void (*wl_columnar_relation_test_builder_phase)(
@@ -15709,18 +15814,14 @@ static void
 wl_columnar_relation_constructor_attempt_reader_inert(
     wl_columnar_source_access_reader_t *reader)
 {
-    reader->owner = NULL;
-    reader->secondary_owner = NULL;
-    reader->identity = 0;
-    reader->thread_valid = false;
-    reader->transferable = false;
+    wl_columnar_source_access_reader_clear(reader);
 }
 
 static int
-wl_columnar_relation_reader_acquire_attempt_controlled(
+wl_columnar_relation_reader_acquire_mode(
     wl_columnar_source_access_gate_t *gate,
     wl_columnar_source_access_reader_t *token,
-    wl_evaluation_control_t *control, uint64_t attempt_id)
+    wl_evaluation_control_t *control, uint64_t attempt_id, bool retain_on_error)
 {
     int rc = wl_columnar_relation_constructor_attempt_charge(control,
             attempt_id,
@@ -15790,10 +15891,21 @@ wl_columnar_relation_reader_acquire_attempt_controlled(
             return 0;
         continue;
 stopped:
-        if (acquired && wl_columnar_source_access_reader_release(token) != 0)
+        if (acquired && !retain_on_error &&
+            wl_columnar_source_access_reader_release(token) != 0)
             abort();
         return rc;
     }
+}
+
+static int
+wl_columnar_relation_reader_acquire_attempt_controlled(
+    wl_columnar_source_access_gate_t *gate,
+    wl_columnar_source_access_reader_t *token,
+    wl_evaluation_control_t *control, uint64_t id)
+{
+    return wl_columnar_relation_reader_acquire_mode(gate, token, control, id,
+               false);
 }
 
 static void
@@ -18783,8 +18895,10 @@ wl_columnar_relation_new_auto_attempt_controlled(
  * metric. Control scheduling, instrumentation and original physical/token/ref
  * retirement interiors retain their documented exclusions. Ordinary source
  * end validation/latch/drain dispatch/clearing is counted, never exempted.
- * INIT256 prepays initialization86 and ONE live END72, including interrupted
- * init or declined BEGIN. DRAINED repeat is a bounded readonly bootstrap.
+ * INIT256 keeps its logical initialization/one-legacy-END72 allowance.
+ * The expanded initializer SOURCE upper is separate below; neither term
+ * certifies the legacy reader-drain interior or funds a new cleanup grant.
+ * DRAINED repeat is a bounded readonly bootstrap.
  * Selected PRE228 and RETURN243 include next refused admissions. ROW_CALL
  * prepays its caller continuation; child fees still fund their own regions.
  * Successful B2 return uses immutable locals, then G and a genuine zero poll:
@@ -18854,9 +18968,13 @@ typedef char wl_columnar_relation_scalar_source_tariffs_bound[
         && WL_COLUMNAR_RELATION_SCALAR_SOURCE_COMPOUND_WORK <=
         WL_EVALUATION_CONTROL_QUANTUM) ? 1 : -1];
 
+/* 46 real stores plus identity, reader-clear call chains, thread and tail
+ * fronts: explicit142 portable/158 MSVC, with18 reserve. See the operator
+ * accounting ledger. This SOURCE bound is independent of logical INIT256. */
+enum { WL_COLUMNAR_RELATION_SCALAR_SOURCE_INIT_SOURCE_UPPER = 176 };
 typedef char wl_columnar_relation_scalar_source_init_bound[
-        (UINT64_C(86) + UINT64_C(72) <=
-        WL_COLUMNAR_RELATION_SCALAR_SOURCE_INIT_WORK) ? 1 : -1];
+        (WL_COLUMNAR_RELATION_SCALAR_SOURCE_INIT_SOURCE_UPPER <=
+        WL_EVALUATION_CONTROL_QUANTUM) ? 1 : -1];
 
 typedef char wl_columnar_relation_scalar_source_column_bound[
         (UINT64_C(208) <=
@@ -18997,6 +19115,84 @@ wl_columnar_relation_scalar_source_end(
     source->thread_valid = false;
     source->phase = WL_COLUMNAR_RELATION_SCALAR_SOURCE_DRAINED;
     return source->first_result;
+}
+
+int
+wl_columnar_relation_scalar_source_end_step(
+    wl_columnar_relation_scalar_source_t *source, int initiating_result,
+    wl_evaluation_control_t *funding, uint64_t id, bool *done)
+{
+    if (!source || !done || source->identity != source) return EINVAL;
+    uintptr_t output = (uintptr_t)done, base = (uintptr_t)source;
+    if (output >= base && output - base < sizeof(*source)) return EINVAL;
+    *done = false;
+    if (source->phase == WL_COLUMNAR_RELATION_SCALAR_SOURCE_DRAINED) {
+        *done = true; return 0;
+    }
+    if (!wl_columnar_relation_scalar_source_thread_equal(source)
+        || !funding || !id || !source->control_identity
+        || wl_evaluation_control_identity(funding) == source->control_identity
+        || source->phase < WL_COLUMNAR_RELATION_SCALAR_SOURCE_INERT
+        || source->phase > WL_COLUMNAR_RELATION_SCALAR_SOURCE_ENDING
+        || source->end_cursor > 4) return EINVAL;
+    int rc = wl_evaluation_control_charge_attempt(funding, id, 128);
+    if (rc) return rc;
+    if (source->phase != WL_COLUMNAR_RELATION_SCALAR_SOURCE_ENDING) {
+        if (!source->first_result_saved) {
+            source->first_result = initiating_result;
+            source->first_result_saved = true;
+        }
+        source->end_cursor = 0;
+        source->phase = WL_COLUMNAR_RELATION_SCALAR_SOURCE_ENDING;
+    }
+#ifdef WL_SESSION_TEST_HOOKS
+    if (wl_columnar_relation_test_scalar_end_checkpoint)
+        wl_columnar_relation_test_scalar_end_checkpoint(source, funding, id, 0);
+#endif
+    rc = wl_evaluation_control_charge_attempt(funding, id, 0);
+    if (rc) return rc;
+    if (source->end_cursor < 2) {
+        wl_columnar_source_access_reader_t *reader = source->end_cursor
+            ? &source->descriptor_reader : &source->owner_reader;
+        if (reader->owner || reader->secondary_owner) {
+            bool released = false;
+            rc = wl_columnar_source_access_reader_release_step(reader,
+                    &released);
+            if (rc && rc != EAGAIN) return rc;
+            if (released) ++source->end_cursor;
+        } else {
+            if (!wl_columnar_relation_scalar_source_reader_empty(reader)
+                || reader->acquire_stage ||
+                reader->release_stage) return EINVAL;
+            ++source->end_cursor;
+        }
+    } else if (source->end_cursor == 2) {
+        source->descriptor = NULL; source->owner = NULL;
+        source->columns = NULL; source->timestamps = NULL;
+        source->names = NULL; source->types = NULL;
+        source->width = 0; source->nrows = 0; source->capacity = 0;
+        source->timestamp_capacity = 0;
+        ++source->end_cursor;
+    } else if (source->end_cursor == 3) {
+        source->descriptor_identity = 0; source->descriptor_view_generation = 0;
+        source->descriptor_storage_generation = 0; source->owner_identity = 0;
+        source->owner_storage_generation = 0;
+        source->has_graph_column = false; source->graph_col_idx = 0;
+        source->declared_ncols = 0; source->preserve_timestamps = false;
+        ++source->end_cursor;
+    } else {
+        source->control = NULL; source->attempt_id = 0;
+        source->thread_valid = false;
+        source->phase = WL_COLUMNAR_RELATION_SCALAR_SOURCE_DRAINED;
+    }
+#ifdef WL_SESSION_TEST_HOOKS
+    if (wl_columnar_relation_test_scalar_end_checkpoint)
+        wl_columnar_relation_test_scalar_end_checkpoint(source, funding, id, 1);
+#endif
+    rc = wl_evaluation_control_charge_attempt(funding, id, 0);
+    if (!rc) *done = source->phase ==
+            WL_COLUMNAR_RELATION_SCALAR_SOURCE_DRAINED;
+    return rc;
 }
 
 enum {
@@ -19251,6 +19447,8 @@ wl_columnar_relation_scalar_source_init_attempt_controlled(
     if (rc)
         return rc;
     source->control = control; source->attempt_id = attempt_id;
+    source->control_identity = wl_evaluation_control_identity(control);
+    source->end_attempt_id = attempt_id; source->end_cursor = 0;
     source->phase = WL_COLUMNAR_RELATION_SCALAR_SOURCE_INERT;
     source->thread_valid = false;
     wl_columnar_relation_constructor_attempt_reader_inert(
@@ -19282,14 +19480,10 @@ wl_columnar_relation_scalar_source_init_attempt_controlled(
                WL_COLUMNAR_RELATION_SCALAR_SOURCE_INIT_WORK);
 }
 
-int
-wl_columnar_relation_scalar_source_begin_attempt_controlled(
+static int
+wl_columnar_relation_scalar_source_begin_mode(
     wl_columnar_relation_scalar_source_t *source, const col_rel_t *relation,
-    bool preserve_timestamps)
-{
-    return wl_columnar_relation_scalar_source_admit_attempt_controlled(
-        source, relation, preserve_timestamps, 0u);
-}
+    bool preserve_timestamps, bool retain_on_error, uint32_t admit);
 
 /* Validates a held INLINE descriptor's arity map in metered chunks of eight
  * logical entries, with the same predicates as
@@ -19329,10 +19523,10 @@ wl_columnar_relation_scalar_source_compound_check(
     return 0;
 }
 
-int
-wl_columnar_relation_scalar_source_admit_attempt_controlled(
+static int
+wl_columnar_relation_scalar_source_begin_mode(
     wl_columnar_relation_scalar_source_t *source, const col_rel_t *relation,
-    bool preserve_timestamps, uint32_t admit)
+    bool preserve_timestamps, bool retain_on_error, uint32_t admit)
 {
     int rc = wl_columnar_relation_scalar_source_check(source,
             WL_COLUMNAR_RELATION_SCALAR_SOURCE_INERT);
@@ -19351,9 +19545,9 @@ wl_columnar_relation_scalar_source_admit_attempt_controlled(
     if (rc)
         goto done;
     source->descriptor = relation;
-    rc = wl_columnar_relation_reader_acquire_attempt_controlled(
+    rc = wl_columnar_relation_reader_acquire_mode(
         (wl_columnar_source_access_gate_t *)&relation->descriptor_access,
-        &source->descriptor_reader, control, id);
+        &source->descriptor_reader, control, id, retain_on_error);
     if (rc)
         goto done;
     rc = wl_columnar_relation_constructor_attempt_charge(control, id,
@@ -19389,8 +19583,9 @@ wl_columnar_relation_scalar_source_admit_attempt_controlled(
     if (tail > 0 || !rc) rc = tail;
     if (rc)
         goto done;
-    rc = wl_columnar_relation_reader_acquire_attempt_controlled(
-        &source->owner->source_access, &source->owner_reader, control, id);
+    rc = wl_columnar_relation_reader_acquire_mode(
+        &source->owner->source_access, &source->owner_reader, control, id,
+        retain_on_error);
     if (rc)
         goto done;
     rc = wl_columnar_relation_constructor_attempt_charge(control, id,
@@ -19478,7 +19673,51 @@ wl_columnar_relation_scalar_source_admit_attempt_controlled(
     }
     return 0;
 done:
+    if (retain_on_error) {
+        if (!source->first_result_saved) {
+            source->first_result_saved = true; source->first_result = rc;
+        }
+        source->end_cursor = 0;
+        source->phase = WL_COLUMNAR_RELATION_SCALAR_SOURCE_ENDING;
+        return rc;
+    }
     return wl_columnar_relation_scalar_source_end(source, rc);
+}
+
+int
+wl_columnar_relation_scalar_source_begin_attempt_controlled(
+    wl_columnar_relation_scalar_source_t *source, const col_rel_t *relation,
+    bool timestamps)
+{
+    return wl_columnar_relation_scalar_source_begin_mode(source, relation,
+               timestamps, false, 0);
+}
+
+int
+wl_columnar_relation_scalar_source_begin_retained_attempt_controlled(
+    wl_columnar_relation_scalar_source_t *source, const col_rel_t *relation,
+    bool timestamps)
+{
+    return wl_columnar_relation_scalar_source_begin_mode(source, relation,
+               timestamps, true, 0);
+}
+
+int
+wl_columnar_relation_scalar_source_admit_attempt_controlled(
+    wl_columnar_relation_scalar_source_t *source, const col_rel_t *relation,
+    bool timestamps, uint32_t admit)
+{
+    return wl_columnar_relation_scalar_source_begin_mode(source, relation,
+               timestamps, false, admit);
+}
+
+int
+wl_columnar_relation_scalar_source_admit_retained_attempt_controlled(
+    wl_columnar_relation_scalar_source_t *source, const col_rel_t *relation,
+    bool timestamps, uint32_t admit)
+{
+    return wl_columnar_relation_scalar_source_begin_mode(source, relation,
+               timestamps, true, admit);
 }
 
 int
@@ -19640,8 +19879,10 @@ wl_columnar_relation_source_like_operator_build(const char *name,
  * scaffolding (<80), pointer/cursor work (<32), and ordinary return (<16).
  * Source/final validation192 includes one actual lease/snapshot validation.
  * Fixed owner validation192 is separate from each column192. No sized loop
- * hides in these actions. Lazy retirement ZERO and BEGIN each pay256 in
- * distinct calls; prepare/step wrappers pay192 beyond inherited leaf debits.
+ * hides in these actions. Lazy retirement ZERO/CLEAR visit64 bytes per256
+ * turn, TOKENS initializes one reservation per192 turn, and BIND has its own
+ * 256 turn. Actual whole-wrapper bounds/carry require separate qualification;
+ * unchanged prepare/step wrappers retain their inherited leaf debits.
  * Existing allocator/standard Arrow/free/token logical exceptions are inherited
  * solely by those existing leaves, never by a new raw deep-copy/destructor. */
 enum {
@@ -19652,25 +19893,22 @@ enum {
     WL_COLUMNAR_RELATION_CACHE_COPY_RETIRE_ZERO_WORK = 256,
     WL_COLUMNAR_RELATION_CACHE_COPY_RETIRE_BEGIN_WORK = 256
 };
-/* ZERO: scalar clear123 + common/native/funding/refusal/phase <=128 =251.
- * BEGIN: managed clear116 +4*(token clear11+NULL guard1+identity1+atomic1+
- * return1)=60 +loop10 +managed guards/stores/return10 +copy wrapper58 =254.
- * Wrapper58: enter/native12, output/busy guards4, done/dispatch8, hook/funding
- * validity8, selector/branch8, phase/leave/return12, abort-result bookkeeping6.
- * Control/test callback bodies retain their established exclusions. Neither
- * bulk clear is optimizer-elided in this source proof. Layout guards preserve
- * these expanded bounds on other supported ABIs as well. */
+/* Actual lazy initialization/final clear visits at most64 bytes, token
+ * restoration visits one full reservation, and BIND publishes identity last.
+ * These replace the old whole-scalar/whole-managed clear and four-token body;
+ * whole-wrapper Source/carry qualification remains separate. */
 typedef char wl_columnar_relation_cache_copy_retirement_init_bound[
-        ((sizeof(wl_columnar_relation_scalar_retirement_t) + 7u) / 8u + 128u <=
-        256u
-        && (sizeof(wl_columnar_relation_managed_retirement_t) + 7u) / 8u
-        + 4u * ((sizeof(wl_columnar_memory_reservation_t) + 7u) / 8u + 4u)
-        + 78u <= 256u) ? 1 : -1];
+        (8u+128u <= 256u
+        && (sizeof(wl_columnar_memory_reservation_t)+7u)/8u+78u <= 192u)
+        ? 1 : -1];
 
 #ifdef WL_SESSION_TEST_HOOKS
 void (*wl_columnar_relation_cache_scalar_copy_test_checkpoint)(
     wl_columnar_relation_cache_scalar_copy_attempt_t *,
     wl_evaluation_control_t *, unsigned);
+void (*wl_columnar_relation_cache_scalar_copy_test_after_action)(
+    wl_columnar_relation_cache_scalar_copy_attempt_t *,
+    wl_evaluation_control_t *, wl_columnar_relation_cache_scalar_copy_phase_t);
 #define WL_COLUMNAR_RELATION_CACHE_COPY_HOOK(a, c, api) do { \
             if (wl_columnar_relation_cache_scalar_copy_test_checkpoint) \
             wl_columnar_relation_cache_scalar_copy_test_checkpoint(a, c, api); \
@@ -19776,6 +20014,7 @@ wl_columnar_relation_cache_scalar_copy_begin(
     a->reader.acquire_stage = a->reader.release_stage = 0;
     a->snapshot = (col_relation_snapshot_t){0};
     a->held = false; a->run_valid = true; a->retirement_started = false;
+    a->retirement_offset = 0; a->retirement_token_index = 0;
     a->output = NULL; a->width = a->rows = a->capacity = 0;
     a->column = a->row = a->run = a->previous_end = 0;
     a->constructor_initialized = false;
@@ -20186,8 +20425,11 @@ wl_columnar_relation_cache_copy_end(
         ? WL_COLUMNAR_RELATION_CACHE_COPY_RETIRE_BEGIN_WORK
         : a->phase == WL_COLUMNAR_RELATION_CACHE_COPY_CONSTRUCTOR_END
         ? WL_COLUMNAR_RELATION_CACHE_COPY_VALIDATE_WORK
-        : a->phase == WL_COLUMNAR_RELATION_CACHE_COPY_RETIRE_ZERO
+        : (a->phase == WL_COLUMNAR_RELATION_CACHE_COPY_RETIRE_ZERO
+        || a->phase == WL_COLUMNAR_RELATION_CACHE_COPY_RETIRE_CLEAR)
         ? WL_COLUMNAR_RELATION_CACHE_COPY_RETIRE_ZERO_WORK
+        : a->phase == WL_COLUMNAR_RELATION_CACHE_COPY_RETIRE_TOKENS
+        ? WL_COLUMNAR_RELATION_CACHE_COPY_VALIDATE_WORK
         : (a->phase == WL_COLUMNAR_RELATION_CACHE_COPY_RETIRE_PREPARE
         || a->phase == WL_COLUMNAR_RELATION_CACHE_COPY_RETIRE_STEP
         || a->phase == WL_COLUMNAR_RELATION_CACHE_COPY_END)
@@ -20411,6 +20653,9 @@ wl_columnar_relation_cache_copy_end(
             !wl_columnar_relation_cache_copy_reader_inert(
                 &a->reader)) return EINVAL;
         a->source = NULL; a->governor = NULL;
+        if (a->discarding && a->output) {
+            a->retirement_offset = 0; a->retirement_token_index = 0;
+        }
         if (a->discarding) a->phase =
                 a->output ? WL_COLUMNAR_RELATION_CACHE_COPY_RETIRE_ZERO
                 : WL_COLUMNAR_RELATION_CACHE_COPY_DISCARDED;
@@ -20423,48 +20668,41 @@ wl_columnar_relation_cache_copy_end(
         /* Parent abort may discard a successful untaken clone while retaining
         * the first saved result (including zero). No original poll occurs. */
         if (!a->discarding || !a->output) return EINVAL;
+        a->retirement_offset = 0; a->retirement_token_index = 0;
         a->phase = WL_COLUMNAR_RELATION_CACHE_COPY_RETIRE_ZERO;
         return 0;
-    case WL_COLUMNAR_RELATION_CACHE_COPY_RETIRE_ZERO:
-        if (!a->output || a->retirement_started) return EINVAL;
-        /* Historic inert receipt bytes may be poisoned; do not inspect them
-         * before this actual paid clear. No live retirement is overwritten. */
-        memset(&a->retirement, 0, sizeof(a->retirement));
-        a->phase = WL_COLUMNAR_RELATION_CACHE_COPY_RETIRE_BEGIN;
+    case WL_COLUMNAR_RELATION_CACHE_COPY_RETIRE_ZERO: {
+        if (!a->output || a->retirement_started
+            || a->retirement_offset >= sizeof(a->retirement)) return EINVAL;
+        size_t count = sizeof(a->retirement)-a->retirement_offset;
+        if (count > 64) count = 64;
+        memset((unsigned char *)&a->retirement+a->retirement_offset, 0, count);
+        a->retirement_offset += count;
+        if (a->retirement_offset == sizeof(a->retirement))
+            a->phase = WL_COLUMNAR_RELATION_CACHE_COPY_RETIRE_TOKENS;
+        return 0;
+    }
+    case WL_COLUMNAR_RELATION_CACHE_COPY_RETIRE_TOKENS:
+        if (!a->output || a->retirement_started
+            || a->retirement_offset != sizeof(a->retirement)
+            || a->retirement_token_index >= 4) return EINVAL;
+        wl_columnar_memory_reservation_init(
+            &a->retirement.storage.tokens[a->retirement_token_index]);
+        ++a->retirement_token_index;
+        if (a->retirement_token_index == 4)
+            a->phase = WL_COLUMNAR_RELATION_CACHE_COPY_RETIRE_BEGIN;
         return 0;
     case WL_COLUMNAR_RELATION_CACHE_COPY_RETIRE_BEGIN: {
-        if (!a->output || a->retirement_started) return EINVAL;
-        wl_columnar_relation_managed_retirement_t *retirement
-            = &a->retirement.storage;
-        /* The outer guard just checked output; retirement is this live
-         * nonNULL copier subobject, with no callback in between. */
-        if (retirement->identity)
-            return EINVAL;
-        memset(retirement, 0, sizeof(*retirement));
-        retirement->identity = (uintptr_t)retirement;
+        if (!a->output || a->retirement_started
+            || a->retirement_offset != sizeof(a->retirement)
+            || a->retirement_token_index != 4) return EINVAL;
+        wl_columnar_relation_managed_retirement_t *retirement =
+            &a->retirement.storage;
         retirement->relation = a->output;
         retirement->original_relation_address = (uintptr_t)a->output;
-        retirement->phase
-            = WL_COLUMNAR_RELATION_MANAGED_RETIREMENT_ACQUIRE_WRITERS;
-        /* Full managed-record clear above already cleared all four complete
-         * token objects in THIS activation. No cross-return freshness assumption.
-         * Preserve the exact initializer's identity and relaxed atomic store. */
-        wl_columnar_memory_reservation_t *token = retirement->tokens;
-        token->identity = token;
-        atomic_store_explicit(&token->state,
-            WL_COLUMNAR_MEMORY_RESERVATION_EMPTY, memory_order_relaxed);
-        ++token;
-        token->identity = token;
-        atomic_store_explicit(&token->state,
-            WL_COLUMNAR_MEMORY_RESERVATION_EMPTY, memory_order_relaxed);
-        ++token;
-        token->identity = token;
-        atomic_store_explicit(&token->state,
-            WL_COLUMNAR_MEMORY_RESERVATION_EMPTY, memory_order_relaxed);
-        ++token;
-        token->identity = token;
-        atomic_store_explicit(&token->state,
-            WL_COLUMNAR_MEMORY_RESERVATION_EMPTY, memory_order_relaxed);
+        retirement->phase =
+            WL_COLUMNAR_RELATION_MANAGED_RETIREMENT_ACQUIRE_WRITERS;
+        retirement->identity = (uintptr_t)retirement;
         a->retirement_started = true;
         a->phase = WL_COLUMNAR_RELATION_CACHE_COPY_RETIRE_PREPARE;
         return 0;
@@ -20484,13 +20722,56 @@ wl_columnar_relation_cache_copy_end(
     case WL_COLUMNAR_RELATION_CACHE_COPY_RETIRE_STEP:
         rc = wl_columnar_relation_scalar_retirement_step(&a->retirement,
                 funding, id);
-        if (rc == EAGAIN) return 0;
-        if (rc) return rc;
-        a->output = NULL; a->retirement_started = false;
-        a->phase = WL_COLUMNAR_RELATION_CACHE_COPY_DISCARDED; *done = true;
+        if (a->retirement.phase == 13 && a->retirement.storage.phase ==
+            WL_COLUMNAR_RELATION_MANAGED_RETIREMENT_DONE) {
+            /* The descriptor can be gone before its last credit/ref phase.
+            * Only genuine managed DONE authorizes final metadata clear. */
+            a->output = NULL; a->retirement_offset = 0;
+            a->phase = WL_COLUMNAR_RELATION_CACHE_COPY_RETIRE_CLEAR;
+            return rc == EAGAIN ? 0 : rc;
+        }
+        return rc == EAGAIN ? 0 : rc ? rc : EINVAL;
+    case WL_COLUMNAR_RELATION_CACHE_COPY_RETIRE_CLEAR: {
+        if (a->output || !a->retirement_started || a->source || a->held
+            || !wl_columnar_relation_cache_copy_reader_inert(&a->reader)
+            || a->retirement_offset >= sizeof(a->retirement)) return EINVAL;
+        size_t count = sizeof(a->retirement)-a->retirement_offset;
+        if (count > 64) count = 64;
+        memset((unsigned char *)&a->retirement+a->retirement_offset, 0, count);
+        a->retirement_offset += count;
+        if (a->retirement_offset == sizeof(a->retirement)) {
+            a->retirement_offset = 0; a->retirement_token_index = 0;
+            a->retirement_started = false;
+            a->phase = WL_COLUMNAR_RELATION_CACHE_COPY_DISCARDED; *done = true;
+        }
         return 0;
+    }
     default: return EINVAL;
     }
+}
+
+static int
+wl_columnar_relation_cache_copy_after_action(
+    wl_columnar_relation_cache_scalar_copy_attempt_t *a,
+    wl_evaluation_control_t *funding, uint64_t id,
+    wl_columnar_relation_cache_scalar_copy_phase_t before,
+    size_t offset, unsigned token, int rc)
+{
+#ifdef WL_SESSION_TEST_HOOKS
+    if (wl_columnar_relation_cache_scalar_copy_test_after_action
+        && before >= WL_COLUMNAR_RELATION_CACHE_COPY_RETIRE_ZERO
+        && before <= WL_COLUMNAR_RELATION_CACHE_COPY_RETIRE_CLEAR
+        && (a->phase != before || a->retirement_offset != offset
+        || a->retirement_token_index != token)) {
+        wl_columnar_relation_cache_scalar_copy_test_after_action(a, funding,
+            before);
+        int tail = wl_evaluation_control_charge_attempt(funding, id, 0);
+        if (!rc) rc = tail;
+    }
+#else
+    (void)funding; (void)id; (void)before; (void)offset; (void)token;
+#endif
+    return wl_columnar_relation_cache_copy_leave(a, rc);
 }
 
 int
@@ -20500,8 +20781,12 @@ wl_columnar_relation_cache_scalar_copy_finish(
 {
     int rc = wl_columnar_relation_cache_copy_enter(a);
     if (rc) return rc;
+    wl_columnar_relation_cache_scalar_copy_phase_t before = a->phase;
+    size_t offset = a->retirement_offset;
+    unsigned token = a->retirement_token_index;
     rc = wl_columnar_relation_cache_copy_end(a, 0, false, funding, id, done);
-    return wl_columnar_relation_cache_copy_leave(a, rc);
+    return wl_columnar_relation_cache_copy_after_action(a, funding, id,
+               before, offset, token, rc);
 }
 
 int
@@ -20511,9 +20796,13 @@ wl_columnar_relation_cache_scalar_copy_abort(
 {
     int rc = wl_columnar_relation_cache_copy_enter(a);
     if (rc) return rc;
+    wl_columnar_relation_cache_scalar_copy_phase_t before = a->phase;
+    size_t offset = a->retirement_offset;
+    unsigned token = a->retirement_token_index;
     rc = wl_columnar_relation_cache_copy_end(a, initiating, true, funding, id,
             done);
-    return wl_columnar_relation_cache_copy_leave(a, rc);
+    return wl_columnar_relation_cache_copy_after_action(a, funding, id,
+               before, offset, token, rc);
 }
 
 int
@@ -20594,6 +20883,7 @@ wl_columnar_relation_cache_scalar_copy_ack(
     a->column = a->row = a->run = a->previous_end = 0;
     a->snapshot = (col_relation_snapshot_t){0};
     a->constructor_initialized = false;
+    a->retirement_offset = 0; a->retirement_token_index = 0;
     a->phase = WL_COLUMNAR_RELATION_CACHE_COPY_INERT;
     wl_evaluation_control_release(owned);
     return wl_columnar_relation_cache_copy_leave(a, 0);

@@ -76,6 +76,17 @@ wl_columnar_mem_ledger_publication_strong(wl_mem_ledger_t *ledger,
 #endif
 }
 
+static void
+wl_columnar_mem_ledger_publication_gate_release(wl_mem_ledger_t *ledger)
+{
+#ifdef _MSC_VER
+    (void)atomic_exchange_explicit(&ledger->writer_gate, 0,
+        memory_order_release);
+#else
+    atomic_store_explicit(&ledger->writer_gate, 0, memory_order_release);
+#endif
+}
+
 static bool
 wl_columnar_mem_ledger_publication_origin(
     const wl_columnar_mem_ledger_publication_prepared_t *prepared)
@@ -337,13 +348,7 @@ wl_columnar_mem_ledger_publication_release(
         return EINVAL;
     if (wl_columnar_mem_ledger_publication_gate_read(prepared->ledger) != 1)
         return EINVAL;
-#ifdef _MSC_VER
-    (void)atomic_exchange_explicit(&prepared->ledger->writer_gate, 0,
-        memory_order_release);
-#else
-    atomic_store_explicit(&prepared->ledger->writer_gate, 0,
-        memory_order_release);
-#endif
+    wl_columnar_mem_ledger_publication_gate_release(prepared->ledger);
     prepared->phase = WL_COLUMNAR_MEM_LEDGER_PUBLICATION_CONSUMED;
     return 0;
 }
@@ -359,6 +364,215 @@ wl_columnar_mem_ledger_publication_cancel(
     if (prepared->phase != WL_COLUMNAR_MEM_LEDGER_PUBLICATION_READY)
         return EINVAL;
     prepared->phase = WL_COLUMNAR_MEM_LEDGER_PUBLICATION_CONSUMED;
+    return 0;
+}
+
+/* This separate description never carries the old prepared prepayment. */
+#ifdef WL_COLUMNAR_MEM_LEDGER_PUBLICATION_TEST_HOOKS
+void (*wl_columnar_mem_ledger_description_test_checkpoint)(
+    wl_columnar_mem_ledger_description_t *, wl_evaluation_control_t *,
+    unsigned);
+#endif
+
+static bool
+wl_columnar_mem_ledger_description_overlap(const void *a, size_t an,
+    const void *b, size_t bn)
+{
+    if (!a || !b || !an || !bn) return false;
+    uintptr_t x = (uintptr_t)a, y = (uintptr_t)b;
+    if (an-1 > UINTPTR_MAX-x || bn-1 > UINTPTR_MAX-y) return true;
+    return x <= y+bn-1 && y <= x+an-1;
+}
+
+static bool
+wl_columnar_mem_ledger_description_owned(
+    const wl_columnar_mem_ledger_description_t *d, const void *parent,
+    wl_evaluation_control_t *control)
+{
+    if (!d || d->identity != d || !parent || d->parent != parent
+        || !d->ledger || !control || d->control != control
+        || !d->control_identity || wl_evaluation_control_identity(control)
+        != d->control_identity || !d->thread_valid || d->count > 2)
+        return false;
+#if defined(WL_HAVE_C11_THREADS)
+    if (!thrd_equal(d->owner_thread, thrd_current())) return false;
+#elif defined(_WIN32) || defined(_WIN64)
+    if (d->owner_thread != GetCurrentThreadId()) return false;
+#else
+    if (!pthread_equal(d->owner_thread, pthread_self())) return false;
+#endif
+    return (d->count < 1 || wl_columnar_mem_ledger_publication_request_valid(
+               &d->requests[0]))
+           && (d->count < 2 || wl_columnar_mem_ledger_publication_request_valid(
+               &d->requests[1]));
+}
+
+int
+wl_columnar_mem_ledger_publication_describe_controlled(
+    wl_columnar_mem_ledger_description_t *d, const void *parent,
+    wl_mem_ledger_t *ledger,
+    const wl_columnar_mem_ledger_publication_request_t *requests,
+    unsigned count,
+    wl_evaluation_control_t *control, uint64_t id)
+{
+    if (!d || !parent || !ledger || !control || !id || count > 2
+        || (count && !requests)
+        || wl_columnar_mem_ledger_description_overlap(d, sizeof(*d), ledger,
+        sizeof(*ledger))
+        || wl_columnar_mem_ledger_description_overlap(d, sizeof(*d), control, 1)
+        || wl_columnar_mem_ledger_description_overlap(d, sizeof(*d), requests,
+        count*sizeof(*requests))
+        || wl_columnar_mem_ledger_description_overlap(requests,
+        count*sizeof(*requests), ledger, sizeof(*ledger))
+        || wl_columnar_mem_ledger_description_overlap(requests,
+        count*sizeof(*requests), control, 1)
+        || d->identity || d->parent || d->ledger || d->control
+        || d->control_identity || d->attempted_id || d->count || d->thread_valid
+        || d->applied || d->phase != WL_COLUMNAR_MEM_LEDGER_DESCRIPTION_INERT
+        || wl_evaluation_control_active_attempt_id(control) != id)
+        return EINVAL;
+    int rc = wl_evaluation_control_charge_attempt(control, id,
+            WL_COLUMNAR_MEM_LEDGER_PUBLICATION_PREPARE_WORK);
+    if (rc) return rc;
+    if ((count > 0 &&
+        !wl_columnar_mem_ledger_publication_request_valid(&requests[0]))
+        || (count > 1 &&
+        !wl_columnar_mem_ledger_publication_request_valid(&requests[1])))
+        return EINVAL;
+    d->parent = parent; d->ledger = ledger; d->control = control;
+    d->control_identity = wl_evaluation_control_identity(control);
+    d->attempted_id = 0; d->count = count; d->applied = false;
+#if defined(WL_HAVE_C11_THREADS)
+    d->owner_thread = thrd_current();
+#elif defined(_WIN32) || defined(_WIN64)
+    d->owner_thread = GetCurrentThreadId();
+#else
+    d->owner_thread = pthread_self();
+#endif
+    d->thread_valid = true;
+    d->requests[0] = count > 0 ? requests[0]
+        : (wl_columnar_mem_ledger_publication_request_t){0};
+    d->requests[1] = count > 1 ? requests[1]
+        : (wl_columnar_mem_ledger_publication_request_t){0};
+    d->phase = WL_COLUMNAR_MEM_LEDGER_DESCRIPTION_DESCRIBED;
+    d->identity = d;
+    return 0;
+}
+
+int
+wl_columnar_mem_ledger_publication_try_commit_described_controlled(
+    wl_columnar_mem_ledger_description_t *d, const void *parent,
+    wl_evaluation_control_t *control, uint64_t id)
+{
+    if (!wl_columnar_mem_ledger_description_owned(d, parent, control)
+        || d->phase != WL_COLUMNAR_MEM_LEDGER_DESCRIPTION_DESCRIBED
+        || d->attempted_id || d->applied || !id
+        || wl_evaluation_control_active_attempt_id(control) !=
+        id) return EINVAL;
+    /* The owned attempt is now selected even if its first admission refuses.
+     * A foreign/protocol rejection above cannot consume another owner. */
+    d->attempted_id = id;
+    d->phase = WL_COLUMNAR_MEM_LEDGER_DESCRIPTION_CONSUMED;
+    int rc = wl_evaluation_control_charge_attempt(control, id,
+            WL_COLUMNAR_MEM_LEDGER_PUBLICATION_INITIAL_WORK
+            + WL_COLUMNAR_MEM_LEDGER_PUBLICATION_APPLY_WORK
+            + WL_COLUMNAR_MEM_LEDGER_PUBLICATION_RELEASE_WORK);
+    if (rc) return rc;
+#ifdef WL_COLUMNAR_MEM_LEDGER_PUBLICATION_TEST_HOOKS
+    if (wl_columnar_mem_ledger_description_test_checkpoint)
+        wl_columnar_mem_ledger_description_test_checkpoint(d, control, 1);
+#endif
+    rc = wl_evaluation_control_charge_attempt(control, id,
+            WL_COLUMNAR_MEM_LEDGER_PUBLICATION_ROUND_WORK);
+    if (rc) return rc;
+#ifdef WL_COLUMNAR_MEM_LEDGER_PUBLICATION_TEST_HOOKS
+    if (wl_columnar_mem_ledger_description_test_checkpoint)
+        wl_columnar_mem_ledger_description_test_checkpoint(d, control, 2);
+#endif
+    if (!wl_columnar_mem_ledger_description_owned(d, parent, control)
+        || d->phase != WL_COLUMNAR_MEM_LEDGER_DESCRIPTION_CONSUMED
+        || d->attempted_id != id || d->applied) return EINVAL;
+    rc = wl_evaluation_control_charge_attempt(control, id, 0);
+    if (rc) return rc;
+    uint64_t expected = 0;
+    if (!wl_columnar_mem_ledger_publication_strong(d->ledger, &expected))
+        return EAGAIN;
+    /* Everything fallible precedes CAS. No poll, hook, allocation or error
+    * path can leave the actual writer held in this successful interval. */
+    if (d->count > 0)
+        wl_columnar_mem_ledger_event_locked(d->ledger, d->requests[0].subsystem,
+            d->requests[0].bytes, d->requests[0].kind ==
+            WL_COLUMNAR_MEM_LEDGER_PUBLICATION_ALLOC);
+    if (d->count > 1)
+        wl_columnar_mem_ledger_event_locked(d->ledger, d->requests[1].subsystem,
+            d->requests[1].bytes, d->requests[1].kind ==
+            WL_COLUMNAR_MEM_LEDGER_PUBLICATION_ALLOC);
+    wl_columnar_mem_ledger_publication_gate_release(d->ledger);
+    d->applied = true;
+    return 0;
+}
+
+int
+wl_columnar_mem_ledger_retirement_capture_owned(
+    wl_columnar_mem_ledger_retirement_journal_t *j, const void *parent,
+    wl_evaluation_control_t *control, uint64_t completed_id)
+{
+    if (!j || !completed_id
+        || !wl_columnar_mem_ledger_description_owned(&j->description, parent,
+        control)
+        || j->description.phase != WL_COLUMNAR_MEM_LEDGER_DESCRIPTION_CONSUMED
+        || j->description.attempted_id != completed_id
+        || wl_evaluation_control_active_attempt_id(control)) return EINVAL;
+    wl_evaluation_control_report_t report;
+    if (wl_evaluation_control_report(control, &report)
+        || report.attempt_id != completed_id) return EINVAL;
+    if (j->report_valid) {
+        const wl_evaluation_control_report_t *saved = &j->report;
+        return saved->attempt_id == report.attempt_id
+               && saved->limit == report.limit
+               && saved->consumed == report.consumed
+               && saved->stop_reason == report.stop_reason
+               && saved->execution_status == report.execution_status
+               && saved->cleanup_status == report.cleanup_status
+               && saved->result == report.result ? 0 : EINVAL;
+    }
+    j->report = report;
+    j->report_valid = true;
+    return 0;
+}
+
+int
+wl_columnar_mem_ledger_retirement_ack_prepaid_owned(
+    wl_columnar_mem_ledger_retirement_journal_t *j, const void *parent,
+    wl_evaluation_control_t *control, uint64_t id, bool *applied)
+{
+    if (!j || !applied || !id
+        || wl_columnar_mem_ledger_description_overlap(j, sizeof(*j), applied,
+        sizeof(*applied))
+        || !wl_columnar_mem_ledger_description_owned(&j->description, parent,
+        control)) return EINVAL;
+    wl_columnar_mem_ledger_description_t *d = &j->description;
+    if (wl_columnar_mem_ledger_description_overlap(d->ledger,
+        sizeof(*d->ledger), applied, sizeof(*applied))
+        || wl_columnar_mem_ledger_description_overlap(control, 1, applied,
+        sizeof(*applied))
+        || d->phase != WL_COLUMNAR_MEM_LEDGER_DESCRIPTION_CONSUMED
+        || !d->attempted_id || !j->report_valid
+        || j->report.attempt_id != d->attempted_id
+        || id <= d->attempted_id
+        || wl_evaluation_control_active_attempt_id(control) != id)
+        return EINVAL;
+    /* A refused ACK generation may itself have replaced completed. The
+     * actual captured COMMIT report remains authoritative in this pinned
+     * original-address journal; it is never recaptured from that later ACK. */
+    bool performed = d->applied;
+    d->identity = NULL;
+    d->parent = NULL; d->ledger = NULL; d->control = NULL;
+    d->control_identity = d->attempted_id = 0;
+    d->count = 0; d->thread_valid = false; d->applied = false;
+    d->phase = WL_COLUMNAR_MEM_LEDGER_DESCRIPTION_INERT;
+    j->report_valid = false;
+    *applied = performed;
     return 0;
 }
 

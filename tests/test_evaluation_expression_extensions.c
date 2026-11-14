@@ -6,6 +6,7 @@
 #include "../wirelog/session.h"
 #include "../wirelog/wirelog-internal.h"
 #include "../wirelog/extension_registry_private.h"
+#include "controlled_step_observation.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -1248,9 +1249,21 @@ static void session_stops(void){
                             wl_columnar_relation_snapshot_equal(generation,
                             wl_columnar_relation_snapshot(prior)));
                         host_check_end(&f, rc);
-                        CHECK(!wl_evaluation_control_reset(f.control) &&
-                            !wl_evaluation_control_configure(f.control,
-                            0) && !complete(f.session));
+                        int reset_rc = wl_evaluation_control_reset(f.control);
+                        int configure_rc = reset_rc ? reset_rc :
+                            wl_evaluation_control_configure(f.control, 0);
+                        int resume_rc =
+                            configure_rc ? configure_rc : complete(f.session);
+                        if (reset_rc || configure_rc || resume_rc)
+                            fprintf(stderr,
+                                "host retry abi=%u route=%u filter=%u target=%u action=%u reset=%d configure=%d resume=%d phase=%u origin=%u\n",
+                                abi, route, filter, host_target, host_action,
+                                reset_rc, configure_rc, resume_rc,
+                                COL_SESSION(
+                                    f.session)->controlled_step_reset.phase,
+                                COL_SESSION(
+                                    f.session)->controlled_step_reset.origin);
+                        CHECK(!reset_rc && !configure_rc && !resume_rc);
                         unsigned count = filter?1:3; host_contents(&f, count);
                         CHECK(f.events == count && f.positive == count &&
                             !f.negative);
@@ -1388,6 +1401,184 @@ static void host_errors(void){
     host_fault = 0;
 }
 
+extern void (*wl_columnar_session_test_join_forward_phase)(
+    const wl_col_session_t *, unsigned, wl_evaluation_control_t *, uint64_t);
+extern void (*wl_columnar_session_test_framed_grant_finished)(
+    const wl_col_session_t *, wl_columnar_eval_serial_framed_host_action_t,
+    wl_evaluation_control_t *, int);
+extern int wl_columnar_session_test_producer_disposition_view(
+    const wl_col_session_t *, uint64_t[6]);
+
+typedef struct {
+    host_t *fixture;
+    unsigned phase, starts, reports, releases, acknowledgements;
+    bool work, fired, closed;
+    uint64_t original_id, source_id, source_identity;
+} join_forward_probe_t;
+static join_forward_probe_t *join_forward_probe;
+
+static void
+join_forward_phase(const wl_col_session_t *sess, unsigned phase,
+    wl_evaluation_control_t *source, uint64_t source_id)
+{
+    join_forward_probe_t *probe = join_forward_probe;
+    if (!probe || sess != COL_SESSION(probe->fixture->session)) return;
+    if (!phase) ++probe->starts;
+    if (phase == probe->phase && !probe->fired) {
+        CHECK(source && source != probe->fixture->control && source_id
+            && wl_evaluation_control_active_attempt_id(source) == source_id);
+        probe->original_id = wl_evaluation_control_active_attempt_id(
+            probe->fixture->control);
+        CHECK(probe->original_id
+            && wl_columnar_session_test_cleanup_owners(sess) == 1);
+        probe->source_id = source_id;
+        probe->source_identity = wl_evaluation_control_identity(source);
+        probe->fired = true;
+        if (probe->work)
+            CHECK(wl_evaluation_control_charge_attempt(source, source_id,
+                2304) == WL_EVALUATION_CONTROL_WORK_LIMIT);
+        else wl_evaluation_control_request_cancel(source);
+    }
+    if (phase == 9) {
+        ++probe->reports;
+        CHECK(source && source_id
+            && !wl_evaluation_control_active_attempt_id(source));
+        if (probe->fired && !probe->closed) {
+            wl_evaluation_control_report_t report;
+            uint64_t consumed = probe->phase == 6 ? 988 :
+                probe->phase == 7 ? 1116 : 1308;
+            CHECK(wl_evaluation_control_identity(source) ==
+                probe->source_identity
+                && !wl_evaluation_control_report(source, &report)
+                && report.attempt_id == probe->source_id
+                && report.limit == 2304 && report.consumed == consumed
+                && !report.execution_status && !report.cleanup_status
+                && report.stop_reason == (probe->work ?
+                WL_EVALUATION_CONTROL_WORK_LIMIT :
+                WL_EVALUATION_CONTROL_CANCELLED)
+                && report.result == report.stop_reason);
+        }
+    }
+    if (phase == 10) {
+        CHECK(!source && !source_id);
+        ++probe->releases;
+        if (probe->fired) probe->closed = true;
+    }
+}
+
+static void
+join_forward_ack(const wl_col_session_t *sess,
+    wl_columnar_eval_serial_framed_host_action_t action,
+    wl_evaluation_control_t *funding, int protocol)
+{
+    (void)funding;
+    if (join_forward_probe
+        && sess == COL_SESSION(join_forward_probe->fixture->session)
+        && action == WL_COLUMNAR_EVAL_SERIAL_FRAMED_RECEIPT_ACK && !protocol)
+        ++join_forward_probe->acknowledgements;
+}
+
+static void
+join_forward_refusals(void)
+{
+    const unsigned phases[] = {6, 7, 8};
+    for (unsigned abi = 0; abi < 2; ++abi)
+        for (unsigned cut = 0; cut < 3; ++cut)
+            for (unsigned work = 0; work < 2; ++work) {
+                host_fault = 3;
+                host_t fixture = host_open(abi, true, false, 0, 1);
+                host_bind(&fixture); host_prepare_route(&fixture, 1);
+                CHECK(!wl_session_insert(fixture.session, "input",
+                    fixture.input[0], 1, 2) && !complete(fixture.session));
+                host_contents(&fixture, 1);
+                CHECK(fixture.events == 1);
+                col_rel_t *committed = session_find_rel(
+                    COL_SESSION(fixture.session), "out");
+                col_relation_snapshot_t image =
+                    wl_columnar_relation_snapshot(committed);
+                wl_evaluation_control_report_t prior, after, failed;
+                CHECK(!wl_evaluation_control_report(fixture.control, &prior));
+                fixture.input[1][1] = wl_intern_put(fixture.plan->intern,
+                        "!bad");
+                CHECK(fixture.input[1][1] >= 0
+                    && !wl_session_insert(fixture.session, "input",
+                    fixture.input[1], 1, 2)
+                    && !wl_session_insert(fixture.session, "input",
+                    fixture.input[2], 1, 2));
+                join_forward_probe_t probe = {
+                    .fixture = &fixture, .phase = phases[cut],
+                    .work = work != 0
+                };
+                CHECK(!wl_columnar_session_test_join_forward_phase
+                    && !wl_columnar_session_test_framed_grant_finished);
+                join_forward_probe = &probe;
+                wl_columnar_session_test_join_forward_phase =
+                    join_forward_phase;
+                wl_columnar_session_test_framed_grant_finished =
+                    join_forward_ack;
+                for (unsigned turn = 0; turn < 10000 && !probe.closed; ++turn)
+                    CHECK(wl_session_step(fixture.session) == EAGAIN);
+                CHECK(probe.fired && probe.closed && probe.starts == 1
+                    && probe.reports == 1 && probe.releases == 1
+                    && probe.acknowledgements == 1
+                    && wl_evaluation_control_active_attempt_id(fixture.control)
+                    == probe.original_id
+                    && wl_columnar_session_test_cleanup_owners(
+                        COL_SESSION(fixture.session)) == 1);
+                uint64_t disposition[6];
+                CHECK(!wl_columnar_session_test_producer_disposition_view(
+                        COL_SESSION(fixture.session), disposition)
+                    && disposition[0] == (phases[cut] == 6 ? 0u : 1u)
+                    && !disposition[4] && !disposition[5]);
+                CHECK(!wl_evaluation_control_report(fixture.control, &after)
+                    && wl_test_completed_step_report_equal(&prior, &after)
+                    && fixture.events == 1
+                    && session_find_rel(COL_SESSION(fixture.session), "out")
+                    == committed
+                    && wl_columnar_relation_snapshot_equal(image,
+                    wl_columnar_relation_snapshot(committed)));
+                CHECK(complete(fixture.session) ==
+                    WL_COLUMNAR_EXPR_CALLBACK_FAILURE);
+                wl_columnar_session_test_join_forward_phase = NULL;
+                wl_columnar_session_test_framed_grant_finished = NULL;
+                join_forward_probe = NULL;
+                CHECK(probe.starts == 2 && probe.reports == 2
+                    && probe.releases == 2 && probe.acknowledgements == 1);
+                host_failure_closed(&fixture,
+                    WL_COLUMNAR_EXPR_CALLBACK_FAILURE);
+                host_contents(&fixture, 1);
+                CHECK(fixture.events == 1
+                    && !wl_evaluation_control_report(fixture.control, &failed)
+                    && failed.attempt_id == probe.original_id
+                    && failed.execution_status ==
+                    WL_COLUMNAR_EXPR_CALLBACK_FAILURE);
+                CHECK(!wl_session_remove(fixture.session, "input",
+                    fixture.input[1], 1, 2));
+                fixture.input[1][1] = wl_intern_put(fixture.plan->intern,
+                        "fixed");
+                CHECK(fixture.input[1][1] >= 0
+                    && !wl_session_insert(fixture.session, "input",
+                    fixture.input[1], 1, 2)
+                    && !wl_evaluation_control_report(fixture.control, &after)
+                    && wl_test_completed_step_report_equal(&failed, &after)
+                    && !wl_evaluation_control_reset(fixture.control)
+                    && !complete(fixture.session));
+                host_contents(&fixture, 3);
+                CHECK(fixture.events == 3 && fixture.positive == 3
+                    && !fixture.negative);
+                CHECK(!wl_session_remove(fixture.session, "input",
+                    fixture.input[0], 1, 2) && !complete(fixture.session));
+                host_contents(&fixture, 2);
+                CHECK(fixture.events == 4 && fixture.negative == 1);
+                CHECK(!wl_session_insert(fixture.session, "input",
+                    fixture.input[0], 1, 2) && !complete(fixture.session));
+                host_contents(&fixture, 3);
+                CHECK(fixture.events == 5 && fixture.positive == 4
+                    && !complete(fixture.session) && fixture.events == 5);
+                host_close(&fixture);
+            }
+    host_fault = 0;
+}
 /* The existing creator test seam supplies normal internal control options;
  * facade construction/STEP and terminal error mapping are actual public calls.
  * Installed control configuration/continuation remains outside this issue. */
@@ -1444,10 +1635,63 @@ static wirelog_error_t facade_drive(wirelog_session_t *session,
     wl_evaluation_control_t *control){
     /* Public control continuation is not an installed API. The test's existing
      * inner/control inspection drives genuine pending calls through STEP. */
+    uint64_t completed_before = 0, attempt = 0;
+    wl_test_completed_step_t ended = {0};
+    if (control) {
+        wl_evaluation_control_report_t initial;
+        int rc = wl_evaluation_control_report(control, &initial);
+        CHECK(!rc || rc == ENOENT);
+        if (!rc) completed_before = initial.attempt_id;
+    }
     for (unsigned i = 0; i < 10000; ++i) {
+        uint64_t before = control ?
+            wl_evaluation_control_active_attempt_id(control) : 0;
+        if (before) {
+            CHECK(!ended.selected && (!attempt || attempt == before));
+            attempt = before;
+        }
         wirelog_error_t error = wirelog_session_step(session);
-        if (!control ||
-            !wl_evaluation_control_active_attempt_id(control)) return error;
+        if (!control) return error;
+        wl_session_t *inner = wirelog_session_testhook_inner(session);
+        CHECK(inner && inner->evaluation_control == control);
+        uint64_t current = wl_evaluation_control_active_attempt_id(control);
+        if (ended.selected) {
+            wl_evaluation_control_report_t report;
+            CHECK(!wl_evaluation_control_report(control, &report)
+                && wl_test_completed_step_unchanged(&ended,
+                inner->evaluation_control == control, current, &report));
+        }
+        if (current) {
+            CHECK(!ended.selected && (!attempt || attempt == current));
+            attempt = current;
+        } else {
+            if (attempt && wl_test_completed_step_observe(inner, control,
+                current, attempt, &ended)) continue;
+            /* Bootstrap and completed financial receipts are actual pending
+             * metadata even before BEGIN or after matching Original FINISH.
+             * An ended WORK result with no such debt still returns here. */
+            wl_controlled_step_state_t state =
+                inner->backend->session_controlled_step_state(inner);
+            if (state == WL_CONTROLLED_STEP_NATIVE_ERROR_CLEANUP_PENDING)
+                continue;
+            if (state == WL_CONTROLLED_STEP_PENDING) {
+                uint64_t binding[10];
+                wl_evaluation_control_report_t report;
+                int rc = wl_evaluation_control_report(control, &report);
+                /* Cursor4's completed binding has a real id0 handoff before
+                 * the first Native BEGIN. An actual ended WORK generation
+                 * changes the Original report and must still return. */
+                if (!wl_columnar_session_test_metadata_bind_view(
+                        COL_SESSION(inner), binding)
+                    && binding[0] == 2 && binding[1] == 4
+                    && !binding[2] && !binding[3] && !binding[4]
+                    && !binding[5] && !binding[6] && !binding[7]
+                    && ((rc == ENOENT && !completed_before)
+                    || (!rc && report.attempt_id == completed_before)))
+                    continue;
+            }
+            return error;
+        }
     }
     CHECK(false); return WIRELOG_ERR_EXEC;
 }
@@ -1548,11 +1792,9 @@ static void public_errors(void){
                         CHECK(
                             !wl_columnar_session_test_committed_metadata_bytes(
                                 COL_SESSION(inner), &prior_credit)
-                            && prior_credit &&
-                            allocation_baseline >= prior_credit);
-                        /* Next STEP genuinely retires the previous successful
-                         * transaction's still-held metadata before the new failure. */
-                        allocation_baseline -= prior_credit;
+                            && !prior_credit);
+                        /* Successful public STEP already retired the prior
+                         * transaction's metadata and returned its credit. */
                     }
                     uint64_t failed_attempt = 0;
                     int semantic = allocation?WL_COLUMNAR_EXPR_OK:fault == 1?
@@ -1841,10 +2083,14 @@ static void policy_depth(void){
         }
 }
 
-int main(void){
+int main(int argc, char **argv){
+    if (argc == 2 && !strcmp(argv[1], "join-forward")) {
+        join_forward_refusals(); return 0;
+    }
+    if (argc != 1) return 2;
     decode_oracles(); invoke_oracles(); scalar_parity(); malformed_parity();
     decode_stops(); invoke_stops(); lifetime(); policy_depth();
     session_positive();
-    session_stops(); host_errors(); public_errors();
+    session_stops(); host_errors(); join_forward_refusals(); public_errors();
     puts("bounded extension expressions: all checks passed"); return 0;
 }

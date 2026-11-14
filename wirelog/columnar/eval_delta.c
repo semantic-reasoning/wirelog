@@ -1322,6 +1322,7 @@ static int
 wl_columnar_eval_delta_observer_build_start_internal(wl_col_session_t *sess,
     uint64_t mask, const char *missing_head_name)
 {
+    if (wl_columnar_session_observed_observer_pending(sess)) return EBUSY;
     if (!sess || !sess->plan
         || (sess->plan->stratum_count && !sess->plan->strata)
         || (sess->nrels && !sess->rels)
@@ -1352,6 +1353,7 @@ int
 wl_columnar_eval_delta_observer_build_start(wl_col_session_t *sess,
     uint64_t mask)
 {
+    if (wl_columnar_session_observed_observer_pending(sess)) return EBUSY;
     return wl_columnar_eval_delta_observer_build_start_internal(sess, mask,
                NULL);
 }
@@ -1360,6 +1362,7 @@ int
 wl_columnar_eval_delta_observer_build_start_missing_head(
     wl_col_session_t *sess, uint64_t mask, const char *name)
 {
+    if (wl_columnar_session_observed_observer_pending(sess)) return EBUSY;
     if (!name || !name[0])
         return EINVAL;
     return wl_columnar_eval_delta_observer_build_start_internal(sess, mask,
@@ -1371,6 +1374,7 @@ wl_columnar_eval_delta_observer_build_start_missing_heads(
     wl_col_session_t *sess, uint64_t mask,
     const wl_columnar_eval_delta_binding_t *heads, uint32_t count)
 {
+    if (wl_columnar_session_observed_observer_pending(sess)) return EBUSY;
     if (!heads || !count) return EINVAL;
     int rc = wl_columnar_eval_delta_observer_build_start_internal(sess, mask,
             NULL);
@@ -1931,6 +1935,7 @@ int
 wl_columnar_eval_delta_observer_build_advance(wl_col_session_t *sess,
     wl_evaluation_control_t *control, uint64_t id, bool *ready)
 {
+    if (wl_columnar_session_observed_observer_pending(sess)) return EBUSY;
     if (!sess || !control || !ready || !id
         || wl_evaluation_control_active_attempt_id(control) != id)
         return EINVAL;
@@ -1965,6 +1970,10 @@ wl_columnar_eval_delta_observer_build_advance(wl_col_session_t *sess,
             b->sorting_pending = false;
             b->phase = WL_COLUMNAR_DELTA_BUILD_SORT;
         } else b->phase = WL_COLUMNAR_DELTA_BUILD_ACQUIRE;
+#ifdef WL_SESSION_TEST_HOOKS
+        if (wl_columnar_eval_delta_test_observer_advanced)
+            wl_columnar_eval_delta_test_observer_advanced(sess);
+#endif
         if (wl_evaluation_control_active_attempt_id(control) !=
             id) return EINVAL;
         rc = wl_evaluation_control_charge_attempt(control, id,
@@ -1984,10 +1993,18 @@ wl_columnar_eval_delta_observer_build_advance(wl_col_session_t *sess,
         sess->delta_observer_build = NULL;
         free(b);
         *ready = true;
+#ifdef WL_SESSION_TEST_HOOKS
+        if (wl_columnar_eval_delta_test_observer_advanced)
+            wl_columnar_eval_delta_test_observer_advanced(sess);
+#endif
         return 0;
     }
     int action = wl_columnar_eval_delta_build_action(sess, b);
     if (action > 0) b->error = action;
+#ifdef WL_SESSION_TEST_HOOKS
+    if (wl_columnar_eval_delta_test_observer_advanced)
+        wl_columnar_eval_delta_test_observer_advanced(sess);
+#endif
     if (wl_evaluation_control_active_attempt_id(control) != id) return EINVAL;
     rc = wl_evaluation_control_charge_attempt(control, id,
             0);
@@ -1997,6 +2014,7 @@ wl_columnar_eval_delta_observer_build_advance(wl_col_session_t *sess,
 int
 wl_columnar_eval_delta_observer_build_discard(wl_col_session_t *sess)
 {
+    if (wl_columnar_session_observed_observer_pending(sess)) return EBUSY;
     if (!sess) return EINVAL;
     wl_columnar_eval_delta_observer_build_t *b = sess->delta_observer_build;
     if (!b) return 0;
@@ -2071,6 +2089,7 @@ wl_columnar_eval_delta_observer_mask(const wl_col_session_t *sess)
 void
 wl_columnar_eval_delta_observer_set_active(wl_col_session_t *sess, bool active)
 {
+    if (wl_columnar_session_observed_observer_pending(sess)) return;
     if (sess->delta_observer)
         sess->delta_observer->active = active;
 }
@@ -2078,6 +2097,7 @@ wl_columnar_eval_delta_observer_set_active(wl_col_session_t *sess, bool active)
 void
 wl_columnar_eval_delta_observer_set_evaluated(wl_col_session_t *sess)
 {
+    if (wl_columnar_session_observed_observer_pending(sess)) return;
     if (sess->delta_observer) {
         sess->delta_observer->evaluated = true;
 #ifdef WL_SESSION_TEST_HOOKS
@@ -2090,6 +2110,7 @@ wl_columnar_eval_delta_observer_set_evaluated(wl_col_session_t *sess)
 void
 wl_columnar_eval_delta_observer_cancel(wl_col_session_t *sess)
 {
+    if (wl_columnar_session_observed_observer_pending(sess)) return;
     if (sess->delta_observer)
         sess->delta_observer->cancelled = true;
 }
@@ -2097,6 +2118,7 @@ wl_columnar_eval_delta_observer_cancel(wl_col_session_t *sess)
 int
 wl_columnar_eval_delta_observer_discard(wl_col_session_t *sess)
 {
+    if (wl_columnar_session_observed_observer_pending(sess)) return EBUSY;
     if (sess && sess->delta_observer_prepare)
         return EBUSY;
     wl_columnar_eval_delta_observer_t *observer = sess->delta_observer;
@@ -2179,6 +2201,7 @@ wl_columnar_eval_delta_observer_discard(wl_col_session_t *sess)
 int
 wl_columnar_eval_delta_observer_begin(wl_col_session_t *sess, uint64_t mask)
 {
+    if (wl_columnar_session_observed_observer_pending(sess)) return EBUSY;
     if (sess->delta_observer_build || sess->delta_observer_prepare)
         return EBUSY;
     if (sess->delta_observer) {
@@ -2532,6 +2555,7 @@ int
 wl_columnar_eval_delta_observer_prepare_start_with_override(
     wl_col_session_t *sess, const char *name, col_rel_t *relation)
 {
+    if (wl_columnar_session_observed_observer_pending(sess)) return EBUSY;
     if (!sess || ((name == NULL) != (relation == NULL))
         || !sess->delta_observer || sess->delta_observer_prepare
         || sess->delta_observer_build || sess->delta_publish_active)
@@ -2558,6 +2582,7 @@ wl_columnar_eval_delta_observer_prepare_start_with_override(
 int
 wl_columnar_eval_delta_observer_prepare_start(wl_col_session_t *sess)
 {
+    if (wl_columnar_session_observed_observer_pending(sess)) return EBUSY;
     return wl_columnar_eval_delta_observer_prepare_start_with_override(sess,
                NULL, NULL);
 }
@@ -2567,6 +2592,7 @@ wl_columnar_eval_delta_observer_prepare_start_with_bindings(
     wl_col_session_t *sess, const wl_columnar_eval_delta_binding_t *bindings,
     uint32_t count)
 {
+    if (wl_columnar_session_observed_observer_pending(sess)) return EBUSY;
     if (!bindings || !count) return EINVAL;
     int rc = wl_columnar_eval_delta_observer_prepare_start(sess);
     if (rc) return rc;
@@ -2983,6 +3009,7 @@ int
 wl_columnar_eval_delta_observer_prepare_advance(wl_col_session_t *sess,
     wl_evaluation_control_t *control, uint64_t id, bool *ready)
 {
+    if (wl_columnar_session_observed_observer_pending(sess)) return EBUSY;
     if (!sess || !control || !id || !ready
         || wl_evaluation_control_active_attempt_id(control) != id)
         return EINVAL;
@@ -2999,12 +3026,17 @@ wl_columnar_eval_delta_observer_prepare_advance(wl_col_session_t *sess,
     if (rc > 0 && rc != EAGAIN
         && rc != WL_EVALUATION_CONTROL_WORK_LIMIT)
         p->error = rc;
+#ifdef WL_SESSION_TEST_HOOKS
+    if (wl_columnar_eval_delta_test_observer_advanced)
+        wl_columnar_eval_delta_test_observer_advanced(sess);
+#endif
     return rc;
 }
 
 int
 wl_columnar_eval_delta_observer_prepare_discard(wl_col_session_t *sess)
 {
+    if (wl_columnar_session_observed_observer_pending(sess)) return EBUSY;
     if (!sess) return EINVAL;
     wl_columnar_eval_delta_observer_prepare_t *p = sess->delta_observer_prepare;
     if (!p) return 0;
@@ -3047,6 +3079,7 @@ wl_columnar_eval_delta_observer_prepare_discard(wl_col_session_t *sess)
 int
 wl_columnar_eval_delta_observer_prepare(wl_col_session_t *sess)
 {
+    if (wl_columnar_session_observed_observer_pending(sess)) return EBUSY;
     if (!sess) return EINVAL;
     if (sess->delta_observer_prepare)
         return EBUSY;
@@ -3174,6 +3207,7 @@ fail:
 void
 wl_columnar_eval_delta_observer_publish(wl_col_session_t *sess)
 {
+    if (wl_columnar_session_observed_observer_pending(sess)) return;
     wl_columnar_eval_delta_observer_t *observer = sess->delta_observer;
     if (!observer || observer->delivered || !observer->prepared)
         return;
@@ -3224,6 +3258,7 @@ wl_columnar_eval_delta_observer_event_count(const wl_col_session_t *sess)
 int
 wl_columnar_eval_delta_observer_finish(wl_col_session_t *sess)
 {
+    if (wl_columnar_session_observed_observer_pending(sess)) return EBUSY;
     if (!sess->delta_observer)
         return wl_columnar_eval_delta_observer_discard(sess);
     sess->delta_observer->active = false;
@@ -4023,3 +4058,1150 @@ cleanup:
     }
     return 0;
 }
+
+/* Finite resource actions behind the canonical observed Step permit. */
+
+static bool
+wl_columnar_eval_delta_resource_reader_live(
+    const wl_columnar_source_access_reader_t *r)
+{
+    return r->owner || r->secondary_owner || r->identity || r->thread_valid
+           || r->transferable || r->acquire_stage || r->release_stage;
+}
+
+static bool
+wl_columnar_eval_delta_resource_relation_reader_live(
+    const wl_columnar_relation_reader_step_t *r)
+{
+    return r->identity || r->descriptor_held || r->relation
+           || wl_columnar_eval_delta_resource_reader_live(&r->token);
+}
+
+static bool
+wl_columnar_eval_delta_resource_thread(
+    const wl_columnar_eval_delta_observer_resource_t *r)
+{
+    if (!r->thread_valid) return false;
+#if defined(WL_HAVE_C11_THREADS)
+    return thrd_equal(r->thread, thrd_current()) != 0;
+#elif defined(_WIN32) || defined(_WIN64)
+    return r->thread == GetCurrentThreadId();
+#else
+    return pthread_equal(r->thread, pthread_self()) != 0;
+#endif
+}
+
+static int
+wl_columnar_eval_delta_resource_prove(wl_col_session_t *s,
+    wl_columnar_eval_delta_observer_resource_t *r)
+{
+    if (r->identity != r || r->session != s ||
+        !wl_columnar_eval_delta_resource_thread(r)
+        || r->arena != s->compound_arena || r->build != s->delta_observer_build
+        || r->prepare != s->delta_observer_prepare) return EINVAL;
+    if (r->build && (r->build->identity != (uintptr_t)r->build
+        || r->build->session != s
+        || r->build->metadata_bytes != r->extent
+        || r->build->zero != r->initialized_bytes)) return EINVAL;
+    if (r->prepare && (r->prepare->identity != (uintptr_t)r->prepare
+        || r->prepare->session != s ||
+        r->prepare->observer != r->observer)) return EINVAL;
+    if (r->observer) {
+        if (r->build_owned) {
+            if (!r->build || s->delta_observer ||
+                r->build->observer != r->observer)
+                return EINVAL;
+        } else if (s->delta_observer != r->observer) return EINVAL;
+        if (!r->partial && (r->observer->count != r->count
+            || r->observer->metadata_bytes != r->extent || r->observer->active))
+            return EINVAL;
+    } else if (s->delta_observer ||
+        (r->build && r->build->observer)) return EINVAL;
+    return 0;
+}
+
+static wl_columnar_eval_delta_observer_resource_quote_t
+wl_columnar_eval_delta_resource_observe(wl_col_session_t *s,
+    wl_columnar_eval_delta_observer_resource_t *r)
+{
+    wl_columnar_eval_delta_observer_resource_quote_t out = {0};
+    out.protocol = wl_columnar_eval_delta_resource_prove(s, r);
+    if (out.protocol) return out;
+    out.action = r->phase; out.readers_done = r->readers_done;
+    out.done = r->phase == WL_COLUMNAR_EVAL_DELTA_RESOURCE_DONE
+        || r->phase == WL_COLUMNAR_EVAL_DELTA_RESOURCE_CLEAR;
+    if (out.done) return out;
+    out.work = 128;
+    if (r->phase == WL_COLUMNAR_EVAL_DELTA_RESOURCE_BUILD_READER && r->build
+        && wl_columnar_eval_delta_resource_relation_reader_live(
+            &r->build->reader)) out.work = 1;
+    if (r->phase == WL_COLUMNAR_EVAL_DELTA_RESOURCE_PREPARE_READER && r->prepare
+        && wl_columnar_eval_delta_resource_relation_reader_live(
+            &r->prepare->reader)) out.work = 1;
+    if (r->phase == WL_COLUMNAR_EVAL_DELTA_RESOURCE_STREAM_READER &&
+        r->observer && !r->partial
+        && wl_columnar_eval_delta_resource_relation_reader_live(
+            &r->observer->stream_reader)) out.work = 1;
+    if (r->phase == WL_COLUMNAR_EVAL_DELTA_RESOURCE_ENTRY_READER &&
+        r->observer && !r->partial
+        && r->index < r->count
+        && wl_columnar_eval_delta_resource_reader_live(
+            &r->observer->entries[r->index].reader)) out.work = 1;
+    if (r->phase == WL_COLUMNAR_EVAL_DELTA_RESOURCE_GC &&
+        s->delta_observer_retirement_gc
+        && r->gc.phase == WL_ARENA_COMPOUND_ARENA_GC_SCAN) out.work = 1;
+    return out;
+}
+
+#ifdef WL_SESSION_TEST_HOOKS
+void (*wl_columnar_eval_delta_test_resource_prefooter)(
+    wl_evaluation_control_t *, uint64_t, unsigned);
+void (*wl_columnar_eval_delta_test_observer_advanced)(wl_col_session_t *);
+
+#endif
+
+static wl_columnar_eval_delta_observer_resource_reply_t
+wl_columnar_eval_delta_resource_begin(wl_col_session_t *s,
+    wl_columnar_eval_delta_observer_resource_t *r,
+    wl_evaluation_control_t *funding, uint64_t id,
+    wl_columnar_eval_delta_observer_retire_t disposition)
+{
+    wl_columnar_eval_delta_observer_resource_reply_t out = {EINVAL, 0, false,
+                                                            false, false};
+    if (!funding || !id || funding == s->base.evaluation_control || r->identity
+        || r->phase || r->session || r->thread_valid) return out;
+    wl_columnar_eval_delta_observer_build_t *b = s->delta_observer_build;
+    wl_columnar_eval_delta_observer_prepare_t *p = s->delta_observer_prepare;
+    wl_columnar_eval_delta_observer_t *o = b ? b->observer : s->delta_observer;
+    if ((b &&
+        (b->identity != (uintptr_t)b || b->session != s || s->delta_observer ||
+        p))
+        || (p &&
+        (p->identity != (uintptr_t)p || p->session != s ||
+        p->observer != o))) return out;
+    if (b && (b->metadata_bytes > SIZE_MAX || b->zero > b->metadata_bytes))
+        return out;
+    bool partial = b && o && b->zero < b->metadata_bytes;
+    size_t extent =
+        b ? (size_t)b->metadata_bytes : o ? (size_t)o->metadata_bytes : 0;
+    if (o && extent < sizeof(*o)) return out;
+    if ((b && b->governor && b->governor != s->memory_governor)
+        || (o && !partial && o->governor && o->governor != s->memory_governor)
+        || (s->delta_observer_retirement_governor
+        && s->delta_observer_retirement_governor != s->memory_governor))
+        return out;
+    int rc = wl_evaluation_control_charge_attempt(funding, id, 0);
+    if (rc) {
+        out.protocol = rc; return out;
+    }
+    unsigned count = 0;
+    if (disposition == WL_COLUMNAR_EVAL_DELTA_OBSERVER_RETIRE_DISCARD
+        && s->delta_observer_retirement ==
+        WL_COLUMNAR_EVAL_DELTA_OBSERVER_RETIRE_BEGIN_ABORT)
+        disposition = WL_COLUMNAR_EVAL_DELTA_OBSERVER_RETIRE_BEGIN_ABORT;
+    if (o && !partial) {
+        if ((o->active &&
+            disposition == WL_COLUMNAR_EVAL_DELTA_OBSERVER_RETIRE_NONE)
+            || extent < sizeof(*o)
+            || o->count >
+            (extent - sizeof(*o)) / sizeof(*o->entries)) return out;
+        count = o->count;
+        if (disposition != WL_COLUMNAR_EVAL_DELTA_OBSERVER_RETIRE_NONE) {
+            wl_columnar_eval_delta_observer_retire_t prior = o->retirement;
+            if (prior == WL_COLUMNAR_EVAL_DELTA_OBSERVER_RETIRE_BEGIN_ABORT
+                && disposition ==
+                WL_COLUMNAR_EVAL_DELTA_OBSERVER_RETIRE_DISCARD)
+                disposition = prior;
+            else if (prior != WL_COLUMNAR_EVAL_DELTA_OBSERVER_RETIRE_NONE
+                && prior != disposition) return out;
+        }
+    }
+    if (disposition != WL_COLUMNAR_EVAL_DELTA_OBSERVER_RETIRE_NONE
+        && s->delta_observer_retirement !=
+        WL_COLUMNAR_EVAL_DELTA_OBSERVER_RETIRE_NONE
+        && s->delta_observer_retirement != disposition) return out;
+    if (s->delta_observer_retirement_gc
+        || (o && !partial && o->gc_requested)) {
+        if (!s->coordinator && s->compound_arena && s->rotation_ops
+            && s->rotation_ops->gc_epoch_boundary
+            && s->rotation_ops != &col_rotation_standard_ops
+            && s->rotation_ops != &col_rotation_pinned_ops) return out;
+    }
+    rc = wl_evaluation_control_charge_attempt(funding, id, 128);
+    if (rc) {
+        out.protocol = rc; return out;
+    }
+    r->session = s; r->arena = s->compound_arena;
+    r->observer = o; r->build = b; r->prepare = p;
+    r->build_owned = b != NULL; r->partial = partial; r->extent = extent;
+    r->initialized_bytes = b ? b->zero : extent;
+    r->count = count;
+    r->disposition = disposition !=
+        WL_COLUMNAR_EVAL_DELTA_OBSERVER_RETIRE_NONE ? disposition
+        : o && !partial &&
+        o->retirement != WL_COLUMNAR_EVAL_DELTA_OBSERVER_RETIRE_NONE
+        ? o->retirement : s->delta_observer_retirement !=
+        WL_COLUMNAR_EVAL_DELTA_OBSERVER_RETIRE_NONE
+        ? s->delta_observer_retirement :
+        WL_COLUMNAR_EVAL_DELTA_OBSERVER_RETIRE_DISCARD;
+    s->delta_observer_retirement = r->disposition;
+    if (o && !partial) {
+        o->active = false; o->retirement = r->disposition;
+    }
+#if defined(WL_HAVE_C11_THREADS)
+    r->thread = thrd_current();
+#elif defined(_WIN32) || defined(_WIN64)
+    r->thread = GetCurrentThreadId();
+#else
+    r->thread = pthread_self();
+#endif
+    r->thread_valid = true;
+    r->phase = WL_COLUMNAR_EVAL_DELTA_RESOURCE_BUILD_READER;
+    r->identity = r;
+    out.progressed = true;
+#ifdef WL_SESSION_TEST_HOOKS
+    if (wl_columnar_eval_delta_test_resource_prefooter)
+        wl_columnar_eval_delta_test_resource_prefooter(funding, id,
+            WL_COLUMNAR_EVAL_DELTA_TEST_RESOURCE_BEGIN);
+#endif
+    out.protocol = wl_evaluation_control_charge_attempt(funding, id, 0);
+    return out;
+}
+
+/* One token transition; mode is chosen before the first mutation and retained
+ * through the genuine release CAS. No token is copied or manufactured. */
+static int
+wl_columnar_eval_delta_resource_credit(
+    wl_columnar_eval_delta_observer_resource_t *r,
+    wl_columnar_memory_reservation_t *token, bool *done)
+{
+    *done = false;
+    uint64_t state = atomic_load_explicit(&token->state, memory_order_acquire);
+    if (state == WL_COLUMNAR_MEMORY_RESERVATION_EMPTY) {
+        *done = true; return 0;
+    }
+    if (state == WL_COLUMNAR_MEMORY_RESERVATION_RELEASED) {
+        wl_columnar_memory_reservation_init(token);
+        r->token_mode_set = false; *done = true; return 0;
+    }
+    if (!r->token_mode_set) {
+        if (state != WL_COLUMNAR_MEMORY_RESERVATION_RESERVED
+            && state != WL_COLUMNAR_MEMORY_RESERVATION_COMMITTED) return EBUSY;
+        r->rollback = state == WL_COLUMNAR_MEMORY_RESERVATION_RESERVED;
+        r->token_mode_set = true;
+    }
+    bool credited = false;
+    int rc = wl_columnar_memory_reservation_finish_step(token, r->rollback,
+            &credited);
+    /* RELEASED is acknowledged/reset by a separate admitted action before
+     * governor release or another token can reuse this continuation. */
+    return rc;
+}
+
+/* Capture the selected in-place receipt once. The refusal suffix reads only
+ * that actual receipt, rather than redispatching the complete observer shape. */
+typedef struct {
+    const wl_columnar_source_access_reader_t *reader;
+    const wl_columnar_relation_reader_step_t *relation;
+    const wl_columnar_memory_reservation_t *credit;
+    const wl_arena_compound_arena_hold_release_t *hold;
+    const wl_arena_compound_arena_gc_step_t *gc;
+    const bool *token_mode;
+} wl_columnar_eval_delta_resource_progress_t;
+
+static uint64_t
+wl_columnar_eval_delta_resource_progress_value(
+    const wl_columnar_eval_delta_resource_progress_t *p)
+{
+    if (p->reader) return (uint64_t)(p->reader->owner != NULL)
+               | ((uint64_t)(p->reader->secondary_owner != NULL) << 1)
+               | ((uint64_t)p->reader->acquire_stage << 2)
+               | ((uint64_t)p->reader->release_stage << 4)
+               | ((uint64_t)(p->relation && p->relation->descriptor_held) << 6);
+    if (p->hold) return p->hold->phase;
+    if (p->gc) return p->gc->phase | ((uint64_t)p->gc->index << 8);
+    if (p->credit) return atomic_load_explicit(&p->credit->state,
+                   memory_order_acquire)
+               | ((uint64_t)*p->token_mode << 32);
+    return 0;
+}
+
+static wl_columnar_eval_delta_resource_progress_t
+wl_columnar_eval_delta_resource_progress(
+    const wl_columnar_eval_delta_observer_resource_t *r)
+{
+    wl_columnar_eval_delta_resource_progress_t p = {0};
+    if (r->phase == WL_COLUMNAR_EVAL_DELTA_RESOURCE_BUILD_READER && r->build)
+        p.relation = &r->build->reader;
+    if (r->phase == WL_COLUMNAR_EVAL_DELTA_RESOURCE_PREPARE_READER &&
+        r->prepare)
+        p.relation = &r->prepare->reader;
+    if (r->phase == WL_COLUMNAR_EVAL_DELTA_RESOURCE_STREAM_READER
+        && r->observer && !r->partial) p.relation = &r->observer->stream_reader;
+    if (p.relation) p.reader = &p.relation->token;
+    if (r->phase == WL_COLUMNAR_EVAL_DELTA_RESOURCE_ENTRY_READER
+        && r->observer && !r->partial && r->index < r->count)
+        p.reader = &r->observer->entries[r->index].reader;
+    if (r->phase == WL_COLUMNAR_EVAL_DELTA_RESOURCE_HOLD) p.hold = &r->hold;
+    if (r->phase == WL_COLUMNAR_EVAL_DELTA_RESOURCE_GC) p.gc = &r->gc;
+    if (r->phase == WL_COLUMNAR_EVAL_DELTA_RESOURCE_STAGING && r->observer)
+        p.credit = &r->observer->staging;
+    if (r->phase == WL_COLUMNAR_EVAL_DELTA_RESOURCE_PAYLOAD && r->observer)
+        p.credit = &r->observer->payload;
+    if (r->phase == WL_COLUMNAR_EVAL_DELTA_RESOURCE_METADATA)
+        p.credit = &r->session->delta_observer_retirement_metadata;
+    if (r->phase == WL_COLUMNAR_EVAL_DELTA_RESOURCE_BUILD_METADATA && r->build)
+        p.credit = &r->build->metadata;
+    if (p.credit) p.token_mode = &r->token_mode_set;
+    return p;
+}
+
+static wl_columnar_eval_delta_observer_resource_reply_t
+wl_columnar_eval_delta_resource_step(wl_col_session_t *s,
+    wl_columnar_eval_delta_observer_resource_t *r,
+    wl_evaluation_control_t *funding, uint64_t id)
+{
+    wl_columnar_eval_delta_observer_resource_reply_t out = {0};
+    wl_columnar_eval_delta_observer_resource_quote_t quote =
+        wl_columnar_eval_delta_resource_observe(s, r);
+    int observed = wl_evaluation_control_charge_attempt(funding, id, 0);
+    out.protocol = quote.protocol ? quote.protocol : observed;
+    out.action = quote.action;
+    out.readers_done = quote.readers_done; out.done = quote.done;
+    if (out.protocol || out.done) return out;
+    if (!funding || !id || funding == s->base.evaluation_control) {
+        out.protocol = EINVAL; return out;
+    }
+    wl_columnar_eval_delta_observer_t *o = r->observer;
+    wl_columnar_eval_delta_observer_build_t *b = r->build;
+    wl_columnar_eval_delta_observer_prepare_t *p = r->prepare;
+    bool self_charge = (r->phase ==
+        WL_COLUMNAR_EVAL_DELTA_RESOURCE_BUILD_READER && quote.work == 1)
+        || (r->phase == WL_COLUMNAR_EVAL_DELTA_RESOURCE_PREPARE_READER &&
+        quote.work == 1)
+        || (r->phase == WL_COLUMNAR_EVAL_DELTA_RESOURCE_STREAM_READER &&
+        quote.work == 1)
+        || (r->phase == WL_COLUMNAR_EVAL_DELTA_RESOURCE_HOLD && o &&
+        o->compound_hold.arena)
+        || (r->phase == WL_COLUMNAR_EVAL_DELTA_RESOURCE_HOLD &&
+        r->hold.reference_owed)
+        || (r->phase == WL_COLUMNAR_EVAL_DELTA_RESOURCE_GC &&
+        s->delta_observer_retirement_gc
+        && r->arena && s->rotation_ops && s->rotation_ops->gc_epoch_boundary);
+    int rc = self_charge ? wl_evaluation_control_charge_attempt(funding, id, 0)
+        : wl_evaluation_control_charge_attempt(funding, id, quote.work);
+    if (rc) {
+        out.protocol = rc; return out;
+    }
+    bool done = false;
+    unsigned old_phase = r->phase, old_index = r->index;
+    wl_columnar_eval_delta_resource_progress_t progress =
+        wl_columnar_eval_delta_resource_progress(r);
+    uint64_t old_progress =
+        wl_columnar_eval_delta_resource_progress_value(&progress);
+    rc = wl_evaluation_control_charge_attempt(funding, id, 0);
+    if (rc) {
+        out.protocol = rc; return out;
+    }
+    switch (r->phase) {
+    case WL_COLUMNAR_EVAL_DELTA_RESOURCE_BUILD_READER:
+        if (b &&
+            wl_columnar_eval_delta_resource_relation_reader_live(&b->reader)){
+            if (b->kind >= 3) {
+                rc = EINVAL; break;
+            }
+            rc = wl_columnar_relation_reader_step(b->sources[b->kind],
+                    &b->reader, true, funding, id);
+            if (rc) break;
+        }
+        r->phase = WL_COLUMNAR_EVAL_DELTA_RESOURCE_PREPARE_READER; break;
+    case WL_COLUMNAR_EVAL_DELTA_RESOURCE_PREPARE_READER:
+        if (p &&
+            wl_columnar_eval_delta_resource_relation_reader_live(&p->reader)){
+            rc = wl_columnar_relation_reader_step(p->relation, &p->reader, true,
+                    funding, id);
+            if (rc) break;
+        }
+        if (p) {
+            p->reader_held = p->preflight_captured = p->relation_selected =
+                false; p->relation = NULL;
+        }
+        r->phase = WL_COLUMNAR_EVAL_DELTA_RESOURCE_STREAM_READER; break;
+    case WL_COLUMNAR_EVAL_DELTA_RESOURCE_STREAM_READER:
+        if (o && !r->partial &&
+            wl_columnar_eval_delta_resource_relation_reader_live(
+                &o->stream_reader)){
+#ifdef WL_SESSION_TEST_HOOKS
+            if (wl_columnar_eval_delta_test_fail_observer_stream_release_once
+                && (o->stream_reader.descriptor_held
+                || o->stream_reader.token.owner)) {
+                rc = wl_columnar_relation_reader_step_validate(
+                    o->stream_relation, &o->stream_reader);
+                if (rc) break;
+                if (!self_charge || quote.work != 1) {
+                    rc = EINVAL; break;
+                }
+                /* Simulate this actual reader action after its own debit,
+                 * before any gate/record change. Keep the common footer. */
+                rc = wl_evaluation_control_charge_attempt(funding, id,
+                        quote.work);
+                if (rc) break;
+                wl_columnar_eval_delta_test_fail_observer_stream_release_once =
+                    false;
+                rc = EIO;
+                break;
+            }
+#endif
+            rc = wl_columnar_relation_reader_step(o->stream_relation,
+                    &o->stream_reader, true, funding, id);
+            if (rc) break;
+            o->stream_relation = NULL; o->stream_relation_identity = 0;
+            o->stream_storage_generation = 0; o->stream_row_count = 0;
+            o->stream_previous_valid = false;
+        }
+        r->index = 0; r->phase = WL_COLUMNAR_EVAL_DELTA_RESOURCE_ENTRY_READER;
+        break;
+    case WL_COLUMNAR_EVAL_DELTA_RESOURCE_ENTRY_READER:
+        if (o && !r->partial && r->index < r->count) {
+            wl_columnar_source_access_reader_t *reader =
+                &o->entries[r->index].reader;
+            if (wl_columnar_eval_delta_resource_reader_live(reader)) {
+                rc = wl_columnar_source_access_reader_release_step(reader,
+                        &done);
+                if (rc || !done) break;
+            }
+            ++r->index;
+        } else {
+            r->readers_done = true;
+            r->phase = WL_COLUMNAR_EVAL_DELTA_RESOURCE_READERS_DONE;
+        }
+        break;
+    case WL_COLUMNAR_EVAL_DELTA_RESOURCE_READERS_DONE:
+        r->index = 0;
+        r->phase =
+            r->partial ? WL_COLUMNAR_EVAL_DELTA_RESOURCE_OBSERVER_FREE :
+            WL_COLUMNAR_EVAL_DELTA_RESOURCE_EVENTS;
+        break;
+    case WL_COLUMNAR_EVAL_DELTA_RESOURCE_CURRENT:
+        if (o && r->index < r->count) {
+            free(o->entries[r->index].current);
+            o->entries[r->index].current = NULL;
+            o->entries[r->index].current_nrows =
+                o->entries[r->index].current_ncols = 0; ++r->index;
+        } else r->phase = WL_COLUMNAR_EVAL_DELTA_RESOURCE_STAGING;
+        break;
+    case WL_COLUMNAR_EVAL_DELTA_RESOURCE_EVENTS:
+        if (o) {
+            free(o->events); o->events = NULL; o->event_count = 0;
+            o->prepared = false;
+        }
+        r->index = 0; r->phase = WL_COLUMNAR_EVAL_DELTA_RESOURCE_CURRENT; break;
+    case WL_COLUMNAR_EVAL_DELTA_RESOURCE_STAGING:
+        if (o) {
+            rc = wl_columnar_eval_delta_resource_credit(r, &o->staging, &done);
+            if (rc || !done) break; o->staging_bytes = 0;
+            if (!wl_columnar_memory_size_add(o->metadata_bytes,
+                o->payload_bytes, &s->delta_observer_reserved_bytes)){
+                rc = EOVERFLOW; break;
+            }
+        }
+        r->token_mode_set = false;
+        r->phase = WL_COLUMNAR_EVAL_DELTA_RESOURCE_PREPARE_FREE; break;
+    case WL_COLUMNAR_EVAL_DELTA_RESOURCE_PREPARE_FREE:
+        if (p) {
+            s->delta_observer_prepare = NULL; r->prepare = NULL; free(p);
+        }
+        r->index = 0; r->phase = WL_COLUMNAR_EVAL_DELTA_RESOURCE_ROWS; break;
+    case WL_COLUMNAR_EVAL_DELTA_RESOURCE_ROWS:
+        if (o && r->index < r->count) {
+            free(o->entries[r->index].rows); o->entries[r->index].rows = NULL;
+            r->phase = WL_COLUMNAR_EVAL_DELTA_RESOURCE_NAME;
+        }else r->phase = WL_COLUMNAR_EVAL_DELTA_RESOURCE_PAYLOAD;
+        break;
+    case WL_COLUMNAR_EVAL_DELTA_RESOURCE_NAME:
+        free(o->entries[r->index].name); o->entries[r->index].name = NULL;
+        ++r->index; r->phase = WL_COLUMNAR_EVAL_DELTA_RESOURCE_ROWS; break;
+    case WL_COLUMNAR_EVAL_DELTA_RESOURCE_PAYLOAD:
+        if (o) {
+            rc = wl_columnar_eval_delta_resource_credit(r, &o->payload, &done);
+            if (rc || !done) break; o->payload_bytes = 0;
+            s->delta_observer_reserved_bytes = o->metadata_bytes;
+        }
+        r->token_mode_set = false;
+        r->phase = WL_COLUMNAR_EVAL_DELTA_RESOURCE_HOLD; break;
+    case WL_COLUMNAR_EVAL_DELTA_RESOURCE_HOLD:
+        if (o && (o->compound_hold.arena || r->hold.reference_owed)) {
+            rc =
+                wl_arena_compound_arena_gc_hold_release_step_owned(
+                &o->compound_hold,
+                r->arena, &r->hold, r, funding, id, &done);
+            if (rc || !done) break;
+        }
+        r->phase = WL_COLUMNAR_EVAL_DELTA_RESOURCE_METADATA_MOVE; break;
+    case WL_COLUMNAR_EVAL_DELTA_RESOURCE_METADATA_MOVE:
+        if (o) {
+            if (o->governor) {
+                if (!wl_columnar_memory_reservation_move(
+                        &s->delta_observer_retirement_metadata, &o->metadata)){
+                    rc = EINVAL; break;
+                }
+                s->delta_observer_retirement_governor = o->governor;
+                o->governor = NULL;
+            }
+            s->delta_observer_retirement_gc = s->delta_observer_retirement_gc ||
+                o->gc_requested;
+        }
+        r->phase = WL_COLUMNAR_EVAL_DELTA_RESOURCE_OBSERVER_FREE; break;
+    case WL_COLUMNAR_EVAL_DELTA_RESOURCE_OBSERVER_FREE:
+        if (o) {
+            if (r->build_owned) b->observer = NULL;
+            else s->delta_observer = NULL;
+            r->observer = NULL; free(o);
+        }
+        r->phase = WL_COLUMNAR_EVAL_DELTA_RESOURCE_METADATA; break;
+    case WL_COLUMNAR_EVAL_DELTA_RESOURCE_METADATA:
+        rc = wl_columnar_eval_delta_resource_credit(r,
+                &s->delta_observer_retirement_metadata, &done);
+        if (rc || !done) break;
+        s->delta_observer_reserved_bytes = 0;
+        r->token_mode_set = false;
+        r->phase = WL_COLUMNAR_EVAL_DELTA_RESOURCE_GOVERNOR; break;
+    case WL_COLUMNAR_EVAL_DELTA_RESOURCE_GOVERNOR:
+        if (s->delta_observer_retirement_governor) {
+            wl_columnar_memory_governor_ref_release(
+                s->delta_observer_retirement_governor);
+            s->delta_observer_retirement_governor = NULL;
+        }
+        r->phase = WL_COLUMNAR_EVAL_DELTA_RESOURCE_BUILD_METADATA; break;
+    case WL_COLUMNAR_EVAL_DELTA_RESOURCE_BUILD_METADATA:
+        if (b && b->metadata_held) {
+            rc = wl_columnar_eval_delta_resource_credit(r, &b->metadata, &done);
+            if (rc || !done) break;
+            b->metadata_held = false;
+        }
+        r->token_mode_set = false;
+        r->phase = WL_COLUMNAR_EVAL_DELTA_RESOURCE_BUILD_GOVERNOR; break;
+    case WL_COLUMNAR_EVAL_DELTA_RESOURCE_BUILD_GOVERNOR:
+        if (b && b->governor) {
+            wl_columnar_memory_governor_ref_release(b->governor);
+            b->governor = NULL;
+        }
+        r->phase = WL_COLUMNAR_EVAL_DELTA_RESOURCE_BUILD_FREE; break;
+    case WL_COLUMNAR_EVAL_DELTA_RESOURCE_BUILD_FREE:
+        if (b) {
+            s->delta_observer_build = NULL; r->build = NULL; free(b);
+        }
+        r->phase = WL_COLUMNAR_EVAL_DELTA_RESOURCE_GC; break;
+    case WL_COLUMNAR_EVAL_DELTA_RESOURCE_GC:
+        if (s->delta_observer_retirement_gc && r->arena && s->rotation_ops
+            && s->rotation_ops->gc_epoch_boundary) {
+            uint32_t epoch = 0;
+            rc = wl_arena_compound_arena_gc_epoch_step_owned(r->arena, &r->gc,
+                    r, funding, id, &done, &epoch);
+            if (rc || !done) break;
+        }
+        r->phase = WL_COLUMNAR_EVAL_DELTA_RESOURCE_DONE; break;
+    default: rc = EINVAL; break;
+    }
+    /* Resource journaling always precedes this independent financial footer.
+     * A refusal here cannot turn a completed free into an unperformed action. */
+#ifdef WL_SESSION_TEST_HOOKS
+    if (wl_columnar_eval_delta_test_resource_prefooter)
+        wl_columnar_eval_delta_test_resource_prefooter(funding, id,
+            WL_COLUMNAR_EVAL_DELTA_TEST_RESOURCE_STEP_BASE + old_phase);
+#endif
+    int progress_check = wl_evaluation_control_charge_attempt(funding, id, 0);
+    /* Native progress is already journaled. Even a stopped financier must
+     * receive this fixed observation suffix; it cannot repeat the action. */
+    out.progressed = !rc || r->phase != old_phase || r->index != old_index
+        || wl_columnar_eval_delta_resource_progress_value(&progress) !=
+        old_progress;
+    out.readers_done = r->readers_done;
+    out.done = r->phase == WL_COLUMNAR_EVAL_DELTA_RESOURCE_DONE;
+    int footer = wl_evaluation_control_charge_attempt(funding, id, 0);
+    out.protocol = rc && rc != EAGAIN ? rc
+        : progress_check ? progress_check : footer;
+    return out;
+}
+
+static wl_columnar_eval_delta_observer_resource_reply_t
+wl_columnar_eval_delta_resource_ack(wl_col_session_t *s,
+    wl_columnar_eval_delta_observer_resource_t *r, bool *acknowledged,
+    wl_evaluation_control_t *funding, uint64_t id)
+{
+    wl_columnar_eval_delta_observer_resource_reply_t out = {0};
+    out.protocol = wl_columnar_eval_delta_resource_prove(s, r);
+    if (out.protocol) return out;
+    if (!funding || !id || funding == s->base.evaluation_control
+        || (r->phase != WL_COLUMNAR_EVAL_DELTA_RESOURCE_DONE &&
+        r->phase != WL_COLUMNAR_EVAL_DELTA_RESOURCE_CLEAR)
+        || r->hold.reference_owed || r->gc.gate_owned || r->observer ||
+        r->build || r->prepare){
+        out.protocol = EINVAL; return out;
+    }
+    int rc = wl_evaluation_control_charge_attempt(funding, id, 128);
+    if (rc) {
+        out.protocol = rc; return out;
+    }
+    if (r->phase == WL_COLUMNAR_EVAL_DELTA_RESOURCE_DONE) {
+        s->delta_observer_retirement =
+            WL_COLUMNAR_EVAL_DELTA_OBSERVER_RETIRE_NONE;
+        s->delta_observer_retirement_gc = false;
+        s->delta_observer_reserved_bytes = 0;
+        r->clear_offset = sizeof(*r);
+        r->phase = WL_COLUMNAR_EVAL_DELTA_RESOURCE_CLEAR;
+    } else {
+        size_t start = offsetof(wl_columnar_eval_delta_observer_resource_t,
+                index);
+        size_t bytes = r->clear_offset - start;
+        if (bytes > 16) bytes = 16;
+        if (bytes) {
+            size_t next = r->clear_offset - bytes;
+            for (size_t i = 0; i < bytes; ++i)
+                ((unsigned char *)r)[next + i] = 0;
+            r->clear_offset = next;
+        } else {
+            /* A separately admitted fixed packet invalidates the inert
+             * header. The thread value is irrelevant once its proof clears. */
+            r->clear_offset = 0;
+            r->phase = WL_COLUMNAR_EVAL_DELTA_RESOURCE_INERT;
+            r->session = NULL; r->arena = NULL; r->thread_valid = false;
+            r->identity = NULL;
+            *acknowledged = true;
+            out.done = true;
+        }
+    }
+    out.progressed = true;
+#ifdef WL_SESSION_TEST_HOOKS
+    if (wl_columnar_eval_delta_test_resource_prefooter)
+        wl_columnar_eval_delta_test_resource_prefooter(funding, id,
+            WL_COLUMNAR_EVAL_DELTA_TEST_RESOURCE_ACK);
+#endif
+    out.protocol = wl_evaluation_control_charge_attempt(funding, id, 0);
+    return out;
+}
+
+static int
+wl_columnar_eval_delta_resource_barrier(wl_col_session_t *s,
+    wl_columnar_eval_delta_observer_resource_t *r)
+{
+    int rc = wl_columnar_eval_delta_resource_prove(s, r);
+    if (rc) return rc;
+    if (r->phase != WL_COLUMNAR_EVAL_DELTA_RESOURCE_READERS_DONE
+        || !r->readers_done || r->index != r->count) return EINVAL;
+    if ((r->build && wl_columnar_eval_delta_resource_relation_reader_live(
+            &r->build->reader))
+        || (r->prepare && wl_columnar_eval_delta_resource_relation_reader_live(
+            &r->prepare->reader))
+        || (r->observer && !r->partial
+        && wl_columnar_eval_delta_resource_relation_reader_live(
+            &r->observer->stream_reader))) return EBUSY;
+    return 0;
+}
+
+wl_columnar_eval_delta_observer_resource_reply_t
+wl_columnar_eval_delta_observer_resource_begin_owned(wl_col_session_t *s,
+    wl_columnar_controlled_step_t *step,
+    wl_columnar_eval_delta_observer_resource_t *r,
+    wl_evaluation_control_t *funding, uint64_t id)
+{
+    wl_columnar_session_observed_observer_permit_t permit =
+        wl_columnar_session_observed_observer_prove(s, step,
+            WL_COLUMNAR_EVAL_DELTA_RESOURCE_CALL_BEGIN, r, funding, id);
+    if (permit.protocol) return (
+            wl_columnar_eval_delta_observer_resource_reply_t){
+                   .protocol = permit.protocol
+        };
+    r->busy = true;
+    wl_columnar_eval_delta_observer_resource_reply_t out =
+        wl_columnar_eval_delta_resource_begin(s, r, funding, id,
+            permit.disposition);
+    r->busy = false;
+    return out;
+}
+
+wl_columnar_eval_delta_observer_resource_quote_t
+wl_columnar_eval_delta_observer_resource_observe_owned(wl_col_session_t *s,
+    wl_columnar_controlled_step_t *step,
+    wl_columnar_eval_delta_observer_resource_t *r,
+    wl_evaluation_control_t *funding, uint64_t id)
+{
+    wl_columnar_session_observed_observer_permit_t permit =
+        wl_columnar_session_observed_observer_prove(s, step,
+            WL_COLUMNAR_EVAL_DELTA_RESOURCE_CALL_OBSERVE, r, funding, id);
+    if (permit.protocol) return (
+            wl_columnar_eval_delta_observer_resource_quote_t){
+                   .protocol = permit.protocol
+        };
+    if (permit.acked) return (wl_columnar_eval_delta_observer_resource_quote_t){
+                   .done = true, .readers_done = true
+        };
+    wl_columnar_eval_delta_observer_resource_quote_t out =
+        wl_columnar_eval_delta_resource_observe(s, r);
+    if (!out.protocol)
+        out.protocol = wl_evaluation_control_charge_attempt(funding, id, 0);
+    if (!out.protocol && out.readers_done
+        && r->phase == WL_COLUMNAR_EVAL_DELTA_RESOURCE_READERS_DONE)
+        out.protocol = wl_columnar_eval_delta_resource_barrier(s, r);
+    if (!out.protocol)
+        out.protocol = wl_evaluation_control_charge_attempt(funding, id, 0);
+    return out;
+}
+
+wl_columnar_eval_delta_observer_resource_reply_t
+wl_columnar_eval_delta_observer_resource_step_owned(wl_col_session_t *s,
+    wl_columnar_controlled_step_t *step,
+    wl_columnar_eval_delta_observer_resource_t *r,
+    wl_evaluation_control_t *funding, uint64_t id)
+{
+    wl_columnar_session_observed_observer_permit_t permit =
+        wl_columnar_session_observed_observer_prove(s, step,
+            WL_COLUMNAR_EVAL_DELTA_RESOURCE_CALL_STEP, r, funding, id);
+    if (permit.protocol) return (
+            wl_columnar_eval_delta_observer_resource_reply_t){
+                   .protocol = permit.protocol
+        };
+    r->busy = true;
+    wl_columnar_eval_delta_observer_resource_reply_t out =
+        wl_columnar_eval_delta_resource_step(s, r, funding, id);
+    r->busy = false;
+    return out;
+}
+
+wl_columnar_eval_delta_observer_resource_reply_t
+wl_columnar_eval_delta_observer_resource_ack_owned(wl_col_session_t *s,
+    wl_columnar_controlled_step_t *step,
+    wl_columnar_eval_delta_observer_resource_t *r,
+    wl_evaluation_control_t *funding, uint64_t id)
+{
+    wl_columnar_session_observed_observer_permit_t permit =
+        wl_columnar_session_observed_observer_prove(s, step,
+            WL_COLUMNAR_EVAL_DELTA_RESOURCE_CALL_ACK, r, funding, id);
+    if (permit.protocol) return (
+            wl_columnar_eval_delta_observer_resource_reply_t){
+                   .protocol = permit.protocol
+        };
+    if (permit.acked) return (wl_columnar_eval_delta_observer_resource_reply_t){
+                   .protocol = wl_evaluation_control_charge_attempt(funding, id,
+                           0),
+                   .done = true, .readers_done = true
+        };
+    r->busy = true;
+    wl_columnar_eval_delta_observer_resource_reply_t out =
+        wl_columnar_eval_delta_resource_ack(s, r, permit.acknowledged,
+            funding, id);
+    r->busy = false;
+    return out;
+}
+
+wl_columnar_eval_delta_observer_resource_reply_t
+wl_columnar_eval_delta_observer_resource_begin_main_owned(wl_col_session_t *s,
+    wl_columnar_controlled_step_t *step,
+    wl_columnar_eval_delta_observer_resource_t *r,
+    wl_evaluation_control_t *funding, uint64_t id)
+{
+    wl_columnar_session_observed_observer_permit_t permit =
+        wl_columnar_session_observed_observer_main_prove(s, step,
+            WL_COLUMNAR_EVAL_DELTA_RESOURCE_CALL_BEGIN, r, funding, id);
+    if (permit.protocol)
+        return (wl_columnar_eval_delta_observer_resource_reply_t){
+                   .protocol = permit.protocol
+        };
+    r->busy = true;
+    wl_columnar_eval_delta_observer_resource_reply_t out =
+        wl_columnar_eval_delta_resource_begin(s, r, funding, id,
+            permit.disposition);
+    r->busy = false;
+    return out;
+}
+
+wl_columnar_eval_delta_observer_resource_quote_t
+wl_columnar_eval_delta_observer_resource_observe_main_owned(wl_col_session_t *s,
+    wl_columnar_controlled_step_t *step,
+    wl_columnar_eval_delta_observer_resource_t *r,
+    wl_evaluation_control_t *funding, uint64_t id)
+{
+    wl_columnar_session_observed_observer_permit_t permit =
+        wl_columnar_session_observed_observer_main_prove(s, step,
+            WL_COLUMNAR_EVAL_DELTA_RESOURCE_CALL_OBSERVE, r, funding, id);
+    wl_columnar_eval_delta_observer_resource_quote_t out = {
+        .protocol = permit.protocol
+    };
+    if (permit.protocol) return out;
+    out.protocol = wl_evaluation_control_charge_attempt(funding, id, 128);
+    if (out.protocol) return out;
+    if (permit.acked) {
+        out.done = out.readers_done = true;
+    } else {
+        out = wl_columnar_eval_delta_resource_observe(s, r);
+        if (!out.protocol && out.readers_done
+            && r->phase == WL_COLUMNAR_EVAL_DELTA_RESOURCE_READERS_DONE)
+            out.protocol = wl_columnar_eval_delta_resource_barrier(s, r);
+    }
+    int footer = wl_evaluation_control_charge_attempt(funding, id, 0);
+    if (!out.protocol) out.protocol = footer;
+    return out;
+}
+
+wl_columnar_eval_delta_observer_resource_reply_t
+wl_columnar_eval_delta_observer_resource_step_main_owned(wl_col_session_t *s,
+    wl_columnar_controlled_step_t *step,
+    wl_columnar_eval_delta_observer_resource_t *r,
+    wl_evaluation_control_t *funding, uint64_t id)
+{
+    wl_columnar_session_observed_observer_permit_t permit =
+        wl_columnar_session_observed_observer_main_prove(s, step,
+            WL_COLUMNAR_EVAL_DELTA_RESOURCE_CALL_STEP, r, funding, id);
+    if (permit.protocol)
+        return (wl_columnar_eval_delta_observer_resource_reply_t){
+                   .protocol = permit.protocol
+        };
+    r->busy = true;
+    wl_columnar_eval_delta_observer_resource_reply_t out =
+        wl_columnar_eval_delta_resource_step(s, r, funding, id);
+    r->busy = false;
+    return out;
+}
+
+wl_columnar_eval_delta_observer_resource_reply_t
+wl_columnar_eval_delta_observer_resource_finish_main_owned(wl_col_session_t *s,
+    wl_columnar_controlled_step_t *step,
+    wl_columnar_eval_delta_observer_resource_t *r,
+    wl_evaluation_control_t *funding, uint64_t id)
+{
+    wl_columnar_session_observed_observer_permit_t permit =
+        wl_columnar_session_observed_observer_main_prove(s, step,
+            WL_COLUMNAR_EVAL_DELTA_RESOURCE_CALL_FINISH, r, funding, id);
+    wl_columnar_eval_delta_observer_resource_reply_t out = {
+        .protocol = permit.protocol
+    };
+    if (permit.protocol) return out;
+    out.protocol = wl_evaluation_control_charge_attempt(funding, id, 128);
+    if (out.protocol) return out;
+    out.protocol = wl_columnar_eval_delta_resource_prove(s, r);
+    if (out.protocol) return out;
+    if (permit.acked || r->phase != WL_COLUMNAR_EVAL_DELTA_RESOURCE_DONE
+        || r->hold.reference_owed || r->gc.gate_owned || r->observer
+        || r->build || r->prepare || s->delta_observer
+        || s->delta_observer_build || s->delta_observer_prepare
+        || s->delta_observer_retirement_governor) {
+        out.protocol = EBUSY; return out;
+    }
+    /* BEGIN committed the real immutable disposition, and every physical,
+    * credit and GC action is now complete. Report that actual FINISH to its
+    * owning parent; neither raw discard nor delivery is repeated here. */
+    out.done = out.readers_done = true;
+    out.protocol = wl_evaluation_control_charge_attempt(funding, id, 0);
+    return out;
+}
+
+wl_columnar_eval_delta_observer_resource_reply_t
+wl_columnar_eval_delta_observer_resource_ack_main_owned(wl_col_session_t *s,
+    wl_columnar_controlled_step_t *step,
+    wl_columnar_eval_delta_observer_resource_t *r,
+    wl_evaluation_control_t *funding, uint64_t id)
+{
+    wl_columnar_session_observed_observer_permit_t permit =
+        wl_columnar_session_observed_observer_main_prove(s, step,
+            WL_COLUMNAR_EVAL_DELTA_RESOURCE_CALL_ACK, r, funding, id);
+    if (permit.protocol)
+        return (wl_columnar_eval_delta_observer_resource_reply_t){
+                   .protocol = permit.protocol
+        };
+    if (permit.acked)
+        return (wl_columnar_eval_delta_observer_resource_reply_t){
+                   .protocol = EBUSY
+        };
+    r->busy = true;
+    wl_columnar_eval_delta_observer_resource_reply_t out =
+        wl_columnar_eval_delta_resource_ack(s, r, permit.acknowledged,
+            funding, id);
+    r->busy = false;
+    return out;
+}
+
+#ifdef WL_SESSION_TEST_HOOKS
+void (*wl_columnar_eval_delta_test_close_validation_checkpoint)(
+    wl_col_session_t *,
+    const wl_columnar_eval_delta_observer_close_validation_t *,
+    wl_evaluation_control_t *, uint64_t);
+#endif
+
+static bool
+wl_columnar_eval_delta_close_validation_actor(
+    const wl_columnar_eval_delta_observer_close_validation_t *p)
+{
+    if (!p->actor_valid) return false;
+#if defined(WL_HAVE_C11_THREADS)
+    return thrd_equal(p->actor, thrd_current()) != 0;
+#elif defined(_WIN32) || defined(_WIN64)
+    return p->actor == GetCurrentThreadId();
+#else
+    return pthread_equal(p->actor, pthread_self()) != 0;
+#endif
+}
+
+static bool
+wl_columnar_eval_delta_close_reader_inert(
+    const wl_columnar_source_access_reader_t *r)
+{
+    return !r->owner && !r->secondary_owner && !r->identity
+           && !r->acquire_stage && !r->release_stage
+           && !r->thread_valid && !r->transferable;
+}
+
+static bool
+wl_columnar_eval_delta_close_header(const wl_col_session_t *s,
+    const wl_columnar_eval_delta_observer_t *o)
+{
+    return o && s->delta_observer == o && !s->delta_observer_build
+           && !s->delta_observer_prepare && !s->delta_publish_active
+           && !s->delta_observer_retirement_governor
+           && !s->delta_observer_retirement_gc
+           && s->delta_observer_retirement ==
+           WL_COLUMNAR_EVAL_DELTA_OBSERVER_RETIRE_NONE
+           && !o->active && o->evaluated && o->prepared
+           && !o->cancelled && !o->delivered
+           && o->retirement == WL_COLUMNAR_EVAL_DELTA_OBSERVER_RETIRE_NONE;
+}
+
+static int
+wl_columnar_eval_delta_close_validation_footer(wl_col_session_t *s,
+    wl_columnar_eval_delta_observer_close_validation_t *p,
+    wl_evaluation_control_t *funding, uint64_t id, int result)
+{
+#ifdef WL_SESSION_TEST_HOOKS
+    if (wl_columnar_eval_delta_test_close_validation_checkpoint)
+        wl_columnar_eval_delta_test_close_validation_checkpoint(s, p,
+            funding, id);
+#else
+    (void)s;
+#endif
+    p->busy = false;
+    int footer = wl_evaluation_control_charge_attempt(funding, id, 0);
+    return result ? result : footer;
+}
+
+int
+wl_columnar_eval_delta_observer_close_validation_begin_owned(
+    wl_col_session_t *s, const void *parent,
+    wl_columnar_eval_delta_observer_close_validation_t *p,
+    wl_evaluation_control_t *funding, uint64_t id)
+{
+    if (!s || !parent || !p) return EINVAL;
+    int rc = wl_columnar_session_observer_close_validation_prove(s, parent,
+            p, funding, id, WL_COLUMNAR_EVAL_DELTA_CLOSE_VALIDATE_BEGIN);
+    if (rc) return rc;
+    if (p->identity || p->busy) return EBUSY;
+    if (!s->delta_observer) return EINVAL;
+    rc = wl_evaluation_control_charge_attempt(funding, id, 256);
+    if (rc) return rc;
+    /* Pointer capture only: geometry and every resource field are inspected
+     * in separately admitted packets, outside the financial BANK callback. */
+    p->session = s; p->parent = parent;
+    p->observer = s->delta_observer;
+    p->extent = 0; p->count = p->index = p->credit = 0;
+    p->phase = WL_COLUMNAR_EVAL_DELTA_CLOSE_VALIDATION_HEADER;
+#if defined(WL_HAVE_C11_THREADS)
+    p->actor = thrd_current();
+#elif defined(_WIN32) || defined(_WIN64)
+    p->actor = GetCurrentThreadId();
+#else
+    p->actor = pthread_self();
+#endif
+    p->actor_valid = true; p->ready = false; p->busy = true;
+    p->identity = p;
+    return wl_columnar_eval_delta_close_validation_footer(s, p, funding, id, 0);
+}
+
+static int
+wl_columnar_eval_delta_close_stream(const wl_columnar_eval_delta_observer_t *o)
+{
+    const wl_columnar_relation_reader_step_t *r = &o->stream_reader;
+    if (!o->stream_initial_output || !o->stream_relation) {
+        return !o->stream_relation && !r->identity && !r->relation
+               && !r->descriptor_held
+               && wl_columnar_eval_delta_close_reader_inert(&r->token)
+               && !o->stream_relation_identity
+               && !o->stream_storage_generation && !o->stream_row_count
+            ? 0 : EBUSY;
+    }
+    const col_rel_t *rel = o->stream_relation;
+    int rc = wl_columnar_relation_reader_step_validate(rel, r);
+    if (rc) return rc;
+    if (!r->descriptor_held || !r->token.owner
+        || r->token.acquire_stage || rel->ncols != 1
+        || rel->relation_identity != o->stream_relation_identity
+        || rel->storage_generation != o->stream_storage_generation
+        || rel->nrows != o->stream_row_count
+        || o->event_count != o->stream_row_count || o->events)
+        return EBUSY;
+    /* The shared real reader-step proof above authenticates the transferable
+     * record and both canonical owners. Observe its existing live borrows;
+     * do not reacquire, release or rewrite their actor. */
+    uint64_t source = atomic_load_explicit(&rel->source_access.state,
+            memory_order_acquire);
+    uint64_t descriptor = atomic_load_explicit(&rel->descriptor_access.state,
+            memory_order_acquire);
+    return source && source != WL_COLUMNAR_SOURCE_ACCESS_WRITER
+           && descriptor && descriptor != WL_COLUMNAR_SOURCE_ACCESS_WRITER
+        ? 0 : EBUSY;
+}
+
+static int
+wl_columnar_eval_delta_close_credit(const wl_columnar_eval_delta_observer_t *o,
+    uint32_t credit)
+{
+    const wl_columnar_memory_reservation_t *t = credit == 0 ? &o->metadata
+        : credit == 1 ? &o->payload : &o->staging;
+    uint64_t bytes = credit == 0 ? o->metadata_bytes
+        : credit == 1 ? o->payload_bytes : o->staging_bytes;
+    if (t->identity != t ||
+        t->transition_kind != WL_COLUMNAR_MEMORY_TRANSITION_NONE
+        || t->replacement_bytes) return EBUSY;
+    /* Full prepared constructors initialized all three atomics. A partial
+     * build cannot reach this phase. RELEASED history is not followed. */
+    uint64_t state = atomic_load_explicit(&t->state, memory_order_acquire);
+    if (state == WL_COLUMNAR_MEMORY_RESERVATION_RELEASED)
+        return !bytes ? 0 : EBUSY;
+    uint64_t owner = atomic_load_explicit(&t->owner_bits, memory_order_acquire);
+    if (state == WL_COLUMNAR_MEMORY_RESERVATION_EMPTY)
+        return (!bytes || !o->governor) && !t->governor && !t->bytes && !owner
+            ? 0 : EBUSY;
+    return state == WL_COLUMNAR_MEMORY_RESERVATION_COMMITTED && o->governor
+           && t->governor == wl_columnar_memory_governor_ref_get(o->governor)
+           && t->bytes == bytes && owner == (uint64_t)(uintptr_t)o
+        ? 0 : EBUSY;
+}
+
+int
+wl_columnar_eval_delta_observer_close_validation_step_owned(
+    wl_col_session_t *s, const void *parent,
+    wl_columnar_eval_delta_observer_close_validation_t *p,
+    wl_evaluation_control_t *funding, uint64_t id)
+{
+    if (!s || !parent || !p) return EINVAL;
+    int rc = wl_columnar_session_observer_close_validation_prove(s, parent,
+            p, funding, id, WL_COLUMNAR_EVAL_DELTA_CLOSE_VALIDATE_STEP);
+    if (rc) return rc;
+    if (p->identity != p || p->session != s || p->parent != parent
+        || p->observer != s->delta_observer || !p->observer
+        || !wl_columnar_eval_delta_close_validation_actor(p)) return EINVAL;
+    if (p->busy || p->ready) return EBUSY;
+    if (p->phase < WL_COLUMNAR_EVAL_DELTA_CLOSE_VALIDATION_HEADER
+        || p->phase >= WL_COLUMNAR_EVAL_DELTA_CLOSE_VALIDATION_READY
+        || p->index > p->count || p->credit > 2) return EINVAL;
+    rc = wl_evaluation_control_charge_attempt(funding, id, 256);
+    if (rc) return rc;
+    p->busy = true;
+    wl_columnar_eval_delta_observer_t *o = p->observer;
+    if (!wl_columnar_eval_delta_close_header(s, o))
+        return wl_columnar_eval_delta_close_validation_footer(s, p,
+                   funding, id, EBUSY);
+    if (p->phase != WL_COLUMNAR_EVAL_DELTA_CLOSE_VALIDATION_HEADER
+        && (o->count != p->count || o->metadata_bytes != p->extent))
+        return wl_columnar_eval_delta_close_validation_footer(s, p,
+                   funding, id, EINVAL);
+    switch (p->phase) {
+    case WL_COLUMNAR_EVAL_DELTA_CLOSE_VALIDATION_HEADER: {
+        uint64_t bytes;
+        if (!wl_columnar_memory_size_mul(o->count, sizeof(*o->entries), &bytes)
+            || !wl_columnar_memory_size_add(bytes, sizeof(*o), &bytes)
+            || bytes > SIZE_MAX || bytes != o->metadata_bytes
+            || (o->compound_hold.arena
+            ? o->compound_hold.identity != (uintptr_t)&o->compound_hold
+            || o->compound_hold.arena != s->compound_arena
+            : o->compound_hold.identity != 0)) {
+            rc = EINVAL; break;
+        }
+        p->extent = (size_t)bytes; p->count = o->count;
+        p->phase = WL_COLUMNAR_EVAL_DELTA_CLOSE_VALIDATION_ENTRIES;
+        break;
+    }
+    case WL_COLUMNAR_EVAL_DELTA_CLOSE_VALIDATION_ENTRIES:
+        if (p->index < p->count) {
+            if (!wl_columnar_eval_delta_close_reader_inert(
+                    &o->entries[p->index].reader)) rc = EBUSY;
+            else p->index = p->index + 1;
+        } else p->phase = WL_COLUMNAR_EVAL_DELTA_CLOSE_VALIDATION_STREAM;
+        break;
+    case WL_COLUMNAR_EVAL_DELTA_CLOSE_VALIDATION_STREAM:
+        rc = wl_columnar_eval_delta_close_stream(o);
+        if (!rc) p->phase = WL_COLUMNAR_EVAL_DELTA_CLOSE_VALIDATION_CREDITS;
+        break;
+    case WL_COLUMNAR_EVAL_DELTA_CLOSE_VALIDATION_CREDITS:
+        rc = wl_columnar_eval_delta_close_credit(o, p->credit);
+        if (!rc) {
+            p->credit = p->credit + 1;
+            if (p->credit == 3) {
+                p->phase = WL_COLUMNAR_EVAL_DELTA_CLOSE_VALIDATION_READY;
+                p->ready = true;
+            }
+        }
+        break;
+    default: rc = EINVAL; break;
+    }
+    return wl_columnar_eval_delta_close_validation_footer(s, p, funding, id,
+               rc);
+}
+
+int
+wl_columnar_eval_delta_observer_close_validation_ready_owned(
+    const wl_col_session_t *s, const void *parent,
+    const wl_columnar_eval_delta_observer_close_validation_t *p,
+    wl_evaluation_control_t *funding, uint64_t id)
+{
+    if (!s || !parent || !p) return EINVAL;
+    int rc = wl_columnar_session_observer_close_validation_prove(s, parent,
+            p, funding, id, WL_COLUMNAR_EVAL_DELTA_CLOSE_VALIDATE_READY);
+    if (rc) return rc;
+    if (p->identity != p || p->session != s || p->parent != parent
+        || !p->observer || p->observer != s->delta_observer
+        || !wl_columnar_eval_delta_close_validation_actor(p)
+        || p->busy || !p->ready
+        || p->phase != WL_COLUMNAR_EVAL_DELTA_CLOSE_VALIDATION_READY
+        || p->index != p->count || p->credit != 3) return EINVAL;
+    return wl_columnar_eval_delta_close_header(s, p->observer)
+           && p->observer->count == p->count
+           && p->observer->metadata_bytes == p->extent ? 0 : EBUSY;
+}
+
+#ifdef WL_SESSION_TEST_HOOKS
+int
+wl_columnar_eval_delta_test_observer_resource_view(const wl_col_session_t *s,
+    uint64_t out[16])
+{
+    if (!s || !out) return EINVAL;
+    memset(out, 0, 16 * sizeof(*out));
+    const wl_columnar_eval_delta_observer_build_t *b = s->delta_observer_build;
+    const wl_columnar_eval_delta_observer_prepare_t *p =
+        s->delta_observer_prepare;
+    if (b && (b->identity != (uintptr_t)b || b->session != s)) return EINVAL;
+    const wl_columnar_eval_delta_observer_t *o =
+        b ? b->observer : s->delta_observer;
+    if (p && (p->identity != (uintptr_t)p || p->session != s
+        || p->observer != o)) return EINVAL;
+    bool partial = b && o && b->zero < b->metadata_bytes;
+    out[0] = b != NULL; out[1] = o != NULL; out[2] = partial;
+    out[3] = b ? b->zero : 0; out[4] = b ? b->metadata_bytes : 0;
+    out[5] = b &&
+        wl_columnar_eval_delta_resource_relation_reader_live(&b->reader);
+    out[6] = p != NULL;
+    out[7] = p &&
+        wl_columnar_eval_delta_resource_relation_reader_live(&p->reader);
+    if (o && !partial) {
+        out[8] = o->count; out[9] = o->events != NULL;
+        out[10] = o->compound_hold.arena != NULL;
+        out[11] =
+            wl_columnar_eval_delta_resource_relation_reader_live(
+            &o->stream_reader);
+        if (o->count) {
+            out[12] = o->entries[o->count - 1].name != NULL;
+            out[13] = o->entries[o->count - 1].rows != NULL;
+            out[14] = o->entries[o->count - 1].current != NULL;
+        }
+        out[15] = o->prepared;
+    }
+    return 0;
+}
+#endif

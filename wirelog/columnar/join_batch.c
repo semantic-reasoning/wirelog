@@ -3024,7 +3024,7 @@ wl_columnar_join_batch_prepare_abort_body(wl_columnar_join_batch_prepare_t *a,
             rc = wl_columnar_relation_scalar_retirement_init_step(i, a,
                     &a->retirement,
                     p->batch, funding, funding_id, &begun);
-            if (!rc && begun) a->retirement_started = true;
+            if (begun) a->retirement_started = true;
             return rc;
         }
         rc = wl_evaluation_control_charge_attempt(funding, funding_id, 1);

@@ -1,0 +1,160 @@
+{
+  "archive_sha256": "87e16e6ee73e1c9626e9174c8a8355b14177543e59d07a84d37b17d5f6cc8ea2",
+  "bundle_verify": true,
+  "patch_check": true,
+  "restored_paths": 53,
+  "original_commits": 16,
+  "restored_candidate_tree": "3b54717ab11570eb3db4d8c89b9f75c947ee08b0",
+  "expected_candidate_tree": "3b54717ab11570eb3db4d8c89b9f75c947ee08b0",
+  "worktree": "/srv/home/joykim/.tmp/2364-handoff-restore-check",
+  "scope": "disposable owned reconstruction; protected main and active rebase untouched",
+  "previous_reconstructed_archive_sha256": "7e1fcbfb2e8ed51d68c9ca5f58d09aa7a72430034aa810317adf9b5e33f5e856",
+  "current_archive_original_bundle_patch_identical": true,
+  "verified_manifest_files": 151,
+  "included_files": 152,
+  "compressed_bytes": 2226729,
+  "previous_archive_with_R1_not_for_publication": "9b9db459a9f344c672c34ca256fd990768c598757e2709e25197d823dfea750b",
+  "excluded_preprocessed_files": 23,
+  "preprocessed_capture_members_remaining": 0,
+  "system_header_line_marker_scan": "none in retained C payload",
+  "removed_files": [
+    {
+      "path": "evidence/prepared-native-packet-method-v1/C11-aggregate.preprocessed.c",
+      "bytes": 48247,
+      "sha256": "9b0be2b85b737ee25a740ecb1daec86e61f5d8340e497ad4564ee1773782e49e",
+      "reason": "R1: generated preprocessed capture; omit and regenerate on Windows"
+    },
+    {
+      "path": "evidence/prepared-native-packet-method-v1/C11-discovery.preprocessed.c",
+      "bytes": 47411,
+      "sha256": "0c580b45afeb667db2b23d2162f4d26fdb04d22eb9e36f692a49113f81862b38",
+      "reason": "R1: generated preprocessed capture; omit and regenerate on Windows"
+    },
+    {
+      "path": "evidence/prepared-native-packet-method-v1/C11-shadow-tag.preprocessed.c",
+      "bytes": 409,
+      "sha256": "8a1b21e2a69f032ac96e04202bca818e365b14e347d432b016063c5d58cfa181",
+      "reason": "R1: generated preprocessed capture; omit and regenerate on Windows"
+    },
+    {
+      "path": "evidence/prepared-native-packet-method-v1/C11-zero.preprocessed.c",
+      "bytes": 33739,
+      "sha256": "291e578c0a7900ebfba9e071163705d8695a4edc283a71add94d3b8324d10766",
+      "reason": "R1: generated preprocessed capture; omit and regenerate on Windows"
+    },
+    {
+      "path": "evidence/prepared-native-packet-method-v1/MSVC-C11-aggregate.preprocessed.c",
+      "bytes": 93949,
+      "sha256": "ea5b09ae145472d984cee540603acb6009e22638fe454fd717ba1aff0f5909e1",
+      "reason": "R1: generated preprocessed capture; omit and regenerate on Windows"
+    },
+    {
+      "path": "evidence/prepared-native-packet-method-v1/MSVC-C11-discovery.preprocessed.c",
+      "bytes": 92977,
+      "sha256": "ed4e8536089772a703943ec6d0c00e4bc70636b14319805efad7b6775275d478",
+      "reason": "R1: generated preprocessed capture; omit and regenerate on Windows"
+    },
+    {
+      "path": "evidence/prepared-native-packet-method-v1/MSVC-C11-shadow-tag.preprocessed.c",
+      "bytes": 419,
+      "sha256": "c2edc9d62211937cace898ba1643b06b84646908425f23a1cc5e42910081d8f5",
+      "reason": "R1: generated preprocessed capture; omit and regenerate on Windows"
+    },
+    {
+      "path": "evidence/prepared-native-packet-method-v1/MSVC-C11-zero.preprocessed.c",
+      "bytes": 71423,
+      "sha256": "2582a1b493dac5f39e1a557f9877008f1c5c5ac87c3a736d3be27eea6a7b609d",
+      "reason": "R1: generated preprocessed capture; omit and regenerate on Windows"
+    },
+    {
+      "path": "evidence/prepared-native-packet-method-v1/POSIX-aggregate.preprocessed.c",
+      "bytes": 61441,
+      "sha256": "6a624406e8a5dabe4267f2160b807d3e95775bfc8c9e520176a14c3251148a59",
+      "reason": "R1: generated preprocessed capture; omit and regenerate on Windows"
+    },
+    {
+      "path": "evidence/prepared-native-packet-method-v1/POSIX-discovery.preprocessed.c",
+      "bytes": 60605,
+      "sha256": "3adec2bff19da732e6802093085af67e89bcae35c58154627969e7588eb3f980",
+      "reason": "R1: generated preprocessed capture; omit and regenerate on Windows"
+    },
+    {
+      "path": "evidence/prepared-native-packet-method-v1/POSIX-shadow-tag.preprocessed.c",
+      "bytes": 413,
+      "sha256": "c371a0ed718fe3848869a3d4526df45ec83eda0339f10892e9278712a30a29e3",
+      "reason": "R1: generated preprocessed capture; omit and regenerate on Windows"
+    },
+    {
+      "path": "evidence/prepared-native-packet-method-v1/POSIX-zero.preprocessed.c",
+      "bytes": 33747,
+      "sha256": "a0ce4e41cd9c7387b54ea22422ef6d6f6bac1c172fa26c0fcb25d0e6d40e3b11",
+      "reason": "R1: generated preprocessed capture; omit and regenerate on Windows"
+    },
+    {
+      "path": "evidence/prepared-native-packet-method-v1/Windows-native-shadow-tag.preprocessed.c",
+      "bytes": 431,
+      "sha256": "bab158ad77e38253f22cc070478f3859039c566858314e1e3f7ca775918c696c",
+      "reason": "R1: generated preprocessed capture; omit and regenerate on Windows"
+    },
+    {
+      "path": "evidence/prepared-native-packet-method-v1/Windows-native-zero.preprocessed.c",
+      "bytes": 71447,
+      "sha256": "aea7f54575ab5bdcf09fe4a7749eb7c00a1dfec6b55ae17aa574a645197bd3a6",
+      "reason": "R1: generated preprocessed capture; omit and regenerate on Windows"
+    },
+    {
+      "path": "evidence/prepared-native-packet-method-v1/actual-primary-changed-layout.preprocessed.c",
+      "bytes": 28724,
+      "sha256": "51b5d9fa00b61ced78b3f6023a0d4e50df344f73c1443425a68ddf4778d38280",
+      "reason": "R1: generated preprocessed capture; omit and regenerate on Windows"
+    },
+    {
+      "path": "evidence/prepared-native-packet-method-v1/actual-primary-changed-prototype.preprocessed.c",
+      "bytes": 28769,
+      "sha256": "9d6507a5964c511a82020cf89b4da7e293986dc5707ef1f553f891a76e9aeb51",
+      "reason": "R1: generated preprocessed capture; omit and regenerate on Windows"
+    },
+    {
+      "path": "evidence/prepared-native-packet-method-v1/actual-primary-pack-unknown.no-lines.preprocessed.c",
+      "bytes": 19513,
+      "sha256": "f8771a4bb51ebe3077da503b3fa96bfb94f4bf7a675ff08da96bd752c9e4d001",
+      "reason": "R1: generated preprocessed capture; omit and regenerate on Windows"
+    },
+    {
+      "path": "evidence/prepared-native-packet-method-v1/actual-primary-pack-unknown.preprocessed.c",
+      "bytes": 28563,
+      "sha256": "9363ed380f7d60be4c67ac9555405c5235c160150e2d8ae94efd4fd5a04a411d",
+      "reason": "R1: generated preprocessed capture; omit and regenerate on Windows"
+    },
+    {
+      "path": "evidence/prepared-native-packet-method-v1/actual-primary-pack1.preprocessed.c",
+      "bytes": 28681,
+      "sha256": "1d2b6d3f2fce9e0f5685e587e76ccc25afcc055d3f3868df981a8cdb48aac4ec",
+      "reason": "R1: generated preprocessed capture; omit and regenerate on Windows"
+    },
+    {
+      "path": "evidence/prepared-native-packet-method-v1/actual-primary-pack16.preprocessed.c",
+      "bytes": 28690,
+      "sha256": "29003136d8fa1296b01173bacc09975a6042deb2017d3dfd16aa131eafefe93c",
+      "reason": "R1: generated preprocessed capture; omit and regenerate on Windows"
+    },
+    {
+      "path": "evidence/prepared-native-packet-method-v1/actual-primary-pack4.preprocessed.c",
+      "bytes": 28681,
+      "sha256": "1dfb54b6e130c8df7eb791ed9b4d003effa9fbf149319e8a617f4f90ffef4859",
+      "reason": "R1: generated preprocessed capture; omit and regenerate on Windows"
+    },
+    {
+      "path": "evidence/prepared-native-packet-method-v1/actual-primary-unknown-config.preprocessed.c",
+      "bytes": 28571,
+      "sha256": "7354532042be6a25c67e9ff39c7af0a111a410b6ce0f849ba28f9dfe0a9b34bc",
+      "reason": "R1: generated preprocessed capture; omit and regenerate on Windows"
+    },
+    {
+      "path": "evidence/prepared-native-packet-method-v1/pack8-discovery-preprocessed.c",
+      "bytes": 68144,
+      "sha256": "155348e1f19bebdb9b43a6112895cd82c6bd80afd13560f83052041aa014a95a",
+      "reason": "R1: generated preprocessed capture; omit and regenerate on Windows"
+    }
+  ]
+}

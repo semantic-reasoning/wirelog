@@ -887,6 +887,62 @@ static void session_resources(void) {
 extern int wl_columnar_session_test_retirement_view(const wl_col_session_t *,
     uint64_t out[16]);
 static unsigned late_epoch;
+/* Rollback MAIN refusal (#2368): while observed rollback debt is being
+ * retired, alternately grant one real MAIN packet a single unit and let the
+ * next one run with its real grant, until this many packets were refused.
+ * Each refusal must settle as a genuine WORK_LIMIT report that consumed
+ * nothing, and the following packet must be a fresh attempt. */
+extern uint64_t (*wl_columnar_session_test_main_limit)(const wl_col_session_t *,
+    unsigned, unsigned, uint64_t);
+extern void (*wl_columnar_session_test_main_action_report)(
+    const wl_col_session_t *, unsigned, unsigned,
+    wl_evaluation_control_report_t, int);
+static unsigned late_rollback_refusals, late_rollback_refusals_left,
+    late_rollback_refused, late_rollback_confirmed;
+static bool late_rollback_pending, late_rollback_skip, late_rollback_settled;
+static uint64_t late_rollback_refused_attempt;
+static uint64_t late_rollback_main_limit(const wl_col_session_t *session,
+    unsigned recipient, unsigned main_action, uint64_t capacity) {
+    (void)recipient; (void)main_action;
+    uint64_t view[16];
+    CHECK(!late_rollback_pending);
+    if (!late_rollback_refusals_left ||
+        wl_columnar_session_test_retirement_view(session, view) ||
+        !(view[5]&1))
+        return capacity;
+    if (late_rollback_skip) {
+        late_rollback_skip = false; return capacity;
+    }
+    --late_rollback_refusals_left; ++late_rollback_refused;
+    late_rollback_pending = late_rollback_skip = true;
+    return 1;
+}
+/* After a settled refusal only the MAIN-funded rollback-debt rule can keep
+ * a general route pending, and the state-only STEP observation reports it. */
+static void late_rollback_observe(wl_session_t *session, int rc) {
+    unsigned flags = wl_columnar_session_test_general_route_flags(COL_SESSION(
+                session));
+    if (rc != EAGAIN || !(flags&1u)) return;
+    CHECK(session->backend->session_controlled_step_state(session) ==
+        WL_CONTROLLED_STEP_PENDING);
+    int state = session->backend->session_controlled_step_observe(session,
+            WL_BACKEND_CONTROLLED_COMPLETION_STEP, true, NULL);
+    CHECK(state == WL_CONTROLLED_STEP_NATIVE_ERROR_CLEANUP_PENDING);
+}
+static void late_rollback_main_report(const wl_col_session_t *session,
+    unsigned recipient, unsigned main_action,
+    wl_evaluation_control_report_t report, int result) {
+    (void)session; (void)recipient; (void)main_action;
+    if (late_rollback_pending) {
+        CHECK(report.limit == 1 && !report.consumed &&
+            result == WL_EVALUATION_CONTROL_WORK_LIMIT);
+        late_rollback_pending = false; late_rollback_settled = true;
+        late_rollback_refused_attempt = report.attempt_id;
+        ++late_rollback_confirmed;
+    } else if (late_rollback_refused_attempt) {
+        CHECK(report.attempt_id != late_rollback_refused_attempt);
+    }
+}
 static void late_matrix_stop(wl_evaluation_control_t *c, unsigned phase,
     uint32_t progress,
     const wl_columnar_eval_private_bindings_t *bindings) {
@@ -1120,6 +1176,15 @@ static void late_end_matrix(void) {
                         f.stop = 2100+late_epoch;
                         wl_columnar_session_test_observed_transaction_checkpoint
                             = late_matrix_stop;
+                        late_rollback_refusals_left = late_rollback_refusals;
+                        late_rollback_refused = late_rollback_confirmed = 0;
+                        late_rollback_pending = late_rollback_skip = false;
+                        late_rollback_settled = false;
+                        late_rollback_refused_attempt = 0;
+                        wl_columnar_session_test_main_limit =
+                            late_rollback_main_limit;
+                        wl_columnar_session_test_main_action_report =
+                            late_rollback_main_report;
                         unsigned turns = 0, drain = 0;
                         bool rollback = false, discard = false,
                             maintenance = false;
@@ -1127,6 +1192,12 @@ static void late_end_matrix(void) {
                         for (; turns < 10000; ++turns) {
                             if (f.did_stop) assert_original_frozen(&f);
                             rc = wl_session_step(f.controlled);
+                            if (late_rollback_settled) {
+                                /* Only the MAIN-funded rollback-debt rule
+                                 * keeps a general route pending here. */
+                                late_rollback_settled = false;
+                                late_rollback_observe(f.controlled, rc);
+                            }
                             if (f.did_stop) {
                                 ++drain; assert_original_frozen(&f);
                                 CHECK(old ==
@@ -1176,6 +1247,17 @@ static void late_end_matrix(void) {
                             }
                             if (rc != EAGAIN) break;
                         }
+                        wl_columnar_session_test_main_limit = NULL;
+                        wl_columnar_session_test_main_action_report = NULL;
+                        /* Epoch-0 rollback has no begun Original retirement
+                         * and runs no MAIN action. Later epochs retire real
+                         * Originals through MAIN: every refused packet is
+                         * retried by a fresh packet, never surfaced as EIO
+                         * or replayed, and the drain still ends below. */
+                        CHECK(late_rollback_refused ==
+                            (late_epoch?late_rollback_refusals:0u) &&
+                            late_rollback_confirmed == late_rollback_refused &&
+                            !late_rollback_pending);
                         CHECK(turns < 10000 && f.did_stop && drain &&
                             rollback && discard && maintenance && rc == EINVAL);
                         CHECK(!COL_SESSION(f.controlled)->cleanup_active &&
@@ -1433,9 +1515,13 @@ static void unobserved_missing_matrix(void) {
         f.empty_known = raw_map.items[0].rel->column_types != NULL;
         CHECK(!eval_stack_drain(&raw_map)); bind_unobserved(&f);
         CHECK(!complete(f.controlled) && !complete(f.raw)); equal(&f);
+        /* numeric_frames counts frames that schema() saw while the general
+         * route held its initialized transaction (flags 5). After the
+         * healthy completion, the completed owner (#2368) has disposed of
+         * that transaction, so only the general-route bit remains. */
         CHECK(f.source_calls && f.numeric_frames && !f.events &&
             wl_columnar_session_test_general_route_flags(COL_SESSION(
-                f.controlled)) == 5u &&
+                f.controlled)) == 1u &&
             wl_columnar_relation_snapshot_equal(before,
             wl_columnar_relation_snapshot(f.input)));
         insert(&f, 2, false); CHECK(!wl_evaluation_control_reset(f.control));
@@ -2207,7 +2293,9 @@ static void inferred_schema_stops(void) {
 int main(void) {
     inferred_schema_stops(); inferred_schema_boundaries();
     inferred_six_domain_histories(); inferred_first_arity();
-    state_only_backend_pair(); late_end_matrix(); late_two_head_matrix();
+    state_only_backend_pair(); late_end_matrix();
+    late_rollback_refusals = 3; late_end_matrix(); late_rollback_refusals = 0;
+    late_two_head_matrix();
     unobserved_graph_fee_oracle();
     unobserved_missing_matrix(); unobserved_unknown_variable();
     unobserved_selector_controls();

@@ -2859,8 +2859,7 @@ wl_columnar_ops_reduce_attempt_start_owned(const wl_plan_op_t *op,
     bool count = op->agg_fn == WIRELOG_AGG_COUNT;
     bool floating = !count && op->agg_operand_type == WL_PLAN_AGG_OPERAND_FLOAT;
     bool domain = op->agg_operand_type >= WL_PLAN_AGG_OPERAND_UNKNOWN
-        && op->agg_operand_type <= WL_PLAN_AGG_OPERAND_FLOAT
-        && (count || op->agg_operand_type != WL_PLAN_AGG_OPERAND_STRING);
+        && op->agg_operand_type <= WL_PLAN_AGG_OPERAND_FLOAT;
     bool supported = op->op == WL_PLAN_OP_REDUCE && !op->materialized
         && domain && (count || op->agg_fn == WIRELOG_AGG_SUM
         || op->agg_fn == WIRELOG_AGG_MIN || op->agg_fn == WIRELOG_AGG_MAX
@@ -2944,8 +2943,8 @@ wl_columnar_ops_reduce_attempt_start_owned(const wl_plan_op_t *op,
             &ctx->source_initialized);
         if (!ctx->source_initialized) ctx->source_bare = false;
     } else {
-        rc = wl_columnar_relation_scalar_source_begin_attempt_controlled(
-            &ctx->source, left, false);
+        rc = wl_columnar_eval_stack_scalar_source_begin_owned(frame, owner, op,
+                &ctx->source, left, false);
     }
     rc = wl_columnar_ops_reduce_attempt_return(control, id, rc);
     if (rc) goto done;
@@ -3275,6 +3274,21 @@ wl_columnar_ops_reduce_attempt_start_owned(const wl_plan_op_t *op,
                 next = (int64_t)wl_columnar_float_canonical_bits(
                     wl_columnar_float_to_bits(op->agg_fn == WIRELOG_AGG_AVG
                     ? group->sum / (double)group->count : group->sum));
+            } else if (op->agg_operand_type == WL_PLAN_AGG_OPERAND_STRING) {
+                int comparison;
+                bool candidate_valid, current_valid;
+                rc = wl_columnar_expr_intern_rank_compare_attempt_controlled(
+                    session->intern, operand, next, &comparison,
+                    &candidate_valid, &current_valid, control, id);
+                if (rc) goto done;
+                bool better = candidate_valid != current_valid ? candidate_valid
+                    : candidate_valid ? (op->agg_fn == WIRELOG_AGG_MAX
+                        ? comparison > 0 : comparison < 0)
+                    : op->agg_fn == WIRELOG_AGG_MAX ? operand > next : operand <
+                    next;
+                rc = wl_columnar_ops_reduce_attempt_tail(control, id, 49, r);
+                if (rc) goto done;
+                if (better) next = operand;
             } else {
                 int comparison = floating
                     ? wl_columnar_float_compare_bits(operand, next)

@@ -6139,7 +6139,8 @@ wl_columnar_join_attempt_source(wl_columnar_relation_scalar_source_t *source,
     wl_columnar_relation_empty_source_t *empty, bool *bare, bool *initialized,
     const col_rel_t *relation, const void *owner,
     wl_columnar_join_source_metadata_t *metadata,
-    wl_evaluation_control_t *control, uint64_t id)
+    wl_evaluation_control_t *control, uint64_t id,
+    wl_columnar_eval_stack_cleanup_frame_t *frame, const wl_plan_op_t *op)
 {
     *bare = owner && !relation->schema_ok && !relation->ncols
         && !relation->nrows;
@@ -6158,8 +6159,9 @@ wl_columnar_join_attempt_source(wl_columnar_relation_scalar_source_t *source,
     rc = wl_columnar_join_attempt_return(control, id, rc);
     if (!rc) rc = wl_columnar_join_attempt_charge(control, id,
                 WL_COLUMNAR_JOIN_ATTEMPT_WORK);
-    if (!rc) rc = wl_columnar_relation_scalar_source_begin_attempt_controlled(
-            source, relation, false);
+    if (!rc) rc = wl_columnar_eval_stack_scalar_source_begin_owned(frame, owner,
+                op,
+                source, relation, false);
     if (rc) return rc;
     metadata->width = source->width; metadata->nrows = source->nrows;
     metadata->types = source->types; metadata->names = source->names;
@@ -6299,7 +6301,8 @@ wl_columnar_join_op_attempt_start_owned_initialize(const wl_plan_op_t *op,
     wl_columnar_join_source_metadata_t left_meta = {0}, right_meta = {0};
     rc = wl_columnar_join_attempt_source(&ctx->source,
             &ctx->source_empty_reader, &ctx->source_bare,
-            &ctx->source_initialized, left, owner, &left_meta, control, id);
+            &ctx->source_initialized, left, owner, &left_meta, control, id,
+            frame, op);
     rc = wl_columnar_join_attempt_return(control, id, rc);
     if (rc) goto done;
     col_rel_t *right = NULL, *delta = NULL;
@@ -6354,7 +6357,7 @@ wl_columnar_join_op_attempt_start_owned_initialize(const wl_plan_op_t *op,
         rc = wl_columnar_join_attempt_source(&ctx->join_right,
                 &ctx->join_empty_reader, &ctx->join_right_bare,
                 &ctx->join_right_initialized, right, owner, &right_meta,
-                control, id);
+                control, id, frame, op);
         rc = wl_columnar_join_attempt_return(control, id, rc);
         if (rc) goto done;
     }
@@ -6955,13 +6958,11 @@ wl_columnar_join_probe_op_attempt_start_owned_initialize(const wl_plan_op_t *op,
     rc = wl_columnar_join_attempt_charge(control, id,
             WL_COLUMNAR_JOIN_ATTEMPT_WORK);
     if (rc) goto done;
-    if (semi && op->project_count && !op->project_indices) {
-        rc = ENOTSUP; goto done;
-    }
     wl_columnar_join_source_metadata_t left_meta = {0}, right_meta = {0};
     rc = wl_columnar_join_attempt_source(&ctx->source,
             &ctx->source_empty_reader, &ctx->source_bare,
-            &ctx->source_initialized, left, owner, &left_meta, control, id);
+            &ctx->source_initialized, left, owner, &left_meta, control, id,
+            frame, op);
     rc = wl_columnar_join_attempt_return(control, id, rc);
     if (rc) goto done;
     rc = wl_columnar_join_attempt_charge(control, id,
@@ -6970,7 +6971,7 @@ wl_columnar_join_probe_op_attempt_start_owned_initialize(const wl_plan_op_t *op,
     rc = wl_columnar_join_attempt_source(&ctx->join_right,
             &ctx->join_empty_reader, &ctx->join_right_bare,
             &ctx->join_right_initialized, right, owner, &right_meta, control,
-            id);
+            id, frame, op);
     rc = wl_columnar_join_attempt_return(control, id, rc);
     if (rc) goto done;
     uint32_t selected_rows = right_meta.nrows;
@@ -6990,6 +6991,9 @@ wl_columnar_join_probe_op_attempt_start_owned_initialize(const wl_plan_op_t *op,
     rc = wl_columnar_join_attempt_charge(control, id,
             WL_COLUMNAR_JOIN_ATTEMPT_WORK);
     if (rc) goto done;
+    if (semi && op->project_count && !op->project_indices) {
+        rc = ENOTSUP; goto done;
+    }
     wl_columnar_memory_governor_ref_t *governor = session->memory_governor
         ? session->memory_governor : left->memory_governor
         ? left->memory_governor : right ? right->memory_governor : NULL;

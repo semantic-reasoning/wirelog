@@ -80,6 +80,78 @@ int wl_columnar_mem_ledger_publication_release(
 int wl_columnar_mem_ledger_publication_cancel(
     wl_columnar_mem_ledger_publication_prepared_t *);
 
+/* A description owns no gate or prepaid mutation. The externally serialized
+ * parent pins the actual ledger and control allocation through its matching
+ * commit report and explicit funded ACK. Only then may it reinitialize this
+ * original-address record. CONSUMED/applied distinguishes performed mutation
+ * from financial refusal or one-shot CAS loss; neither permits re-description
+ * before that ACK. Old prepared-publication contracts are unchanged. */
+typedef enum {
+    WL_COLUMNAR_MEM_LEDGER_DESCRIPTION_INERT,
+    WL_COLUMNAR_MEM_LEDGER_DESCRIPTION_DESCRIBED,
+    WL_COLUMNAR_MEM_LEDGER_DESCRIPTION_CONSUMED
+} wl_columnar_mem_ledger_description_phase_t;
+
+typedef struct wl_columnar_mem_ledger_description {
+    struct wl_columnar_mem_ledger_description *identity;
+    const void *parent;
+    wl_mem_ledger_t *ledger;
+    wl_evaluation_control_t *control;
+    uint64_t control_identity, attempted_id;
+    unsigned count;
+    bool thread_valid, applied;
+    wl_columnar_mem_ledger_description_phase_t phase;
+#if defined(WL_HAVE_C11_THREADS)
+    thrd_t owner_thread;
+#elif defined(_WIN32) || defined(_WIN64)
+    DWORD owner_thread;
+#else
+    pthread_t owner_thread;
+#endif
+    wl_columnar_mem_ledger_publication_request_t requests[2];
+} wl_columnar_mem_ledger_description_t;
+
+int wl_columnar_mem_ledger_publication_describe_controlled(
+    wl_columnar_mem_ledger_description_t *, const void *, wl_mem_ledger_t *,
+    const wl_columnar_mem_ledger_publication_request_t *, unsigned,
+    wl_evaluation_control_t *, uint64_t);
+/* Current genuine parent grant on the same allocation; no stored generation
+ * is rebound. Protocol/foreign/stale rejection preserves DESCRIBED. After
+ * owned attempt validation, every financial/CAS outcome is CONSUMED. One
+ * successful CAS applies/releases without a subsequent poll or fallible step.
+ * Inputs and record must be disjoint from each other and ledger/control;
+ * the parent validates the opaque control's complete allocation extent. */
+int wl_columnar_mem_ledger_publication_try_commit_described_controlled(
+    wl_columnar_mem_ledger_description_t *, const void *,
+    wl_evaluation_control_t *, uint64_t);
+
+/* Final-address parent journal. Capture only the actual completed COMMIT
+ * report, before another generation can overwrite it. The parent pins this
+ * record, ledger and controller allocation until its separately funded ACK.
+ * Neither a captured report nor this journal supplies Native permission.
+ * report is immutable while report_valid. */
+typedef struct {
+    wl_columnar_mem_ledger_description_t description;
+    wl_evaluation_control_report_t report;
+    bool report_valid;
+} wl_columnar_mem_ledger_retirement_journal_t;
+
+int wl_columnar_mem_ledger_retirement_capture_owned(
+    wl_columnar_mem_ledger_retirement_journal_t *, const void *,
+    wl_evaluation_control_t *, uint64_t);
+/* The authentic serialized parent must have admitted its existing metadata
+ * action on this actual active funding generation before calling. This fixed
+ * completion consumes that admission; it creates no ACK tariff/prepayment.
+ * The parent has already consumed COMMIT's financial/Source receipt and must
+ * settle this ACK action's own report before advancing another resource.
+ * Output is disjoint from the journal, ledger and full opaque control extent
+ * (the latter extent proof belongs to the parent). Refusal preserves journal
+ * and output. Success returns applied once and invalidates only inert header
+ * fields; dormant request/actor/report bytes are not resource owners. */
+int wl_columnar_mem_ledger_retirement_ack_prepaid_owned(
+    wl_columnar_mem_ledger_retirement_journal_t *, const void *,
+    wl_evaluation_control_t *, uint64_t, bool *);
+
 enum {
     WL_COLUMNAR_MEM_LEDGER_PUBLICATION_ARGUMENTS = 1,
     WL_COLUMNAR_MEM_LEDGER_PUBLICATION_PREPARED,
@@ -90,6 +162,9 @@ enum {
 #ifdef WL_COLUMNAR_MEM_LEDGER_PUBLICATION_TEST_HOOKS
 extern void (*wl_columnar_mem_ledger_publication_test_checkpoint)(
     wl_evaluation_control_t *, wl_columnar_mem_ledger_publication_prepared_t *,
+    unsigned);
+extern void (*wl_columnar_mem_ledger_description_test_checkpoint)(
+    wl_columnar_mem_ledger_description_t *, wl_evaluation_control_t *,
     unsigned);
 #endif
 
