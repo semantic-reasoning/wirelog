@@ -33,9 +33,19 @@ struct wl_evaluation_control {
     const wl_evaluation_control_source_bank_t *source_bank_class;
 };
 
+/* The private active-generation observation requires an aligned uint64
+ * field. MSVC's default C mode has no _Static_assert, so it checks the same
+ * layout through the repository's typedef-array form. */
+#if defined(_MSC_VER)
+typedef char wl_evaluation_control_active_generation_layout_t
+    [(sizeof(wl_atomic_u64) == 8 && __alignof(wl_atomic_u64) >= 8
+        && offsetof(wl_evaluation_control_t, active_attempt_id) % 8 == 0)
+    ? 1 : -1];
+#else
 _Static_assert(sizeof(wl_atomic_u64) == 8 && _Alignof(wl_atomic_u64) >= 8
     && offsetof(wl_evaluation_control_t, active_attempt_id) % 8 == 0,
     "The private active-generation observation requires an aligned uint64 field");
+#endif
 
 static wl_atomic_u64 wl_next_evaluation_control_identity = 1;
 
