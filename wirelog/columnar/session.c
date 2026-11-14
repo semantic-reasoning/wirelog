@@ -26760,13 +26760,14 @@ wl_columnar_session_metadata_bind_dispatch(wl_col_session_t *sess,
             return (wl_columnar_session_native_error_dispatch_result_t){true,
                                                                         EBUSY};
         if (sess->controlled_step_reset.phase ==
-            WL_COLUMNAR_SESSION_STEP_RESET_HANDOFF)
-            return (wl_columnar_session_native_error_dispatch_result_t){
-                       step &&
-                       step->metadata_bind_phase !=
-                       WL_COLUMNAR_SESSION_METADATA_COMPLETE,
-                       EINVAL
+            WL_COLUMNAR_SESSION_STEP_RESET_HANDOFF) {
+            bool bind_open = step && step->metadata_bind_phase !=
+                WL_COLUMNAR_SESSION_METADATA_COMPLETE;
+            wl_columnar_session_native_error_dispatch_result_t handoff = {
+                bind_open, EINVAL
             };
+            return handoff;
+        }
     }
 
     wl_columnar_session_native_error_dispatch_result_t out = {false, 0};
