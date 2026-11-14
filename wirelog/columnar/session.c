@@ -27612,8 +27612,14 @@ col_controlled_step_successor_target_init(wl_col_session_t *sess,
     return rc ? rc : EAGAIN;
 }
 
+/* Partial reset keeps the existing offer accessor's zero sentinels. */
+#if defined(_MSC_VER)
+typedef char wl_columnar_session_metadata_unbound_zero_t
+    [(WL_COLUMNAR_SESSION_METADATA_UNBOUND == 0) ? 1 : -1];
+#else
 _Static_assert(WL_COLUMNAR_SESSION_METADATA_UNBOUND == 0,
     "Partial reset keeps the existing offer accessor's zero sentinels");
+#endif
 
 static int
 wl_columnar_session_step_reset_validate(wl_col_session_t *sess)
