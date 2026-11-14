@@ -11,6 +11,7 @@
 #include "../wirelog/columnar/internal.h"
 #include "../wirelog/exec_plan_gen.h"
 #include "../wirelog/session.h"
+#include "../wirelog/session_facts.h"
 #include "../wirelog/session_options.h"
 #include "../wirelog/wirelog.h"
 #include <errno.h> /* EAGAIN */
@@ -23,6 +24,9 @@
 
 extern void (*wl_columnar_eval_stack_test_physical_publication)(
     wl_col_session_t *, const col_rel_t *, const col_rel_t *);
+extern void (*wl_columnar_session_test_observed_transaction_checkpoint)(
+    wl_evaluation_control_t *, unsigned, uint32_t,
+    const wl_columnar_eval_private_bindings_t *);
 
 /* ---- captures ------------------------------------------------------------ */
 
@@ -88,10 +92,13 @@ equal_capture(capture_t *a, capture_t *b, const char *what, unsigned kind)
 
 enum {
     K_SINGLE, K_UNION_A, K_UNION_C, K_UNION_BOTH, K_FILTER, K_COUNT,
-    K_GROUPED, K_TWO_COL, K_INT_EXPR, K_INT32, K_UINT32, K_UINT64, K_BOOL,
-    K_FLOAT, K_FLOAT_EXPR, K_COUNT_KINDS
+    K_GROUPED, K_TWO_COL, K_INT_EXPR, K_TWO_COL_EXPR, K_TWO_EDB_EXPR,
+    K_NARROW, K_NARROW_TWO_EDB, K_FACTS, K_FACTS_TWO, K_FACTS_EXPR,
+    K_FACTS_FILTER, K_INPUT, K_INPUT_TWO, K_INPUT_EXPR, K_INT32, K_UINT32,
+    K_UINT64, K_BOOL, K_FLOAT, K_FLOAT_EXPR, K_FACTS_STRING, K_COUNT_KINDS
 };
 
+#define INPUT_DIRECTIVE ".input a(filename=\"unused.csv\")\n"
 #define UNION_TEXT ".decl a(x:int64)\n.decl c(x:int64)\n.decl out(x:int64)\n" \
         "out(x) :- a(x).\nout(x) :- c(x).\n"
 
@@ -121,6 +128,43 @@ static const struct {
      * general observed transaction (#2301). */
     { ".decl a(x:int64)\n.decl out(y:int64)\nout(x + 1) :- a(x).\n",
       { "a", NULL }, NULL, WL_PLAN_OP_MAP, "$map" },
+    /* The same expression over a two-column EDB, and beside a declared EDB
+     * the body does not read. */
+    { ".decl a(x:int64,y:int64)\n.decl out(y:int64)\n"
+      "out(x + 1) :- a(x,y).\n",
+      { "a", NULL }, NULL, WL_PLAN_OP_MAP, "$map" },
+    { ".decl a(x:int64)\n.decl b(x:int64)\n.decl out(y:int64)\n"
+      "out(x + 1) :- a(x).\n",
+      { "a", NULL }, NULL, WL_PLAN_OP_MAP, "$map" },
+    /* A column-0 projection of a two-column EDB, alone and beside an
+     * unread EDB. The observed STEP classifies it for the legacy observed
+     * route, whose preflight refuses the width and hands the STEP to the
+     * general observed transaction. */
+    { ".decl a(x:int64,y:int64)\n.decl out(x:int64)\nout(x) :- a(x,y).\n",
+      { "a", NULL }, NULL, WL_PLAN_OP_MAP, "$map" },
+    { ".decl a(x:int64,y:int64)\n.decl b(x:int64)\n.decl out(x:int64)\n"
+      "out(x) :- a(x,y).\n",
+      { "a", NULL }, NULL, WL_PLAN_OP_MAP, "$map" },
+    /* An EDB without a .decl whose arity and types come from its inline
+     * facts (#2231). The fixture does not load the facts, so the EDB is
+     * never inserted; facts_rows loads them. */
+    { "a(1).\na(2).\nout(x) :- a(x).\n",
+      { "a", NULL }, NULL, WL_PLAN_OP_MAP, "$map" },
+    { "a(1,2).\na(3,4).\nout(x) :- a(x,y).\n",
+      { "a", NULL }, NULL, WL_PLAN_OP_MAP, "$map" },
+    { "a(1).\na(2).\nout(x + 1) :- a(x).\n",
+      { "a", NULL }, NULL, WL_PLAN_OP_MAP, "$map" },
+    { "a(1).\na(2).\nout(x) :- a(x), x > 1.\n",
+      { "a", NULL }, NULL, WL_PLAN_OP_FILTER, "$filter" },
+    /* An EDB named only by .input, with neither a declaration nor facts:
+     * the plan gives it no width and no lane types. Session creation reads
+     * no file. */
+    { INPUT_DIRECTIVE "out(x) :- a(x).\n",
+      { "a", NULL }, NULL, WL_PLAN_OP_MAP, "$map" },
+    { INPUT_DIRECTIVE "out(x) :- a(x,y).\n",
+      { "a", NULL }, NULL, WL_PLAN_OP_MAP, "$map" },
+    { INPUT_DIRECTIVE "out(x + 1) :- a(x).\n",
+      { "a", NULL }, NULL, WL_PLAN_OP_MAP, "$map" },
     { ".decl a(x:int32)\n.decl out(x:int32)\nout(x) :- a(x).\n",
       { "a", NULL }, NULL, WL_PLAN_OP_MAP, "$map" },
     /* The parser takes no uint32, uint64 or bool declaration; the fixture
@@ -137,7 +181,32 @@ static const struct {
       { NULL, NULL }, NULL, WL_PLAN_OP_MAP, "$map" },
     { ".decl a(x:float)\n.decl out(y:float)\nout(x + 1.25) :- a(x).\n",
       { NULL, NULL }, NULL, WL_PLAN_OP_MAP, "$map" },
+    /* Symbol facts type the EDB at session creation: a control. */
+    { "a(\"p\").\na(\"q\").\nout(x) :- a(x).\n",
+      { NULL, NULL }, NULL, WL_PLAN_OP_MAP, "$map" },
 };
+
+/* The physical width of the bare EDB of a kind. */
+static unsigned
+edb_width(unsigned kind)
+{
+    return kind == K_GROUPED || kind == K_TWO_COL || kind == K_TWO_COL_EXPR
+           || kind == K_NARROW || kind == K_NARROW_TWO_EDB
+           || kind == K_FACTS_TWO || kind == K_INPUT_TWO ? 2u : 1u;
+}
+
+static bool
+is_facts(unsigned kind)
+{
+    return kind == K_FACTS || kind == K_FACTS_TWO || kind == K_FACTS_EXPR
+           || kind == K_FACTS_FILTER || kind == K_FACTS_STRING;
+}
+
+static bool
+is_input(unsigned kind)
+{
+    return kind == K_INPUT || kind == K_INPUT_TWO || kind == K_INPUT_EXPR;
+}
 
 static bool
 is_union(unsigned kind)
@@ -151,8 +220,10 @@ static bool
 private_empty_step(unsigned kind)
 {
     return kind == K_SINGLE || kind == K_FILTER || kind == K_TWO_COL
-           || kind == K_INT_EXPR || kind == K_INT32 || kind == K_UINT32
-           || kind == K_UINT64 || kind == K_BOOL;
+           || kind == K_INT_EXPR || kind == K_TWO_COL_EXPR || kind == K_NARROW
+           || (is_facts(kind) && kind != K_FACTS_STRING) || is_input(kind)
+           || kind == K_INT32 || kind == K_UINT32 || kind == K_UINT64
+           || kind == K_BOOL;
 }
 
 static unsigned
@@ -374,9 +445,34 @@ fixture(fixture_t *f, unsigned kind)
             && r->storage_owner == r);
         bare_rel[i] = r;
     }
-    if (kind == K_FLOAT || kind == K_FLOAT_EXPR) {
+    if (kind == K_FLOAT || kind == K_FLOAT_EXPR || kind == K_FACTS_STRING) {
         col_rel_t *r = session_find_rel((wl_col_session_t *)f->s, "a");
         CHECK(r && r->schema_ok && r->ncols == 1);
+    }
+    /* A facts EDB has no declared width; its lane types come from the
+     * facts. */
+    if (is_facts(kind)) {
+        bool found = false;
+        for (uint32_t i = 0; i < f->plan->edb_count; i++)
+            if (!strcmp(f->plan->edb_relations[i], "a")) {
+                CHECK(f->plan->edb_declared_width[i]
+                    == WL_PLAN_WIDTH_UNDECLARED
+                    && f->plan->edb_column_type_counts[i]
+                    == edb_width(kind));
+                found = true;
+            }
+        CHECK(found);
+    }
+    if (is_input(kind)) {
+        bool found = false;
+        for (uint32_t i = 0; i < f->plan->edb_count; i++)
+            if (!strcmp(f->plan->edb_relations[i], "a")) {
+                CHECK(f->plan->edb_declared_width[i]
+                    == WL_PLAN_WIDTH_UNDECLARED
+                    && !f->plan->edb_column_type_counts[i]);
+                found = true;
+            }
+        CHECK(found);
     }
 }
 
@@ -505,7 +601,11 @@ run_cell(unsigned kind, bool snapshot, bool observed)
         still_bare(&f, kind, images);
     } else {
         CHECK(!bare_published && !record_count);
-        if (bare && (snapshot || kind != K_SINGLE)) private_trace(bare);
+        /* The general route builds one for every bare EDB,
+         * including a declared one the body does not read. */
+        if (bare && (snapshot || kind != K_SINGLE))
+            private_trace(bare + (kind == K_TWO_EDB_EXPR
+                || kind == K_NARROW_TWO_EDB));
         else CHECK(private_calls == 0);
         if (!snapshot && (kind == K_SINGLE || kind == K_FILTER)) {
             col_rel_t *a = session_find_rel((wl_col_session_t *)f.s, "a");
@@ -532,7 +632,7 @@ run_cell(unsigned kind, bool snapshot, bool observed)
         CHECK(!step(f.s) && !step(f.raw));
         still_bare(&f, kind, images);
         const int64_t rows[] = {5, 6, 7, 8};
-        unsigned width = kind == K_GROUPED || kind == K_TWO_COL ? 2u : 1u;
+        unsigned width = edb_width(kind);
         for (unsigned i = 0; i < 2; i++) {
             if (!cases[kind].bare[i] || kind == K_FLOAT
                 || kind == K_FLOAT_EXPR)
@@ -610,7 +710,7 @@ stopped(unsigned kind, unsigned mode, const char *at, unsigned empty_at,
     same_head(&f, kind);
     /* Both readers were drained: the first insert is admitted. */
     const int64_t rows[] = {9, 10};
-    unsigned width = kind == K_GROUPED || kind == K_TWO_COL ? 2u : 1u;
+    unsigned width = edb_width(kind);
     CHECK(!wl_session_insert(f.s, cases[kind].bare[0], rows, 2 / width,
         width));
     CHECK(!wl_session_insert(f.raw, cases[kind].bare[0], rows, 2 / width,
@@ -629,7 +729,8 @@ stopped(unsigned kind, unsigned mode, const char *at, unsigned empty_at,
  * uncontrolled session: the first call sees rows inserted before it, the
  * next a further insert with one repeated row, the last nothing new. The
  * head matches the uncontrolled session in rows, width and type. The INT64
- * integer-expression body runs the same rounds. */
+ * integer-expression bodies and column-0 projections run the same rounds,
+ * the two-column ones with the rows (1,0), then (0,1) and (1,0). */
 static void
 untyped_rows(unsigned kind, bool snapshot, bool observed)
 {
@@ -641,13 +742,15 @@ untyped_rows(unsigned kind, bool snapshot, bool observed)
         wl_session_set_delta_cb(f.s, on_delta, &ev);
         wl_session_set_delta_cb(f.raw, on_delta, &raw_ev);
     }
-    const int64_t rows[] = {1, 0, 1};
+    const int64_t rows[] = {1, 0, 1}, wide[] = {1, 0, 0, 1, 1, 0};
+    unsigned width = edb_width(kind);
     for (unsigned round = 0; round < 3; round++) {
         if (round < 2) {
-            const int64_t *r = round ? rows + 1 : rows;
+            const int64_t *r = width == 2 ? (round ? wide + 2 : wide)
+                : (round ? rows + 1 : rows);
             uint32_t n = round ? 2u : 1u;
-            CHECK(!wl_session_insert(f.s, "a", r, n, 1));
-            CHECK(!wl_session_insert(f.raw, "a", r, n, 1));
+            CHECK(!wl_session_insert(f.s, "a", r, n, width));
+            CHECK(!wl_session_insert(f.raw, "a", r, n, width));
         }
         capture_t image = {0}, raw_image = {0};
         int rc = snapshot ? wl_session_snapshot(f.s, on_tuple, &image)
@@ -669,6 +772,309 @@ untyped_rows(unsigned kind, bool snapshot, bool observed)
     }
     if (observed && !snapshot)
         equal_capture(&ev, &raw_ev, "untyped events", kind);
+    fixture_destroy(&f);
+}
+
+/* A facts EDB with its facts loaded in both sessions, then the rounds of
+ * untyped_rows: a further insert with a repeated row, a new row, nothing
+ * new. Events are compared with the uncontrolled session on the observed
+ * STEP only: an evaluating SNAPSHOT of the controlled session delivers
+ * observer events, while the uncontrolled one fires none (SEMANTICS.md). */
+static void
+facts_rows(unsigned kind, bool snapshot, bool observed)
+{
+    fixture_t f;
+    fixture(&f, kind);
+    where = snapshot ? "facts snapshot" : "facts step";
+    CHECK(wl_session_load_facts(f.s, f.program) == 0);
+    CHECK(wl_session_load_facts(f.raw, f.program) == 0);
+    capture_t ev = {0}, raw_ev = {0};
+    if (observed) {
+        wl_session_set_delta_cb(f.s, on_delta, &ev);
+        wl_session_set_delta_cb(f.raw, on_delta, &raw_ev);
+    }
+    const int64_t rows[] = {1, 7}, wide[] = {1, 2, 7, 0};
+    unsigned width = edb_width(kind);
+    for (unsigned round = 0; round < 4; round++) {
+        if (round == 1 || round == 2) {
+            const int64_t *r = width == 2 ? wide + (round - 1) * 2
+                : rows + (round - 1);
+            int a = wl_session_insert(f.s, "a", r, 1, width);
+            int b = wl_session_insert(f.raw, "a", r, 1, width);
+            if (a || b)
+                fprintf(stderr, "%s kind%u observed%u round %u: insert %d, "
+                    "raw %d\n", where, kind, observed, round, a, b);
+            CHECK(!a && !b);
+        }
+        capture_t image = {0}, raw_image = {0};
+        int rc = snapshot ? wl_session_snapshot(f.s, on_tuple, &image)
+            : step(f.s);
+        int raw_rc = snapshot ? wl_session_snapshot(f.raw, on_tuple,
+                &raw_image) : step(f.raw);
+        if (rc || raw_rc)
+            fprintf(stderr, "%s kind%u observed%u round %u: rc %d, raw %d\n",
+                where, kind, observed, round, rc, raw_rc);
+        CHECK(!rc && !raw_rc);
+        if (snapshot)
+            equal_capture(&image, &raw_image, "facts image", kind);
+        capture_t a = {0}, b = {0};
+        head_capture(f.s, &a);
+        head_capture(f.raw, &b);
+        equal_capture(&a, &b, "facts head", kind);
+        CHECK(a.count > 0);
+        same_head(&f, kind);
+    }
+    if (observed && !snapshot)
+        equal_capture(&ev, &raw_ev, "facts events", kind);
+    fixture_destroy(&f);
+}
+
+/* The loaded facts fix the arity of a facts EDB (#2231); while the EDB is
+ * never inserted it takes the width of its first insert. After a completed
+ * STEP the controlled session admits or refuses an insert of another width
+ * as the uncontrolled session does, and both then step to the same head. */
+static void
+facts_width(bool loaded)
+{
+    fixture_t f;
+    fixture(&f, K_FACTS_TWO);
+    if (loaded) {
+        CHECK(wl_session_load_facts(f.s, f.program) == 0);
+        CHECK(wl_session_load_facts(f.raw, f.program) == 0);
+    }
+    CHECK(!step(f.s) && !step(f.raw));
+    const int64_t row[] = {1, 2, 3};
+    int rc = wl_session_insert(f.s, "a", row, 1, 3);
+    int raw = wl_session_insert(f.raw, "a", row, 1, 3);
+    CHECK(rc == raw && (loaded ? raw != 0 : raw == 0));
+    CHECK(!step(f.s) && !step(f.raw));
+    same_head(&f, K_FACTS_TWO);
+    fixture_destroy(&f);
+}
+
+/* An EDB named only by .input takes its first insert's width; once it has
+ * rows, both sessions refuse an insert of another width with the same code
+ * and step on to the same head. */
+static void
+input_width(bool observed)
+{
+    fixture_t f;
+    fixture(&f, K_INPUT);
+    capture_t ev = {0}, raw_ev = {0};
+    if (observed) {
+        wl_session_set_delta_cb(f.s, on_delta, &ev);
+        wl_session_set_delta_cb(f.raw, on_delta, &raw_ev);
+    }
+    CHECK(!step(f.s) && !step(f.raw));
+    const int64_t row[] = {5, 6};
+    CHECK(!wl_session_insert(f.s, "a", row, 1, 1));
+    CHECK(!wl_session_insert(f.raw, "a", row, 1, 1));
+    CHECK(!step(f.s) && !step(f.raw));
+    int rc = wl_session_insert(f.s, "a", row, 1, 2);
+    CHECK(rc == EINVAL && rc == wl_session_insert(f.raw, "a", row, 1, 2));
+    CHECK(!wl_session_insert(f.s, "a", row + 1, 1, 1));
+    CHECK(!wl_session_insert(f.raw, "a", row + 1, 1, 1));
+    CHECK(!step(f.s) && !step(f.raw));
+    capture_t a = {0}, b = {0};
+    head_capture(f.s, &a);
+    head_capture(f.raw, &b);
+    equal_capture(&a, &b, "input head", K_INPUT);
+    CHECK(a.count == 2);
+    if (observed)
+        equal_capture(&ev, &raw_ev, "input events", K_INPUT);
+    fixture_destroy(&f);
+}
+
+/* A first insert of zero columns into such an EDB after a STEP returns the
+ * uncontrolled session's code, and a later insert of one column then gets
+ * the same code from both sessions. */
+static void
+input_nullary(bool observed)
+{
+    fixture_t f;
+    fixture(&f, K_INPUT);
+    capture_t ev = {0}, raw_ev = {0};
+    if (observed) {
+        wl_session_set_delta_cb(f.s, on_delta, &ev);
+        wl_session_set_delta_cb(f.raw, on_delta, &raw_ev);
+    }
+    CHECK(!step(f.s) && !step(f.raw));
+    const int64_t row[] = {5};
+    int rc = wl_session_insert(f.s, "a", row, 1, 0);
+    CHECK(rc == wl_session_insert(f.raw, "a", row, 1, 0));
+    CHECK(!step(f.s) && !step(f.raw));
+    rc = wl_session_insert(f.s, "a", row, 1, 1);
+    CHECK(rc == wl_session_insert(f.raw, "a", row, 1, 1));
+    CHECK(!step(f.s) && !step(f.raw));
+    capture_t a = {0}, b = {0};
+    head_capture(f.s, &a);
+    head_capture(f.raw, &b);
+    equal_capture(&a, &b, "nullary input head", K_INPUT);
+    if (observed)
+        equal_capture(&ev, &raw_ev, "nullary input events", K_INPUT);
+    fixture_destroy(&f);
+}
+
+/* ---- deterministic stops in the general observed transaction ------------- */
+
+/* The general observed transaction builds a private empty input for each
+ * bare EDB in its SCHEMA phase (7). The constructor's work tails are
+ * counted while that phase serves the chosen EDB; the k-th tail cancels,
+ * exhausts the work limit, or (mode 3) installs a governor blocker so the
+ * constructor's storage reservation is denied. */
+static uint32_t gen_index;
+static bool gen_armed;
+static unsigned gen_calls, gen_stop_at, gen_mode, gen_hits;
+static wl_columnar_memory_governor_t *gen_governor;
+static wl_columnar_memory_reservation_t gen_blocker;
+
+static void
+gen_phase(wl_evaluation_control_t *control, unsigned phase, uint32_t index,
+    const wl_columnar_eval_private_bindings_t *bindings)
+{
+    (void)control; (void)bindings;
+    gen_armed = phase == 7 && index == gen_index;
+}
+
+static void
+gen_work(wl_evaluation_control_t *control, uint64_t work)
+{
+    (void)work;
+    if (!gen_armed || ++gen_calls != gen_stop_at || !gen_mode)
+        return;
+    gen_hits++;
+    if (gen_mode == 3) {
+        uint64_t usable = atomic_load_explicit(&gen_governor->usable_bytes,
+                memory_order_relaxed);
+        uint64_t reserved = wl_columnar_memory_reserved(gen_governor);
+        CHECK(usable > reserved + 1);
+        wl_columnar_memory_reservation_init(&gen_blocker);
+        CHECK(wl_columnar_memory_reserve(gen_governor, usable - reserved - 1,
+            &gen_blocker));
+        return;
+    }
+    stop_hit = false; stop_mode = gen_mode;
+    request_stop(control);
+}
+
+static uint32_t
+edb_index(const fixture_t *f, const char *name)
+{
+    for (uint32_t i = 0; i < f->plan->edb_count; i++)
+        if (!strcmp(f->plan->edb_relations[i], name))
+            return i;
+    CHECK(false);
+    return 0;
+}
+
+/* Runs one call with the hooks; returns its rc and leaves gen_calls. */
+static int
+gen_call(fixture_t *f, bool snapshot, capture_t *image)
+{
+    wl_columnar_session_test_observed_transaction_checkpoint = gen_phase;
+    wl_columnar_relation_test_work_checkpoint = gen_work;
+    gen_armed = false; gen_calls = gen_hits = 0;
+    int rc = snapshot ? wl_session_snapshot(f->s, on_tuple, image)
+        : step(f->s);
+    wl_columnar_session_test_observed_transaction_checkpoint = NULL;
+    wl_columnar_relation_test_work_checkpoint = NULL;
+    return rc;
+}
+
+/* The constructor tails for bare EDB `which` of a kind on this route; 0
+ * when the route builds no private empty for it. */
+static unsigned
+gen_tails(unsigned kind, bool snapshot, unsigned which)
+{
+    fixture_t f;
+    fixture(&f, kind);
+    capture_t ev = {0}, image = {0};
+    if (!snapshot)
+        wl_session_set_delta_cb(f.s, on_delta, &ev);
+    gen_index = edb_index(&f, cases[kind].bare[which]);
+    gen_mode = 0;
+    CHECK(!gen_call(&f, snapshot, &image));
+    unsigned n = gen_calls;
+    fixture_destroy(&f);
+    return n;
+}
+
+static void
+gen_stopped(unsigned kind, bool snapshot, unsigned which, unsigned mode,
+    unsigned at)
+{
+    fixture_t f;
+    fixture(&f, kind);
+    where = "after a general stop";
+    capture_t ev = {0}, raw_ev = {0}, image = {0}, raw_image = {0};
+    if (!snapshot) {
+        wl_session_set_delta_cb(f.s, on_delta, &ev);
+        wl_session_set_delta_cb(f.raw, on_delta, &raw_ev);
+    }
+    col_relation_snapshot_t images[2] = {{0}};
+    for (unsigned i = 0; i < 2; i++)
+        if (bare_rel[i])
+            images[i] = wl_columnar_relation_snapshot(bare_rel[i]);
+    col_rel_t *old = session_find_rel((wl_col_session_t *)f.s, "out");
+    col_relation_snapshot_t old_image = wl_columnar_relation_snapshot(old);
+    gen_index = edb_index(&f, cases[kind].bare[which]);
+    gen_mode = mode; gen_stop_at = at;
+    gen_governor = wl_columnar_memory_governor_ref_get(f.governor);
+    stop_mode = 0; stop_at = NULL;
+    int rc = gen_call(&f, snapshot, &image);
+    stop_mode = 0; gen_mode = 0;
+    int expected = mode == 1 ? WL_EVALUATION_CONTROL_CANCELLED
+        : mode == 2 ? WL_EVALUATION_CONTROL_WORK_LIMIT : ENOSPC;
+    if (rc != expected || gen_hits != 1)
+        fprintf(stderr, "kind%u snapshot%u bare%u mode%u at %u: rc %d, "
+            "hits %u\n", kind, snapshot, which, mode, at, rc, gen_hits);
+    CHECK(gen_hits == 1 && rc == expected);
+    CHECK(!ev.count && !image.count);
+    still_bare(&f, kind, images);
+    CHECK(session_find_rel((wl_col_session_t *)f.s, "out") == old);
+    if (old)
+        CHECK(wl_columnar_relation_snapshot_equal(old_image,
+            wl_columnar_relation_snapshot(old)));
+    if (mode == 3) {
+        /* The denial is reported as one, as for a denied MAP scratch. */
+        CHECK(wl_session_budget_denied(f.s));
+        CHECK(wl_columnar_memory_release(&gen_blocker));
+    } else {
+        CHECK(!wl_session_budget_denied(f.s));
+        wl_evaluation_control_report_t report = {0}, again = {0};
+        CHECK(!wl_evaluation_control_report(f.control, &report));
+        CHECK(report.result == expected && report.stop_reason == expected
+            && !report.cleanup_status);
+        CHECK(!wl_evaluation_control_report(f.control, &again));
+        CHECK(!memcmp(&report, &again, sizeof(report)));
+    }
+    CHECK(!wl_evaluation_control_reset(f.control));
+    int retry = snapshot ? wl_session_snapshot(f.s, on_tuple, &image)
+        : step(f.s);
+    int raw = snapshot ? wl_session_snapshot(f.raw, on_tuple, &raw_image)
+        : step(f.raw);
+    CHECK(!retry && !raw);
+    if (snapshot)
+        equal_capture(&image, &raw_image, "image after a general stop", kind);
+    else
+        equal_capture(&ev, &raw_ev, "events after a general stop", kind);
+    still_bare(&f, kind, images);
+    same_head(&f, kind);
+    /* The first insert after the stop. */
+    const int64_t rows[] = {9, 10};
+    unsigned width = edb_width(kind);
+    CHECK(!wl_session_insert(f.s, cases[kind].bare[which], rows, 2 / width,
+        width));
+    CHECK(!wl_session_insert(f.raw, cases[kind].bare[which], rows,
+        2 / width, width));
+    CHECK(!(snapshot ? wl_session_snapshot(f.s, on_tuple, &image)
+        : step(f.s)));
+    CHECK(!(snapshot ? wl_session_snapshot(f.raw, on_tuple, &raw_image)
+        : step(f.raw)));
+    capture_t a = {0}, b = {0};
+    head_capture(f.s, &a);
+    head_capture(f.raw, &b);
+    equal_capture(&a, &b, "head after a general stop", kind);
     fixture_destroy(&f);
 }
 
@@ -704,14 +1110,55 @@ run_matrix(void)
         for (unsigned snapshot = 0; snapshot < 2; snapshot++)
             for (unsigned observed = 0; observed < 2; observed++)
                 untyped_rows(kind, snapshot, observed);
-    for (unsigned snapshot = 0; snapshot < 2; snapshot++)
-        for (unsigned observed = 0; observed < 2; observed++)
-            untyped_rows(K_INT_EXPR, snapshot, observed);
+    for (unsigned kind = K_INT_EXPR; kind < K_INT32; kind++)
+        for (unsigned snapshot = 0; snapshot < 2
+            && kind != K_FACTS_FILTER; snapshot++)
+            for (unsigned observed = 0; observed < 2; observed++)
+                untyped_rows(kind, snapshot, observed);
+    for (unsigned kind = 0; kind < K_COUNT_KINDS; kind++)
+        if (is_facts(kind))
+            for (unsigned snapshot = 0; snapshot < 2; snapshot++)
+                for (unsigned observed = 0; observed < 2; observed++)
+                    facts_rows(kind, snapshot, observed);
+    facts_width(false);
+    facts_width(true);
+    input_width(false);
+    input_width(true);
+    input_nullary(false);
+    input_nullary(true);
 }
 
 static void
 run_stops(unsigned kind)
 {
+    /* Every SNAPSHOT, and the observed STEPs that take the general observed
+     * transaction, build a private empty for each bare EDB. The SNAPSHOT of
+     * K_SINGLE and the second EDB of the observed K_UNION_BOTH STEP, which
+     * stops after the first private empty was built, stop at the first and
+     * last three tails and at each quarter; the other cells stop at the
+     * first, middle and last tail. Each stop builds two sessions, so the
+     * points are sampled. A denied reservation there is reported as a
+     * budget denial. */
+    for (unsigned snapshot = 0; snapshot < 2; snapshot++)
+        for (unsigned which = 0; which < bare_count(kind); which++) {
+            unsigned n = gen_tails(kind, snapshot, which);
+            if (snapshot)
+                CHECK(n > 0);
+            if (!n)
+                continue;
+            CHECK(n >= 5);
+            bool wide = (kind == K_SINGLE && snapshot)
+                || (kind == K_UNION_BOTH && !snapshot && which);
+            const unsigned dense[] = {1, 2, 3, n / 4, n / 2, 3 * n / 4,
+                                      n - 2, n - 1, n};
+            const unsigned some[] = {1, n / 2, n};
+            unsigned count = wide ? 9 : 3;
+            for (unsigned mode = 1; mode < 3; mode++)
+                for (unsigned i = 0; i < count; i++)
+                    gen_stopped(kind, snapshot, which, mode,
+                        wide ? dense[i] : some[i]);
+            gen_stopped(kind, snapshot, which, 3, 1);
+        }
     for (unsigned mode = 1; mode < 3; mode++) {
         /* At the consumer's publication, or at CONCAT for a UNION. */
         if (cases[kind].first != WL_PLAN_OP_REDUCE)
@@ -736,7 +1183,7 @@ run_stops(unsigned kind)
 static int
 usage(const char *program)
 {
-    fprintf(stderr, "usage: %s [--matrix | --stops KIND(0..12)]\n", program);
+    fprintf(stderr, "usage: %s [--matrix | --stops KIND(0..23)]\n", program);
     return 2;
 }
 

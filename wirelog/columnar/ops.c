@@ -2925,7 +2925,9 @@ wl_columnar_ops_reduce_attempt_start_owned(const wl_plan_op_t *op,
     if (rc) goto done;
     /* The bare descriptor that VARIABLE borrowed from a never-inserted EDB
      * without a schema is held by the authentic empty-source reader and
-     * read as width 0 with no rows (#2301). */
+     * read as width 0 with no rows (#2301). Unlike MAP and FILTER, REDUCE
+     * needs no stream-frame condition: the join pipeline's stream consumer
+     * switch admits FILTER, MAP, SEMIJOIN and ANTIJOIN only. */
     const bool bare = owner && !left->schema_ok && !left->ncols
         && !left->nrows;
     if (!bare) {

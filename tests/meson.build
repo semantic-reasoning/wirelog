@@ -7262,8 +7262,10 @@ test_evaluation_empty_edb_sources_exe = executable(
   link_with: [testlib_prod],
 )
 # Run the complete coverage with: meson test --suite evaluation_empty_edb_sources
-# Each stop kind retains both modes and every discovered checkpoint. Splitting
-# the exhaustive fixture keeps the existing 60-second watchdog on CI runners.
+# Each stop kind cancels and exhausts the work limit at every discovered
+# checkpoint of its borrowed and private-empty STEP stops, and at sampled work
+# tails of the general route's private empty input. Splitting by kind keeps the
+# existing 60-second watchdog on CI runners.
 test('evaluation_empty_edb_sources', test_evaluation_empty_edb_sources_exe,
      args: ['--matrix'],
      suite: ['unit', 'tsan', 'evaluation_empty_edb_sources'], timeout: 60)
@@ -7277,10 +7279,21 @@ foreach stop_case : [
   ['grouped', '6'],
   ['two_col', '7'],
   ['int_expr', '8'],
-  ['int32', '9'],
-  ['uint32', '10'],
-  ['uint64', '11'],
-  ['bool', '12'],
+  ['two_col_expr', '9'],
+  ['two_edb_expr', '10'],
+  ['narrow', '11'],
+  ['narrow_two_edb', '12'],
+  ['facts', '13'],
+  ['facts_two', '14'],
+  ['facts_expr', '15'],
+  ['facts_filter', '16'],
+  ['input', '17'],
+  ['input_two', '18'],
+  ['input_expr', '19'],
+  ['int32', '20'],
+  ['uint32', '21'],
+  ['uint64', '22'],
+  ['bool', '23'],
 ]
   test('evaluation_empty_edb_sources_stops_' + stop_case[0],
        test_evaluation_empty_edb_sources_exe,

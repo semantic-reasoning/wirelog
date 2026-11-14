@@ -568,3 +568,10 @@ never inserted; see "Int32-declared EDBs in the general observed transaction
 MAP with an expression other than `col0`, such as `x + 1`, and CONSOLIDATE to
 the general observed transaction instead of the legacy route, which refused
 it; see "Integer MAP expressions in observed steps (#2301)".
+
+A second bundle tests EDBs without a `.decl`, whose arity and types come from
+their facts or, for one named only by a directive such as `.input`, from their
+first insert, in the general observed transaction, which has read them at
+their source since f1f29724; see "EDBs without a declaration in the general
+observed transaction (#2301)". It also reports a denied reservation of the
+private empty input of a never-inserted EDB as a budget denial.

@@ -2663,12 +2663,23 @@ SNAPSHOT, observed and unobserved, with an empty INLINE source and with
 cancellation and work exhaustion at `$map` or `$concat`. It compares literal
 tuple sets and the uncontrolled results, and checks that MAP read an INLINE
 input, that the source keeps its layout and image, and that a stopped call
-publishes nothing and retries. It also covers later inserts and a removal,
-300 rows, stops at each INLINE map-check charge of a real STEP (the same body
-over a scalar EDB records none), a denied MAP scratch reservation pinned at
-that reservation with `memory_budget_denied` set and a retry, and a typed
-ENOTSUP with nothing published for FILTER and JOIN bodies over an INLINE
-source.
+publishes nothing and retries. It also covers later inserts and a removal, 300
+rows, stops at each INLINE map-check charge of a real STEP (the same body over
+a scalar EDB records none), a denied MAP scratch reservation pinned at that
+reservation with `memory_budget_denied` set and a retry, and a typed ENOTSUP
+with nothing published for FILTER and JOIN bodies over an INLINE source on the
+observed STEP, the unobserved STEP and SNAPSHOT. After the refused SNAPSHOT
+the step can be retried only as SNAPSHOT: an insert and a STEP return EBUSY.
+`evaluation_map_recovery` pins the same
+`WL_CONTROLLED_STEP_SNAPSHOT_RETRYABLE` state for a failed SNAPSHOT.
+
+Inline slots with declared types, `pair(int64,float) inline` and
+`pair(symbol,int64) inline`, give the source FLOAT or STRING lanes at session
+creation. The same matrix runs over them with binary64 values, among them
+-0.0, and with symbol ids from the program's intern table, and checks that
+`$map` gives the typed slot its FLOAT or STRING lane and that the head has the
+uncontrolled head's width and lane types. Both sessions consolidate a FLOAT
+zero to +0.0.
 
 Open after this bundle: FILTER, JOIN, SEMIJOIN/ANTIJOIN, REDUCE and LFTJ with an
 INLINE input; direct compound, segmented, timestamped/weighted and spill inputs
@@ -2713,10 +2724,13 @@ registered only for the general observed transaction, which replaces a bare
 EDB with a private empty relation before any consumer runs, and the test
 checks that no observed or SNAPSHOT cell publishes a bare input. A native
 join-class cleanup of a bare MAP, FILTER or REDUCE goes through the join-class
-latch, which reports a bare END; no test here drives that route, and it is
-left open. END work is paid on the host's separate funding, as for JOIN
-(#2297); the SOURCE lifecycle slot that MAP and FILTER pre-pay goes unused on
-this path.
+latch, which reports a bare END. Both registrations need private bindings with
+dynamic entries, which only the general observed transaction sets, and that
+transaction replaces a bare EDB before any consumer runs, so no route traced
+here reaches this latch with a bare EDB; bare IDB heads bound on the append
+path were not traced. END work is paid on the host's separate funding, as for
+JOIN (#2297); the SOURCE lifecycle slot that MAP and FILTER pre-pay goes
+unused on this path.
 
 `evaluation_empty_edb_sources` runs single-rule, UNION (either or both
 branches never inserted), FILTER, ungrouped and grouped COUNT, two-column,
@@ -2740,15 +2754,16 @@ exercised here each UNION branch ends in MAP.
 ### Int32-declared EDBs in the general observed transaction (#2301)
 
 Session creation gives an EDB its declared lane types when one of its columns
-is FLOAT or STRING. An EDB declared with int32 or int64 columns only, and no
-compound column, stays untyped, and its inserted rows are read as int64 lanes;
-the uncontrolled session reads it that way and its heads are INT64. The
-general observed transaction, which also serves SNAPSHOT and the controlled
-successor STEP, compared the public EDB's lane types with the declared ones
-and treated an untyped lane as INT64, so an int32-declared EDB with rows
-returned ENOTSUP. For a never-inserted EDB it built the private empty input
-with the declared types, so the head was INT32 where the uncontrolled head was
-INT64.
+is FLOAT or STRING, or it has an INLINE compound column and no SIDE column. An
+EDB declared with int32 or int64 columns only, and no compound column, stays
+untyped, and its inserted rows are read as int64 lanes; the uncontrolled
+session reads it that way and its heads are INT64. The general observed
+transaction, which also serves SNAPSHOT and the successor STEPs that the
+successor selection sends to it (others take the legacy observed route),
+compared the public EDB's lane types with the declared ones and treated an
+untyped lane as INT64, so an int32-declared EDB with rows returned ENOTSUP.
+For a never-inserted EDB it built the private empty input with the declared
+types, so the head was INT32 where the uncontrolled head was INT64.
 
 The schema phase now accepts an untyped lane for a declared INT32, INT64,
 UINT32, UINT64 or BOOL column and keeps the exact comparison for a typed lane.
@@ -2767,6 +2782,20 @@ observed STEP events with the uncontrolled session. The parser takes no
 uint32, uint64 or bool declaration, so the test also runs both checks with the
 plan's int32 lane of the EDB rewritten to UINT32, UINT64 and BOOL.
 
+A denied storage reservation of that private empty input returned ENOSPC while
+`wl_session_budget_denied` reported no denial, where a denied MAP scratch
+reservation reports one. The schema phase now records the denial.
+`evaluation_empty_edb_sources` denies that reservation for each bare EDB on
+every SNAPSHOT and on the observed STEPs that take the general observed
+transaction, and checks ENOSPC, the reported denial, that nothing is published
+and the EDB stays bare, and a retry and the first insert. It also stops that
+input's constructor with cancellation and with work exhaustion at sampled work
+tails: the first and last three and each quarter for the SNAPSHOT of the
+single-rule body and for the second EDB of the observed UNION STEP with both
+branches never inserted, which stops after the first private empty was built
+and must dispose of it, and the first, middle and last tail for the other
+cells.
+
 ### Integer MAP expressions in observed steps (#2301)
 
 A single-rule body over one INT64 EDB, made of VARIABLE, a one-column MAP and
@@ -2784,3 +2813,56 @@ before.
 columns with the stops of the other bodies, and runs it through the
 `untyped_rows` rounds, comparing head rows, width and type, the SNAPSHOT image
 and the observed STEP events with the uncontrolled session.
+
+A column-0 projection of a two-column EDB, such as `out(x) :- a(x,y).`, is
+classified for the legacy observed route. Its preflight refuses a declared
+width other than 1 before the step evaluates anything, and the observed STEP
+then runs in the general observed transaction. `evaluation_empty_edb_sources`
+runs that body, the same body beside a declared EDB it does not read, and
+`out(x + 1)` over a two-column EDB and beside such an EDB, in all four columns
+with the stops and the `untyped_rows` rounds. `evaluation_compound_sources`
+runs a column-0 projection of an INLINE pair and a body over a one-lane INLINE
+box through its matrix.
+
+### EDBs without a declaration in the general observed transaction (#2301)
+
+An EDB without a `.decl` takes its arity and column types from its inline
+facts (#2231), and one named only by a directive such as `.input`, with
+neither a declaration nor facts, takes the width of its first insert. The plan
+gives either no declared width. Before f1f29724 the general observed
+transaction compared the declared width with the lane-type count and refused
+such an EDB, so an observed STEP or any SNAPSHOT of a body over it returned
+ENOTSUP while the uncontrolled session computed the rows, and mutation
+admission after a STEP refused an insert into it. Since f1f29724 the schema
+phase skips the declaration lanes of an undeclared EDB and reads its source,
+and both mutation admissions leave the width of an insert into it to the
+uncontrolled session's validator.
+
+The legacy observed preflight still refuses the undeclared width, which sends
+an observed STEP to the general observed transaction. A relation named only in
+a rule body, with neither a declaration nor facts, has no plan EDB. With the
+facts loaded both sessions refuse an insert of another width; while the EDB is
+never inserted both take the width of its first insert. Facts relations of
+arity zero, facts with compound terms, and relations without a declaration
+that have both facts and rules were not traced.
+
+`evaluation_empty_edb_sources` runs single-rule, two-column, integer
+expression and FILTER bodies over a facts EDB, never inserted, in all four
+STEP and SNAPSHOT, observed and unobserved columns with the stops of the other
+bodies, inserts the first rows after an unobserved STEP, and runs the
+`untyped_rows` rounds for all but the FILTER body, whose filter drops every
+row those rounds insert. With the facts loaded it runs those bodies and a
+symbol-facts control through a further insert with a repeated row, a new row
+and nothing new, comparing head rows, width and type, the SNAPSHOT image and
+the observed STEP events with the uncontrolled session. After a STEP it checks
+that both sessions return the same code for an insert of another width, with
+the facts loaded and without, and step to the same head.
+
+It runs single-rule, two-column and integer expression bodies over an EDB
+named only by `.input`, never inserted, in all four STEP and SNAPSHOT,
+observed and unobserved columns with the stops and the budget denial, inserts
+the first rows after an unobserved STEP, and runs the `untyped_rows` rounds.
+Once that EDB has rows it checks that both sessions refuse an insert of
+another width with EINVAL, on the observed and the unobserved STEP, and that a
+first insert of zero columns after a STEP, and a later insert of one column,
+get the same code from both sessions and leave the same head.

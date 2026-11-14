@@ -100,7 +100,15 @@ add(capture_t *c, unsigned width, const int64_t *v, int diff)
 
 /* ---- programs ---------------------------------------------------------- */
 
-enum { K_PAIR, K_UNION, K_WIDE, K_COUNT };
+/* K_FLOAT_PAIR and K_STRING_PAIR give the inline slots declared types:
+ * session creation gives the source those lane types, and MAP carries
+ * them to the head. */
+/* K_NARROW projects column 0 of a three-lane INLINE source and K_BOX
+ * reads a one-lane INLINE source. */
+enum {
+    K_PAIR, K_UNION, K_WIDE, K_FLOAT_PAIR, K_STRING_PAIR, K_NARROW, K_BOX,
+    K_COUNT
+};
 
 static const char *const programs[K_COUNT] = {
     ".decl a(id:int64,p:pair/2 inline)\n"
@@ -115,6 +123,18 @@ static const char *const programs[K_COUNT] = {
     "s3:int64,s4:int64,s5:int64,s6:int64,s7:int64)\n"
     ".decl out(s7:int64,z:int64,v:int64,k:int64,x:int64)\n"
     "out(s7,z,v,k,x) :- a(k,box(v),triple(x,y,z),s1,s2,s3,s4,s5,s6,s7).\n",
+    ".decl a(id:int64,p:pair(int64,float) inline)\n"
+    ".decl out(id:int64,x:int64,y:float)\n"
+    "out(i,x,y) :- a(i,pair(x,y)).\n",
+    ".decl a(id:int64,p:pair(symbol,int64) inline)\n"
+    ".decl out(id:int64,x:symbol,y:int64)\n"
+    "out(i,x,y) :- a(i,pair(x,y)).\n",
+    ".decl a(id:int64,p:pair/2 inline)\n"
+    ".decl out(id:int64)\n"
+    "out(i) :- a(i,pair(x,y)).\n",
+    ".decl a(b:box/1 inline)\n"
+    ".decl out(v:int64)\n"
+    "out(v) :- a(box(v)).\n",
 };
 
 /* Physical rows for a. The duplicate row collapses under set semantics. */
@@ -130,10 +150,49 @@ static const int64_t wide_rows[] = {
     1, 7, 100, 101, 102, 11, 12, 13, 14, 15, 16, 17,
 };
 
+static const int64_t box_rows[] = {4, -1, 4, 0};
+
 static unsigned
 physical_width(unsigned kind)
 {
-    return kind == K_WIDE ? 12u : 3u;
+    return kind == K_WIDE ? 12u : kind == K_BOX ? 1u : 3u;
+}
+
+/* The typed kinds use the rows of pair_rows with one slot replaced: the y
+ * slot by binary64 bits (a non-integral value, -0.0 and the repeated row),
+ * or the x slot by symbol ids from the program's intern table, which both
+ * sessions share. typed_rows is filled by fixture(). */
+static int64_t typed_rows[12];
+
+static const int64_t *
+rows_of(unsigned kind)
+{
+    return kind == K_FLOAT_PAIR || kind == K_STRING_PAIR ? typed_rows
+           : pair_rows;
+}
+
+static void
+fill_typed_rows(unsigned kind, wl_session_t *s)
+{
+    static const double y[] = {0.5, -0.0, 0.5, 3.25};
+    static const char *const x[] = {"p", "q", "p", "r"};
+    memcpy(typed_rows, pair_rows, sizeof(typed_rows));
+    for (unsigned r = 0; r < 4; r++) {
+        if (kind == K_FLOAT_PAIR) {
+            memcpy(&typed_rows[r * 3 + 2], &y[r], sizeof(int64_t));
+        } else if (kind == K_STRING_PAIR) {
+            typed_rows[r * 3 + 1] = wl_intern_put(
+                ((wl_col_session_t *)s)->intern, x[r]);
+            CHECK(typed_rows[r * 3 + 1] >= 0);
+        }
+    }
+}
+
+/* The declared lane type of a physical column; NULL types are int64. */
+static wirelog_column_type_t
+lane_type(const col_rel_t *r, uint32_t c)
+{
+    return r->column_types ? r->column_types[c] : WIRELOG_TYPE_INT64;
 }
 
 /* empty leaves only the INLINE source a without rows. Session creation gave
@@ -145,8 +204,10 @@ populate(wl_session_t *s, unsigned kind, bool empty)
 {
     if (!empty && kind == K_WIDE)
         CHECK(!wl_session_insert(s, "a", wide_rows, 3, 12));
+    else if (!empty && kind == K_BOX)
+        CHECK(!wl_session_insert(s, "a", box_rows, 4, 1));
     else if (!empty)
-        CHECK(!wl_session_insert(s, "a", pair_rows, 4, 3));
+        CHECK(!wl_session_insert(s, "a", rows_of(kind), 4, 3));
     if (kind == K_UNION)
         CHECK(!wl_session_insert(s, "c", union_rows, 2, 3));
 }
@@ -160,15 +221,34 @@ literal(unsigned kind, bool empty, capture_t *e)
         }
         return;
     }
+    if (kind == K_BOX) {
+        for (unsigned r = 0; r < 4; r++)
+            if (r != 2)
+                add(e, 1, &box_rows[r], 1);
+        return;
+    }
+    if (kind == K_NARROW) {
+        for (unsigned r = 0; r < 4; r++)
+            if (r != 2)
+                add(e, 1, &pair_rows[r * 3], 1);
+        return;
+    }
     if (kind == K_WIDE) {
         const int64_t r1[] = {17, 102, 7, 1, 100};
         const int64_t r2[] = {27, 202, 8, 2, 200};
         add(e, 5, r1, 1); add(e, 5, r2, 1);
         return;
     }
-    for (unsigned r = 0; r < 4; r++)
-        if (r != 2)
-            add(e, 3, &pair_rows[r * 3], 1);
+    for (unsigned r = 0; r < 4; r++) {
+        if (r == 2)
+            continue;
+        /* Both sessions consolidate a FLOAT zero to +0.0. */
+        int64_t row[3];
+        memcpy(row, &rows_of(kind)[r * 3], sizeof(row));
+        if (kind == K_FLOAT_PAIR)
+            row[2] = (int64_t)wl_columnar_float_canonical_bits(row[2]);
+        add(e, 3, row, 1);
+    }
     if (kind == K_UNION)
         add(e, 3, &union_rows[3], 1); /* {2,30,40} is already present */
 }
@@ -208,6 +288,7 @@ check_body(const wl_plan_t *plan, unsigned kind)
 /* ---- publication witness and deterministic stops ------------------------ */
 
 static wl_session_t *active;
+static unsigned active_kind;
 static unsigned map_inline, concat_seen;
 static unsigned stop_mode; /* 0 none, 1 cancel, 2 work limit */
 static const char *stop_at;
@@ -223,6 +304,11 @@ publication(wl_col_session_t *s, const col_rel_t *in, const col_rel_t *out)
         CHECK(out->compound_kind == WIRELOG_COMPOUND_KIND_NONE
             && !out->compound_arity_map && !out->timestamps);
         map_inline++;
+        /* MAP derives the typed slots' lane types from its source. */
+        if (active_kind == K_FLOAT_PAIR)
+            CHECK(lane_type(out, 2) == WIRELOG_TYPE_FLOAT);
+        if (active_kind == K_STRING_PAIR)
+            CHECK(lane_type(out, 1) == WIRELOG_TYPE_STRING);
     }
     if (!strcmp(out->name, "$concat"))
         concat_seen++;
@@ -284,6 +370,13 @@ fixture(fixture_t *f, unsigned kind)
     col_rel_t *a = session_find_rel((wl_col_session_t *)f->s, "a");
     CHECK(a && a->compound_kind == WIRELOG_COMPOUND_KIND_INLINE
         && a->ncols == physical_width(kind));
+    fill_typed_rows(kind, f->s);
+    if (kind == K_FLOAT_PAIR)
+        CHECK(lane_type(a, 1) == WIRELOG_TYPE_INT64
+            && lane_type(a, 2) == WIRELOG_TYPE_FLOAT);
+    if (kind == K_STRING_PAIR)
+        CHECK(lane_type(a, 1) == WIRELOG_TYPE_STRING
+            && lane_type(a, 2) == WIRELOG_TYPE_INT64);
 }
 
 static void
@@ -355,7 +448,7 @@ run_case(unsigned kind, bool snapshot, bool observed, bool empty,
     source_save(&src, f.s);
     col_rel_t *old = session_find_rel((wl_col_session_t *)f.s, "out");
     col_relation_snapshot_t old_image = wl_columnar_relation_snapshot(old);
-    active = f.s; map_inline = concat_seen = 0;
+    active = f.s; active_kind = kind; map_inline = concat_seen = 0;
     stop_mode = fault; stop_hit = false;
     stop_at = kind == K_UNION ? "$concat" : "$map";
     wl_columnar_eval_stack_test_physical_publication = publication;
@@ -400,6 +493,15 @@ run_case(unsigned kind, bool snapshot, bool observed, bool empty,
     col_rel_t *head = session_find_rel((wl_col_session_t *)f.s, "out");
     CHECK(head && head->compound_kind == WIRELOG_COMPOUND_KIND_NONE
         && !head->compound_arity_map && !head->timestamps);
+    /* The head has the uncontrolled head's width and lane types. */
+    col_rel_t *raw_head = session_find_rel((wl_col_session_t *)f.raw, "out");
+    CHECK(raw_head && head->ncols == raw_head->ncols);
+    for (uint32_t c = 0; c < head->ncols; c++)
+        CHECK(lane_type(head, c) == lane_type(raw_head, c));
+    if (kind == K_FLOAT_PAIR)
+        CHECK(lane_type(head, 2) == WIRELOG_TYPE_FLOAT);
+    if (kind == K_STRING_PAIR)
+        CHECK(lane_type(head, 1) == WIRELOG_TYPE_STRING);
     if (snapshot) {
         equal_capture(&image, &want, "snapshot image");
         equal_capture(&raw_image, &want, "raw snapshot image");
@@ -423,9 +525,14 @@ run_case(unsigned kind, bool snapshot, bool observed, bool empty,
 
 /* Consumers that still refuse an INLINE input keep a typed ENOTSUP: the
  * controlled session publishes nothing and leaves the source as it was,
- * while the uncontrolled session computes the rows (open in #2301). */
+ * while the uncontrolled session computes the rows (open in #2301). Each
+ * route is run: the observed STEP, the unobserved STEP and the evaluating
+ * SNAPSHOT. */
+enum { R_OBSERVED, R_UNOBSERVED, R_SNAPSHOT, R_COUNT };
+
 static void
-refused_consumer(const char *text, const char *head, unsigned want_rows)
+refused_consumer(const char *text, const char *head, unsigned want_rows,
+    unsigned route)
 {
     wirelog_error_t error;
     wirelog_program_t *program = wirelog_parse_string(text, &error);
@@ -458,16 +565,40 @@ refused_consumer(const char *text, const char *head, unsigned want_rows)
     source_t src;
     source_save(&src, s);
     capture_t events = {.head = head}, raw_events = {.head = head};
-    wl_session_set_delta_cb(s, on_delta, &events);
-    wl_session_set_delta_cb(raw, on_delta, &raw_events);
+    if (route == R_OBSERVED) {
+        wl_session_set_delta_cb(s, on_delta, &events);
+        wl_session_set_delta_cb(raw, on_delta, &raw_events);
+    }
     col_rel_t *old = session_find_rel((wl_col_session_t *)s, head);
-    int rc = step(s);
+    int rc = route == R_SNAPSHOT ? wl_session_snapshot(s, on_tuple, &events)
+        : step(s);
     if (rc != ENOTSUP)
-        fprintf(stderr, "%s: rc %d, expected ENOTSUP\n", head, rc);
+        fprintf(stderr, "%s route %u: rc %d, expected ENOTSUP\n", head,
+            route, rc);
     CHECK(rc == ENOTSUP && !events.count);
     source_kept(&src, s, true);
     CHECK(session_find_rel((wl_col_session_t *)s, head) == old);
-    CHECK(!step(raw) && raw_events.count == want_rows);
+    if (route == R_SNAPSHOT) {
+        /* An evaluating SNAPSHOT that failed after admission may only be
+         * retried as SNAPSHOT: mutations and STEP wait
+         * (test_evaluation_map_recovery pins the same state). */
+        CHECK(s->backend->session_controlled_step_state(s)
+            == WL_CONTROLLED_STEP_SNAPSHOT_RETRYABLE);
+        CHECK(wl_session_insert(s, "b", b, 1, 2) == EBUSY);
+        CHECK(step(s) == EBUSY);
+        source_kept(&src, s, true);
+        CHECK(!wl_session_snapshot(raw, on_tuple, &raw_events));
+    } else {
+        CHECK(!step(raw));
+    }
+    if (route == R_UNOBSERVED) {
+        col_rel_t *raw_head = session_find_rel((wl_col_session_t *)raw,
+                head);
+        CHECK(!raw_events.count && raw_head
+            && raw_head->nrows == want_rows);
+    } else {
+        CHECK(raw_events.count == want_rows);
+    }
     CHECK(!wl_session_try_destroy(&s));
     wl_session_destroy(raw);
     wl_evaluation_control_release(control);
@@ -554,8 +685,6 @@ scale(void)
     }
     CHECK(!wl_session_insert(f.s, "a", rows, 330, 3));
     CHECK(!wl_session_insert(f.raw, "a", rows, 330, 3));
-    static capture_t image, raw_image;
-    memset(&image, 0, sizeof(image)); memset(&raw_image, 0, sizeof(raw_image));
     CHECK(!step(f.s) && !step(f.raw));
     col_rel_t *head = session_find_rel((wl_col_session_t *)f.s, "out");
     col_rel_t *raw_head = session_find_rel((wl_col_session_t *)f.raw, "out");
@@ -739,12 +868,14 @@ main(void)
     compound_stops();
     map_scratch_denial();
     /* x > 0 keeps ids 1 and 2; the join matches x = 10 and x = 30. */
-    refused_consumer(".decl a(id:int64,p:pair/2 inline)\n"
-        ".decl b(k:int64,v:int64)\n.decl f(id:int64,y:int64)\n"
-        "f(i,y) :- a(i,pair(x,y)), x > 0.\n", "f", 2);
-    refused_consumer(".decl a(id:int64,p:pair/2 inline)\n"
-        ".decl b(k:int64,v:int64)\n.decl j(id:int64,z:int64)\n"
-        "j(i,z) :- a(i,pair(x,y)), b(x,z).\n", "j", 2);
+    for (unsigned route = 0; route < R_COUNT; route++) {
+        refused_consumer(".decl a(id:int64,p:pair/2 inline)\n"
+            ".decl b(k:int64,v:int64)\n.decl f(id:int64,y:int64)\n"
+            "f(i,y) :- a(i,pair(x,y)), x > 0.\n", "f", 2, route);
+        refused_consumer(".decl a(id:int64,p:pair/2 inline)\n"
+            ".decl b(k:int64,v:int64)\n.decl j(id:int64,z:int64)\n"
+            "j(i,z) :- a(i,pair(x,y)), b(x,z).\n", "j", 2, route);
+    }
     puts("evaluation_compound_sources: OK");
     return 0;
 }

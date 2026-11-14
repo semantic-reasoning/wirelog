@@ -62,7 +62,8 @@ typedef enum {
     WL_CONTROLLED_STEP_INVALIDATED,
     /* Completed public state with legal, unevaluated input mutations. */
     WL_CONTROLLED_STEP_DIRTY,
-    /* A stopped synchronous SNAPSHOT may only be retried as SNAPSHOT. */
+    /* An evaluating synchronous SNAPSHOT that failed after admission may only
+     * be retried as SNAPSHOT. */
     WL_CONTROLLED_STEP_SNAPSHOT_RETRYABLE,
     /* A genuine retained native error owns cleanup independently of the
      * original control's current attempt and the caller's progress permission. */

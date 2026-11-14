@@ -402,6 +402,9 @@ struct wl_columnar_controlled_step {
     col_rel_t *successor_candidate;
     wl_columnar_source_access_reader_t successor_input_reader;
     wl_plan_relation_t successor_relation;
+    /* The legacy observed body has three ops; the fourth entry is kept so
+     * the step's size, and with it the chunks of its SOURCE-financed
+     * reset, do not change. */
     wl_plan_op_t successor_ops[4];
     wl_columnar_eval_serial_framed_host_reply_kind_t previous_kind;
     int previous_protocol;
@@ -8676,9 +8679,10 @@ wl_columnar_session_preflight_observer_ops(void *payload)
 {
     wl_columnar_session_preflight_read_t *p = payload;
     const wl_plan_relation_t *r = p->relation;
-    if (!r->name || (r->op_count != 3 && r->op_count != 4) || !r->ops
+    /* VARIABLE, MAP, CONSOLIDATE: the general shape read sends a body with
+     * a FILTER to the general observed transaction first. */
+    if (!r->name || r->op_count != 3 || !r->ops
         || r->ops[0].op != WL_PLAN_OP_VARIABLE
-        || (r->op_count == 4 && r->ops[1].op != WL_PLAN_OP_FILTER)
         || r->ops[r->op_count - 2].op != WL_PLAN_OP_MAP
         || r->ops[r->op_count - 1].op != WL_PLAN_OP_CONSOLIDATE
         || !r->ops[0].relation_name) return ENOTSUP;
@@ -14240,6 +14244,9 @@ wl_columnar_session_observed_action(wl_col_session_t *sess,
                     (
                     tx->entries[i].name, r, plan->edb_column_types[i],
                     sess->memory_governor, &empty, control, step->operation_id);
+                /* A denied reservation is a budget denial, as for a
+                 * denied MAP scratch reservation (#2301). */
+                if (rc == ENOSPC) sess->memory_budget_denied = true;
                 if (rc) return rc;
                 tx->entries[i].relation = empty;
             }
@@ -16986,7 +16993,7 @@ col_controlled_step_successor_target_init(wl_col_session_t *sess,
 {
     if (step->successor_private_name) return 0;
     if (!source_relation || !source_relation->ops
-        || (source_relation->op_count != 3 && source_relation->op_count != 4)
+        || source_relation->op_count != 3
         || !step->observed_input || !step->observed_head) return ENOTSUP;
     wl_evaluation_control_t *control = sess->base.evaluation_control;
     for (unsigned action = 0; action < 64; ++action) {
