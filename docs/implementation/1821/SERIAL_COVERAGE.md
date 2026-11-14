@@ -2784,7 +2784,13 @@ reservation reports one. The schema phase now records the denial.
 `evaluation_empty_edb_sources` denies that reservation for each bare EDB on
 every SNAPSHOT and on the observed STEPs that take the general observed
 transaction, and checks ENOSPC, the reported denial, that nothing is published
-and the EDB stays bare, and a retry and the first insert.
+and the EDB stays bare, and a retry and the first insert. It also stops that
+input's constructor with cancellation and with work exhaustion at sampled work
+tails: the first and last three and each quarter for the SNAPSHOT of the
+single-rule body and for the second EDB of the observed UNION STEP with both
+branches never inserted, which stops after the first private empty was built
+and must dispose of it, and the first, middle and last tail for the other
+cells.
 
 ### Integer MAP expressions in observed steps (#2301)
 

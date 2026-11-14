@@ -1037,15 +1037,32 @@ static void
 run_stops(unsigned kind)
 {
     /* Every SNAPSHOT, and the observed STEPs that take the general observed
-     * transaction, build a private empty for each bare EDB; a denied
-     * reservation there is reported as a budget denial. */
+     * transaction, build a private empty for each bare EDB. The SNAPSHOT of
+     * K_SINGLE and the second EDB of the observed K_UNION_BOTH STEP, which
+     * stops after the first private empty was built, stop at the first and
+     * last three tails and at each quarter; the other cells stop at the
+     * first, middle and last tail. Each stop builds two sessions, so the
+     * points are sampled. A denied reservation there is reported as a
+     * budget denial. */
     for (unsigned snapshot = 0; snapshot < 2; snapshot++)
         for (unsigned which = 0; which < bare_count(kind); which++) {
             unsigned n = gen_tails(kind, snapshot, which);
             if (snapshot)
                 CHECK(n > 0);
-            if (n)
-                gen_stopped(kind, snapshot, which, 3, 1);
+            if (!n)
+                continue;
+            CHECK(n >= 5);
+            bool wide = (kind == K_SINGLE && snapshot)
+                || (kind == K_UNION_BOTH && !snapshot && which);
+            const unsigned dense[] = {1, 2, 3, n / 4, n / 2, 3 * n / 4,
+                                      n - 2, n - 1, n};
+            const unsigned some[] = {1, n / 2, n};
+            unsigned count = wide ? 9 : 3;
+            for (unsigned mode = 1; mode < 3; mode++)
+                for (unsigned i = 0; i < count; i++)
+                    gen_stopped(kind, snapshot, which, mode,
+                        wide ? dense[i] : some[i]);
+            gen_stopped(kind, snapshot, which, 3, 1);
         }
     for (unsigned mode = 1; mode < 3; mode++) {
         /* At the consumer's publication, or at CONCAT for a UNION. */
