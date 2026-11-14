@@ -11,6 +11,7 @@
 #include "../wirelog/columnar/internal.h"
 #include "../wirelog/exec_plan_gen.h"
 #include "../wirelog/session.h"
+#include "../wirelog/session_facts.h"
 #include "../wirelog/session_options.h"
 #include "../wirelog/wirelog.h"
 #include <errno.h> /* EAGAIN */
@@ -89,8 +90,9 @@ equal_capture(capture_t *a, capture_t *b, const char *what, unsigned kind)
 enum {
     K_SINGLE, K_UNION_A, K_UNION_C, K_UNION_BOTH, K_FILTER, K_COUNT,
     K_GROUPED, K_TWO_COL, K_INT_EXPR, K_TWO_COL_EXPR, K_TWO_EDB_EXPR,
-    K_NARROW, K_NARROW_TWO_EDB, K_INT32, K_UINT32, K_UINT64, K_BOOL,
-    K_FLOAT, K_FLOAT_EXPR, K_COUNT_KINDS
+    K_NARROW, K_NARROW_TWO_EDB, K_FACTS, K_FACTS_TWO, K_FACTS_EXPR,
+    K_FACTS_FILTER, K_INT32, K_UINT32, K_UINT64, K_BOOL, K_FLOAT,
+    K_FLOAT_EXPR, K_FACTS_STRING, K_COUNT_KINDS
 };
 
 #define UNION_TEXT ".decl a(x:int64)\n.decl c(x:int64)\n.decl out(x:int64)\n" \
@@ -139,6 +141,17 @@ static const struct {
     { ".decl a(x:int64,y:int64)\n.decl b(x:int64)\n.decl out(x:int64)\n"
       "out(x) :- a(x,y).\n",
       { "a", NULL }, NULL, WL_PLAN_OP_MAP, "$map" },
+    /* An EDB without a .decl whose arity and types come from its inline
+     * facts (#2231). The fixture does not load the facts, so the EDB is
+     * never inserted; facts_rows loads them. */
+    { "a(1).\na(2).\nout(x) :- a(x).\n",
+      { "a", NULL }, NULL, WL_PLAN_OP_MAP, "$map" },
+    { "a(1,2).\na(3,4).\nout(x) :- a(x,y).\n",
+      { "a", NULL }, NULL, WL_PLAN_OP_MAP, "$map" },
+    { "a(1).\na(2).\nout(x + 1) :- a(x).\n",
+      { "a", NULL }, NULL, WL_PLAN_OP_MAP, "$map" },
+    { "a(1).\na(2).\nout(x) :- a(x), x > 1.\n",
+      { "a", NULL }, NULL, WL_PLAN_OP_FILTER, "$filter" },
     { ".decl a(x:int32)\n.decl out(x:int32)\nout(x) :- a(x).\n",
       { "a", NULL }, NULL, WL_PLAN_OP_MAP, "$map" },
     /* The parser takes no uint32, uint64 or bool declaration; the fixture
@@ -155,6 +168,9 @@ static const struct {
       { NULL, NULL }, NULL, WL_PLAN_OP_MAP, "$map" },
     { ".decl a(x:float)\n.decl out(y:float)\nout(x + 1.25) :- a(x).\n",
       { NULL, NULL }, NULL, WL_PLAN_OP_MAP, "$map" },
+    /* Symbol facts type the EDB at session creation: a control. */
+    { "a(\"p\").\na(\"q\").\nout(x) :- a(x).\n",
+      { NULL, NULL }, NULL, WL_PLAN_OP_MAP, "$map" },
 };
 
 /* The physical width of the bare EDB of a kind. */
@@ -162,7 +178,15 @@ static unsigned
 edb_width(unsigned kind)
 {
     return kind == K_GROUPED || kind == K_TWO_COL || kind == K_TWO_COL_EXPR
-           || kind == K_NARROW || kind == K_NARROW_TWO_EDB ? 2u : 1u;
+           || kind == K_NARROW || kind == K_NARROW_TWO_EDB
+           || kind == K_FACTS_TWO ? 2u : 1u;
+}
+
+static bool
+is_facts(unsigned kind)
+{
+    return kind == K_FACTS || kind == K_FACTS_TWO || kind == K_FACTS_EXPR
+           || kind == K_FACTS_FILTER || kind == K_FACTS_STRING;
 }
 
 static bool
@@ -178,8 +202,8 @@ private_empty_step(unsigned kind)
 {
     return kind == K_SINGLE || kind == K_FILTER || kind == K_TWO_COL
            || kind == K_INT_EXPR || kind == K_TWO_COL_EXPR || kind == K_NARROW
-           || kind == K_INT32 || kind == K_UINT32 || kind == K_UINT64
-           || kind == K_BOOL;
+           || (is_facts(kind) && kind != K_FACTS_STRING) || kind == K_INT32
+           || kind == K_UINT32 || kind == K_UINT64 || kind == K_BOOL;
 }
 
 static unsigned
@@ -401,9 +425,23 @@ fixture(fixture_t *f, unsigned kind)
             && r->storage_owner == r);
         bare_rel[i] = r;
     }
-    if (kind == K_FLOAT || kind == K_FLOAT_EXPR) {
+    if (kind == K_FLOAT || kind == K_FLOAT_EXPR || kind == K_FACTS_STRING) {
         col_rel_t *r = session_find_rel((wl_col_session_t *)f->s, "a");
         CHECK(r && r->schema_ok && r->ncols == 1);
+    }
+    /* A facts EDB has no declared width; its lane types come from the
+     * facts. */
+    if (is_facts(kind)) {
+        bool found = false;
+        for (uint32_t i = 0; i < f->plan->edb_count; i++)
+            if (!strcmp(f->plan->edb_relations[i], "a")) {
+                CHECK(f->plan->edb_declared_width[i]
+                    == WL_PLAN_WIDTH_UNDECLARED
+                    && f->plan->edb_column_type_counts[i]
+                    == edb_width(kind));
+                found = true;
+            }
+        CHECK(found);
     }
 }
 
@@ -706,6 +744,83 @@ untyped_rows(unsigned kind, bool snapshot, bool observed)
     fixture_destroy(&f);
 }
 
+/* A facts EDB with its facts loaded in both sessions, then the rounds of
+ * untyped_rows: a further insert with a repeated row, a new row, nothing
+ * new. Events are compared with the uncontrolled session on the observed
+ * STEP only: an evaluating SNAPSHOT of the controlled session delivers
+ * observer events, while the uncontrolled one fires none (SEMANTICS.md). */
+static void
+facts_rows(unsigned kind, bool snapshot, bool observed)
+{
+    fixture_t f;
+    fixture(&f, kind);
+    where = snapshot ? "facts snapshot" : "facts step";
+    CHECK(wl_session_load_facts(f.s, f.program) == 0);
+    CHECK(wl_session_load_facts(f.raw, f.program) == 0);
+    capture_t ev = {0}, raw_ev = {0};
+    if (observed) {
+        wl_session_set_delta_cb(f.s, on_delta, &ev);
+        wl_session_set_delta_cb(f.raw, on_delta, &raw_ev);
+    }
+    const int64_t rows[] = {1, 7}, wide[] = {1, 2, 7, 0};
+    unsigned width = edb_width(kind);
+    for (unsigned round = 0; round < 4; round++) {
+        if (round == 1 || round == 2) {
+            const int64_t *r = width == 2 ? wide + (round - 1) * 2
+                : rows + (round - 1);
+            int a = wl_session_insert(f.s, "a", r, 1, width);
+            int b = wl_session_insert(f.raw, "a", r, 1, width);
+            if (a || b)
+                fprintf(stderr, "%s kind%u observed%u round %u: insert %d, "
+                    "raw %d\n", where, kind, observed, round, a, b);
+            CHECK(!a && !b);
+        }
+        capture_t image = {0}, raw_image = {0};
+        int rc = snapshot ? wl_session_snapshot(f.s, on_tuple, &image)
+            : step(f.s);
+        int raw_rc = snapshot ? wl_session_snapshot(f.raw, on_tuple,
+                &raw_image) : step(f.raw);
+        if (rc || raw_rc)
+            fprintf(stderr, "%s kind%u observed%u round %u: rc %d, raw %d\n",
+                where, kind, observed, round, rc, raw_rc);
+        CHECK(!rc && !raw_rc);
+        if (snapshot)
+            equal_capture(&image, &raw_image, "facts image", kind);
+        capture_t a = {0}, b = {0};
+        head_capture(f.s, &a);
+        head_capture(f.raw, &b);
+        equal_capture(&a, &b, "facts head", kind);
+        CHECK(a.count > 0);
+        same_head(&f, kind);
+    }
+    if (observed && !snapshot)
+        equal_capture(&ev, &raw_ev, "facts events", kind);
+    fixture_destroy(&f);
+}
+
+/* The loaded facts fix the arity of a facts EDB (#2231); while the EDB is
+ * never inserted it takes the width of its first insert. After a completed
+ * STEP the controlled session admits or refuses an insert of another width
+ * as the uncontrolled session does, and both then step to the same head. */
+static void
+facts_width(bool loaded)
+{
+    fixture_t f;
+    fixture(&f, K_FACTS_TWO);
+    if (loaded) {
+        CHECK(wl_session_load_facts(f.s, f.program) == 0);
+        CHECK(wl_session_load_facts(f.raw, f.program) == 0);
+    }
+    CHECK(!step(f.s) && !step(f.raw));
+    const int64_t row[] = {1, 2, 3};
+    int rc = wl_session_insert(f.s, "a", row, 1, 3);
+    int raw = wl_session_insert(f.raw, "a", row, 1, 3);
+    CHECK(rc == raw && (loaded ? raw != 0 : raw == 0));
+    CHECK(!step(f.s) && !step(f.raw));
+    same_head(&f, K_FACTS_TWO);
+    fixture_destroy(&f);
+}
+
 static unsigned
 empty_calls_of(unsigned kind, unsigned *constructor_calls)
 {
@@ -739,9 +854,17 @@ run_matrix(void)
             for (unsigned observed = 0; observed < 2; observed++)
                 untyped_rows(kind, snapshot, observed);
     for (unsigned kind = K_INT_EXPR; kind < K_INT32; kind++)
-        for (unsigned snapshot = 0; snapshot < 2; snapshot++)
+        for (unsigned snapshot = 0; snapshot < 2
+            && kind != K_FACTS_FILTER; snapshot++)
             for (unsigned observed = 0; observed < 2; observed++)
                 untyped_rows(kind, snapshot, observed);
+    for (unsigned kind = 0; kind < K_COUNT_KINDS; kind++)
+        if (is_facts(kind))
+            for (unsigned snapshot = 0; snapshot < 2; snapshot++)
+                for (unsigned observed = 0; observed < 2; observed++)
+                    facts_rows(kind, snapshot, observed);
+    facts_width(false);
+    facts_width(true);
 }
 
 static void
@@ -771,7 +894,7 @@ run_stops(unsigned kind)
 static int
 usage(const char *program)
 {
-    fprintf(stderr, "usage: %s [--matrix | --stops KIND(0..16)]\n", program);
+    fprintf(stderr, "usage: %s [--matrix | --stops KIND(0..20)]\n", program);
     return 2;
 }
 
