@@ -47,6 +47,23 @@ static uint64_t seen_epochs;
 static void latch_epoch(fixture_t *);
 static bool actual_latch_cell;
 static unsigned actual_latch_cells;
+/* Registered unary retirement cell prices (#2299, columnar/session.c): two
+ * owner proofs 2*1088 + facade 384 + framed 384 + child 128 + latch 456 +
+ * dispatch 32 = 3560; the mixed JOIN route prices 2104. A cell whose filter
+ * still holds a live non-bare scalar reader also performs one funded scalar
+ * END action (#2300): plan dispatch 1 (eval_plan.c source_end_fund), filter
+ * wrapper 128 and reader leaf 128, each pinned exact/one-short by
+ * test_evaluation_numeric_plan.c and test_relation_scalar_source_end.c. The
+ * cell keeps its facade/framed 384s; END adds to them and replaces nothing:
+ * 3817<=4096 unary and 2361<=3072 mixed. */
+enum {
+    LATCH_CELL_UNARY = 3560, LATCH_CELL_MIXED = 2104,
+    LATCH_SCALAR_END_DISPATCH = 1, LATCH_SCALAR_END_WRAPPER = 128,
+    LATCH_SCALAR_END_LEAF = 128
+};
+static bool latch_scalar_end, latch_end_continues;
+static unsigned latch_end_cells, latch_plain_cells, latch_end_drained,
+    latch_end_cursor;
 static wl_evaluation_control_report_t frozen;
 static int complete(fixture_t *f){
     f->processing = false;
@@ -172,6 +189,21 @@ static uint64_t grant_limit(const wl_col_session_t *session,
             WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_UNARY_CHILD){
             actual_latch_cell = true;
             CHECK(limit >= (active->mixed?3072u:4096u));
+            /* Classify the cell from the filter state it starts from: a
+             * live non-bare scalar reader makes this registered retirement
+             * cell perform one funded scalar END action. */
+            wl_columnar_filter_context_t *filter = NULL;
+            CHECK(!wl_columnar_eval_stack_filter_context_owned(ctx->frame,
+                &filter, &ctx->child));
+            if (!active->mixed) CHECK(!filter->source_bare);
+            latch_scalar_end =
+                (filter->stage == WL_COLUMNAR_FILTER_STAGE_SOURCE &&
+                filter->source_initialized && !filter->source_bare) ||
+                (filter->stage == WL_COLUMNAR_FILTER_STAGE_JOIN_RIGHT_SOURCE &&
+                filter->join_right_initialized && !filter->join_right_bare);
+            /* A scalar END that did not drain must be continued by the very
+             * next retirement cell; it may not be skipped or replaced. */
+            CHECK(!latch_end_continues || latch_scalar_end);
         }
     }
     return limit;
@@ -187,14 +219,54 @@ static void grant_finished(const wl_col_session_t *session,
     CHECK(!wl_evaluation_control_report(grant,
         &report) && report.attempt_id && report.limit &&
         !report.execution_status && !report.cleanup_status);
-    uint64_t expected = active->mixed?2104u:3560u;
+    uint64_t expected = (active->mixed?LATCH_CELL_MIXED:LATCH_CELL_UNARY) +
+        (latch_scalar_end?LATCH_SCALAR_END_DISPATCH+LATCH_SCALAR_END_WRAPPER+
+        LATCH_SCALAR_END_LEAF:0u);
     if (report.consumed != expected)fprintf(stderr,
-            "real native mixed%u consumed%llu expected%llu\n", active->mixed,
+            "real native mixed%u end%u consumed%llu expected%llu\n",
+            active->mixed, (unsigned)latch_scalar_end,
             (unsigned long long)report.consumed, (unsigned long long)expected);
-    CHECK(report.consumed == expected); ++actual_latch_cells;
+    CHECK(report.consumed == expected && expected <= report.limit);
+    ++actual_latch_cells;
+    latch_end_continues = false;
+    if (!latch_scalar_end) {
+        ++latch_plain_cells; return;
+    }
+    ++latch_end_cells;
+    /* The END action ran on the real reader: either it drained and the
+     * filter left the source stage, or the reader is ENDING with a cursor
+     * that never moves backwards (a release step may legitimately need more
+     * than one cell) and the next retirement cell must continue it. */
+    wl_columnar_eval_serial_framed_attempt_t *ctx = NULL;
+    wl_columnar_filter_context_t *filter = NULL;
+    CHECK(session->cleanup_active &&
+        !wl_columnar_eval_stack_framed_context(session->cleanup_active,
+        (wl_col_session_t *)session, &ctx) &&
+        !wl_columnar_eval_stack_filter_context_owned(ctx->frame, &filter,
+        &ctx->child));
+    bool right = filter->stage == WL_COLUMNAR_FILTER_STAGE_JOIN_RIGHT_SOURCE;
+    if (right ? filter->join_right_initialized :
+        filter->stage == WL_COLUMNAR_FILTER_STAGE_SOURCE &&
+        filter->source_initialized) {
+        const wl_columnar_relation_scalar_source_t *source =
+            right ? &filter->join_right : &filter->source;
+        CHECK(source->phase == WL_COLUMNAR_RELATION_SCALAR_SOURCE_ENDING &&
+            source->end_cursor >= latch_end_cursor &&
+            source->end_cursor <= 4);
+        latch_end_cursor = source->end_cursor;
+        latch_end_continues = true;
+    } else {
+        CHECK(filter->stage == WL_COLUMNAR_FILTER_STAGE_DECIDE ||
+            filter->stage == WL_COLUMNAR_FILTER_STAGE_JOIN_DECIDE ||
+            filter->stage == WL_COLUMNAR_FILTER_STAGE_JOIN_PHYSICAL);
+        ++latch_end_drained; latch_end_cursor = 0;
+    }
 }
 static void hook(fixture_t *f){
     active = f; actual_latch_cells = 0;
+    latch_scalar_end = latch_end_continues = false;
+    latch_end_cells = latch_plain_cells = latch_end_drained = 0;
+    latch_end_cursor = 0;
     wl_columnar_session_test_framed_grant_limit = grant_limit;
     wl_columnar_session_test_framed_grant_finished = grant_finished;
     wl_session_set_delta_cb(f->bounded, event, f);
@@ -371,8 +443,13 @@ static void stops(void){
                         WL_COLUMNAR_FILTER_STAGE_RESET);
                     CHECK((seen_epochs&required) == required);
                 }
+                /* Each retirement drain reaches a real scalar-reader cell on
+                 * both routes: both priced cell kinds must occur, and every
+                 * started END must have been carried to a drained reader. */
                 if ((action == 2 || action == 3) && p > 0 &&
-                    p < 4) CHECK(actual_latch_cells);
+                    p < 4) CHECK(actual_latch_cells && latch_end_cells &&
+                        latch_plain_cells && latch_end_drained &&
+                        !latch_end_continues);
                 int expected = action ==
                     0?WL_EVALUATION_CONTROL_CANCELLED:action ==
                     1?WL_EVALUATION_CONTROL_WORK_LIMIT:action ==
