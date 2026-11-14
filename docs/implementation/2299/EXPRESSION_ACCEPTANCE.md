@@ -1616,6 +1616,13 @@ expanded context/recognition/epoch/tail/next fronts fit248<=256. This explicitly
 reprices native retirement, including existing FILTER/MAP, without changing
 Original expression fees. The actual unary retirement cell is3560<=4096 and
 mixed dynamic cell2104<=3072; tests assert real financier reports and identity.
+Since #2300 retains scalar source readers, a retirement cell that starts with a
+live non-bare reader also performs one funded END action: dispatch1 +
+wrapper128 + leaf128 on top of the unchanged cell, so3817<=4096 unary and
+2361<=3072 mixed. Main ran that
+END unfunded inside the same cell; the test classifies each cell from its
+starting filter state, requires both kinds and a drained reader, and checks
+that an undrained END continues in the next cell.
 SOURCE2048 is a distinct outer financier and unchanged. The directly
 authenticated latch's literal88+(5*192+128)+112+256=1544 schedule is tested at
 1543 (consumed1288, no shape mutation) and1544 through scratch, PROGRAM/SOURCE,

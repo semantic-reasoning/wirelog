@@ -10460,7 +10460,10 @@ col_controlled_step_grant_begin(wl_col_session_t *sess,
         && limit < 3072)
         limit = 3072;
     /* One unary retirement cell: two independent1088 owner proofs plus
-     * facade384, framed384, child128, latch456 and dispatch32 =3560.
+     * facade384, framed384, child128, latch456 and dispatch32 =3560. A cell
+     * that also performs one funded scalar-reader END action adds plan
+     * dispatch1, filter wrapper128 and reader leaf128 on top of the same
+     * facade/framed charges: 3817<=4096 (mixed 2104+257=2361<=3072).
      * Capacity is not charged work and never finances another drain cell. */
     if (action == WL_COLUMNAR_EVAL_SERIAL_FRAMED_NATIVE_CLEANUP
         && step->unary_cleanup.registered && limit < 4096) limit = 4096;
