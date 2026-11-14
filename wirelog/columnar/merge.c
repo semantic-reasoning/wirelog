@@ -4754,32 +4754,40 @@ wl_columnar_managed_ack_actor(
 
 /* These exact member spans partition ordinary bytes from all inline atomic
  * storage. No atomic object is passed to the ordinary byte-zero primitive. */
-/* Typedef guards also execute in MSVC default C mode. */
+/* Typedef guards also execute in MSVC default C mode. The shapes below are
+ * never defined: sizeof does not evaluate its operand, so they only name the
+ * member types without a null-pointer cast. */
+extern const wl_columnar_managed_candidate_merge_t
+    wl_columnar_managed_ack_merge_shape;
+extern const wl_columnar_relation_managed_retirement_t
+    wl_columnar_managed_ack_retirement_shape;
+extern const wl_columnar_memory_reservation_t
+    wl_columnar_managed_ack_reservation_shape;
 typedef char wl_columnar_managed_ack_first_identity_chunk[
         (offsetof(wl_columnar_managed_candidate_merge_t, identity) == 0
-        && sizeof(((wl_columnar_managed_candidate_merge_t *)0)->identity) <= 64)
+        && sizeof(wl_columnar_managed_ack_merge_shape.identity) <= 64)
     ? 1 : -1];
 typedef char wl_columnar_managed_ack_retirement_extent[
-        (sizeof(((wl_columnar_managed_candidate_merge_t *)0)->retirements)
+        (sizeof(wl_columnar_managed_ack_merge_shape.retirements)
         / sizeof(wl_columnar_relation_managed_retirement_t) == 3) ? 1 : -1];
 typedef char wl_columnar_managed_ack_token_extent[
-        (sizeof(((wl_columnar_relation_managed_retirement_t *)0)->tokens)
+        (sizeof(wl_columnar_managed_ack_retirement_shape.tokens)
         / sizeof(wl_columnar_memory_reservation_t) == 4) ? 1 : -1];
 typedef char wl_columnar_managed_ack_atomic_member_order[
         (offsetof(wl_columnar_memory_reservation_t, owner_bits)
-        + sizeof(((wl_columnar_memory_reservation_t *)0)->owner_bits)
+        + sizeof(wl_columnar_managed_ack_reservation_shape.owner_bits)
         <= offsetof(wl_columnar_memory_reservation_t, state)) ? 1 : -1];
 typedef char wl_columnar_managed_ack_complete_atomic_member[
         (offsetof(wl_columnar_memory_reservation_t, state)
-        + sizeof(((wl_columnar_memory_reservation_t *)0)->state)
+        + sizeof(wl_columnar_managed_ack_reservation_shape.state)
         <= sizeof(wl_columnar_memory_reservation_t)) ? 1 : -1];
 typedef char wl_columnar_managed_ack_token_array_bounds[
         (offsetof(wl_columnar_relation_managed_retirement_t, tokens)
-        + sizeof(((wl_columnar_relation_managed_retirement_t *)0)->tokens)
+        + sizeof(wl_columnar_managed_ack_retirement_shape.tokens)
         <= sizeof(wl_columnar_relation_managed_retirement_t)) ? 1 : -1];
 typedef char wl_columnar_managed_ack_retirement_array_bounds[
         (offsetof(wl_columnar_managed_candidate_merge_t, retirements)
-        + sizeof(((wl_columnar_managed_candidate_merge_t *)0)->retirements)
+        + sizeof(wl_columnar_managed_ack_merge_shape.retirements)
         <= sizeof(wl_columnar_managed_candidate_merge_t)) ? 1 : -1];
 static size_t
 wl_columnar_managed_ack_atomic_offset(unsigned index)
