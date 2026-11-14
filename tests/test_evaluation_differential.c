@@ -7,6 +7,7 @@
 #include "../wirelog/session.h"
 #include "../wirelog/session_options.h"
 #include "../wirelog/wirelog.h"
+#include "controlled_step_observation.h"
 
 #include <errno.h>
 #include <stdio.h>
@@ -24,15 +25,44 @@ static unsigned mutation_cycles;
 static int
 finish_step(wl_session_t *session)
 {
+    wl_evaluation_control_t *control = session->evaluation_control;
+    wl_test_completed_step_t ended = {0};
     uint64_t attempt = 0;
     for (unsigned turn = 0; turn < 1000000; ++turn) {
         int rc = wl_session_step(session);
+        if (ended.selected) {
+            wl_evaluation_control_report_t report;
+            CHECK(!wl_evaluation_control_report(control, &report)
+                && wl_test_completed_step_unchanged(&ended,
+                session->evaluation_control == control,
+                wl_evaluation_control_active_attempt_id(control), &report));
+        }
         if (rc != EAGAIN) return rc;
         if (session->evaluation_control) {
             uint64_t active = wl_evaluation_control_active_attempt_id(
                 session->evaluation_control);
-            CHECK(active && (!attempt || attempt == active));
-            attempt = active;
+            if (!active) {
+                if (attempt && wl_test_completed_step_observe(session,
+                    control, active, attempt, &ended)) continue;
+                if (!attempt) {
+                    uint64_t binding[10];
+                    CHECK(!wl_columnar_session_test_metadata_bind_view(
+                            (wl_col_session_t *)session, binding)
+                        && (binding[0] == 1 || (binding[0] == 2
+                        && binding[1] == 4)) && !binding[4] && !binding[5]);
+                } else {
+                    wl_evaluation_control_report_t report;
+                    CHECK(session->backend->session_controlled_step_state(
+                            session)
+                        == WL_CONTROLLED_STEP_NATIVE_ERROR_CLEANUP_PENDING
+                        && !wl_evaluation_control_report(
+                            session->evaluation_control,
+                            &report) && report.attempt_id == attempt);
+                }
+            } else {
+                CHECK(!ended.selected && (!attempt || attempt == active));
+                attempt = active;
+            }
         }
     }
     CHECK(false);
@@ -392,7 +422,10 @@ check_path(wl_session_t *base, const int64_t *edges, unsigned edge_count)
                 int64_t row[] = {i, j};
                 capture_tuple("path", row, 2, &expected);
             }
-    CHECK(!wl_session_snapshot(base, capture_tuple, &actual));
+    int rc = wl_session_snapshot(base, capture_tuple, &actual);
+    if (rc) fprintf(stderr, "recursive snapshot rc=%d [%s]\n", rc,
+            case_context);
+    CHECK(!rc);
     check_capture(&actual, &expected);
 }
 

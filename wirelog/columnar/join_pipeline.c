@@ -1278,6 +1278,8 @@ wl_columnar_join_pipeline_numeric_host_size(void)
 #ifdef WL_SESSION_TEST_HOOKS
 void (*wl_columnar_join_pipeline_test_numeric_checkpoint)(
     wl_evaluation_control_t *, unsigned, uint64_t, uint32_t, uint64_t);
+void (*wl_columnar_join_pipeline_test_first_error)(wl_evaluation_control_t *,
+    int);
 #define WL_COLUMNAR_JOIN_HOST_HOOK(host, event) do { \
             if (wl_columnar_join_pipeline_test_numeric_checkpoint) \
             wl_columnar_join_pipeline_test_numeric_checkpoint( \
@@ -1302,9 +1304,35 @@ wl_columnar_join_host_fund(wl_evaluation_control_t *funding, uint64_t id)
 }
 
 static void
+wl_columnar_join_numeric_select_result(
+    wl_columnar_eval_plan_numeric_attempt_t *parent, int rc)
+{
+    if (rc && !parent->semantic_result
+        && wl_evaluation_control_active_attempt_id(parent->control)
+        == parent->attempt_id) parent->semantic_result = rc;
+}
+
+static void
+wl_columnar_join_host_select_result(wl_columnar_join_host_t *h, int rc)
+{
+    if (rc && !h->result) {
+        h->result = rc;
+        /* Preserve the actual first selection while this producer still
+         * belongs to its live Original. Later FINISH must not replace it.
+         * A refusal from an already ended generation is only a protocol
+         * diagnostic; the canonical owner resolves its saved completion. */
+        wl_columnar_join_numeric_select_result(h->parent, rc);
+#ifdef WL_SESSION_TEST_HOOKS
+        if (wl_columnar_join_pipeline_test_first_error)
+            wl_columnar_join_pipeline_test_first_error(h->parent->control, rc);
+#endif
+    }
+}
+
+static void
 wl_columnar_join_host_fail(wl_columnar_join_host_t *h, int rc)
 {
-    if (!h->result) h->result = rc;
+    wl_columnar_join_host_select_result(h, rc);
     if (rc == ENOSPC) h->parent->session->memory_budget_denied = true;
     h->phase = WL_COLUMNAR_JOIN_HOST_ABORT;
 }
@@ -1332,6 +1360,7 @@ static void
 wl_columnar_join_host_terminal(wl_columnar_eval_plan_numeric_attempt_t *r,
     int result, bool committed)
 {
+    wl_columnar_join_numeric_select_result(r, result);
     r->child_status.execution_result = result;
     r->child_status.semantic_result = result;
     r->child_status.cleanup_result = 0;
@@ -1649,7 +1678,8 @@ wl_columnar_join_host_consumer(wl_columnar_join_host_t *h, unsigned action)
         else h->phase = WL_COLUMNAR_JOIN_HOST_CONSUMER_START;
     } else {
         if (h->consumer_status.progress == WL_COLUMNAR_FILTER_PROGRESS_DONE) {
-            if (!h->result) h->result = h->consumer_status.semantic_result;
+            wl_columnar_join_host_select_result(h,
+                h->consumer_status.semantic_result);
             if (h->result == ENOSPC) r->session->memory_budget_denied = true;
             if (h->phase != WL_COLUMNAR_JOIN_HOST_ABORT)
                 h->phase = WL_COLUMNAR_JOIN_HOST_CONSUMER_ACK;
@@ -2563,7 +2593,7 @@ wl_columnar_join_host_retire(wl_columnar_join_host_t *h, eval_entry_t *entry,
         rc = wl_columnar_relation_scalar_retirement_init_step(i, h,
                 &h->retirement,
                 entry->rel, funding, id, &begun);
-        if (!rc && begun) h->retirement_started = true;
+        if (begun) h->retirement_started = true;
         return rc;
     }
     if (!h->retirement_committed) {
@@ -2812,7 +2842,7 @@ wl_columnar_join_host_cleanup(wl_columnar_join_host_t *h,
         rc = wl_columnar_eval_stack_unary_finish_scalar_funded_owned(r->frame,
                 h->result, r, funding, id, &semantic, &done);
         if (!rc && done) {
-            if (!h->result) h->result = semantic;
+            wl_columnar_join_host_select_result(h, semantic);
             h->unary_finished = true; h->phase = WL_COLUMNAR_JOIN_HOST_RESET;
             h->output_in_frame = false;
         }

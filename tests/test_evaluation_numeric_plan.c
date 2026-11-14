@@ -51,6 +51,73 @@ control_new(uint64_t limit, const void *owner)
     return control;
 }
 
+static void (*test_prepared_initializer_after_ack)(
+    wl_columnar_eval_stack_cleanup_frame_t *,
+    const wl_columnar_eval_plan_numeric_attempt_t *, unsigned);
+
+/* Drive the real selected initializer with a fresh finite support generation
+ * for every packet, then its real FINISH/report and one-use prepaid ACK. */
+static int
+test_prepared_construct_staged(wl_columnar_eval_stack_unary_prepared_t *p,
+    wl_columnar_eval_stack_cleanup_frame_t *frame,
+    const wl_columnar_eval_plan_numeric_attempt_t *owner, bool join)
+{
+    bool selected = false;
+    int rc = join ? wl_columnar_eval_stack_unary_prepared_join_begin(p, frame,
+            owner, &selected) : wl_columnar_eval_stack_unary_prepared_begin(p,
+            frame, owner, &selected);
+    if (!selected) return rc;
+    int cause = rc;
+    for (unsigned turn = 0; ; ++turn) {
+        CHECK(turn < 1000);
+        int support_owner = 0;
+        /* This fixture's control_new already begins its real generation. */
+        wl_evaluation_control_t *support = control_new(256, &support_owner);
+        uint64_t id = wl_evaluation_control_active_attempt_id(support);
+        bool published = false;
+        rc = wl_columnar_eval_stack_unary_prepared_init_step_owned(frame,
+                owner, support, id, &published);
+        if (rc && !cause) cause = rc;
+        CHECK(wl_columnar_eval_stack_unary_prepared_init_action_ack_owned(
+                frame, owner, support, id) == EBUSY);
+        CHECK(!wl_columnar_eval_stack_cleanup_stack(frame));
+        CHECK(!wl_columnar_eval_stack_cleanup_result(frame));
+        (void)wl_evaluation_control_finish(support, &support_owner, 0, 0);
+        wl_evaluation_control_report_t report;
+        CHECK(!wl_evaluation_control_report(support, &report)
+            && report.attempt_id == id && report.consumed == 256);
+        CHECK(wl_columnar_eval_stack_unary_prepared_init_action_ack_owned(
+                frame, owner, support, id + 1) == EBUSY);
+        CHECK(!wl_columnar_eval_stack_unary_prepared_init_action_ack_owned(
+                frame, owner, support, id));
+        CHECK(wl_columnar_eval_stack_unary_prepared_init_action_ack_owned(
+                frame, owner, support, id) == EBUSY);
+        CHECK(!wl_evaluation_control_detach(support, &support_owner));
+        wl_evaluation_control_release(support);
+        if (test_prepared_initializer_after_ack)
+            test_prepared_initializer_after_ack(frame, owner, turn);
+        if (published) return cause;
+        if (!wl_columnar_eval_stack_auto_initializer_pending(frame))
+            return cause ? cause : EINVAL;
+    }
+}
+
+static int
+test_prepared_begin_staged(wl_columnar_eval_stack_unary_prepared_t *p,
+    wl_columnar_eval_stack_cleanup_frame_t *frame,
+    const wl_columnar_eval_plan_numeric_attempt_t *owner)
+{
+    return test_prepared_construct_staged(p, frame, owner, false);
+}
+
+static int
+test_prepared_join_begin_staged(wl_columnar_eval_stack_unary_prepared_t *p,
+    wl_columnar_eval_stack_cleanup_frame_t *frame,
+    const wl_columnar_eval_plan_numeric_attempt_t *owner)
+{
+    return test_prepared_construct_staged(p, frame, owner, true);
+}
+
 static col_rel_t *
 source_new(uint32_t width, uint32_t rows)
 {
@@ -10136,8 +10203,21 @@ static void test_lftj_scalar_cleanup_grants(void)
                     &f.record,
                     WL_EVALUATION_CONTROL_WORK_LIMIT, f.funding, f.funding_id));
         }
-        CHECK(!scalar_lftj_turn(&f, direct != 0, 384, &work) && work == 384
-            && a->retirement_initializer.phase ==
+        for (unsigned turn = 0;
+            a->retirement_initializer.phase ==
+            WL_COLUMNAR_RELATION_SCALAR_INIT_ZERO;
+            ++turn) {
+            CHECK(turn < 1000 && !scalar_lftj_turn(&f, direct != 0, 384, &work)
+                && work == 384);
+        }
+        CHECK(a->retirement_initializer.phase ==
+            WL_COLUMNAR_RELATION_SCALAR_INIT_TOKENS);
+        for (unsigned token = 0; token < 4; ++token) {
+            CHECK(!scalar_lftj_turn(&f, direct != 0, 384, &work) && work == 320
+                && a->retirement_initializer.token_index == token+1
+                && !a->retirement_started);
+        }
+        CHECK(a->retirement_initializer.phase ==
             WL_COLUMNAR_RELATION_SCALAR_INIT_BIND);
         CHECK(!scalar_lftj_turn(&f, direct != 0, 384, &work) && work == 320
             && a->retirement_started &&
@@ -11529,7 +11609,7 @@ test_prepared_unary_actual_lifecycle(void)
             eval_entry_t original = stack->items[0];
             wl_columnar_eval_stack_unary_prepared_t p = {0};
             if (owned) {
-                CHECK(wl_columnar_eval_stack_unary_prepared_begin(&p, f.frame,
+                CHECK(test_prepared_begin_staged(&p, f.frame,
                     &f.record) == EBUSY
                     && !p.identity);
                 bool ready = false;
@@ -11541,7 +11621,7 @@ test_prepared_unary_actual_lifecycle(void)
                             (f.frame, &f.record, &ready));
                 }
             }
-            CHECK(!wl_columnar_eval_stack_unary_prepared_begin(&p, f.frame,
+            CHECK(!test_prepared_begin_staged(&p, f.frame,
                 &f.record));
             prepared_guard_fixture = &f;
             memset(prepared_guard_hits, 0, sizeof(prepared_guard_hits));
@@ -11745,6 +11825,72 @@ prepared_reach(prepared_case_t *m, const prepared_boundary_t *target)
     }
 }
 
+static prepared_case_t *initializer_case;
+static unsigned initializer_stop_turn, initializer_stop_mode;
+static uint64_t initializer_successor;
+static wl_evaluation_control_report_t initializer_old_report;
+
+static void
+initializer_stop_after_ack(wl_columnar_eval_stack_cleanup_frame_t *frame,
+    const wl_columnar_eval_plan_numeric_attempt_t *owner, unsigned turn)
+{
+    fixture_t *f = &initializer_case->fixture;
+    CHECK(frame == f->frame && owner == &f->record);
+    if (turn == initializer_stop_turn) {
+        if (!initializer_stop_mode) wl_evaluation_control_request_cancel(
+                f->operation);
+        else {
+            CHECK(!wl_evaluation_control_finish(f->operation,
+                &f->operation_owner, 0, 0));
+            CHECK(!wl_evaluation_control_report(f->operation,
+                &initializer_old_report)
+                && initializer_old_report.attempt_id == f->operation_id);
+        }
+    }
+    if (initializer_stop_mode == 2 && turn == initializer_stop_turn + 1) {
+        CHECK(!wl_evaluation_control_begin(f->operation, &f->operation_owner));
+        initializer_successor =
+            wl_evaluation_control_active_attempt_id(f->operation);
+        CHECK(initializer_successor &&
+            initializer_successor != f->operation_id);
+    }
+}
+
+static void
+test_prepared_initializer_external_journal(void)
+{
+    const unsigned stops[] = {0, 4, 10};
+    for (unsigned mode = 0; mode != 3; ++mode)
+        for (unsigned stop = 0; stop != 3; ++stop) {
+            prepared_case_t m; prepared_case_init(&m, false, 0);
+            initializer_case = &m; initializer_stop_mode = mode;
+            initializer_stop_turn = stops[stop]; initializer_successor = 0;
+            test_prepared_initializer_after_ack = initializer_stop_after_ack;
+            int cause = test_prepared_begin_staged(&m.prepared, m.fixture.frame,
+                    &m.fixture.record);
+            test_prepared_initializer_after_ack = NULL;
+            CHECK(cause == (mode ? EINVAL : WL_EVALUATION_CONTROL_CANCELLED)
+                && !m.prepared.identity
+                && !wl_columnar_eval_stack_auto_initializer_pending(
+                    m.fixture.frame));
+            const unsigned char *bytes = (const void *)&m.prepared;
+            for (size_t i = 0; i != sizeof(m.prepared); ++i) CHECK(!bytes[i]);
+            if (mode == 2) {
+                uint64_t used = UINT64_MAX;
+                CHECK(!wl_evaluation_control_test_active_consumed(
+                        m.fixture.operation,
+                        initializer_successor, &used) && !used);
+                wl_evaluation_control_report_t actual;
+                CHECK(!wl_evaluation_control_report(m.fixture.operation,
+                    &actual)
+                    && metadata_reports_equal(&actual,
+                    &initializer_old_report));
+            }
+            prepared_case_close(&m, cause);
+        }
+    initializer_case = NULL;
+}
+
 static void
 test_prepared_unary_original_boundaries(void)
 {
@@ -11759,7 +11905,7 @@ test_prepared_unary_original_boundaries(void)
             prepared_case_t m;
             prepared_case_init(&m, owned, before + 256 - !exact);
             fixture_t *f = &m.fixture;
-            int rc = wl_columnar_eval_stack_unary_prepared_begin(&m.prepared,
+            int rc = test_prepared_begin_staged(&m.prepared,
                     f->frame, &f->record);
             CHECK(rc == (exact ? 0 : WL_EVALUATION_CONTROL_WORK_LIMIT));
             uint64_t work;
@@ -11779,7 +11925,7 @@ test_prepared_unary_original_boundaries(void)
                 target->phase == WL_COLUMNAR_EVAL_STACK_PREPARED_ACQUIRE_OLD &&
                 target->stage) continue;
             prepared_case_init(&baseline, owned, 0);
-            CHECK(!wl_columnar_eval_stack_unary_prepared_begin(
+            CHECK(!test_prepared_begin_staged(
                     &baseline.prepared, baseline.fixture.frame,
                     &baseline.fixture.record));
             prepared_reach(&baseline, target);
@@ -11791,7 +11937,7 @@ test_prepared_unary_original_boundaries(void)
                 prepared_case_t m;
                 prepared_case_init(&m, owned, before + target->fee - !exact);
                 fixture_t *f = &m.fixture;
-                CHECK(!wl_columnar_eval_stack_unary_prepared_begin(&m.prepared,
+                CHECK(!test_prepared_begin_staged(&m.prepared,
                     f->frame, &f->record));
                 prepared_reach(&m, target);
                 int rc =
@@ -11825,7 +11971,7 @@ test_prepared_unary_cancelled_parent_cleanup(void)
         const prepared_boundary_t *target = &prepared_boundaries[b];
         prepared_case_t m; prepared_case_init(&m, false, 0);
         fixture_t *f = &m.fixture;
-        CHECK(!wl_columnar_eval_stack_unary_prepared_begin(&m.prepared,
+        CHECK(!test_prepared_begin_staged(&m.prepared,
             f->frame, &f->record));
         prepared_reach(&m, target);
         wl_evaluation_control_request_cancel(f->operation);
@@ -11870,7 +12016,7 @@ test_prepared_unary_funded_cleanup(void)
         prepared_case_t m; prepared_case_init(&m, false, 0);
         fixture_t *f = &m.fixture;
         wl_columnar_eval_stack_unary_prepared_t *p = &m.prepared;
-        CHECK(!wl_columnar_eval_stack_unary_prepared_begin(p, f->frame,
+        CHECK(!test_prepared_begin_staged(p, f->frame,
             &f->record));
         if (!partial) prepared_until(p, WL_COLUMNAR_EVAL_STACK_PREPARED_READY);
         wl_columnar_eval_stack_unary_prepared_t saved;
@@ -11957,15 +12103,15 @@ test_prepared_unary_authority_and_query(void)
     uint64_t init_before, init_after;
     CHECK(!wl_evaluation_control_test_active_consumed(f->operation,
         f->operation_id, &init_before));
-    CHECK(wl_columnar_eval_stack_unary_prepared_begin((void *)f->frame,
+    CHECK(test_prepared_begin_staged((void *)f->frame,
         f->frame, &f->record) == EINVAL);
-    CHECK(wl_columnar_eval_stack_unary_prepared_begin((void *)&f->record,
+    CHECK(test_prepared_begin_staged((void *)&f->record,
         f->frame, &f->record) == EINVAL);
     CHECK(!wl_evaluation_control_test_active_consumed(f->operation,
         f->operation_id, &init_after)
         && init_before == init_after &&
         wl_columnar_eval_stack_cleanup_stack(f->frame) == stack);
-    CHECK(!wl_columnar_eval_stack_unary_prepared_begin(p, f->frame,
+    CHECK(!test_prepared_begin_staged(p, f->frame,
         &f->record));
     prepared_until(p, WL_COLUMNAR_EVAL_STACK_PREPARED_READY);
     CHECK(col_rel_destroy_checked(f->input) == EBUSY);
@@ -12099,10 +12245,112 @@ test_prepared_unary_authority_and_query(void)
 }
 
 static void
+test_prepared_work_chunk_cleanup(void)
+{
+    const unsigned chunks =
+        (sizeof(wl_columnar_eval_stack_unary_prepared_work_t)+63)/64;
+    for (unsigned turnover = 0; turnover < 3; ++turnover)
+        for (unsigned boundary = 0; boundary < 3; ++boundary) {
+            prepared_case_t m; prepared_case_init(&m, false, 0);
+            fixture_t *f = &m.fixture;
+            wl_columnar_eval_stack_unary_prepared_t *p = &m.prepared;
+            CHECK(!test_prepared_begin_staged(p, f->frame,
+                &f->record));
+            prepared_until(p, WL_COLUMNAR_EVAL_STACK_PREPARED_READY);
+            CHECK(!wl_columnar_eval_stack_unary_prepared_cancel(p, ERANGE,
+                f->funding, f->funding_id));
+            for (unsigned turn = 0;
+                p->phase != WL_COLUMNAR_EVAL_STACK_PREPARED_CLEAR_WORK;
+                ++turn) {
+                CHECK(turn < 16 &&
+                    !wl_columnar_eval_stack_unary_prepared_drain(p,
+                    f->funding, f->funding_id));
+            }
+            uint64_t successor = 0;
+            wl_evaluation_control_report_t old_report = {0};
+            unsigned target = boundary == 0 ? 0 : boundary ==
+                1 ? chunks/2 : chunks-1;
+            for (unsigned chunk = 0; chunk < chunks; ++chunk) {
+                CHECK(p->phase == WL_COLUMNAR_EVAL_STACK_PREPARED_CLEAR_WORK
+                    && p->alias_cursor == chunk*64 && p->control_ref
+                    && wl_columnar_eval_stack_frame_mutation_blocked(f->frame));
+                if (turnover && chunk == target) {
+                    CHECK(wl_evaluation_control_finish(f->operation,
+                        &f->operation_owner, 7, 0) == 7
+                        && !wl_evaluation_control_report(f->operation,
+                        &old_report));
+                    if (turnover == 2) {
+                        CHECK(!wl_evaluation_control_begin(f->operation,
+                            &f->operation_owner));
+                        successor =
+                            wl_evaluation_control_active_attempt_id(
+                            f->operation);
+                    }
+                }
+                wl_columnar_eval_stack_unary_prepared_t copy = *p;
+                CHECK(wl_columnar_eval_stack_unary_prepared_drain(&copy,
+                    f->funding, f->funding_id) == EINVAL);
+                prepared_peer_t peer = {.fixture = &m}; wl_thread_t thread;
+                CHECK(!wl_thread_create(&thread, prepared_peer, &peer)
+                    && !wl_thread_join(&thread) && peer.drain == EINVAL
+                    && peer.query == EINVAL);
+                wl_columnar_eval_stack_unary_prepared_work_t work = p->work;
+                uint64_t paid;
+                CHECK(prepared_funding_turn(&m, 1, 127, 0, 0, &paid)
+                    == WL_EVALUATION_CONTROL_WORK_LIMIT && !paid
+                    && p->alias_cursor == chunk*64 && !memcmp(&work, &p->work,
+                    sizeof(work)));
+                int funding_owner = 0;
+                wl_evaluation_control_t *cancelled = control_new(128,
+                        &funding_owner);
+                uint64_t id =
+                    wl_evaluation_control_active_attempt_id(cancelled);
+                wl_evaluation_control_request_cancel(cancelled);
+                CHECK(wl_columnar_eval_stack_unary_prepared_drain(p, cancelled,
+                    id)
+                    == WL_EVALUATION_CONTROL_CANCELLED
+                    && p->alias_cursor == chunk*64 && !memcmp(&work, &p->work,
+                    sizeof(work)));
+                CHECK(wl_evaluation_control_finish(cancelled, &funding_owner, 0,
+                    0)
+                    == WL_EVALUATION_CONTROL_CANCELLED
+                    && !wl_evaluation_control_detach(cancelled,
+                    &funding_owner));
+                wl_evaluation_control_release(cancelled);
+                wl_columnar_eval_stack_unary_prepared_status_t status;
+                CHECK(!wl_columnar_eval_stack_unary_prepared_query(p, &status)
+                    && status.phase ==
+                    WL_COLUMNAR_EVAL_STACK_PREPARED_CLEAR_WORK
+                    && status.alias_cursor == chunk*64 && !status.old_held &&
+                    !status.output_held);
+                CHECK(!prepared_funding_turn(&m, 1, 128, 0, 0,
+                    &paid) && paid == 128);
+                CHECK(p->phase == (chunk+1 == chunks
+                    ? WL_COLUMNAR_EVAL_STACK_PREPARED_ACK_READY
+                    : WL_COLUMNAR_EVAL_STACK_PREPARED_CLEAR_WORK)
+                    && p->alias_cursor == (chunk+1 == chunks ? 0 : (chunk+1)*64)
+                    && p->control_ref && p->first_result == ERANGE);
+                if (turnover && chunk >= target) {
+                    wl_evaluation_control_report_t actual;
+                    CHECK(!wl_evaluation_control_report(f->operation, &actual)
+                        && metadata_reports_equal(&actual, &old_report));
+                    if (successor) CHECK(
+                            !wl_evaluation_control_test_active_consumed(
+                                f->operation, successor, &paid) && !paid);
+                }
+            }
+            uint64_t paid;
+            CHECK(!prepared_funding_turn(&m, 2, 192, 0, 0, &paid)
+                && paid == 192 && !p->control_ref);
+            prepared_case_close(&m, ERANGE);
+        }
+}
+
+static void
 prepared_abandon_ready(prepared_case_t *m)
 {
     fixture_t *f = &m->fixture;
-    CHECK(!wl_columnar_eval_stack_unary_prepared_begin(&m->prepared, f->frame,
+    CHECK(!test_prepared_begin_staged(&m->prepared, f->frame,
         &f->record));
     prepared_until(&m->prepared, WL_COLUMNAR_EVAL_STACK_PREPARED_READY);
     CHECK(!wl_columnar_eval_stack_unary_prepared_cancel(&m->prepared, 0,
@@ -12137,7 +12385,7 @@ test_prepared_unary_generation_checkpoint(void)
         prepared_case_t m; prepared_case_init(&m, false, 0);
         fixture_t *f = &m.fixture;
         wl_columnar_eval_stack_unary_prepared_t *p = &m.prepared;
-        CHECK(!wl_columnar_eval_stack_unary_prepared_begin(p, f->frame,
+        CHECK(!test_prepared_begin_staged(p, f->frame,
             &f->record));
         if (action == 3) {
             prepared_until(p, WL_COLUMNAR_EVAL_STACK_PREPARED_ACQUIRE_OLD);
@@ -12228,7 +12476,7 @@ test_prepared_unary_entry_aliases(void)
         CHECK(!wl_columnar_eval_stack_unary_output_owned(f->frame, &slot,
             &f->record));
         *slot = alias == 0 ? f->input : alias == 1 ? lower : result_relation;
-        CHECK(!wl_columnar_eval_stack_unary_prepared_begin(&m.prepared,
+        CHECK(!test_prepared_begin_staged(&m.prepared,
             f->frame, &f->record));
         int rc = 0;
         for (unsigned turn = 0; !rc; ++turn) {
@@ -12261,7 +12509,7 @@ test_prepared_unary_descriptor_only_cleanup(void)
     prepared_case_t m; prepared_case_init(&m, false, 0);
     fixture_t *f = &m.fixture;
     wl_columnar_eval_stack_unary_prepared_t *p = &m.prepared;
-    CHECK(!wl_columnar_eval_stack_unary_prepared_begin(p, f->frame,
+    CHECK(!test_prepared_begin_staged(p, f->frame,
         &f->record));
     prepared_until(p, WL_COLUMNAR_EVAL_STACK_PREPARED_ACQUIRE_OLD);
     CHECK(!wl_columnar_eval_stack_unary_prepared_step(p));
@@ -12311,7 +12559,7 @@ test_prepared_unary_static_bindings_status(void)
             f.operation_id));
     int64_t row = 10; CHECK(!col_rel_append_row(*slot, &row));
     wl_columnar_eval_stack_unary_prepared_t prepared = {0};
-    CHECK(!wl_columnar_eval_stack_unary_prepared_begin(&prepared, f.frame,
+    CHECK(!test_prepared_begin_staged(&prepared, f.frame,
         &f.record));
     prepared_until(&prepared, WL_COLUMNAR_EVAL_STACK_PREPARED_READY);
     wl_columnar_eval_plan_numeric_attempt_t saved;
@@ -12387,7 +12635,7 @@ test_prepared_unary_acked_reuse(void)
             prepared_abandon_ready(&m);
             wl_columnar_eval_stack_unary_prepared_t saved;
             memcpy(&saved, &m.prepared, sizeof(saved));
-            int rc = wl_columnar_eval_stack_unary_prepared_begin(&m.prepared,
+            int rc = test_prepared_begin_staged(&m.prepared,
                     m.fixture.frame, &m.fixture.record);
             CHECK(rc == (exact ? 0 : WL_EVALUATION_CONTROL_WORK_LIMIT));
             if (!exact) CHECK(!memcmp(&saved, &m.prepared, sizeof(saved)));
@@ -12538,7 +12786,7 @@ test_prepared_join_chained_delta(void)
                         uint64_t cleanup_id =
                             wl_evaluation_control_active_attempt_id(cleanup);
                         wl_columnar_eval_stack_unary_prepared_t p = {0};
-                        CHECK(!wl_columnar_eval_stack_unary_prepared_join_begin(
+                        CHECK(!test_prepared_join_begin_staged(
                                 &p, f.frame, &f.record));
                         CHECK(!p.join_mode &&
                             p.phase ==
@@ -12799,7 +13047,7 @@ test_prepared_join_early_stop_turnover(void)
                 CHECK(!wl_evaluation_control_test_active_consumed(f->funding,
                     f->funding_id, &pending_work));
                 wl_columnar_eval_stack_unary_prepared_t p = {0};
-                CHECK(!wl_columnar_eval_stack_unary_prepared_join_begin(&p,
+                CHECK(!test_prepared_join_begin_staged(&p,
                     f->frame, &f->record));
                 if (!work) wl_evaluation_control_request_cancel(f->operation);
                 int stop =
@@ -12904,7 +13152,7 @@ test_prepared_join_original_boundaries(void)
                 prepared_join_case_init(&baseline, owned, pending, 0);
                 wl_columnar_eval_stack_unary_prepared_t p = {0};
                 if (!init) {
-                    CHECK(!wl_columnar_eval_stack_unary_prepared_join_begin(&p,
+                    CHECK(!test_prepared_join_begin_staged(&p,
                         baseline.f.frame, &baseline.f.record));
                     prepared_until(&p, boundaries[b].phase);
                 }
@@ -12932,12 +13180,12 @@ test_prepared_join_original_boundaries(void)
                     fixture_t *f = &m.f;
                     wl_columnar_eval_stack_unary_prepared_t receipt = {0};
                     if (!init) {
-                        CHECK(!wl_columnar_eval_stack_unary_prepared_join_begin(
+                        CHECK(!test_prepared_join_begin_staged(
                                 &receipt, f->frame, &f->record));
                         prepared_until(&receipt, boundaries[b].phase);
                     }
                     int rc = init
-                    ? wl_columnar_eval_stack_unary_prepared_join_begin(
+                    ? test_prepared_join_begin_staged(
                         &receipt, f->frame, &f->record)
                     : wl_columnar_eval_stack_unary_prepared_step(&receipt);
                     CHECK(rc == (exact ? 0 : WL_EVALUATION_CONTROL_WORK_LIMIT));
@@ -13018,7 +13266,7 @@ test_prepared_join_unsupported_contexts(void)
                 memcpy(&context_before, ctx, sizeof(context_before));
                 memcpy(&parent_before, &f.record, sizeof(parent_before));
                 if (attempt) CHECK(
-                        !wl_columnar_eval_stack_unary_prepared_join_begin(&p,
+                        !test_prepared_join_begin_staged(&p,
                         f.frame, &f.record));
                 if (stopped) wl_evaluation_control_request_cancel(f.operation);
                 if (attempt) {
@@ -13148,7 +13396,7 @@ test_prepared_join_empty_destinations(void)
                 && !ctx->output->nrows &&
                 ctx->join_disposition == WL_COLUMNAR_JOIN_DISPOSITION_REPLACE);
             wl_columnar_eval_stack_unary_prepared_t p = {0};
-            CHECK(!wl_columnar_eval_stack_unary_prepared_join_begin(&p, f.frame,
+            CHECK(!test_prepared_join_begin_staged(&p, f.frame,
                 &f.record));
             prepared_until(&p, WL_COLUMNAR_EVAL_STACK_PREPARED_SEALED);
             wl_columnar_eval_stack_unary_commit_prepared_nofail(&p);
@@ -13247,7 +13495,7 @@ test_prepared_join_context_finish(void)
                         uint64_t cleanup_id =
                             wl_evaluation_control_active_attempt_id(cleanup);
                         wl_columnar_eval_stack_unary_prepared_t p = {0};
-                        CHECK(!wl_columnar_eval_stack_unary_prepared_join_begin(
+                        CHECK(!test_prepared_join_begin_staged(
                                 &p, f->frame, &f->record));
                         prepared_until(&p,
                             WL_COLUMNAR_EVAL_STACK_PREPARED_SEALED);
@@ -13414,7 +13662,7 @@ test_prepared_join_pool_decline(void)
         wl_evaluation_control_t *funding = control_new(0, &owner);
         uint64_t id = wl_evaluation_control_active_attempt_id(funding);
         wl_columnar_eval_stack_unary_prepared_t p = {0};
-        CHECK(!wl_columnar_eval_stack_unary_prepared_join_begin(
+        CHECK(!test_prepared_join_begin_staged(
                 &p, m.f.frame, &m.f.record));
         prepared_until(&p, WL_COLUMNAR_EVAL_STACK_PREPARED_SEALED);
         wl_columnar_eval_stack_unary_commit_prepared_nofail(&p);
@@ -13501,7 +13749,7 @@ test_prepared_join_abort_distinct_segments_decline(void)
             wl_evaluation_control_t *funding = control_new(0, &owner);
             uint64_t id = wl_evaluation_control_active_attempt_id(funding);
             wl_columnar_eval_stack_unary_prepared_t p = {0};
-            CHECK(!wl_columnar_eval_stack_unary_prepared_join_begin(&p,
+            CHECK(!test_prepared_join_begin_staged(&p,
                 f->frame, &f->record));
             prepared_until(&p, WL_COLUMNAR_EVAL_STACK_PREPARED_SEALED);
             CHECK(!wl_columnar_eval_stack_unary_prepared_cancel(&p, ERANGE,
@@ -13647,6 +13895,7 @@ prepared_finish_schedule(wl_columnar_eval_stack_unary_prepared_phase_t phase,
             return (prepared_finish_schedule_t){192, 192 + 128, 192};
         case WL_COLUMNAR_RELATION_SCALAR_INIT_ZERO:
             return (prepared_finish_schedule_t){192, 192 + 256, 192};
+        case WL_COLUMNAR_RELATION_SCALAR_INIT_TOKENS:
         case WL_COLUMNAR_RELATION_SCALAR_INIT_BIND:
             return (prepared_finish_schedule_t){192, 192 + 192, 192};
         case WL_COLUMNAR_RELATION_SCALAR_INIT_DONE:
@@ -13727,7 +13976,7 @@ test_prepared_join_finish_boundaries(void)
         wl_evaluation_control_t *setup = control_new(0, &owner);
         uint64_t id = wl_evaluation_control_active_attempt_id(setup);
         wl_columnar_eval_stack_unary_prepared_t p = {0};
-        CHECK(!wl_columnar_eval_stack_unary_prepared_join_begin(&p, f->frame,
+        CHECK(!test_prepared_join_begin_staged(&p, f->frame,
             &f->record));
         prepared_until(&p, WL_COLUMNAR_EVAL_STACK_PREPARED_SEALED);
         wl_columnar_eval_stack_unary_commit_prepared_nofail(&p);
@@ -13806,12 +14055,12 @@ test_prepared_join_finish_boundaries(void)
             CHECK((!rc || rc == EAGAIN) && spent == schedule.total
                 && !memcmp(&parent, &f->record, sizeof(parent)));
         }
-        if (initializer_phases != 15 || !saw_payload || !saw_ledger ||
+        if (initializer_phases != 31 || !saw_payload || !saw_ledger ||
             !saw_credit)
             fprintf(stderr,
                 "finish milestones init=%u payload=%u ledger=%u credit=%u\n",
                 initializer_phases, saw_payload, saw_ledger, saw_credit);
-        CHECK(initializer_phases == 15 && saw_payload && saw_ledger &&
+        CHECK(initializer_phases == 31 && saw_payload && saw_ledger &&
             saw_credit);
         CHECK(prepared_finish_grant(&p, f, 191, false, true, &spent)
             == WL_EVALUATION_CONTROL_WORK_LIMIT && !spent);
@@ -13830,7 +14079,7 @@ prepared_finish_fixture_start_options(prepared_join_case_t *m,
     wl_evaluation_control_t *funding, uint64_t id, unsigned flags)
 {
     prepared_join_case_init_options(m, true, false, 0, flags);
-    CHECK(!wl_columnar_eval_stack_unary_prepared_join_begin(p, m->f.frame,
+    CHECK(!test_prepared_join_begin_staged(p, m->f.frame,
         &m->f.record));
     prepared_until(p, WL_COLUMNAR_EVAL_STACK_PREPARED_SEALED);
     wl_columnar_eval_stack_unary_commit_prepared_nofail(p);
@@ -13954,6 +14203,136 @@ test_prepared_join_finish_authority(void)
         wl_evaluation_control_release(funding);
         prepared_join_case_close(&m);
     }
+}
+
+static void
+test_prepared_finish_work_chunks(void)
+{
+    const unsigned chunks =
+        (sizeof(wl_columnar_eval_stack_unary_prepared_work_t)+63)/64;
+    for (unsigned pending = 0; pending < 2; ++pending)
+        for (unsigned turnover = 0; turnover < 3; ++turnover)
+            for (unsigned boundary = 0; boundary < 3; ++boundary) {
+                prepared_join_case_t m;
+                wl_columnar_eval_stack_unary_prepared_t p = {0};
+                int owner = 0;
+                wl_evaluation_control_t *setup = control_new(0, &owner);
+                uint64_t setup_id =
+                    wl_evaluation_control_active_attempt_id(setup);
+                prepared_finish_fixture_start(&m, &p, pending, setup, setup_id);
+                for (unsigned turn = 0;
+                    p.phase !=
+                    WL_COLUMNAR_EVAL_STACK_PREPARED_FINISH_CLEAR_WORK;
+                    ++turn) {
+                    CHECK(turn < 100000);
+                    int rc =
+                        wl_columnar_eval_stack_unary_prepared_join_finish_step(
+                        &p, setup, setup_id);
+                    CHECK(!rc || rc == EAGAIN);
+                }
+                unsigned target = boundary == 0 ? 0 : boundary ==
+                    1 ? chunks/2 : chunks-1;
+                uint64_t successor = 0;
+                wl_evaluation_control_report_t old_report = {0};
+                for (unsigned chunk = 0; chunk < chunks; ++chunk) {
+                    CHECK(p.phase ==
+                        WL_COLUMNAR_EVAL_STACK_PREPARED_FINISH_CLEAR_WORK
+                        && p.alias_cursor == chunk*64 && p.control_ref
+                        && wl_columnar_eval_stack_frame_mutation_blocked(
+                            m.f.frame));
+                    if (turnover && chunk == target) {
+                        CHECK(wl_evaluation_control_finish(m.f.operation,
+                            &m.f.operation_owner, 7, 0) == 7
+                            && !wl_evaluation_control_report(m.f.operation,
+                            &old_report));
+                        if (turnover == 2) {
+                            CHECK(!wl_evaluation_control_begin(m.f.operation,
+                                &m.f.operation_owner));
+                            successor =
+                                wl_evaluation_control_active_attempt_id(
+                                m.f.operation);
+                        }
+                    }
+                    wl_columnar_eval_stack_unary_prepared_t copy = p;
+                    CHECK(
+                        wl_columnar_eval_stack_unary_prepared_join_finish_step(
+                            &copy, setup, setup_id) == EINVAL);
+                    prepared_finish_foreign_t foreign = {&m, &p, setup,
+                                                         setup_id};
+                    wl_thread_t thread;
+                    CHECK(!wl_thread_create(&thread, prepared_finish_foreign,
+                        &foreign)
+                        && !wl_thread_join(&thread));
+                    wl_columnar_eval_stack_unary_prepared_work_t work = p.work;
+                    uint64_t paid;
+                    CHECK(prepared_finish_grant(&p, &m.f, 127, false, false,
+                        &paid)
+                        == WL_EVALUATION_CONTROL_WORK_LIMIT && !paid
+                        && p.alias_cursor == chunk*64 && !memcmp(&work, &p.work,
+                        sizeof(work)));
+                    int cancel_owner = 0;
+                    wl_evaluation_control_t *cancelled = control_new(128,
+                            &cancel_owner);
+                    uint64_t id =
+                        wl_evaluation_control_active_attempt_id(cancelled);
+                    wl_evaluation_control_request_cancel(cancelled);
+                    CHECK(
+                        wl_columnar_eval_stack_unary_prepared_join_finish_step(
+                            &p, cancelled,
+                            id) == WL_EVALUATION_CONTROL_CANCELLED
+                        && p.alias_cursor == chunk*64 && !memcmp(&work, &p.work,
+                        sizeof(work)));
+                    CHECK(wl_evaluation_control_finish(cancelled, &cancel_owner,
+                        0, 0)
+                        == WL_EVALUATION_CONTROL_CANCELLED
+                        && !wl_evaluation_control_detach(cancelled,
+                        &cancel_owner));
+                    wl_evaluation_control_release(cancelled);
+                    wl_columnar_eval_stack_unary_prepared_status_t status;
+                    CHECK(!wl_columnar_eval_stack_unary_prepared_query(&p,
+                        &status)
+                        && status.phase ==
+                        WL_COLUMNAR_EVAL_STACK_PREPARED_FINISH_CLEAR_WORK
+                        && status.alias_cursor == chunk*64
+                        && !status.old_held && !status.output_held);
+                    CHECK(!prepared_finish_grant(&p, &m.f, 128, false, false,
+                        &paid)
+                        && paid == 128 && p.control_ref
+                        && p.phase == (chunk+1 == chunks
+                            ? WL_COLUMNAR_EVAL_STACK_PREPARED_ACK_READY
+                            : WL_COLUMNAR_EVAL_STACK_PREPARED_FINISH_CLEAR_WORK)
+                        && p.alias_cursor ==
+                        (chunk+1 == chunks ? 0 : (chunk+1)*64));
+                    if (turnover && chunk >= target) {
+                        wl_evaluation_control_report_t report;
+                        CHECK(!wl_evaluation_control_report(m.f.operation,
+                            &report)
+                            && metadata_reports_equal(&report, &old_report));
+                        if (successor) CHECK(
+                                !wl_evaluation_control_test_active_consumed(
+                                    m.f.operation, successor, &paid) && !paid);
+                    }
+                }
+                CHECK(!wl_columnar_eval_stack_unary_prepared_ack(&p, setup,
+                    setup_id)
+                    && !p.control_ref);
+                run(&m.f);
+                CHECK(!m.f.record.semantic_result && m.f.record.completed == 2);
+                prepared_join_finish_raw_parity(&m);
+                if (turnover) {
+                    wl_evaluation_control_report_t report;
+                    CHECK(!wl_evaluation_control_report(m.f.operation, &report)
+                        && metadata_reports_equal(&report, &old_report));
+                    uint64_t paid;
+                    if (successor) CHECK(
+                            !wl_evaluation_control_test_active_consumed(
+                                m.f.operation, successor, &paid) && !paid);
+                }
+                CHECK(!wl_evaluation_control_finish(setup, &owner, 0, 0)
+                    && !wl_evaluation_control_detach(setup, &owner));
+                wl_evaluation_control_release(setup);
+                prepared_join_case_close(&m);
+            }
 }
 
 static wl_columnar_eval_stack_unary_prepared_t *finish_turnover_receipt;
@@ -14304,7 +14683,7 @@ test_prepared_join_finish_foreign_context(void)
             wl_evaluation_control_t *funding = control_new(0, &owner);
             uint64_t id = wl_evaluation_control_active_attempt_id(funding);
             wl_columnar_eval_stack_unary_prepared_t p = {0};
-            CHECK(!wl_columnar_eval_stack_unary_prepared_join_begin(&p, f.frame,
+            CHECK(!test_prepared_join_begin_staged(&p, f.frame,
                 &f.record)
                 && wl_columnar_eval_stack_unary_prepared_step(&p) == EINVAL &&
                 !p.join_mode
@@ -14329,10 +14708,21 @@ test_prepared_join_finish_foreign_context(void)
                 sizeof(context))
                 && !memcmp(&parent, &f.record, sizeof(parent)));
             CHECK(!wl_columnar_eval_stack_unary_prepared_join_finish_decline(&p,
-                funding, id)
-                && !wl_columnar_eval_stack_unary_prepared_join_finish_step(&p,
-                funding, id)
-                && p.phase == WL_COLUMNAR_EVAL_STACK_PREPARED_ACK_READY
+                funding, id));
+            for (unsigned chunk = 0;
+                p.phase != WL_COLUMNAR_EVAL_STACK_PREPARED_ACK_READY;
+                ++chunk) {
+                wl_columnar_eval_stack_unary_prepared_status_t status;
+                CHECK(chunk < (sizeof(p.work)+63)/64
+                    && !wl_columnar_eval_stack_unary_prepared_query(&p, &status)
+                    && status.phase ==
+                    WL_COLUMNAR_EVAL_STACK_PREPARED_FINISH_CLEAR_WORK
+                    && status.alias_cursor == chunk*64
+                    && !wl_columnar_eval_stack_unary_prepared_join_finish_step(
+                        &p,
+                        funding, id));
+            }
+            CHECK(p.phase == WL_COLUMNAR_EVAL_STACK_PREPARED_ACK_READY
                 && !wl_columnar_eval_stack_unary_prepared_ack(&p, funding, id)
                 && !memcmp(&context, ctx, sizeof(context))
                 && !memcmp(&parent, &f.record, sizeof(parent))
@@ -16655,15 +17045,18 @@ main(void)
     test_prepared_join_abort_distinct_segments_decline();
     test_prepared_join_finish_boundaries();
     test_prepared_join_finish_authority();
+    test_prepared_finish_work_chunks();
     test_prepared_join_finish_funding_turnover();
     test_prepared_join_finish_partial_decline();
     test_prepared_join_finish_foreign_context();
     test_prepared_join_finish_wide();
+    test_prepared_initializer_external_journal();
     test_prepared_unary_actual_lifecycle();
     test_prepared_unary_original_boundaries();
     test_prepared_unary_cancelled_parent_cleanup();
     test_prepared_unary_funded_cleanup();
     test_prepared_unary_authority_and_query();
+    test_prepared_work_chunk_cleanup();
     test_prepared_unary_acked_reuse();
     test_prepared_unary_generation_checkpoint();
     test_prepared_unary_entry_aliases();

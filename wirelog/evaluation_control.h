@@ -228,6 +228,10 @@ wl_evaluation_control_lexical_finance_birth_result_t
 extern void (*wl_evaluation_control_test_finance_birth_claim)(void);
 /* One-shot allocator/mutex-init boundary faults, only for birth_try. */
 extern unsigned wl_evaluation_control_test_finance_birth_fail;
+/* Seed only the actual next unpublished attached allocation's counter before
+ * its genuine first BEGIN; no returned id/report/active state is fabricated. */
+extern uint64_t wl_evaluation_control_test_finance_birth_attempt_id;
+
 #endif
 
 int wl_evaluation_control_lexical_finance_prove_checked(
@@ -278,6 +282,231 @@ typedef struct {
 } wl_evaluation_control_source_phase_result_t;
 
 typedef int (*wl_evaluation_control_source_action_fn)(void *payload);
+
+/* Actual financial-only metadata outcome, at a stable caller-owned address.
+ * Initialize before entry; disjoint from BANK, its controllers and context.
+ * An uncalled action leaves this record unchanged. It conveys no authority.
+ * The sealed action runs with BANK locked: only the designated bounded Normal
+ * financial/fixed-metadata bodies, no Native/user/diagnostic/nested issuer. */
+typedef struct {
+    int action_result;
+    bool action_called;
+} wl_evaluation_control_source_metadata_outcome_t;
+int wl_evaluation_control_source_bank_run_metadata(
+    wl_evaluation_control_source_bank_t *, wl_evaluation_control_source_lane_t,
+    const wl_evaluation_control_source_phase_policy_t *,
+    wl_evaluation_control_source_action_fn, void *,
+    wl_evaluation_control_source_metadata_outcome_t *);
+
+/* Trusted automatic preparation for one synchronous sealed recipe issuer.
+ * Initialize before entry. None of this storage may escape the admitted call.
+ * Groups authenticate the stable recipe, resolve its live financial tuple,
+ * then publish the selected action. They receive no BANK/control/id loan.
+ * A completed group is retained even if its following actual zero refuses;
+ * only action_called proves execution. Prices remain caller policy. */
+typedef struct {
+    /* checkpoint_result is valid only after an actual begun phase. */
+    int checkpoint_result;
+    bool begun, settled;
+} wl_evaluation_control_source_metadata_entry_t;
+
+typedef struct {
+    wl_evaluation_control_source_action_fn action;
+    void *payload;
+    wl_evaluation_control_source_metadata_outcome_t outcome;
+    int preparation_protocol;
+    unsigned groups_completed;
+    bool result_published;
+    wl_evaluation_control_source_metadata_entry_t entry;
+} wl_evaluation_control_source_metadata_preparation_t;
+typedef int (*wl_evaluation_control_source_metadata_prepare_fn)(
+    const void *, unsigned,
+    wl_evaluation_control_source_metadata_preparation_t *);
+int wl_evaluation_control_source_bank_run_metadata_recipe(
+    wl_evaluation_control_source_bank_t *, wl_evaluation_control_source_lane_t,
+    const wl_evaluation_control_source_phase_policy_t *,
+    wl_evaluation_control_source_metadata_prepare_fn, const void *,
+    wl_evaluation_control_source_metadata_preparation_t *);
+
+/* Separate bootstrap for the four stable role recipes: no recipe exists
+ * yet. Only the admitted fresh/reset constructor supplies these no-owner
+ * metadata packets. Each successful packet must advance the real cursor
+ * exactly once, before the following refusing checkpoint. */
+typedef int (*wl_evaluation_control_source_metadata_bind_fn)(void *, unsigned);
+int wl_evaluation_control_source_bank_bind_metadata_roles(
+    wl_evaluation_control_source_bank_t *, wl_evaluation_control_source_lane_t,
+    const wl_evaluation_control_source_phase_policy_t *,
+    wl_evaluation_control_source_metadata_bind_fn, void *, unsigned *);
+/* Cursor4 completion consumes the caller's authentic initialization lineage.
+* This protocol has a genuine saved check/FINISH, and no positive coupons. */
+int wl_evaluation_control_source_bank_observe_metadata(
+    wl_evaluation_control_source_bank_t *, wl_evaluation_control_source_lane_t,
+    wl_evaluation_control_source_metadata_entry_t *);
+/* Private issued entry, exclusively from a live owning admission/frame. BANK
+ * and fresh automatic context are accessible/disjoint, never copied or loaned
+ * to Native/user code. Context is initialized ONLY on OPEN. No policy/recipe
+ * is submitted before the first real check. Generic checked APIs stay strict.
+ * +1 classifies a genuinely closed CANCEL: its actual report remains -2.
+ * Negative errno means no new phase began; it never means a Source stop. */
+enum {
+    WL_EVALUATION_CONTROL_SOURCE_METADATA_OPEN = 0,
+    WL_EVALUATION_CONTROL_SOURCE_METADATA_INITIAL_CANCELLED = 1
+};
+int wl_evaluation_control_source_metadata_enter_issued(
+    wl_evaluation_control_source_bank_t *,
+    wl_evaluation_control_source_context_t *);
+int wl_evaluation_control_source_metadata_enter_close_owned(
+    wl_evaluation_control_source_bank_t *,
+    wl_evaluation_control_source_context_t *);
+/* Source-only fixed OP observation, no callback/payload or Native loan.
+ * Caller owns the live BANK/frame. One actual setup-derived coupon10; every
+ * actual OPEN settles/unbinds before return. Non-OPEN never reads context. */
+#define WL_EVALUATION_CONTROL_SOURCE_OBSERVATION_WORK UINT64_C(10)
+int wl_evaluation_control_source_operation_observe_owned(
+    wl_evaluation_control_source_bank_t *);
+
+/* Private ordinary STEP observation lifetime. Fresh final-address context and
+ * live owning BANK are accessible/disjoint. Only OPEN initializes context;
+ * first0/fixed10/post10zero all precede publication. Poll/end have no positive
+ * charge; a financial stop settles and invalidates its exact owner. Generic
+ * context/metadata operations cannot consume this distinct active family. */
+int wl_evaluation_control_source_observation_open(
+    wl_evaluation_control_source_bank_t *,
+    wl_evaluation_control_source_context_t *);
+int wl_evaluation_control_source_observation_poll(
+    wl_evaluation_control_source_context_t *);
+int wl_evaluation_control_source_observation_end(
+    wl_evaluation_control_source_context_t *);
+
+/* Stable BANK-owned financial generations. No automatic context, controller
+ * or Native generation escapes the owner. Only an authenticated attach may
+ * publish an automatic frame. Financial refusal and protocol are distinct. */
+typedef enum {
+    WL_EVALUATION_CONTROL_SOURCE_QUIESCENT,
+    WL_EVALUATION_CONTROL_SOURCE_STANDBY,
+    WL_EVALUATION_CONTROL_SOURCE_FRAME,
+    WL_EVALUATION_CONTROL_SOURCE_METADATA,
+    WL_EVALUATION_CONTROL_SOURCE_STOPPED_STANDBY,
+    WL_EVALUATION_CONTROL_SOURCE_FINISH_PENDING,
+    WL_EVALUATION_CONTROL_SOURCE_PF_FROZEN,
+    WL_EVALUATION_CONTROL_SOURCE_PF_HEADER_BUILT,
+    WL_EVALUATION_CONTROL_SOURCE_PF_BODY_BUILT,
+    WL_EVALUATION_CONTROL_SOURCE_PF_PUBLISHED,
+    WL_EVALUATION_CONTROL_SOURCE_PF_HEADER_CHECKED,
+    WL_EVALUATION_CONTROL_SOURCE_PF_TOTALS_CHECKED,
+    WL_EVALUATION_CONTROL_SOURCE_PF_VERIFIED
+} wl_evaluation_control_source_financial_state_t;
+typedef struct {
+    int financial_result;
+    wl_evaluation_control_source_financial_state_t state;
+    bool opened, report_verified;
+} wl_evaluation_control_source_retained_output_t;
+/* Positive protocol errno leaves the exclusive accessible output unchanged.
+ * On zero all four fields describe the real transition. Output storage is
+ * disjoint from slot, BANK/private controllers and optional context; its
+ * pointer never escapes this call. Financial stops remain output values. */
+int
+wl_evaluation_control_source_standby_prepare_owned(
+    wl_evaluation_control_source_bank_t **,
+    wl_evaluation_control_source_retained_output_t *);
+int
+wl_evaluation_control_source_standby_observe_owned(
+    wl_evaluation_control_source_bank_t **,
+    wl_evaluation_control_source_retained_output_t *);
+int
+wl_evaluation_control_source_standby_attach_owned(
+    wl_evaluation_control_source_bank_t **,
+    wl_evaluation_control_source_context_t *,
+    wl_evaluation_control_source_retained_output_t *);
+/* First call FINISHes and verifies the report; a second owner call ACKs that
+ * exact report and reaches QUIESCENT. Neither call rearms a generation. */
+int
+wl_evaluation_control_source_standby_handoff_owned(
+    wl_evaluation_control_source_bank_t **,
+    wl_evaluation_control_source_retained_output_t *);
+/* Advance exactly one context-free financial packet. Freeze's actual zero is
+ * this Source-only FINISH's stop linearization; later cancellation stays sticky
+ * for the next observation. BUILD preserves the old completed report. COMMIT
+ * publishes inactive, and separate readback packets establish verification
+ * before ACK. No positive charge, callback, context or rearm is performed.
+ * Q is EINVAL; live FRAME/METADATA or a conflicting protocol is EBUSY. Positive
+ * protocol errors leave valid output and actual owner unchanged, including
+ * outNULL. Output/storage preconditions match the retained scalar APIs. */
+int wl_evaluation_control_source_financial_progress_owned(
+    wl_evaluation_control_source_bank_t **,
+    wl_evaluation_control_source_retained_output_t *);
+
+/* Retained OP metadata has its own authenticated family; legacy issued and
+ * CLOSE continuations cannot consume it. Entry requires an empty context at
+ * its final address and the actual BANK birth slot. Initial refusal retains
+ * the active zero-work generation without publishing an automatic context.
+ * Accessible/aligned/exclusive/disjoint storage is required as above. */
+int wl_evaluation_control_source_metadata_enter_retained_owned(
+    wl_evaluation_control_source_bank_t **,
+    wl_evaluation_control_source_context_t *,
+    wl_evaluation_control_source_retained_output_t *);
+/* Convert only the genuine uncharged STANDBY generation, under its BANK lock
+ * and real saved-generation zero. No BEGIN, FINISH or observation ten is paid.
+ * Empty final-address context and output/storage rules match retained entry;
+ * protocol rejection leaves both untouched. Later continuation still proves
+ * the complete live tuple before actual metadata charges or actions. */
+int wl_evaluation_control_source_metadata_attach_retained_owned(
+    wl_evaluation_control_source_bank_t **,
+    wl_evaluation_control_source_context_t *,
+    wl_evaluation_control_source_retained_output_t *);
+/* Unowned/copy rejection leaves valid output storage and the owner unchanged;
+ * a foreign actor returns EBUSY without settling the rightful actor's context.
+ * After authenticating an owned context, even bad parameters (including NULL
+ * outputs) settle/unlink it and return positive protocol errno. Valid output
+ * storage then records actual FINISH_PENDING/report state, despite that errno;
+ * valid prepared/outcome storage records settled. No output may be inspected
+ * after an unowned rejection. Preparation/action outcomes remain separate from
+ * the real financial stop. Only a later owner handoff ACK reaches QUIESCENT. */
+int wl_evaluation_control_source_metadata_continue_retained_owned(
+    wl_evaluation_control_source_context_t *,
+    const wl_evaluation_control_source_phase_policy_t *,
+    wl_evaluation_control_source_metadata_prepare_fn, const void *,
+    wl_evaluation_control_source_metadata_preparation_t *,
+    wl_evaluation_control_source_retained_output_t *);
+
+/* Continue only the exact owned automatic OPEN context, in the same public
+ * frame. Every owned protocol/action/refusal exit settles and unbinds it.
+ * A copied/foreign context cannot close its real owner's active phase. */
+int wl_evaluation_control_source_metadata_continue_issued(
+    wl_evaluation_control_source_context_t *,
+    const wl_evaluation_control_source_phase_policy_t *,
+    wl_evaluation_control_source_metadata_prepare_fn, const void *,
+    wl_evaluation_control_source_metadata_preparation_t *);
+int wl_evaluation_control_source_metadata_continue_close_owned(
+    wl_evaluation_control_source_context_t *,
+    const wl_evaluation_control_source_phase_policy_t *,
+    wl_evaluation_control_source_metadata_prepare_fn, const void *,
+    wl_evaluation_control_source_metadata_preparation_t *);
+
+/* Bootstrap one unpublished canonical role in an owned OP phase. The
+ * preparation establishes the real cursor and exact slot before any body.
+ * Cursor4 observes completion without a positive charge or role call. */
+typedef struct {
+    unsigned *cursor;
+    unsigned before_cursor, after_cursor;
+    int preparation_protocol;
+    bool role_called, complete_selected, settled;
+} wl_evaluation_control_source_metadata_bind_outcome_t;
+typedef int (*wl_evaluation_control_source_metadata_bind_prepare_fn)(
+    void *, unsigned,
+    wl_evaluation_control_source_metadata_bind_outcome_t *);
+/* Same retained owned-error settlement and disjoint-storage contract above. */
+int wl_evaluation_control_source_metadata_bind_continue_retained_owned(
+    wl_evaluation_control_source_context_t *,
+    wl_evaluation_control_source_metadata_bind_prepare_fn,
+    wl_evaluation_control_source_metadata_bind_fn, void *,
+    wl_evaluation_control_source_metadata_bind_outcome_t *,
+    wl_evaluation_control_source_retained_output_t *);
+int wl_evaluation_control_source_metadata_bind_continue_issued(
+    wl_evaluation_control_source_context_t *,
+    wl_evaluation_control_source_metadata_bind_prepare_fn,
+    wl_evaluation_control_source_metadata_bind_fn, void *,
+    wl_evaluation_control_source_metadata_bind_outcome_t *);
 
 /* out is NULL-initialized exclusive external owning storage and must
  * outlive BANK. Its address is the immutable owner_slot; never move/copy
@@ -521,6 +750,60 @@ extern unsigned wl_evaluation_control_test_source_final_cancel_at;
 extern unsigned wl_evaluation_control_test_source_final_geometry_fault;
 /* Cancel the actual generic lexical BANK after its next called action. */
 extern bool wl_evaluation_control_test_source_lexical_cancel_after_action;
+/* Cancel after actual bootstrap admission, before CURRENT observes its stop. */
+extern bool wl_evaluation_control_test_source_lexical_cancel_before_action;
+/* 1 initial saved zero, 2..4 after preparation groups0..2;
+ * the role binder additionally uses5 after its fourth actual role packet. */
+extern unsigned wl_evaluation_control_test_source_metadata_cancel_at;
+/* Separate producer:1 first0,2 before10,3 after10,4 poll,5 final0. */
+extern unsigned wl_evaluation_control_test_source_observation_cancel_at;
+extern bool wl_evaluation_control_test_source_bank_destroy_cancel;
+/* Deliberately invalid financial callers. Statistics are observations only;
+ * no underlying BANK controller, context or usable funding pair is loaned. */
+typedef struct {
+    uint64_t counter, active_id, consumed, lane_id, charged;
+    bool verified;
+    wl_evaluation_control_report_t report;
+} wl_evaluation_control_source_metadata_probe_state_t;
+typedef struct {
+    wl_evaluation_control_source_metadata_probe_state_t before, after;
+    wl_evaluation_control_source_metadata_entry_t entry;
+} wl_evaluation_control_source_metadata_probe_t;
+int wl_evaluation_control_test_source_metadata_start_rejection(
+    wl_evaluation_control_source_bank_t *, wl_evaluation_control_source_lane_t,
+    unsigned fault, wl_evaluation_control_t *foreign, unsigned issuer,
+    wl_evaluation_control_source_metadata_probe_t *);
+/* Externally serialized test fixture for the observer's REQUIRED runtime
+ * class/owner/ref/saved-id/current-id/control checks. It never invalidates
+ * projected count/limit/context/report invariants and exports no control. */
+int wl_evaluation_control_test_source_standby_rejection(
+    wl_evaluation_control_source_bank_t **, unsigned,
+    wl_evaluation_control_source_retained_output_t *);
+int wl_evaluation_control_test_source_metadata_attach_rejection(
+    wl_evaluation_control_source_bank_t **, unsigned,
+    wl_evaluation_control_source_retained_output_t *);
+/* Serialized diagnostics of prior/published bytes, never a current-report ACK
+ * or funding loan. A false verified flag forbids interpreting history as the
+ * current generation's completed report. */
+typedef struct {
+    wl_evaluation_control_source_financial_state_t state;
+    uint64_t active_id, charged;
+    size_t bank_bytes;
+    bool verified;
+    wl_evaluation_control_report_t history;
+} wl_evaluation_control_source_financial_view_t;
+int wl_evaluation_control_test_source_financial_view(
+    wl_evaluation_control_source_bank_t **,
+    wl_evaluation_control_source_financial_view_t *);
+int wl_evaluation_control_test_source_financial_cancel(
+    wl_evaluation_control_source_bank_t **);
+int wl_evaluation_control_test_source_financial_readback_rejection(
+    wl_evaluation_control_source_bank_t **, unsigned,
+    wl_evaluation_control_source_retained_output_t *);
+int wl_evaluation_control_test_source_financial_rejection(
+    wl_evaluation_control_source_bank_t **, unsigned,
+    wl_evaluation_control_source_retained_output_t *);
+
 /* Genuine quiescent issuer reset after a completed injected CANCEL only. */
 int wl_evaluation_control_test_source_final_reset_cancel(
     wl_evaluation_control_source_bank_t *, wl_evaluation_control_source_lane_t);
@@ -574,5 +857,43 @@ typedef struct {
 wl_evaluation_control_attempt_begin_result_t
 wl_evaluation_control_begin_attempt(wl_evaluation_control_t *control,
     const void *owner);
+
+/* Reuse only an exclusively owned private NORMAL financial allocation's
+ * exact completed generation. Configuration, cancel reset and next BEGIN are
+ * one mutex transition; failures return ID0 and leave every field unchanged.
+ * Caller independently proves all callbacks/borrowers have returned. This
+ * supplies neither SOURCE provenance nor Native resource permission. */
+wl_evaluation_control_attempt_begin_result_t
+wl_evaluation_control_private_financier_rebegin(wl_evaluation_control_t *,
+    const void *owner, uint64_t allocation_identity, uint64_t completed_id,
+    uint64_t positive_limit);
+
+/* Read-only financial proof of an actual inactive positive NORMAL generation
+ * and its exact creation+attachment pair. Host independently owns the live
+ * allocation and serializes lifecycle/all borrowers through the following
+ * callback-free adoption. Success is not a retained permission or a SOURCE/
+ * Native capability; no charge, cancel poll, reference or state changes. */
+int wl_evaluation_control_private_financier_parked_owned(
+    wl_evaluation_control_t *, const void *owner,
+    uint64_t allocation_identity, uint64_t completed_id);
+
+/* Additive financial-only transitions. Host serializes lifecycle and proves
+ * all workers/borrowers have drained; none supplies Native/SOURCE authority.
+ * Output storage is trusted internal caller-owned writable memory, disjoint
+ * from the control allocation and all validated owner/id/phase fields. It is
+ * written only on success; foreign generations leave it unchanged. */
+int wl_evaluation_control_financier_finish_commit(wl_evaluation_control_t *,
+    const void *owner, uint64_t expected_id);
+int wl_evaluation_control_financier_report_owned(wl_evaluation_control_t *,
+    const void *owner, uint64_t expected_id,
+    wl_evaluation_control_report_t *out);
+/* Positive no-Native construction errors retain generic FINISH precedence.
+* SUCCESSOR_MISMATCH classifies only the local constructor result; it conveys
+* no report or permission over that foreign active/ended generation.
+* Returns strict positive OWN/ALREADY_ENDED/SUCCESSOR_MISMATCH classification;
+* negative errno is protocol refusal. Zero is never a successful result. */
+int wl_evaluation_control_construction_error_finish_commit(
+    wl_evaluation_control_t *, const void *owner, uint64_t expected_id,
+    int positive_error);
 
 #endif /* WL_EVALUATION_CONTROL_H */

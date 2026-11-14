@@ -546,9 +546,19 @@ wl_columnar_ops_lftj_attempt_preflight(const wl_plan_op_t *op,
     return 0;
 }
 
+enum {
+    WL_COLUMNAR_LFTJ_BEGIN_CLEAR_OFFSET =
+        offsetof(wl_columnar_lftj_attempt_t, registry_count),
+    WL_COLUMNAR_LFTJ_BEGIN_CLEAR_BYTES =
+        offsetof(wl_columnar_lftj_attempt_t, retirement)
+        - WL_COLUMNAR_LFTJ_BEGIN_CLEAR_OFFSET
+};
+/* The six skipped pointers are assigned below. Identity invalidation and the
+ * tail address add at most five fronts to the existing fixed112 cover. */
 typedef char wl_columnar_lftj_attempt_prefix_bound[
-        (offsetof(wl_columnar_lftj_attempt_t,
-        retirement)+7u)/8u+112u <= 256u ? 1 : -1];
+        WL_COLUMNAR_LFTJ_BEGIN_CLEAR_OFFSET
+        < offsetof(wl_columnar_lftj_attempt_t, retirement)
+        && (WL_COLUMNAR_LFTJ_BEGIN_CLEAR_BYTES+7u)/8u+117u <= 256u ? 1 : -1];
 
 int
 wl_columnar_ops_lftj_attempt_begin(wl_columnar_lftj_attempt_t *attempt,
@@ -568,12 +578,14 @@ wl_columnar_ops_lftj_attempt_begin(wl_columnar_lftj_attempt_t *attempt,
     }
     if (bindings && session->nrels > UINT32_MAX - bindings->count)
         return EOVERFLOW;
-    /* Actual context prefix only: the large retirement is intentionally
-     * historic until its later parent-authorized ZERO. Prefix clear141 plus
-     * fixed metadata/token/native/initializer/caller<=112 fits256. */
+    /* The header pointers are unconditionally assigned below. Clear only the
+     * remaining prefix; its largest qualified span is139 cells plus117 fixed
+     * fronts. The retirement remains historic until parent-authorized ZERO. */
     rc = wl_evaluation_control_charge_attempt(control, attempt_id, 256);
     if (rc) return rc;
-    memset(attempt, 0, offsetof(wl_columnar_lftj_attempt_t, retirement));
+    attempt->identity = NULL;
+    memset((unsigned char *)attempt + WL_COLUMNAR_LFTJ_BEGIN_CLEAR_OFFSET,
+        0, WL_COLUMNAR_LFTJ_BEGIN_CLEAR_BYTES);
     attempt->writer_drain.identity = NULL;
     attempt->retirement_initializer.identity = NULL;
     attempt->retirement_initializer.parent = NULL;
@@ -581,6 +593,8 @@ wl_columnar_ops_lftj_attempt_begin(wl_columnar_lftj_attempt_t *attempt,
     attempt->retirement_initializer.relation = NULL;
     attempt->retirement_initializer.thread_valid = false;
     attempt->retirement_initializer.busy = false;
+    attempt->retirement_initializer.zero_offset = 0;
+    attempt->retirement_initializer.token_index = 0;
     attempt->retirement_initializer.phase =
         WL_COLUMNAR_RELATION_SCALAR_INIT_INERT;
     attempt->retirement_started = attempt->retirement_committed =
@@ -644,6 +658,8 @@ wl_columnar_lftj_attempt_begin_prevalidated(wl_columnar_lftj_attempt_t *attempt,
     attempt->retirement_initializer.relation = NULL;
     attempt->retirement_initializer.thread_valid = false;
     attempt->retirement_initializer.busy = false;
+    attempt->retirement_initializer.zero_offset = 0;
+    attempt->retirement_initializer.token_index = 0;
     attempt->retirement_initializer.phase =
         WL_COLUMNAR_RELATION_SCALAR_INIT_INERT;
     attempt->retirement_started = attempt->retirement_committed =
@@ -1539,7 +1555,7 @@ wl_columnar_lftj_attempt_release(wl_columnar_lftj_attempt_t *a, bool *done,
             rc = wl_columnar_relation_scalar_retirement_init_step(i, a,
                     &a->retirement,
                     a->output, funding, funding_id, &begun);
-            if (!rc && begun) a->retirement_started = true;
+            if (begun) a->retirement_started = true;
             return rc;
         }
         rc = wl_columnar_lftj_attempt_cleanup_charge(funding, funding_id);
