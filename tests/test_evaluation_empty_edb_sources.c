@@ -24,6 +24,9 @@
 
 extern void (*wl_columnar_eval_stack_test_physical_publication)(
     wl_col_session_t *, const col_rel_t *, const col_rel_t *);
+extern void (*wl_columnar_session_test_observed_transaction_checkpoint)(
+    wl_evaluation_control_t *, unsigned, uint32_t,
+    const wl_columnar_eval_private_bindings_t *);
 
 /* ---- captures ------------------------------------------------------------ */
 
@@ -821,6 +824,169 @@ facts_width(bool loaded)
     fixture_destroy(&f);
 }
 
+/* ---- deterministic stops in the general observed transaction ------------- */
+
+/* The general observed transaction builds a private empty input for each
+ * bare EDB in its SCHEMA phase (7). The constructor's work tails are
+ * counted while that phase serves the chosen EDB; the k-th tail cancels,
+ * exhausts the work limit, or (mode 3) installs a governor blocker so the
+ * constructor's storage reservation is denied. */
+static uint32_t gen_index;
+static bool gen_armed;
+static unsigned gen_calls, gen_stop_at, gen_mode, gen_hits;
+static wl_columnar_memory_governor_t *gen_governor;
+static wl_columnar_memory_reservation_t gen_blocker;
+
+static void
+gen_phase(wl_evaluation_control_t *control, unsigned phase, uint32_t index,
+    const wl_columnar_eval_private_bindings_t *bindings)
+{
+    (void)control; (void)bindings;
+    gen_armed = phase == 7 && index == gen_index;
+}
+
+static void
+gen_work(wl_evaluation_control_t *control, uint64_t work)
+{
+    (void)work;
+    if (!gen_armed || ++gen_calls != gen_stop_at || !gen_mode)
+        return;
+    gen_hits++;
+    if (gen_mode == 3) {
+        uint64_t usable = atomic_load_explicit(&gen_governor->usable_bytes,
+                memory_order_relaxed);
+        uint64_t reserved = wl_columnar_memory_reserved(gen_governor);
+        CHECK(usable > reserved + 1);
+        wl_columnar_memory_reservation_init(&gen_blocker);
+        CHECK(wl_columnar_memory_reserve(gen_governor, usable - reserved - 1,
+            &gen_blocker));
+        return;
+    }
+    stop_hit = false; stop_mode = gen_mode;
+    request_stop(control);
+}
+
+static uint32_t
+edb_index(const fixture_t *f, const char *name)
+{
+    for (uint32_t i = 0; i < f->plan->edb_count; i++)
+        if (!strcmp(f->plan->edb_relations[i], name))
+            return i;
+    CHECK(false);
+    return 0;
+}
+
+/* Runs one call with the hooks; returns its rc and leaves gen_calls. */
+static int
+gen_call(fixture_t *f, bool snapshot, capture_t *image)
+{
+    wl_columnar_session_test_observed_transaction_checkpoint = gen_phase;
+    wl_columnar_relation_test_work_checkpoint = gen_work;
+    gen_armed = false; gen_calls = gen_hits = 0;
+    int rc = snapshot ? wl_session_snapshot(f->s, on_tuple, image)
+        : step(f->s);
+    wl_columnar_session_test_observed_transaction_checkpoint = NULL;
+    wl_columnar_relation_test_work_checkpoint = NULL;
+    return rc;
+}
+
+/* The constructor tails for bare EDB `which` of a kind on this route; 0
+ * when the route builds no private empty for it. */
+static unsigned
+gen_tails(unsigned kind, bool snapshot, unsigned which)
+{
+    fixture_t f;
+    fixture(&f, kind);
+    capture_t ev = {0}, image = {0};
+    if (!snapshot)
+        wl_session_set_delta_cb(f.s, on_delta, &ev);
+    gen_index = edb_index(&f, cases[kind].bare[which]);
+    gen_mode = 0;
+    CHECK(!gen_call(&f, snapshot, &image));
+    unsigned n = gen_calls;
+    fixture_destroy(&f);
+    return n;
+}
+
+static void
+gen_stopped(unsigned kind, bool snapshot, unsigned which, unsigned mode,
+    unsigned at)
+{
+    fixture_t f;
+    fixture(&f, kind);
+    where = "after a general stop";
+    capture_t ev = {0}, raw_ev = {0}, image = {0}, raw_image = {0};
+    if (!snapshot) {
+        wl_session_set_delta_cb(f.s, on_delta, &ev);
+        wl_session_set_delta_cb(f.raw, on_delta, &raw_ev);
+    }
+    col_relation_snapshot_t images[2] = {{0}};
+    for (unsigned i = 0; i < 2; i++)
+        if (bare_rel[i])
+            images[i] = wl_columnar_relation_snapshot(bare_rel[i]);
+    col_rel_t *old = session_find_rel((wl_col_session_t *)f.s, "out");
+    col_relation_snapshot_t old_image = wl_columnar_relation_snapshot(old);
+    gen_index = edb_index(&f, cases[kind].bare[which]);
+    gen_mode = mode; gen_stop_at = at;
+    gen_governor = wl_columnar_memory_governor_ref_get(f.governor);
+    stop_mode = 0; stop_at = NULL;
+    int rc = gen_call(&f, snapshot, &image);
+    stop_mode = 0; gen_mode = 0;
+    int expected = mode == 1 ? WL_EVALUATION_CONTROL_CANCELLED
+        : mode == 2 ? WL_EVALUATION_CONTROL_WORK_LIMIT : ENOSPC;
+    if (rc != expected || gen_hits != 1)
+        fprintf(stderr, "kind%u snapshot%u bare%u mode%u at %u: rc %d, "
+            "hits %u\n", kind, snapshot, which, mode, at, rc, gen_hits);
+    CHECK(gen_hits == 1 && rc == expected);
+    CHECK(!ev.count && !image.count);
+    still_bare(&f, kind, images);
+    CHECK(session_find_rel((wl_col_session_t *)f.s, "out") == old);
+    if (old)
+        CHECK(wl_columnar_relation_snapshot_equal(old_image,
+            wl_columnar_relation_snapshot(old)));
+    if (mode == 3) {
+        /* The denial is reported as one, as for a denied MAP scratch. */
+        CHECK(wl_session_budget_denied(f.s));
+        CHECK(wl_columnar_memory_release(&gen_blocker));
+    } else {
+        CHECK(!wl_session_budget_denied(f.s));
+        wl_evaluation_control_report_t report = {0}, again = {0};
+        CHECK(!wl_evaluation_control_report(f.control, &report));
+        CHECK(report.result == expected && report.stop_reason == expected
+            && !report.cleanup_status);
+        CHECK(!wl_evaluation_control_report(f.control, &again));
+        CHECK(!memcmp(&report, &again, sizeof(report)));
+    }
+    CHECK(!wl_evaluation_control_reset(f.control));
+    int retry = snapshot ? wl_session_snapshot(f.s, on_tuple, &image)
+        : step(f.s);
+    int raw = snapshot ? wl_session_snapshot(f.raw, on_tuple, &raw_image)
+        : step(f.raw);
+    CHECK(!retry && !raw);
+    if (snapshot)
+        equal_capture(&image, &raw_image, "image after a general stop", kind);
+    else
+        equal_capture(&ev, &raw_ev, "events after a general stop", kind);
+    still_bare(&f, kind, images);
+    same_head(&f, kind);
+    /* The first insert after the stop. */
+    const int64_t rows[] = {9, 10};
+    unsigned width = edb_width(kind);
+    CHECK(!wl_session_insert(f.s, cases[kind].bare[which], rows, 2 / width,
+        width));
+    CHECK(!wl_session_insert(f.raw, cases[kind].bare[which], rows,
+        2 / width, width));
+    CHECK(!(snapshot ? wl_session_snapshot(f.s, on_tuple, &image)
+        : step(f.s)));
+    CHECK(!(snapshot ? wl_session_snapshot(f.raw, on_tuple, &raw_image)
+        : step(f.raw)));
+    capture_t a = {0}, b = {0};
+    head_capture(f.s, &a);
+    head_capture(f.raw, &b);
+    equal_capture(&a, &b, "head after a general stop", kind);
+    fixture_destroy(&f);
+}
+
 static unsigned
 empty_calls_of(unsigned kind, unsigned *constructor_calls)
 {
@@ -870,6 +1036,17 @@ run_matrix(void)
 static void
 run_stops(unsigned kind)
 {
+    /* Every SNAPSHOT, and the observed STEPs that take the general observed
+     * transaction, build a private empty for each bare EDB; a denied
+     * reservation there is reported as a budget denial. */
+    for (unsigned snapshot = 0; snapshot < 2; snapshot++)
+        for (unsigned which = 0; which < bare_count(kind); which++) {
+            unsigned n = gen_tails(kind, snapshot, which);
+            if (snapshot)
+                CHECK(n > 0);
+            if (n)
+                gen_stopped(kind, snapshot, which, 3, 1);
+        }
     for (unsigned mode = 1; mode < 3; mode++) {
         /* At the consumer's publication, or at CONCAT for a UNION. */
         if (cases[kind].first != WL_PLAN_OP_REDUCE)
