@@ -103,7 +103,12 @@ add(capture_t *c, unsigned width, const int64_t *v, int diff)
 /* K_FLOAT_PAIR and K_STRING_PAIR give the inline slots declared types:
  * session creation gives the source those lane types, and MAP carries
  * them to the head. */
-enum { K_PAIR, K_UNION, K_WIDE, K_FLOAT_PAIR, K_STRING_PAIR, K_COUNT };
+/* K_NARROW projects column 0 of a three-lane INLINE source and K_BOX
+ * reads a one-lane INLINE source. */
+enum {
+    K_PAIR, K_UNION, K_WIDE, K_FLOAT_PAIR, K_STRING_PAIR, K_NARROW, K_BOX,
+    K_COUNT
+};
 
 static const char *const programs[K_COUNT] = {
     ".decl a(id:int64,p:pair/2 inline)\n"
@@ -124,6 +129,12 @@ static const char *const programs[K_COUNT] = {
     ".decl a(id:int64,p:pair(symbol,int64) inline)\n"
     ".decl out(id:int64,x:symbol,y:int64)\n"
     "out(i,x,y) :- a(i,pair(x,y)).\n",
+    ".decl a(id:int64,p:pair/2 inline)\n"
+    ".decl out(id:int64)\n"
+    "out(i) :- a(i,pair(x,y)).\n",
+    ".decl a(b:box/1 inline)\n"
+    ".decl out(v:int64)\n"
+    "out(v) :- a(box(v)).\n",
 };
 
 /* Physical rows for a. The duplicate row collapses under set semantics. */
@@ -139,10 +150,12 @@ static const int64_t wide_rows[] = {
     1, 7, 100, 101, 102, 11, 12, 13, 14, 15, 16, 17,
 };
 
+static const int64_t box_rows[] = {4, -1, 4, 0};
+
 static unsigned
 physical_width(unsigned kind)
 {
-    return kind == K_WIDE ? 12u : 3u;
+    return kind == K_WIDE ? 12u : kind == K_BOX ? 1u : 3u;
 }
 
 /* The typed kinds use the rows of pair_rows with one slot replaced: the y
@@ -191,6 +204,8 @@ populate(wl_session_t *s, unsigned kind, bool empty)
 {
     if (!empty && kind == K_WIDE)
         CHECK(!wl_session_insert(s, "a", wide_rows, 3, 12));
+    else if (!empty && kind == K_BOX)
+        CHECK(!wl_session_insert(s, "a", box_rows, 4, 1));
     else if (!empty)
         CHECK(!wl_session_insert(s, "a", rows_of(kind), 4, 3));
     if (kind == K_UNION)
@@ -204,6 +219,18 @@ literal(unsigned kind, bool empty, capture_t *e)
         if (kind == K_UNION) {
             add(e, 3, &union_rows[0], 1); add(e, 3, &union_rows[3], 1);
         }
+        return;
+    }
+    if (kind == K_BOX) {
+        for (unsigned r = 0; r < 4; r++)
+            if (r != 2)
+                add(e, 1, &box_rows[r], 1);
+        return;
+    }
+    if (kind == K_NARROW) {
+        for (unsigned r = 0; r < 4; r++)
+            if (r != 2)
+                add(e, 1, &pair_rows[r * 3], 1);
         return;
     }
     if (kind == K_WIDE) {

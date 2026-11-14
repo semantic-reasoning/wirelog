@@ -2795,3 +2795,13 @@ before.
 columns with the stops of the other bodies, and runs it through the
 `untyped_rows` rounds, comparing head rows, width and type, the SNAPSHOT image
 and the observed STEP events with the uncontrolled session.
+
+A column-0 projection of a two-column EDB, such as `out(x) :- a(x,y).`, is
+classified for the legacy observed route. Its preflight refuses a declared
+width other than 1 before the step evaluates anything, and the observed STEP
+then runs in the general observed transaction. `evaluation_empty_edb_sources`
+runs that body, the same body beside a declared EDB it does not read, and
+`out(x + 1)` over a two-column EDB and beside such an EDB, in all four columns
+with the stops and the `untyped_rows` rounds. `evaluation_compound_sources`
+runs a column-0 projection of an INLINE pair and a body over a one-lane INLINE
+box through its matrix.
