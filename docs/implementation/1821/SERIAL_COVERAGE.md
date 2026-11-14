@@ -2865,8 +2865,8 @@ a rule body, with neither a declaration nor facts, has no plan EDB. With the
 facts loaded both sessions refuse an insert of another width; while the EDB is
 never inserted both take the width of its first insert. The parser refuses a
 compound term as a fact argument ("fact arguments must be constants"), so facts
-reach a compound column only as flat lanes. Relations without a declaration
-that have both facts and rules were not traced.
+reach a compound column only as flat lanes. A rule head that also has inline
+facts, declared or not, is also a plan EDB; see the end of this section.
 
 `evaluation_empty_edb_sources` runs single-rule, two-column, integer
 expression and FILTER bodies over a facts EDB, never inserted, in all four
@@ -2899,3 +2899,21 @@ in an EDB declared with an inline compound column, which session creation gives
 its INLINE layout before the facts load, so MAP reads an INLINE source, and a
 nullary facts EDB `flag().` under a nullary head, declared and undeclared,
 through a nullary insert, removal and reinsert.
+
+A rule head that also has inline facts, such as the fact `out(7).` beside the
+rule `out(x) :- a(x).`, holds them in its seed shadow, and the plan lists it as
+an EDB too, whether `out` is declared or not. The uncontrolled session derives
+the rule's rows beside the facts. With the facts not loaded, its first STEP or
+SNAPSHOT returned EINVAL: the head was a bare EDB without a schema, and the
+non-recursive append into it took the rule's width only for a recursive head.
+The append now gives such a head the rule's width either way. The physical seed
+actor, which no library caller hosts yet, still refuses that width change with
+EINVAL, and `evaluation_seed_physical` expects that refusal beside the
+uncontrolled success when its target has no schema. The controlled session
+refuses these bodies with ENOTSUP or EINVAL before it publishes anything, with
+the facts loaded or not; the general observed transaction, for one, finds the
+head's name among the EDB names and returns EINVAL. Controlled evaluation of
+heads with input stays open in #2301. `evaluation_facts_sources` runs three
+such programs through STEP and SNAPSHOT, observed and unobserved, loaded and
+not, and checks the refusal with nothing published and the uncontrolled rows
+before and after an insert into the body's EDB.

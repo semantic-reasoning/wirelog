@@ -1,15 +1,16 @@
 /* #2301: EDBs whose rows come from inline facts, through controlled
  * sessions.
  *
- * Each program is run through a controlled session and an uncontrolled
- * session over the same plan, with the facts loaded into both or into
- * neither. A script of STEPs (or evaluating SNAPSHOTs), inserts and
+ * Each program of programs[] is run through a controlled session and an
+ * uncontrolled session over the same plan, with the facts loaded into both
+ * or into neither. A script of STEPs (or evaluating SNAPSHOTs), inserts and
  * removals is applied to both: every call must return the same code in both
  * sessions, and after each evaluation the head images must agree, as must
  * the observer events of an observed STEP. A controlled evaluating SNAPSHOT
  * that the general private-head transaction serves delivers observer events
  * (#2295) while the uncontrolled one fires none, so events are compared on
- * the STEP only. */
+ * the STEP only. Each head of head_input_programs[] has both inline facts
+ * and a rule, a body the controlled session refuses; see head_input(). */
 #include "../wirelog/columnar/internal.h"
 #include "../wirelog/exec_plan_gen.h"
 #include "../wirelog/session.h"
@@ -325,6 +326,74 @@ static const program_t programs[] = {
     },
 };
 
+/* A rule head that also has inline facts holds them in its seed shadow
+ * (#1994, #2100). The plan lists such a head as an EDB as well, declared or
+ * not. The uncontrolled session derives the rule's rows beside the facts,
+ * and with the facts not loaded it derives the rule's rows alone. The
+ * controlled session refuses the body with ENOTSUP or EINVAL before it
+ * publishes anything; the general observed transaction, for one, finds the
+ * head's name among the EDBs and returns EINVAL. Heads with input stay open
+ * in #2301. */
+static const char *const head_input_programs[] = {
+    "a(1).\na(2).\nout(7).\nout(x) :- a(x).\n",
+    ".decl a(x:int64)\n.decl out(x:int64)\n"
+    "a(1).\na(2).\nout(7).\nout(x) :- a(x).\n",
+    "a(1).\na(2).\n.decl out(x:int64)\nout(7).\nout(x) :- a(x).\n",
+};
+
+static void
+head_input(unsigned which, bool snapshot, bool observed, bool loaded)
+{
+    fixture_t f;
+    fixture(&f, head_input_programs[which]);
+    char label[64];
+    snprintf(label, sizeof(label), "head input %u snapshot%u observed%u "
+        "loaded%u", which, snapshot, observed, loaded);
+    where = label;
+    if (loaded) {
+        CHECK(wl_session_load_facts(f.s, f.program) == 0);
+        CHECK(wl_session_load_facts(f.raw, f.program) == 0);
+    }
+    capture_t ev = {.head = "out"}, raw_ev = {.head = "out"};
+    if (observed) {
+        wl_session_set_delta_cb(f.s, on_delta, &ev);
+        wl_session_set_delta_cb(f.raw, on_delta, &raw_ev);
+    }
+    col_rel_t *old = session_find_rel((wl_col_session_t *)f.s, "out");
+    col_relation_snapshot_t old_image = wl_columnar_relation_snapshot(old);
+    capture_t img = {.head = "out"};
+    int rc = snapshot ? wl_session_snapshot(f.s, on_tuple, &img) : step(f.s);
+    if (rc != ENOTSUP && rc != EINVAL)
+        fprintf(stderr, "%s: rc %d\n", where, rc);
+    CHECK((rc == ENOTSUP || rc == EINVAL) && !img.count && !ev.count);
+    CHECK(session_find_rel((wl_col_session_t *)f.s, "out") == old);
+    CHECK(wl_columnar_relation_snapshot_equal(old_image,
+        wl_columnar_relation_snapshot(old)));
+    /* The uncontrolled rows: the facts with the rule's rows, then an insert
+     * into the body's EDB. */
+    static const int64_t first[] = {1, 2, 7}, second[] = {1, 2, 3, 7};
+    for (unsigned round = 0; round < 2; round++) {
+        if (round) {
+            const int64_t row[] = {3};
+            CHECK(!wl_session_insert(f.raw, "a", row, 1, 1));
+        }
+        capture_t raw_img = {.head = "out"};
+        rc = snapshot ? wl_session_snapshot(f.raw, on_tuple, &raw_img)
+            : step(f.raw);
+        if (rc)
+            fprintf(stderr, "%s round %u: raw rc %d\n", where, round, rc);
+        CHECK(!rc);
+        capture_t got, expect = {.head = "out"};
+        image(f.raw, "out", &got);
+        const int64_t *rows = round ? second : first;
+        for (unsigned r = 0; r < (round ? 4u : 3u); r++)
+            if (loaded ? true : rows[r] == 3)
+                on_delta("out", &rows[r], 1, 1, &expect);
+        equal_capture(&got, &expect, "uncontrolled head");
+    }
+    fixture_destroy(&f);
+}
+
 int
 main(void)
 {
@@ -333,6 +402,11 @@ main(void)
             for (unsigned observed = 0; observed < 2; observed++)
                 for (unsigned loaded = 0; loaded < 2; loaded++)
                     run_program(&programs[p], snapshot, observed, loaded);
+    for (unsigned p = 0; p < 3; p++)
+        for (unsigned snapshot = 0; snapshot < 2; snapshot++)
+            for (unsigned observed = 0; observed < 2; observed++)
+                for (unsigned loaded = 0; loaded < 2; loaded++)
+                    head_input(p, snapshot, observed, loaded);
     puts("evaluation_facts_sources: OK");
     return 0;
 }
