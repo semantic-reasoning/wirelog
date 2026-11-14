@@ -581,4 +581,8 @@ and MAP do, so bodies with a FILTER between VARIABLE and MAP over an inline
 compound EDB, and a COUNT or a JOIN after such a FILTER, evaluate instead of
 returning ENOTSUP; see "Inline compound sources through VARIABLE and MAP
 (#2301)". JOIN, SEMIJOIN/ANTIJOIN, REDUCE and LFTJ reading an INLINE input
-directly remain with #2300.
+directly remain with #2300. It compares facts EDBs, among them flat facts in an
+inline compound column and nullary facts, with the uncontrolled session, and
+fixes an uncontrolled STEP that returned EINVAL for a rule head whose inline
+facts were not loaded. Controlled evaluation of a rule head that also holds
+input is refused and stays open with #2301.

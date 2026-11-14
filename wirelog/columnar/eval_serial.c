@@ -1917,7 +1917,10 @@ wl_columnar_eval_serial_framed_relation_internal(const wl_plan_relation_t *rp,
                 goto done;
             *result = eval_stack_pop(stack);
         }
-        if (recursive && target->ncols == 0 && result->rel->ncols > 0) {
+        /* A head that is also a plan EDB, such as one whose inline facts
+         * were never loaded, has no schema until its first row; it takes
+         * the rule's width, recursive or not (#2301). */
+        if (target->ncols == 0 && result->rel->ncols > 0) {
             rc = col_rel_set_schema(target, result->rel->ncols,
                     (const char *const *)result->rel->col_names);
             if (rc != 0)

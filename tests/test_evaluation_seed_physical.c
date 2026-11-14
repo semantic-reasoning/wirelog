@@ -649,8 +649,13 @@ static int run(unsigned k, unsigned loaded, unsigned observed, unsigned ts) {
     if (untyped_target && !result.rel) CHECK(rc);
     if (injection_mode != 6 && (!untyped_target || result.rel))
         raw_rc = raw_reference(raw, rt, result.rel);
+    /* A head that is also a plan EDB can have no schema before its first
+     * row. The raw STEP gives it the rule's width (#2301); this actor still
+     * refuses the width change, and no library caller hosts it yet. */
+    bool unschemaed = !untyped_target && !t->ncols;
     if (!injection_mode && !allocation_failure &&
-        !malformed_format && !paid_enabled) CHECK(rc == raw_rc);
+        !malformed_format && !paid_enabled)
+        CHECK(unschemaed ? rc == EINVAL && !raw_rc : rc == raw_rc);
     if (malformed_format)CHECK(rc == ENOTSUP);
     col_rel_t *out = NULL; if (!rc){
         bool ready = false; for (unsigned i = 0;
