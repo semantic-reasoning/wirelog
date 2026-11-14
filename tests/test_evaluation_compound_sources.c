@@ -423,9 +423,14 @@ run_case(unsigned kind, bool snapshot, bool observed, bool empty,
 
 /* Consumers that still refuse an INLINE input keep a typed ENOTSUP: the
  * controlled session publishes nothing and leaves the source as it was,
- * while the uncontrolled session computes the rows (open in #2301). */
+ * while the uncontrolled session computes the rows (open in #2301). Each
+ * route is run: the observed STEP, the unobserved STEP and the evaluating
+ * SNAPSHOT. */
+enum { R_OBSERVED, R_UNOBSERVED, R_SNAPSHOT, R_COUNT };
+
 static void
-refused_consumer(const char *text, const char *head, unsigned want_rows)
+refused_consumer(const char *text, const char *head, unsigned want_rows,
+    unsigned route)
 {
     wirelog_error_t error;
     wirelog_program_t *program = wirelog_parse_string(text, &error);
@@ -458,16 +463,40 @@ refused_consumer(const char *text, const char *head, unsigned want_rows)
     source_t src;
     source_save(&src, s);
     capture_t events = {.head = head}, raw_events = {.head = head};
-    wl_session_set_delta_cb(s, on_delta, &events);
-    wl_session_set_delta_cb(raw, on_delta, &raw_events);
+    if (route == R_OBSERVED) {
+        wl_session_set_delta_cb(s, on_delta, &events);
+        wl_session_set_delta_cb(raw, on_delta, &raw_events);
+    }
     col_rel_t *old = session_find_rel((wl_col_session_t *)s, head);
-    int rc = step(s);
+    int rc = route == R_SNAPSHOT ? wl_session_snapshot(s, on_tuple, &events)
+        : step(s);
     if (rc != ENOTSUP)
-        fprintf(stderr, "%s: rc %d, expected ENOTSUP\n", head, rc);
+        fprintf(stderr, "%s route %u: rc %d, expected ENOTSUP\n", head,
+            route, rc);
     CHECK(rc == ENOTSUP && !events.count);
     source_kept(&src, s, true);
     CHECK(session_find_rel((wl_col_session_t *)s, head) == old);
-    CHECK(!step(raw) && raw_events.count == want_rows);
+    if (route == R_SNAPSHOT) {
+        /* An evaluating SNAPSHOT that failed after admission may only be
+         * retried as SNAPSHOT: mutations and STEP wait
+         * (test_evaluation_map_recovery pins the same state). */
+        CHECK(s->backend->session_controlled_step_state(s)
+            == WL_CONTROLLED_STEP_SNAPSHOT_RETRYABLE);
+        CHECK(wl_session_insert(s, "b", b, 1, 2) == EBUSY);
+        CHECK(step(s) == EBUSY);
+        source_kept(&src, s, true);
+        CHECK(!wl_session_snapshot(raw, on_tuple, &raw_events));
+    } else {
+        CHECK(!step(raw));
+    }
+    if (route == R_UNOBSERVED) {
+        col_rel_t *raw_head = session_find_rel((wl_col_session_t *)raw,
+                head);
+        CHECK(!raw_events.count && raw_head
+            && raw_head->nrows == want_rows);
+    } else {
+        CHECK(raw_events.count == want_rows);
+    }
     CHECK(!wl_session_try_destroy(&s));
     wl_session_destroy(raw);
     wl_evaluation_control_release(control);
@@ -554,8 +583,6 @@ scale(void)
     }
     CHECK(!wl_session_insert(f.s, "a", rows, 330, 3));
     CHECK(!wl_session_insert(f.raw, "a", rows, 330, 3));
-    static capture_t image, raw_image;
-    memset(&image, 0, sizeof(image)); memset(&raw_image, 0, sizeof(raw_image));
     CHECK(!step(f.s) && !step(f.raw));
     col_rel_t *head = session_find_rel((wl_col_session_t *)f.s, "out");
     col_rel_t *raw_head = session_find_rel((wl_col_session_t *)f.raw, "out");
@@ -739,12 +766,14 @@ main(void)
     compound_stops();
     map_scratch_denial();
     /* x > 0 keeps ids 1 and 2; the join matches x = 10 and x = 30. */
-    refused_consumer(".decl a(id:int64,p:pair/2 inline)\n"
-        ".decl b(k:int64,v:int64)\n.decl f(id:int64,y:int64)\n"
-        "f(i,y) :- a(i,pair(x,y)), x > 0.\n", "f", 2);
-    refused_consumer(".decl a(id:int64,p:pair/2 inline)\n"
-        ".decl b(k:int64,v:int64)\n.decl j(id:int64,z:int64)\n"
-        "j(i,z) :- a(i,pair(x,y)), b(x,z).\n", "j", 2);
+    for (unsigned route = 0; route < R_COUNT; route++) {
+        refused_consumer(".decl a(id:int64,p:pair/2 inline)\n"
+            ".decl b(k:int64,v:int64)\n.decl f(id:int64,y:int64)\n"
+            "f(i,y) :- a(i,pair(x,y)), x > 0.\n", "f", 2, route);
+        refused_consumer(".decl a(id:int64,p:pair/2 inline)\n"
+            ".decl b(k:int64,v:int64)\n.decl j(id:int64,z:int64)\n"
+            "j(i,z) :- a(i,pair(x,y)), b(x,z).\n", "j", 2, route);
+    }
     puts("evaluation_compound_sources: OK");
     return 0;
 }
