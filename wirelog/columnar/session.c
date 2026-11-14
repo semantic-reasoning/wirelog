@@ -345,8 +345,7 @@ typedef struct {
     uint32_t rollback_index;
     int rollback_result;
     uint32_t image_cap, image_count;
-    wl_evaluation_control_t *maintenance;
-    uint64_t maintenance_id, generation, closed_generation;
+    uint64_t generation, closed_generation;
     uint32_t head_count, op_count, count, old_count;
     uint32_t si, ri, index, other, op, head, filled_heads, filled_ops;
     size_t byte;
@@ -13041,8 +13040,10 @@ wl_columnar_session_test_snapshot_finish_retained_view(
     const wl_columnar_session_observed_origin_t *o = &step->observed_origin;
     const wl_columnar_session_observed_transaction_t *tx = step->transaction;
     out[0] = (uintptr_t)tx; out[1] = (uintptr_t)o->transaction;
-    out[2] = tx ? (uintptr_t)tx->maintenance : 0;
-    out[3] = tx ? tx->maintenance_id : 0;
+    /* Slots 2/3 described the retired private transaction maintenance
+     * control; MAIN funds that work now, so they stay reserved zero. */
+    out[2] = 0;
+    out[3] = 0;
     out[4] = (uintptr_t)o->terminal_funding.control;
     out[5] = o->terminal_funding.id;
     out[6] = (uintptr_t)o->terminal_maintenance.control;
@@ -16299,8 +16300,8 @@ wl_columnar_session_observed_cancel_claims(wl_columnar_controlled_step_t *step,
         rc = wl_columnar_session_retirement_completed_result(step, p);
         if (rc) return rc;
         if (p->identity) {
-            rc = wl_columnar_session_retirement_drive(step, p, tx->maintenance,
-                    tx->maintenance_id, 2);
+            rc = wl_columnar_session_retirement_drive(step, p, NULL,
+                    0, 2);
             if (rc) return rc;
         }
         tx->rollback_index++;
@@ -18411,7 +18412,7 @@ wl_columnar_session_observed_action(wl_col_session_t *sess,
             if (original->retire && !original->retirement_done) {
                 rc = wl_columnar_session_retirement_drive(step,
                         &original->retirement_progress,
-                        tx->maintenance, tx->maintenance_id, 1);
+                        NULL, 0, 1);
                 if (rc) return rc;
                 original->retirement_done = true;
             } else if (!original->retire && original->relation) {
@@ -18426,7 +18427,7 @@ wl_columnar_session_observed_action(wl_col_session_t *sess,
         if (tx->append_delta || tx->round_owner == &tx->append_delta) {
             rc = wl_columnar_session_recursive_retire(step, tx,
                     &tx->append_delta,
-                    tx->maintenance, tx->maintenance_id);
+                    NULL, 0);
             if (rc) return rc;
             return 0;
         }
@@ -18447,8 +18448,8 @@ wl_columnar_session_observed_action(wl_col_session_t *sess,
                         entry->public_relation, 4, tx->index);
                 if (rc) return rc;
                 rc = wl_columnar_session_retirement_drive(step, p,
-                        tx->maintenance,
-                        tx->maintenance_id, 1);
+                        NULL,
+                        0, 1);
                 if (rc) return rc;
             }
             tx->index++; return 0;
@@ -23199,18 +23200,10 @@ wl_columnar_session_terminal_action(wl_col_session_t *sess,
     case WL_COLUMNAR_SESSION_TERMINAL_FRONTIER_SOURCES:
         free(tx->frontier_sources); tx->frontier_sources = NULL; break;
     case WL_COLUMNAR_SESSION_TERMINAL_RETRY:
-        /* Transfer the real creation obligation; its attachment owner remains
-         * the still-live tx until matching-generation DETACH completes. */
-        if (tx->maintenance) {
-            wl_columnar_session_financier_t *f = &o->terminal_maintenance;
-            if (f->outer_source.ready ||
-                f->snapshot_financial_stop) return EBUSY;
-            f->control = tx->maintenance; f->id = tx->maintenance_id;
-            f->owner = tx; f->report_valid = false;
-            wl_columnar_session_financier_outer_start(f);
-            f->phase = WL_COLUMNAR_SESSION_FINANCE_CLOSE_FINISH;
-            tx->maintenance = NULL; tx->maintenance_id = 0;
-        }
+        /* The transaction owns no private maintenance control any more; its
+         * maintenance is MAIN-funded, so this stage has nothing to transfer.
+         * It stays a stage so the terminal sequence and its charges are
+         * unchanged. */
         break;
     case WL_COLUMNAR_SESSION_TERMINAL_METADATA_MOVE:
         if (tx->metadata_credit.identity == &tx->metadata_credit) {
@@ -23229,8 +23222,8 @@ wl_columnar_session_terminal_action(wl_col_session_t *sess,
         } else if (tx->metadata_admitted) return EINVAL;
         break;
     case WL_COLUMNAR_SESSION_TERMINAL_TX_FREE:
-        if (o->terminal_maintenance.control || o->terminal_maintenance.phase
-            || (o->terminal_full_header && tx->maintenance)) return EBUSY;
+        if (o->terminal_maintenance.control || o->terminal_maintenance.phase)
+            return EBUSY;
 #ifdef WL_SESSION_TEST_HOOKS
         if (step->observed_observer.identity
             && wl_columnar_session_test_observer_parent_free)
@@ -24535,8 +24528,8 @@ wl_columnar_session_observed_dispose(wl_col_session_t *sess,
             bool committed = p->physical_done
                 || (p->begun && !p->cancel_clear &&
                 original->retirement.committed);
-            rc = wl_columnar_session_retirement_drive(step, p, tx->maintenance,
-                    tx->maintenance_id, committed ? 1 : 2);
+            rc = wl_columnar_session_retirement_drive(step, p, NULL,
+                    0, committed ? 1 : 2);
             if (rc) return rc;
             if (committed) original->retirement_done = true;
         }
@@ -24549,14 +24542,14 @@ wl_columnar_session_observed_dispose(wl_col_session_t *sess,
     if (tx->phase >= WL_SESSION_OBSERVED_SCHEMA && tx->heads) {
         if (tx->round_owner) {
             rc = wl_columnar_session_recursive_retire(step, tx, tx->round_owner,
-                    tx->maintenance, tx->maintenance_id);
+                    NULL, 0);
             if (rc) return rc;
         }
         while (tx->cleanup_round < tx->head_count) {
             col_rel_t **owner = &tx->heads[tx->cleanup_round].previous;
             if (*owner) {
                 rc = wl_columnar_session_recursive_retire(step, tx, owner,
-                        tx->maintenance, tx->maintenance_id);
+                        NULL, 0);
                 if (rc) return rc;
             }
             wl_columnar_session_observed_head_t *head =
@@ -24564,13 +24557,13 @@ wl_columnar_session_observed_dispose(wl_col_session_t *sess,
             if (head->frontier || tx->round_owner == &head->frontier) {
                 rc = wl_columnar_session_recursive_retire(step, tx,
                         &head->frontier,
-                        tx->maintenance, tx->maintenance_id);
+                        NULL, 0);
                 if (rc) return rc;
             }
             if (head->next_frontier) {
                 rc = wl_columnar_session_recursive_retire(step, tx,
                         &head->next_frontier,
-                        tx->maintenance, tx->maintenance_id);
+                        NULL, 0);
                 if (rc) return rc;
             }
             tx->cleanup_round++;
@@ -24579,7 +24572,7 @@ wl_columnar_session_observed_dispose(wl_col_session_t *sess,
     }
     if (tx->append_delta) {
         rc = wl_columnar_session_recursive_retire(step, tx, &tx->append_delta,
-                tx->maintenance, tx->maintenance_id);
+                NULL, 0);
         if (rc) return rc;
         return EAGAIN;
     }
@@ -24588,7 +24581,7 @@ wl_columnar_session_observed_dispose(wl_col_session_t *sess,
     if (rc) return rc;
     if (tx->disposal_progress.identity) {
         rc = wl_columnar_session_retirement_drive(step, &tx->disposal_progress,
-                tx->maintenance, tx->maintenance_id, 1);
+                NULL, 0, 1);
         return rc ? rc : EAGAIN;
     }
     uint32_t entries = tx->phase < WL_SESSION_OBSERVED_SCHEMA ? 0 : tx->count;
@@ -24614,7 +24607,7 @@ wl_columnar_session_observed_dispose(wl_col_session_t *sess,
             if (rc) return rc;
             rc = wl_columnar_session_retirement_drive(step,
                     &tx->disposal_progress,
-                    tx->maintenance, tx->maintenance_id, 1);
+                    NULL, 0, 1);
             if (rc) return rc;
         }
         tx->dispose_index++;
@@ -24676,8 +24669,8 @@ wl_columnar_session_native_error_observed_dispose(wl_col_session_t *sess,
                 || (p->begun && !p->cancel_clear &&
                 original->retirement.committed);
             rc = wl_columnar_session_native_error_retirement_drive(step, p,
-                    tx->maintenance,
-                    tx->maintenance_id, committed ? 1 : 2);
+                    NULL,
+                    0, committed ? 1 : 2);
             if (rc) return rc;
             if (committed) original->retirement_done = true;
         }
@@ -24691,7 +24684,7 @@ wl_columnar_session_native_error_observed_dispose(wl_col_session_t *sess,
         if (tx->round_owner) {
             rc = wl_columnar_session_native_error_recursive_retire(step, tx,
                     tx->round_owner,
-                    tx->maintenance, tx->maintenance_id);
+                    NULL, 0);
             if (rc) return rc;
         }
         while (tx->cleanup_round < tx->head_count) {
@@ -24699,7 +24692,7 @@ wl_columnar_session_native_error_observed_dispose(wl_col_session_t *sess,
             if (*owner) {
                 rc = wl_columnar_session_native_error_recursive_retire(step, tx,
                         owner,
-                        tx->maintenance, tx->maintenance_id);
+                        NULL, 0);
                 if (rc) return rc;
             }
             wl_columnar_session_observed_head_t *head =
@@ -24707,13 +24700,13 @@ wl_columnar_session_native_error_observed_dispose(wl_col_session_t *sess,
             if (head->frontier || tx->round_owner == &head->frontier) {
                 rc = wl_columnar_session_native_error_recursive_retire(step, tx,
                         &head->frontier,
-                        tx->maintenance, tx->maintenance_id);
+                        NULL, 0);
                 if (rc) return rc;
             }
             if (head->next_frontier) {
                 rc = wl_columnar_session_native_error_recursive_retire(step, tx,
                         &head->next_frontier,
-                        tx->maintenance, tx->maintenance_id);
+                        NULL, 0);
                 if (rc) return rc;
             }
             tx->cleanup_round++;
@@ -24723,7 +24716,7 @@ wl_columnar_session_native_error_observed_dispose(wl_col_session_t *sess,
     if (tx->append_delta) {
         rc = wl_columnar_session_native_error_recursive_retire(step, tx,
                 &tx->append_delta,
-                tx->maintenance, tx->maintenance_id);
+                NULL, 0);
         if (rc) return rc;
         return EAGAIN;
     }
@@ -24733,7 +24726,7 @@ wl_columnar_session_native_error_observed_dispose(wl_col_session_t *sess,
     if (tx->disposal_progress.identity) {
         rc = wl_columnar_session_native_error_retirement_drive(step,
                 &tx->disposal_progress,
-                tx->maintenance, tx->maintenance_id, 1);
+                NULL, 0, 1);
         return rc ? rc : EAGAIN;
     }
     uint32_t entries = tx->phase < WL_SESSION_OBSERVED_SCHEMA ? 0 : tx->count;
@@ -24759,7 +24752,7 @@ wl_columnar_session_native_error_observed_dispose(wl_col_session_t *sess,
             if (rc) return rc;
             rc = wl_columnar_session_native_error_retirement_drive(step,
                     &tx->disposal_progress,
-                    tx->maintenance, tx->maintenance_id, 1);
+                    NULL, 0, 1);
             if (rc) return rc;
         }
         tx->dispose_index++;
@@ -26421,12 +26414,6 @@ wl_columnar_session_general_rollback_pending(const wl_col_session_t *sess,
         step->native_error_phase != WL_COLUMNAR_SESSION_NATIVE_ERROR_INERT ||
         step->finish_source_pending || step->staging_cancel_pending ||
         step->retirement_begin_failure_pending)return false;
-    if (tx->maintenance){
-        if (!tx->maintenance_id ||
-            tx->maintenance == sess->base.evaluation_control ||
-            wl_evaluation_control_active_attempt_id(tx->maintenance) !=
-            tx->maintenance_id) return false;
-    }else if (tx->maintenance_id)return false;
     /* Rollback past the first Original is MAIN debt: it is pending only
      * while this Step's own MAIN either runs an action for this transaction
      * or is parked between packets under authentic retained custody. */
@@ -27195,10 +27182,7 @@ col_controlled_step_drive(wl_col_session_t *sess,
             && !tx->child_active && !tx->receipt_pending && !tx->receipt_ack
             && step->primary_result > 0 && !sess->cleanup_active
             && !sess->cleanup_pending && !step->join_cleanup.kind &&
-            !step->unary_cleanup.registered
-            && (!tx->maintenance || (tx->maintenance_id
-            && wl_evaluation_control_active_attempt_id(tx->maintenance)
-            == tx->maintenance_id)))
+            !step->unary_cleanup.registered)
             return wl_columnar_session_observed_drive(sess, step);
         if (step->general_observed && step->transaction_initialized && tx
             && tx->committed && step->published
