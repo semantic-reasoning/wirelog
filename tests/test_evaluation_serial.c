@@ -1,4 +1,5 @@
 #include "evaluation_guard_fixture.h"
+#include "controlled_step_observation.h"
 #include "../wirelog/session.h"
 #include "../wirelog/session_options.h"
 #include "../wirelog/thread.h"
@@ -9,6 +10,7 @@
 #include "../wirelog/intern.h"
 #include "../wirelog/wirelog.h"
 #include <errno.h>
+#include <inttypes.h>
 #include <math.h>
 #include <signal.h>
 #include <stdarg.h>
@@ -128,6 +130,62 @@ control_new(uint64_t limit, const void *owner)
     CHECK(!wl_evaluation_control_create(limit, &control));
     CHECK(!wl_evaluation_control_attach(control, owner));
     return control;
+}
+
+static bool foundation_key_equal(const wl_columnar_eval_cleanup_receipt_key_t *,
+    const wl_columnar_eval_cleanup_receipt_key_t *);
+
+/* Drive the real selected initializer with a fresh finite support generation
+ * for every packet, then its real FINISH/report and one-use prepaid ACK. */
+static int
+test_prepared_construct_staged(wl_columnar_eval_stack_unary_prepared_t *p,
+    wl_columnar_eval_stack_cleanup_frame_t *frame,
+    const wl_columnar_eval_plan_numeric_attempt_t *owner, bool join)
+{
+    bool selected = false;
+    int rc = join ? wl_columnar_eval_stack_unary_prepared_join_begin(p, frame,
+            owner, &selected) : wl_columnar_eval_stack_unary_prepared_begin(p,
+            frame, owner, &selected);
+    if (!selected) return rc;
+    int cause = rc;
+    for (unsigned turn = 0; ; ++turn) {
+        CHECK(turn < 1000);
+        int support_owner = 0;
+        wl_evaluation_control_t *support = control_new(256, &support_owner);
+        CHECK(!wl_evaluation_control_begin(support, &support_owner));
+        uint64_t id = wl_evaluation_control_active_attempt_id(support);
+        bool published = false;
+        rc = wl_columnar_eval_stack_unary_prepared_init_step_owned(frame,
+                owner, support, id, &published);
+        if (rc && !cause) cause = rc;
+        CHECK(wl_columnar_eval_stack_unary_prepared_init_action_ack_owned(
+                frame, owner, support, id) == EBUSY);
+        CHECK(!wl_columnar_eval_stack_cleanup_stack(frame));
+        CHECK(!wl_columnar_eval_stack_cleanup_result(frame));
+        (void)wl_evaluation_control_finish(support, &support_owner, 0, 0);
+        wl_evaluation_control_report_t report;
+        CHECK(!wl_evaluation_control_report(support, &report)
+            && report.attempt_id == id && report.consumed == 256);
+        CHECK(wl_columnar_eval_stack_unary_prepared_init_action_ack_owned(
+                frame, owner, support, id + 1) == EBUSY);
+        CHECK(!wl_columnar_eval_stack_unary_prepared_init_action_ack_owned(
+                frame, owner, support, id));
+        CHECK(wl_columnar_eval_stack_unary_prepared_init_action_ack_owned(
+                frame, owner, support, id) == EBUSY);
+        CHECK(!wl_evaluation_control_detach(support, &support_owner));
+        wl_evaluation_control_release(support);
+        if (published) return cause;
+        if (!wl_columnar_eval_stack_auto_initializer_pending(frame))
+            return cause ? cause : EINVAL;
+    }
+}
+
+static int
+test_prepared_begin_staged(wl_columnar_eval_stack_unary_prepared_t *p,
+    wl_columnar_eval_stack_cleanup_frame_t *frame,
+    const wl_columnar_eval_plan_numeric_attempt_t *owner)
+{
+    return test_prepared_construct_staged(p, frame, owner, false);
 }
 
 static grant_t *
@@ -1489,6 +1547,8 @@ typedef struct {
     wl_columnar_eval_serial_framed_host_reply_t reply;
     int protocol;
     unsigned next, calls, witnesses;
+    bool initializer_turn;
+    wl_columnar_eval_stack_prepared_init_action_outcome_t initializer_outcome;
 } entry_fixture_t;
 
 typedef struct {
@@ -1606,8 +1666,14 @@ entry_host(entry_fixture_t *f,
     const wl_columnar_eval_serial_framed_host_request_t *request,
     grant_t *grant)
 {
-    int rc = wl_columnar_eval_serial_framed_relation(f->relation, f->session,
-            false, request);
+    int rc;
+    if (f->initializer_turn && wl_columnar_eval_stack_auto_initializer_pending(
+            f->session->cleanup_active))
+        rc = wl_columnar_eval_stack_auto_initializer_action_owned(f->session,
+                f->session->cleanup_active, request, grant->control, grant->id,
+                &f->initializer_outcome);
+    else rc = wl_columnar_eval_serial_framed_relation(f->relation, f->session,
+                false, request);
     (void)wl_evaluation_control_finish(grant->control,
         &grant->owner, 0, 0);
     return rc;
@@ -1628,6 +1694,17 @@ static int
 entry_turn_action(entry_fixture_t *f,
     wl_columnar_eval_serial_framed_host_action_t action, uint64_t limit)
 {
+    wl_columnar_eval_stack_cleanup_frame_t *initializer_frame =
+        f->session->cleanup_active;
+    f->initializer_turn = action != WL_COLUMNAR_EVAL_SERIAL_FRAMED_STATUS
+        && wl_columnar_eval_stack_auto_initializer_pending(initializer_frame);
+    f->initializer_outcome =
+        (wl_columnar_eval_stack_prepared_init_action_outcome_t){0};
+    wl_columnar_eval_stack_prepared_init_view_t initializer_view;
+    if (f->initializer_turn)
+        CHECK(!wl_columnar_eval_stack_auto_initializer_inspect(
+                initializer_frame,
+                f->session, &initializer_view));
     wl_columnar_eval_serial_framed_attempt_t *ctx = entry_context(f);
     bool consume = action != WL_COLUMNAR_EVAL_SERIAL_FRAMED_STATUS
         && ((ctx && ctx->phase ==
@@ -1635,13 +1712,17 @@ entry_turn_action(entry_fixture_t *f,
         || (!ctx && f->previous.previous_valid
         && f->previous.previous_kind ==
         WL_COLUMNAR_EVAL_SERIAL_FRAMED_REPLY_BOOTSTRAP_RECEIPT));
-    grant_t *grant = entry_grant(f, limit);
+    /* Manual host provides a genuine finite packet grant for initialization;
+     * ordinary legacy turns retain their existing caller-selected limits. */
+    grant_t *grant = entry_grant(f,
+            f->initializer_turn && !limit ? 256 : limit);
     wl_columnar_eval_serial_framed_host_request_t request = f->previous;
     request.funding = grant->control; request.funding_id = grant->id;
     request.operation = f->operation; request.operation_id = f->id;
     request.operation_identity = f->operation_identity;
     request.action = action;
     request.reply = &f->reply;
+    if (f->initializer_turn) request.receipt_key = initializer_view.key;
     /* entry_host itself is the queued action callback. Protocol storage and
      * the next job's dispatch occur in this external driver AFTER that actual
      * callback returns; no enclosing action-job wrapper extends its suffix. */
@@ -1664,6 +1745,21 @@ entry_turn_action(entry_fixture_t *f,
         && report.attempt_id == grant->id && !report.cleanup_status
         && (!report.execution_status || report.execution_status == EOVERFLOW)
         && !wl_evaluation_control_active_attempt_id(grant->control));
+    if (f->initializer_turn) {
+        if (f->initializer_outcome.performed) {
+            CHECK(f->initializer_outcome.needs_ack && report.consumed == 256);
+            CHECK(!wl_columnar_eval_stack_auto_initializer_action_ack_owned(
+                    f->session, initializer_frame, &request, grant->control,
+                    grant->id));
+            if (f->initializer_outcome.launch_consumed)
+                f->previous.previous_valid = false;
+        }
+        /* PREPARED_MORE preserves the initial launch across every staged
+         * action and its matching completed grant/report ACK. */
+        CHECK(f->reply.kind ==
+            WL_COLUMNAR_EVAL_SERIAL_FRAMED_REPLY_PREPARED_MORE);
+        return f->protocol;
+    }
     if (action != WL_COLUMNAR_EVAL_SERIAL_FRAMED_STATUS
         && f->reply.kind != WL_COLUMNAR_EVAL_SERIAL_FRAMED_REPLY_PREPARED_MORE
         && f->reply.kind != WL_COLUMNAR_EVAL_SERIAL_FRAMED_REPLY_REJECTED
@@ -1951,11 +2047,16 @@ entry_outer_guards(entry_fixture_t *f)
     uint64_t before = wl_test_evaluation_guard_state(f->session);
     uint64_t parent_before[64] = {0}, parent_after[64] = {0};
     entry_parent_observation(f, parent_before);
+    CHECK(!f->session->controlled_step);
     CHECK(wl_session_step(&f->session->base) == EBUSY);
-    CHECK(wl_session_snapshot(&f->session->base, NULL, NULL) == EBUSY);
+    CHECK(!f->session->controlled_step);
+    int null_snapshot = f->session->cleanup_active ||
+        f->session->cleanup_pending
+        ? EBUSY : EINVAL;
+    CHECK(wl_session_snapshot(&f->session->base, NULL, NULL) == null_snapshot);
     CHECK(f->session->base.backend->session_step(&f->session->base) == EBUSY);
     CHECK(f->session->base.backend->session_snapshot(&f->session->base,
-        NULL, NULL) == EBUSY);
+        NULL, NULL) == null_snapshot);
     CHECK(col_eval_stratum(f->stratum, f->session, 0) == ENOTSUP);
     CHECK(col_eval_stratum_tdd(f->stratum, f->session, 0) == ENOTSUP);
     CHECK(col_eval_stratum_multiworker(f->stratum, f->session, 0,
@@ -1965,6 +2066,75 @@ entry_outer_guards(entry_fixture_t *f)
     CHECK(wl_test_evaluation_guard_state(f->session) == before);
     entry_parent_observation(f, parent_after);
     CHECK(!memcmp(parent_before, parent_after, sizeof(parent_before)));
+}
+
+extern int wl_columnar_session_test_prepared_finish_status(
+    const wl_col_session_t *, bool *, int *, unsigned *);
+
+/* New financial bootstrap invocations precede the actual Original BEGIN.
+ * Preserve tests' Native entry point rather than assuming the first host call. */
+static int
+controlled_session_until_attempt(wl_session_t *session,
+    wl_evaluation_control_t *control)
+{
+    unsigned financial_turns = 0;
+    uint64_t financial_original = 0, financial_consumed = 0;
+    int financial_cause = 0, prior_report_status = ENOENT;
+    wl_evaluation_control_report_t prior_report;
+    for (unsigned call = 0; call < 10000; ++call) {
+        int rc = wl_session_step(session);
+        uint64_t active = wl_evaluation_control_active_attempt_id(control);
+        if (rc != EAGAIN) {
+            if (financial_turns) {
+                wl_evaluation_control_report_t report;
+                CHECK(rc == financial_cause && !active
+                    && !wl_evaluation_control_report(control, &report)
+                    && report.attempt_id == financial_original
+                    && report.result == financial_cause);
+            }
+            return rc;
+        }
+        if (active) {
+            bool financial_pending;
+            int saved_cause;
+            unsigned phase;
+            CHECK(!wl_columnar_session_test_prepared_finish_status(
+                    (wl_col_session_t *)session, &financial_pending,
+                    &saved_cause, &phase));
+            if (financial_pending) {
+                /* The Original is still owned until five real parent
+                 * finance action/TAKE pairs and CLOSED handoff finish it. */
+                CHECK(++financial_turns <= 2 * 5 + 2);
+                if (financial_turns == 1) {
+                    financial_original = active; financial_cause = saved_cause;
+                    CHECK(!wl_evaluation_control_test_active_consumed(control,
+                        active, &financial_consumed));
+                    prior_report_status = wl_evaluation_control_report(control,
+                            &prior_report);
+                    CHECK(!prior_report_status ||
+                        prior_report_status == ENOENT);
+                }
+                uint64_t used;
+                wl_evaluation_control_report_t current_report;
+                CHECK(active == financial_original &&
+                    saved_cause == financial_cause
+                    && !wl_evaluation_control_test_active_consumed(control,
+                    active, &used)
+                    && used == financial_consumed);
+                int current_status = wl_evaluation_control_report(control,
+                        &current_report);
+                CHECK(current_status == prior_report_status
+                    && (current_status || !memcmp(&prior_report,
+                    &current_report,
+                    sizeof(prior_report))));
+                continue;
+            }
+            /* Preserve the ordinary Native pending-attempt stop exactly. */
+            return rc;
+        }
+    }
+    CHECK(false);
+    return EIO;
 }
 
 static void
@@ -1990,7 +2160,8 @@ test_controlled_session_step_resume(void)
         &options, &session));
     CHECK(!wl_session_insert(session, "input", rows, 3, 1));
 
-    CHECK(wl_session_step(session) == WL_EVALUATION_CONTROL_WORK_LIMIT);
+    CHECK(controlled_session_until_attempt(session, control)
+        == WL_EVALUATION_CONTROL_WORK_LIMIT);
     CHECK(!wl_evaluation_control_active_attempt_id(control));
     wl_evaluation_control_report_t report;
     CHECK(!wl_evaluation_control_report(control, &report));
@@ -2001,7 +2172,7 @@ test_controlled_session_step_resume(void)
     CHECK(!wl_evaluation_control_configure(control, 0));
 
     wl_columnar_session_test_fail_framed_funding_before_stop = 1;
-    CHECK(wl_session_step(session) == EAGAIN);
+    CHECK(controlled_session_until_attempt(session, control) == EAGAIN);
     uint64_t first_id = wl_evaluation_control_active_attempt_id(control);
     CHECK(first_id != 0);
     CHECK(wl_session_insert(session, "input", rows, 1, 1) == EBUSY);
@@ -2010,6 +2181,15 @@ test_controlled_session_step_resume(void)
     CHECK(wl_evaluation_control_configure(control, 100) == EBUSY);
 
     int resumed_rc = wl_session_step(session);
+    if (resumed_rc == EAGAIN) {
+        bool financial_pending;
+        int saved_result;
+        unsigned financial_phase;
+        CHECK(!wl_columnar_session_test_prepared_finish_status(
+                (wl_col_session_t *)session, &financial_pending, &saved_result,
+                &financial_phase) && financial_pending && saved_result == 0);
+        resumed_rc = controlled_session_until_attempt(session, control);
+    }
     CHECK(!resumed_rc);
     CHECK(!wl_evaluation_control_active_attempt_id(control));
     CHECK(!wl_evaluation_control_report(control, &report));
@@ -2450,18 +2630,574 @@ controlled_recursive_two_join_session(const int64_t *edges,
     return session;
 }
 
+typedef void (*controlled_recursive_main_hook_t)(wl_col_session_t *,
+    wl_evaluation_control_t *, uint64_t, unsigned, unsigned, unsigned, int);
+extern controlled_recursive_main_hook_t
+    wl_columnar_session_test_main_action_advanced;
+typedef struct controlled_recursive_work_probe {
+    const wl_col_session_t *session;
+    uint64_t native_calls;
+    controlled_recursive_main_hook_t previous_hook;
+    struct controlled_recursive_work_probe *previous;
+} controlled_recursive_work_probe_t;
+static controlled_recursive_work_probe_t *controlled_recursive_work_probe;
+
+static void
+controlled_recursive_main_work(wl_col_session_t *session,
+    wl_evaluation_control_t *funding, uint64_t id, unsigned recipient,
+    unsigned before, unsigned after, int result)
+{
+    controlled_recursive_main_hook_t previous = NULL;
+    for (controlled_recursive_work_probe_t *p = controlled_recursive_work_probe;
+        p; p = p->previous){
+        if (p->session == session) ++p->native_calls;
+        if (p->previous_hook != controlled_recursive_main_work)
+            previous = p->previous_hook;
+    }
+    if (previous) previous(session, funding, id, recipient, before, after,
+            result);
+}
+
+static void
+test_controlled_recursive_post_finish_metadata(void)
+{
+    /* Pure guard inputs; never passed to an engine consumer or FINISH. */
+    const int pending =
+        WL_BACKEND_CONTROLLED_OBSERVATION_COMPLETED_OWNER_PENDING;
+    wl_backend_controlled_completion_t c = {
+        .ticket = 3, .operation_identity = 5, .completed_attempt_id = 7,
+        .domain = WL_BACKEND_CONTROLLED_COMPLETION_POST_FINISH_TX,
+        .kind = WL_BACKEND_CONTROLLED_COMPLETION_STEP,
+        .state = WL_CONTROLLED_STEP_PENDING, .selected = true
+    };
+    wl_session_test_completed_pin_t pin = {
+        .selected = true, .ticket = 3, .operation_identity = 5,
+        .completed_attempt_id = 7
+    };
+    wl_evaluation_control_report_t report = {.attempt_id = 7, .limit = 19,
+                                             .consumed = 11};
+    wl_test_completed_step_t old = {
+        .ticket = 3, .operation_identity = 5, .old_id = 7,
+        .domain = c.domain, .kind = c.kind, .report = report, .selected = true
+    };
+    CHECK(wl_test_completed_step_matches(&old, true, 0, 7, pending, &c, &pin,
+        &report));
+    CHECK(!wl_test_completed_step_matches(&old, false, 0, 7, pending, &c,
+        &pin, &report));
+    CHECK(!wl_test_completed_step_matches(&old, true, 8, 7, pending, &c,
+        &pin, &report));
+    CHECK(!wl_test_completed_step_matches(&old, true, 0, 0, pending, &c,
+        &pin, &report));
+    CHECK(!wl_test_completed_step_matches(&old, true, 0, 7, 0, &c, &pin,
+        &report));
+    CHECK(!wl_test_completed_step_matches(&old, true, 0, 7,
+        WL_BACKEND_CONTROLLED_OBSERVATION_COMPLETION_READY, &c, &pin, &report));
+    for (unsigned bad = 0; bad < 10; ++bad) {
+        wl_backend_controlled_completion_t wrong = c;
+        switch (bad) {
+        case 0: wrong.selected = false; break;
+        case 1: wrong.domain = WL_BACKEND_CONTROLLED_COMPLETION_RESET; break;
+        case 2: wrong.kind = WL_BACKEND_CONTROLLED_COMPLETION_SNAPSHOT; break;
+        case 3: wrong.kind = 0; break;
+        case 4: wrong.state = WL_CONTROLLED_STEP_COMPLETE; break;
+        case 5: wrong.ticket = 0; break;
+        case 6: wrong.ticket = 4; break;
+        case 7: wrong.operation_identity = 0; break;
+        case 8: wrong.completed_attempt_id = 8; break;
+        case 9: wrong.result = EINVAL; break;
+        }
+        CHECK(!wl_test_completed_step_matches(&old, true, 0, 7, pending,
+            &wrong, &pin, &report));
+    }
+    for (unsigned bad = 0; bad < 6; ++bad) {
+        wl_session_test_completed_pin_t wrong = pin;
+        switch (bad) {
+        case 0: wrong.selected = false; break;
+        case 1: wrong.active_operations = 1; break;
+        case 2: wrong.ticket = 4; break;
+        case 3: wrong.operation_identity = 6; break;
+        case 4: wrong.completed_attempt_id = 8; break;
+        case 5: wrong.result = EINVAL; break;
+        }
+        CHECK(!wl_test_completed_step_matches(&old, true, 0, 7, pending, &c,
+            &wrong, &report));
+    }
+    for (unsigned bad = 0; bad < 7; ++bad) {
+        wl_evaluation_control_report_t wrong = report;
+        switch (bad) {
+        case 0: ++wrong.attempt_id; break;
+        case 1: ++wrong.limit; break;
+        case 2: ++wrong.consumed; break;
+        case 3: wrong.stop_reason = WL_EVALUATION_CONTROL_CANCELLED; break;
+        case 4: wrong.execution_status = EINVAL; break;
+        case 5: wrong.cleanup_status = EINVAL; break;
+        case 6: wrong.result = EINVAL; break;
+        }
+        CHECK(!wl_test_completed_step_matches(&old, true, 0, 7, pending, &c,
+            &pin, &wrong));
+        CHECK(!wl_test_completed_step_unchanged(&old, true, 0, &wrong));
+    }
+    /* An unchanged old report cannot hide an active successor at final rc0. */
+    CHECK(!wl_test_completed_step_unchanged(&old, true, 8, &report)
+        && !wl_test_completed_step_unchanged(&old, true, 7, &report)
+        && !wl_test_completed_step_unchanged(&old, false, 0, &report));
+    /* Coherent later tuples still cannot replace the saved historical one. */
+    for (unsigned bad = 0; bad < 4; ++bad) {
+        wl_backend_controlled_completion_t later = c;
+        wl_session_test_completed_pin_t later_pin = pin;
+        wl_evaluation_control_report_t later_report = report;
+        uint64_t later_id = 7;
+        switch (bad) {
+        case 0: ++later.ticket; ++later_pin.ticket; break;
+        case 1: ++later.operation_identity; ++later_pin.operation_identity;
+            break;
+        case 2:
+            ++later.completed_attempt_id; ++later_pin.completed_attempt_id;
+            ++later_report.attempt_id; ++later_id; break;
+        case 3:
+            later.result = EINVAL; later_pin.result = EINVAL;
+            later_report.result = EINVAL; break;
+        }
+        CHECK(!wl_test_completed_step_matches(&old, true, 0, later_id,
+            pending,
+            &later, &later_pin, &later_report));
+    }
+    wl_test_completed_step_t empty = {0};
+    CHECK(wl_test_completed_step_matches(&empty, true, 0, 7, pending, &c,
+        &pin, &report));
+    c.invocation_accepted = true;
+    CHECK(wl_test_completed_step_matches(&old, true, 0, 7, pending, &c, &pin,
+        &report));
+}
+
+/* Bound to Source31's real BEFORE/AFTER FINAL observations, never a
+ * replacement for the shared POST_FINISH_TX owner/pin matcher. */
+typedef void (*controlled_observer_phase_hook_t)(const wl_col_session_t *,
+    unsigned, bool, wl_evaluation_control_source_final_result_t);
+extern controlled_observer_phase_hook_t
+    wl_columnar_session_test_observer_error_phase;
+
+typedef struct controlled_observer_metadata_probe {
+    wl_session_t *session;
+    wl_evaluation_control_t *control;
+    uint64_t allocation, before_id;
+    const void *step;
+    wl_evaluation_control_report_t report;
+    unsigned finish_tag;
+    bool success, before, finished, selected;
+    controlled_observer_phase_hook_t previous_hook;
+    struct controlled_observer_metadata_probe *previous;
+} controlled_observer_metadata_probe_t;
+
+static controlled_observer_metadata_probe_t *controlled_observer_metadata_probe;
+
+static void
+controlled_observer_metadata_phase(const wl_col_session_t *session,
+    unsigned tag, bool after,
+    wl_evaluation_control_source_final_result_t result)
+{
+    controlled_observer_metadata_probe_t *p =
+        controlled_observer_metadata_probe;
+    CHECK(p);
+    if (p->previous_hook == controlled_observer_metadata_phase) {
+        CHECK(p->previous);
+        controlled_observer_metadata_probe = p->previous;
+        p->previous_hook(session, tag, after, result);
+        controlled_observer_metadata_probe = p;
+    } else if (p->previous_hook) p->previous_hook(session, tag, after, result);
+    if (&session->base != p->session || tag != p->finish_tag) return;
+    CHECK(p->session->evaluation_control == p->control
+        && wl_evaluation_control_identity(p->control) == p->allocation);
+    if (!after) {
+        CHECK(!p->before && !p->finished);
+        p->before = true;
+        p->before_id = wl_evaluation_control_active_attempt_id(p->control);
+        CHECK(p->before_id && session->controlled_step);
+        if (!p->step) p->step = session->controlled_step;
+        CHECK(p->step == session->controlled_step);
+        return;
+    }
+    CHECK(p->before && p->step == session->controlled_step);
+    p->before = false;
+    if (!result.phase_started || !result.action_called
+        || !result.phase_finished || result.action_result
+        || wl_evaluation_control_active_attempt_id(p->control)) return;
+    CHECK(!wl_evaluation_control_report(p->control, &p->report)
+        && p->report.attempt_id == p->before_id
+        && p->report.execution_status == (p->success ? 0 : EIO)
+        && p->report.result == (p->success ? 0 : EIO)
+        && !p->report.cleanup_status);
+    if (p->success) CHECK(p->report.stop_reason == WL_EVALUATION_CONTROL_NONE);
+    p->finished = true;
+}
+
+static bool
+controlled_observer_metadata_unchanged(wl_session_t *session,
+    wl_evaluation_control_t *control)
+{
+    controlled_observer_metadata_probe_t *p =
+        controlled_observer_metadata_probe;
+    wl_evaluation_control_report_t report;
+    return p && p->session == session && p->control == control
+           && session->evaluation_control == control && p->step
+           && p->step == ((wl_col_session_t *)session)->controlled_step
+           && wl_evaluation_control_identity(control) == p->allocation
+           && !wl_evaluation_control_active_attempt_id(control)
+           && !wl_evaluation_control_report(control, &report)
+           && wl_test_completed_step_report_equal(&p->report, &report);
+}
+
+static bool
+controlled_observer_metadata_observe(wl_session_t *session,
+    wl_evaluation_control_t *control, uint64_t id)
+{
+    controlled_observer_metadata_probe_t *p =
+        controlled_observer_metadata_probe;
+    if (!p || !p->finished || !id || id != p->before_id
+        || p->report.attempt_id != id
+        || !controlled_observer_metadata_unchanged(session, control)
+        || session->backend->session_controlled_step_state(session)
+        != WL_CONTROLLED_STEP_NATIVE_ERROR_CLEANUP_PENDING) return false;
+    p->selected = true;
+    return true;
+}
+
 static int
 controlled_recursive_run(wl_session_t *session,
     wl_evaluation_control_t *control)
 {
+    controlled_recursive_work_probe_t probe = {
+        .session = (wl_col_session_t *)session,
+        .previous_hook = wl_columnar_session_test_main_action_advanced,
+        .previous = controlled_recursive_work_probe
+    };
+    controlled_recursive_work_probe = &probe;
+    wl_columnar_session_test_main_action_advanced =
+        controlled_recursive_main_work;
+    wl_test_completed_step_t ended = {0};
     int rc = wl_session_step(session);
     uint64_t id = wl_evaluation_control_active_attempt_id(control);
-    for (unsigned turn = 0; rc == EAGAIN && id && turn < 10000; ++turn) {
+    unsigned native_turns = 0, financial_turns = 0;
+    uint64_t financial_id = 0, financial_identity = 0;
+    while (rc == EAGAIN) {
+        uint64_t view[16];
+        CHECK(!wl_columnar_session_test_main_view(
+                (wl_col_session_t *)session, view));
+        uint64_t native_before = probe.native_calls;
         rc = wl_session_step(session);
-        if (rc == EAGAIN)
-            CHECK(wl_evaluation_control_active_attempt_id(control) == id);
+        uint64_t current = wl_evaluation_control_active_attempt_id(control);
+        if (ended.selected) {
+            wl_evaluation_control_report_t report;
+            CHECK(!wl_evaluation_control_report(control, &report)
+                && wl_test_completed_step_unchanged(&ended,
+                session->evaluation_control == control, current, &report));
+        }
+        if (controlled_observer_metadata_probe
+            && controlled_observer_metadata_probe->selected)
+            CHECK(!ended.selected
+                && controlled_observer_metadata_unchanged(session, control));
+        if (id && rc == EAGAIN)
+            CHECK(current == id || (!current
+                && (wl_test_completed_step_observe(session, control,
+                current, id, &ended)
+                || (!ended.selected
+                && controlled_observer_metadata_observe(session, control,
+                id)))));
+        if (!id) id = current; /* Only an actual positive BEGIN can latch. */
+        bool finance_only = probe.native_calls == native_before
+            && view[0] && (view[1] == 1 || view[1] == 3 || view[1] == 4);
+        if (finance_only) {
+            CHECK(view[5] && view[6] && view[7] && view[9] && !view[4]);
+            if (view[6] != financial_id || view[7] != financial_identity) {
+                if (view[7] == financial_identity)
+                    CHECK(view[6] > financial_id);
+                financial_id = view[6]; financial_identity = view[7];
+                financial_turns = 0;
+            }
+            /* Real REBEGIN/FINISH/REPORT issue+take and READY handoff are
+             * distinct from Native execution. Bound each genuine grant;
+             * a Native action observed by the real hook is never discounted. */
+            CHECK(++financial_turns <= 2 * 3 + 2);
+        } else {
+            /* Preserve the original evaluation/Native turn bound. */
+            if (++native_turns >= 10000) break;
+        }
     }
+    if (ended.selected) {
+        wl_evaluation_control_report_t report;
+        CHECK(!wl_evaluation_control_report(control, &report)
+            && wl_test_completed_step_unchanged(&ended,
+            session->evaluation_control == control,
+            wl_evaluation_control_active_attempt_id(control), &report));
+    }
+    if (controlled_observer_metadata_probe
+        && controlled_observer_metadata_probe->selected)
+        CHECK(!ended.selected
+            && controlled_observer_metadata_unchanged(session, control));
+    wl_columnar_session_test_main_action_advanced = probe.previous_hook;
+    controlled_recursive_work_probe = probe.previous;
     return rc;
+}
+
+static int
+controlled_observer_metadata_run(wl_session_t *session,
+    wl_evaluation_control_t *control, bool success)
+{
+    controlled_observer_metadata_probe_t probe = {
+        .session = session, .control = control,
+        .allocation = wl_evaluation_control_identity(control),
+        /* Current Source31 tags: RESOURCES_DONE2 and RETRY_ACTIVE6.
+         * Only a real positive-to-inactive FINISH can publish the witness. */
+        .finish_tag = success ? 6u : 2u, .success = success,
+        .previous_hook = wl_columnar_session_test_observer_error_phase,
+        .previous = controlled_observer_metadata_probe
+    };
+    CHECK(probe.allocation && session->evaluation_control == control);
+    controlled_observer_metadata_probe = &probe;
+    wl_columnar_session_test_observer_error_phase =
+        controlled_observer_metadata_phase;
+    int rc = controlled_recursive_run(session, control);
+    CHECK(probe.finished && probe.selected && !probe.before
+        && controlled_observer_metadata_unchanged(session, control));
+    wl_columnar_session_test_observer_error_phase = probe.previous_hook;
+    controlled_observer_metadata_probe = probe.previous;
+    return rc;
+}
+
+/* Explicit literal-fixture hang detection; these are not production caps. */
+typedef struct {
+    const wl_evaluation_control_t *control;
+    uint64_t generation, total;
+    unsigned ceiling, body, pending_body, interval, peak;
+    bool invalid;
+} controlled_recursive_watchdog_t;
+
+static bool
+controlled_recursive_watchdog_supported(unsigned ceiling, bool fresh,
+    bool active)
+{
+    return fresh && !active && ceiling && ceiling <= 6;
+}
+
+static bool
+controlled_recursive_watchdog_generation(controlled_recursive_watchdog_t *p,
+    uint64_t id)
+{
+    if (!id) return false;
+    if (p->generation && p->generation != id) {
+        p->invalid = true; return false;
+    }
+    p->generation = id;
+    return true;
+}
+
+static bool
+controlled_recursive_watchdog_body(controlled_recursive_watchdog_t *p,
+    const wl_evaluation_control_t *control, uint64_t id, unsigned phase,
+    unsigned iteration)
+{
+    if (control != p->control
+        || phase != WL_COLUMNAR_SESSION_TEST_RECURSIVE_AFTER_BODY)
+        return false;
+    if (!controlled_recursive_watchdog_generation(p, id)) return false;
+    if (iteration > p->ceiling) {
+        p->invalid = true; return false;
+    }
+    if (iteration != p->pending_body + 1) return false;
+    p->pending_body = iteration;
+    return true;
+}
+
+/* A boundary call pays its entire old interval before progress can reset it. */
+static bool
+controlled_recursive_watchdog_charge(controlled_recursive_watchdog_t *p,
+    uint64_t native_delta, bool finance_only)
+{
+    uint64_t units = native_delta ? native_delta : finance_only ? 0 : 1;
+    uint64_t whole = UINT64_C(10000) * (p->ceiling + 1u);
+    if (p->invalid || p->interval > 10000 || p->total > whole
+        || units > 10000u - p->interval || units > whole - p->total) {
+        p->invalid = true; return false;
+    }
+    p->interval += (unsigned)units; p->total += units;
+    if (p->interval > p->peak) p->peak = p->interval;
+    if (p->pending_body > p->body) {
+        p->body = p->pending_body; p->interval = 0;
+    }
+    return p->interval < 10000 && p->total < whole;
+}
+
+typedef struct controlled_recursive_round_probe {
+    controlled_recursive_watchdog_t policy;
+    const wl_session_t *session;
+    void (*previous_hook)(wl_evaluation_control_t *, unsigned, uint32_t);
+    struct controlled_recursive_round_probe *previous;
+} controlled_recursive_round_probe_t;
+static controlled_recursive_round_probe_t *controlled_recursive_round_probe;
+static bool controlled_recursive_watchdog_report;
+
+static void
+controlled_recursive_round_progress(wl_evaluation_control_t *control,
+    unsigned phase, uint32_t iteration)
+{
+    void (*previous)(wl_evaluation_control_t *, unsigned, uint32_t) = NULL;
+    for (controlled_recursive_round_probe_t *p =
+        controlled_recursive_round_probe;
+        p; p = p->previous) {
+        if (control == p->policy.control && p->session
+            && p->session->evaluation_control == control)
+            (void)controlled_recursive_watchdog_body(&p->policy, control,
+                wl_evaluation_control_active_attempt_id(control), phase,
+                iteration);
+        if (p->previous_hook != controlled_recursive_round_progress)
+            previous = p->previous_hook;
+    }
+    if (previous) previous(control, phase, iteration);
+}
+
+static int
+controlled_recursive_run_fresh(wl_session_t *session,
+    wl_evaluation_control_t *control, unsigned body_ceiling)
+{
+    wl_evaluation_control_report_t report;
+    wl_controlled_step_state_t state =
+        session->backend->session_controlled_step_state(session);
+    bool fresh = !wl_evaluation_control_report(control, &report)
+        && (!report.attempt_id ? state == WL_CONTROLLED_STEP_IDLE :
+        !report.result && (state == WL_CONTROLLED_STEP_COMPLETE
+        || state == WL_CONTROLLED_STEP_DIRTY));
+    if (!controlled_recursive_watchdog_supported(body_ceiling, fresh,
+        wl_evaluation_control_active_attempt_id(control) != 0))
+        return controlled_recursive_run(session, control);
+    controlled_recursive_round_probe_t rounds = {
+        .policy = {.control = control, .ceiling = body_ceiling},
+        .session = session,
+        .previous_hook = wl_columnar_session_test_recursive_step_checkpoint,
+        .previous = controlled_recursive_round_probe
+    };
+    controlled_recursive_work_probe_t work = {
+        .session = (wl_col_session_t *)session,
+        .previous_hook = wl_columnar_session_test_main_action_advanced,
+        .previous = controlled_recursive_work_probe
+    };
+    controlled_recursive_round_probe = &rounds;
+    controlled_recursive_work_probe = &work;
+    wl_columnar_session_test_recursive_step_checkpoint =
+        controlled_recursive_round_progress;
+    wl_columnar_session_test_main_action_advanced =
+        controlled_recursive_main_work;
+    unsigned financial_turns = 0;
+    uint64_t financial_id = 0, financial_identity = 0;
+    int rc;
+    do {
+        uint64_t view[16];
+        CHECK(!wl_columnar_session_test_main_view((wl_col_session_t *)session,
+            view));
+        uint64_t before = work.native_calls;
+        rc = wl_session_step(session);
+        uint64_t native_delta = work.native_calls - before;
+        bool finance_turn = !native_delta && view[0]
+            && (view[1] == 1 || view[1] == 3 || view[1] == 4);
+        /* READY may acknowledge finance and continue the ordinary caller
+         * in this same call. Count that caller work conservatively. */
+        bool finance_only = finance_turn && view[1] != 4;
+        if (finance_turn) {
+            CHECK(view[5] && view[6] && view[7] && view[9] && !view[4]);
+            if (view[6] != financial_id || view[7] != financial_identity) {
+                if (view[7] ==
+                    financial_identity) CHECK(view[6] > financial_id);
+                financial_id = view[6]; financial_identity = view[7];
+                financial_turns = 0;
+            }
+            CHECK(++financial_turns <= 2 * 3 + 2);
+        }
+        uint64_t current = wl_evaluation_control_active_attempt_id(control);
+        if (current) (void)controlled_recursive_watchdog_generation(
+                &rounds.policy, current);
+        if (!controlled_recursive_watchdog_charge(&rounds.policy, native_delta,
+            finance_only)) {
+            if (rounds.policy.invalid) rc = EAGAIN;
+            break;
+        }
+    } while (rc == EAGAIN);
+    wl_columnar_session_test_recursive_step_checkpoint = rounds.previous_hook;
+    wl_columnar_session_test_main_action_advanced = work.previous_hook;
+    controlled_recursive_round_probe = rounds.previous;
+    controlled_recursive_work_probe = work.previous;
+    if (controlled_recursive_watchdog_report)
+        fprintf(stderr,
+            "recursive watchdog ceiling=%u bodies=%u peak=%u total=%" PRIu64
+            " rc=%d\n",
+            rounds.policy.ceiling, rounds.policy.body, rounds.policy.peak,
+            rounds.policy.total, rc);
+    return rc;
+}
+
+static void
+test_controlled_recursive_watchdog_policy(void)
+{
+    /* Opaque unit-policy identities; no fake controller or engine receipt. */
+    const wl_evaluation_control_t *a =
+        (const void *)&controlled_recursive_round_probe;
+    const wl_evaluation_control_t *b =
+        (const void *)&controlled_recursive_work_probe;
+    CHECK(!controlled_recursive_watchdog_supported(0, true, false)
+        && !controlled_recursive_watchdog_supported(7, true, false)
+        && !controlled_recursive_watchdog_supported(4, false, false)
+        && !controlled_recursive_watchdog_supported(4, true, true)
+        && controlled_recursive_watchdog_supported(4, true, false));
+    controlled_recursive_watchdog_t p = {.control = a, .generation = 7,
+                                         .ceiling = 2,
+                                         .interval = 9999, .total = 9999};
+    CHECK(!controlled_recursive_watchdog_body(&p, b, 7,
+        WL_COLUMNAR_SESSION_TEST_RECURSIVE_AFTER_BODY, 1));
+    CHECK(!controlled_recursive_watchdog_body(&p, a, 7,
+        WL_COLUMNAR_SESSION_TEST_RECURSIVE_AFTER_MERGE, 1));
+    CHECK(!controlled_recursive_watchdog_body(&p, a, 7,
+        WL_COLUMNAR_SESSION_TEST_RECURSIVE_AFTER_BODY, 2));
+    CHECK(!controlled_recursive_watchdog_charge(&p, 0, false)
+        && p.interval == 10000 && p.body == 0);
+    p = (controlled_recursive_watchdog_t){.control = a, .ceiling = 1};
+    CHECK(!controlled_recursive_watchdog_body(&p, a, 0,
+        WL_COLUMNAR_SESSION_TEST_RECURSIVE_AFTER_BODY, 1));
+    CHECK(controlled_recursive_watchdog_charge(&p, 2, false)
+        && p.interval == 2 && p.total == 2);
+    p.interval = 9999; p.total = 9999;
+    CHECK(controlled_recursive_watchdog_body(&p, a, 7,
+        WL_COLUMNAR_SESSION_TEST_RECURSIVE_AFTER_BODY, 1));
+    CHECK(controlled_recursive_watchdog_charge(&p, 1, false)
+        && p.body == 1 && !p.interval && p.total == 10000 && p.peak == 10000);
+    CHECK(!controlled_recursive_watchdog_body(&p, a, 7,
+        WL_COLUMNAR_SESSION_TEST_RECURSIVE_AFTER_BODY, 1));
+    CHECK(!controlled_recursive_watchdog_body(&p, a, 7,
+        WL_COLUMNAR_SESSION_TEST_RECURSIVE_AFTER_BODY, 0));
+    CHECK(controlled_recursive_watchdog_charge(&p, 9999, false));
+    CHECK(!controlled_recursive_watchdog_charge(&p, 1, false)
+        && p.total == 20000 && p.interval == 10000);
+    CHECK(!controlled_recursive_watchdog_charge(&p, 1, false) && p.invalid);
+    p = (controlled_recursive_watchdog_t){.control = a, .generation = 7,
+                                          .ceiling = 1,
+                                          .interval = 9999, .total = 9999};
+    CHECK(controlled_recursive_watchdog_body(&p, a, 7,
+        WL_COLUMNAR_SESSION_TEST_RECURSIVE_AFTER_BODY, 1));
+    CHECK(!controlled_recursive_watchdog_charge(&p, 2, true)
+        && p.invalid && !p.body && p.interval == 9999);
+    p = (controlled_recursive_watchdog_t){.control = a, .generation = 7,
+                                          .ceiling = 1};
+    CHECK(!controlled_recursive_watchdog_body(&p, a, 8,
+        WL_COLUMNAR_SESSION_TEST_RECURSIVE_AFTER_BODY, 1)
+        && p.invalid && p.generation == 7 && !p.pending_body);
+    p = (controlled_recursive_watchdog_t){.control = a, .generation = 7,
+                                          .ceiling = 1};
+    CHECK(!controlled_recursive_watchdog_body(&p, a, 7,
+        WL_COLUMNAR_SESSION_TEST_RECURSIVE_AFTER_BODY, 2) && p.invalid);
+    p = (controlled_recursive_watchdog_t){.control = a, .generation = 7,
+                                          .ceiling = 1,
+                                          .total = 19999};
+    CHECK(controlled_recursive_watchdog_body(&p, a, 7,
+        WL_COLUMNAR_SESSION_TEST_RECURSIVE_AFTER_BODY, 1));
+    CHECK(!controlled_recursive_watchdog_charge(&p, 1,
+        false) && p.total == 20000);
 }
 
 static void
@@ -2534,9 +3270,13 @@ test_controlled_recursive_two_join_step(void)
         + 3u * recursive_capture_scan_work(plan, "path")
         + UINT64_C(3) * 224
         * ((wl_columnar_eval_stack_test_allocation_size() + 15) / 16)
-        + UINT64_C(18) * 224 * ((sizeof(col_rel_t) + 7) / 8);
+        + UINT64_C(18) * 224 * ((sizeof(col_rel_t) + 7) / 8)
+        /* Final empty-delta retirement moves 28 managed phases and two
+         * three-poll token handoffs to MAIN. Scalar retirement revisits
+         * the Original caller once for each body and the final frontier. */
+        - UINT64_C(28) - UINT64_C(2) * 3 + UINT64_C(3) + 1;
     CHECK(!wl_evaluation_control_configure(control, expected_work));
-    CHECK(!controlled_recursive_run(session, control));
+    CHECK(!controlled_recursive_run_fresh(session, control, 3));
     const col_rel_t *path = session_find_rel((wl_col_session_t *)session,
             "path");
     check_two_join_path(path, 6);
@@ -2551,7 +3291,7 @@ test_controlled_recursive_two_join_step(void)
     session = controlled_recursive_two_join_session(edges, 4, &plan,
             &program, &control);
     CHECK(!wl_evaluation_control_configure(control, expected_work - 1));
-    CHECK(controlled_recursive_run(session, control)
+    CHECK(controlled_recursive_run_fresh(session, control, 3)
         == WL_EVALUATION_CONTROL_WORK_LIMIT);
     CHECK(!session_find_rel((wl_col_session_t *)session, "path"));
     CHECK(!wl_evaluation_control_report(control, &report)
@@ -2666,7 +3406,7 @@ test_controlled_recursive_step_publication_and_stops(void)
     controlled_recursive_session_under_test = columnar;
     wl_columnar_session_test_recursive_step_checkpoint =
         controlled_recursive_stop_checkpoint;
-    CHECK(!controlled_recursive_run(session, control));
+    CHECK(!controlled_recursive_run_fresh(session, control, 4));
     wl_columnar_session_test_recursive_step_checkpoint = NULL;
     controlled_recursive_session_under_test = NULL;
     CHECK(controlled_recursive_convergence_unpublished);
@@ -2690,7 +3430,11 @@ test_controlled_recursive_step_publication_and_stops(void)
         + 4u * recursive_capture_scan_work(plan, "path")
         + UINT64_C(4) * 224
         * ((wl_columnar_eval_stack_test_allocation_size() + 15) / 16)
-        + UINT64_C(20) * 224 * ((sizeof(col_rel_t) + 7) / 8);
+        + UINT64_C(20) * 224 * ((sizeof(col_rel_t) + 7) / 8)
+        /* MAIN replaces 28 final-empty managed phase polls and two
+         * three-poll token handoffs. Final READY adds one caller revisit
+         * for each of four body results and the final frontier. */
+        - UINT64_C(28) - UINT64_C(2) * 3 + UINT64_C(4) + 1;
     CHECK(successful_report.consumed == expected_work);
     CHECK(path && path->nrows == 6 && path->ncols == 2
         && path->capacity == 6
@@ -2731,7 +3475,7 @@ test_controlled_recursive_step_publication_and_stops(void)
             &control);
     columnar = (wl_col_session_t *)session;
     CHECK(!wl_evaluation_control_configure(control, expected_work));
-    CHECK(!controlled_recursive_run(session, control));
+    CHECK(!controlled_recursive_run_fresh(session, control, 4));
     wl_evaluation_control_report_t boundary_report;
     CHECK(!wl_evaluation_control_report(control, &boundary_report)
         && boundary_report.limit == expected_work
@@ -2750,7 +3494,7 @@ test_controlled_recursive_step_publication_and_stops(void)
             &control);
     columnar = (wl_col_session_t *)session;
     CHECK(!wl_evaluation_control_configure(control, expected_work - 1u));
-    int short_rc = controlled_recursive_run(session, control);
+    int short_rc = controlled_recursive_run_fresh(session, control, 4);
     CHECK(short_rc == WL_EVALUATION_CONTROL_WORK_LIMIT
         && !session_find_rel(columnar, "path")
         && !columnar->cleanup_active && !columnar->cleanup_pending);
@@ -2789,7 +3533,7 @@ test_controlled_recursive_step_publication_and_stops(void)
         controlled_recursive_session_under_test = columnar;
         wl_columnar_session_test_recursive_step_checkpoint =
             controlled_recursive_stop_checkpoint;
-        int rc = controlled_recursive_run(session, control);
+        int rc = controlled_recursive_run_fresh(session, control, 4);
         wl_columnar_session_test_recursive_step_checkpoint = NULL;
         controlled_recursive_session_under_test = NULL;
         CHECK(controlled_recursive_stop_fired
@@ -2841,7 +3585,7 @@ test_controlled_recursive_step_after_public_edge_append(void)
     wl_session_t *session = controlled_recursive_session(edges, 3, &plan,
             &program, &control);
     wl_col_session_t *columnar = (wl_col_session_t *)session;
-    CHECK(!controlled_recursive_run(session, control));
+    CHECK(!controlled_recursive_run_fresh(session, control, 4));
     const col_rel_t *path = session_find_rel(columnar, "path");
     CHECK(path && path->nrows == 6);
     CHECK(!wl_session_insert(session, "edge", later_edge, 1, 2));
@@ -2863,7 +3607,7 @@ test_controlled_recursive_step_after_public_edge_append(void)
     controlled_recursive_session_under_test = columnar;
     wl_columnar_session_test_recursive_step_checkpoint =
         controlled_recursive_stop_checkpoint;
-    int successor_rc = controlled_recursive_run(session, control);
+    int successor_rc = controlled_recursive_run_fresh(session, control, 5);
     wl_columnar_session_test_recursive_step_checkpoint = NULL;
     controlled_recursive_session_under_test = NULL;
     controlled_recursive_boundary_enabled = false;
@@ -2895,7 +3639,11 @@ test_controlled_recursive_step_after_public_edge_append(void)
         + 5u * recursive_capture_scan_work(plan, "path")
         + UINT64_C(5) * 224
         * ((wl_columnar_eval_stack_test_allocation_size() + 15) / 16)
-        + UINT64_C(25) * 224 * ((sizeof(col_rel_t) + 7) / 8);
+        + UINT64_C(25) * 224 * ((sizeof(col_rel_t) + 7) / 8)
+        /* MAIN removes the final empty delta's 28 phase polls and two
+         * three-call token handoffs; five bodies and final frontier each
+         * revisit their Original caller for final READY consumption. */
+        - UINT64_C(28) - UINT64_C(2) * 3 + UINT64_C(5) + 1;
     CHECK(successor_report.consumed == successor_work);
     const int64_t expected[][2] = {
         { 1, 2 }, { 1, 3 }, { 1, 4 }, { 1, 5 },
@@ -2907,7 +3655,7 @@ test_controlled_recursive_step_after_public_edge_append(void)
             && path->columns[1][i] == expected[i][1]);
     const int64_t next_edge[] = { 5, 6 };
     CHECK(!wl_session_insert(session, "edge", next_edge, 1, 2));
-    CHECK(!controlled_recursive_run(session, control));
+    CHECK(!controlled_recursive_run_fresh(session, control, 6));
     path = session_find_rel(columnar, "path");
     CHECK(path && path->nrows == 15);
     const int64_t third_expected[][2] = {
@@ -2943,12 +3691,16 @@ test_controlled_recursive_successor_work_boundaries(void)
         + 5u * recursive_capture_scan_work(plan, "path")
         + UINT64_C(5) * 224
         * ((wl_columnar_eval_stack_test_allocation_size() + 15) / 16)
-        + UINT64_C(25) * 224 * ((sizeof(col_rel_t) + 7) / 8);
+        + UINT64_C(25) * 224 * ((sizeof(col_rel_t) + 7) / 8)
+        /* MAIN removes the final empty delta's 28 phase polls and two
+         * three-call token handoffs; five bodies and final frontier each
+         * revisit their Original caller for final READY consumption. */
+        - UINT64_C(28) - UINT64_C(2) * 3 + UINT64_C(5) + 1;
     wl_col_session_t *columnar = (wl_col_session_t *)session;
-    CHECK(!controlled_recursive_run(session, control));
+    CHECK(!controlled_recursive_run_fresh(session, control, 4));
     CHECK(!wl_session_insert(session, "edge", later_edge, 1, 2));
     CHECK(!wl_evaluation_control_configure(control, successor_work));
-    CHECK(!controlled_recursive_run(session, control));
+    CHECK(!controlled_recursive_run_fresh(session, control, 5));
     wl_evaluation_control_report_t report;
     CHECK(!wl_evaluation_control_report(control, &report)
         && report.limit == successor_work
@@ -2963,13 +3715,13 @@ test_controlled_recursive_successor_work_boundaries(void)
     session = controlled_recursive_session(edges, 3, &plan, &program,
             &control);
     columnar = (wl_col_session_t *)session;
-    CHECK(!controlled_recursive_run(session, control));
+    CHECK(!controlled_recursive_run_fresh(session, control, 4));
     const col_rel_t *old_path = session_find_rel(columnar, "path");
     CHECK(old_path && old_path->nrows == 6);
     const uint64_t old_path_identity = old_path->relation_identity;
     CHECK(!wl_session_insert(session, "edge", later_edge, 1, 2));
     CHECK(!wl_evaluation_control_configure(control, successor_work - 1u));
-    int rc = controlled_recursive_run(session, control);
+    int rc = controlled_recursive_run_fresh(session, control, 5);
     CHECK(rc == WL_EVALUATION_CONTROL_WORK_LIMIT
         && session_find_rel(columnar, "path") == old_path
         && old_path->nrows == 6
@@ -3062,7 +3814,10 @@ test_controlled_recursive_snapshot_rejects_prelease_mutation(void)
     wl_session_t *session = controlled_recursive_session(edges, 3, &plan,
             &program, &control);
     wl_col_session_t *columnar = (wl_col_session_t *)session;
-    CHECK(wl_session_step(session) == EAGAIN);
+    for (unsigned call = 0;
+        !wl_evaluation_control_active_attempt_id(control); ++call) {
+        CHECK(call < 10000 && wl_session_step(session) == EAGAIN);
+    }
     const col_rel_t *edge = session_find_rel(columnar, "edge");
     CHECK(edge && !col_rel_append_row((col_rel_t *)edge, changed_edge));
     int rc = controlled_recursive_run(session, control);
@@ -3100,7 +3855,7 @@ test_controlled_recursive_step_requires_edge_before_attempt(void)
     wl_session_t *session = NULL;
     CHECK(!wl_session_create_with_options(wl_backend_columnar(), plan, 1,
         &options, &session));
-    CHECK(wl_session_step(session) == ENOTSUP);
+    CHECK(controlled_recursive_run(session, control) == ENOTSUP);
     wl_evaluation_control_report_t report;
     CHECK(wl_evaluation_control_report(control, &report) == ENOENT);
     wl_session_destroy(session);
@@ -3304,6 +4059,16 @@ static bool observed_multi_authenticated;
 static unsigned observed_multi_stop_phase;
 static uint32_t observed_multi_stop_index;
 static bool observed_multi_stop_work, observed_multi_stop_in_child;
+typedef struct observed_multi_stop_context {
+    wl_session_t *session;
+    wl_evaluation_control_t *original;
+    uint64_t original_identity;
+    struct observed_multi_stop_context *previous;
+} observed_multi_stop_context_t;
+static observed_multi_stop_context_t *observed_multi_stop_context;
+static wl_evaluation_control_t *observed_multi_semantic_stop_target(
+    wl_evaluation_control_t *, unsigned);
+
 static void
 observed_multi_stop(wl_evaluation_control_t *control, unsigned phase,
     uint32_t index, const wl_columnar_eval_private_bindings_t *bindings)
@@ -3331,6 +4096,7 @@ observed_multi_stop(wl_evaluation_control_t *control, unsigned phase,
     if (phase == observed_multi_stop_phase &&
         index == observed_multi_stop_index
         && (!observed_multi_stop_in_child || bindings)){
+        control = observed_multi_semantic_stop_target(control, phase);
         wl_columnar_session_test_observed_transaction_checkpoint = NULL;
         if (observed_multi_stop_work)
             CHECK(wl_evaluation_control_charge(control, UINT64_MAX)
@@ -3502,9 +4268,234 @@ static unsigned frontier_selected_op, frontier_first_branch,
     frontier_late_reads,
     frontier_back_reads, frontier_mirror_reads, frontier_audit_hits;
 
+extern int wl_columnar_session_test_retirement_view(const wl_col_session_t *,
+    uint64_t[16]);
+extern void (*wl_columnar_session_test_retirement_checkpoint)(
+    wl_evaluation_control_t *, unsigned, unsigned, uint32_t, const col_rel_t *);
+
+static wl_evaluation_control_t *
+observed_multi_semantic_stop_target(wl_evaluation_control_t *funding,
+    unsigned phase)
+{
+    const observed_multi_stop_context_t *c = observed_multi_stop_context;
+    if (!c || (phase != 22 && phase != 23)) return funding;
+    uint64_t main[16], progress[16], consumed = UINT64_MAX;
+    CHECK(c->session && c->original
+        && c->session->evaluation_control == c->original
+        && funding != c->original && c->original_identity
+        && wl_evaluation_control_identity(c->original) == c->original_identity
+        && !wl_columnar_session_test_main_view(
+            (wl_col_session_t *)c->session, main)
+        && !wl_columnar_session_test_retirement_view(
+            (wl_col_session_t *)c->session, progress));
+    /* These exact source22/23 callsites identify role2/action1 and a
+     * positive Tx round. The MAIN view does not expose those fields. */
+    CHECK(main[0] && main[1] == 3 && main[2] == 2 && main[3] && main[4]
+        && main[8] && !main[15] && main[9] == (uintptr_t)funding
+        && main[6] &&
+        main[6] == wl_evaluation_control_active_attempt_id(funding)
+        && main[7] == wl_evaluation_control_identity(funding)
+        && !wl_evaluation_control_test_active_consumed(funding, main[6],
+        &consumed) && !consumed);
+    CHECK(progress[3] == 21 && progress[1]
+        && progress[1] == wl_evaluation_control_active_attempt_id(c->original)
+        && progress[6] == main[6] && !(progress[10] & 1u)
+        && progress[13] == (phase == 22 ? 6u : 13u));
+    /* At23 the relation header has already been freed. Read only the
+     * external progress metadata above, never the retired target. */
+    return c->original;
+}
+
+typedef struct {
+    uint64_t ordinal, relation_identity;
+    uintptr_t target_bits;
+    uint32_t index;
+    unsigned header_frees, physical_completions, final_acks;
+    bool active, physical_seen;
+} frontier_retirement_occurrence_t;
+
+typedef struct frontier_stop_context {
+    uint64_t original_identity;
+    wl_session_t *session;
+    wl_evaluation_control_t *original;
+    uint64_t original_id, main_identity, stopped_id, target_ordinal,
+        next_ordinal;
+    uint64_t clear_id;
+    unsigned stopped_reports;
+    bool financial, tracking, recovered, target_done;
+    frontier_retirement_occurrence_t current, finished;
+    wl_evaluation_control_report_t original_before, stopped_report;
+    void (*previous_observed)(wl_evaluation_control_t *, unsigned, uint32_t,
+        const wl_columnar_eval_private_bindings_t *);
+    void (*previous_constructor)(wl_evaluation_control_t *, unsigned);
+    void (*previous_row)(wl_evaluation_control_t *, uint64_t);
+    void (*previous_retirement)(wl_evaluation_control_t *, unsigned, unsigned,
+        uint32_t, const col_rel_t *);
+    controlled_recursive_main_hook_t previous_advanced;
+    void (*previous_report)(const wl_col_session_t *, unsigned, unsigned,
+        wl_evaluation_control_report_t, int);
+    struct frontier_stop_context *previous;
+} frontier_stop_context_t;
+static frontier_stop_context_t *frontier_stop_context;
+
+static void
+frontier_retirement_checkpoint(wl_evaluation_control_t *funding, unsigned role,
+    unsigned action, uint32_t index, const col_rel_t *target)
+{
+    frontier_stop_context_t *c = frontier_stop_context;
+    if (c && c->tracking && role == 2) {
+        uint64_t main[16];
+        CHECK(!wl_columnar_session_test_main_view(
+                (wl_col_session_t *)c->session,
+                main));
+        CHECK(main[0] && main[2] == 2 && main[3] && main[4] && main[8]
+            && main[9] == (uintptr_t)funding
+            && main[6] == wl_evaluation_control_active_attempt_id(funding)
+            && main[7] == wl_evaluation_control_identity(funding));
+        if (!c->main_identity) c->main_identity = main[7];
+        CHECK(c->main_identity == main[7]);
+        uint64_t id = wl_evaluation_control_active_attempt_id(c->original);
+        if (!c->original_id) {
+            CHECK(id); c->original_id = id;
+        }
+        CHECK(id == c->original_id
+            || (!c->financial && frontier_stopped && !id));
+        if (action == 1) {
+            /* This sole target read precedes initialization and physical free.
+             * The monotonic occurrence distinguishes reused progress storage. */
+            CHECK(target && target->relation_identity);
+            if (!c->current.active) {
+                c->current = (frontier_retirement_occurrence_t){
+                    .ordinal = ++c->next_ordinal,
+                    .relation_identity = target->relation_identity,
+                    .target_bits = (uintptr_t)target, .index = index,
+                    .active = true
+                };
+            } else CHECK(c->current.target_bits == (uintptr_t)target
+                    && c->current.relation_identity == target->relation_identity
+                    && c->current.index == index);
+        } else if (action == 6) {
+            CHECK(c->current.active && c->current.index == index && !target);
+            c->clear_id = main[6];
+        }
+    }
+    if (c && c->previous_retirement
+        && c->previous_retirement != frontier_retirement_checkpoint)
+        c->previous_retirement(funding, role, action, index, target);
+}
+
+static void
+frontier_main_advanced(wl_col_session_t *session,
+    wl_evaluation_control_t *funding, uint64_t id, unsigned recipient,
+    unsigned before, unsigned after, int result)
+{
+    frontier_stop_context_t *c = frontier_stop_context;
+    if (c && c->tracking && &session->base == c->session
+        && recipient == 2 && c->current.active) {
+        uint64_t progress[16];
+        CHECK(!wl_columnar_session_test_retirement_view(session, progress));
+        CHECK(wl_evaluation_control_identity(funding) == c->main_identity);
+        /* Scalar11 is the actual header free and persists phase13 before
+         * return. No retired-target dereference is needed at or after it. */
+        if (before == 11 && after == 13)
+            CHECK(++c->current.header_frees == 1);
+        if ((progress[10] & 1u) && !c->current.physical_seen) {
+            c->current.physical_seen = true;
+            CHECK(++c->current.physical_completions == 1);
+        }
+        if (c->financial && c->target_ordinal == c->current.ordinal
+            && c->stopped_reports && id > c->stopped_id)
+            c->recovered = true;
+    }
+    if (c && c->previous_advanced &&
+        c->previous_advanced != frontier_main_advanced)
+        c->previous_advanced(session, funding, id, recipient, before, after,
+            result);
+}
+
+static void
+frontier_main_report(const wl_col_session_t *session, unsigned recipient,
+    unsigned action, wl_evaluation_control_report_t report, int result)
+{
+    frontier_stop_context_t *c = frontier_stop_context;
+    if (c && c->tracking && &session->base == c->session && recipient == 2
+        && action == 1 && c->current.active) {
+        uint64_t main[16], progress[16];
+        CHECK(!wl_columnar_session_test_main_view(session, main)
+            && !wl_columnar_session_test_retirement_view(session, progress));
+        CHECK(main[7] == c->main_identity && main[6] == report.attempt_id
+            && !main[10] && !main[11]);
+        if (c->financial && c->target_ordinal == c->current.ordinal
+            && report.attempt_id == c->stopped_id) {
+            int stop = frontier_stop_work ? WL_EVALUATION_CONTROL_WORK_LIMIT :
+                WL_EVALUATION_CONTROL_CANCELLED;
+            CHECK(++c->stopped_reports == 1 && report.limit == 256
+                && !report.consumed && report.stop_reason == stop
+                && !report.execution_status && !report.cleanup_status
+                && report.result == stop && result == stop);
+            c->stopped_report = report;
+            wl_evaluation_control_report_t original;
+            CHECK(wl_evaluation_control_active_attempt_id(c->original)
+                == c->original_id
+                && !wl_evaluation_control_report(c->original, &original)
+                && wl_test_completed_step_report_equal(&original,
+                &c->original_before));
+        }
+        /* This hook is AFTER actual FINISH/report/Source TAKE. A successful
+         * sparse invalidation action, not each clear chunk, is the final ACK. */
+        if (c->clear_id == report.attempt_id && !result) {
+            CHECK(!report.result && report.limit == 256 &&
+                report.consumed == 256
+                && c->current.physical_seen && !(progress[10] & 1u)
+                && c->current.header_frees == 1
+                && c->current.physical_completions == 1
+                && ++c->current.final_acks == 1);
+            if (c->target_ordinal == c->current.ordinal) {
+                CHECK(!c->target_done);
+                c->finished = c->current; c->target_done = true;
+            }
+            c->current.active = false; c->clear_id = 0;
+        }
+    }
+    if (c && c->previous_report && c->previous_report != frontier_main_report)
+        c->previous_report(session, recipient, action, report, result);
+}
+
 static void
 frontier_request_stop(wl_evaluation_control_t *control)
 {
+    frontier_stop_context_t *c = frontier_stop_context;
+    if (c && (frontier_stop_phase == 22 || frontier_stop_phase == 23)) {
+        uint64_t main[16], progress[16], consumed = UINT64_MAX;
+        /* Only these two actual source callsites identify role2/action1
+         * and a positive Tx round; the16-word MAIN view supplies no such fields. */
+        CHECK(c->tracking && c->session->evaluation_control == c->original
+            && c->original_identity
+            && wl_evaluation_control_identity(c->original) ==
+            c->original_identity
+            && control != c->original
+            && !wl_columnar_session_test_main_view(
+                (wl_col_session_t *)c->session, main)
+            && !wl_columnar_session_test_retirement_view(
+                (wl_col_session_t *)c->session, progress));
+        CHECK(main[0] && main[1] == 3 && main[2] == 2 && main[3] && main[4]
+            && main[8] && main[9] == (uintptr_t)control
+            && main[7] == c->main_identity
+            && main[6] == wl_evaluation_control_active_attempt_id(control)
+            && main[7] == wl_evaluation_control_identity(control)
+            && c->current.active && c->current.ordinal
+            && progress[3] == 21 && progress[8] == c->current.index
+            && frontier_round > 0
+            && c->original_id
+            && wl_evaluation_control_active_attempt_id(c->original) ==
+            c->original_id
+            && !wl_evaluation_control_test_active_consumed(control, main[6],
+            &consumed)
+            && !consumed);
+        CHECK(c->current.header_frees == (frontier_stop_phase == 23 ? 1u : 0u));
+        c->target_ordinal = c->current.ordinal; c->stopped_id = main[6];
+        if (!c->financial) control = c->original;
+    }
     frontier_stopped = true;
     if (frontier_stop_work)
         CHECK(wl_evaluation_control_charge(control, UINT64_MAX)
@@ -3568,6 +4559,10 @@ static void
 frontier_checkpoint(wl_evaluation_control_t *control, unsigned phase,
     uint32_t progress, const wl_columnar_eval_private_bindings_t *bindings)
 {
+    if (frontier_stop_context && frontier_stop_context->previous_observed
+        && frontier_stop_context->previous_observed != frontier_checkpoint)
+        frontier_stop_context->previous_observed(control, phase, progress,
+            bindings);
     frontier_parent_phase = phase;
     bool later_branch = false;
     if (phase == 37) {
@@ -3612,7 +4607,10 @@ frontier_checkpoint(wl_evaluation_control_t *control, unsigned phase,
 static void
 frontier_constructor_checkpoint(wl_evaluation_control_t *control, unsigned part)
 {
-    (void)part;
+    if (frontier_stop_context && frontier_stop_context->previous_constructor
+        && frontier_stop_context->previous_constructor !=
+        frontier_constructor_checkpoint)
+        frontier_stop_context->previous_constructor(control, part);
     if (!frontier_stopped && frontier_internal_stop && frontier_stop_phase == 32
         && frontier_parent_phase == 32) frontier_request_stop(control);
 }
@@ -3620,7 +4618,9 @@ frontier_constructor_checkpoint(wl_evaluation_control_t *control, unsigned part)
 static void
 frontier_row_checkpoint(wl_evaluation_control_t *control, uint64_t work)
 {
-    (void)work;
+    if (frontier_stop_context && frontier_stop_context->previous_row
+        && frontier_stop_context->previous_row != frontier_row_checkpoint)
+        frontier_stop_context->previous_row(control, work);
     if (!frontier_stopped && frontier_internal_stop && frontier_stop_phase == 35
         && frontier_parent_phase == 35 && ++frontier_work_hits == 3)
         frontier_request_stop(control);
@@ -3834,12 +4834,13 @@ test_controlled_recursive_frontiers(void)
 }
 
 static void
-test_controlled_recursive_frontier_stops(void)
+frontier_stop_cases(bool financial)
 {
     const unsigned phases[] = {42, 41, 40, 29, 30, 31, 32, 33, 34, 35, 36, 39,
                                21, 22, 23, 8, 14};
     for (unsigned point = 0; point < sizeof(phases)/sizeof(phases[0]);
         ++point){
+        if (financial && phases[point] != 22 && phases[point] != 23) continue;
         for (unsigned outcome = 0; outcome < 2; ++outcome) {
             wirelog_error_t error;
             char *source = frontier_source(3);
@@ -3896,34 +4897,109 @@ test_controlled_recursive_frontier_stops(void)
             frontier_stopped = false; frontier_round = frontier_work_hits = 0;
             frontier_first_branch = UINT_MAX; frontier_audit_hits = 0;
             frontier_internal_stop = phases[point] == 32 || phases[point] == 35;
+            frontier_stop_context_t context = {
+                .session = session, .original = control, .financial = financial,
+                .original_identity = wl_evaluation_control_identity(control),
+                .tracking = phases[point] == 22 || phases[point] == 23,
+                .previous_observed =
+                    wl_columnar_session_test_observed_transaction_checkpoint,
+                .previous_constructor =
+                    wl_columnar_relation_test_constructor_committed,
+                .previous_row = wl_columnar_relation_test_work_checkpoint,
+                .previous_retirement =
+                    wl_columnar_session_test_retirement_checkpoint,
+                .previous_advanced =
+                    wl_columnar_session_test_main_action_advanced,
+                .previous_report = wl_columnar_session_test_main_action_report,
+                .previous = frontier_stop_context
+            };
+            CHECK(!wl_evaluation_control_report(control,
+                &context.original_before));
+            frontier_stop_context = &context;
+            if (context.tracking) {
+                wl_columnar_session_test_retirement_checkpoint =
+                    frontier_retirement_checkpoint;
+                wl_columnar_session_test_main_action_advanced =
+                    frontier_main_advanced;
+                wl_columnar_session_test_main_action_report =
+                    frontier_main_report;
+            }
             wl_columnar_session_test_observed_transaction_checkpoint =
                 frontier_checkpoint;
             wl_columnar_relation_test_constructor_committed =
                 frontier_constructor_checkpoint;
             wl_columnar_relation_test_work_checkpoint = frontier_row_checkpoint;
             int rc = observed_multi_step(session);
-            wl_columnar_session_test_observed_transaction_checkpoint = NULL;
-            wl_columnar_relation_test_constructor_committed = NULL;
-            wl_columnar_relation_test_work_checkpoint = NULL;
+            wl_columnar_session_test_observed_transaction_checkpoint =
+                context.previous_observed;
+            wl_columnar_relation_test_constructor_committed =
+                context.previous_constructor;
+            wl_columnar_relation_test_work_checkpoint = context.previous_row;
+            wl_columnar_session_test_retirement_checkpoint =
+                context.previous_retirement;
+            wl_columnar_session_test_main_action_advanced =
+                context.previous_advanced;
+            wl_columnar_session_test_main_action_report =
+                context.previous_report;
+            frontier_stop_context = context.previous;
             if (!frontier_stopped) fprintf(stderr,
                     "missed frontier stop phase=%u outcome=%u rc=%d\n",
                     phases[point], outcome, rc);
             CHECK(frontier_stopped);
-            CHECK(rc ==
-                (outcome ? WL_EVALUATION_CONTROL_WORK_LIMIT :
-                WL_EVALUATION_CONTROL_CANCELLED));
-            CHECK(!actual->count &&
-                ((wl_col_session_t *)session)->pending_input_change);
-            for (unsigned h = 0; h < 3; ++h) {
-                CHECK(session_find_rel((wl_col_session_t *)session,
-                    names[h]) == old[h]);
-                CHECK(wl_columnar_relation_snapshot_equal(snapshots[h],
-                    wl_columnar_relation_snapshot(old[h])));
+            if (financial) {
+                CHECK(!rc && context.stopped_reports == 1 && context.recovered
+                    && context.target_done && context.finished.header_frees == 1
+                    && context.finished.physical_completions == 1
+                    && context.finished.final_acks == 1);
+                wl_evaluation_control_report_t report;
+                CHECK(!wl_evaluation_control_report(control, &report)
+                    && report.attempt_id == context.original_id
+                    && report.limit == UINT64_C(1000000000)
+                    && report.stop_reason == WL_EVALUATION_CONTROL_NONE
+                    && !report.execution_status && !report.cleanup_status
+                    && !report.result &&
+                    !wl_evaluation_control_active_attempt_id(control));
+                CHECK(!((wl_col_session_t *)session)->cleanup_active
+                    && !((wl_col_session_t *)session)->cleanup_pending
+                    && !session->source_financial_head
+                    && session->backend->session_controlled_step_state(session)
+                    == WL_CONTROLLED_STEP_COMPLETE
+                    && !wl_session_step(reference));
+                frontier_check_parity(session, reference, actual, expected,
+                    false);
+                fprintf(stderr,
+                    "frontier MAIN phase=%u work=%u allocation=%" PRIu64
+                    " stopped_id=%" PRIu64 " consumed=%" PRIu64 " result=%d"
+                    " occurrence=%" PRIu64 " free=%u physical=%u final_ack=%u\n",
+                    phases[point], outcome, context.main_identity,
+                    context.stopped_id,
+                    context.stopped_report.consumed,
+                    context.stopped_report.result,
+                    context.finished.ordinal, context.finished.header_frees,
+                    context.finished.physical_completions,
+                    context.finished.final_acks);
+            } else {
+                CHECK(rc ==
+                    (outcome ? WL_EVALUATION_CONTROL_WORK_LIMIT :
+                    WL_EVALUATION_CONTROL_CANCELLED));
+                CHECK(!actual->count &&
+                    ((wl_col_session_t *)session)->pending_input_change);
+                for (unsigned h = 0; h < 3; ++h) {
+                    CHECK(session_find_rel((wl_col_session_t *)session,
+                        names[h]) == old[h]);
+                    CHECK(wl_columnar_relation_snapshot_equal(snapshots[h],
+                        wl_columnar_relation_snapshot(old[h])));
+                }
+                CHECK(!wl_evaluation_control_reset(control));
+                CHECK(!wl_evaluation_control_configure(control, 0));
+                int retried = observed_multi_step(session);
+                if (retried) fprintf(stderr,
+                        "frontier retry phase=%u outcome=%u rc=%d\n",
+                        phases[point], outcome, retried);
+                CHECK(!retried && !wl_session_step(reference));
+                frontier_check_parity(session, reference, actual, expected,
+                    false);
             }
-            CHECK(!wl_evaluation_control_reset(control));
-            CHECK(!wl_evaluation_control_configure(control, 0));
-            CHECK(!observed_multi_step(session) && !wl_session_step(reference));
-            frontier_check_parity(session, reference, actual, expected, false);
             CHECK(!wl_session_try_destroy(&session));
             wl_session_destroy(reference);
             wl_evaluation_control_release(control); wl_plan_free(plan);
@@ -3934,6 +5010,18 @@ test_controlled_recursive_frontier_stops(void)
             free(expected);
         }
     }
+}
+
+static void
+test_controlled_recursive_frontier_stops(void)
+{
+    frontier_stop_cases(false);
+}
+
+static void
+test_controlled_recursive_frontier_main_stops(void)
+{
+    frontier_stop_cases(true);
 }
 
 static void
@@ -4351,9 +5439,16 @@ test_controlled_recursive_transaction_stops(void)
             observed_multi_stop_phase = phases[point];
             observed_multi_stop_index = indices[point];
             observed_multi_stop_work = outcome != 1;
+            observed_multi_stop_context_t stop_context = {
+                .session = session, .original = control,
+                .original_identity = wl_evaluation_control_identity(control),
+                .previous = observed_multi_stop_context
+            };
+            observed_multi_stop_context = &stop_context;
             wl_columnar_session_test_observed_transaction_checkpoint =
                 observed_multi_stop;
             int rc = observed_multi_step(session);
+            observed_multi_stop_context = stop_context.previous;
             if (wl_columnar_session_test_observed_transaction_checkpoint)
                 fprintf(stderr,
                     "missed recursive stop phase=%u outcome=%u rc=%d\n",
@@ -4552,8 +5647,8 @@ test_controlled_recursive_transaction_refusals(void)
     }
 }
 
-/* This is an explicitly unoptimized internal plan view. The default optimizer's
-* K_FUSION route remains refused; these assertions do not qualify that route. */
+/* The compiler-bound default route and an explicitly unoptimized body view
+ * compute the same independently specified nonlinear closure. */
 static void
 test_controlled_recursive_transaction_nonlinear_view(void)
 {
@@ -4581,8 +5676,20 @@ test_controlled_recursive_transaction_nonlinear_view(void)
         &options, &session));
     const int64_t edges[] = {1, 2, 2, 3, 3, 4, 4, 5, 5, 2, 2, 3};
     CHECK(!wl_session_insert(session, "links", edges, 6, 2));
-    CHECK(observed_multi_step(session) == ENOTSUP);
-    CHECK(!session_find_rel((wl_col_session_t *)session, "reach"));
+    CHECK(!observed_multi_step(session));
+    const col_rel_t *closure = session_find_rel((wl_col_session_t *)session,
+            "reach");
+    CHECK(closure && closure->nrows == 20 && closure->ncols == 2);
+    uint32_t literal_pairs = 0;
+    for (uint32_t row = 0; row < closure->nrows; ++row) {
+        int64_t x = col_rel_get(closure, row, 0),
+            y = col_rel_get(closure, row, 1);
+        CHECK(x >= 1 && x <= 5 && y >= 2 && y <= 5);
+        uint32_t bit = UINT32_C(1) <<
+            ((uint32_t)(x - 1) * 4 + (uint32_t)(y - 2));
+        CHECK(!(literal_pairs & bit)); literal_pairs |= bit;
+    }
+    CHECK(literal_pairs == (UINT32_C(1) << 20) - 1);
     wl_session_destroy(session);
     CHECK(!wl_evaluation_control_reset(control));
     CHECK(!wl_evaluation_control_configure(control, UINT64_C(1000000000)));
@@ -6023,6 +7130,544 @@ test_controlled_observed_missing_private_head(void)
     free(source); free(capture);
 }
 
+/* Value-only history: no saved address is dereferenced after the hook. The
+ * third slot records an actual overflow event and fails, never deduplicates. */
+typedef struct {
+    uintptr_t context, frame, session, plan, control;
+    uint64_t attempt_id, operation_identity;
+    wl_columnar_eval_cleanup_receipt_key_t key;
+    uint32_t last_registry_slot, last_name_byte;
+    bool indexed;
+} observer_metadata_body_t;
+
+/* Diagnostic tags bound to frozen Source31v4 (3dea5279), not phase setters.
+ * These cases exercise real CANCEL only; they make no WORK/224-bound claim. */
+enum {
+    OBS_META_LOCAL_RESET = 4,
+    OBS_META_RETRY_RESET = 8,
+    OBS_META_TAGS = 10,
+    OBS_META_NO_FAULT = 10
+};
+
+typedef struct {
+    wl_session_t *session;
+    wl_evaluation_control_t *control;
+    uint64_t allocation, original_id, retry_id, before_id, first_original_id;
+    unsigned target, event, before[OBS_META_TAGS], after[OBS_META_TAGS];
+    unsigned performed[OBS_META_TAGS];
+    bool inside, armed, injected, fault_return, original_ended, retry_ended;
+    wl_evaluation_control_report_t original, retry, fault_bank;
+    observer_metadata_body_t bodies[3];
+    unsigned body_entries;
+} observer_metadata_validation_t;
+
+static observer_metadata_validation_t *observer_metadata_validation;
+
+static observer_metadata_validation_t *observer_metadata_body_probe;
+
+static bool
+observer_metadata_body_key_equal(
+    const wl_columnar_eval_cleanup_receipt_key_t *a,
+    const wl_columnar_eval_cleanup_receipt_key_t *b)
+{
+    return a->session_generation == b->session_generation
+           && a->receipt_id == b->receipt_id && a->plan_epoch == b->plan_epoch
+           && a->operation_attempt_id == b->operation_attempt_id
+           && a->operation_id == b->operation_id;
+}
+
+static void
+observer_metadata_body_checkpoint(wl_columnar_eval_serial_framed_attempt_t *ctx)
+{
+    /* Preserve every historical raw checkpoint observation unchanged. */
+    controlled_observer_count_rule_start(ctx);
+    observer_metadata_validation_t *p = observer_metadata_body_probe;
+    CHECK(p);
+    if (ctx->session != (wl_col_session_t *)p->session
+        || ctx->phase != WL_COLUMNAR_EVAL_SERIAL_FRAMED_LOOKUP) return;
+    CHECK(ctx->identity == ctx && ctx->frame && ctx->plan && ctx->plan->name
+        && ctx->plan->ops && ctx->plan->op_count && ctx->pin_owned
+        && ctx->thread_valid && ctx->control == p->control
+        && wl_evaluation_control_identity(ctx->control) == p->allocation
+        && ctx->attempt_id && ctx->operation_identity
+        && wl_evaluation_control_active_attempt_id(ctx->control) ==
+        ctx->attempt_id);
+#if defined(WL_HAVE_C11_THREADS)
+    CHECK(thrd_equal(ctx->owner_thread, thrd_current()));
+#elif defined(_WIN32) || defined(_WIN64)
+    CHECK(ctx->owner_thread == GetCurrentThreadId());
+#else
+    CHECK(pthread_equal(ctx->owner_thread, pthread_self()));
+#endif
+    CHECK(ctx->session->nrels && ctx->session->rels
+        && ctx->session->rels[0] && ctx->session->rels[0]->name
+        && !strcmp(ctx->session->rels[0]->name, "input")
+        && !strcmp(ctx->plan->name, "output")
+        && strcmp(ctx->session->rels[0]->name, ctx->plan->name));
+    bool indexed = ctx->capture_only && ctx->private_bindings
+        && ctx->private_bindings->dynamic_entries
+        && !ctx->controlled_materialized_batch_fallback;
+    const wl_columnar_eval_cleanup_receipt_key_t *key =
+        &ctx->cleanup_receipt_key;
+    bool has_key = key->session_generation || key->receipt_id || key->plan_epoch
+        || key->operation_attempt_id || key->operation_id;
+    if (indexed || has_key)
+        CHECK(key->session_generation && key->receipt_id && key->plan_epoch
+            && key->operation_attempt_id == ctx->attempt_id
+            && key->operation_id == ctx->operation_identity);
+    if (!ctx->registry_slot && !ctx->name_byte) {
+        CHECK(p->body_entries < 3);
+        observer_metadata_body_t *body = &p->bodies[p->body_entries++];
+        *body = (observer_metadata_body_t){
+            .context = (uintptr_t)ctx, .frame = (uintptr_t)ctx->frame,
+            .session = (uintptr_t)ctx->session, .plan = (uintptr_t)ctx->plan,
+            .control = (uintptr_t)ctx->control, .attempt_id = ctx->attempt_id,
+            .operation_identity = ctx->operation_identity, .key = *key,
+            .last_registry_slot = ctx->registry_slot,
+            .last_name_byte = ctx->name_byte,
+            .indexed = indexed
+        };
+        /* Count every real entry, even reused addresses or an actual rewind. */
+        CHECK(p->body_entries <= 2);
+        CHECK(ctx->operation_identity == p->bodies[0].operation_identity);
+        return;
+    }
+    CHECK(p->body_entries && p->body_entries <= 2);
+    observer_metadata_body_t *body = &p->bodies[p->body_entries-1];
+    CHECK(body->context == (uintptr_t)ctx &&
+        body->frame == (uintptr_t)ctx->frame
+        && body->session == (uintptr_t)ctx->session
+        && body->plan == (uintptr_t)ctx->plan &&
+        body->control == (uintptr_t)ctx->control
+        && body->attempt_id == ctx->attempt_id
+        && body->operation_identity == ctx->operation_identity
+        && body->indexed == indexed &&
+        observer_metadata_body_key_equal(&body->key, key));
+    CHECK(ctx->registry_slot > body->last_registry_slot
+        || (ctx->registry_slot == body->last_registry_slot
+        && ctx->name_byte > body->last_name_byte));
+    body->last_registry_slot = ctx->registry_slot;
+    body->last_name_byte = ctx->name_byte;
+}
+
+static void
+observer_metadata_validation_phase(
+    const wl_col_session_t *session, unsigned tag, bool after,
+    wl_evaluation_control_source_final_result_t result)
+{
+    observer_metadata_validation_t *p = observer_metadata_validation;
+    CHECK(p && &session->base == p->session && tag < OBS_META_TAGS);
+    CHECK(p->session->evaluation_control == p->control &&
+        wl_evaluation_control_identity(p->control) == p->allocation);
+    uint64_t current = wl_evaluation_control_active_attempt_id(p->control);
+    if (!after) {
+        CHECK(!p->inside);
+        if (current && !p->retry_id) {
+            if (!p->first_original_id)
+                p->first_original_id = current;
+            CHECK(current == p->first_original_id);
+        }
+        p->inside = true;
+        p->before_id = current;
+        p->before[tag]++;
+        if (tag == p->target && !p->armed) {
+            CHECK(!wl_evaluation_control_test_source_final_cancel_at);
+            p->armed = true;
+            wl_evaluation_control_test_source_final_cancel_at = p->event;
+        }
+        return;
+    }
+    CHECK(p->inside);
+    p->inside = false;
+    p->after[tag]++;
+    if (result.action_called && result.phase_finished && !result.action_result)
+        p->performed[tag]++;
+    if (tag == p->target && p->armed && !p->injected) {
+        CHECK(!wl_evaluation_control_test_source_final_cancel_at);
+        CHECK(result.financial_result == WL_EVALUATION_CONTROL_CANCELLED &&
+            result.phase_started && result.phase_finished);
+        CHECK(result.action_called ==
+            (p->event == WL_EVALUATION_CONTROL_TEST_SOURCE_FINAL_AFTER_ACTION));
+        if (result.action_called)
+            CHECK(!result.action_result);
+        CHECK(!wl_session_test_source_early_report(p->session, &p->fault_bank));
+        CHECK(p->fault_bank.attempt_id && p->fault_bank.limit == 768 &&
+            p->fault_bank.consumed == (result.action_called ? 432u : 0u) &&
+            p->fault_bank.stop_reason == WL_EVALUATION_CONTROL_CANCELLED &&
+            !p->fault_bank.execution_status && !p->fault_bank.cleanup_status &&
+            p->fault_bank.result == WL_EVALUATION_CONTROL_CANCELLED);
+        p->injected = p->fault_return = true;
+    }
+    if (tag == 2 && p->before_id && !current && result.action_called &&
+        result.phase_finished && !result.action_result) {
+        CHECK(!p->original_ended);
+        CHECK(!wl_evaluation_control_report(p->control, &p->original));
+        CHECK(!p->original.limit && p->original.attempt_id == p->before_id &&
+            p->before_id == p->first_original_id &&
+            p->original.execution_status == EIO && p->original.result == EIO &&
+            !p->original.cleanup_status);
+        p->original_id = p->before_id;
+        p->original_ended = true;
+    }
+    /* CLOSE may discard ENDED_RETRY under the same diagnostic tag5; it
+     * never supplies a retry BEGIN. Bind the actual OPERATION scope too. */
+    if (tag == 5 && wl_session_source_operation_scope_owned(&session->base) &&
+        result.action_called && result.phase_finished &&
+        !result.action_result) {
+        CHECK(!p->before_id && current > p->original_id && !p->retry_id);
+        p->retry_id = current;
+    }
+    if (tag == 6 && p->before_id && !current && result.action_called &&
+        result.phase_finished && !result.action_result) {
+        CHECK(p->before_id == p->retry_id && !p->retry_ended);
+        CHECK(!wl_evaluation_control_report(p->control, &p->retry));
+        CHECK(!p->retry.limit && p->retry.attempt_id == p->retry_id &&
+            !p->retry.result &&
+            !p->retry.execution_status && !p->retry.cleanup_status &&
+            p->retry.stop_reason == WL_EVALUATION_CONTROL_NONE);
+        p->retry_ended = true;
+    }
+}
+
+/* Public results are inspected before any host reset or continuation.  The
+ * 10000-call fixture watchdog is unchanged; CANCEL is never generic EAGAIN. */
+static int
+observer_metadata_validation_run(observer_metadata_validation_t *p)
+{
+    for (unsigned turn = 0; turn < 10000; ++turn) {
+        CHECK(!p->fault_return && !p->inside);
+        int rc = wl_session_step(p->session);
+        CHECK(p->body_entries <= 1);
+        uint64_t current = wl_evaluation_control_active_attempt_id(p->control);
+        wl_controlled_step_state_t state =
+            p->session->backend->session_controlled_step_state(p->session);
+        wl_evaluation_control_report_t report;
+        int report_rc = wl_evaluation_control_report(p->control, &report);
+        if (p->retry_ended || p->original_ended) {
+            CHECK(!report_rc);
+            /* R remains the last completed report even while S is active.
+             * Only the genuine FINISH hook may replace this witness with S. */
+            CHECK(wl_test_completed_step_report_equal(
+                    &report, p->retry_ended ? &p->retry : &p->original));
+        } else {
+            /* Fresh control has no completed Original; ENOENT supplies no
+             * readable report and is never used as an admission witness. */
+            CHECK(report_rc == ENOENT);
+        }
+        if (current && !p->retry_id) {
+            if (!p->first_original_id)
+                p->first_original_id = current;
+            CHECK(current == p->first_original_id);
+        }
+        if (p->retry_id && current)
+            CHECK(current == p->retry_id);
+
+        if (p->fault_return) {
+            bool pre =
+                p->event == WL_EVALUATION_CONTROL_TEST_SOURCE_FINAL_AFTER_BEGIN;
+            CHECK(!current);
+            if (p->target == OBS_META_LOCAL_RESET) {
+                CHECK(rc == (pre ? EAGAIN : EIO));
+                CHECK(state ==
+                    (pre ? WL_CONTROLLED_STEP_NATIVE_ERROR_CLEANUP_PENDING
+                            : WL_CONTROLLED_STEP_RETRYABLE));
+                CHECK(p->original_ended && !p->retry_id);
+            } else {
+                CHECK(p->target == OBS_META_RETRY_RESET && p->retry_ended &&
+                    rc == WL_EVALUATION_CONTROL_CANCELLED);
+                CHECK(state ==
+                    (pre ? WL_CONTROLLED_STEP_NATIVE_ERROR_CLEANUP_PENDING
+                            : WL_CONTROLLED_STEP_COMPLETE));
+            }
+            /* A public checkpoint can publish a later genuine bank report.
+             * Observe that current report, not a fabricated copy of the hook's. */
+            wl_evaluation_control_report_t bank, reset;
+            if (state == WL_CONTROLLED_STEP_NATIVE_ERROR_CLEANUP_PENDING) {
+                CHECK(!wl_session_test_source_pending_report(p->session,
+                    &bank));
+                CHECK(!wl_session_test_source_pending_reset_cancel(p->session,
+                    &reset));
+                CHECK(wl_test_completed_step_report_equal(&bank, &reset));
+            } else {
+                CHECK(
+                    !wl_session_test_source_unstarted_reset_cancel(p->session,
+                    &reset));
+            }
+            CHECK(reset.attempt_id && reset.limit == 768 &&
+                reset.result == WL_EVALUATION_CONTROL_CANCELLED &&
+                reset.stop_reason == WL_EVALUATION_CONTROL_CANCELLED &&
+                !reset.execution_status && !reset.cleanup_status);
+            p->fault_return = false;
+            if (pre)
+                continue; /* The exact public refusal was asserted above. */
+            return rc;
+        }
+        if (rc == EAGAIN) {
+            if (!current && (p->original_ended || p->retry_ended))
+                CHECK(state == WL_CONTROLLED_STEP_NATIVE_ERROR_CLEANUP_PENDING);
+            continue;
+        }
+        return rc;
+    }
+    CHECK(false);
+    return EAGAIN;
+}
+
+typedef struct {
+    wirelog_program_t *program;
+    wl_plan_t *plan;
+    wl_evaluation_control_t *control;
+    wl_columnar_memory_governor_ref_t *governor;
+    wl_session_t *session;
+    controlled_observer_capture_t capture;
+    observer_metadata_validation_t probe;
+} observer_metadata_fixture_t;
+
+static void
+observer_metadata_fixture_create(observer_metadata_fixture_t *f,
+    unsigned target, unsigned event)
+{
+    static const char source[] =
+        ".decl input(x:int64)\n"
+        ".decl output(x:int64)\noutput(x) :- input(x).\n";
+    const int64_t rows[] = {7, 3, 7, 11};
+    wirelog_error_t error;
+    f->program = wirelog_parse_string(source, &error);
+    CHECK(f->program);
+    CHECK(!wl_plan_from_program(f->program, &f->plan));
+    CHECK(!wl_evaluation_control_create(0, &f->control));
+    wl_columnar_memory_resolution_t resolution = {
+        .budget_bytes = WL_COLUMNAR_MEMORY_MIN_BUDGET,
+        .usable_bytes = WL_COLUMNAR_MEMORY_MIN_BUDGET,
+        .mode = WL_COLUMNAR_MEMORY_MODE_ENFORCING
+    };
+    f->governor = wl_columnar_memory_governor_ref_create(&resolution);
+    CHECK(f->governor);
+    wl_session_options_t options;
+    wl_session_options_init(&options);
+    options.evaluation_control = f->control;
+    options.memory_governor = f->governor;
+    CHECK(!wl_session_create_with_options(wl_backend_columnar(), f->plan, 1,
+        &options, &f->session));
+    CHECK(!wl_session_insert(f->session, "input", rows, 4, 1));
+    f->capture.control = f->control;
+    f->capture.cancel_on_first = true;
+    wl_session_set_delta_cb(f->session, controlled_observer_capture,
+        &f->capture);
+    CHECK(!observer_metadata_validation && !observer_metadata_body_probe &&
+        !wl_columnar_session_test_observer_error_phase &&
+        !wl_columnar_eval_serial_test_framed_checkpoint);
+    f->probe.session = f->session;
+    f->probe.control = f->control;
+    f->probe.allocation = wl_evaluation_control_identity(f->control);
+    f->probe.target = target;
+    f->probe.event = event;
+    observer_metadata_validation = &f->probe;
+    observer_metadata_body_probe = &f->probe;
+    wl_columnar_session_test_observer_error_phase =
+        observer_metadata_validation_phase;
+    controlled_observer_framed_lookup_hits = 0;
+    wl_columnar_eval_serial_test_framed_checkpoint =
+        observer_metadata_body_checkpoint;
+    wl_columnar_eval_delta_test_fail_observer_stream_release_once = true;
+}
+
+static void
+observer_metadata_error_ready(observer_metadata_fixture_t *f)
+{
+    CHECK(observer_metadata_validation_run(&f->probe) == EIO);
+    CHECK(f->probe.original_ended && f->probe.performed[4] == 1 &&
+        !wl_evaluation_control_active_attempt_id(f->control));
+    CHECK(!wl_columnar_eval_delta_test_fail_observer_stream_release_once);
+    CHECK(f->session->backend->session_controlled_step_state(f->session) ==
+        WL_CONTROLLED_STEP_RETRYABLE);
+    CHECK(f->capture.count == 3 && controlled_observer_framed_lookup_hits == 1);
+    CHECK(f->probe.body_entries == 1
+        && f->probe.bodies[0].attempt_id == f->probe.original_id);
+    for (unsigned i = 0; i < 3; ++i) {
+        const int64_t expected[] = {3, 7, 11};
+        CHECK(f->capture.rows[i] == expected[i] && f->capture.diffs[i] == 1);
+    }
+    CHECK(wl_session_snapshot(f->session, controlled_observer_snapshot_capture,
+        NULL) == EBUSY);
+    CHECK(f->probe.performed[0] == 1 && f->probe.performed[1] == 1 &&
+        f->probe.performed[2] == 2 && f->probe.performed[3] == 1);
+}
+
+static void
+observer_metadata_retry(observer_metadata_fixture_t *f)
+{
+    CHECK(!wl_evaluation_control_reset(f->control));
+    int rc = observer_metadata_validation_run(&f->probe);
+    bool ack_post =
+        f->probe.target == OBS_META_RETRY_RESET &&
+        f->probe.event == WL_EVALUATION_CONTROL_TEST_SOURCE_FINAL_AFTER_ACTION;
+    CHECK(rc == (ack_post ? WL_EVALUATION_CONTROL_CANCELLED : 0));
+    CHECK(f->probe.retry_ended && f->probe.retry_id > f->probe.original_id &&
+        f->probe.performed[5] == 1 && f->probe.performed[6] == 1 &&
+        f->probe.performed[7] == 1 && f->probe.performed[8] == 1);
+    CHECK(f->session->backend->session_controlled_step_state(f->session) ==
+        WL_CONTROLLED_STEP_COMPLETE);
+    for (unsigned quiet = 0; quiet < 2; ++quiet) {
+        CHECK(!observer_metadata_validation_run(&f->probe));
+        wl_evaluation_control_report_t report;
+        CHECK(!wl_evaluation_control_report(f->control, &report));
+        CHECK(wl_test_completed_step_report_equal(&report, &f->probe.retry));
+    }
+    CHECK(f->capture.count == 3 && controlled_observer_framed_lookup_hits == 1);
+    CHECK(f->probe.body_entries == 1
+        && f->probe.bodies[0].attempt_id == f->probe.original_id);
+}
+
+static void
+observer_metadata_fixture_close(observer_metadata_fixture_t *f,
+    const wl_evaluation_control_report_t *expected,
+    unsigned events, unsigned rules, unsigned bodies)
+{
+    for (unsigned turn = 0; f->session && turn < 10000; ++turn) {
+        int rc = wl_session_try_destroy(&f->session);
+        CHECK(!rc || rc == EBUSY || rc == EAGAIN);
+        wl_evaluation_control_report_t report;
+        CHECK(!wl_evaluation_control_report(f->control, &report));
+        CHECK(wl_test_completed_step_report_equal(&report, expected));
+        CHECK(f->capture.count == events &&
+            controlled_observer_framed_lookup_hits == rules);
+        CHECK(f->probe.body_entries == bodies);
+    }
+    CHECK(!f->session && !f->probe.inside && f->probe.body_entries == bodies
+        && controlled_observer_framed_lookup_hits == rules);
+    wl_columnar_session_test_observer_error_phase = NULL;
+    wl_columnar_eval_serial_test_framed_checkpoint = NULL;
+    observer_metadata_validation = NULL;
+    observer_metadata_body_probe = NULL;
+    wl_evaluation_control_release(f->control);
+    wl_plan_free(f->plan);
+    wirelog_program_free(f->program);
+    CHECK(!wl_columnar_memory_reserved(
+            wl_columnar_memory_governor_ref_get(f->governor)));
+    wl_columnar_memory_governor_ref_release(f->governor);
+}
+
+static void
+observer_metadata_new_capture(const char *relation,
+    const int64_t *row, uint32_t ncols,
+    int diff, void *data)
+{
+    controlled_observer_capture(relation, row, ncols, diff, data);
+}
+
+typedef struct {
+    int64_t rows[4];
+    unsigned count;
+} observer_metadata_snapshot_t;
+
+static void
+observer_metadata_snapshot_capture(const char *relation,
+    const int64_t *row,
+    uint32_t ncols, void *data)
+{
+    observer_metadata_snapshot_t *s = data;
+    CHECK(!strcmp(relation, "output") && ncols == 1 && row && s->count < 4);
+    s->rows[s->count++] = row[0];
+}
+
+static void
+test_observer_error_metadata(void)
+{
+    /* One baseline/future-consumer fixture and four real financial histories. */
+    for (unsigned trial = 0; trial < 5; ++trial) {
+        unsigned tag = trial == 0 ? OBS_META_NO_FAULT : trial <= 2 ? 4u : 8u;
+        unsigned event = trial && !(trial % 2)
+                         ? WL_EVALUATION_CONTROL_TEST_SOURCE_FINAL_AFTER_ACTION
+                         : WL_EVALUATION_CONTROL_TEST_SOURCE_FINAL_AFTER_BEGIN;
+        observer_metadata_fixture_t f = {0};
+        observer_metadata_fixture_create(&f, tag, event);
+        observer_metadata_error_ready(&f);
+        observer_metadata_retry(&f);
+        if (trial) {
+            CHECK(f.probe.armed && f.probe.injected);
+            unsigned repeats =
+                event ==
+                WL_EVALUATION_CONTROL_TEST_SOURCE_FINAL_AFTER_BEGIN ? 2u
+                                                                       : 1u;
+            CHECK(f.probe.before[tag] == repeats &&
+                f.probe.after[tag] == repeats);
+        } else {
+            controlled_observer_capture_t newer = {.control = f.control};
+            wl_session_set_delta_cb(f.session, observer_metadata_new_capture,
+                &newer);
+            CHECK(!observer_metadata_validation_run(&f.probe));
+            wl_evaluation_control_report_t report;
+            CHECK(!wl_evaluation_control_report(f.control, &report) &&
+                wl_test_completed_step_report_equal(&report, &f.probe.retry));
+            CHECK(!newer.count && f.capture.count == 3 &&
+                controlled_observer_framed_lookup_hits == 1);
+            CHECK(f.probe.body_entries == 1);
+            const int64_t extra = 13;
+            CHECK(!wl_session_insert(f.session, "input", &extra, 1, 1));
+            CHECK(f.session->backend->session_controlled_step_state(
+                    f.session) ==
+                WL_CONTROLLED_STEP_DIRTY);
+            CHECK(!wl_evaluation_control_report(f.control, &report) &&
+                wl_test_completed_step_report_equal(&report, &f.probe.retry));
+            /* Future consumers have their own real generations; the earlier
+             * error/retry probe must not claim their ids as its own. */
+            wl_columnar_session_test_observer_error_phase = NULL;
+            observer_metadata_validation = NULL;
+            CHECK(!controlled_recursive_run(f.session, f.control));
+            CHECK(newer.count == 1 && newer.rows[0] == 13 &&
+                newer.diffs[0] == 1 &&
+                f.capture.count == 3);
+            unsigned successor_raw_lookups =
+                controlled_observer_framed_lookup_hits;
+            CHECK(f.probe.body_entries == 2);
+            CHECK(!wl_evaluation_control_report(f.control,
+                &report) && !report.result
+                && report.attempt_id > f.probe.retry_id);
+            uint64_t successor_id = report.attempt_id;
+            CHECK(f.probe.bodies[1].attempt_id == successor_id
+                && f.probe.bodies[0].attempt_id == f.probe.original_id);
+            const col_rel_t *output =
+                session_find_rel((wl_col_session_t *)f.session, "output");
+            CHECK(output && output->nrows == 4);
+            observer_metadata_snapshot_t snapshot = {0};
+            CHECK(!wl_session_snapshot(f.session,
+                observer_metadata_snapshot_capture,
+                &snapshot));
+            const int64_t expected[] = {3, 7, 11, 13};
+            CHECK(snapshot.count == 4);
+            for (unsigned i = 0; i < 4; ++i)
+                CHECK(snapshot.rows[i] == expected[i] &&
+                    output->columns[0][i] == expected[i]);
+            CHECK(!wl_evaluation_control_report(f.control, &report) &&
+                report.attempt_id > successor_id && !report.result);
+            CHECK(f.probe.body_entries == 2
+                && controlled_observer_framed_lookup_hits ==
+                successor_raw_lookups);
+            CHECK(!controlled_recursive_run(f.session, f.control));
+            CHECK(newer.count == 1 && f.capture.count == 3);
+            CHECK(!wl_evaluation_control_report(f.control, &report) &&
+                !report.result);
+            CHECK(controlled_observer_framed_lookup_hits ==
+                successor_raw_lookups
+                && f.probe.body_entries == 2);
+            observer_metadata_fixture_close(&f, &report, 3,
+                successor_raw_lookups, 2);
+            /* The actual installed callback remains live throughout CLOSE. */
+            CHECK(newer.count == 1 && newer.rows[0] == 13
+                && newer.diffs[0] == 1);
+        }
+        if (trial)
+            observer_metadata_fixture_close(&f, &f.probe.retry, 3, 1, 1);
+    }
+    /* CLOSE a real error-ready owner without ever BEGINning its retry. */
+    observer_metadata_fixture_t f = {0};
+    observer_metadata_fixture_create(&f, OBS_META_NO_FAULT, 0);
+    observer_metadata_error_ready(&f);
+    observer_metadata_fixture_close(&f, &f.probe.original, 3, 1, 1);
+    CHECK(!f.probe.retry_id);
+}
+
 static void
 test_controlled_observed_step(void)
 {
@@ -6054,7 +7699,8 @@ test_controlled_observed_step(void)
     wl_columnar_eval_serial_test_framed_checkpoint =
         controlled_observer_count_rule_start;
 
-    CHECK(wl_session_step(session) == WL_EVALUATION_CONTROL_WORK_LIMIT);
+    CHECK(controlled_recursive_run(session,
+        control) == WL_EVALUATION_CONTROL_WORK_LIMIT);
     CHECK(!session_find_rel((wl_col_session_t *)session, "output")
         && capture.count == 0);
     wl_evaluation_control_report_t report;
@@ -6069,7 +7715,7 @@ test_controlled_observed_step(void)
     controlled_observer_boundary_hits = 0;
     wl_columnar_eval_delta_test_observer_boundary =
         controlled_observer_cancel_after_evaluation;
-    int observed_rc = wl_session_step(session);
+    int observed_rc = controlled_recursive_run(session, control);
     CHECK(observed_rc == WL_EVALUATION_CONTROL_CANCELLED);
     wl_columnar_eval_delta_test_observer_boundary = NULL;
     CHECK(controlled_observer_boundary_hits == 1);
@@ -6086,13 +7732,13 @@ test_controlled_observed_step(void)
     CHECK(!wl_evaluation_control_reset(control));
     CHECK(!wl_evaluation_control_configure(control, 0));
     wl_columnar_eval_delta_test_fail_observer_stream_release_once = true;
-    int retry_rc = wl_session_step(session);
+    int retry_rc = controlled_observer_metadata_run(session, control, false);
     CHECK(retry_rc == EIO);
     CHECK(capture.count == 3);
     CHECK(wl_session_snapshot(session,
         controlled_observer_snapshot_capture, NULL) == EBUSY);
     CHECK(!wl_evaluation_control_reset(control));
-    CHECK(!controlled_recursive_run(session, control));
+    CHECK(!controlled_observer_metadata_run(session, control, true));
     CHECK(capture.count == 3 && controlled_observer_framed_lookup_hits == 1);
     CHECK(!wl_evaluation_control_report(control, &report)
         && report.result == 0
@@ -6161,7 +7807,8 @@ test_controlled_observed_step(void)
     wl_columnar_eval_serial_test_framed_checkpoint =
         controlled_observer_count_rule_start;
     wl_columnar_eval_delta_test_fail_observer_stream_release_once = true;
-    CHECK(wl_session_step(destroy_session) == EIO);
+    CHECK(controlled_observer_metadata_run(destroy_session, destroy_control,
+        false) == EIO);
     CHECK(destroy_capture.count == 3
         && controlled_observer_framed_lookup_hits == 1);
     CHECK(wl_session_snapshot(destroy_session,
@@ -6188,7 +7835,7 @@ test_controlled_observed_step(void)
     };
     wl_session_set_delta_cb(measure, controlled_observer_capture,
         &measure_capture);
-    CHECK(!wl_session_step(measure));
+    CHECK(!observed_multi_step(measure));
     CHECK(!wl_evaluation_control_report(measure_control, &report));
     uint64_t complete_budget = report.consumed;
     CHECK(complete_budget > 6 && measure_capture.count == 3);
@@ -6216,7 +7863,7 @@ test_controlled_observed_step(void)
     wl_columnar_eval_serial_test_framed_checkpoint =
         controlled_observer_count_rule_start;
     wl_columnar_session_test_observer_precharged_events = 0;
-    CHECK(wl_session_step(validation_session)
+    CHECK(observed_multi_step(validation_session)
         == WL_EVALUATION_CONTROL_WORK_LIMIT);
     CHECK(wl_columnar_eval_delta_test_stream_validation_rows > 0
         && wl_columnar_eval_delta_test_stream_validation_rows < 3);
@@ -6226,7 +7873,7 @@ test_controlled_observed_step(void)
     CHECK(wl_session_snapshot(validation_session,
         controlled_observer_snapshot_capture, NULL) == EBUSY);
     CHECK(!wl_evaluation_control_reset(validation_control));
-    CHECK(!wl_session_step(validation_session));
+    CHECK(!observed_multi_step(validation_session));
     CHECK(validation_capture.count == 3
         && controlled_observer_framed_lookup_hits == 1);
     wl_session_destroy(validation_session);
@@ -6248,7 +7895,7 @@ test_controlled_observed_step(void)
     wl_session_set_delta_cb(limited, controlled_observer_capture,
         &limited_capture);
     wl_columnar_session_test_observer_precharged_events = 0;
-    CHECK(wl_session_step(limited) == WL_EVALUATION_CONTROL_WORK_LIMIT);
+    CHECK(observed_multi_step(limited) == WL_EVALUATION_CONTROL_WORK_LIMIT);
     CHECK(!wl_evaluation_control_report(limited_control, &report)
         && report.result == WL_EVALUATION_CONTROL_WORK_LIMIT);
     const col_rel_t *limited_output = session_find_rel(
@@ -6260,7 +7907,7 @@ test_controlled_observed_step(void)
     CHECK(wl_session_snapshot(limited,
         controlled_observer_snapshot_capture, NULL) == EBUSY);
     CHECK(!wl_evaluation_control_reset(limited_control));
-    CHECK(!wl_session_step(limited));
+    CHECK(!observed_multi_step(limited));
     CHECK(limited_capture.count == 3);
     wl_session_destroy(limited);
     wl_evaluation_control_release(limited_control);
@@ -6284,7 +7931,7 @@ test_controlled_observed_step(void)
     controlled_observer_framed_lookup_hits = 0;
     wl_columnar_eval_serial_test_framed_checkpoint =
         controlled_observer_count_rule_start;
-    CHECK(wl_session_step(destroy_limited)
+    CHECK(observed_multi_step(destroy_limited)
         == WL_EVALUATION_CONTROL_WORK_LIMIT);
     col_rel_t *destroy_limited_output = session_find_rel(
         (wl_col_session_t *)destroy_limited, "output");
@@ -6299,7 +7946,8 @@ test_controlled_observed_step(void)
     CHECK(!wl_evaluation_control_reset(destroy_limited_control));
     CHECK(!wl_evaluation_control_configure(destroy_limited_control, 0));
     wl_evaluation_control_request_cancel(destroy_limited_control);
-    CHECK(wl_session_step(destroy_limited) == WL_EVALUATION_CONTROL_CANCELLED);
+    CHECK(observed_multi_step(destroy_limited) ==
+        WL_EVALUATION_CONTROL_CANCELLED);
     CHECK(!wl_session_try_destroy(&destroy_limited) && !destroy_limited);
     CHECK(destroy_limited_capture.count == 0
         && controlled_observer_framed_lookup_hits == 1);
@@ -6320,7 +7968,7 @@ test_controlled_observed_step(void)
     controlled_observer_capture_t empty_capture = { .control = empty_control };
     wl_session_set_delta_cb(empty_session, controlled_observer_capture,
         &empty_capture);
-    int empty_rc = wl_session_step(empty_session);
+    int empty_rc = observed_multi_step(empty_session);
     CHECK(!empty_rc);
     CHECK(empty_capture.count == 0);
     const col_rel_t *empty_output = session_find_rel(
@@ -6352,7 +8000,7 @@ test_controlled_observed_step(void)
         else
             wl_session_set_delta_cb(callback_session,
                 controlled_observer_clear_callback, &clear);
-        CHECK(!wl_session_step(callback_session));
+        CHECK(!observed_multi_step(callback_session));
         CHECK(mode == 0 ? replacement.count == 1
             && replacement_count == 2 : clear.count == 1);
         wl_session_destroy(callback_session);
@@ -6374,12 +8022,12 @@ test_controlled_observed_step(void)
     };
     wl_session_set_delta_cb(successor_measure, controlled_observer_capture,
         &successor_measure_capture);
-    CHECK(!wl_session_step(successor_measure));
+    CHECK(!observed_multi_step(successor_measure));
     int64_t successor_row = 13;
     CHECK(!wl_session_insert(successor_measure, "input", &successor_row,
         1, 1));
     CHECK(!wl_evaluation_control_reset(successor_measure_control));
-    CHECK(!wl_session_step(successor_measure));
+    CHECK(!observed_multi_step(successor_measure));
     CHECK(!wl_evaluation_control_report(successor_measure_control, &report));
     uint64_t successor_budget = report.consumed;
     CHECK(successor_budget > 1 && successor_measure_capture.count == 4);
@@ -6397,7 +8045,7 @@ test_controlled_observed_step(void)
             "output");
     CHECK(output && output->nrows == 4 && output->columns[0][3] == 13);
     CHECK(!wl_evaluation_control_reset(successor_measure_control));
-    CHECK(!wl_session_step(successor_measure));
+    CHECK(!observed_multi_step(successor_measure));
     CHECK(successor_measure_capture.count == 5
         && successor_measure_capture.rows[4] == 17
         && successor_measure_capture.diffs[4] == 1);
@@ -6421,7 +8069,7 @@ test_controlled_observed_step(void)
     CHECK(!col_rel_source_reader_release(
             &controlled_observer_registration_reader));
     CHECK(!wl_evaluation_control_reset(successor_measure_control));
-    CHECK(!wl_session_step(successor_measure));
+    CHECK(!observed_multi_step(successor_measure));
     CHECK(successor_measure_capture.count == 6
         && successor_measure_capture.rows[5] == 19
         && successor_measure_capture.diffs[5] == 1
@@ -6468,7 +8116,7 @@ test_controlled_observed_step(void)
         == registry_scan_lookup_hits);
     CHECK(!wl_evaluation_control_reset(successor_measure_control));
     CHECK(!wl_evaluation_control_configure(successor_measure_control, 0));
-    CHECK(!wl_session_step(successor_measure));
+    CHECK(!observed_multi_step(successor_measure));
     CHECK(controlled_registry_scan_counts[1] == 3
         && controlled_registry_scan_indices[1][1] == 1
         && successor_measure_capture.count == 7
@@ -6494,7 +8142,7 @@ test_controlled_observed_step(void)
     };
     wl_session_set_delta_cb(successor_limited, controlled_observer_capture,
         &successor_limited_capture);
-    CHECK(!wl_session_step(successor_limited));
+    CHECK(!observed_multi_step(successor_limited));
     CHECK(!wl_session_insert(successor_limited, "input", &successor_row,
         1, 1));
     CHECK(!wl_evaluation_control_reset(successor_limited_control));
@@ -6519,7 +8167,7 @@ test_controlled_observed_step(void)
     CHECK(!wl_evaluation_control_reset(successor_limited_control));
     CHECK(!wl_evaluation_control_configure(successor_limited_control, 0));
     wl_evaluation_control_request_cancel(successor_limited_control);
-    int successor_cancel_rc = wl_session_step(successor_limited);
+    int successor_cancel_rc = observed_multi_step(successor_limited);
     CHECK(successor_cancel_rc == WL_EVALUATION_CONTROL_CANCELLED);
     CHECK(successor_limited_capture.count == 3);
     limited_head = session_find_rel((wl_col_session_t *)successor_limited,
@@ -6529,7 +8177,7 @@ test_controlled_observed_step(void)
         && limited_head->columns[0][1] == 7
         && limited_head->columns[0][2] == 11);
     CHECK(!wl_evaluation_control_reset(successor_limited_control));
-    CHECK(!wl_session_step(successor_limited));
+    CHECK(!observed_multi_step(successor_limited));
     CHECK(successor_limited_capture.count == 4
         && successor_limited_capture.rows[3] == 13
         && successor_limited_capture.diffs[3] == 1
@@ -6672,7 +8320,7 @@ test_controlled_observed_filter_successors(void)
         if (before != after)
             CHECK(capture.rows[events] == changes[i]
                 && capture.diffs[events] == (after ? 1 : -1));
-        CHECK(!wl_session_step(session) && capture.count == events
+        CHECK(!observed_multi_step(session) && capture.count == events
             + (before != after));
         CHECK(((wl_col_session_t *)session)->nrels == 2);
         CHECK(!session_find_rel((wl_col_session_t *)session, "$r$input"));
@@ -6723,7 +8371,7 @@ test_controlled_observed_filter_successors(void)
                 CHECK(capture.count == 1);
                 CHECK(!wl_evaluation_control_reset(control));
             }
-            CHECK(!wl_session_step(session));
+            CHECK(!observed_multi_step(session));
             if (cycle % 4 == 3) {
                 uint64_t current = wl_columnar_memory_reserved(
                     wl_columnar_memory_governor_ref_get(governor));
@@ -6981,7 +8629,7 @@ test_controlled_observed_filter_stops(void)
             CHECK(head && head->nrows == successor &&
                 capture.count == successor);
             if (successor) CHECK(capture.rows[0] == 9 && capture.diffs[0] == 1);
-            CHECK(!wl_session_step(session) && capture.count == successor);
+            CHECK(!observed_multi_step(session) && capture.count == successor);
             col_rel_t *input = session_find_rel((wl_col_session_t *)session,
                     "input");
             wl_columnar_source_access_writer_t writer = {0};
@@ -7087,7 +8735,7 @@ controlled_projected_positive(wl_session_t *session, wl_plan_t *plan,
             &snapshot)
             && snapshot.mask == masks[phase] &&
             snapshot.count == counts[phase]);
-        CHECK(!wl_session_step(session) && capture->count == events[phase]);
+        CHECK(!observed_multi_step(session) && capture->count == events[phase]);
         controlled_observed_filter_compare(session, reference);
     }
     wl_session_destroy(reference);
@@ -7157,7 +8805,7 @@ test_controlled_observed_preflight_rejections(void)
             wirelog_program_free(program);
             continue;
         }
-        CHECK(wl_session_step(session) == ENOTSUP);
+        CHECK(observed_multi_step(session) == ENOTSUP);
         CHECK(!wl_evaluation_control_active_attempt_id(control));
         wl_evaluation_control_report_t report;
         if (i == 2)
@@ -7498,8 +9146,7 @@ test_controlled_join_setup_exact_retry(void)
             controlled_setup_exact_limit;
         wl_columnar_session_test_framed_grant_finished =
             controlled_setup_exact_finished;
-        CHECK(!(dynamic ? controlled_recursive_run(session, control)
-                    : wl_session_step(session)));
+        CHECK(!controlled_recursive_run(session, control));
         if (dynamic) CHECK(capture.count == 1);
         wl_columnar_session_test_framed_grant_limit = NULL;
         wl_columnar_session_test_framed_grant_finished = NULL;
@@ -7754,7 +9401,8 @@ test_controlled_session_join_step(void)
         controlled_session_join_cancel_after = 128;
         wl_columnar_join_test_attempt_checkpoint =
             controlled_session_join_checkpoint;
-        CHECK(wl_session_step(session) == WL_EVALUATION_CONTROL_CANCELLED);
+        CHECK(controlled_recursive_run(session,
+            control) == WL_EVALUATION_CONTROL_CANCELLED);
         wl_columnar_join_test_attempt_checkpoint = NULL;
         CHECK(controlled_session_join_stop
             && controlled_session_join_stop_phase == 17);
@@ -7772,7 +9420,8 @@ test_controlled_session_join_step(void)
         controlled_session_join_cancel_after = UINT64_MAX;
         wl_columnar_join_test_attempt_checkpoint =
             controlled_session_join_checkpoint;
-        CHECK(wl_session_step(session) == WL_EVALUATION_CONTROL_WORK_LIMIT);
+        CHECK(controlled_recursive_run(session,
+            control) == WL_EVALUATION_CONTROL_WORK_LIMIT);
         wl_columnar_join_test_attempt_checkpoint = NULL;
         CHECK(controlled_session_join_phase17_hits == 127);
         CHECK(!session_find_rel((wl_col_session_t *)session, "output"));
@@ -7786,7 +9435,7 @@ test_controlled_session_join_step(void)
         controlled_join_setup_grants = 0;
         wl_columnar_session_test_framed_grant_finished =
             controlled_join_setup_grant_finished;
-        CHECK(!wl_session_step(session));
+        CHECK(!observed_multi_step(session));
         wl_columnar_session_test_framed_grant_finished = NULL;
         CHECK(controlled_join_setup_grants > 0);
         const col_rel_t *output = session_find_rel((wl_col_session_t *)session,
@@ -7856,7 +9505,7 @@ test_controlled_step_preflight_byte_cursor(void)
             wl_columnar_session_test_preflight_state_t before = {0}, after;
             int before_rc = wl_columnar_session_test_preflight_snapshot(base,
                     &before);
-            int rc = wl_session_step(base);
+            int rc = controlled_session_until_attempt(base, control);
             CHECK(rc == EAGAIN);
             uint64_t active_id = wl_evaluation_control_active_attempt_id(
                 control);
@@ -7892,7 +9541,8 @@ test_controlled_step_preflight_byte_cursor(void)
         CHECK(observed_long_prefix && operation_id);
 
         wl_evaluation_control_request_cancel(control);
-        CHECK(wl_session_step(base) == WL_EVALUATION_CONTROL_CANCELLED);
+        CHECK(controlled_recursive_run(base, control)
+            == WL_EVALUATION_CONTROL_CANCELLED);
         CHECK(!wl_evaluation_control_active_attempt_id(control)
             && !session_find_rel(session, target_name));
         wl_evaluation_control_report_t stopped;
@@ -7903,7 +9553,7 @@ test_controlled_step_preflight_byte_cursor(void)
         wl_columnar_session_test_preflight_quantum = 64;
         CHECK(!wl_evaluation_control_reset(control));
         CHECK(!wl_evaluation_control_configure(control, UINT64_C(1000000)));
-        int rc = wl_session_step(base);
+        int rc = controlled_session_until_attempt(base, control);
         uint64_t fresh_id = wl_evaluation_control_active_attempt_id(control);
         CHECK(rc == EAGAIN && fresh_id > operation_id);
         bool done = false;
@@ -7958,7 +9608,7 @@ test_controlled_step_preflight_work_limit_boundary(void)
 
     uint64_t needed = 0;
     for (unsigned turn = 0; turn < 1000; ++turn) {
-        int rc = wl_session_step(base);
+        int rc = controlled_session_until_attempt(base, control);
         CHECK(rc == EAGAIN);
         wl_columnar_session_test_preflight_state_t state;
         CHECK(!wl_columnar_session_test_preflight_snapshot(base, &state));
@@ -7969,7 +9619,8 @@ test_controlled_step_preflight_work_limit_boundary(void)
     }
     CHECK(needed > 1);
     wl_evaluation_control_request_cancel(control);
-    CHECK(wl_session_step(base) == WL_EVALUATION_CONTROL_CANCELLED);
+    CHECK(controlled_recursive_run(base, control)
+        == WL_EVALUATION_CONTROL_CANCELLED);
     CHECK(!session_find_rel(session, "output"));
 
     CHECK(!wl_evaluation_control_reset(control));
@@ -7989,7 +9640,7 @@ test_controlled_step_preflight_work_limit_boundary(void)
     rc = EAGAIN;
     bool ready = false;
     for (unsigned turn = 0; turn < 1000 && rc == EAGAIN; ++turn) {
-        rc = wl_session_step(base);
+        rc = controlled_session_until_attempt(base, control);
         if (rc == EAGAIN) {
             wl_columnar_session_test_preflight_state_t state;
             CHECK(!wl_columnar_session_test_preflight_snapshot(base, &state));
@@ -8002,7 +9653,8 @@ test_controlled_step_preflight_work_limit_boundary(void)
     }
     CHECK(ready && rc == EAGAIN && !session_find_rel(session, "output"));
     wl_evaluation_control_request_cancel(control);
-    CHECK(wl_session_step(base) == WL_EVALUATION_CONTROL_CANCELLED);
+    CHECK(controlled_recursive_run(base, control)
+        == WL_EVALUATION_CONTROL_CANCELLED);
     CHECK(!wl_evaluation_control_report(control, &report)
         && report.result == WL_EVALUATION_CONTROL_CANCELLED
         && report.consumed == needed);
@@ -8059,7 +9711,7 @@ test_controlled_step_scheduler_empty_strata(void)
     bool scheduler_yielded = false;
     int rc = EAGAIN;
     for (unsigned turn = 0; turn < 1000 && rc == EAGAIN; ++turn) {
-        rc = wl_session_step(base);
+        rc = controlled_session_until_attempt(base, control);
         wl_columnar_session_test_preflight_state_t state;
         CHECK(!wl_columnar_session_test_preflight_snapshot(base, &state));
         if (!operation_id) {
@@ -8143,7 +9795,7 @@ test_controlled_batch_join_filter_map_step(void)
     CHECK(!wl_session_insert(session, a_name, left, 1, 2));
     CHECK(!wl_session_insert(session, b_name, right, 1, 2));
 
-    int rc = wl_session_step(session);
+    int rc = controlled_recursive_run(session, control);
     CHECK(rc == WL_EVALUATION_CONTROL_WORK_LIMIT);
     wl_evaluation_control_report_t stopped_report;
     CHECK(!wl_evaluation_control_report(control, &stopped_report)
@@ -8160,13 +9812,14 @@ test_controlled_batch_join_filter_map_step(void)
      * so this cancellation remains before frame construction even when the
      * source names are no longer traversed by the plan/target proof. */
     wl_columnar_session_test_preflight_quantum = 1;
-    rc = wl_session_step(session);
+    rc = controlled_session_until_attempt(session, control);
     CHECK(rc == EAGAIN);
     uint64_t operation_id = wl_evaluation_control_active_attempt_id(control);
     CHECK(operation_id && !columnar->cleanup_active);
     CHECK(wl_session_snapshot(session, NULL, NULL) == EBUSY);
     wl_evaluation_control_request_cancel(control);
-    CHECK(wl_session_step(session) == WL_EVALUATION_CONTROL_CANCELLED);
+    CHECK(controlled_recursive_run(session,
+        control) == WL_EVALUATION_CONTROL_CANCELLED);
     CHECK(!wl_evaluation_control_active_attempt_id(control)
         && !columnar->cleanup_active
         && !session_find_rel(columnar, "output")
@@ -8175,7 +9828,7 @@ test_controlled_batch_join_filter_map_step(void)
     CHECK(!wl_evaluation_control_reset(control));
     CHECK(!wl_evaluation_control_configure(control, UINT64_C(1000000)));
 
-    rc = wl_session_step(session);
+    rc = controlled_session_until_attempt(session, control);
     CHECK(rc == EAGAIN);
     operation_id = wl_evaluation_control_active_attempt_id(control);
     CHECK(operation_id > cancelled_id && !columnar->cleanup_active);
@@ -8229,7 +9882,7 @@ static int
 controlled_batch_run_to_terminal(wl_session_t *session,
     wl_evaluation_control_t *control)
 {
-    int rc = wl_session_step(session);
+    int rc = controlled_session_until_attempt(session, control);
     uint64_t id = wl_evaluation_control_active_attempt_id(control);
     for (unsigned turn = 0; rc == EAGAIN && id && turn < 10000; ++turn) {
         rc = wl_session_step(session);
@@ -8383,9 +10036,14 @@ test_controlled_batch_delta_selectors(void)
             wl_columnar_join_pipeline_test_numeric_checkpoint =
                 controlled_batch_pipeline_checkpoint;
         }
+        uint32_t cleanup_count = session->cleanup_active_count;
+        uint64_t cleanup_bytes = session->cleanup_reserved_bytes;
+        CHECK(!session->cleanup_active && !session->cleanup_pending
+            && !session->cleanup_pending_count && !cleanup_count
+            && !cleanup_bytes);
         int rc = ci == 15
             ? controlled_batch_run_to_terminal(base, control)
-            : wl_session_step(base);
+            : controlled_session_until_attempt(base, control);
         if (ci == 15) {
             wl_columnar_join_test_attempt_checkpoint = NULL;
             wl_columnar_join_pipeline_test_numeric_checkpoint = NULL;
@@ -8411,24 +10069,67 @@ test_controlled_batch_delta_selectors(void)
                 CHECK(!wl_evaluation_control_reset(control));
                 CHECK(!wl_evaluation_control_configure(control,
                     UINT64_C(1000000)));
-                rc = wl_session_step(base);
+                rc = controlled_session_until_attempt(base, control);
             }
             uint64_t id = wl_evaluation_control_active_attempt_id(control);
-            CHECK((rc == 0 || (rc == EAGAIN && id))
-                && !session->cleanup_active);
+            CHECK(rc == 0 || (rc == EAGAIN && id));
+            if (!rc) {
+                CHECK(!session->cleanup_active && !session->cleanup_pending
+                    && !session->cleanup_pending_count
+                    && session->cleanup_active_count == cleanup_count
+                    && session->cleanup_reserved_bytes == cleanup_bytes);
+            } else if (session->cleanup_active) {
+                wl_columnar_eval_serial_framed_view_t view;
+                CHECK(session->cleanup_active_count == 1
+                    && !session->cleanup_pending
+                    && !session->cleanup_pending_count
+                    && !wl_columnar_eval_stack_framed_inspect(
+                        session->cleanup_active, session, &view));
+                CHECK(view.session == session && view.control == control
+                    && view.attempt_id == id && view.plan == output
+                    && view.operation_identity
+                    && view.cleanup_receipt_key.session_generation
+                    && view.cleanup_receipt_key.receipt_id
+                    && view.cleanup_receipt_key.plan_epoch
+                    && view.cleanup_receipt_key.operation_attempt_id == id
+                    && view.cleanup_receipt_key.operation_id
+                    == view.operation_identity);
+            }
             bool done = rc == 0;
             for (unsigned turn = 0; turn < 10000; ++turn) {
                 rc = wl_session_step(base);
                 if (rc == EAGAIN) {
                     CHECK(wl_evaluation_control_active_attempt_id(control)
                         == id);
+                    if (session->cleanup_active) {
+                        wl_columnar_eval_serial_framed_view_t view;
+                        CHECK(session->cleanup_active_count == 1
+                            && !session->cleanup_pending
+                            && !session->cleanup_pending_count
+                            && !wl_columnar_eval_stack_framed_inspect(
+                                session->cleanup_active, session, &view));
+                        CHECK(view.session == session && view.control == control
+                            && view.attempt_id == id && view.plan == output
+                            && view.operation_identity
+                            && view.cleanup_receipt_key.session_generation
+                            && view.cleanup_receipt_key.receipt_id
+                            && view.cleanup_receipt_key.plan_epoch
+                            && view.cleanup_receipt_key.operation_attempt_id ==
+                            id
+                            && view.cleanup_receipt_key.operation_id
+                            == view.operation_identity);
+                    }
                     continue;
                 }
                 CHECK(!rc);
                 done = true;
                 break;
             }
-            CHECK(done && !wl_evaluation_control_active_attempt_id(control));
+            CHECK(done && !wl_evaluation_control_active_attempt_id(control)
+                && !session->cleanup_active && !session->cleanup_pending
+                && !session->cleanup_pending_count
+                && session->cleanup_active_count == cleanup_count
+                && session->cleanup_reserved_bytes == cleanup_bytes);
             const col_rel_t *result = session_find_rel(session, "output");
             /* Full inputs produce the four key-1 combinations. Equal/larger
              * delta contents are
@@ -8561,7 +10262,7 @@ test_controlled_session_step_prefix_resume(void)
 
     wl_columnar_session_test_preflight_quantum = 7;
     wl_columnar_session_test_exhaust_after_relation = 1;
-    int rc = wl_session_step(session);
+    int rc = controlled_session_until_attempt(session, control);
     uint64_t operation_id = wl_evaluation_control_active_attempt_id(control);
     CHECK(rc == EAGAIN && operation_id);
     unsigned yields = 0;
@@ -8597,7 +10298,7 @@ test_controlled_session_step_prefix_resume(void)
     CHECK(wl_session_snapshot(session, NULL, NULL) == EBUSY);
     CHECK(!wl_evaluation_control_reset(control));
     CHECK(!wl_evaluation_control_configure(control, 0));
-    CHECK(!wl_session_step(session));
+    CHECK(!observed_multi_step(session));
 
     left = session_find_rel((wl_col_session_t *)session, "left");
     right = session_find_rel((wl_col_session_t *)session, "right");
@@ -8640,14 +10341,14 @@ test_controlled_session_step_destroy_refusal(void)
     CHECK(!wl_session_insert(session, "input", input_rows, 3, 1));
 
     wl_columnar_session_test_fail_framed_funding_before_stop = 1;
-    CHECK(wl_session_step(session) == EAGAIN);
+    CHECK(controlled_session_until_attempt(session, control) == EAGAIN);
     uint64_t attempt_id = wl_evaluation_control_active_attempt_id(control);
     CHECK(attempt_id != 0);
     wl_session_t *same_session = session;
     CHECK(wl_session_try_destroy(&session) == EBUSY
         && session == same_session
         && wl_evaluation_control_active_attempt_id(control) == attempt_id);
-    CHECK(wl_session_step(session) == 0);
+    CHECK(controlled_recursive_run(session, control) == 0);
     CHECK(!wl_evaluation_control_active_attempt_id(control));
     CHECK(!wl_session_try_destroy(&session) && !session);
     wl_evaluation_control_report_t report;
@@ -8685,7 +10386,8 @@ test_controlled_session_step_void_destroy_precondition(void)
             &options, &session) != 0)
             _exit(6);
         wl_columnar_session_test_fail_framed_funding_before_stop = 1;
-        if (wl_session_step(session) != EAGAIN) _exit(7);
+        if (controlled_session_until_attempt(session, control) != EAGAIN
+            || !wl_evaluation_control_active_attempt_id(control)) _exit(7);
         wl_session_destroy(session);
         _exit(8);
     }
@@ -8725,7 +10427,7 @@ test_controlled_session_snapshot_publication(void)
     CHECK(!wl_session_create_with_options(wl_backend_columnar(), plan, 1,
         &options, &session));
     CHECK(!wl_session_insert(session, "input", rows, 3, 1));
-    CHECK(!wl_session_step(session));
+    CHECK(!observed_multi_step(session));
 
     wl_evaluation_control_report_t step_report, report;
     CHECK(!wl_evaluation_control_report(control, &step_report));
@@ -9796,6 +11498,50 @@ static const char entry_simple[] =
     "output(x) :- input(x).\n";
 static const int64_t entry_rows[] = {3, 1, 3, 2};
 
+static void
+test_entry_active_owner_without_root(void)
+{
+    for (unsigned c1 = 0; c1 < 2; ++c1) {
+        entry_fixture_t f; entry_init(&f, entry_simple, entry_rows, 4, 1, 0);
+        f.session->base.source_c1_admission = c1 != 0;
+        CHECK(wl_evaluation_control_finish(f.operation,
+            f.session->base.operation_admission, 7, 0) == 7);
+        wl_evaluation_control_report_t frozen, after;
+        CHECK(!wl_evaluation_control_report(f.operation, &frozen)
+            && !wl_evaluation_control_begin(f.operation,
+            f.session->base.operation_admission));
+        f.id = wl_evaluation_control_active_attempt_id(f.operation);
+        CHECK(f.id && !wl_evaluation_control_charge_attempt(f.operation, f.id,
+            3)
+            && !f.session->controlled_step && !f.session->cleanup_active);
+        uint64_t before = wl_test_evaluation_guard_state(f.session);
+        snapshot_capture_t capture = {0};
+        CHECK(wl_session_step(&f.session->base) == EBUSY
+            && wl_session_snapshot(&f.session->base, capture_snapshot_tuple,
+            &capture) == EBUSY && !capture.count &&
+            !f.session->controlled_step);
+        /* A direct compatibility backend has no public Source Scope; exercise
+         * that entry in its actual non-C1 configuration as well. */
+        if (!c1)
+            CHECK(f.session->base.backend->session_snapshot(&f.session->base,
+                capture_snapshot_tuple, &capture) == EBUSY && !capture.count);
+        uint64_t used = 0;
+        CHECK(!wl_evaluation_control_test_active_consumed(f.operation, f.id,
+            &used)
+            && used == 3 && !wl_evaluation_control_report(f.operation, &after)
+            && !memcmp(&frozen, &after, sizeof(frozen))
+            && wl_test_evaluation_guard_state(f.session) == before
+            && !session_find_rel(f.session, "output"));
+        CHECK(!wl_evaluation_control_finish(f.operation,
+            f.session->base.operation_admission, 0, 0));
+        CHECK(!observed_multi_step(&f.session->base));
+        const col_rel_t *output = session_find_rel(f.session, "output");
+        CHECK(output && output->nrows == 3 && output->columns[0][0] == 1
+            && output->columns[0][1] == 2 && output->columns[0][2] == 3);
+        entry_destroy(&f);
+    }
+}
+
 static const char entry_generated_count_reduce[] =
     ".decl input(x:int64)\n.decl output(n:int64)\n"
     "output(count(x)) :- input(x).\n";
@@ -10828,6 +12574,12 @@ test_entry_receipt_pool_position(unsigned peer_count)
             f.session, &frame, f.operation, f.id, f.operation_identity, &key));
     CHECK(f.session->cleanup_receipts[peer_count].key.receipt_id ==
         key.receipt_id);
+    CHECK(wl_columnar_eval_stack_cleanup_receipt_frame_birth_index_bind(frame,
+        &key) == EINVAL);
+    wl_columnar_eval_cleanup_receipt_key_t unchanged_key;
+    CHECK(!wl_columnar_eval_stack_cleanup_receipt_key_for_frame(frame,
+        &unchanged_key)
+        && foundation_key_equal(&key, &unchanged_key));
     entry_receipt_ack_funded_turn(&f, &key, 383,
         WL_EVALUATION_CONTROL_WORK_LIMIT, 0, 0);
     entry_receipt_ack_funded_turn(&f, &key, 384, EBUSY, 0, 384);
@@ -13901,7 +15653,7 @@ test_scalar_retirement_receipt(void)
             wl_mem_ledger_alloc(&ledger, WL_MEM_SUBSYS_RELATION,
                 col_rel_owned_ledger_bytes(relation));
         }
-        int owner;
+        int owner = 0;
         wl_evaluation_control_t *control = control_new(0, &owner);
         CHECK(!wl_evaluation_control_begin(control, &owner));
         uint64_t id = wl_evaluation_control_active_attempt_id(control);
@@ -14069,15 +15821,13 @@ test_framed_lftj_retirement_funding(void)
     CHECK(!wl_evaluation_control_report(g->control,
         &report) && report.consumed == 768
         && a->retirement_initializer.phase ==
-        WL_COLUMNAR_RELATION_SCALAR_INIT_BIND);
+        WL_COLUMNAR_RELATION_SCALAR_INIT_ZERO
+        && a->retirement_initializer.zero_offset == 64);
     run(&f);
     CHECK(f.ctx->phase == WL_COLUMNAR_EVAL_SERIAL_FRAMED_DONE
         && close_frame(&f) == WL_EVALUATION_CONTROL_CANCELLED);
     fixture_destroy(&f);
 }
-
-extern void (*wl_columnar_session_test_retirement_checkpoint)(
-    wl_evaluation_control_t *, unsigned, unsigned, uint32_t, const col_rel_t *);
 
 typedef struct {
     wl_session_t *session;
@@ -14085,6 +15835,8 @@ typedef struct {
     unsigned role, action, hits, reentries;
     bool work_stop, observe_only;
     unsigned seen[7][11];
+    wl_evaluation_control_t *explicit_end_grant;
+    unsigned explicit_end_hits;
 } session_retirement_probe_t;
 static session_retirement_probe_t *session_retirement_probe;
 
@@ -14097,6 +15849,8 @@ session_retirement_probe_checkpoint(wl_evaluation_control_t *funding,
     CHECK(p && p->session && role && role < 7 && action && action < 11
         && wl_evaluation_control_active_attempt_id(funding));
     ++p->seen[role][action];
+    if (role == 1 && action == 7 && funding == p->explicit_end_grant)
+        ++p->explicit_end_hits;
     if (action == 6) CHECK(!target || role != 6);
     wl_evaluation_control_report_t before = {0}, after = {0};
     int before_status = wl_evaluation_control_report(p->original, &before);
@@ -14129,8 +15883,7 @@ session_retirement_probe_checkpoint(wl_evaluation_control_t *funding,
     }
 }
 
-extern int wl_columnar_session_test_retirement_view(const wl_col_session_t *,
-    uint64_t[16]);
+static bool staging_close_allow_retry;
 typedef struct {
     wl_session_t *session;
     wl_evaluation_control_t *control;
@@ -14156,9 +15909,35 @@ retirement_peer(void *data)
     int before_report = wl_evaluation_control_report(p->control,
             &original_before);
     CHECK(!before_report || before_report == ENOENT);
+    uint64_t main_before[16], main_after[16];
+    CHECK(!wl_columnar_session_test_main_view(
+            (wl_col_session_t *)p->session, main_before));
+    /* A completed physical leaf may still have a genuine selected MAIN
+     * FINISH/report/TAKE obligation. Its foreign caller is refused by the
+     * financier's actor guard before the retained Native WORK disposition. */
+    bool financial = main_before[0] && main_before[1] == 3
+        && main_before[3] && !main_before[4]
+        && (!main_before[15] || main_before[10] || main_before[11])
+        && main_before[5] && main_before[6] && main_before[7]
+        && main_before[9];
+    if (financial) CHECK(!main_before[8] && !main_before[4]);
+    int expected = financial ? EBUSY : p->expected;
     wl_session_t *alias = p->session;
     CHECK(wl_session_try_destroy(&alias) == EBUSY && alias == p->session);
-    CHECK(wl_session_step(p->session) == p->expected);
+    int peer_result = wl_session_step(p->session);
+    if (peer_result != expected) {
+        uint64_t terminal[16];
+        CHECK(!wl_columnar_session_test_terminal_view(
+                (wl_col_session_t *)p->session, terminal));
+        fprintf(stderr, "retirement peer: rc=%d expected=%d terminal=%" PRIu64
+            " route=%" PRIu64 " registered=%" PRIu64 " flags=%" PRIu64 "\n",
+            peer_result, expected, terminal[0], terminal[1], before[0],
+            before[7]);
+    }
+    CHECK(peer_result == expected);
+    CHECK(!wl_columnar_session_test_main_view(
+            (wl_col_session_t *)p->session, main_after)
+        && !memcmp(main_before, main_after, sizeof(main_before)));
     CHECK(wl_evaluation_control_active_attempt_id(p->control) == id);
     CHECK(wl_session_try_destroy(&alias) == EBUSY && alias == p->session);
     CHECK(!wl_columnar_session_test_retirement_view(
@@ -14357,6 +16136,12 @@ test_session_retirement_initialization_stops(void)
             wl_columnar_session_test_retirement_checkpoint = NULL;
             session_retirement_probe = NULL;
             bool published = peer_case || (kind < 2 && stage == 6);
+            if (probe.hits != 1 || !probe.reentries ||
+                rc != (published ? 0 : WL_EVALUATION_CONTROL_CANCELLED))
+                fprintf(stderr,
+                    "retirement history: kind=%u trial=%u stage=%u hits=%u reentries=%u rc=%d published=%d\n",
+                    kind, trial, stage, probe.hits, probe.reentries, rc,
+                    published);
             CHECK(probe.hits == 1 && probe.reentries &&
                 rc == (published ? 0 : WL_EVALUATION_CONTROL_CANCELLED));
             CHECK(wl_columnar_relation_snapshot_equal(input_image,
@@ -14419,14 +16204,26 @@ begin_failure_metadata_checkpoint(wl_columnar_memory_reservation_t *token,
     begin_failure_metadata_in_hook = true;
     unsigned index = phase == WL_COLUMNAR_MEMORY_TEST_FINISH_RELEASING;
     ++begin_failure_metadata_hits[index];
+    bool terminal = wl_columnar_session_test_terminal_credit(
+        (wl_col_session_t *)begin_failure_metadata_session, token);
     uint64_t before[16], after[16];
     CHECK(!wl_columnar_session_test_retirement_view(
             (wl_col_session_t *)begin_failure_metadata_session, before)
-        && !before[0] && (before[7] & 6u) == 6u);
+        && !before[0] && (terminal ? (before[7] & 2u)
+        && wl_columnar_session_test_terminal_busy(
+            (wl_col_session_t *)begin_failure_metadata_session)
+        : (before[7] & 6u) == 6u));
     uint64_t consumed, consumed_after;
     CHECK(!wl_columnar_session_test_begin_failure_consumed(
             (wl_col_session_t *)begin_failure_metadata_session, token,
             &consumed));
+    if (terminal) {
+        uint64_t view[16];
+        CHECK(!wl_columnar_session_test_terminal_view(
+                (wl_col_session_t *)begin_failure_metadata_session, view)
+            && !view[2] && view[3] == token->bytes && view[3]
+            && view[5] >= view[3] && consumed == 128);
+    }
     uint64_t state = atomic_load_explicit(&token->state, memory_order_acquire);
     uint64_t owner = atomic_load_explicit(&token->owner_bits,
             memory_order_relaxed);
@@ -14571,7 +16368,8 @@ test_retirement_retained_work_native_owner(void)
             unchanged.result == original.result);
         if (max_id) {
             CHECK(original.attempt_id == UINT64_MAX);
-            CHECK(wl_session_step(session) == WL_EVALUATION_CONTROL_WORK_LIMIT);
+            CHECK(controlled_recursive_run(session,
+                control) == WL_EVALUATION_CONTROL_WORK_LIMIT);
             CHECK(!wl_columnar_session_test_retirement_view(
                     (wl_col_session_t *)session, view)
                 && (view[7] & 2u) && view[0]);
@@ -14673,7 +16471,23 @@ staging_peer(void *data)
     staging_peer_t *p = data;
     wl_session_t *alias = p->session;
     if (p->idle_destroy) {
-        CHECK(!wl_session_try_destroy(&alias) && !alias);
+        wl_evaluation_control_report_t saved, after;
+        CHECK(!wl_evaluation_control_report(p->original, &saved));
+        unsigned refusals = 0;
+        int rc;
+        while ((rc = wl_session_try_destroy(&alias)) == EAGAIN) {
+            CHECK(staging_close_allow_retry && ++refusals <= 2
+                && alias == p->session
+                && !wl_evaluation_control_report(p->original, &after)
+                && after.attempt_id == saved.attempt_id
+                && after.limit == saved.limit &&
+                after.consumed == saved.consumed
+                && after.stop_reason == saved.stop_reason
+                && after.execution_status == saved.execution_status
+                && after.cleanup_status == saved.cleanup_status
+                && after.result == saved.result);
+        }
+        CHECK(!rc && !alias);
         p->session = NULL; return NULL;
     }
     bool pending, selected, after_pending, after_selected;
@@ -14687,9 +16501,23 @@ staging_peer(void *data)
     CHECK(!wl_columnar_session_test_staging_reader_status(
             (wl_col_session_t *)p->session,
             &held, &reader_stage, &funding_id));
+    uint64_t main_before[16], main_after[16];
+    CHECK(!wl_columnar_session_test_main_view(
+            (wl_col_session_t *)p->session, main_before));
+    /* Ordinary staging suspends behind its selected MAIN report, even
+     * before Source FINISH starts. BEGIN_FAILURE's retained WORK return is
+     * a different public disposition tested by retirement_peer above. */
+    bool financial = main_before[0] && main_before[1] == 3
+        && main_before[3] && !main_before[4] && !main_before[15]
+        && main_before[5] && main_before[6] && main_before[7]
+        && main_before[9];
+    if (financial) CHECK(!main_before[8]);
     CHECK(wl_session_try_destroy(&alias) == EBUSY && alias == p->session);
-    CHECK(wl_session_step(p->session) == EAGAIN
+    CHECK(wl_session_step(p->session) == (financial ? EBUSY : EAGAIN)
         && wl_evaluation_control_active_attempt_id(p->original) == p->id);
+    CHECK(!wl_columnar_session_test_main_view(
+            (wl_col_session_t *)p->session, main_after)
+        && !memcmp(main_before, main_after, sizeof(main_before)));
     CHECK(wl_session_try_destroy(&alias) == EBUSY && alias == p->session);
     CHECK(!wl_columnar_session_test_staging_status(
             (wl_col_session_t *)p->session,
@@ -14725,10 +16553,163 @@ staging_ready_stop(wl_evaluation_control_t *control)
     session_retirement_probe_checkpoint(control, 1, 9, 0, NULL);
 }
 
+/* Copied diagnostic of an authentic dependency-free financial close; no
+ * Native permission or private Step layout is borrowed by this test. */
+
+typedef struct {
+    wl_session_t *session;
+    wl_evaluation_control_t *original;
+    uint64_t id;
+    int cause;
+} staging_financial_peer_t;
+
+static void *
+staging_financial_peer(void *data)
+{
+    staging_financial_peer_t *p = data;
+    bool pending, after_pending;
+    unsigned phase, after_phase;
+    int cause, after_cause;
+    CHECK(!wl_columnar_session_test_prepared_finish_status(
+            (wl_col_session_t *)p->session, &pending, &cause, &phase)
+        && pending && cause == p->cause);
+    uint64_t before, after;
+    wl_evaluation_control_report_t report_before, report_after;
+    CHECK(wl_evaluation_control_active_attempt_id(p->original) == p->id
+        && !wl_evaluation_control_test_active_consumed(p->original, p->id,
+        &before)
+        && !wl_evaluation_control_report(p->original, &report_before));
+    wl_session_t *same = p->session;
+    CHECK(wl_session_try_destroy(&same) == EBUSY && same == p->session);
+    CHECK(wl_session_step(p->session) == EBUSY);
+    CHECK(wl_session_try_destroy(&same) == EBUSY && same == p->session);
+    CHECK(!wl_columnar_session_test_prepared_finish_status(
+            (wl_col_session_t *)p->session, &after_pending, &after_cause,
+            &after_phase)
+        && after_pending && after_cause == cause && after_phase == phase);
+    CHECK(wl_evaluation_control_active_attempt_id(p->original) == p->id
+        && !wl_evaluation_control_test_active_consumed(p->original, p->id,
+        &after)
+        && before == after && !wl_evaluation_control_report(p->original,
+        &report_after)
+        && !memcmp(&report_before, &report_after, sizeof(report_before)));
+    bool native_held;
+    unsigned native_stage;
+    uint64_t native_id;
+    CHECK(!wl_columnar_session_test_staging_reader_status(
+            (wl_col_session_t *)p->session, &native_held, &native_stage,
+            &native_id)
+        && !native_held);
+    return NULL;
+}
+
+static void
+staging_run_financial_peer(wl_session_t *session,
+    wl_evaluation_control_t *original, int cause)
+{
+    staging_financial_peer_t peer = {.session = session, .original = original,
+                                     .id =
+                                         wl_evaluation_control_active_attempt_id
+                                             (original), .cause = cause};
+    wl_thread_t thread;
+    CHECK(!wl_thread_create(&thread, staging_financial_peer, &peer)
+        && !wl_thread_join(&thread));
+}
+
+/* Observe the real retained observer CLOSE packets; never synthesize a
+ * custodian, grant, observer or completion receipt for validation tests. */
+extern void (*wl_columnar_eval_delta_test_close_validation_checkpoint)(
+    wl_col_session_t *,
+    const wl_columnar_eval_delta_observer_close_validation_t *,
+    wl_evaluation_control_t *, uint64_t);
+static unsigned staging_close_validation_calls;
+static uint64_t staging_close_allocation;
+static unsigned staging_close_fault_kind;
+static bool staging_close_fault_ready, staging_close_fault_seen;
+
+typedef struct {
+    wl_col_session_t *session;
+    wl_columnar_eval_delta_observer_close_validation_t *validation;
+    wl_evaluation_control_t *funding;
+    uint64_t id;
+    bool begin;
+} staging_close_validation_peer_t;
+
+static int
+staging_close_validation_call(staging_close_validation_peer_t *p,
+    const void *parent,
+    wl_columnar_eval_delta_observer_close_validation_t *validation)
+{
+    return p->begin
+        ? wl_columnar_eval_delta_observer_close_validation_begin_owned(
+        p->session, parent, validation, p->funding, p->id)
+        : wl_columnar_eval_delta_observer_close_validation_step_owned(
+        p->session, parent, validation, p->funding, p->id);
+}
+
+static void *
+staging_close_validation_foreign(void *payload)
+{
+    staging_close_validation_peer_t *p = payload;
+    CHECK(staging_close_validation_call(p, p->validation->parent,
+        p->validation) == EINVAL);
+    return NULL;
+}
+
+static void
+staging_close_validation(wl_col_session_t *session,
+    const wl_columnar_eval_delta_observer_close_validation_t *validation,
+    wl_evaluation_control_t *funding, uint64_t id)
+{
+    uint64_t main_before[16], main_after[16], before, after;
+    CHECK(validation->identity == validation && validation->busy
+        && validation->session == session && validation->actor_valid
+        && validation->parent && validation->observer);
+    CHECK(!wl_columnar_session_test_main_view(session, main_before)
+        && main_before[0] && main_before[1] == 3 && main_before[3]
+        && main_before[4] && main_before[8]
+        && main_before[6] == id && main_before[7] == staging_close_allocation
+        && (main_before[2] == 18 || main_before[2] == 19));
+    CHECK(!wl_evaluation_control_test_active_consumed(funding, id, &before)
+        && before == 256);
+    staging_close_validation_peer_t peer = {session,
+                                            (
+                                                wl_columnar_eval_delta_observer_close_validation_t
+                                                *)validation,
+                                            funding, id, main_before[2] == 18};
+    wl_columnar_eval_delta_observer_close_validation_t copy = *validation;
+    CHECK(staging_close_validation_call(&peer, validation->parent, &copy)
+        == EINVAL);
+    CHECK(staging_close_validation_call(&peer, &copy, peer.validation)
+        == EINVAL);
+    CHECK(staging_close_validation_call(&peer, validation->parent,
+        peer.validation) == EBUSY);
+    wl_thread_t thread;
+    CHECK(!wl_thread_create(&thread, staging_close_validation_foreign, &peer)
+        && !wl_thread_join(&thread));
+    CHECK(!wl_evaluation_control_test_active_consumed(funding, id, &after)
+        && after == before
+        && !wl_columnar_session_test_main_view(session, main_after)
+        && !memcmp(main_before, main_after, sizeof(main_before)));
+    ++staging_close_validation_calls;
+    if (staging_close_fault_kind && !staging_close_fault_seen
+        && (staging_close_fault_ready ? validation->ready
+        : validation->phase ==
+        WL_COLUMNAR_EVAL_DELTA_CLOSE_VALIDATION_HEADER)) {
+        staging_close_fault_seen = true;
+        if (staging_close_fault_kind == 1)
+            wl_evaluation_control_request_cancel(funding);
+        else CHECK(wl_evaluation_control_charge_attempt(funding, id,
+                UINT64_MAX) == WL_EVALUATION_CONTROL_WORK_LIMIT);
+    }
+}
+
 static void
 test_staging_native_pending_admission(void)
 {
     const unsigned stages[] = {1, 2, 3, 4, 8, 9, 0};
+    staging_close_validation_calls = 0;
+    staging_close_fault_seen = false;
     for (unsigned work = 0; work < 2; ++work)
         for (unsigned trial = 0; trial < 7; ++trial) {
             if (work && trial == 6) continue;
@@ -14837,18 +16818,90 @@ test_staging_native_pending_admission(void)
                     semantic == expected && cleanup == EINVAL);
                 staging_run_peer(session, control, false); /* Error did not open admission. */
             }
-            unsigned turns = 0;
+            unsigned turns = 0, financial_turns = 0;
+            unsigned main_report_turns = 0;
+            uint64_t main_report_id = 0, main_report_identity = 0;
+            bool financial_draining = false;
             bool saw_finalize = false, saw_reader_stage1 = false,
                 tested_end_grants = false;
             int rc = EAGAIN;
             while (rc == EAGAIN) {
-                CHECK(++turns < 8);
+                uint64_t main_view[16];
+                CHECK(!wl_columnar_session_test_main_view(
+                        (wl_col_session_t *)session, main_view));
+                bool main_report_pending = main_view[0]
+                    && (main_view[1] == 1 || main_view[1] == 3
+                    || main_view[1] == 4);
+                if (!financial_draining && main_report_pending) {
+                    CHECK(main_view[5] && main_view[6] && main_view[7]
+                        && main_view[9] && !main_view[4] && main_view[8]);
+                    if (main_view[6] != main_report_id) {
+                        CHECK(!main_report_identity ||
+                            (main_view[7] == main_report_identity
+                            && main_view[6] > main_report_id));
+                        main_report_identity = main_view[7];
+                        main_report_id = main_view[6];
+                        main_report_turns = 0;
+                    }
+                    /* The actual generation's FINISH and REPORT are each
+                     * issued and taken once, followed by READY handoff.
+                     * These are not another Native byte-clear action. */
+                    CHECK(++main_report_turns <= 2 * 2 + 2);
+                } else if (!financial_draining) {
+                    /* Preserve the original Native 64-byte clear bound. */
+                    CHECK(++turns <
+                        8+(sizeof(wl_columnar_relation_scalar_retirement_t)+63)/
+                        64);
+                }
                 rc = wl_session_step(session);
                 CHECK(!wl_columnar_session_test_staging_status(
                         (wl_col_session_t *)session,
                         &pending, &selected, &phase, &semantic, &cleanup));
+                if (rc == EAGAIN && !pending) {
+                    bool parent_pending = false;
+                    int parent_result = 0;
+                    unsigned parent_phase;
+                    CHECK(!wl_columnar_session_test_prepared_finish_status(
+                            (wl_col_session_t *)session, &parent_pending,
+                            &parent_result, &parent_phase)
+                        && parent_pending && parent_result == expected
+                        && !selected && !semantic);
+                    /* Five real financial actions, each issued/taken once,
+                     * followed by CLOSED handoff and semantic FINISH. This is
+                     * separate from the unchanged Native clear-turn bound. */
+                    CHECK(++financial_turns <= 2 * 5 + 2);
+                    financial_draining = true;
+                    CHECK(parent_phase ==
+                        WL_COLUMNAR_SESSION_FINANCE_CLOSE_FINISH
+                        || parent_phase ==
+                        WL_COLUMNAR_SESSION_FINANCE_CLOSE_REPORT
+                        || parent_phase ==
+                        WL_COLUMNAR_SESSION_FINANCE_CLOSE_DETACH
+                        || parent_phase ==
+                        WL_COLUMNAR_SESSION_FINANCE_CLOSE_RELEASE
+                        || parent_phase ==
+                        WL_COLUMNAR_SESSION_FINANCE_CLOSE_CONSUME
+                        || parent_phase ==
+                        WL_COLUMNAR_SESSION_FINANCE_CLOSE_OBSERVED
+                        || !parent_phase);
+                    bool native_held;
+                    unsigned native_stage;
+                    uint64_t native_id;
+                    CHECK(saw_finalize && saw_reader_stage1
+                        && !wl_columnar_session_test_staging_reader_status(
+                            (wl_col_session_t *)session, &native_held,
+                            &native_stage, &native_id) && !native_held);
+                    CHECK(atomic_load_explicit(&input->source_access.state,
+                        memory_order_acquire) == storage_holds - 1
+                        && atomic_load_explicit(&input->descriptor_access.state,
+                        memory_order_acquire) == descriptor_holds - 1);
+                    CHECK(wl_evaluation_control_reset(control) == EBUSY);
+                    staging_run_financial_peer(session, control, expected);
+                    continue;
+                }
                 if (rc == EAGAIN) {
-                    CHECK(pending && semantic == expected);
+                    CHECK(!financial_draining && pending &&
+                        semantic == expected);
                     if (trial == 0 && !selected && !tested_end_grants) {
                         tested_end_grants = true;
                         for (unsigned exact = 0; exact < 2; ++exact) {
@@ -14862,7 +16915,18 @@ test_staging_native_pending_admission(void)
                                 grant;
                             wl_columnar_session_test_staging_end_funding_id =
                                 id;
-                            CHECK(wl_session_step(session) == EAGAIN);
+                            probe.explicit_end_grant = grant;
+                            unsigned before_end = probe.explicit_end_hits;
+                            for (unsigned wait = 0;
+                                probe.explicit_end_hits == before_end; ++wait) {
+                                /* Drain the genuine prior MAIN FINISH/report
+                                 * and READY before the explicit reader grant.
+                                 * The checkpoint must name this exact grant. */
+                                CHECK(wait < 2 * 2 + 3
+                                    && wl_session_step(session) == EAGAIN);
+                            }
+                            CHECK(probe.explicit_end_hits == before_end + 1);
+                            probe.explicit_end_grant = NULL;
                             wl_columnar_session_test_staging_end_funding = NULL;
                             wl_columnar_session_test_staging_end_funding_id = 0;
                             CHECK(wl_evaluation_control_finish(grant, &owner, 0,
@@ -14947,13 +17011,25 @@ test_staging_native_pending_admission(void)
             if (trial & 1u) {
                 CHECK(!wl_evaluation_control_reset(control) &&
                     !wl_evaluation_control_configure(control, 0));
-                CHECK(!observed_multi_step(session) && events->count == 4);
+                int retry_result = observed_multi_step(session);
+                if (retry_result || events->count != 4)
+                    fprintf(stderr,
+                        "staging healthy retry: trial=%u work=%u rc=%d events=%u\n",
+                        trial, work, retry_result, events->count);
+                CHECK(!retry_result && events->count == 4);
                 const col_rel_t *out =
                     session_find_rel((wl_col_session_t *)session, "output");
                 CHECK(out && out->nrows == 2 && out->columns[0][0] == 1 &&
                     out->columns[0][1] == 8);
             }
+            uint64_t close_main[16];
+            CHECK(!wl_columnar_session_test_main_view(
+                    (wl_col_session_t *)session, close_main));
+            staging_close_allocation = close_main[7];
+            wl_columnar_eval_delta_test_close_validation_checkpoint =
+                staging_close_validation;
             staging_run_peer(session, control, true); session = NULL;
+            wl_columnar_eval_delta_test_close_validation_checkpoint = NULL;
             wl_evaluation_control_report_t after;
             CHECK(!wl_evaluation_control_report(control, &after));
             if (!work &&
@@ -14967,6 +17043,8 @@ test_staging_native_pending_admission(void)
                     wl_columnar_memory_governor_ref_get(g)));
             wl_columnar_memory_governor_ref_release(g); free(events);
         }
+    CHECK(staging_close_validation_calls);
+    CHECK(!staging_close_fault_kind || staging_close_fault_seen);
 }
 
 static bool
@@ -15365,7 +17443,7 @@ framed_checkpoint_begin_prepared(wl_columnar_eval_stack_cleanup_frame_t *frame,
     wl_col_session_t *session)
 {
     CHECK(session->cleanup_active == frame);
-    CHECK(!wl_columnar_eval_stack_unary_prepared_begin(
+    CHECK(!test_prepared_begin_staged(
             framed_checkpoint_prepared,
             frame, framed_checkpoint_parent));
 }
@@ -15832,13 +17910,44 @@ test_entry_automatic_begin_failure_turnover(void)
     /* Leave255 actual original units for the genuine256 constructor. */
     CHECK(!wl_evaluation_control_charge(f.operation,
         UINT64_MAX - 1 - consumed - 255));
-    CHECK(entry_turn(&f, false, 0) == WL_EVALUATION_CONTROL_WORK_LIMIT);
+    CHECK(!entry_turn(&f, false, 0));
+    wl_columnar_eval_serial_framed_host_request_t initial_launch = f.previous;
+    wl_evaluation_control_report_t launch_before, launch_after;
+    CHECK(!wl_evaluation_control_report(initial_launch.previous_funding,
+        &launch_before));
+    const unsigned cancellation_bound =
+        (sizeof(wl_columnar_eval_stack_unary_prepared_t) + 63) / 64 + 3;
+    wl_columnar_eval_stack_prepared_init_view_t initializing;
+    bool saw_cause = false;
+    for (unsigned turn = 0; ; ++turn) {
+        CHECK(turn < cancellation_bound);
+        CHECK(!wl_columnar_eval_stack_auto_initializer_inspect(
+                f.session->cleanup_active, f.session, &initializing));
+        if (initializing.physical_cancelled) break;
+        int protocol = entry_turn(&f, false, 256);
+        CHECK(!protocol || protocol == WL_EVALUATION_CONTROL_WORK_LIMIT);
+        saw_cause = saw_cause || protocol == WL_EVALUATION_CONTROL_WORK_LIMIT;
+    }
+    CHECK(saw_cause &&
+        initializing.semantic_cause == WL_EVALUATION_CONTROL_WORK_LIMIT
+        && !initializing.action_pending && !initializing.launch_consumed
+        && !initializing.physical_published
+        && !memcmp(&initial_launch, &f.previous, sizeof(initial_launch)));
     wl_columnar_eval_stack_test_auto_observation_t observation;
     CHECK(!wl_columnar_eval_stack_test_auto_observe(f.session->cleanup_active,
-        f.session, &observation) && observation.launch
+        f.session,
+        &observation) && observation.launch && observation.initializer_pending
         && observation.receipt_phase == WL_COLUMNAR_EVAL_STACK_PREPARED_INERT
-        && observation.launch_protocol == WL_EVALUATION_CONTROL_WORK_LIMIT);
-    entry_automatic_parked_geometry(&f);
+        && !observation.launch_protocol
+        && observation.first_result == WL_EVALUATION_CONTROL_WORK_LIMIT);
+    CHECK(!wl_evaluation_control_report(initial_launch.previous_funding,
+        &launch_after)
+        && !memcmp(&launch_before, &launch_after, sizeof(launch_before)));
+    /* Cancellation has made the target physically inert, but its immutable
+    * launch still pins this actual frame until the real consume action. */
+    wl_columnar_eval_stack_cleanup_frame_t *nested = NULL;
+    CHECK(wl_columnar_eval_stack_cleanup_begin(f.session,
+        &nested) == EBUSY && !nested);
     CHECK(wl_evaluation_control_finish(f.operation,
         f.session->base.operation_admission, 0,
         0) == WL_EVALUATION_CONTROL_WORK_LIMIT);
@@ -15848,10 +17957,12 @@ test_entry_automatic_begin_failure_turnover(void)
         f.session->base.operation_admission));
     uint64_t successor = wl_evaluation_control_active_attempt_id(f.operation);
     CHECK(successor != f.id);
-    CHECK(!entry_turn(&f, false, 896));
+    CHECK(!entry_turn(&f, false, 256));
     CHECK(!wl_columnar_eval_stack_test_auto_observe(f.session->cleanup_active,
         f.session, &observation) && !observation.launch
-        && observation.receipt_phase == WL_COLUMNAR_EVAL_STACK_PREPARED_INERT);
+        && observation.receipt_phase == WL_COLUMNAR_EVAL_STACK_PREPARED_INERT
+        && observation.launch_protocol == WL_EVALUATION_CONTROL_WORK_LIMIT
+        && !observation.initializer_pending);
     entry_automatic_parked_geometry(&f);
     entry_complete(&f);
     CHECK(f.reply.execution_result == WL_EVALUATION_CONTROL_WORK_LIMIT
@@ -15864,7 +17975,7 @@ test_entry_automatic_begin_failure_turnover(void)
 }
 
 static void
-test_entry_automatic_prepared_funding(void)
+test_entry_automatic_prepared_funding(unsigned peer_count)
 {
     const char *source = ".decl a(k:int64,x:int64)\n"
         ".decl b(k:int64,t:int64,y:int64)\n.decl c(t:int64,z:int64)\n"
@@ -15877,6 +17988,12 @@ test_entry_automatic_prepared_funding(void)
                                     {"c", c, 2, 2}};
     entry_fixture_t f;
     entry_init_inputs(&f, source, inputs, 3, 0);
+    CHECK(peer_count < WL_COLUMNAR_EVAL_STACK_CLEANUP_MAX_FRAMES);
+    wl_columnar_eval_cleanup_receipt_key_t peers[
+        WL_COLUMNAR_EVAL_STACK_CLEANUP_MAX_FRAMES];
+    for (unsigned i = 0; i < peer_count; ++i)
+        CHECK(!wl_columnar_eval_stack_cleanup_receipt_reserve(f.session,
+            f.id, f.operation_identity, &peers[i]));
     for (unsigned turn = 0; ; ++turn) {
         CHECK(turn < 100000);
         if (f.session->cleanup_active
@@ -15884,6 +18001,49 @@ test_entry_automatic_prepared_funding(void)
                 f.session->cleanup_active)) break;
         CHECK(!entry_turn(&f, false, 0));
     }
+    CHECK(wl_columnar_eval_stack_auto_initializer_pending(
+            f.session->cleanup_active));
+    wl_columnar_eval_serial_framed_host_request_t immutable_launch = f.previous;
+    wl_evaluation_control_report_t immutable_report, current_report;
+    CHECK(!wl_evaluation_control_report(immutable_launch.previous_funding,
+        &immutable_report));
+    uint64_t before_initialization, after_initialization;
+    CHECK(!wl_evaluation_control_test_active_consumed(f.operation, f.id,
+        &before_initialization));
+    for (unsigned retry = 0; retry != 4; ++retry) {
+        CHECK(entry_turn(&f, false, 255) == WL_EVALUATION_CONTROL_WORK_LIMIT);
+        /* The same invalid transport/range matrix also exercises the new
+        * initializer front while the real external owner is retained. */
+        if (!retry) entry_automatic_geometry(&f);
+        wl_columnar_eval_stack_prepared_init_view_t view;
+        CHECK(!wl_columnar_eval_stack_auto_initializer_inspect(
+                f.session->cleanup_active,
+                f.session,
+                &view) &&
+            view.phase == WL_COLUMNAR_EVAL_STACK_PREPARED_INIT_CAPTURE
+            && !view.action_pending && !view.performed &&
+            !view.physical_published);
+        CHECK(!memcmp(&immutable_launch, &f.previous,
+            sizeof(immutable_launch)));
+    }
+    CHECK(!wl_evaluation_control_test_active_consumed(f.operation, f.id,
+        &after_initialization)
+        && after_initialization == before_initialization);
+    const unsigned initializer_bound =
+        (sizeof(wl_columnar_eval_stack_unary_prepared_t) + 63) / 64 + 7;
+    for (unsigned turn = 0; wl_columnar_eval_stack_auto_initializer_pending(
+            f.session->cleanup_active); ++turn) {
+        CHECK(turn < initializer_bound && !entry_turn(&f, false, 256));
+        CHECK(!memcmp(&immutable_launch, &f.previous,
+            sizeof(immutable_launch)));
+        CHECK(!wl_evaluation_control_report(immutable_launch.previous_funding,
+            &current_report)
+            && !memcmp(&immutable_report, &current_report,
+            sizeof(immutable_report)));
+    }
+    CHECK(!wl_evaluation_control_test_active_consumed(f.operation, f.id,
+        &after_initialization)
+        && after_initialization == before_initialization + 256);
     wl_columnar_eval_stack_test_auto_observation_t observed;
     CHECK(!wl_columnar_eval_stack_test_auto_observe(f.session->cleanup_active,
         f.session, &observed));
@@ -15981,6 +18141,9 @@ test_entry_automatic_prepared_funding(void)
     const col_rel_t *output = session_find_rel(f.session, "output");
     CHECK(output && output->nrows == 2 && output->ncols == 3
         && output->columns[0][0] == 10 && output->columns[2][1] == 2000);
+    for (unsigned i = 0; i < peer_count; ++i)
+        CHECK(!wl_columnar_eval_stack_cleanup_receipt_release(f.session,
+            &peers[i]));
     entry_destroy(&f);
 }
 
@@ -16001,7 +18164,7 @@ test_entry_bound_automatic_turnover(void)
         "path(x,y) :- edge(x,y).\n"
         "path(x,w) :- path(x,y), edge(y,z), edge(z,w).\n";
     const int64_t edges[] = {1, 2, 2, 3, 3, 4};
-    for (unsigned trial = 0; trial < 5; ++trial) {
+    for (unsigned trial = 0; trial < 7; ++trial) {
         entry_fixture_t f;
         entry_init_static_capture_program(&f, source, 8, edges, 3,
             UINT64_MAX - 1);
@@ -16025,8 +18188,8 @@ test_entry_bound_automatic_turnover(void)
         bound_finish_heads = 0;
         wl_columnar_eval_stack_test_unary_prepared_checkpoint =
             bound_prepared_checkpoint;
-        int cause = trial ==
-            3 ? WL_EVALUATION_CONTROL_CANCELLED :
+        int cause = (trial == 3 ||
+            trial == 5) ? WL_EVALUATION_CONTROL_CANCELLED :
             WL_EVALUATION_CONTROL_WORK_LIMIT;
         uint64_t successor = 0;
         if (trial) {
@@ -16062,19 +18225,82 @@ test_entry_bound_automatic_turnover(void)
                     f.id, &consumed) && consumed < UINT64_MAX - 256);
                 CHECK(!wl_evaluation_control_charge(f.operation,
                     UINT64_MAX - 1 - consumed - 255));
-                CHECK(entry_turn(&f, false, 0) == cause);
-            } else {
+            }
+            /* The initial CHILD call registers an external initializer;
+             * actual Original ADMIT belongs to a later genuine Native turn. */
+            CHECK(!entry_turn(&f, false, 0));
+            wl_columnar_eval_stack_prepared_init_view_t initialized;
+            CHECK(!wl_columnar_eval_stack_auto_initializer_inspect(
+                    f.session->cleanup_active, f.session, &initialized)
+                && initialized.phase ==
+                WL_COLUMNAR_EVAL_STACK_PREPARED_INIT_CAPTURE);
+            bool initializer_cancel = trial <= 2 || trial >= 5;
+            if (trial >= 3 && trial <= 4) {
+                /* Preserve the original published-owner cancellation test:
+                 * only a genuine PUBLISH plus matching action ACK earns HEAD. */
+                const unsigned publish_bound =
+                    (sizeof(wl_columnar_eval_stack_unary_prepared_t) + 63) /
+                    64 + 7;
+                for (unsigned turn = 0; ; ++turn) {
+                    CHECK(turn < publish_bound);
+                    CHECK(!wl_columnar_eval_stack_test_auto_observe(
+                            f.session->cleanup_active, f.session, &after));
+                    if (!after.initializer_pending) break;
+                    CHECK(!entry_turn(&f, false, 0));
+                }
+                CHECK(after.receipt_phase ==
+                    WL_COLUMNAR_EVAL_STACK_PREPARED_JOIN_HEAD
+                    && after.launch && !after.committed);
+            } else if (trial >= 5) {
+                /* Additional actual partial-owner scenarios have no published
+                * prepared owner and must never synthesize its FINISH hook. */
                 CHECK(!entry_turn(&f, false, 0));
-                if (trial ==
-                    3) wl_evaluation_control_request_cancel(f.operation);
+                CHECK(!entry_turn(&f, false, 0));
+                CHECK(!wl_columnar_eval_stack_auto_initializer_inspect(
+                        f.session->cleanup_active, f.session, &initialized)
+                    && initialized.phase ==
+                    WL_COLUMNAR_EVAL_STACK_PREPARED_INIT_CLEAR
+                    && !initialized.physical_published);
+            }
+            if (trial >= 3) {
+                if (trial == 3 || trial == 5)
+                    wl_evaluation_control_request_cancel(f.operation);
                 else CHECK(wl_evaluation_control_charge(f.operation,
                         UINT64_MAX) == cause);
+            }
+            bool saw_initializer_cause = false;
+            if (initializer_cancel) {
+                const unsigned cancel_turn_bound =
+                    (sizeof(wl_columnar_eval_stack_unary_prepared_t) + 63) /
+                    64 + 3;
+                for (unsigned turn = 0; ; ++turn) {
+                    CHECK(turn < cancel_turn_bound);
+                    CHECK(!wl_columnar_eval_stack_auto_initializer_inspect(
+                            f.session->cleanup_active, f.session,
+                            &initialized));
+                    if (initialized.physical_cancelled) break;
+                    int protocol = entry_turn(&f, false, 0);
+                    CHECK(!protocol || protocol == cause);
+                    saw_initializer_cause = saw_initializer_cause ||
+                        protocol == cause;
+                    CHECK(f.reply.kind ==
+                        WL_COLUMNAR_EVAL_SERIAL_FRAMED_REPLY_PREPARED_MORE);
+                }
+                CHECK(saw_initializer_cause &&
+                    initialized.semantic_cause == cause
+                    && !initialized.action_pending &&
+                    !initialized.launch_consumed
+                    && !initialized.physical_published);
+            } else {
+                /* Existing published receipt uses its genuine cancel/drain/ACK
+                 * family, independently of the new external initializer. */
                 for (unsigned turn = 0; ; ++turn) {
                     CHECK(turn < 10000);
                     CHECK(!wl_columnar_eval_stack_test_auto_observe(
                             f.session->cleanup_active, f.session, &after));
                     if (after.receipt_phase ==
-                        WL_COLUMNAR_EVAL_STACK_PREPARED_ACKED) break;
+                        WL_COLUMNAR_EVAL_STACK_PREPARED_ACKED)
+                        break;
                     int protocol = entry_turn(&f, false, 0);
                     CHECK(!protocol || protocol == cause || (protocol == EAGAIN
                         && f.reply.kind ==
@@ -16084,23 +18310,29 @@ test_entry_bound_automatic_turnover(void)
             CHECK(!wl_columnar_eval_stack_test_auto_observe(
                     f.session->cleanup_active, f.session, &after));
             CHECK(after.launch && !after.finish
+                && after.initializer_pending == initializer_cancel
                 && after.saved_binding == before.saved_binding
                 && after.saved_binding_generation ==
                 before.saved_binding_generation
-                && after.operation == &f.relation->ops[target]);
-            if (trial <= 2) CHECK(after.launch_protocol == cause
-                    && after.receipt_phase == before.receipt_phase
-                    && after.committed == before.committed);
-            else CHECK(!after.launch_protocol && !after.committed
-                    && after.receipt_phase ==
-                    WL_COLUMNAR_EVAL_STACK_PREPARED_ACKED
-                    && after.first_result == cause);
+                && after.operation == &f.relation->ops[target]
+                && !after.launch_protocol && after.first_result == cause);
+            if (trial <= 2) {
+                CHECK(after.receipt_phase == before.receipt_phase
+                    && after.committed == before.committed
+                    && initialized.physical_cancelled);
+            } else CHECK(!after.committed && after.receipt_phase ==
+                    (initializer_cancel ?
+                    WL_COLUMNAR_EVAL_STACK_PREPARED_INERT :
+                    WL_COLUMNAR_EVAL_STACK_PREPARED_ACKED));
             if (trial == 2) CHECK(before.operation != after.operation);
-            CHECK(!entry_turn(&f, false, 896));
+            /* Distinct real256 action consumes the immutable launch, then
+            * its actual completed support report ACK releases the pin. */
+            CHECK(!entry_turn(&f, false, initializer_cancel ? 256 : 896));
             CHECK(!wl_columnar_eval_stack_test_auto_observe(
                     f.session->cleanup_active, f.session,
-                    &after) && !after.launch
-                && after.abort_requested);
+                    &after) && !after.launch && after.abort_requested
+                && !wl_columnar_eval_stack_auto_initializer_pending(
+                    f.session->cleanup_active));
             CHECK(wl_evaluation_control_finish(f.operation,
                 f.session->base.operation_admission, 0, 0) == cause);
             CHECK(!wl_evaluation_control_reset(f.operation));
@@ -16165,7 +18397,9 @@ test_entry_bound_automatic_turnover(void)
         }
         entry_complete(&f);
         wl_columnar_eval_stack_test_unary_prepared_checkpoint = NULL;
-        CHECK(bound_finish_heads == (!trial ? 2u : trial == 1 ? 0u : 1u));
+        /* Only actually published owners produce positive FINISH_HEAD work. */
+        CHECK(bound_finish_heads == (!trial ? 2u :
+            (trial >= 2 && trial <= 4) ? 1u : 0u));
         CHECK(!f.reply.cleanup_result && !f.reply.committed
             && !session_find_rel(f.session, "path"));
         CHECK(wl_columnar_relation_snapshot_equal(edge_before,
@@ -16268,6 +18502,15 @@ typedef struct {
     wl_controlled_step_state_t state;
     int step_result;
     unsigned fault;
+    wl_session_source_metadata_result_t metadata;
+    wl_evaluation_control_report_t metadata_report;
+    uint64_t metadata_id, metadata_successor;
+    unsigned metadata_phase, metadata_finishes, metadata_reports,
+        metadata_issues, metadata_fault;
+    bool metadata_busy, metadata_fault_fired;
+    bool metadata_recipe_mode;
+    wl_session_source_metadata_recipe_t metadata_recipe;
+    unsigned metadata_preparations[3];
 } completion_contract_session_t;
 
 static unsigned completion_contract_creates, completion_contract_destroys;
@@ -16361,6 +18604,427 @@ completion_contract_commit(wl_session_t *session,
     ++s->commits;
 }
 
+/* This custom backend exercises only real financial/admission ownership. It
+* creates no Columnar Native owner and is not operator coverage evidence. */
+static int
+metadata_contract_action(void *payload)
+{
+    completion_contract_session_t *s = payload;
+    CHECK(s->metadata_busy && s->metadata.scheduled);
+    int rc;
+    if (s->metadata_phase == 1) {
+        rc = wl_evaluation_control_financier_finish_commit(
+            s->base.evaluation_control, s->base.operation_admission,
+            s->metadata_id);
+        if (rc) return rc;
+        ++s->metadata_finishes; s->metadata_phase = 2;
+    } else {
+        CHECK(s->metadata_phase == 2);
+        rc = wl_evaluation_control_financier_report_owned(
+            s->base.evaluation_control, s->base.operation_admission,
+            s->metadata_id, &s->metadata_report);
+        if (rc) return rc;
+        ++s->metadata_reports; s->metadata_phase = 3;
+    }
+    return 0;
+}
+
+static void
+metadata_contract_after(void *payload)
+{
+    completion_contract_session_t *s = payload;
+    CHECK(s->metadata_busy && s->metadata.scheduled && s->metadata.ready);
+    ++s->metadata_issues;
+    if (!s->metadata.financial_result && !s->metadata.preparation_protocol) {
+        wl_evaluation_control_report_t source_report;
+        CHECK(!wl_session_test_source_early_report(&s->base, &source_report)
+            && !source_report.result && source_report.consumed == 512);
+    }
+    /* Real same-thread public reentry and destruction are denied while the
+     * admitted issuer is still alive, after BANK settlement/unbinding. */
+    CHECK(wl_session_step(&s->base) == EBUSY);
+    const int64_t row = 1;
+    CHECK(wl_session_insert(&s->base, "input", &row, 0, 1) == EBUSY);
+    wl_session_t *same = &s->base;
+    CHECK(wl_session_try_destroy(&same) == EBUSY && same == &s->base);
+    if (s->metadata.preparation_protocol) {
+        CHECK(s->metadata_fault == 7
+            && s->metadata.preparation_protocol == EINVAL
+            && s->metadata.financial_result == EINVAL
+            && !s->metadata.outcome.action_called && !s->metadata.semantic_valid
+            && wl_evaluation_control_active_attempt_id(
+                s->base.evaluation_control)
+            == s->metadata_successor);
+    } else if (s->metadata.financial_result) {
+        CHECK(s->metadata.financial_result == WL_EVALUATION_CONTROL_CANCELLED
+            && s->metadata_fault_fired);
+        CHECK(!wl_session_test_source_final_reset_cancel(&s->base));
+    }
+}
+
+typedef struct {
+    completion_contract_session_t *session;
+    int result;
+} metadata_contract_peer_t;
+
+static void *
+metadata_contract_foreign_take(void *payload)
+{
+    metadata_contract_peer_t *peer = payload;
+    completion_contract_session_t *s = peer->session;
+    wl_evaluation_control_source_phase_result_t out;
+    unsigned before;
+    peer->result = s->metadata_recipe_mode ?
+        wl_session_source_step_metadata_take_recipe(&s->base,
+            &s->metadata_recipe, &out, &before) :
+        wl_session_source_step_metadata_take(&s->base, &s->metadata,
+            s, s->metadata_id, s->metadata_id,
+            WL_SESSION_SOURCE_METADATA_FINANCIER, &out, &before);
+    return NULL;
+}
+
+static int
+metadata_recipe_contract_resolve(const wl_session_source_metadata_recipe_t *r,
+    unsigned group, wl_session_source_metadata_preparation_t *p)
+{
+    completion_contract_session_t *s = (void *)r->root;
+    if (r != &s->metadata_recipe || r->identity != r
+        || r->session != &s->base || r->root_identity != (uint64_t)(uintptr_t)s
+        || r->role != WL_SESSION_SOURCE_METADATA_MAIN
+        || r->result != &s->metadata || r->result->recipe != r
+        || r->busy != &s->metadata_busy || r->phase != &s->metadata_phase)
+        return EINVAL;
+    if (group == WL_SESSION_SOURCE_METADATA_AFTER) {
+        metadata_contract_after(s); return 0;
+    }
+    if (group == WL_SESSION_SOURCE_METADATA_SELECT)
+        return s->metadata_id && s->metadata_phase &&
+               s->metadata_busy ? 0 : EINVAL;
+    if (group == WL_SESSION_SOURCE_METADATA_TAKE) {
+        return s->metadata.owner != s || s->metadata.session != &s->base
+               || s->metadata.admission != s->base.operation_admission
+               || s->metadata.operation_id != s->metadata_id
+               || s->metadata.operation_identity != s->metadata_id
+               || s->metadata.kind != WL_SESSION_SOURCE_METADATA_FINANCIER
+               ? EINVAL : 0;
+    }
+    CHECK(group < 3 && p && s->metadata_busy && s->metadata.scheduled);
+    ++s->metadata_preparations[group];
+    if (group == 0)
+        return s->metadata.before_phase == s->metadata_phase ? 0 : EINVAL;
+    if (group == 1) {
+        uint64_t active = wl_evaluation_control_active_attempt_id(
+            s->base.evaluation_control);
+        return (s->metadata_phase == 1 && active == s->metadata_id)
+               || (s->metadata_phase == 2 && !active) ? 0 : EINVAL;
+    }
+    s->metadata.owner = s; s->metadata.session = &s->base;
+    s->metadata.admission = s->base.operation_admission;
+    s->metadata.operation_id = s->metadata_id;
+    s->metadata.operation_identity = s->metadata_id;
+    s->metadata.kind = WL_SESSION_SOURCE_METADATA_FINANCIER;
+    p->source.action = metadata_contract_action; p->source.payload = s;
+    p->source.result_published = true;
+    return 0;
+}
+
+static int
+metadata_recipe_contract_step(wl_session_t *session)
+{
+    completion_contract_session_t *s = (void *)session;
+    if (!s->metadata_phase) {
+        CHECK(!wl_evaluation_control_begin(session->evaluation_control,
+            session->operation_admission));
+        s->metadata_id = wl_evaluation_control_active_attempt_id(
+            session->evaluation_control);
+        CHECK(s->metadata_id); s->metadata_phase = 1;
+    }
+    if (s->metadata.ready) {
+        s->metadata_busy = true;
+        wl_evaluation_control_source_phase_result_t out = {17, 23, true};
+        unsigned before = 99;
+        wl_session_source_metadata_recipe_t copy = s->metadata_recipe;
+        CHECK(wl_session_source_step_metadata_take_recipe(session, &copy,
+            &out, &before) == -EINVAL && out.financial_result == 17
+            && out.action_result == 23 && out.action_called && before == 99);
+        metadata_contract_peer_t peer = {s, 0}; wl_thread_t thread;
+        CHECK(!wl_thread_create(&thread, metadata_contract_foreign_take,
+            &peer));
+        CHECK(!wl_thread_join(&thread) && peer.result == -EINVAL);
+        if (s->metadata.semantic_valid) {
+            ++s->metadata.operation_id;
+            CHECK(wl_session_source_step_metadata_take_recipe(session,
+                &s->metadata_recipe, &out, &before) == -EINVAL);
+            --s->metadata.operation_id;
+            s->metadata.kind = WL_SESSION_SOURCE_METADATA_CONSTRUCTION;
+            CHECK(wl_session_source_step_metadata_take_recipe(session,
+                &s->metadata_recipe, &out, &before) == -EINVAL);
+            s->metadata.kind = WL_SESSION_SOURCE_METADATA_FINANCIER;
+        } else {
+            CHECK((s->metadata.financial_result
+                == WL_EVALUATION_CONTROL_CANCELLED
+                || s->metadata.preparation_protocol == EINVAL)
+                && !s->metadata.outcome.action_called);
+        }
+        CHECK(wl_session_source_step_metadata_take_recipe(session,
+            &s->metadata_recipe, &out, &before) == 1);
+        CHECK(before == 1 || before == 2);
+        s->metadata_busy = false;
+        CHECK(!s->metadata.ready && !s->metadata.scheduled
+            && !s->metadata.semantic_valid && !s->metadata_busy);
+        CHECK(wl_session_source_step_metadata_take_recipe(session,
+            &s->metadata_recipe, &out, &before) == 0);
+        if (s->metadata.preparation_protocol) {
+            CHECK(s->metadata_fault == 7 && out.financial_result == EINVAL
+                && !out.action_called && before == 1);
+            s->state = WL_CONTROLLED_STEP_IDLE;
+            return s->metadata.preparation_protocol;
+        }
+        if (out.financial_result || s->metadata_phase != 3) return EAGAIN;
+        CHECK(out.action_called && !out.action_result
+            && s->metadata_finishes == 1 && s->metadata_reports == 1
+            && s->metadata_report.attempt_id == s->metadata_id
+            && !s->metadata_report.result && !s->metadata_report.consumed);
+        s->state = WL_CONTROLLED_STEP_COMPLETE;
+        return 0;
+    }
+    s->state = WL_CONTROLLED_STEP_NATIVE_ERROR_CLEANUP_PENDING;
+    s->metadata_busy = false;
+    CHECK(wl_session_source_step_metadata_select_recipe(session,
+        &s->metadata_recipe) == -EINVAL && !s->metadata.scheduled);
+    s->metadata_busy = true;
+    wl_session_source_metadata_recipe_t copy = s->metadata_recipe;
+    CHECK(wl_session_source_step_metadata_select_recipe(session, &copy)
+        == -EINVAL && !s->metadata.scheduled);
+    copy.identity = &copy;
+    CHECK(wl_session_source_step_metadata_select_recipe(session, &copy)
+        == -EINVAL && !s->metadata.scheduled);
+    for (unsigned invalid = 0; invalid < 4; ++invalid) {
+        copy = s->metadata_recipe; copy.identity = &copy;
+        if (invalid == 0) copy.result = NULL;
+        if (invalid == 1) copy.busy = NULL;
+        if (invalid == 2) copy.phase = NULL;
+        if (invalid == 3) copy.root = NULL;
+        CHECK(wl_session_source_step_metadata_select_recipe(session, &copy)
+            == -EINVAL && !s->metadata.scheduled);
+    }
+    s->metadata_recipe.role = WL_SESSION_SOURCE_METADATA_OBSERVER;
+    CHECK(wl_session_source_step_metadata_select_recipe(session,
+        &s->metadata_recipe) == -EINVAL && !s->metadata.scheduled);
+    s->metadata_recipe.role = WL_SESSION_SOURCE_METADATA_MAIN;
+    CHECK(wl_session_source_step_metadata_select_recipe(session,
+        &s->metadata_recipe) == 1);
+    CHECK(wl_session_source_step_metadata_select_recipe(session,
+        &s->metadata_recipe) == -EBUSY);
+    if (s->metadata_fault && !s->metadata_fault_fired) {
+        s->metadata_fault_fired = true;
+        if (s->metadata_fault == 7) {
+            /* Genuine Original turnover is allowed while this immutable
+             * financial recipe is selected. Its live tuple proof must refuse
+             * the old id without touching the real new generation. */
+            wl_evaluation_control_attempt_finish_result_t ended =
+                wl_evaluation_control_finish_attempt(
+                session->evaluation_control,
+                session->operation_admission, s->metadata_id, 0, 0);
+            CHECK(!ended.protocol && ended.report_valid
+                && ended.report.attempt_id == s->metadata_id &&
+                !ended.report.result);
+            CHECK(!wl_evaluation_control_begin(session->evaluation_control,
+                session->operation_admission));
+            s->metadata_successor = wl_evaluation_control_active_attempt_id(
+                session->evaluation_control);
+            CHECK(s->metadata_successor > s->metadata_id);
+        } else if (s->metadata_fault >= 3)
+            wl_evaluation_control_test_source_metadata_cancel_at =
+                s->metadata_fault - 2;
+        else if (s->metadata_fault == 1)
+            wl_evaluation_control_test_source_lexical_cancel_before_action =
+                true;
+        else wl_evaluation_control_test_source_lexical_cancel_after_action =
+                true;
+    }
+    return EAGAIN;
+}
+
+static int
+metadata_contract_step(wl_session_t *session)
+{
+    completion_contract_session_t *s = (void *)session;
+    if (s->metadata_recipe_mode) return metadata_recipe_contract_step(session);
+    if (!s->metadata_phase) {
+        CHECK(!wl_evaluation_control_begin(session->evaluation_control,
+            session->operation_admission));
+        s->metadata_id =
+            wl_evaluation_control_active_attempt_id(
+            session->evaluation_control);
+        CHECK(s->metadata_id); s->metadata_phase = 1;
+    }
+    if (s->metadata.ready) {
+        wl_session_source_metadata_result_t copy = s->metadata;
+        wl_evaluation_control_source_phase_result_t out = {17, 23, true};
+        unsigned before = 99;
+        CHECK(wl_session_source_step_metadata_take(session, &copy, s,
+            s->metadata_id, s->metadata_id,
+            WL_SESSION_SOURCE_METADATA_FINANCIER, &out, &before) == -EINVAL);
+        CHECK(wl_session_source_step_metadata_take(session, &s->metadata,
+            &copy, s->metadata_id, s->metadata_id,
+            WL_SESSION_SOURCE_METADATA_FINANCIER, &out, &before) == -EINVAL);
+        CHECK(wl_session_source_step_metadata_take(session, &s->metadata, s,
+            s->metadata_id + 1, s->metadata_id,
+            WL_SESSION_SOURCE_METADATA_FINANCIER, &out, &before) == -EINVAL);
+        CHECK(wl_session_source_step_metadata_take(session, &s->metadata, s,
+            s->metadata_id, s->metadata_id + 1,
+            WL_SESSION_SOURCE_METADATA_FINANCIER, &out, &before) == -EINVAL);
+        CHECK(wl_session_source_step_metadata_take(session, &s->metadata, s,
+            s->metadata_id, s->metadata_id,
+            WL_SESSION_SOURCE_METADATA_CONSTRUCTION, &out, &before) == -EINVAL);
+        CHECK(out.financial_result == 17 && out.action_result == 23
+            && out.action_called && before == 99 && s->metadata.ready);
+        metadata_contract_peer_t peer = {s, 0}; wl_thread_t thread;
+        CHECK(!wl_thread_create(&thread, metadata_contract_foreign_take,
+            &peer));
+        CHECK(!wl_thread_join(&thread) && peer.result == -EINVAL);
+        CHECK(wl_session_source_step_metadata_take(session, &s->metadata, s,
+            s->metadata_id, s->metadata_id,
+            WL_SESSION_SOURCE_METADATA_FINANCIER, &out, &before) == 1);
+        CHECK(before == 1 || before == 2);
+        CHECK(!s->metadata.identity && !s->metadata.ready
+            && !s->metadata.scheduled && !s->metadata_busy);
+        CHECK(wl_session_source_step_metadata_take(session, &s->metadata, s,
+            s->metadata_id, s->metadata_id,
+            WL_SESSION_SOURCE_METADATA_FINANCIER, &out, &before) == 0);
+        if (out.financial_result || s->metadata_phase != 3) return EAGAIN;
+        CHECK(out.action_called && !out.action_result
+            && s->metadata_finishes == 1 && s->metadata_reports == 1
+            && s->metadata_report.attempt_id == s->metadata_id
+            && !s->metadata_report.result && !s->metadata_report.consumed);
+        s->state = WL_CONTROLLED_STEP_COMPLETE;
+        return 0;
+    }
+    s->state = WL_CONTROLLED_STEP_NATIVE_ERROR_CLEANUP_PENDING;
+    s->metadata_busy = true;
+    const wl_session_source_metadata_request_t request = {
+        .result = &s->metadata, .owner = s, .action = metadata_contract_action,
+        .payload = s, .busy = &s->metadata_busy, .phase = &s->metadata_phase,
+        .operation_id = s->metadata_id, .operation_identity = s->metadata_id,
+        .before_phase = s->metadata_phase,
+        .kind = WL_SESSION_SOURCE_METADATA_FINANCIER,
+        .after = metadata_contract_after
+    };
+    wl_session_source_metadata_request_t invalid = request;
+    invalid.operation_identity = 0;
+    CHECK(wl_session_source_step_metadata_select(session, &invalid) == -EINVAL
+        && !s->metadata.identity && !s->metadata.scheduled);
+    invalid = request; invalid.operation_id = 0;
+    CHECK(wl_session_source_step_metadata_select(session, &invalid) == -EINVAL
+        && !s->metadata.identity && !s->metadata.scheduled);
+    invalid.kind = WL_SESSION_SOURCE_METADATA_CONSTRUCTION;
+    CHECK(wl_session_source_step_metadata_select(session, &invalid) == -EINVAL
+        && !s->metadata.identity && !s->metadata.scheduled);
+    CHECK(wl_session_source_step_metadata_select(session, &request) == 1);
+    CHECK(wl_session_source_step_metadata_select(session, &request) == -EBUSY);
+    if (s->metadata_fault && !s->metadata_fault_fired) {
+        s->metadata_fault_fired = true;
+        if (s->metadata_fault == 1)
+            wl_evaluation_control_test_source_lexical_cancel_before_action =
+                true;
+        else wl_evaluation_control_test_source_lexical_cancel_after_action =
+                true;
+    }
+    return EAGAIN;
+}
+
+static int
+metadata_contract_other_resolver(const wl_session_source_metadata_recipe_t *r,
+    unsigned group, wl_session_source_metadata_preparation_t *prepared)
+{
+    (void)r; (void)group; (void)prepared;
+    CHECK(false);
+    return EINVAL;
+}
+
+static void
+test_metadata_backend_contract(void)
+{
+    wl_compute_backend_t backend = {
+        .name = "metadata-contract",
+        .session_create = completion_contract_create,
+        .session_create_with_options = completion_contract_create_options,
+        .session_destroy = completion_contract_destroy,
+        .session_step = metadata_contract_step,
+        .session_controlled_step_state = completion_contract_state
+    };
+    for (unsigned variant = 0; variant < 13; ++variant) {
+        bool recipe_mode = variant >= 3;
+        unsigned fault = variant >= 11 ? 0 :
+            recipe_mode ? variant - 3 : variant;
+        /* A class declaration does not identify the actual audited producer.
+         * Exercise both an absent token and a different resolver token. */
+        backend.session_source_metadata_canonical_resolver = variant == 12 ?
+            metadata_contract_other_resolver : NULL;
+        wl_evaluation_control_t *control = NULL;
+        CHECK(!wl_evaluation_control_create(17, &control));
+        wl_session_options_t options; wl_session_options_init(&options);
+        options.evaluation_control = control;
+        wl_session_t *session = NULL;
+        CHECK(!wl_session_create_with_options(&backend, NULL, 1, &options,
+            &session));
+        completion_contract_session_t *s = (void *)session;
+        s->metadata_fault = fault;
+        s->metadata_recipe_mode = recipe_mode;
+        if (recipe_mode) {
+            /* Fixture setup only; no production Source price/provenance is
+             * inferred from this custom financial backend's role binding. */
+            s->metadata_recipe = (wl_session_source_metadata_recipe_t){
+                .identity = &s->metadata_recipe, .session = session, .root = s,
+                .root_identity = (uint64_t)(uintptr_t)s,
+                .role = WL_SESSION_SOURCE_METADATA_MAIN,
+                .result = &s->metadata, .busy = &s->metadata_busy,
+                .phase = &s->metadata_phase,
+                .resolve = metadata_recipe_contract_resolve
+            };
+            if (variant >= 11)
+                s->metadata_recipe.accounting_class =
+                    WL_SESSION_SOURCE_METADATA_ACCOUNTING_COLUMNAR_ROLE;
+            s->metadata.recipe = &s->metadata_recipe;
+        }
+        CHECK(wl_session_source_step_metadata_select(session, NULL) == 0);
+        CHECK(wl_session_source_step_metadata_select_recipe(session,
+            NULL) == 0);
+        CHECK(wl_session_step(session) == EAGAIN && s->metadata.ready
+            && !s->metadata.scheduled && !s->metadata_busy && !s->state_reads);
+        if (recipe_mode && fault == 7) {
+            CHECK(wl_session_step(session) == EINVAL
+                && !s->metadata_finishes && !s->metadata_reports
+                && s->metadata_issues == 1 && !s->metadata.ready);
+            wl_evaluation_control_report_t report;
+            uint64_t used = UINT64_MAX;
+            CHECK(!wl_evaluation_control_report(control, &report)
+                && report.attempt_id == s->metadata_id && !report.result
+                && !wl_evaluation_control_test_active_consumed(control,
+                s->metadata_successor, &used) && !used);
+            wl_evaluation_control_attempt_finish_result_t ended =
+                wl_evaluation_control_finish_attempt(control,
+                    session->operation_admission, s->metadata_successor, 0, 0);
+            CHECK(!ended.protocol && ended.report_valid && !ended.report.result
+                && !ended.report.consumed);
+            CHECK(!wl_session_try_destroy(&session));
+            wl_evaluation_control_release(control);
+            continue;
+        }
+        unsigned turns = 0;
+        int rc;
+        do {
+            CHECK(++turns < 16); rc = wl_session_step(session);
+        }while (rc == EAGAIN);
+        CHECK(!rc && s->metadata_finishes == 1 && s->metadata_reports == 1
+            && s->metadata_issues == (fault == 1 || fault >= 3 ? 3u : 2u)
+            && !wl_evaluation_control_active_attempt_id(control));
+        CHECK(!wl_session_try_destroy(&session));
+        wl_evaluation_control_release(control);
+    }
+}
+
 static void
 test_completion_backend_contract(void)
 {
@@ -16447,7 +19111,8 @@ test_completion_backend_contract(void)
             WL_BACKEND_CONTROLLED_COMPLETION_STEP, true, &poison) == state
             && !memcmp(&poison, &saved, sizeof(poison)));
         s->reads = 0;
-        CHECK(wl_session_step(session) == WL_EVALUATION_CONTROL_WORK_LIMIT
+        CHECK(controlled_recursive_run(session,
+            control) == WL_EVALUATION_CONTROL_WORK_LIMIT
             && s->reads == 1 && s->state_reads == 0 && !s->commits);
         int64_t row = 1;
         if (state == WL_CONTROLLED_STEP_PENDING
@@ -17099,6 +19764,55 @@ test_observed_owner_recovery(void)
 int
 main(int argc, char **argv)
 {
+    if (argc == 2 && !strcmp(argv[1], "--observer-error-metadata")) {
+        CHECK(!unsetenv("WIRELOG_JOIN_BATCH_BYTES"));
+        CHECK(!unsetenv("WIRELOG_JOIN_BATCH_STRICT"));
+        test_observer_error_metadata(); return 0;
+    }
+    if (argc == 2 && !strcmp(argv[1], "--recursive-transaction-stops")) {
+        test_controlled_recursive_transaction_stops(); return 0;
+    }
+    if (argc == 2 && !strcmp(argv[1], "--frontier-original-stops")) {
+        test_controlled_recursive_frontier_stops(); return 0;
+    }
+    if (argc == 2 && !strcmp(argv[1], "--frontier-main-stops")) {
+        test_controlled_recursive_frontier_main_stops(); return 0;
+    }
+    if (argc == 2 && !strcmp(argv[1], "--recursive-post-finish-metadata")) {
+        test_controlled_recursive_post_finish_metadata();
+        test_controlled_recursive_step_general_join_chain(); return 0;
+    }
+    test_controlled_recursive_post_finish_metadata();
+    if (argc == 2 && !strcmp(argv[1], "--recursive-watchdog-policy")) {
+        test_controlled_recursive_watchdog_policy(); return 0;
+    }
+    if (argc == 2 && !strcmp(argv[1], "--recursive-successor-work")) {
+        controlled_recursive_watchdog_report = true;
+        test_controlled_recursive_watchdog_policy();
+        test_controlled_recursive_step_after_public_edge_append();
+        test_controlled_recursive_successor_work_boundaries();
+        return 0;
+    }
+    test_controlled_recursive_watchdog_policy();
+    if (argc == 2 && !strcmp(argv[1], "--recursive-single-join-work")) {
+        controlled_recursive_watchdog_report = true;
+        test_controlled_recursive_step_publication_and_stops(); return 0;
+    }
+    if (argc == 2 && !strcmp(argv[1], "--recursive-two-join-work")) {
+        controlled_recursive_watchdog_report = true;
+        test_controlled_recursive_two_join_step(); return 0;
+    }
+    if (argc == 2 && !strcmp(argv[1], "--staging-native-recovery")) {
+        test_staging_native_pending_admission();
+        staging_close_allow_retry = true;
+        for (unsigned kind = 1; kind <= 2; ++kind)
+            for (unsigned ready = 0; ready < 2; ++ready) {
+                staging_close_fault_kind = kind;
+                staging_close_fault_ready = ready != 0;
+                test_staging_native_pending_admission();
+            }
+        return 0;
+    }
     if (argc == 2 && !strcmp(argv[1], "--observed-source-begin-recovery")) {
         test_observed_owner_recovery_range(10, 14, 3); return 0;
     }
@@ -17107,6 +19821,9 @@ main(int argc, char **argv)
     }
     if (argc == 2 && !strcmp(argv[1], "--observed-owner-recovery")) {
         test_observed_owner_recovery(); return 0;
+    }
+    if (argc == 2 && !strcmp(argv[1], "--metadata-contract")) {
+        test_metadata_backend_contract(); return 0;
     }
     if (argc == 2 && !strcmp(argv[1], "--completion-contract")) {
         test_completion_backend_contract();
@@ -17124,7 +19841,9 @@ main(int argc, char **argv)
     CHECK(!unsetenv("WIRELOG_JOIN_BATCH_BYTES"));
     CHECK(!unsetenv("WIRELOG_JOIN_BATCH_STRICT"));
     test_entry_bound_automatic_turnover();
-    test_entry_automatic_prepared_funding();
+    test_entry_automatic_prepared_funding(0);
+    test_entry_automatic_prepared_funding(15);
+    test_entry_automatic_prepared_funding(31);
     test_entry_automatic_first_cause_turnover();
     test_entry_automatic_begin_failure_turnover();
     test_retirement_retained_work_native_owner();
@@ -17151,6 +19870,7 @@ main(int argc, char **argv)
     test_controlled_recursive_transaction();
     test_controlled_recursive_frontiers();
     test_controlled_recursive_frontier_stops();
+    test_controlled_recursive_frontier_main_stops();
     test_controlled_recursive_union_heads();
     test_recursive_union_workers();
     test_controlled_recursive_transaction_successors();
@@ -17169,6 +19889,7 @@ main(int argc, char **argv)
     test_controlled_observed_transaction_budget();
     test_controlled_observed_missing_private_head();
     test_controlled_observed_step();
+    test_observer_error_metadata();
     test_scalar_retirement_receipt();
     test_controlled_observed_filter_successors();
     test_controlled_observed_filter_stops();
@@ -17193,6 +19914,7 @@ main(int argc, char **argv)
     test_controlled_session_snapshot_publication();
     test_controlled_snapshot_preparation();
     test_controlled_session_admission_matrix();
+    test_entry_active_owner_without_root();
     test_entry_shapes(); test_entry_generated_operators();
     test_entry_generated_right_filter_large();
     test_entry_generated_join_abort_cleanup_retry();

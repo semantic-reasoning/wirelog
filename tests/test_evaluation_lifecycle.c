@@ -719,7 +719,10 @@ test_snapshot_admission(void)
 
     fixture_init(&f, true);
     wl_columnar_session_test_fail_framed_funding_before_stop = 1;
-    CHECK(wl_session_step(f.session) == EAGAIN);
+    for (unsigned call = 0;
+        !wl_evaluation_control_active_attempt_id(f.control); ++call) {
+        CHECK(call < 10000 && wl_session_step(f.session) == EAGAIN);
+    }
     CHECK(!wl_columnar_session_test_fail_framed_funding_before_stop);
     CHECK(wl_evaluation_control_active_attempt_id(f.control));
     actual = (capture_t){0};

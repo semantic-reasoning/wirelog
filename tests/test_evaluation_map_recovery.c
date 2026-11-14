@@ -972,7 +972,7 @@ static void gateway_source_probe(wl_col_session_t *sess,
         sess->base.evaluation_control), original_before = 0, original_after = 0;
     CHECK(original_id && !wl_evaluation_control_test_active_consumed(
             sess->base.evaluation_control, original_id, &original_before));
-    int owner;
+    int owner = 0;
     wl_evaluation_control_t *native = NULL;
     CHECK(!wl_evaluation_control_create(mode == 7 ? 383 : 384, &native)
         && !wl_evaluation_control_attach(native, &owner)
@@ -1383,9 +1383,165 @@ static void mixed_owners(void) {
         }
 }
 
-int main(void) {
+extern void (*wl_columnar_session_test_unary_forward_phase)(
+    const wl_col_session_t *, unsigned, wl_evaluation_control_t *, uint64_t);
+extern int wl_columnar_session_test_producer_disposition_view(
+    const wl_col_session_t *, uint64_t[6]);
+
+typedef struct {
+    fixture_t *fixture;
+    unsigned phase, starts, reports, releases, acknowledgements;
+    bool work, fired, closed;
+    uint64_t original_id, failed_source_id, failed_source_identity;
+    wl_evaluation_control_report_t failed_report;
+} forward_refusal_probe_t;
+static forward_refusal_probe_t *forward_refusal_probe;
+
+static void
+forward_refusal_phase(const wl_col_session_t *sess, unsigned phase,
+    wl_evaluation_control_t *source, uint64_t id)
+{
+    forward_refusal_probe_t *p = forward_refusal_probe;
+    if (!p || sess != COL_SESSION(p->fixture->session)) return;
+    if (phase == 0) ++p->starts;
+    if (phase == p->phase && !p->fired) {
+        CHECK(source && source != p->fixture->control && id
+            && wl_evaluation_control_active_attempt_id(source) == id);
+        p->original_id = wl_evaluation_control_active_attempt_id(
+            p->fixture->control);
+        CHECK(p->original_id &&
+            wl_columnar_session_test_cleanup_owners(sess) == 2);
+        p->failed_source_id = id;
+        p->failed_source_identity = wl_evaluation_control_identity(source);
+        p->fired = true;
+        if (p->work)
+            CHECK(wl_evaluation_control_charge_attempt(source, id, 2304)
+                == WL_EVALUATION_CONTROL_WORK_LIMIT);
+        else
+            wl_evaluation_control_request_cancel(source);
+    }
+    if (phase == 9) {
+        ++p->reports;
+        CHECK(source && id && !wl_evaluation_control_active_attempt_id(source));
+        if (p->fired && !p->closed) {
+            CHECK(wl_evaluation_control_identity(source) ==
+                p->failed_source_identity
+                && !wl_evaluation_control_report(source, &p->failed_report));
+            uint64_t expected = p->phase == 6 ? 988 : p->phase ==
+                7 ? 1116 : 1308;
+            CHECK(p->failed_report.attempt_id == p->failed_source_id
+                && p->failed_report.limit == 2304
+                && p->failed_report.consumed == expected
+                && !p->failed_report.execution_status
+                && !p->failed_report.cleanup_status
+                && p->failed_report.result == (p->work
+                    ? WL_EVALUATION_CONTROL_WORK_LIMIT
+                    : WL_EVALUATION_CONTROL_CANCELLED));
+        }
+    }
+    if (phase == 10) {
+        CHECK(!source && !id);
+        ++p->releases;
+        if (p->fired && !p->closed) p->closed = true;
+    }
+}
+
+static void
+forward_refusal_ack(const wl_col_session_t *sess,
+    wl_columnar_eval_serial_framed_host_action_t action,
+    wl_evaluation_control_t *funding, int protocol)
+{
+    (void)funding;
+    forward_refusal_probe_t *p = forward_refusal_probe;
+    if (p && sess == COL_SESSION(p->fixture->session)
+        && action == WL_COLUMNAR_EVAL_SERIAL_FRAMED_RECEIPT_ACK && !protocol)
+        ++p->acknowledgements;
+}
+
+static void
+unary_forward_refusals(void)
+{
+    const unsigned phases[] = {6, 7, 8};
+    for (unsigned cut = 0; cut < 3; ++cut)
+        for (unsigned work = 0; work < 2; ++work) {
+            fixture_t f = create();
+            wl_session_set_delta_cb(f.session, capture, &f);
+            insert(&f, "12tail");
+            CHECK(!complete(f.session)); contents(&f, 1);
+            CHECK(f.events == 1);
+            col_rel_t *committed = session_find_rel(COL_SESSION(f.session),
+                    "out");
+            col_relation_snapshot_t image =
+                wl_columnar_relation_snapshot(committed);
+            wl_evaluation_control_report_t prior, stopped, after;
+            CHECK(!wl_evaluation_control_report(f.control, &prior));
+            int64_t bad = insert(&f, "9223372036854775808");
+            forward_refusal_probe_t probe = {
+                .fixture = &f, .phase = phases[cut], .work = work != 0
+            };
+            CHECK(!wl_columnar_session_test_unary_forward_phase
+                && !wl_columnar_session_test_framed_grant_finished);
+            forward_refusal_probe = &probe;
+            wl_columnar_session_test_unary_forward_phase =
+                forward_refusal_phase;
+            wl_columnar_session_test_framed_grant_finished =
+                forward_refusal_ack;
+            int rc = EAGAIN;
+            for (unsigned turn = 0; turn < 10000 && !probe.closed; ++turn) {
+                rc = wl_session_step(f.session);
+                CHECK(rc == EAGAIN);
+            }
+            CHECK(probe.fired && probe.closed && probe.starts == 1
+                && probe.reports == 1 && probe.releases == 1
+                && probe.acknowledgements == 1
+                && wl_evaluation_control_active_attempt_id(f.control)
+                == probe.original_id
+                && wl_columnar_session_test_cleanup_owners(COL_SESSION(
+                    f.session)) == 2);
+            uint64_t disposition[6];
+            CHECK(!wl_columnar_session_test_producer_disposition_view(
+                    COL_SESSION(f.session), disposition)
+                && disposition[0] == (phases[cut] == 6 ? 0u : 1u)
+                && !disposition[4] && !disposition[5]);
+            CHECK(!wl_evaluation_control_report(f.control, &after));
+            same_report(&prior, &after);
+            CHECK(f.events == 1
+                && session_find_rel(COL_SESSION(f.session), "out") == committed
+                && wl_columnar_relation_snapshot_equal(image,
+                wl_columnar_relation_snapshot(committed)));
+            CHECK(complete(f.session) == ERANGE);
+            wl_columnar_session_test_unary_forward_phase = NULL;
+            wl_columnar_session_test_framed_grant_finished = NULL;
+            forward_refusal_probe = NULL;
+            CHECK(probe.starts == 2 && probe.reports == 2 && probe.releases == 2
+                && probe.acknowledgements == 1 && f.events == 1
+                && !wl_columnar_session_test_cleanup_owners(COL_SESSION(
+                    f.session))
+                && !wl_evaluation_control_report(f.control, &stopped)
+                && stopped.attempt_id == probe.original_id
+                && stopped.result == ERANGE &&
+                stopped.execution_status == ERANGE
+                && !stopped.cleanup_status);
+            CHECK(!wl_columnar_session_test_producer_disposition_view(
+                    COL_SESSION(f.session), disposition)
+                && disposition[4] && disposition[5]);
+            CHECK(!wl_session_remove(f.session, "input", &bad, 1, 1));
+            CHECK(!wl_evaluation_control_report(f.control, &after));
+            same_report(&stopped, &after);
+            CHECK(!wl_evaluation_control_reset(f.control) &&
+                !complete(f.session));
+            contents(&f, 1);
+            CHECK(f.events == 1 && !complete(f.session) && f.events == 1);
+            destroy(&f);
+        }
+}
+int main(int argc, char **argv) {
+    if (argc == 2 && !strcmp(argv[1], "unary-forward")) {
+        unary_forward_refusals(); return 0;
+    }
     terminal(); native_rebind(); registration_denials(); indexed_history();
     indexed_lookup(); grant_boundaries(); ack_denials(); acked_source_denials();
     gateway_sources(); unary_source_tails(); mixed_owners();
+    unary_forward_refusals();
     puts("hot scalar MAP recovery: all checks passed"); return 0;
 }

@@ -244,6 +244,18 @@ run_case(unsigned history, bool cancel)
     CHECK(wl_columnar_managed_candidate_merge_ack_step_owned(&copy, &owner,
         &a, maintenance, id, &done) == EINVAL);
     settle(&p, &a, maintenance, id);
+    /* Isolate the creator-thread guard from the pending-report guard: the
+     * real prior receipt is settled and this fresh finite grant is unused. */
+    id = restart(maintenance, 256);
+    wl_columnar_managed_candidate_merge_ack_progress_t ready = p;
+    foreign_t ready_peer = {&p, &a, maintenance, id, 0};
+    CHECK(!wl_thread_create(&thread, foreign_step, &ready_peer));
+    CHECK(!wl_thread_join(&thread) && ready_peer.rc == EBUSY);
+    uint64_t foreign_consumed = UINT64_MAX;
+    CHECK(!memcmp(&ready, &p, sizeof(p))
+        && !wl_evaluation_control_test_active_consumed(maintenance, id,
+        &foreign_consumed) && !foreign_consumed);
+    CHECK(!wl_evaluation_control_finish(maintenance, &owner, 0, 0));
     unsigned atomic_actions = 0, ordinary_actions = 0;
     for (unsigned i = 0; wl_columnar_managed_candidate_merge_ack_pending(&p);
         ++i) {

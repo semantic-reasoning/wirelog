@@ -409,8 +409,37 @@ static void boundaries(void){
     }
 }
 
+/* JOIN's source order includes journal7 before publication6. */
+static const unsigned join_birth_stages[] = {0, 1, 2, 3, 4, 5, 7, 6};
+static uint32_t join_birth_ops(const fixture_t *f, unsigned extra){
+    const wl_plan_relation_t *r = &f->plan->strata[0].relations[0];
+    CHECK(r->op_count == extra+4 && r->ops[0].op == WL_PLAN_OP_VARIABLE);
+    for (unsigned i = 0; i < extra; ++i)
+        CHECK(r->ops[i+1].op == WL_PLAN_OP_MAP);
+    CHECK(r->ops[extra+1].op == WL_PLAN_OP_JOIN &&
+        r->ops[extra+2].op == WL_PLAN_OP_MAP &&
+        r->ops[extra+3].op == WL_PLAN_OP_CONSOLIDATE);
+    return r->op_count;
+}
+static uint64_t join_birth_ordinal(uint32_t n, unsigned stage,
+    uint32_t progress){
+    CHECK(n >= 4);
+    if (stage == 1) {
+        CHECK(progress < n); return (uint64_t)progress+2;
+    }
+    CHECK(!progress);
+    if (stage == 0) return 1;
+    if (stage >= 2 && stage <= 5) return (uint64_t)n+stage;
+    if (stage == 7) return (uint64_t)n+6;
+    CHECK(stage == 6); return (uint64_t)n+7;
+}
 static uint64_t registration_cap, registration_used;
-static bool registration_injected, registration_refused;
+static uint64_t registration_grant_identity, registration_grant_id;
+static uint64_t registration_original_id;
+static wl_evaluation_control_t *registration_grant;
+static const void *registration_frame, *registration_plan;
+static bool registration_injected, registration_refused, registration_exact;
+static bool registration_bound, registration_succeeded;
 static unsigned registration_forward;
 static uint64_t registration_limit(const wl_col_session_t *session,
     wl_columnar_eval_serial_framed_host_action_t which, uint64_t limit){
@@ -420,55 +449,132 @@ static uint64_t registration_limit(const wl_col_session_t *session,
     }
     return limit;
 }
+/* The first JOIN ENTRY pre-funding barrier binds the injected ADVANCE grant,
+ * not a later healthy grant that happens to carry the same limit. */
+static void registration_birth(wl_columnar_eval_serial_framed_attempt_t *ctx,
+    wl_evaluation_control_t *grant, uint64_t id, unsigned stage,
+    uint32_t progress, bool funded){
+    if (stage != 0 || progress || funded || registration_bound) return;
+    CHECK(registration_injected && ctx->control == active->control &&
+        ctx->session == COL_SESSION(active->session) && ctx->frame &&
+        ctx->session->cleanup_active == ctx->frame &&
+        !wl_columnar_session_test_cleanup_owners(ctx->session));
+    uint64_t used;
+    CHECK(!wl_evaluation_control_test_active_consumed(grant, id, &used) &&
+        used == 2176 && id == wl_evaluation_control_active_attempt_id(grant));
+    registration_grant = grant; registration_grant_id = id;
+    registration_grant_identity = wl_evaluation_control_identity(grant);
+    CHECK(!wl_columnar_eval_stack_framed_authenticate(ctx->frame,
+        ctx->session, ctx) && ctx->plan && ctx->plan->name
+        && ctx->plan->op_count == join_birth_ops(active, 0)
+        && !strcmp(ctx->plan->name,
+        active->plan->strata[0].relations[0].name));
+    for (uint32_t i = 0; i < ctx->plan->op_count; ++i)
+        CHECK(ctx->plan->ops[i].op ==
+            active->plan->strata[0].relations[0].ops[i].op);
+    registration_original_id = ctx->attempt_id;
+    registration_plan = ctx->plan;
+    registration_frame = ctx->frame; registration_bound = true;
+}
 static void registration_finished(const wl_col_session_t *session,
     wl_columnar_eval_serial_framed_host_action_t which,
     wl_evaluation_control_t *grant, int protocol){
-    (void)which; (void)protocol; wl_evaluation_control_report_t report;
-    CHECK(!wl_evaluation_control_report(grant, &report));
-    if (report.limit != registration_cap) return;
-    CHECK(!registration_refused &&
-        report.result == WL_EVALUATION_CONTROL_WORK_LIMIT &&
-        report.consumed == registration_used && !report.execution_status &&
-        !report.cleanup_status &&
-        !session->cleanup_active && !session->cleanup_pending &&
-        !session->cleanup_reserved_bytes); registration_refused = true;
+    if (!registration_bound || grant != registration_grant ||
+        wl_evaluation_control_identity(grant) != registration_grant_identity)
+        return;
+    wl_evaluation_control_report_t report;
+    CHECK(which == WL_COLUMNAR_EVAL_SERIAL_FRAMED_ADVANCE &&
+        !registration_refused && !registration_succeeded &&
+        !wl_evaluation_control_report(grant, &report) &&
+        report.attempt_id == registration_grant_id &&
+        report.limit == registration_cap && report.consumed == registration_used
+        && !report.execution_status && !report.cleanup_status);
+    if (registration_exact) {
+        CHECK(!protocol && !report.result &&
+            report.stop_reason == WL_EVALUATION_CONTROL_NONE &&
+            session->cleanup_active == registration_frame &&
+            !session->cleanup_pending &&
+            wl_columnar_session_test_cleanup_owners(session) == 1);
+        wl_columnar_eval_serial_framed_view_t view;
+        CHECK(!wl_columnar_eval_stack_framed_inspect(session->cleanup_active,
+            session, &view) && view.session == session &&
+            view.control == active->control &&
+            view.attempt_id == registration_original_id &&
+            view.plan == registration_plan);
+        wl_columnar_eval_cleanup_receipt_key_t key;
+        CHECK(!wl_columnar_eval_stack_cleanup_receipt_key_for_frame(
+                session->cleanup_active, &key) && key.session_generation &&
+            key.receipt_id && key.plan_epoch && key.operation_id &&
+            key.operation_attempt_id == registration_original_id &&
+            key.session_generation ==
+            view.cleanup_receipt_key.session_generation
+            && key.receipt_id == view.cleanup_receipt_key.receipt_id &&
+            key.plan_epoch == view.cleanup_receipt_key.plan_epoch &&
+            key.operation_id == view.cleanup_receipt_key.operation_id &&
+            key.operation_attempt_id ==
+            view.cleanup_receipt_key.operation_attempt_id);
+        uint32_t index = UINT32_MAX;
+        CHECK(!wl_columnar_session_native_cleanup_receipt_index(session, &key,
+            &index) && index == 1);
+        registration_succeeded = true;
+    } else {
+        /* Rollback may have freed the saved frame. Never dereference it here. */
+        CHECK(report.result == WL_EVALUATION_CONTROL_WORK_LIMIT &&
+            !session->cleanup_active && !session->cleanup_pending &&
+            !session->cleanup_reserved_bytes);
+        registration_refused = true;
+    }
 }
 static void registration_observe(wl_evaluation_control_t *c, unsigned phase,
     uint64_t progress, bool failed){
     (void)c; (void)progress; (void)failed; if (phase == 94) {
-        CHECK(registration_refused); ++registration_forward;
+        CHECK(registration_exact ? registration_succeeded :
+            registration_refused);
+        ++registration_forward;
     }
 }
 static void birth_refusals(void){
-    /* Compiler VARIABLE/JOIN/MAP/CONSOLIDATE; actual index1 lookup640+
-     * host768+unary768 gives B2176. Ten independently paid JOIN256 packets. */
-    const uint64_t caps[] = {2431, 2687, 2943, 3199, 3455, 3711, 3967, 4223,
-                             4479, 4735};
-    const uint64_t used[] = {2176, 2432, 2688, 2944, 3200, 3456, 3712, 3968,
-                             4224, 4480};
-    for (unsigned i = 0; i < sizeof(caps)/sizeof(*caps); ++i) {
+    /* Index1 lookup640+host768+unary768=B2176. JOIN has11 real256
+     * packets, including journal7 before publication6. Last pair4991/4736;
+     * exact4992 must publish on that same first ADVANCE before later grants. */
+    for (unsigned i = 0; i < 12; ++i) {
         fixture_t f = create(false); active = &f; seed_history(&f, 1);
+        CHECK(join_birth_ops(&f, 0) == 4);
         wl_session_set_delta_cb(f.session, capture, &f);
         CHECK(!complete(f.session));
         wl_columnar_eval_cleanup_receipt_t historical =
             COL_SESSION(f.session)->cleanup_receipts[0];
         for (unsigned r = 0; r < 3;
             ++r) CHECK(!wl_session_insert(f.session, "input", f.rows[r], 1, 2));
-        registration_cap = caps[i]; registration_used = used[i];
+        registration_exact = i == 11;
+        uint64_t prefix = 2176+256u*(registration_exact ? 11u : i+1u);
+        registration_cap = prefix-(registration_exact ? 0u : 1u);
+        registration_used = prefix-(registration_exact ? 0u : 256u);
         registration_injected = registration_refused = false;
-        registration_forward = 0;
+        registration_bound = registration_succeeded = false;
+        registration_grant = NULL; registration_frame = NULL;
+        registration_plan = NULL;
+        registration_grant_identity = registration_grant_id = 0;
+        registration_original_id = 0; registration_forward = 0;
+        wl_columnar_session_test_join_birth_checkpoint = registration_birth;
         wl_columnar_session_test_framed_grant_limit = registration_limit;
         wl_columnar_session_test_framed_grant_finished = registration_finished;
         wl_columnar_expr_test_checkpoint = registration_observe;
         int rc = complete(f.session);
         wl_columnar_expr_test_checkpoint = NULL;
+        wl_columnar_session_test_join_birth_checkpoint = NULL;
         wl_columnar_session_test_framed_grant_limit = NULL;
         wl_columnar_session_test_framed_grant_finished = NULL;
-        CHECK(!rc && registration_injected && registration_refused &&
-            registration_forward && f.events == 3 && f.positive == 3 &&
+        CHECK(!rc && registration_injected && registration_bound &&
+            (registration_exact ? registration_succeeded &&
+            !registration_refused
+                                : registration_refused &&
+            !registration_succeeded)
+            && registration_forward && f.events == 3 && f.positive == 3 &&
             !f.negative);
         contents(&f, 3);
-        CHECK(!memcmp(&historical, &COL_SESSION(f.session)->cleanup_receipts[0],
+        CHECK(!complete(f.session) && f.events == 3 &&
+            !memcmp(&historical, &COL_SESSION(f.session)->cleanup_receipts[0],
             sizeof(historical)) && !COL_SESSION(f.session)->cleanup_active &&
             !COL_SESSION(f.session)->cleanup_pending &&
             !COL_SESSION(f.session)->cleanup_reserved_bytes);
@@ -535,8 +641,10 @@ static void fresh_observation(void){
      * actual unary prefix ending at JOIN, initial lookup and two host fronts.
      * With index1: B=2176+256*extra. k is independent JOIN packet ordinal. */
     for (unsigned stress = 0; stress < 2; ++stress)
-        for (poll_stage = 0; poll_stage < 7; ++poll_stage)
+        for (unsigned si = 0;
+            si < sizeof(join_birth_stages)/sizeof(*join_birth_stages); ++si)
             for (action = 0; action < 5; ++action) {
+                poll_stage = join_birth_stages[si];
                 if (stress && poll_stage != 1) continue;
                 unsigned extra = stress?64u:0u;
                 fixture_t f = create_extra(false, extra); active = &f;
@@ -547,8 +655,8 @@ static void fresh_observation(void){
                     CHECK(!wl_session_insert(f.session, "input", f.rows[i], 1,
                         2));
                 poll_progress = poll_stage == 1?(stress?63u:2u):0u;
-                uint64_t ordinal = poll_stage == 0?1u:poll_stage == 1?
-                    (uint64_t)poll_progress+2u:(uint64_t)extra+poll_stage+4u;
+                uint64_t ordinal = join_birth_ordinal(join_birth_ops(&f, extra),
+                        poll_stage, poll_progress);
                 poll_prefix = 2176+256u*extra+256*ordinal;
                 poll_funding_first = false; poll_after_stop = 0;
                 poll_seen = poll_finished = stopped = false; poll_grant = NULL;
@@ -578,14 +686,17 @@ static void fresh_observation(void){
             }
     /* Funding refusal wins before Original cancellation is observed. The
      * pre-funding barrier causes both conditions at each actual packet. */
-    for (poll_stage = 0; poll_stage < 7; ++poll_stage) {
+    for (unsigned si = 0;
+        si < sizeof(join_birth_stages)/sizeof(*join_birth_stages); ++si) {
+        poll_stage = join_birth_stages[si];
         fixture_t f = create(false); active = &f; seed_history(&f, 1);
         wl_session_set_delta_cb(f.session, capture, &f);
         CHECK(!complete(f.session));
         for (unsigned i = 0; i < 3; ++i)
             CHECK(!wl_session_insert(f.session, "input", f.rows[i], 1, 2));
         poll_progress = poll_stage == 1?2u:0u;
-        uint64_t ordinal = poll_stage == 0?1u:poll_stage == 1?4u:poll_stage+4u;
+        uint64_t ordinal = join_birth_ordinal(join_birth_ops(&f, 0),
+                poll_stage, poll_progress);
         poll_prefix = 2176+256*ordinal; action = 0; successor = 0;
         poll_funding_first = true; poll_after_stop = 0;
         poll_seen = poll_finished = stopped = false; poll_grant = NULL;

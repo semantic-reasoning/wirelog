@@ -9,7 +9,11 @@
 #include "thread.h"
 
 #include <errno.h>
+#include <stddef.h>
 #include <stdlib.h>
+#ifdef WL_SESSION_TEST_HOOKS
+#include <string.h>
+#endif
 
 struct wl_evaluation_control {
     wl_mutex_t mutex;
@@ -28,6 +32,10 @@ struct wl_evaluation_control {
     wl_evaluation_control_report_t completed;
     const wl_evaluation_control_source_bank_t *source_bank_class;
 };
+
+_Static_assert(sizeof(wl_atomic_u64) == 8 && _Alignof(wl_atomic_u64) >= 8
+    && offsetof(wl_evaluation_control_t, active_attempt_id) % 8 == 0,
+    "The private active-generation observation requires an aligned uint64 field");
 
 static wl_atomic_u64 wl_next_evaluation_control_identity = 1;
 
@@ -447,6 +455,7 @@ wl_evaluation_control_completion_generation_observe(
 #ifdef WL_SESSION_TEST_HOOKS
 void (*wl_evaluation_control_test_finance_birth_claim)(void);
 unsigned wl_evaluation_control_test_finance_birth_fail;
+uint64_t wl_evaluation_control_test_finance_birth_attempt_id;
 #endif
 
 static void *
@@ -512,6 +521,14 @@ wl_evaluation_control_attached_birth_try(uint64_t limit,
     atomic_init(&control->active_attempt_id, 0);
     control->owner = owner; control->identity = identity;
     control->configured_limit = limit;
+#ifdef WL_SESSION_TEST_HOOKS
+    if (wl_evaluation_control_test_finance_birth_attempt_id) {
+        uint64_t seed = wl_evaluation_control_test_finance_birth_attempt_id;
+        wl_evaluation_control_test_finance_birth_attempt_id = 0;
+        if (wl_evaluation_control_test_seed_attempt_id(control, owner, seed))
+            abort();
+    }
+#endif
     out.protocol = wl_evaluation_control_begin(control, owner);
     if (out.protocol) {
         /* Fresh private BEGIN cannot have a foreign owner or active attempt.
@@ -841,6 +858,9 @@ enum { WL_EVALUATION_CONTROL_SOURCE_LANES = 2 };
 /* Identity cookie only, never a TLS BANK/context/control issuer. */
 static WL_EVALUATION_CONTROL_SOURCE_THREAD_LOCAL unsigned char
 wl_evaluation_control_source_thread_cookie;
+/* Enforced sealed-callback precondition: no nested BANK of any lane. */
+static WL_EVALUATION_CONTROL_SOURCE_THREAD_LOCAL bool
+    wl_evaluation_control_locked_metadata_action;
 #undef WL_EVALUATION_CONTROL_SOURCE_THREAD_LOCAL
 
 typedef struct {
@@ -851,6 +871,8 @@ typedef struct {
     bool running;
     bool callback_active;
     bool report_verified;
+    bool observation_active;
+    wl_evaluation_control_source_financial_state_t retained_state;
 } wl_evaluation_control_source_lane_state_t;
 
 struct wl_evaluation_control_source_bank {
@@ -860,12 +882,16 @@ struct wl_evaluation_control_source_bank {
     bool closing;
     wl_evaluation_control_source_lane_state_t
         lanes[WL_EVALUATION_CONTROL_SOURCE_LANES];
+    /* OP only. Each BUILD packet initializes its members before publishing
+     * their phase; no pending member is read in Q or before its BUILD. */
+    wl_evaluation_control_report_t pending_report;
 };
 
 static int
 wl_evaluation_control_source_bank_lock(
     wl_evaluation_control_source_bank_t *bank)
 {
+    if (wl_evaluation_control_locked_metadata_action) return EBUSY;
     return wl_mutex_lock(&bank->mutex) == 0 ? 0 : EIO;
 }
 
@@ -888,7 +914,8 @@ wl_evaluation_control_source_bank_rearm_phase(
         || index >= WL_EVALUATION_CONTROL_SOURCE_LANES) return EINVAL;
     wl_evaluation_control_source_lane_state_t *lane = &bank->lanes[index];
     wl_evaluation_control_t *control = lane->control;
-    if (!control || !lane->context || lane->running || lane->callback_active
+    if (lane->retained_state != WL_EVALUATION_CONTROL_SOURCE_QUIESCENT
+        || !control || !lane->context || lane->running || lane->callback_active
         || (lane->id && !lane->report_verified)) return EBUSY;
     if (wl_mutex_lock(&control->mutex)) return EIO;
 #ifdef _MSC_VER
@@ -1101,7 +1128,8 @@ wl_evaluation_control_source_context_begin(
     int rc = wl_evaluation_control_source_bank_lock(bank);
     if (rc) return rc;
     wl_evaluation_control_source_lane_state_t *lane = &bank->lanes[index];
-    if (bank->closing || lane->context || lane->running
+    if (lane->retained_state != WL_EVALUATION_CONTROL_SOURCE_QUIESCENT
+        || bank->closing || lane->context || lane->running
         || lane->callback_active) rc = EBUSY;
     if (!rc) {
         context->identity = context;
@@ -1211,6 +1239,7 @@ wl_evaluation_control_source_bank_run(
  * after real phase settlement, including failed admissions/actions. */
 #ifdef WL_SESSION_TEST_HOOKS
 bool wl_evaluation_control_test_source_lexical_cancel_after_action;
+bool wl_evaluation_control_test_source_lexical_cancel_before_action;
 #endif
 
 wl_evaluation_control_source_phase_result_t
@@ -1235,7 +1264,8 @@ wl_evaluation_control_source_bank_run_lexical(
         result.financial_result = rc; return result;
     }
     wl_evaluation_control_source_lane_state_t *lane = &bank->lanes[index];
-    if (bank->closing || lane->context || lane->running
+    if (lane->retained_state != WL_EVALUATION_CONTROL_SOURCE_QUIESCENT
+        || bank->closing || lane->context || lane->running
         || lane->callback_active) {
         wl_evaluation_control_source_bank_unlock(bank);
         result.financial_result = EBUSY;
@@ -1258,6 +1288,12 @@ wl_evaluation_control_source_bank_run_lexical(
     if (!lane->id) abort();
     lane->running = true;
     rc = wl_evaluation_control_source_bank_charge(lane, policy->bootstrap_work);
+#ifdef WL_SESSION_TEST_HOOKS
+    if (!rc && wl_evaluation_control_test_source_lexical_cancel_before_action) {
+        wl_evaluation_control_test_source_lexical_cancel_before_action = false;
+        wl_evaluation_control_request_cancel(lane->control);
+    }
+#endif
     if (!rc) rc = wl_evaluation_control_source_bank_charge(lane,
                 policy->current_work);
     if (!rc) {
@@ -1281,6 +1317,1927 @@ wl_evaluation_control_source_bank_run_lexical(
     lane->context = NULL;
     wl_evaluation_control_source_bank_unlock(bank);
     return result;
+}
+
+/* Scalar sibling for the public STEP financial-continuation handoff. The
+ * same generic FINISH/report verification and lexical BANK lifetime remain. */
+int
+wl_evaluation_control_source_bank_run_metadata(
+    wl_evaluation_control_source_bank_t *bank,
+    wl_evaluation_control_source_lane_t index,
+    const wl_evaluation_control_source_phase_policy_t *policy,
+    wl_evaluation_control_source_action_fn action, void *payload,
+    wl_evaluation_control_source_metadata_outcome_t *outcome)
+{
+    if (!bank || bank->identity != bank
+        || (unsigned)index >= WL_EVALUATION_CONTROL_SOURCE_LANES
+        || !policy || !action || !outcome || payload == bank
+        || !policy->bootstrap_work || !policy->current_work
+        || !policy->close_work
+        || policy->bootstrap_work > WL_EVALUATION_CONTROL_QUANTUM
+        || policy->current_work > WL_EVALUATION_CONTROL_QUANTUM
+        || policy->close_work > WL_EVALUATION_CONTROL_QUANTUM)
+        return EINVAL;
+    int rc = wl_evaluation_control_source_bank_lock(bank);
+    if (rc) {
+        return rc;
+    }
+    wl_evaluation_control_source_lane_state_t *lane = &bank->lanes[index];
+    if (lane->retained_state != WL_EVALUATION_CONTROL_SOURCE_QUIESCENT
+        || bank->closing || lane->context || lane->running
+        || lane->callback_active) {
+        wl_evaluation_control_source_bank_unlock(bank);
+        return EBUSY;
+    }
+    wl_evaluation_control_source_context_t context = {
+        .identity = &context, .bank = bank, .lane = (unsigned)index,
+        .thread_cookie = &wl_evaluation_control_source_thread_cookie
+    };
+    lane->context = &context;
+    rc = wl_evaluation_control_source_bank_rearm_phase(bank, (unsigned)index);
+    if (!rc) rc = wl_evaluation_control_begin(lane->control, lane);
+    if (rc) {
+        lane->context = NULL;
+        wl_evaluation_control_source_bank_unlock(bank);
+        return rc;
+    }
+    lane->id = wl_evaluation_control_active_attempt_id(lane->control);
+    if (!lane->id) abort();
+    lane->running = true;
+    rc = wl_evaluation_control_source_bank_charge(lane, policy->bootstrap_work);
+#ifdef WL_SESSION_TEST_HOOKS
+    if (!rc && wl_evaluation_control_test_source_lexical_cancel_before_action) {
+        wl_evaluation_control_test_source_lexical_cancel_before_action = false;
+        wl_evaluation_control_request_cancel(lane->control);
+    }
+#endif
+    if (!rc) rc = wl_evaluation_control_source_bank_charge(lane,
+                policy->current_work);
+    if (!rc) {
+        lane->callback_active = true;
+        wl_evaluation_control_locked_metadata_action = true;
+        outcome->action_result = action(payload);
+        wl_evaluation_control_locked_metadata_action = false;
+        outcome->action_called = true;
+#ifdef WL_SESSION_TEST_HOOKS
+        if (wl_evaluation_control_test_source_lexical_cancel_after_action) {
+            wl_evaluation_control_test_source_lexical_cancel_after_action =
+                false;
+            wl_evaluation_control_request_cancel(lane->control);
+        }
+#endif
+        lane->callback_active = false;
+        rc = wl_evaluation_control_source_bank_charge(lane, policy->close_work);
+    }
+    int finished = wl_evaluation_control_source_bank_finish_phase(lane);
+    lane->context = NULL;
+    wl_evaluation_control_source_bank_unlock(bank);
+    return rc ? rc : finished;
+}
+
+#ifdef WL_SESSION_TEST_HOOKS
+unsigned wl_evaluation_control_test_source_metadata_cancel_at;
+unsigned wl_evaluation_control_test_source_observation_cancel_at;
+
+static void
+wl_evaluation_control_source_observation_test_cancel(
+    wl_evaluation_control_source_lane_state_t *lane, unsigned checkpoint)
+{
+    if (wl_evaluation_control_test_source_observation_cancel_at == checkpoint) {
+        wl_evaluation_control_test_source_observation_cancel_at = 0;
+        wl_evaluation_control_request_cancel(lane->control);
+    }
+}
+
+static void
+wl_evaluation_control_source_metadata_test_cancel(
+    wl_evaluation_control_source_lane_state_t *lane, unsigned checkpoint)
+{
+    if (wl_evaluation_control_test_source_metadata_cancel_at == checkpoint) {
+        wl_evaluation_control_test_source_metadata_cancel_at = 0;
+        wl_evaluation_control_request_cancel(lane->control);
+    }
+}
+#endif
+
+/* The actual uint64 field has the width/alignment assertions in mem_ledger.h.
+ * Publishing inactive needs release ordering, not a returned old RMW value.
+ * MSVC's exact-width Interlocked exchange supplies at least that ordering. */
+static void
+wl_evaluation_control_financier_publish_inactive(
+    wl_evaluation_control_t *control)
+{
+    control->active = false;
+#ifdef _MSC_VER
+    (void)_InterlockedExchange64(
+        (volatile __int64 *)&control->active_attempt_id, 0);
+#else
+    atomic_store_explicit(&control->active_attempt_id, 0, memory_order_release);
+#endif
+}
+
+/* BANK is locked and its actual lane was selected by the checked issuer.
+ * This shares the real controller critical section for owned private rearm,
+ * BEGIN, the first locked zero and its refusal FINISH/readback. Ordinary
+ * counted source throughout; it is not an exact-nine Native interior. */
+static int
+wl_evaluation_control_source_metadata_start(
+    wl_evaluation_control_source_bank_t *bank, unsigned index,
+    wl_evaluation_control_source_metadata_entry_t *entry, bool observe_only)
+{
+    wl_evaluation_control_source_lane_state_t *lane = &bank->lanes[index];
+    wl_evaluation_control_t *control = lane->control;
+    if (lane->retained_state != WL_EVALUATION_CONTROL_SOURCE_QUIESCENT
+        || !control || lane->context || lane->running || lane->callback_active
+        || (lane->id && !lane->report_verified)) return EBUSY;
+    if (wl_mutex_lock(&control->mutex)) return EIO;
+#ifdef _MSC_VER
+    uint64_t references = (uint64_t)atomic_fetch_add_explicit(
+        &control->references, UINT64_C(0), memory_order_acquire);
+#else
+    uint64_t references = atomic_load_explicit(&control->references,
+            memory_order_acquire);
+#endif
+    if (control->source_bank_class != bank || control->owner != lane
+        || references != UINT64_C(2) || control->active
+        || wl_evaluation_control_active_attempt_id(control)
+        || control->configured_limit !=
+        WL_EVALUATION_CONTROL_SOURCE_PHASE_CAPACITY) {
+        if (wl_mutex_unlock(&control->mutex)) abort();
+        return EBUSY;
+    }
+    /* This exact Source class alone may reuse its private id space, after
+     * the prior actual report and ref2/quiescence proof. No Original reset. */
+    control->attempt_id = 0;
+    lane->id = 0; lane->charged_total = 0; lane->report_verified = false;
+    control->active = true;
+    ++control->attempt_id;
+    control->attempt_limit = control->configured_limit;
+    control->consumed = 0; control->stop = WL_EVALUATION_CONTROL_NONE;
+    control->accounting_error = 0;
+    (void)atomic_exchange_explicit(&control->active_attempt_id,
+        control->attempt_id, memory_order_release);
+    lane->id = control->attempt_id; lane->running = true;
+    entry->begun = true;
+#ifdef WL_SESSION_TEST_HOOKS
+    wl_evaluation_control_source_metadata_test_cancel(lane, 1);
+#endif
+    /* Same actual locked charge as charge_attempt after the exact generation
+     * was just published under this still-held mutex. Cancellation is sticky. */
+    int rc = wl_evaluation_control_charge_locked(control, 0);
+    entry->checkpoint_result = rc;
+    if (rc || observe_only) {
+        int execution = control->accounting_error;
+        int result = execution ? execution : (int)control->stop;
+        control->completed = (wl_evaluation_control_report_t){
+            .attempt_id = control->attempt_id, .limit = control->attempt_limit,
+            .consumed = control->consumed, .stop_reason = control->stop,
+            .execution_status = execution, .cleanup_status = 0, .result = result
+        };
+        wl_evaluation_control_financier_publish_inactive(control);
+        const wl_evaluation_control_report_t *report = &control->completed;
+        if (report->attempt_id != lane->id
+            || report->limit != WL_EVALUATION_CONTROL_SOURCE_PHASE_CAPACITY
+            || report->consumed != lane->charged_total
+            || report->stop_reason != rc || report->execution_status
+            || report->cleanup_status || report->result != rc
+            || control->active ||
+            wl_evaluation_control_active_attempt_id(control))
+            abort();
+        lane->report_verified = true; lane->running = false;
+        entry->settled = true;
+    }
+    if (wl_mutex_unlock(&control->mutex)) abort();
+    return rc;
+}
+
+/* Only a live issued BANK is accepted here; no arbitrary controller input.
+ * All non-atomic state of these private controllers is serialized by BANK:
+ * no API loans a callable control/owner/id pair, unlocked ordinary callbacks
+ * retain running/context/callback exclusion, and unlocked cancellation touches
+ * only the atomic flag. Creation is unpublished; teardown first marks closing.
+ * Generic controller/BANK methods retain their existing mutexes/readbacks. */
+int
+wl_evaluation_control_source_metadata_enter_issued(
+    wl_evaluation_control_source_bank_t *bank,
+    wl_evaluation_control_source_context_t *context)
+{
+    if (wl_evaluation_control_locked_metadata_action) return -EBUSY;
+    if (wl_mutex_lock(&bank->mutex)) return -EIO;
+    wl_evaluation_control_source_lane_state_t *lane =
+        &bank->lanes[WL_EVALUATION_CONTROL_SOURCE_OPERATION];
+    if (lane->retained_state != WL_EVALUATION_CONTROL_SOURCE_QUIESCENT
+        || bank->closing || !lane->control || lane->context || lane->running
+        || lane->callback_active || (lane->id && !lane->report_verified)) {
+        wl_evaluation_control_source_bank_unlock(bank); return -EBUSY;
+    }
+    wl_evaluation_control_t *control = lane->control;
+#ifdef _MSC_VER
+    uint64_t references = (uint64_t)_InterlockedCompareExchange64(
+        (volatile __int64 *)&control->references, 0, 0);
+#else
+    uint64_t references = atomic_load_explicit(&control->references,
+            memory_order_acquire);
+#endif
+    if (control->source_bank_class != bank || control->owner != lane
+        || references != UINT64_C(2) || control->active
+        || wl_evaluation_control_active_attempt_id(control)
+        || control->configured_limit !=
+        WL_EVALUATION_CONTROL_SOURCE_PHASE_CAPACITY) {
+        wl_evaluation_control_source_bank_unlock(bank); return -EBUSY;
+    }
+    /* Actual proved Source-only private rearm/BEGIN, not an Original reset. */
+    control->attempt_id = 1; lane->id = 1;
+    lane->charged_total = 0; lane->report_verified = false;
+    control->active = true; control->attempt_limit =
+        WL_EVALUATION_CONTROL_SOURCE_PHASE_CAPACITY;
+    control->consumed = 0; control->stop = WL_EVALUATION_CONTROL_NONE;
+    control->accounting_error = 0;
+#ifdef _MSC_VER
+    (void)_InterlockedExchange64(
+        (volatile __int64 *)&control->active_attempt_id, 1);
+#else
+    atomic_store_explicit(&control->active_attempt_id, 1, memory_order_release);
+#endif
+    lane->running = true;
+#ifdef WL_SESSION_TEST_HOOKS
+    wl_evaluation_control_source_metadata_test_cancel(lane, 1);
+#endif
+    /* The exclusive fresh stores prove active/id/limit/count/accounting and
+     * zero price. This actual RMW is the remaining charge0 observation. */
+#ifdef _MSC_VER
+    uint64_t cancelled = (uint64_t)_InterlockedExchangeAdd64(
+        (volatile __int64 *)&control->cancelled, 0);
+#else
+    uint64_t cancelled = atomic_fetch_add_explicit(&control->cancelled, 0,
+            memory_order_relaxed);
+#endif
+    if (cancelled) {
+        control->stop = WL_EVALUATION_CONTROL_CANCELLED;
+        /* Every field is the real just-initialized/observed state, under
+         * BANK exclusion with no intervening callback or non-atomic writer. */
+        control->completed = (wl_evaluation_control_report_t){
+            .attempt_id = 1,
+            .limit = WL_EVALUATION_CONTROL_SOURCE_PHASE_CAPACITY,
+            .consumed = 0, .stop_reason = WL_EVALUATION_CONTROL_CANCELLED,
+            .execution_status = 0, .cleanup_status = 0,
+            .result = WL_EVALUATION_CONTROL_CANCELLED
+        };
+        control->active = false;
+#ifdef _MSC_VER
+        (void)_InterlockedExchange64(
+            (volatile __int64 *)&control->active_attempt_id, 0);
+#else
+        atomic_store_explicit(&control->active_attempt_id, 0,
+            memory_order_release);
+#endif
+        lane->report_verified = true; lane->running = false;
+        if (wl_mutex_unlock(&bank->mutex)) abort();
+        return WL_EVALUATION_CONTROL_SOURCE_METADATA_INITIAL_CANCELLED;
+    }
+    context->identity = context; context->bank = bank;
+    context->lane = WL_EVALUATION_CONTROL_SOURCE_OPERATION;
+    context->thread_cookie = &wl_evaluation_control_source_thread_cookie;
+    lane->context = context;
+    wl_evaluation_control_source_bank_unlock(bank);
+    return WL_EVALUATION_CONTROL_SOURCE_METADATA_OPEN;
+}
+
+/* BANK alone serializes this unloaned fixed family. Generic Normal and
+ * Original APIs retain their independent mutex and accounting contracts. */
+static int
+wl_evaluation_control_source_observation_zero_locked(
+    wl_evaluation_control_source_lane_state_t *lane)
+{
+    wl_evaluation_control_t *control = lane->control;
+    if (control->stop != WL_EVALUATION_CONTROL_NONE) return (int)control->stop;
+#ifdef _MSC_VER
+    uint64_t cancelled = (uint64_t)_InterlockedExchangeAdd64(
+        (volatile __int64 *)&control->cancelled, 0);
+#else
+    uint64_t cancelled = atomic_fetch_add_explicit(&control->cancelled, 0,
+            memory_order_relaxed);
+#endif
+    if (cancelled) control->stop = WL_EVALUATION_CONTROL_CANCELLED;
+    return (int)control->stop;
+}
+
+static void
+wl_evaluation_control_source_observation_settle_locked(
+    wl_evaluation_control_source_lane_state_t *lane,
+    wl_evaluation_control_source_context_t *context)
+{
+    wl_evaluation_control_t *control = lane->control;
+    control->completed = (wl_evaluation_control_report_t){
+        .attempt_id = 1, .limit = WL_EVALUATION_CONTROL_SOURCE_PHASE_CAPACITY,
+        .consumed = lane->charged_total, .stop_reason = control->stop,
+        .execution_status = 0, .cleanup_status = 0, .result = (int)control->stop
+    };
+    wl_evaluation_control_financier_publish_inactive(control);
+    lane->report_verified = true; lane->running = false;
+    lane->observation_active = false; lane->context = NULL;
+    if (context) context->identity = NULL;
+}
+
+/* Success holds BANK exclusion. The birth slot is part of the proof, so an
+* alias containing the same BANK pointer cannot settle the stable owner. */
+static int
+wl_evaluation_control_source_retained_lock(
+    wl_evaluation_control_source_bank_t **slot,
+    wl_evaluation_control_source_lane_state_t **out)
+{
+    if (!slot || !*slot || (*slot)->identity != *slot
+        || (*slot)->owner_slot != slot) return EINVAL;
+    wl_evaluation_control_source_bank_t *bank = *slot;
+    int rc = wl_evaluation_control_source_bank_lock(bank);
+    if (rc) return rc;
+    wl_evaluation_control_source_lane_state_t *lane =
+        &bank->lanes[WL_EVALUATION_CONTROL_SOURCE_OPERATION];
+    wl_evaluation_control_t *control = lane->control;
+    if (bank->closing || !control || control->source_bank_class != bank
+        || control->owner != lane
+        || atomic_load_explicit(&control->references, memory_order_acquire) != 2
+        || control->configured_limit !=
+        WL_EVALUATION_CONTROL_SOURCE_PHASE_CAPACITY
+        || lane->context || lane->callback_active || lane->observation_active) {
+        wl_evaluation_control_source_bank_unlock(bank); return EBUSY;
+    }
+    *out = lane;
+    return 0;
+}
+
+static bool
+wl_evaluation_control_source_retained_active(
+    const wl_evaluation_control_source_lane_state_t *lane)
+{
+    const wl_evaluation_control_t *control = lane->control;
+    return lane->running && !lane->report_verified && lane->id == 1
+           && control->active && control->attempt_id == lane->id
+           && wl_evaluation_control_active_attempt_id(lane->control) == lane->id
+           && control->attempt_limit ==
+           WL_EVALUATION_CONTROL_SOURCE_PHASE_CAPACITY
+           && control->consumed == lane->charged_total
+           && control->consumed <= control->attempt_limit
+           && !control->accounting_error;
+}
+
+int
+wl_evaluation_control_source_standby_prepare_owned(
+    wl_evaluation_control_source_bank_t **slot,
+    wl_evaluation_control_source_retained_output_t *out)
+{
+    if (!out) return EINVAL;
+    wl_evaluation_control_source_lane_state_t *lane;
+    int rc = wl_evaluation_control_source_retained_lock(slot, &lane);
+    if (rc) return rc;
+    wl_evaluation_control_source_bank_t *bank = *slot;
+    wl_evaluation_control_t *control = lane->control;
+    if (lane->retained_state != WL_EVALUATION_CONTROL_SOURCE_QUIESCENT
+        || lane->running || control->active
+        || wl_evaluation_control_active_attempt_id(control)
+        || (lane->id && !lane->report_verified)) {
+        wl_evaluation_control_source_bank_unlock(bank); return EBUSY;
+    }
+    control->attempt_id = 1; lane->id = 1;
+    lane->charged_total = 0; lane->report_verified = false;
+    control->active = true;
+    control->attempt_limit = WL_EVALUATION_CONTROL_SOURCE_PHASE_CAPACITY;
+    control->consumed = 0; control->stop = WL_EVALUATION_CONTROL_NONE;
+    control->accounting_error = 0;
+    atomic_store_explicit(&control->active_attempt_id, 1, memory_order_release);
+    lane->running = true;
+    lane->retained_state = WL_EVALUATION_CONTROL_SOURCE_STANDBY;
+#ifdef WL_SESSION_TEST_HOOKS
+    wl_evaluation_control_source_observation_test_cancel(lane, 1);
+#endif
+    rc = wl_evaluation_control_source_observation_zero_locked(lane);
+    if (rc) lane->retained_state =
+            WL_EVALUATION_CONTROL_SOURCE_STOPPED_STANDBY;
+    out->financial_result = rc;
+    out->state = lane->retained_state;
+    out->opened = !rc;
+    out->report_verified = lane->report_verified;
+    wl_evaluation_control_source_bank_unlock(bank);
+    return 0;
+}
+
+int
+wl_evaluation_control_source_metadata_enter_retained_owned(
+    wl_evaluation_control_source_bank_t **slot,
+    wl_evaluation_control_source_context_t *context,
+    wl_evaluation_control_source_retained_output_t *out)
+{
+    if (!out || !context || context->identity || context->bank
+        || context->lane || context->thread_cookie) return EINVAL;
+    wl_evaluation_control_source_lane_state_t *lane;
+    int rc = wl_evaluation_control_source_retained_lock(slot, &lane);
+    if (rc) return rc;
+    wl_evaluation_control_source_bank_t *bank = *slot;
+    wl_evaluation_control_t *control = lane->control;
+    if (lane->retained_state != WL_EVALUATION_CONTROL_SOURCE_QUIESCENT
+        || lane->running || control->active
+        || wl_evaluation_control_active_attempt_id(control)
+        || (lane->id && !lane->report_verified)) {
+        wl_evaluation_control_source_bank_unlock(bank); return EBUSY;
+    }
+    control->attempt_id = 1; lane->id = 1;
+    lane->charged_total = 0; lane->report_verified = false;
+    control->active = true;
+    control->attempt_limit = WL_EVALUATION_CONTROL_SOURCE_PHASE_CAPACITY;
+    control->consumed = 0; control->stop = WL_EVALUATION_CONTROL_NONE;
+    control->accounting_error = 0;
+    atomic_store_explicit(&control->active_attempt_id, 1, memory_order_release);
+    lane->running = true;
+    lane->retained_state = WL_EVALUATION_CONTROL_SOURCE_METADATA;
+#ifdef WL_SESSION_TEST_HOOKS
+    wl_evaluation_control_source_metadata_test_cancel(lane, 1);
+#endif
+    rc = wl_evaluation_control_source_observation_zero_locked(lane);
+    if (rc) lane->retained_state = WL_EVALUATION_CONTROL_SOURCE_STOPPED_STANDBY;
+    else {
+        context->identity = context; context->bank = bank;
+        context->lane = WL_EVALUATION_CONTROL_SOURCE_OPERATION;
+        context->thread_cookie = &wl_evaluation_control_source_thread_cookie;
+        lane->context = context;
+    }
+    out->financial_result = rc;
+    out->state = lane->retained_state;
+    out->opened = !rc;
+    out->report_verified = false;
+    wl_evaluation_control_source_bank_unlock(bank);
+    return 0;
+}
+
+/* Continue only an actual retained metadata activation. The ordinary active
+ * proof admits its real metadata extent, not just observation's fixed ten. */
+static bool
+wl_evaluation_control_source_retained_metadata_valid(
+    const wl_evaluation_control_source_bank_t *bank,
+    const wl_evaluation_control_source_lane_state_t *lane)
+{
+    const wl_evaluation_control_t *control = lane->control;
+    return bank->identity == bank && !bank->closing && bank->owner_slot
+           && *bank->owner_slot == bank
+           && control && control->source_bank_class == bank
+           && control->owner == lane
+           && atomic_load_explicit(&control->references,
+               memory_order_acquire) == 2
+           && control->configured_limit ==
+           WL_EVALUATION_CONTROL_SOURCE_PHASE_CAPACITY
+           && wl_evaluation_control_source_retained_active(lane);
+}
+
+/* Only zero observation projects the closed STANDBY invariant. Every writer
+ * into that variant proves the full tuple; legacy writers require Q before
+ * mutation. Positive attach, FRAME and FINISH/ACK still check the full tuple. */
+int
+wl_evaluation_control_source_standby_observe_owned(
+    wl_evaluation_control_source_bank_t **slot,
+    wl_evaluation_control_source_retained_output_t *out)
+{
+    if (!out || !slot) return EINVAL;
+    wl_evaluation_control_source_bank_t *bank = *slot;
+    if (!bank || bank->identity != bank ||
+        bank->owner_slot != slot) return EINVAL;
+    int rc = wl_evaluation_control_source_bank_lock(bank);
+    if (rc) return rc;
+    wl_evaluation_control_source_lane_state_t *lane =
+        &bank->lanes[WL_EVALUATION_CONTROL_SOURCE_OPERATION];
+    wl_evaluation_control_t *control = lane->control;
+    if (bank->closing || !control || control->source_bank_class != bank
+        || control->owner != lane
+        || atomic_load_explicit(&control->references,
+        memory_order_acquire) != UINT64_C(2)) {
+        wl_evaluation_control_source_bank_unlock(bank); return EBUSY;
+    }
+    wl_evaluation_control_source_financial_state_t state = lane->retained_state;
+    if (state != WL_EVALUATION_CONTROL_SOURCE_STANDBY
+        && state != WL_EVALUATION_CONTROL_SOURCE_STOPPED_STANDBY) {
+        /* Preserve the legacy busy-before-variant refusal, including a real
+        * FRAME context. A mode tag cannot hide an occupied legacy owner. */
+        rc = lane->context || lane->callback_active || lane->observation_active
+            || control->configured_limit !=
+            WL_EVALUATION_CONTROL_SOURCE_PHASE_CAPACITY
+            ? EBUSY : EINVAL;
+        wl_evaluation_control_source_bank_unlock(bank); return rc;
+    }
+    if (lane->id != 1) {
+        wl_evaluation_control_source_bank_unlock(bank); return EINVAL;
+    }
+#ifdef _MSC_VER
+    uint64_t active = (uint64_t)_InterlockedCompareExchange64(
+        (volatile __int64 *)&control->active_attempt_id, 0, 0);
+#else
+    uint64_t active = atomic_load_explicit(&control->active_attempt_id,
+            memory_order_acquire);
+#endif
+    if (active != lane->id) {
+        wl_evaluation_control_source_bank_unlock(bank); return EINVAL;
+    }
+#ifdef WL_SESSION_TEST_HOOKS
+    wl_evaluation_control_source_observation_test_cancel(lane, 4);
+#endif
+    rc = wl_evaluation_control_source_observation_zero_locked(lane);
+    if (rc) {
+        lane->retained_state = WL_EVALUATION_CONTROL_SOURCE_STOPPED_STANDBY;
+        out->financial_result = rc;
+        out->state = WL_EVALUATION_CONTROL_SOURCE_STOPPED_STANDBY;
+        out->opened = false;
+    } else {
+        out->financial_result = 0;
+        out->state = state;
+        out->opened = true;
+    }
+    /* Both real active variants have no FINISH report. Report ACK is proved
+     * only in full handoff; no negative result stands in for that receipt. */
+    out->report_verified = false;
+    wl_evaluation_control_source_bank_unlock(bank);
+    return 0;
+}
+
+/* STANDBY is the closed, uncharged variant: only full checked prepare enters
+ * it. Legacy and fresh metadata writers require Q, ordinary attach leaves it
+ * for FRAME, and this zero-only conversion leaves it for METADATA. No writer
+ * may alter its extent/accounting/report or automatic-context facts in place.
+ * Actual class/ref/owner/saved/current checks remain mandatory here; the full
+ * positive metadata continuation independently authenticates its live tuple. */
+int
+wl_evaluation_control_source_metadata_attach_retained_owned(
+    wl_evaluation_control_source_bank_t **slot,
+    wl_evaluation_control_source_context_t *context,
+    wl_evaluation_control_source_retained_output_t *out)
+{
+    if (!out || !context || context->identity || context->bank
+        || context->lane || context->thread_cookie || !slot) return EINVAL;
+    wl_evaluation_control_source_bank_t *bank = *slot;
+    if (!bank || bank->identity != bank ||
+        bank->owner_slot != slot) return EINVAL;
+    int rc = wl_evaluation_control_source_bank_lock(bank);
+    if (rc) return rc;
+    wl_evaluation_control_source_lane_state_t *lane =
+        &bank->lanes[WL_EVALUATION_CONTROL_SOURCE_OPERATION];
+    wl_evaluation_control_t *control = lane->control;
+    if (bank->closing || !control || control->source_bank_class != bank
+        || control->owner != lane
+        || atomic_load_explicit(&control->references,
+        memory_order_acquire) != 2) {
+        wl_evaluation_control_source_bank_unlock(bank); return EBUSY;
+    }
+    if (lane->retained_state != WL_EVALUATION_CONTROL_SOURCE_STANDBY) {
+        wl_evaluation_control_source_bank_unlock(bank); return EBUSY;
+    }
+    if (lane->id != 1) {
+        wl_evaluation_control_source_bank_unlock(bank); return EINVAL;
+    }
+#ifdef _MSC_VER
+    uint64_t active = (uint64_t)_InterlockedCompareExchange64(
+        (volatile __int64 *)&control->active_attempt_id, 0, 0);
+#else
+    uint64_t active = atomic_load_explicit(&control->active_attempt_id,
+            memory_order_acquire);
+#endif
+    if (active != lane->id) {
+        wl_evaluation_control_source_bank_unlock(bank); return EINVAL;
+    }
+#ifdef WL_SESSION_TEST_HOOKS
+    wl_evaluation_control_source_metadata_test_cancel(lane, 1);
+#endif
+    rc = wl_evaluation_control_source_observation_zero_locked(lane);
+    if (rc) lane->retained_state = WL_EVALUATION_CONTROL_SOURCE_STOPPED_STANDBY;
+    else {
+        context->identity = context; context->bank = bank;
+        context->lane = WL_EVALUATION_CONTROL_SOURCE_OPERATION;
+        context->thread_cookie = &wl_evaluation_control_source_thread_cookie;
+        lane->context = context;
+        lane->retained_state = WL_EVALUATION_CONTROL_SOURCE_METADATA;
+    }
+    out->financial_result = rc;
+    out->state = lane->retained_state;
+    out->opened = !rc;
+    out->report_verified = false;
+    wl_evaluation_control_source_bank_unlock(bank);
+    return 0;
+}
+
+#ifdef WL_SESSION_TEST_HOOKS
+static int
+wl_evaluation_control_test_source_retained_rejection(
+    wl_evaluation_control_source_bank_t **slot, unsigned fault,
+    wl_evaluation_control_source_retained_output_t *out, unsigned target)
+{
+    if (!out || fault < 1 || fault > 6) return EINVAL;
+    wl_evaluation_control_source_lane_state_t *lane;
+    int rc = wl_evaluation_control_source_retained_lock(slot, &lane);
+    if (rc) return rc;
+    wl_evaluation_control_source_bank_t *bank = *slot;
+    bool allowed = target == 2 ?
+        lane->retained_state >= WL_EVALUATION_CONTROL_SOURCE_PF_FROZEN
+        && lane->retained_state <= WL_EVALUATION_CONTROL_SOURCE_PF_VERIFIED :
+        (lane->retained_state == WL_EVALUATION_CONTROL_SOURCE_STANDBY
+        || lane->retained_state == WL_EVALUATION_CONTROL_SOURCE_STOPPED_STANDBY)
+        && wl_evaluation_control_source_retained_active(lane);
+    if (!allowed || target > 2) {
+        wl_evaluation_control_source_bank_unlock(bank); return EBUSY;
+    }
+    wl_evaluation_control_t *control = lane->control;
+    const wl_evaluation_control_source_bank_t *original_class =
+        control->source_bank_class;
+    const void *owner = control->owner;
+    uint64_t id = lane->id, consumed = control->consumed, active = 0;
+    wl_evaluation_control_stop_t stop = control->stop;
+    bool verified = lane->report_verified;
+    wl_evaluation_control_source_financial_state_t state = lane->retained_state;
+    int other_owner = 0;
+    if (fault == 1) control->source_bank_class = NULL;
+    if (fault == 2) control->owner = &other_owner;
+    if (fault == 3 && wl_evaluation_control_retain(control)) abort();
+    if (fault == 4) lane->id = 2;
+    if (fault ==
+        5) active = atomic_exchange_explicit(&control->active_attempt_id,
+                UINT64_C(2), memory_order_release);
+    if (fault == 6) lane->control = NULL;
+    wl_evaluation_control_source_bank_unlock(bank);
+    /* Actual API locks BANK; only this test owns the temporary bad tuple. */
+    if (target == 2)
+        rc = wl_evaluation_control_source_financial_progress_owned(slot, out);
+    else if (target == 1) {
+        wl_evaluation_control_source_context_t context = {0};
+        rc = wl_evaluation_control_source_metadata_attach_retained_owned(slot,
+                &context, out);
+        if (context.identity || context.bank || context.thread_cookie
+            || context.lane) abort();
+    } else rc = wl_evaluation_control_source_standby_observe_owned(slot, out);
+    if (wl_evaluation_control_source_bank_lock(bank)) abort();
+    control->source_bank_class = original_class; control->owner = owner;
+    if (fault == 3) wl_evaluation_control_release(control);
+    lane->id = id; lane->control = control;
+    if (fault == 5) (void)atomic_exchange_explicit(&control->active_attempt_id,
+            active, memory_order_release);
+    if (control->consumed != consumed || control->stop != stop
+        || lane->retained_state != state || lane->context ||
+        lane->report_verified != verified
+        || lane->observation_active || lane->callback_active || !lane->running)
+        abort();
+    wl_evaluation_control_source_bank_unlock(bank);
+    return rc;
+}
+
+int
+wl_evaluation_control_test_source_standby_rejection(
+    wl_evaluation_control_source_bank_t **slot, unsigned fault,
+    wl_evaluation_control_source_retained_output_t *out)
+{
+    return wl_evaluation_control_test_source_retained_rejection(slot, fault,
+               out, 0);
+}
+
+int
+wl_evaluation_control_test_source_metadata_attach_rejection(
+    wl_evaluation_control_source_bank_t **slot, unsigned fault,
+    wl_evaluation_control_source_retained_output_t *out)
+{
+    return wl_evaluation_control_test_source_retained_rejection(slot, fault,
+               out, 1);
+}
+
+int
+wl_evaluation_control_test_source_financial_rejection(
+    wl_evaluation_control_source_bank_t **slot, unsigned fault,
+    wl_evaluation_control_source_retained_output_t *out)
+{
+    return wl_evaluation_control_test_source_retained_rejection(slot, fault,
+               out, 2);
+}
+#endif
+
+int
+wl_evaluation_control_source_standby_attach_owned(
+    wl_evaluation_control_source_bank_t **slot,
+    wl_evaluation_control_source_context_t *context,
+    wl_evaluation_control_source_retained_output_t *out)
+{
+    if (!out) return EINVAL;
+    if (!context || context->identity || context->bank || context->lane
+        || context->thread_cookie) return EINVAL;
+    wl_evaluation_control_source_lane_state_t *lane;
+    int rc = wl_evaluation_control_source_retained_lock(slot, &lane);
+    if (rc) return rc;
+    wl_evaluation_control_source_bank_t *bank = *slot;
+    if (lane->retained_state != WL_EVALUATION_CONTROL_SOURCE_STANDBY
+        || !wl_evaluation_control_source_retained_active(lane)
+        || lane->charged_total) {
+        wl_evaluation_control_source_bank_unlock(bank); return EINVAL;
+    } else {
+#ifdef WL_SESSION_TEST_HOOKS
+        wl_evaluation_control_source_observation_test_cancel(lane, 2);
+#endif
+        rc = wl_evaluation_control_source_observation_zero_locked(lane);
+        if (!rc) {
+            lane->control->consumed =
+                WL_EVALUATION_CONTROL_SOURCE_OBSERVATION_WORK;
+            lane->charged_total = WL_EVALUATION_CONTROL_SOURCE_OBSERVATION_WORK;
+#ifdef WL_SESSION_TEST_HOOKS
+            wl_evaluation_control_source_observation_test_cancel(lane, 3);
+#endif
+            rc = wl_evaluation_control_source_observation_zero_locked(lane);
+        }
+        if (rc) {
+            lane->retained_state = WL_EVALUATION_CONTROL_SOURCE_STOPPED_STANDBY;
+        } else {
+            context->bank = bank;
+            context->lane = WL_EVALUATION_CONTROL_SOURCE_OPERATION;
+            context->thread_cookie =
+                &wl_evaluation_control_source_thread_cookie;
+            context->identity = context;
+            lane->context = context; lane->observation_active = true;
+            lane->retained_state = WL_EVALUATION_CONTROL_SOURCE_FRAME;
+        }
+        out->financial_result = rc;
+        out->state = lane->retained_state;
+        out->opened = !rc;
+        out->report_verified = lane->report_verified;
+    }
+    wl_evaluation_control_source_bank_unlock(bank);
+    return 0;
+}
+
+int
+wl_evaluation_control_source_standby_handoff_owned(
+    wl_evaluation_control_source_bank_t **slot,
+    wl_evaluation_control_source_retained_output_t *out)
+{
+    if (!out) return EINVAL;
+    wl_evaluation_control_source_lane_state_t *lane;
+    int rc = wl_evaluation_control_source_retained_lock(slot, &lane);
+    if (rc) return rc;
+    wl_evaluation_control_source_bank_t *bank = *slot;
+    wl_evaluation_control_t *control = lane->control;
+    int financial;
+    if (lane->retained_state >= WL_EVALUATION_CONTROL_SOURCE_PF_FROZEN
+        && lane->retained_state <= WL_EVALUATION_CONTROL_SOURCE_PF_VERIFIED) {
+        wl_evaluation_control_source_bank_unlock(bank); return EBUSY;
+    }
+    if (lane->retained_state == WL_EVALUATION_CONTROL_SOURCE_FINISH_PENDING) {
+        const wl_evaluation_control_report_t *r = &control->completed;
+        if (!lane->running || !lane->report_verified || control->active
+            || wl_evaluation_control_active_attempt_id(control)
+            || r->attempt_id != lane->id || r->limit != control->attempt_limit
+            || r->consumed != lane->charged_total ||
+            r->stop_reason != control->stop
+            || r->execution_status || r->cleanup_status ||
+            r->result != (int)control->stop) {
+            wl_evaluation_control_source_bank_unlock(bank); return EINVAL;
+        }
+        financial = r->result;
+        lane->running = false;
+        lane->retained_state = WL_EVALUATION_CONTROL_SOURCE_QUIESCENT;
+    } else if ((lane->retained_state == WL_EVALUATION_CONTROL_SOURCE_STANDBY
+        || lane->retained_state == WL_EVALUATION_CONTROL_SOURCE_STOPPED_STANDBY)
+        && wl_evaluation_control_source_retained_active(lane)) {
+        financial = wl_evaluation_control_source_observation_zero_locked(lane);
+        wl_evaluation_control_source_observation_settle_locked(lane, NULL);
+        lane->retained_state = WL_EVALUATION_CONTROL_SOURCE_FINISH_PENDING;
+        /* Keep legacy issuers excluded until this report is really ACKed. */
+        lane->running = true;
+    } else {
+        wl_evaluation_control_source_bank_unlock(bank); return EINVAL;
+    }
+    out->financial_result = financial;
+    out->state = lane->retained_state;
+    out->opened = false;
+    out->report_verified = lane->report_verified;
+    wl_evaluation_control_source_bank_unlock(bank);
+    return 0;
+}
+
+/* Each PF publisher closes its complete phase invariant under BANK. Legacy
+ * writers and readers require Q; retained FRAME/METADATA and old handoff cannot
+ * enter a claimed PF phase. Only atomic cancellation may change after freeze;
+ * it does not mutate the frozen stop or the unloaned controller/report facts. */
+int
+wl_evaluation_control_source_financial_progress_owned(
+    wl_evaluation_control_source_bank_t **slot,
+    wl_evaluation_control_source_retained_output_t *out)
+{
+    if (!out || !slot) return EINVAL;
+    wl_evaluation_control_source_bank_t *bank = *slot;
+    if (!bank || bank->identity != bank ||
+        bank->owner_slot != slot) return EINVAL;
+    int rc = wl_evaluation_control_source_bank_lock(bank);
+    if (rc) return rc;
+    wl_evaluation_control_source_lane_state_t *lane =
+        &bank->lanes[WL_EVALUATION_CONTROL_SOURCE_OPERATION];
+    wl_evaluation_control_t *control = lane->control;
+    if (bank->closing || !control || control->source_bank_class != bank
+        || control->owner != lane
+        || atomic_load_explicit(&control->references,
+        memory_order_acquire) != 2) {
+        wl_evaluation_control_source_bank_unlock(bank); return EBUSY;
+    }
+    wl_evaluation_control_source_financial_state_t state = lane->retained_state;
+    bool active;
+    switch (state) {
+    case WL_EVALUATION_CONTROL_SOURCE_STANDBY:
+    case WL_EVALUATION_CONTROL_SOURCE_STOPPED_STANDBY:
+    case WL_EVALUATION_CONTROL_SOURCE_PF_FROZEN:
+    case WL_EVALUATION_CONTROL_SOURCE_PF_HEADER_BUILT:
+    case WL_EVALUATION_CONTROL_SOURCE_PF_BODY_BUILT:
+        active = true; break;
+    case WL_EVALUATION_CONTROL_SOURCE_FINISH_PENDING:
+    case WL_EVALUATION_CONTROL_SOURCE_PF_PUBLISHED:
+    case WL_EVALUATION_CONTROL_SOURCE_PF_HEADER_CHECKED:
+    case WL_EVALUATION_CONTROL_SOURCE_PF_TOTALS_CHECKED:
+    case WL_EVALUATION_CONTROL_SOURCE_PF_VERIFIED:
+        active = false; break;
+    default:
+        wl_evaluation_control_source_bank_unlock(bank);
+        return state == WL_EVALUATION_CONTROL_SOURCE_QUIESCENT ? EINVAL : EBUSY;
+    }
+    if (lane->id != 1) {
+        wl_evaluation_control_source_bank_unlock(bank); return EINVAL;
+    }
+#ifdef _MSC_VER
+    uint64_t current = (uint64_t)_InterlockedCompareExchange64(
+        (volatile __int64 *)&control->active_attempt_id, 0, 0);
+#else
+    uint64_t current = atomic_load_explicit(&control->active_attempt_id,
+            memory_order_acquire);
+#endif
+    if (current != (active ? lane->id : 0)) {
+        wl_evaluation_control_source_bank_unlock(bank); return EINVAL;
+    }
+    wl_evaluation_control_report_t *pending = &bank->pending_report;
+    wl_evaluation_control_report_t *report = &control->completed;
+    switch (state) {
+    case WL_EVALUATION_CONTROL_SOURCE_STANDBY:
+        (void)wl_evaluation_control_source_observation_zero_locked(lane);
+        lane->retained_state = WL_EVALUATION_CONTROL_SOURCE_PF_FROZEN;
+        break;
+    case WL_EVALUATION_CONTROL_SOURCE_STOPPED_STANDBY:
+        lane->retained_state = WL_EVALUATION_CONTROL_SOURCE_PF_FROZEN;
+        break;
+    case WL_EVALUATION_CONTROL_SOURCE_PF_FROZEN:
+        pending->attempt_id = control->attempt_id;
+        pending->limit = control->attempt_limit;
+        pending->consumed = control->consumed;
+        lane->retained_state = WL_EVALUATION_CONTROL_SOURCE_PF_HEADER_BUILT;
+        break;
+    case WL_EVALUATION_CONTROL_SOURCE_PF_HEADER_BUILT:
+        pending->stop_reason = control->stop;
+        pending->execution_status = 0;
+        pending->cleanup_status = 0;
+        pending->result = (int)control->stop;
+        lane->retained_state = WL_EVALUATION_CONTROL_SOURCE_PF_BODY_BUILT;
+        break;
+    case WL_EVALUATION_CONTROL_SOURCE_PF_BODY_BUILT:
+        report->attempt_id = pending->attempt_id;
+        report->limit = pending->limit;
+        report->consumed = pending->consumed;
+        report->stop_reason = pending->stop_reason;
+        report->execution_status = pending->execution_status;
+        report->cleanup_status = pending->cleanup_status;
+        report->result = pending->result;
+        wl_evaluation_control_financier_publish_inactive(control);
+        lane->retained_state = WL_EVALUATION_CONTROL_SOURCE_PF_PUBLISHED;
+        break;
+    case WL_EVALUATION_CONTROL_SOURCE_PF_PUBLISHED:
+        if (report->attempt_id != lane->id ||
+            report->limit != control->attempt_limit) {
+            wl_evaluation_control_source_bank_unlock(bank); return EINVAL;
+        }
+        lane->retained_state = WL_EVALUATION_CONTROL_SOURCE_PF_HEADER_CHECKED;
+        break;
+    case WL_EVALUATION_CONTROL_SOURCE_PF_HEADER_CHECKED:
+        if (report->consumed != lane->charged_total ||
+            report->stop_reason != control->stop) {
+            wl_evaluation_control_source_bank_unlock(bank); return EINVAL;
+        }
+        lane->retained_state = WL_EVALUATION_CONTROL_SOURCE_PF_TOTALS_CHECKED;
+        break;
+    case WL_EVALUATION_CONTROL_SOURCE_PF_TOTALS_CHECKED:
+        if (report->execution_status || report->cleanup_status
+            || report->result != (int)control->stop) {
+            wl_evaluation_control_source_bank_unlock(bank); return EINVAL;
+        }
+        lane->report_verified = true;
+        lane->retained_state = WL_EVALUATION_CONTROL_SOURCE_PF_VERIFIED;
+        break;
+    case WL_EVALUATION_CONTROL_SOURCE_FINISH_PENDING:
+        lane->retained_state = WL_EVALUATION_CONTROL_SOURCE_PF_VERIFIED;
+        break;
+    case WL_EVALUATION_CONTROL_SOURCE_PF_VERIFIED:
+        lane->running = false;
+        lane->retained_state = WL_EVALUATION_CONTROL_SOURCE_QUIESCENT;
+        break;
+    default: abort(); /* The locked phase selector above proved this row. */
+    }
+    out->financial_result = (int)control->stop;
+    out->state = lane->retained_state;
+    out->opened = false;
+    out->report_verified = lane->report_verified;
+    wl_evaluation_control_source_bank_unlock(bank);
+    return 0;
+}
+
+#ifdef WL_SESSION_TEST_HOOKS
+int
+wl_evaluation_control_test_source_financial_view(
+    wl_evaluation_control_source_bank_t **slot,
+    wl_evaluation_control_source_financial_view_t *out)
+{
+    if (!out || !slot || !*slot || (*slot)->identity != *slot
+        || (*slot)->owner_slot != slot) return EINVAL;
+    wl_evaluation_control_source_bank_t *bank = *slot;
+    int rc = wl_evaluation_control_source_bank_lock(bank);
+    if (rc) return rc;
+    wl_evaluation_control_source_lane_state_t *lane =
+        &bank->lanes[WL_EVALUATION_CONTROL_SOURCE_OPERATION];
+    if (!lane->control || lane->context || lane->callback_active
+        || lane->observation_active || bank->closing) {
+        wl_evaluation_control_source_bank_unlock(bank); return EBUSY;
+    }
+    out->state = lane->retained_state;
+    out->active_id = wl_evaluation_control_active_attempt_id(lane->control);
+    out->charged = lane->charged_total;
+    out->bank_bytes = sizeof(*bank);
+    out->verified = lane->report_verified;
+    out->history = lane->control->completed;
+    wl_evaluation_control_source_bank_unlock(bank);
+    return 0;
+}
+
+int
+wl_evaluation_control_test_source_financial_cancel(
+    wl_evaluation_control_source_bank_t **slot)
+{
+    if (!slot || !*slot || (*slot)->identity != *slot
+        || (*slot)->owner_slot != slot) return EINVAL;
+    wl_evaluation_control_source_bank_t *bank = *slot;
+    int rc = wl_evaluation_control_source_bank_lock(bank);
+    if (rc) return rc;
+    wl_evaluation_control_source_lane_state_t *lane =
+        &bank->lanes[WL_EVALUATION_CONTROL_SOURCE_OPERATION];
+    if (!lane->control || lane->control->source_bank_class != bank
+        || bank->closing) {
+        wl_evaluation_control_source_bank_unlock(bank); return EBUSY;
+    }
+    wl_evaluation_control_request_cancel(lane->control);
+    wl_evaluation_control_source_bank_unlock(bank);
+    return 0;
+}
+
+/* Only corrupt the field this exact readback packet has not yet checked.
+ * Earlier closed predicates and all runtime identity facts stay intact. */
+int
+wl_evaluation_control_test_source_financial_readback_rejection(
+    wl_evaluation_control_source_bank_t **slot, unsigned fault,
+    wl_evaluation_control_source_retained_output_t *out)
+{
+    if (!out || fault < 1 || fault > 7) return EINVAL;
+    wl_evaluation_control_source_lane_state_t *lane;
+    int rc = wl_evaluation_control_source_retained_lock(slot, &lane);
+    if (rc) return rc;
+    wl_evaluation_control_source_bank_t *bank = *slot;
+    wl_evaluation_control_source_financial_state_t state = lane->retained_state;
+    if (state != (fault <= 2 ? WL_EVALUATION_CONTROL_SOURCE_PF_PUBLISHED :
+        fault <= 4 ? WL_EVALUATION_CONTROL_SOURCE_PF_HEADER_CHECKED :
+        WL_EVALUATION_CONTROL_SOURCE_PF_TOTALS_CHECKED)) {
+        wl_evaluation_control_source_bank_unlock(bank); return EINVAL;
+    }
+    wl_evaluation_control_report_t *r = &lane->control->completed;
+    uint64_t saved_count = 0;
+    int saved_status = 0;
+    wl_evaluation_control_stop_t saved_stop = r->stop_reason;
+    switch (fault) {
+    case 1: saved_count = r->attempt_id; r->attempt_id = saved_count + 1; break;
+    case 2: saved_count = r->limit; r->limit = saved_count + 1; break;
+    case 3: saved_count = r->consumed; r->consumed = saved_count + 1; break;
+    case 4: r->stop_reason = saved_stop == WL_EVALUATION_CONTROL_NONE ?
+            WL_EVALUATION_CONTROL_CANCELLED : WL_EVALUATION_CONTROL_NONE; break;
+    case 5: saved_status = r->execution_status; r->execution_status = EINVAL;
+        break;
+    case 6: saved_status = r->cleanup_status; r->cleanup_status = EINVAL; break;
+    case 7: saved_status = r->result; r->result = EINVAL; break;
+    default: abort();
+    }
+    wl_evaluation_control_source_bank_unlock(bank);
+    rc = wl_evaluation_control_source_financial_progress_owned(slot, out);
+    if (wl_evaluation_control_source_bank_lock(bank)) abort();
+    if (rc != EINVAL || lane->retained_state != state || lane->report_verified
+        || wl_evaluation_control_active_attempt_id(lane->control)) abort();
+    switch (fault) {
+    case 1: r->attempt_id = saved_count; break;
+    case 2: r->limit = saved_count; break;
+    case 3: r->consumed = saved_count; break;
+    case 4: r->stop_reason = saved_stop; break;
+    case 5: r->execution_status = saved_status; break;
+    case 6: r->cleanup_status = saved_status; break;
+    case 7: r->result = saved_status; break;
+    default: abort();
+    }
+    wl_evaluation_control_source_bank_unlock(bank);
+    return rc;
+}
+#endif
+
+int
+wl_evaluation_control_source_observation_open(
+    wl_evaluation_control_source_bank_t *bank,
+    wl_evaluation_control_source_context_t *context)
+{
+    if (wl_evaluation_control_locked_metadata_action) return -EBUSY;
+    if (wl_mutex_lock(&bank->mutex)) return -EIO;
+    wl_evaluation_control_source_lane_state_t *lane =
+        &bank->lanes[WL_EVALUATION_CONTROL_SOURCE_OPERATION];
+    if (lane->retained_state != WL_EVALUATION_CONTROL_SOURCE_QUIESCENT
+        || bank->closing || !lane->control || lane->context || lane->running
+        || lane->callback_active || (lane->id && !lane->report_verified)) {
+        wl_evaluation_control_source_bank_unlock(bank); return -EBUSY;
+    }
+    wl_evaluation_control_t *control = lane->control;
+#ifdef _MSC_VER
+    uint64_t references = (uint64_t)_InterlockedCompareExchange64(
+        (volatile __int64 *)&control->references, 0, 0);
+#else
+    uint64_t references = atomic_load_explicit(&control->references,
+            memory_order_acquire);
+#endif
+    if (control->source_bank_class != bank || control->owner != lane
+        || references != UINT64_C(2) || control->active
+        || wl_evaluation_control_active_attempt_id(control)
+        || control->configured_limit !=
+        WL_EVALUATION_CONTROL_SOURCE_PHASE_CAPACITY) {
+        wl_evaluation_control_source_bank_unlock(bank); return -EBUSY;
+    }
+    /* Actual proved Source-only private rearm/BEGIN, not an Original reset. */
+    control->attempt_id = 1; lane->id = 1;
+    lane->charged_total = 0; lane->report_verified = false;
+    control->active = true; control->attempt_limit =
+        WL_EVALUATION_CONTROL_SOURCE_PHASE_CAPACITY;
+    control->consumed = 0; control->stop = WL_EVALUATION_CONTROL_NONE;
+    control->accounting_error = 0;
+#ifdef _MSC_VER
+    (void)_InterlockedExchange64(
+        (volatile __int64 *)&control->active_attempt_id, 1);
+#else
+    atomic_store_explicit(&control->active_attempt_id, 1, memory_order_release);
+#endif
+    lane->running = true;
+#ifdef WL_SESSION_TEST_HOOKS
+    wl_evaluation_control_source_observation_test_cancel(lane, 1);
+#endif
+    int rc = wl_evaluation_control_source_observation_zero_locked(lane);
+    if (!rc) {
+#ifdef WL_SESSION_TEST_HOOKS
+        wl_evaluation_control_source_observation_test_cancel(lane, 2);
+#endif
+        /* This real zero is the fixed positive10's cancellation observation.
+         * Exclusive fresh0/limit768 prove its arithmetic cannot deny. */
+        rc = wl_evaluation_control_source_observation_zero_locked(lane);
+    }
+    if (!rc) {
+        control->consumed = WL_EVALUATION_CONTROL_SOURCE_OBSERVATION_WORK;
+        lane->charged_total = WL_EVALUATION_CONTROL_SOURCE_OBSERVATION_WORK;
+#ifdef WL_SESSION_TEST_HOOKS
+        wl_evaluation_control_source_observation_test_cancel(lane, 3);
+#endif
+        rc = wl_evaluation_control_source_observation_zero_locked(lane);
+    }
+    if (rc) {
+        wl_evaluation_control_source_observation_settle_locked(lane, NULL);
+        if (wl_mutex_unlock(&bank->mutex)) abort();
+        return WL_EVALUATION_CONTROL_SOURCE_METADATA_INITIAL_CANCELLED;
+    }
+    context->bank = bank;
+    context->lane = WL_EVALUATION_CONTROL_SOURCE_OPERATION;
+    context->thread_cookie = &wl_evaluation_control_source_thread_cookie;
+    context->identity = context;
+    lane->context = context; lane->observation_active = true;
+    wl_evaluation_control_source_bank_unlock(bank);
+    return WL_EVALUATION_CONTROL_SOURCE_METADATA_OPEN;
+}
+
+static int
+wl_evaluation_control_source_observation_continue(
+    wl_evaluation_control_source_context_t *context, bool finish)
+{
+    if (!context || context->identity != context || !context->bank
+        || context->lane !=
+        WL_EVALUATION_CONTROL_SOURCE_OPERATION) return EINVAL;
+    if (context->thread_cookie != &wl_evaluation_control_source_thread_cookie)
+        return EBUSY;
+    wl_evaluation_control_source_bank_t *bank = context->bank;
+    if (bank->identity != bank) return EINVAL;
+    int rc = wl_evaluation_control_source_bank_lock(bank);
+    if (rc) return rc;
+    wl_evaluation_control_source_lane_state_t *lane =
+        &bank->lanes[WL_EVALUATION_CONTROL_SOURCE_OPERATION];
+    wl_evaluation_control_t *control = lane->control;
+    if (bank->closing || !lane->observation_active || lane->context != context
+        || !lane->running || lane->callback_active || lane->id != 1
+        || !control || control->source_bank_class != bank ||
+        control->owner != lane
+        || !control->active || control->attempt_id != lane->id
+        || wl_evaluation_control_active_attempt_id(control) != lane->id
+        || control->consumed != WL_EVALUATION_CONTROL_SOURCE_OBSERVATION_WORK
+        || lane->charged_total != control->consumed
+        || control->attempt_limit != WL_EVALUATION_CONTROL_SOURCE_PHASE_CAPACITY
+        || control->configured_limit !=
+        WL_EVALUATION_CONTROL_SOURCE_PHASE_CAPACITY
+        || control->accounting_error) {
+        wl_evaluation_control_source_bank_unlock(bank); return EINVAL;
+    }
+#ifdef WL_SESSION_TEST_HOOKS
+    wl_evaluation_control_source_observation_test_cancel(lane, finish ? 5 : 4);
+#endif
+    rc = wl_evaluation_control_source_observation_zero_locked(lane);
+    if (lane->retained_state == WL_EVALUATION_CONTROL_SOURCE_FRAME) {
+        if (rc) {
+            /* Preserve the genuine active generation and exact admitted
+             * extent, while unlinking this still-live automatic frame. */
+            lane->context = NULL; lane->observation_active = false;
+            context->identity = NULL;
+            lane->retained_state = WL_EVALUATION_CONTROL_SOURCE_STOPPED_STANDBY;
+        } else if (finish) {
+            wl_evaluation_control_source_observation_settle_locked(lane,
+                context);
+            lane->retained_state = WL_EVALUATION_CONTROL_SOURCE_FINISH_PENDING;
+            lane->running = true;
+        }
+    } else if (rc || finish) {
+        wl_evaluation_control_source_observation_settle_locked(lane, context);
+    }
+    wl_evaluation_control_source_bank_unlock(bank);
+    return rc;
+}
+
+int
+wl_evaluation_control_source_observation_poll(
+    wl_evaluation_control_source_context_t *context)
+{
+    return wl_evaluation_control_source_observation_continue(context, false);
+}
+
+int
+wl_evaluation_control_source_observation_end(
+    wl_evaluation_control_source_context_t *context)
+{
+    return wl_evaluation_control_source_observation_continue(context, true);
+}
+
+/* Fixed CLOSE sibling: an actual destroy owner never relabels OP. */
+int
+wl_evaluation_control_source_metadata_enter_close_owned(
+    wl_evaluation_control_source_bank_t *bank,
+    wl_evaluation_control_source_context_t *context)
+{
+    if (wl_evaluation_control_locked_metadata_action) return -EBUSY;
+    if (wl_mutex_lock(&bank->mutex)) return -EIO;
+    wl_evaluation_control_source_lane_state_t *lane =
+        &bank->lanes[WL_EVALUATION_CONTROL_SOURCE_CLOSE];
+    if (lane->retained_state != WL_EVALUATION_CONTROL_SOURCE_QUIESCENT
+        || bank->closing || !lane->control || lane->context || lane->running
+        || lane->callback_active || (lane->id && !lane->report_verified)) {
+        wl_evaluation_control_source_bank_unlock(bank); return -EBUSY;
+    }
+    wl_evaluation_control_t *control = lane->control;
+#ifdef _MSC_VER
+    uint64_t references = (uint64_t)_InterlockedCompareExchange64(
+        (volatile __int64 *)&control->references, 0, 0);
+#else
+    uint64_t references = atomic_load_explicit(&control->references,
+            memory_order_acquire);
+#endif
+    if (control->source_bank_class != bank || control->owner != lane
+        || references != UINT64_C(2) || control->active
+        || wl_evaluation_control_active_attempt_id(control)
+        || control->configured_limit !=
+        WL_EVALUATION_CONTROL_SOURCE_PHASE_CAPACITY) {
+        wl_evaluation_control_source_bank_unlock(bank); return -EBUSY;
+    }
+    /* Actual proved Source-only private rearm/BEGIN, not an Original reset. */
+    control->attempt_id = 1; lane->id = 1;
+    lane->charged_total = 0; lane->report_verified = false;
+    control->active = true; control->attempt_limit =
+        WL_EVALUATION_CONTROL_SOURCE_PHASE_CAPACITY;
+    control->consumed = 0; control->stop = WL_EVALUATION_CONTROL_NONE;
+    control->accounting_error = 0;
+#ifdef _MSC_VER
+    (void)_InterlockedExchange64(
+        (volatile __int64 *)&control->active_attempt_id, 1);
+#else
+    atomic_store_explicit(&control->active_attempt_id, 1, memory_order_release);
+#endif
+    lane->running = true;
+#ifdef WL_SESSION_TEST_HOOKS
+    wl_evaluation_control_source_metadata_test_cancel(lane, 1);
+#endif
+    /* The exclusive fresh stores prove active/id/limit/count/accounting and
+     * zero price. This actual RMW is the remaining charge0 observation. */
+#ifdef _MSC_VER
+    uint64_t cancelled = (uint64_t)_InterlockedExchangeAdd64(
+        (volatile __int64 *)&control->cancelled, 0);
+#else
+    uint64_t cancelled = atomic_fetch_add_explicit(&control->cancelled, 0,
+            memory_order_relaxed);
+#endif
+    if (cancelled) {
+        control->stop = WL_EVALUATION_CONTROL_CANCELLED;
+        /* Every field is the real just-initialized/observed state, under
+         * BANK exclusion with no intervening callback or non-atomic writer. */
+        control->completed = (wl_evaluation_control_report_t){
+            .attempt_id = 1,
+            .limit = WL_EVALUATION_CONTROL_SOURCE_PHASE_CAPACITY,
+            .consumed = 0, .stop_reason = WL_EVALUATION_CONTROL_CANCELLED,
+            .execution_status = 0, .cleanup_status = 0,
+            .result = WL_EVALUATION_CONTROL_CANCELLED
+        };
+        control->active = false;
+#ifdef _MSC_VER
+        (void)_InterlockedExchange64(
+            (volatile __int64 *)&control->active_attempt_id, 0);
+#else
+        atomic_store_explicit(&control->active_attempt_id, 0,
+            memory_order_release);
+#endif
+        lane->report_verified = true; lane->running = false;
+        if (wl_mutex_unlock(&bank->mutex)) abort();
+        return WL_EVALUATION_CONTROL_SOURCE_METADATA_INITIAL_CANCELLED;
+    }
+    context->identity = context; context->bank = bank;
+    context->lane = WL_EVALUATION_CONTROL_SOURCE_CLOSE;
+    context->thread_cookie = &wl_evaluation_control_source_thread_cookie;
+    lane->context = context;
+    wl_evaluation_control_source_bank_unlock(bank);
+    return WL_EVALUATION_CONTROL_SOURCE_METADATA_OPEN;
+}
+
+/* Fixed observation class: no recipe, callback, state read or Native body.
+ * The local context never leaves this owning frame or supplies authority. */
+int
+wl_evaluation_control_source_operation_observe_owned(
+    wl_evaluation_control_source_bank_t *bank)
+{
+    wl_evaluation_control_source_context_t context;
+    int entered = wl_evaluation_control_source_metadata_enter_issued(bank,
+            &context);
+    if (entered) return entered <
+               0 ? -entered : WL_EVALUATION_CONTROL_CANCELLED;
+    /* OPEN must settle before this automatic context dies. Lock failure is
+     * an infrastructure invariant failure, never a dangling public return. */
+    if (wl_evaluation_control_source_bank_lock(bank)) abort();
+    wl_evaluation_control_source_lane_state_t *lane =
+        &bank->lanes[WL_EVALUATION_CONTROL_SOURCE_OPERATION];
+    if (lane->context != &context || !lane->running || lane->callback_active
+        || context.identity != &context) abort();
+#ifdef WL_SESSION_TEST_HOOKS
+    wl_evaluation_control_source_metadata_test_cancel(lane, 2);
+#endif
+    int rc = wl_evaluation_control_source_bank_charge(lane,
+            WL_EVALUATION_CONTROL_SOURCE_OBSERVATION_WORK);
+#ifdef WL_SESSION_TEST_HOOKS
+    if (!rc) wl_evaluation_control_source_metadata_test_cancel(lane, 3);
+#endif
+    int finished = wl_evaluation_control_source_bank_finish_phase(lane);
+    lane->context = NULL;
+    context.identity = NULL;
+    wl_evaluation_control_source_bank_unlock(bank);
+    return rc ? rc : finished;
+}
+
+#ifdef WL_SESSION_TEST_HOOKS
+static void
+wl_evaluation_control_source_metadata_probe_state(
+    wl_evaluation_control_source_lane_state_t *lane,
+    wl_evaluation_control_source_metadata_probe_state_t *out)
+{
+    wl_evaluation_control_t *control = lane->control;
+    if (wl_mutex_lock(&control->mutex)) abort();
+    out->counter = control->attempt_id;
+    out->active_id = wl_evaluation_control_active_attempt_id(control);
+    out->consumed = control->consumed;
+    out->report = control->completed;
+    if (wl_mutex_unlock(&control->mutex)) abort();
+    out->lane_id = lane->id; out->charged = lane->charged_total;
+    out->verified = lane->report_verified;
+}
+
+int
+wl_evaluation_control_test_source_metadata_start_rejection(
+    wl_evaluation_control_source_bank_t *bank,
+    wl_evaluation_control_source_lane_t index, unsigned fault,
+    wl_evaluation_control_t *foreign, unsigned issuer,
+    wl_evaluation_control_source_metadata_probe_t *out)
+{
+    if (!bank || bank->identity != bank || !out || fault < 1 || fault > 6
+        || (unsigned)index >= WL_EVALUATION_CONTROL_SOURCE_LANES
+        || (fault == 5 && !foreign) || issuer > 2) return EINVAL;
+    int rc = wl_evaluation_control_source_bank_lock(bank);
+    if (rc) return rc;
+    wl_evaluation_control_source_lane_state_t *lane = &bank->lanes[index];
+    wl_evaluation_control_t *owned = lane->control;
+    if (lane->retained_state != WL_EVALUATION_CONTROL_SOURCE_QUIESCENT) {
+        wl_evaluation_control_source_bank_unlock(bank); return EBUSY;
+    }
+    if (lane->context || lane->running || lane->callback_active
+        || !lane->id || !lane->report_verified) abort();
+    /* Actual private counter changed by the existing test API. A refused
+     * proof must not silently reset it while preserving an old id1 report. */
+    if (wl_evaluation_control_test_seed_attempt_id(owned, lane, 7)) abort();
+    int other_owner = 0;
+    bool verified = lane->report_verified;
+    if (fault == 1 && wl_evaluation_control_retain(owned)) abort();
+    if (fault == 2 && wl_evaluation_control_transfer(owned, lane, &other_owner))
+        abort();
+    if (fault == 3 && wl_evaluation_control_begin(owned, lane)) abort();
+    if (fault == 4) lane->report_verified = false;
+    if (fault == 5) lane->control = foreign; /* Invalid borrowed Normal class. */
+    if (fault == 6 && wl_evaluation_control_configure(owned,
+        WL_EVALUATION_CONTROL_SOURCE_PHASE_CAPACITY - 1)) abort();
+    wl_evaluation_control_source_metadata_probe_state(lane, &out->before);
+    if (issuer) {
+        /* Setup and snapshots still mutate/read under BANK. The actual
+         * externally serialized invalid fixture is then presented through
+         * the real issued entry, which acquires the same BANK exclusion. */
+        if (index != WL_EVALUATION_CONTROL_SOURCE_OPERATION) abort();
+        wl_evaluation_control_source_bank_unlock(bank);
+        wl_evaluation_control_source_context_t context = {0};
+        if (issuer == 1)
+            rc = wl_evaluation_control_source_metadata_enter_issued(bank,
+                    &context);
+        else {
+            wl_evaluation_control_source_retained_output_t retained;
+            unsigned char unchanged[sizeof(retained)];
+            memset(&retained, 0x5a, sizeof(retained));
+            memcpy(unchanged, &retained, sizeof(retained));
+            rc = -wl_evaluation_control_source_metadata_enter_retained_owned(
+                bank->owner_slot, &context, &retained);
+            if (context.identity || memcmp(unchanged, &retained,
+                sizeof(retained))) abort();
+        }
+        if (rc >= 0) abort(); /* Every fixture must refuse before BEGIN. */
+        if (wl_evaluation_control_source_bank_lock(bank)) abort();
+    } else rc = wl_evaluation_control_source_metadata_start(bank,
+                (unsigned)index,
+                &out->entry, false);
+    wl_evaluation_control_source_metadata_probe_state(lane, &out->after);
+    /* Restore actual invalid fixture transitions honestly, after observing
+     * the refusal. No such transition is a positive SOURCE/Native issuer. */
+    if (fault == 1) wl_evaluation_control_release(owned);
+    if (fault == 2 && wl_evaluation_control_transfer(owned, &other_owner, lane))
+        abort();
+    if (fault == 3) {
+        if (wl_evaluation_control_finish(owned, lane, 0, 0)) abort();
+        wl_evaluation_control_report_t report;
+        if (wl_evaluation_control_report(owned, &report)
+            || wl_evaluation_control_active_attempt_id(owned)
+            || report.limit != WL_EVALUATION_CONTROL_SOURCE_PHASE_CAPACITY
+            || report.consumed || report.stop_reason || report.execution_status
+            || report.cleanup_status || report.result) abort();
+        lane->id = report.attempt_id; lane->charged_total = report.consumed;
+        lane->report_verified = true;
+    }
+    if (fault == 4) lane->report_verified = verified;
+    if (fault == 5) lane->control = owned;
+    if (fault == 6 && wl_evaluation_control_configure(owned,
+        WL_EVALUATION_CONTROL_SOURCE_PHASE_CAPACITY)) abort();
+    wl_evaluation_control_source_bank_unlock(bank);
+    return rc;
+}
+#endif
+
+/* Unlike the compatibility full-request issuer, this entry observes the real
+ * saved BANK generation before preparing the live semantic tuple. Preparation
+ * is sealed fixed metadata, never Native/user work. Every zero is an actual
+ * charge_attempt on this generation; a refused zero supplies no cut. */
+int
+wl_evaluation_control_source_bank_run_metadata_recipe(
+    wl_evaluation_control_source_bank_t *bank,
+    wl_evaluation_control_source_lane_t index,
+    const wl_evaluation_control_source_phase_policy_t *policy,
+    wl_evaluation_control_source_metadata_prepare_fn prepare,
+    const void *recipe,
+    wl_evaluation_control_source_metadata_preparation_t *prepared)
+{
+    if (!bank || bank->identity != bank
+        || (unsigned)index >= WL_EVALUATION_CONTROL_SOURCE_LANES
+        || !policy || !prepare || !recipe || recipe == bank || !prepared
+        || !policy->bootstrap_work || !policy->current_work
+        || !policy->close_work
+        || policy->bootstrap_work > WL_EVALUATION_CONTROL_QUANTUM
+        || policy->current_work > WL_EVALUATION_CONTROL_QUANTUM
+        || policy->close_work > WL_EVALUATION_CONTROL_QUANTUM)
+        return EINVAL;
+    int rc = wl_evaluation_control_source_bank_lock(bank);
+    if (rc) return rc;
+    wl_evaluation_control_source_lane_state_t *lane = &bank->lanes[index];
+    if (lane->retained_state != WL_EVALUATION_CONTROL_SOURCE_QUIESCENT
+        || bank->closing || lane->context || lane->running
+        || lane->callback_active) {
+        wl_evaluation_control_source_bank_unlock(bank);
+        return EBUSY;
+    }
+    rc = wl_evaluation_control_source_metadata_start(bank, (unsigned)index,
+            &prepared->entry, false);
+    if (rc) {
+        /* Every begun refusal was really settled. No context was published,
+         * no BOOT was paid, and no preparation/action ran. */
+        wl_evaluation_control_source_bank_unlock(bank);
+        return rc;
+    }
+    wl_evaluation_control_source_context_t context = {
+        .identity = &context, .bank = bank, .lane = (unsigned)index,
+        .thread_cookie = &wl_evaluation_control_source_thread_cookie
+    };
+    lane->context = &context;
+    if (!rc) rc = wl_evaluation_control_source_bank_charge(lane,
+                policy->bootstrap_work);
+    for (unsigned group = 0; !rc && group < 3; ++group) {
+        lane->callback_active = true;
+        wl_evaluation_control_locked_metadata_action = true;
+        prepared->preparation_protocol = prepare(recipe, group, prepared);
+        wl_evaluation_control_locked_metadata_action = false;
+        lane->callback_active = false;
+        if (prepared->preparation_protocol) {
+            rc = prepared->preparation_protocol;
+            break;
+        }
+        prepared->groups_completed = group + 1;
+#ifdef WL_SESSION_TEST_HOOKS
+        wl_evaluation_control_source_metadata_test_cancel(lane, group + 2);
+#endif
+        rc = wl_evaluation_control_source_bank_charge(lane, 0);
+    }
+#ifdef WL_SESSION_TEST_HOOKS
+    if (!rc && wl_evaluation_control_test_source_lexical_cancel_before_action) {
+        wl_evaluation_control_test_source_lexical_cancel_before_action = false;
+        wl_evaluation_control_request_cancel(lane->control);
+    }
+#endif
+    if (!rc && (!prepared->action || !prepared->result_published)) rc = EINVAL;
+    if (!rc) rc = wl_evaluation_control_source_bank_charge(lane,
+                policy->current_work);
+    if (!rc) {
+        lane->callback_active = true;
+        wl_evaluation_control_locked_metadata_action = true;
+        prepared->outcome.action_result = prepared->action(prepared->payload);
+        wl_evaluation_control_locked_metadata_action = false;
+        prepared->outcome.action_called = true;
+#ifdef WL_SESSION_TEST_HOOKS
+        if (wl_evaluation_control_test_source_lexical_cancel_after_action) {
+            wl_evaluation_control_test_source_lexical_cancel_after_action =
+                false;
+            wl_evaluation_control_request_cancel(lane->control);
+        }
+#endif
+        lane->callback_active = false;
+        rc = wl_evaluation_control_source_bank_charge(lane, policy->close_work);
+    }
+    int finished = wl_evaluation_control_source_bank_finish_phase(lane);
+    prepared->entry.settled = true;
+    lane->context = NULL;
+    wl_evaluation_control_source_bank_unlock(bank);
+    return rc ? rc : finished;
+}
+
+/* The only active context returned to a caller belongs to issued entry.
+ * Authentication precedes parameter rejection: an actual owned phase must
+ * settle even when the continuation recipe/policy is refused. */
+static int
+wl_evaluation_control_source_metadata_continue_mode(
+    wl_evaluation_control_source_context_t *context,
+    const wl_evaluation_control_source_phase_policy_t *policy,
+    wl_evaluation_control_source_metadata_prepare_fn prepare,
+    const void *recipe,
+    wl_evaluation_control_source_metadata_preparation_t *prepared,
+    bool retained, wl_evaluation_control_source_retained_output_t *out)
+{
+    if (!context || context->identity != context || !context->bank
+        || context->lane != WL_EVALUATION_CONTROL_SOURCE_OPERATION)
+        return EINVAL;
+    if (context->thread_cookie != &wl_evaluation_control_source_thread_cookie)
+        return retained ? EBUSY : EINVAL;
+    wl_evaluation_control_source_bank_t *bank = context->bank;
+    int rc = wl_evaluation_control_source_bank_lock(bank);
+    if (rc) return rc;
+    wl_evaluation_control_source_lane_state_t *lane =
+        &bank->lanes[WL_EVALUATION_CONTROL_SOURCE_OPERATION];
+    if (lane->retained_state !=
+        (retained ? WL_EVALUATION_CONTROL_SOURCE_METADATA
+            : WL_EVALUATION_CONTROL_SOURCE_QUIESCENT)
+        || lane->context != context || !lane->running || lane->callback_active
+        || lane->observation_active || (retained &&
+        !wl_evaluation_control_source_retained_metadata_valid(bank, lane))) {
+        wl_evaluation_control_source_bank_unlock(bank); return EBUSY;
+    }
+    int protocol = 0;
+    if (prepared) {
+        prepared->entry.begun = true;
+        prepared->entry.checkpoint_result = 0; /* Actual prior OPEN. */
+        if (retained) {
+            prepared->entry.settled = false;
+            prepared->groups_completed = 0; prepared->preparation_protocol = 0;
+            prepared->action = NULL; prepared->payload = NULL;
+            prepared->outcome.action_result = 0;
+            prepared->outcome.action_called = false;
+            prepared->result_published = false;
+        }
+    }
+    if (!policy || !prepare || !recipe || recipe == bank || !prepared
+        || !policy->bootstrap_work || !policy->current_work ||
+        !policy->close_work
+        || policy->bootstrap_work > WL_EVALUATION_CONTROL_QUANTUM
+        || policy->current_work > WL_EVALUATION_CONTROL_QUANTUM
+        || policy->close_work > WL_EVALUATION_CONTROL_QUANTUM
+        || (retained && !out)) {
+        protocol = EINVAL; rc = EINVAL; goto settle;
+    }
+    if (!rc) rc = wl_evaluation_control_source_bank_charge(lane,
+                policy->bootstrap_work);
+    for (unsigned group = 0; !rc && group < 3; ++group) {
+        lane->callback_active = true;
+        wl_evaluation_control_locked_metadata_action = true;
+        prepared->preparation_protocol = prepare(recipe, group, prepared);
+        wl_evaluation_control_locked_metadata_action = false;
+        lane->callback_active = false;
+        if (prepared->preparation_protocol) {
+            protocol = prepared->preparation_protocol > 0 ?
+                prepared->preparation_protocol : EINVAL;
+            rc = prepared->preparation_protocol;
+            break;
+        }
+        prepared->groups_completed = group + 1;
+#ifdef WL_SESSION_TEST_HOOKS
+        wl_evaluation_control_source_metadata_test_cancel(lane, group + 2);
+#endif
+        rc = wl_evaluation_control_source_bank_charge(lane, 0);
+    }
+#ifdef WL_SESSION_TEST_HOOKS
+    if (!rc && wl_evaluation_control_test_source_lexical_cancel_before_action) {
+        wl_evaluation_control_test_source_lexical_cancel_before_action = false;
+        wl_evaluation_control_request_cancel(lane->control);
+    }
+#endif
+    if (!rc && (!prepared->action || !prepared->result_published)) {
+        protocol = EINVAL; rc = EINVAL;
+    }
+    if (!rc) rc = wl_evaluation_control_source_bank_charge(lane,
+                policy->current_work);
+    if (!rc) {
+        lane->callback_active = true;
+        wl_evaluation_control_locked_metadata_action = true;
+        prepared->outcome.action_result = prepared->action(prepared->payload);
+        wl_evaluation_control_locked_metadata_action = false;
+        prepared->outcome.action_called = true;
+#ifdef WL_SESSION_TEST_HOOKS
+        if (wl_evaluation_control_test_source_lexical_cancel_after_action) {
+            wl_evaluation_control_test_source_lexical_cancel_after_action =
+                false;
+            wl_evaluation_control_request_cancel(lane->control);
+        }
+#endif
+        lane->callback_active = false;
+        rc = wl_evaluation_control_source_bank_charge(lane, policy->close_work);
+    }
+settle:;
+    int finished = wl_evaluation_control_source_bank_finish_phase(lane);
+    if (prepared) prepared->entry.settled = true;
+    lane->context = NULL;
+    context->identity = NULL;
+    if (retained) {
+        lane->retained_state = WL_EVALUATION_CONTROL_SOURCE_FINISH_PENDING;
+        lane->running = true;
+        if (out) {
+            out->financial_result = finished;
+            out->state = lane->retained_state;
+            out->opened = false; out->report_verified = lane->report_verified;
+        }
+    }
+    wl_evaluation_control_source_bank_unlock(bank);
+    return retained ? protocol : rc ? rc : finished;
+}
+
+int
+wl_evaluation_control_source_metadata_continue_issued(
+    wl_evaluation_control_source_context_t *context,
+    const wl_evaluation_control_source_phase_policy_t *policy,
+    wl_evaluation_control_source_metadata_prepare_fn prepare,
+    const void *recipe,
+    wl_evaluation_control_source_metadata_preparation_t *prepared)
+{
+    return wl_evaluation_control_source_metadata_continue_mode(context, policy,
+               prepare, recipe, prepared, false, NULL);
+}
+
+int
+wl_evaluation_control_source_metadata_continue_retained_owned(
+    wl_evaluation_control_source_context_t *context,
+    const wl_evaluation_control_source_phase_policy_t *policy,
+    wl_evaluation_control_source_metadata_prepare_fn prepare,
+    const void *recipe,
+    wl_evaluation_control_source_metadata_preparation_t *prepared,
+    wl_evaluation_control_source_retained_output_t *out)
+{
+    return wl_evaluation_control_source_metadata_continue_mode(context, policy,
+               prepare, recipe, prepared, true, out);
+}
+
+/* Authenticate and settle the actual fixed CLOSE lane. */
+int
+wl_evaluation_control_source_metadata_continue_close_owned(
+    wl_evaluation_control_source_context_t *context,
+    const wl_evaluation_control_source_phase_policy_t *policy,
+    wl_evaluation_control_source_metadata_prepare_fn prepare,
+    const void *recipe,
+    wl_evaluation_control_source_metadata_preparation_t *prepared)
+{
+    if (!context || context->identity != context || !context->bank
+        || context->lane != WL_EVALUATION_CONTROL_SOURCE_CLOSE
+        || context->thread_cookie !=
+        &wl_evaluation_control_source_thread_cookie)
+        return EINVAL;
+    wl_evaluation_control_source_bank_t *bank = context->bank;
+    int rc = wl_evaluation_control_source_bank_lock(bank);
+    if (rc) return rc;
+    wl_evaluation_control_source_lane_state_t *lane =
+        &bank->lanes[WL_EVALUATION_CONTROL_SOURCE_CLOSE];
+    if (lane->context != context || !lane->running || lane->callback_active) {
+        wl_evaluation_control_source_bank_unlock(bank); return EBUSY;
+    }
+    if (prepared) {
+        prepared->entry.begun = true;
+        prepared->entry.checkpoint_result = 0; /* Actual prior OPEN. */
+    }
+    if (!policy || !prepare || !recipe || recipe == bank || !prepared
+        || !policy->bootstrap_work || !policy->current_work ||
+        !policy->close_work
+        || policy->bootstrap_work > WL_EVALUATION_CONTROL_QUANTUM
+        || policy->current_work > WL_EVALUATION_CONTROL_QUANTUM
+        || policy->close_work > WL_EVALUATION_CONTROL_QUANTUM) {
+        rc = EINVAL; goto settle;
+    }
+    if (!rc) rc = wl_evaluation_control_source_bank_charge(lane,
+                policy->bootstrap_work);
+    for (unsigned group = 0; !rc && group < 3; ++group) {
+        lane->callback_active = true;
+        wl_evaluation_control_locked_metadata_action = true;
+        prepared->preparation_protocol = prepare(recipe, group, prepared);
+        wl_evaluation_control_locked_metadata_action = false;
+        lane->callback_active = false;
+        if (prepared->preparation_protocol) {
+            rc = prepared->preparation_protocol;
+            break;
+        }
+        prepared->groups_completed = group + 1;
+#ifdef WL_SESSION_TEST_HOOKS
+        wl_evaluation_control_source_metadata_test_cancel(lane, group + 2);
+#endif
+        rc = wl_evaluation_control_source_bank_charge(lane, 0);
+    }
+#ifdef WL_SESSION_TEST_HOOKS
+    if (!rc && wl_evaluation_control_test_source_lexical_cancel_before_action) {
+        wl_evaluation_control_test_source_lexical_cancel_before_action = false;
+        wl_evaluation_control_request_cancel(lane->control);
+    }
+#endif
+    if (!rc && (!prepared->action || !prepared->result_published)) rc = EINVAL;
+    if (!rc) rc = wl_evaluation_control_source_bank_charge(lane,
+                policy->current_work);
+    if (!rc) {
+        lane->callback_active = true;
+        wl_evaluation_control_locked_metadata_action = true;
+        prepared->outcome.action_result = prepared->action(prepared->payload);
+        wl_evaluation_control_locked_metadata_action = false;
+        prepared->outcome.action_called = true;
+#ifdef WL_SESSION_TEST_HOOKS
+        if (wl_evaluation_control_test_source_lexical_cancel_after_action) {
+            wl_evaluation_control_test_source_lexical_cancel_after_action =
+                false;
+            wl_evaluation_control_request_cancel(lane->control);
+        }
+#endif
+        lane->callback_active = false;
+        rc = wl_evaluation_control_source_bank_charge(lane, policy->close_work);
+    }
+settle:;
+    int finished = wl_evaluation_control_source_bank_finish_phase(lane);
+    if (prepared) prepared->entry.settled = true;
+    lane->context = NULL;
+    context->identity = NULL;
+    wl_evaluation_control_source_bank_unlock(bank);
+    return rc ? rc : finished;
+}
+
+static int
+wl_evaluation_control_source_metadata_bind_continue_mode(
+    wl_evaluation_control_source_context_t *context,
+    wl_evaluation_control_source_metadata_bind_prepare_fn prepare,
+    wl_evaluation_control_source_metadata_bind_fn bind, void *root,
+    wl_evaluation_control_source_metadata_bind_outcome_t *out, bool retained,
+    wl_evaluation_control_source_retained_output_t *retained_out)
+{
+    if (!context || context->identity != context || !context->bank
+        || context->lane !=
+        WL_EVALUATION_CONTROL_SOURCE_OPERATION) return EINVAL;
+    if (context->thread_cookie != &wl_evaluation_control_source_thread_cookie)
+        return retained ? EBUSY : EINVAL;
+    wl_evaluation_control_source_bank_t *bank = context->bank;
+    int rc = wl_evaluation_control_source_bank_lock(bank);
+    if (rc) return rc;
+    wl_evaluation_control_source_lane_state_t *lane =
+        &bank->lanes[WL_EVALUATION_CONTROL_SOURCE_OPERATION];
+    if (lane->retained_state !=
+        (retained ? WL_EVALUATION_CONTROL_SOURCE_METADATA
+            : WL_EVALUATION_CONTROL_SOURCE_QUIESCENT)
+        || lane->context != context || !lane->running || lane->callback_active
+        || lane->observation_active || (retained &&
+        !wl_evaluation_control_source_retained_metadata_valid(bank, lane))) {
+        wl_evaluation_control_source_bank_unlock(bank); return EBUSY;
+    }
+    int protocol = 0;
+    if (out) {
+        out->cursor = NULL; out->before_cursor = 0; out->after_cursor = 0;
+        out->preparation_protocol = 0; out->role_called = false;
+        out->complete_selected = false; out->settled = false;
+    }
+    if (!prepare || !bind || !root || root == bank || !out
+        || (retained && !retained_out)) {
+        protocol = EINVAL; rc = EINVAL; goto settle;
+    }
+    for (unsigned group = 0; !rc && group < 2; ++group) {
+        lane->callback_active = true;
+        wl_evaluation_control_locked_metadata_action = true;
+        out->preparation_protocol = prepare(root, group, out);
+        wl_evaluation_control_locked_metadata_action = false;
+        lane->callback_active = false;
+        if (out->preparation_protocol) {
+            protocol = out->preparation_protocol > 0 ?
+                out->preparation_protocol : EINVAL;
+            rc = out->preparation_protocol; break;
+        }
+#ifdef WL_SESSION_TEST_HOOKS
+        wl_evaluation_control_source_metadata_test_cancel(lane, group + 2);
+#endif
+        rc = wl_evaluation_control_source_bank_charge(lane, 0);
+    }
+    if (!rc && (!out->cursor || out->before_cursor > 4
+        || *out->cursor != out->before_cursor)) {
+        protocol = EINVAL; rc = EINVAL;
+    }
+    if (!rc && out->before_cursor < 4) {
+        rc = wl_evaluation_control_source_bank_charge(lane, 10);
+        if (!rc) {
+            lane->callback_active = true;
+            wl_evaluation_control_locked_metadata_action = true;
+            out->preparation_protocol = bind(root, out->before_cursor);
+            wl_evaluation_control_locked_metadata_action = false;
+            lane->callback_active = false;
+            out->role_called = true;
+            out->after_cursor = *out->cursor;
+            if (out->preparation_protocol) {
+                protocol = out->preparation_protocol > 0 ?
+                    out->preparation_protocol : EINVAL;
+                rc = out->preparation_protocol;
+            } else if (out->after_cursor != out->before_cursor + 1) {
+                protocol = EINVAL; rc = EINVAL;
+            }
+#ifdef WL_SESSION_TEST_HOOKS
+            wl_evaluation_control_source_metadata_test_cancel(lane, 4);
+#endif
+            if (!rc) rc = wl_evaluation_control_source_bank_charge(lane, 0);
+        }
+    } else if (!rc) {
+        out->after_cursor = out->before_cursor;
+        out->complete_selected = true;
+    }
+settle:;
+    int finished = wl_evaluation_control_source_bank_finish_phase(lane);
+    if (out) out->settled = true;
+    lane->context = NULL; context->identity = NULL;
+    if (retained) {
+        lane->retained_state = WL_EVALUATION_CONTROL_SOURCE_FINISH_PENDING;
+        lane->running = true;
+        if (retained_out) {
+            retained_out->financial_result = finished;
+            retained_out->state = lane->retained_state;
+            retained_out->opened = false;
+            retained_out->report_verified = lane->report_verified;
+        }
+    }
+    wl_evaluation_control_source_bank_unlock(bank);
+    return retained ? protocol : rc ? rc : finished;
+}
+
+int
+wl_evaluation_control_source_metadata_bind_continue_issued(
+    wl_evaluation_control_source_context_t *context,
+    wl_evaluation_control_source_metadata_bind_prepare_fn prepare,
+    wl_evaluation_control_source_metadata_bind_fn bind, void *root,
+    wl_evaluation_control_source_metadata_bind_outcome_t *out)
+{
+    return wl_evaluation_control_source_metadata_bind_continue_mode(context,
+               prepare, bind, root, out, false, NULL);
+}
+
+int
+wl_evaluation_control_source_metadata_bind_continue_retained_owned(
+    wl_evaluation_control_source_context_t *context,
+    wl_evaluation_control_source_metadata_bind_prepare_fn prepare,
+    wl_evaluation_control_source_metadata_bind_fn bind, void *root,
+    wl_evaluation_control_source_metadata_bind_outcome_t *outcome,
+    wl_evaluation_control_source_retained_output_t *out)
+{
+    return wl_evaluation_control_source_metadata_bind_continue_mode(context,
+               prepare, bind, root, outcome, true, out);
+}
+
+/* Bootstrap recipes before any private financier/resource birth. Cursor
+ * progress is real caller-owned metadata and never a Native permission. The
+ * bank activation/context remains automatic and settled on every return. */
+int
+wl_evaluation_control_source_bank_bind_metadata_roles(
+    wl_evaluation_control_source_bank_t *bank,
+    wl_evaluation_control_source_lane_t index,
+    const wl_evaluation_control_source_phase_policy_t *policy,
+    wl_evaluation_control_source_metadata_bind_fn bind, void *root,
+    unsigned *cursor)
+{
+    if (!bank || bank->identity != bank
+        || (unsigned)index >= WL_EVALUATION_CONTROL_SOURCE_LANES
+        || !policy || !bind || !root || root == bank || !cursor || *cursor >= 4
+        || !policy->bootstrap_work || !policy->current_work
+        || !policy->close_work
+        || policy->bootstrap_work > WL_EVALUATION_CONTROL_QUANTUM
+        || policy->current_work > WL_EVALUATION_CONTROL_QUANTUM
+        || policy->close_work > WL_EVALUATION_CONTROL_QUANTUM) return EINVAL;
+    int rc = wl_evaluation_control_source_bank_lock(bank);
+    if (rc) return rc;
+    wl_evaluation_control_source_lane_state_t *lane = &bank->lanes[index];
+    if (lane->retained_state != WL_EVALUATION_CONTROL_SOURCE_QUIESCENT
+        || bank->closing || lane->context || lane->running
+        || lane->callback_active) {
+        wl_evaluation_control_source_bank_unlock(bank);
+        return EBUSY;
+    }
+    wl_evaluation_control_source_metadata_entry_t entry = {0};
+    rc = wl_evaluation_control_source_metadata_start(bank, (unsigned)index,
+            &entry, false);
+    if (rc) {
+        wl_evaluation_control_source_bank_unlock(bank);
+        return rc;
+    }
+    wl_evaluation_control_source_context_t context = {
+        .identity = &context, .bank = bank, .lane = (unsigned)index,
+        .thread_cookie = &wl_evaluation_control_source_thread_cookie
+    };
+    lane->context = &context;
+    if (!rc) rc = wl_evaluation_control_source_bank_charge(lane,
+                policy->bootstrap_work);
+    /* Always select CURRENT once, including resumed cursors2..4. */
+    for (unsigned packet = 0; !rc && packet < 4; ++packet) {
+        if (packet == 2) rc = wl_evaluation_control_source_bank_charge(lane,
+                    policy->current_work);
+        if (rc || packet != *cursor) continue;
+        lane->callback_active = true;
+        wl_evaluation_control_locked_metadata_action = true;
+        rc = bind(root, packet);
+        wl_evaluation_control_locked_metadata_action = false;
+        lane->callback_active = false;
+        if (!rc && *cursor != packet + 1) rc = EINVAL;
+        if (rc) break;
+#ifdef WL_SESSION_TEST_HOOKS
+        wl_evaluation_control_source_metadata_test_cancel(lane, packet + 2);
+#endif
+        rc = wl_evaluation_control_source_bank_charge(lane, 0);
+    }
+    if (!rc) rc = wl_evaluation_control_source_bank_charge(lane,
+                policy->close_work);
+    int finished = wl_evaluation_control_source_bank_finish_phase(lane);
+    lane->context = NULL;
+    wl_evaluation_control_source_bank_unlock(bank);
+    return rc ? rc : finished;
+}
+
+/* A real no-coupon financial observation, not the positive policy runner
+* with invented zero fees. Every begun path settles under the same mutex;
+* no context or action is published, including successful observation. */
+int
+wl_evaluation_control_source_bank_observe_metadata(
+    wl_evaluation_control_source_bank_t *bank,
+    wl_evaluation_control_source_lane_t index,
+    wl_evaluation_control_source_metadata_entry_t *entry)
+{
+    if (!bank || bank->identity != bank || !entry
+        || (unsigned)index >= WL_EVALUATION_CONTROL_SOURCE_LANES) return EINVAL;
+    int rc = wl_evaluation_control_source_bank_lock(bank);
+    if (rc) return rc;
+    if (bank->closing) {
+        wl_evaluation_control_source_bank_unlock(bank); return EBUSY;
+    }
+    rc = wl_evaluation_control_source_metadata_start(bank, (unsigned)index,
+            entry, true);
+    wl_evaluation_control_source_bank_unlock(bank);
+    return rc;
 }
 
 #ifdef WL_SESSION_TEST_HOOKS
@@ -1311,7 +3268,8 @@ wl_evaluation_control_source_bank_run_lexical_constructor(
         result.financial_result = rc; return result;
     }
     wl_evaluation_control_source_lane_state_t *lane = &bank->lanes[index];
-    if (bank->closing || lane->context || lane->running
+    if (lane->retained_state != WL_EVALUATION_CONTROL_SOURCE_QUIESCENT
+        || bank->closing || lane->context || lane->running
         || lane->callback_active) {
         wl_evaluation_control_source_bank_unlock(bank);
         result.financial_result = EBUSY;
@@ -1385,7 +3343,8 @@ wl_evaluation_control_source_bank_run_lexical_pair(
         result.financial_result = rc; return result;
     }
     wl_evaluation_control_source_lane_state_t *lane = &bank->lanes[index];
-    if (bank->closing || lane->context || lane->running ||
+    if (lane->retained_state != WL_EVALUATION_CONTROL_SOURCE_QUIESCENT
+        || bank->closing || lane->context || lane->running ||
         lane->callback_active){
         wl_evaluation_control_source_bank_unlock(bank);
         result.financial_result = EBUSY; return result;
@@ -1530,7 +3489,9 @@ wl_evaluation_control_test_source_early_report(
         }
     }
     wl_evaluation_control_source_lane_state_t *lane = &bank->lanes[index];
-    if (bank->closing || lane->context || lane->running || lane->callback_active
+    if (lane->retained_state != WL_EVALUATION_CONTROL_SOURCE_QUIESCENT
+        || bank->closing || lane->context || lane->running ||
+        lane->callback_active
         || !lane->control || !lane->id || !lane->report_verified) {
         wl_evaluation_control_source_bank_unlock(bank); return EBUSY;
     }
@@ -1583,7 +3544,9 @@ wl_evaluation_control_test_source_final_reset_cancel(
     int rc = wl_evaluation_control_source_bank_lock(bank);
     if (rc) return rc;
     wl_evaluation_control_source_lane_state_t *lane = &bank->lanes[index];
-    if (bank->closing || lane->context || lane->running || lane->callback_active
+    if (lane->retained_state != WL_EVALUATION_CONTROL_SOURCE_QUIESCENT
+        || bank->closing || lane->context || lane->running ||
+        lane->callback_active
         || !lane->control || !lane->id || !lane->report_verified) {
         wl_evaluation_control_source_bank_unlock(bank); return EBUSY;
     }
@@ -1753,7 +3716,8 @@ wl_evaluation_control_source_bank_run_lexical_pair_final(
         result.financial_result = rc; return result;
     }
     wl_evaluation_control_source_lane_state_t *lane = &bank->lanes[index];
-    if (bank->closing || lane->context || lane->running ||
+    if (lane->retained_state != WL_EVALUATION_CONTROL_SOURCE_QUIESCENT
+        || bank->closing || lane->context || lane->running ||
         lane->callback_active){
         wl_evaluation_control_source_bank_unlock(bank);
         result.financial_result = EBUSY; return result;
@@ -1868,7 +3832,8 @@ wl_evaluation_control_source_bank_run_lexical_final(
         result.financial_result = rc; return result;
     }
     wl_evaluation_control_source_lane_state_t *lane = &bank->lanes[index];
-    if (bank->closing || lane->context || lane->running ||
+    if (lane->retained_state != WL_EVALUATION_CONTROL_SOURCE_QUIESCENT
+        || bank->closing || lane->context || lane->running ||
         lane->callback_active){
         wl_evaluation_control_source_bank_unlock(bank);
         result.financial_result = EBUSY; return result;
@@ -1948,6 +3913,9 @@ wl_evaluation_control_source_bank_begin_checkpoint(
     wl_evaluation_control_source_lane_state_t *lane)
 {
     wl_evaluation_control_source_early_begin_t result = {0};
+    if (lane->retained_state != WL_EVALUATION_CONTROL_SOURCE_QUIESCENT) {
+        result.protocol = EBUSY; return result;
+    }
     wl_evaluation_control_t *control = lane->control;
     wl_mutex_lock(&control->mutex);
     int rc = control->owner != lane ? EINVAL : control->active ? EBUSY : 0;
@@ -2002,7 +3970,8 @@ wl_evaluation_control_source_bank_run_lexical_early(
         result.protocol = rc; result.financial_result = rc; return result;
     }
     wl_evaluation_control_source_lane_state_t *lane = &bank->lanes[index];
-    if (bank->closing || lane->context || lane->running
+    if (lane->retained_state != WL_EVALUATION_CONTROL_SOURCE_QUIESCENT
+        || bank->closing || lane->context || lane->running
         || lane->callback_active) {
         wl_evaluation_control_source_bank_unlock(bank);
         result.protocol = EBUSY; result.financial_result = EBUSY;
@@ -2081,7 +4050,8 @@ wl_evaluation_control_source_bank_run_lexical_constructor_early(
         result.protocol = rc; result.financial_result = rc; return result;
     }
     wl_evaluation_control_source_lane_state_t *lane = &bank->lanes[index];
-    if (bank->closing || lane->context || lane->running
+    if (lane->retained_state != WL_EVALUATION_CONTROL_SOURCE_QUIESCENT
+        || bank->closing || lane->context || lane->running
         || lane->callback_active) {
         wl_evaluation_control_source_bank_unlock(bank);
         result.protocol = EBUSY; result.financial_result = EBUSY;
@@ -2170,7 +4140,8 @@ wl_evaluation_control_source_bank_run_lexical_pair_early(
         result.protocol = rc; result.financial_result = rc; return result;
     }
     wl_evaluation_control_source_lane_state_t *lane = &bank->lanes[index];
-    if (bank->closing || lane->context || lane->running ||
+    if (lane->retained_state != WL_EVALUATION_CONTROL_SOURCE_QUIESCENT
+        || bank->closing || lane->context || lane->running ||
         lane->callback_active){
         wl_evaluation_control_source_bank_unlock(bank);
         result.protocol = EBUSY; result.financial_result = EBUSY; return result;
@@ -2268,7 +4239,8 @@ wl_evaluation_control_source_bank_run_lexical_final_early(
         result.protocol = rc; result.financial_result = rc; return result;
     }
     wl_evaluation_control_source_lane_state_t *lane = &bank->lanes[index];
-    if (bank->closing || lane->context || lane->running ||
+    if (lane->retained_state != WL_EVALUATION_CONTROL_SOURCE_QUIESCENT
+        || bank->closing || lane->context || lane->running ||
         lane->callback_active){
         wl_evaluation_control_source_bank_unlock(bank);
         result.protocol = EBUSY; result.financial_result = EBUSY; return result;
@@ -2374,7 +4346,8 @@ wl_evaluation_control_source_bank_run_lexical_pair_final_early(
         result.protocol = rc; result.financial_result = rc; return result;
     }
     wl_evaluation_control_source_lane_state_t *lane = &bank->lanes[index];
-    if (bank->closing || lane->context || lane->running ||
+    if (lane->retained_state != WL_EVALUATION_CONTROL_SOURCE_QUIESCENT
+        || bank->closing || lane->context || lane->running ||
         lane->callback_active){
         wl_evaluation_control_source_bank_unlock(bank);
         result.protocol = EBUSY; result.financial_result = EBUSY; return result;
@@ -2476,6 +4449,10 @@ wl_evaluation_control_source_bank_run_lexical_pair_final_early(
     return result;
 }
 
+#ifdef WL_SESSION_TEST_HOOKS
+bool wl_evaluation_control_test_source_bank_destroy_cancel;
+#endif
+
 int
 wl_evaluation_control_source_bank_destroy(
     wl_evaluation_control_source_bank_t **slot)
@@ -2488,7 +4465,8 @@ wl_evaluation_control_source_bank_destroy(
     if (rc) return rc;
     for (unsigned i = 0; i < WL_EVALUATION_CONTROL_SOURCE_LANES; ++i) {
         wl_evaluation_control_source_lane_state_t *lane = &bank->lanes[i];
-        if (lane->context || lane->running || lane->callback_active
+        if (lane->retained_state != WL_EVALUATION_CONTROL_SOURCE_QUIESCENT
+            || lane->context || lane->running || lane->callback_active
             || wl_evaluation_control_active_attempt_id(lane->control)
             || (lane->id && !lane->report_verified)) {
             wl_evaluation_control_source_bank_unlock(bank);
@@ -2518,6 +4496,12 @@ wl_evaluation_control_source_bank_destroy(
     lane->id = wl_evaluation_control_active_attempt_id(lane->control);
     if (!lane->id) abort();
     lane->running = true;
+#ifdef WL_SESSION_TEST_HOOKS
+    if (wl_evaluation_control_test_source_bank_destroy_cancel) {
+        wl_evaluation_control_test_source_bank_destroy_cancel = false;
+        wl_evaluation_control_request_cancel(lane->control);
+    }
+#endif
     rc = wl_evaluation_control_source_bank_charge(lane,
             WL_EVALUATION_CONTROL_QUANTUM);
     if (!rc) rc = wl_evaluation_control_source_bank_charge(lane,
@@ -2755,7 +4739,8 @@ wl_evaluation_control_source_bank_run_lexical_close_early(
         out.phase.financial_result = rc; return out;
     }
     wl_evaluation_control_source_lane_state_t *lane = &bank->lanes[index];
-    if (bank->closing || lane->context || lane->running ||
+    if (lane->retained_state != WL_EVALUATION_CONTROL_SOURCE_QUIESCENT
+        || bank->closing || lane->context || lane->running ||
         lane->callback_active){
         wl_evaluation_control_source_bank_unlock(bank);
         out.protocol = EBUSY; out.phase.protocol = EBUSY;
@@ -2836,4 +4821,164 @@ unlock:
     lane->context = NULL;
     wl_evaluation_control_source_bank_unlock(bank);
     return out;
+}
+
+wl_evaluation_control_attempt_begin_result_t
+wl_evaluation_control_private_financier_rebegin(
+    wl_evaluation_control_t *control,
+    const void *owner, uint64_t allocation_identity, uint64_t completed_id,
+    uint64_t positive_limit)
+{
+    wl_evaluation_control_attempt_begin_result_t out = {EINVAL, 0};
+    if (!control || !owner || !allocation_identity || !completed_id
+        || !positive_limit) return out;
+    if (wl_mutex_lock(&control->mutex)) {
+        out.protocol = EIO; return out;
+    }
+    if (control->source_bank_class || control->identity != allocation_identity
+        || control->owner != owner || control->attempt_id != completed_id
+        || control->completed.attempt_id != completed_id) goto done;
+    if (control->active || atomic_load_explicit(&control->active_attempt_id,
+        memory_order_acquire) || atomic_load_explicit(&control->references,
+        memory_order_acquire) != UINT64_C(2)) {
+        out.protocol = EBUSY; goto done;
+    }
+    if (completed_id == UINT64_MAX) {
+        out.protocol = EOVERFLOW; goto done;
+    }
+    control->configured_limit = control->attempt_limit = positive_limit;
+    control->consumed = 0;
+    control->stop = WL_EVALUATION_CONTROL_NONE;
+    control->accounting_error = 0;
+    (void)atomic_exchange_explicit(&control->cancelled, 0,
+        memory_order_relaxed);
+    control->attempt_id = completed_id + 1;
+    control->active = true;
+    (void)atomic_exchange_explicit(&control->active_attempt_id,
+        control->attempt_id, memory_order_release);
+    out.protocol = 0; out.attempt_id = control->attempt_id;
+done:
+    wl_mutex_unlock(&control->mutex);
+    return out;
+}
+
+int
+wl_evaluation_control_private_financier_parked_owned(
+    wl_evaluation_control_t *control, const void *owner,
+    uint64_t allocation_identity, uint64_t completed_id)
+{
+    if (!control || !owner || !allocation_identity || !completed_id)
+        return EINVAL;
+    if (wl_mutex_lock(&control->mutex)) return EIO;
+    int rc = EINVAL;
+    if (control->source_bank_class || control->identity != allocation_identity
+        || control->owner != owner) goto done;
+    if (control->active || atomic_load_explicit(&control->active_attempt_id,
+        memory_order_acquire) || atomic_load_explicit(&control->references,
+        memory_order_acquire) != UINT64_C(2)) {
+        rc = EBUSY; goto done;
+    }
+    if (control->attempt_id != completed_id
+        || control->completed.attempt_id != completed_id
+        || !control->configured_limit || !control->attempt_limit) goto done;
+    rc = 0;
+done:
+    wl_mutex_unlock(&control->mutex);
+    return rc;
+}
+
+int
+wl_evaluation_control_financier_finish_commit(wl_evaluation_control_t *control,
+    const void *owner, uint64_t expected_id)
+{
+    if (!control || !owner || !expected_id) return EINVAL;
+    if (wl_mutex_lock(&control->mutex)) return EIO;
+    if (control->source_bank_class || control->owner != owner) {
+        wl_mutex_unlock(&control->mutex);
+        return EINVAL;
+    }
+    if (control->attempt_id != expected_id) {
+        wl_mutex_unlock(&control->mutex);
+        return EBUSY;
+    }
+    if (!control->active) {
+        if (control->completed.attempt_id != expected_id) {
+            wl_mutex_unlock(&control->mutex);
+            return EINVAL;
+        }
+    } else {
+        /* Like generic FINISH this does not poll cancellation. */
+        control->completed = (wl_evaluation_control_report_t){
+            .attempt_id = expected_id, .limit = control->attempt_limit,
+            .consumed = control->consumed, .stop_reason = control->stop,
+            .execution_status = control->accounting_error, .cleanup_status = 0,
+            .result = control->accounting_error ? control->accounting_error
+                : (int)control->stop,
+        };
+        wl_evaluation_control_financier_publish_inactive(control);
+    }
+    wl_mutex_unlock(&control->mutex);
+    return 0;
+}
+
+int
+wl_evaluation_control_financier_report_owned(wl_evaluation_control_t *control,
+    const void *owner, uint64_t expected_id,
+    wl_evaluation_control_report_t *out)
+{
+    if (!control || !owner || !expected_id || !out) return EINVAL;
+    if (wl_mutex_lock(&control->mutex)) return EIO;
+    if (control->source_bank_class || control->owner != owner) {
+        wl_mutex_unlock(&control->mutex);
+        return EINVAL;
+    }
+    if (control->active || control->attempt_id != expected_id
+        || control->completed.attempt_id != expected_id) {
+        wl_mutex_unlock(&control->mutex);
+        return EBUSY;
+    }
+    *out = control->completed;
+    wl_mutex_unlock(&control->mutex);
+    return 0;
+}
+
+int
+wl_evaluation_control_construction_error_finish_commit(
+    wl_evaluation_control_t *control, const void *owner, uint64_t expected_id,
+    int positive_error)
+{
+    if (!control || !owner || !expected_id || positive_error <= 0)
+        return -EINVAL;
+    if (wl_mutex_lock(&control->mutex)) return -EIO;
+    if (control->source_bank_class || control->owner != owner) {
+        wl_mutex_unlock(&control->mutex);
+        return -EINVAL;
+    }
+    if (control->attempt_id != expected_id) {
+        wl_mutex_unlock(&control->mutex);
+        return WL_EVALUATION_CONTROL_ATTEMPT_FINISH_SUCCESSOR_MISMATCH;
+    }
+    if (!control->active) {
+        if (control->completed.attempt_id != expected_id) {
+            wl_mutex_unlock(&control->mutex);
+            return -EINVAL;
+        }
+        wl_mutex_unlock(&control->mutex);
+        return WL_EVALUATION_CONTROL_ATTEMPT_FINISH_ALREADY_ENDED;
+    }
+    control->completed = (wl_evaluation_control_report_t){
+        .attempt_id = expected_id, .limit = control->attempt_limit,
+        .consumed = control->consumed, .stop_reason = control->stop,
+        .execution_status = positive_error, .cleanup_status = 0,
+        .result = positive_error,
+    };
+    control->active = false;
+#ifdef _MSC_VER
+    (void)_InterlockedExchange64(
+        (volatile __int64 *)&control->active_attempt_id, 0);
+#else
+    atomic_store_explicit(&control->active_attempt_id, 0, memory_order_release);
+#endif
+    wl_mutex_unlock(&control->mutex);
+    return WL_EVALUATION_CONTROL_ATTEMPT_FINISH_OWN_FINISHED;
 }

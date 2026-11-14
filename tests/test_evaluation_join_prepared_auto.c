@@ -735,7 +735,9 @@ bound_ended_drive(wl_session_t *session)
                 bound_metadata_refusal(session, false);
                 disposing = true;
             }
-            if (!final && phase == WL_COLUMNAR_SESSION_NATIVE_ERROR_FINAL) {
+            if (!final && phase == WL_COLUMNAR_SESSION_NATIVE_ERROR_FINAL
+                && !wl_columnar_session_test_terminal_physical_pending(
+                    columnar)) {
                 CHECK(!columnar->cleanup_active && !columnar->cleanup_pending);
                 bound_metadata_refusal(session, false);
                 final = true;
@@ -743,15 +745,37 @@ bound_ended_drive(wl_session_t *session)
             bound_check_original(session);
         }
         bool metadata = bound_turned_over;
+        bool terminal =
+            wl_columnar_session_test_terminal_physical_pending(columnar);
         unsigned reports = bound_metadata_reports;
+        unsigned factories = bound_metadata_factories;
+        uint64_t main_before[16], main_after[16];
+        CHECK(!wl_columnar_session_test_main_view(columnar, main_before));
         if (metadata) {
             bound_metadata_limit = 2304;
             if (bound_factory_reentries < 2) bound_factory_reentry = true;
         }
         int rc = wl_session_step(session);
+        CHECK(!wl_columnar_session_test_main_view(columnar, main_after));
         bound_metadata_limit = 0;
-        if (metadata) CHECK(bound_metadata_reports == reports + 1
-                && bound_metadata_consumed == 2304);
+        if (metadata) {
+            if (terminal) CHECK(bound_metadata_reports == reports);
+            else if (bound_metadata_factories != factories) {
+                CHECK(bound_metadata_factories == factories + 1
+                    && bound_metadata_reports == reports + 1
+                    && bound_metadata_consumed == 2304);
+            } else {
+                /* MAIN's real retained report/TAKE is drained before the
+                * next native-error metadata factory. This public call must
+                * preserve that exact financial owner rather than create a
+                * second controller merely to satisfy the old fixture. */
+                CHECK(bound_metadata_reports == reports
+                    && ((main_before[0] && main_before[13]
+                    && main_before[6] && main_before[7] && main_before[9])
+                    || (main_after[0] && main_after[13]
+                    && main_after[6] && main_after[7] && main_after[9])));
+            }
+        }
         if (rc == WL_EVALUATION_CONTROL_WORK_LIMIT && bound_receipt_probe
             && bound_receipt_refusals == 1 && !bound_receipt_acks
             && wl_columnar_session_test_native_error_phase(columnar)
@@ -1203,12 +1227,15 @@ test_mr1_constructor_and_workers(void)
     CHECK(!col_worker_session_destroy(worker)); free(worker);
     const int64_t edges[] = {1, 2, 2, 3, 3, 4};
     CHECK(!wl_session_insert(session, "edge", edges, 3, 2));
-    CHECK(drive(session, false, NULL) == ENOTSUP);
+    CHECK(!drive(session, false, NULL));
+    unsigned controlled_seen = 0;
+    CHECK(!wl_session_snapshot(session, mr1_literal_rows, &controlled_seen)
+        && controlled_seen == 15);
     CHECK(c->controlled_scalar_view == view && c->plan == plan
         && !c->controlled_materialized_batch_published_count);
     CHECK(!wl_session_try_destroy(&session));
     /* Generic creation's control attachment was released by real teardown. */
-    int owner;
+    int owner = 0;
     CHECK(!wl_evaluation_control_attach(control, &owner));
     CHECK(!wl_evaluation_control_detach(control, &owner));
     wl_evaluation_control_release(control);
@@ -1370,7 +1397,7 @@ test_mr1_governed_failure(void)
             CHECK(!rc && session); CHECK(!wl_session_try_destroy(&session));
 #endif
         }
-        int owner;
+        int owner = 0;
         CHECK(!wl_evaluation_control_attach(control, &owner));
         CHECK(!wl_evaluation_control_detach(control, &owner));
         wl_evaluation_control_release(control);

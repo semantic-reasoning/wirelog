@@ -838,8 +838,7 @@ test_cancel_inside_builder(void)
                 do {
                     rc = wl_session_step(f.session);
                     ++builder_call;
-                } while (rc == EAGAIN && (!builder_cancelled
-                    || builder_call - builder_cancel_call < 1024));
+                } while (rc == EAGAIN && builder_call < SLICE_CAP);
                 wl_columnar_relation_test_builder_phase = NULL;
                 if (!builder_cancelled) {
                     /* Every builder of this phase has been targeted. */

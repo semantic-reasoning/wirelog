@@ -1,0 +1,65 @@
+{
+  "source_only_candidate_tree": "5c7b6e879703c92c8d3ac0790af37df6f54416c5",
+  "main": "60e28c6fa7300c51fc2b2bc150daca44f7fce25c",
+  "count": 720,
+  "results": {
+    "OK": 705,
+    "SKIP": 13,
+    "FAIL": 2
+  },
+  "failures": [
+    {
+      "name": "unit+tsan - wirelog:evaluation_expression_reduce",
+      "result": "FAIL",
+      "returncode": 1,
+      "stdout_tail": [],
+      "stderr_tail": [
+        "real native mixed0 consumed3817 expected3560",
+        "../tests/test_evaluation_expression_reduce.c:194: report.consumed == expected"
+      ]
+    },
+    {
+      "name": "unit+tsan - wirelog:evaluation_empty_expression_sources",
+      "result": "FAIL",
+      "returncode": -6,
+      "stdout_tail": [],
+      "stderr_tail": [
+        "../tests/test_evaluation_empty_expression_sources.c:1180: turns < 10000 && f.did_stop && drain && rollback && discard && maintenance && rc == EINVAL"
+      ]
+    }
+  ],
+  "tidy": [
+    {
+      "name": "tidy - wirelog:clang_tidy_sensitivity",
+      "result": "OK"
+    },
+    {
+      "name": "tidy - wirelog:clang_tidy_ratchet",
+      "result": "OK"
+    },
+    {
+      "name": "tidy - wirelog:clang_tidy_guard_unit",
+      "result": "OK"
+    },
+    {
+      "name": "tidy - wirelog:clang_tidy_backlog_monotonic",
+      "result": "OK"
+    }
+  ],
+  "skips": [
+    "perf - wirelog:log_perf_gate",
+    "abi - wirelog:release_template",
+    "abi - wirelog:version_extraction",
+    "abi - wirelog:release_roundtrip",
+    "sbom - wirelog:sbom_venv_exclusion",
+    "abi - wirelog:abi_manifest",
+    "sbom - wirelog:sbom_snapshot",
+    "perf - wirelog:crdt_perf_gate",
+    "perf - wirelog:crdt_correctness_full",
+    "perf - wirelog:cspa_w1_gate",
+    "perf - wirelog:doop_w8_gate",
+    "perf - wirelog:sub_ms_graph_perf_gate",
+    "perf - wirelog:rotate_latency_nightly"
+  ],
+  "scope": "post-rebase Linux Clang withLLVM22required; not MSVC qualification or Ready; preserve exact failures for unfinished Draft handoff"
+}

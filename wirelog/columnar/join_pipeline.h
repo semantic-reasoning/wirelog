@@ -88,6 +88,8 @@ enum {
 };
 extern void (*wl_columnar_join_pipeline_test_numeric_checkpoint)(
     wl_evaluation_control_t *, unsigned, uint64_t, uint32_t, uint64_t);
+extern void (*wl_columnar_join_pipeline_test_first_error)(
+    wl_evaluation_control_t *, int);
 int wl_columnar_join_pipeline_test_stream_view(const void *,
     const col_rel_t **, uint64_t *, bool *, const wl_plan_op_t **);
 #endif
