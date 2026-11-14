@@ -8,6 +8,7 @@
 #include "../wirelog/session_options.h"
 #include "../wirelog/thread.h"
 #include "../wirelog/wirelog.h"
+#include "../wirelog/wirelog-optimizer.h"
 #include "../wirelog/wirelog-internal.h"
 #include <errno.h>
 #include <limits.h>
@@ -35,6 +36,17 @@ static unsigned first_probe_op, first_probe_mode, first_probe_followups,
     first_probe_acks;
 static uint64_t first_probe_limit, first_probe_prefix, first_probe_paid;
 static bool first_probe_found, first_probe_inert_start;
+static bool reset_enabled, reset_fault, reset_after, reset_fired,
+    reset_recovery_pending;
+static unsigned reset_target;
+static size_t reset_bytes;
+static wl_session_t *reset_session;
+static col_rel_t *reset_head;
+static col_relation_snapshot_t reset_head_snapshot;
+static unsigned *reset_event_calls;
+static void reset_recover(wl_session_t *, int);
+extern void (*wl_columnar_session_test_step_reset_phase)(wl_col_session_t *,
+    unsigned, size_t, bool);
 
 static void
 first_probe_checkpoint(wl_evaluation_control_t *control,
@@ -189,7 +201,8 @@ funding_limit(const wl_col_session_t *session,
     CHECK(!wl_columnar_join_pipeline_numeric_funding_work(&root->child, &work));
     if (work != 384) return proposed;
     CHECK(wl_columnar_session_controlled_batch_authorized(session, active,
-        root->attempt_id, root->operation_identity));
+        root->attempt_id, root->operation_identity, root->plan,
+        root->private_bindings));
     selected_id = root->attempt_id; selected_consumers = consumers;
     selected_limit = short_grant ? 1791 : 1792;
     return selected_limit;
@@ -226,6 +239,10 @@ finish(wl_session_t *session)
 {
     for (unsigned turn = 0; turn < 1000000; ++turn) {
         int rc = wl_session_step(session);
+        if (reset_recovery_pending && session == reset_session) {
+            reset_recover(session, rc);
+            continue;
+        }
         if (rc != EAGAIN) return rc;
     }
     CHECK(false); return EIO;
@@ -1168,7 +1185,7 @@ filtered_probe_anti(wirelog_ir_node_t *node)
 }
 
 static unsigned filtered_phase, filtered_fault, filtered_rows,
-    filtered_build_maps, filtered_probe_maps;
+    filtered_build_rows, filtered_probe_rows;
 static bool filtered_fired, filtered_scalar_mode;
 static unsigned filtered_scalar_owners;
 static wl_columnar_memory_governor_ref_t *filtered_governor;
@@ -1196,8 +1213,10 @@ filtered_checkpoint(wl_evaluation_control_t *control, unsigned phase,
             ++filtered_scalar_owners;
         }
     }
-    if (phase == 50) ++filtered_build_maps;
-    if (phase == 51) ++filtered_probe_maps;
+    /* Main keeps physical row chains:28 inserts selected right rows;
+     * 17 visits a real candidate during membership probing. */
+    if (phase == 28) ++filtered_build_rows;
+    if (phase == 17) ++filtered_probe_rows;
     if (!filtered_fault || filtered_fired || phase != filtered_phase) return;
     filtered_fired = true;
     if (filtered_fault == 7) {
@@ -1331,10 +1350,10 @@ filtered_generated_probes(unsigned domain)
                         filtered_scalar_owners = 0;
                         filtered_fault = fault; filtered_fired = false;
                         wl_columnar_memory_reservation_init(&filtered_peer);
-                        filtered_rows = filtered_build_maps =
-                            filtered_probe_maps = 0;
+                        filtered_rows = filtered_build_rows =
+                            filtered_probe_rows = 0;
                         filtered_phase = fault >= 7 ? 43 : fault >=
-                            5 ? 51 : fault >= 3 ? 50 : 44;
+                            5 ? 17 : fault >= 3 ? 28 : 44;
                         wl_columnar_join_test_attempt_checkpoint =
                             filtered_checkpoint;
                     }
@@ -1361,15 +1380,15 @@ filtered_generated_probes(unsigned domain)
                             && !wl_evaluation_control_configure(control, 0));
                         filtered_fault = 0;
                         filtered_scalar_owners = 0;
-                        filtered_rows = filtered_build_maps =
-                            filtered_probe_maps = 0;
+                        filtered_rows = filtered_build_rows =
+                            filtered_probe_rows = 0;
                         rc = finish(sessions[i]);
                     }
                     CHECK(!rc && events.events == (semi ? 2u : 1u)
                         && events.mask == (semi ? 3u : 4u));
                     if (!i) {
-                        CHECK(filtered_rows == 65 && filtered_build_maps == 2
-                            && filtered_probe_maps >= 2
+                        CHECK(filtered_rows == 65 && filtered_build_rows == 2
+                            && filtered_probe_rows >= 2
                             && filtered_scalar_owners == (domain ? 65u : 0u));
                         wl_columnar_join_test_attempt_checkpoint = NULL;
                         active = NULL; active_session = NULL;
@@ -1404,9 +1423,573 @@ filtered_generated_probes(unsigned domain)
             }
 }
 
+/* The public optimizer produces this SEMI; no compiled IR is rewritten. */
+static wl_session_t *natural_session;
+static wl_evaluation_control_t *natural_control;
+static unsigned natural_fault, natural_starts, natural_builds,
+    natural_rejected, natural_emits, natural_variant, natural_key_column;
+static bool natural_fired, natural_resumed;
+static uint64_t natural_stopped_id;
+static uint32_t natural_row_baseline, natural_row;
+static const wl_plan_op_t *natural_emitted, *natural_body;
+
+typedef struct {
+    unsigned positive, negative, calls;
+} natural_events_t;
+
+static unsigned
+natural_bit(int64_t x, int64_t z)
+{
+    return x == 1 && z == 9 ? 1u : x == 3 && z == 7 ? 2u
+        : x == 3 && z == 8 ? 4u : x == 2 && z == 6 ? 8u
+        : x == 4 && z == 5 ? 16u : 0;
+}
+
+static void
+natural_capture(const char *name, const int64_t *row, uint32_t width,
+    int32_t diff, void *data)
+{
+    if (strcmp(name, "output")) return;
+    natural_events_t *events = data;
+    CHECK(width == 2 && (diff == 1 || diff == -1));
+    unsigned bit = natural_bit(row[0], row[1]);
+    unsigned *mask = diff == 1 ? &events->positive : &events->negative;
+    CHECK(bit && !(*mask & bit));
+    *mask |= bit; ++events->calls;
+}
+
+static void
+natural_snapshot_callback(const char *name, const int64_t *row, uint32_t width,
+    void *data)
+{
+    (void)name; (void)row; (void)width;
+    ++*(unsigned *)data;
+}
+
+static void
+natural_content(wl_session_t *session, unsigned expected)
+{
+    const col_rel_t *out = session_find_rel((wl_col_session_t *)session,
+            "output");
+    CHECK(out && out->ncols == 2);
+    unsigned mask = 0;
+    for (uint32_t r = 0; r < out->nrows; ++r) {
+        unsigned bit = natural_bit(out->columns[0][r], out->columns[1][r]);
+        CHECK(bit && !(mask & bit)); mask |= bit;
+    }
+    CHECK(mask == expected);
+}
+
+static void
+natural_checkpoint(wl_evaluation_control_t *control, unsigned phase,
+    uint64_t progress)
+{
+    wl_col_session_t *col = (wl_col_session_t *)natural_session;
+    wl_columnar_eval_serial_framed_attempt_t *frame = NULL;
+    if (!col || !col->cleanup_active
+        || wl_columnar_eval_stack_framed_context(col->cleanup_active, col,
+        &frame))
+        return;
+    wl_columnar_filter_context_t *ctx = NULL;
+    if (wl_columnar_eval_stack_filter_context_owned(frame->child.frame,
+        &ctx, &frame->child) || !ctx->join_operation
+        || ctx->join_operation->op != WL_PLAN_OP_SEMIJOIN) return;
+    const wl_plan_op_t *op = ctx->join_operation;
+    CHECK(control == natural_control && ctx->control == control
+        && ctx->attempt_id == wl_evaluation_control_active_attempt_id(control)
+        && ctx->session == col && ctx->identity == ctx && ctx->thread_valid
+        && op->key_count == 1 && !op->project_count && !op->materialized
+        && !strcmp(op->right_relation, "c")
+        && (op == natural_emitted || op == natural_body
+        || (!strcmp(op->left_keys[0], natural_body->left_keys[0])
+        && !strcmp(op->right_keys[0], natural_body->right_keys[0]))));
+    if (phase == 1) {
+        ++natural_starts;
+        if (natural_stopped_id) {
+            CHECK(ctx->attempt_id != natural_stopped_id);
+            natural_resumed = true;
+        }
+    }
+    if (phase == 28) ++natural_builds;
+    if (phase == 29) {
+        CHECK(ctx->output && progress < ctx->source.nrows);
+        natural_row = (uint32_t)progress;
+        natural_row_baseline = ctx->output->nrows;
+    }
+    bool rejected = false;
+    if (phase == 31) {
+        CHECK(progress < ctx->source.nrows && op->left_keys[0]);
+        uint32_t key_column = UINT32_MAX;
+        for (uint32_t c = 0; c < ctx->source.width; ++c)
+            if (ctx->source.names && ctx->source.names[c]
+                && !strcmp(op->left_keys[0],
+                ctx->source.names[c])) key_column = c;
+        if (key_column == UINT32_MAX) {
+            unsigned encoded = UINT_MAX; char extra;
+            CHECK(sscanf(op->left_keys[0], "col%u%c", &encoded, &extra) == 1);
+            key_column = encoded;
+        }
+        CHECK(key_column < ctx->source.width);
+        int64_t w = ctx->source.columns[key_column][progress];
+        natural_key_column = key_column;
+        bool selected = natural_variant == 3
+            || ((natural_variant == 0 || natural_variant == 4)
+            && (w == 100 || w == 300));
+        rejected = !selected;
+        if (rejected) {
+            CHECK(natural_row == progress && ctx->output
+                && ctx->output->nrows == natural_row_baseline);
+            ++natural_rejected;
+        }
+    }
+    if (phase == 20) {
+        CHECK(ctx->output && ctx->output->nrows &&
+            progress == ctx->output->nrows
+            && natural_key_column < ctx->output->ncols);
+        int64_t w =
+            ctx->output->columns[natural_key_column][ctx->output->nrows - 1];
+        CHECK(w == 100 || w == 300 ||
+            (natural_variant == 3 && (w == 200 || w == 400)));
+        ++natural_emits;
+    }
+    if (!natural_fault || natural_fired
+        || (natural_fault <= 2 ? !rejected ||
+        phase != 31 : phase != 20)) return;
+    natural_fired = true;
+    if (natural_fault & 1) wl_evaluation_control_request_cancel(control);
+    else CHECK(wl_evaluation_control_charge(control, UINT64_MAX)
+            == WL_EVALUATION_CONTROL_WORK_LIMIT);
+}
+
+static void
+reset_checkpoint(wl_col_session_t *session, unsigned phase, size_t cursor,
+    bool after)
+{
+    if (&session->base != reset_session) return;
+    wl_columnar_session_step_reset_t *r = &session->controlled_step_reset;
+    if (phase == WL_COLUMNAR_SESSION_STEP_RESET_CLEAR && after
+        && r->phase == WL_COLUMNAR_SESSION_STEP_RESET_RESTORE) {
+        if (!reset_bytes) reset_bytes = cursor;
+        CHECK(cursor == reset_bytes);
+    }
+    if (!reset_fault || reset_fired || after != reset_after) return;
+    bool selected = false;
+    if (reset_target < 3 && phase == WL_COLUMNAR_SESSION_STEP_RESET_CLEAR) {
+        CHECK(reset_target == 0 || reset_bytes);
+        size_t byte = after ? cursor >= 64 ? cursor - 64 : 0 : cursor;
+        selected = reset_target == 0 ? !byte : reset_target == 1
+            ? byte == (reset_bytes / 128) * 64
+            : after ? r->phase == WL_COLUMNAR_SESSION_STEP_RESET_RESTORE
+            : byte + 64 >= reset_bytes;
+    } else if (reset_target < 6
+        && phase == WL_COLUMNAR_SESSION_STEP_RESET_RESTORE) {
+        selected = cursor == reset_target - 3 + (after ? 1u : 0u);
+    } else if (reset_target == 6
+        && phase == WL_COLUMNAR_SESSION_STEP_RESET_READY) selected = true;
+    if (!selected) return;
+    reset_fired = reset_recovery_pending = true;
+    CHECK(!*reset_event_calls);
+    /* This seam arms the real observation's cancel RMW, not a simulated
+     * action result. Before/after is relative to actual metadata progress. */
+    wl_evaluation_control_test_source_observation_cancel_at = 4;
+}
+
+static void
+reset_blocked_tuple(const char *relation, const int64_t *row, uint32_t width,
+    void *payload)
+{
+    (void)relation; (void)row; (void)width; (void)payload;
+    CHECK(false);
+}
+
+typedef struct {
+    wl_session_t *session;
+    int result;
+} reset_migration_t;
+
+static void *
+reset_migrate(void *payload)
+{
+    reset_migration_t *call = payload;
+    call->result = wl_session_step(call->session);
+    CHECK(!wl_session_source_operation_scope_owned(call->session));
+    return NULL;
+}
+
+static void
+reset_recover(wl_session_t *session, int rc)
+{
+    CHECK(rc == EAGAIN && reset_fired && !*reset_event_calls);
+    wl_col_session_t *col = COL_SESSION(session);
+    wl_columnar_session_step_reset_t *r = &col->controlled_step_reset;
+    CHECK((r->identity == r && r->target == col->controlled_step)
+        || (reset_target == 6 && reset_after && !r->identity
+        && r->phase == WL_COLUMNAR_SESSION_STEP_RESET_NONE));
+    size_t byte = r->byte; unsigned restore = r->restore;
+    wl_evaluation_control_report_t original, after, source;
+    CHECK(!wl_evaluation_control_report(session->evaluation_control,
+        &original));
+    uint64_t id =
+        wl_evaluation_control_active_attempt_id(session->evaluation_control);
+    uint64_t used = 0;
+    if (id) CHECK(!wl_evaluation_control_test_active_consumed(
+                session->evaluation_control, id, &used));
+    const int64_t blocked[] = {999, 999};
+    CHECK(wl_session_insert(session, "c", blocked, 1, 2) == EBUSY
+        && wl_session_remove(session, "c", blocked, 1, 2) == EBUSY
+        && wl_session_snapshot(session, reset_blocked_tuple, NULL) == EBUSY);
+    if (r->identity) {
+        CHECK(session->backend->session_insert(session, "c", blocked, 1,
+            2) == EBUSY
+            && session->backend->session_insert(session, "c", blocked, 0,
+            2) == EBUSY
+            && session->backend->session_remove(session, "c", blocked, 1,
+            2) == EBUSY
+            && session->backend->session_remove(session, "c", blocked, 0,
+            2) == EBUSY
+            && col_session_insert_incremental(session, "c", blocked, 1,
+            2) == EBUSY);
+        wirelog_on_delta_fn callback = col->delta_cb;
+        void *data = col->delta_data;
+        session->backend->session_set_delta_cb(session, NULL, NULL);
+        CHECK(col->delta_cb == callback && col->delta_data == data);
+        wirelog_compound_arg_t argument = {WIRELOG_TYPE_INT64, 999};
+        uint64_t handle = UINT64_MAX;
+        CHECK(session->backend->session_make_compound(session, "blocked", 1,
+            &argument, &handle) == EBUSY
+            && handle == WIRELOG_COMPOUND_HANDLE_NULL);
+        wl_col_session_t *copy = malloc(sizeof(*copy)); CHECK(copy);
+        wl_columnar_session_copy_without_ledger(copy, col);
+        CHECK(!copy->controlled_step && !copy->controlled_step_reset.identity
+            && copy->controlled_step_reset.phase ==
+            WL_COLUMNAR_SESSION_STEP_RESET_NONE
+            && !copy->controlled_step_reset.busy
+            && !copy->controlled_step_reset.thread_valid
+            && !copy->destroy_prepared && !copy->destroy_controlled_prepared
+            && !wl_columnar_session_controlled_batch_authorized(copy,
+            session->evaluation_control, id, r->operation_identity, NULL,
+            NULL));
+        free(copy);
+    }
+    wl_session_t *slot = session;
+    CHECK(wl_session_try_destroy(&slot) == EBUSY && slot == session);
+    CHECK(session_find_rel(col, "output") == reset_head
+        && wl_columnar_relation_snapshot_equal(reset_head_snapshot,
+        wl_columnar_relation_snapshot(reset_head))
+        && r->byte == byte && r->restore == restore && !*reset_event_calls);
+    CHECK(!wl_session_test_source_unstarted_reset_cancel(session, &source)
+        && source.result == WL_EVALUATION_CONTROL_CANCELLED
+        && source.consumed == 10);
+    CHECK(!wl_evaluation_control_report(session->evaluation_control, &after)
+        && after.attempt_id == original.attempt_id
+        && after.limit == original.limit && after.consumed == original.consumed
+        && after.stop_reason == original.stop_reason
+        && after.execution_status == original.execution_status
+        && after.cleanup_status == original.cleanup_status
+        && after.result == original.result
+        && wl_evaluation_control_active_attempt_id(
+            session->evaluation_control) == id);
+    if (id) {
+        uint64_t current = 0;
+        CHECK(!wl_evaluation_control_test_active_consumed(
+                session->evaluation_control, id, &current) && current == used);
+    }
+    reset_recovery_pending = false;
+    if (r->identity && r->phase < WL_COLUMNAR_SESSION_STEP_RESET_READY) {
+        /* No Native actor lease survives the arm proof. A different actual
+         * thread may perform one metadata-only packet, retaining Original. */
+        reset_migration_t call = {session, EIO};
+        wl_thread_t thread;
+        CHECK(!wl_thread_create(&thread, reset_migrate, &call)
+            && !wl_thread_join(&thread) && call.result == EAGAIN
+            && !*reset_event_calls
+            && wl_evaluation_control_active_attempt_id(
+                session->evaluation_control) == id);
+        if (id) {
+            uint64_t current = 0;
+            CHECK(!wl_evaluation_control_test_active_consumed(
+                    session->evaluation_control, id,
+                    &current) && current == used);
+        }
+    }
+}
+
+static void
+natural_generated_semi(bool batched)
+{
+    for (unsigned variant = 0; variant < (reset_enabled ? 1u : 5u); ++variant)
+        for (unsigned fault = 0;
+            fault < (reset_enabled ? 1u : variant ? 1u : 5u); ++fault) {
+            wirelog_error_t error;
+            wirelog_program_t *program = wirelog_parse_string(
+                ".decl a(x:int64,y:int64)\n.decl b(y:int64,w:int64)\n"
+                ".decl c(w:int64,z:int64)\n.decl output(x:int64,z:int64)\n"
+                "output(x,z):-a(x,y),b(y,w),c(w,z).\n", &error);
+            CHECK(program);
+            wirelog_opt_config_t config = {0};
+            config.enable_semijoin = true; config.max_join_search_space = 1024;
+            CHECK(wirelog_optimize_with_config(program, &config, &error));
+            wl_plan_t *plan = NULL;
+            CHECK(!wl_plan_from_program(program, &plan));
+            natural_emitted = natural_body = NULL;
+            for (uint32_t st = 0; st < plan->stratum_count; ++st)
+                for (uint32_t r = 0; r < plan->strata[st].relation_count; ++r) {
+                    const wl_plan_relation_t *rel =
+                        &plan->strata[st].relations[r];
+                    for (uint32_t o = 0; o < rel->op_count; ++o)
+                        if (rel->ops[o].op == WL_PLAN_OP_SEMIJOIN) {
+                            CHECK(!natural_emitted);
+                            natural_emitted = &rel->ops[o];
+                        }
+                    if (plan->strata[st].bodies) {
+                        const wl_plan_body_t *body =
+                            &plan->strata[st].bodies[r];
+                        for (uint32_t o = 0; o < body->op_count; ++o)
+                            if (body->ops[o].op == WL_PLAN_OP_SEMIJOIN) {
+                                CHECK(!natural_body);
+                                natural_body = &body->ops[o];
+                            }
+                    }
+                }
+            CHECK(natural_emitted && natural_body
+                && natural_emitted->key_count == 1 &&
+                !natural_emitted->project_count
+                && !natural_emitted->materialized
+                && !strcmp(natural_emitted->right_relation, "c"));
+            wl_evaluation_control_t *control = NULL;
+            /* Generous host allowance; independent primitive exact/one-short
+             * tariffs are tested separately and are not inferred from this. */
+            CHECK(!wl_evaluation_control_create(UINT64_C(10000000), &control));
+            wl_columnar_memory_resolution_t resolution = {
+                .budget_bytes = UINT64_C(128) << 20,
+                    .usable_bytes = UINT64_C(128) << 20,
+                    .mode = WL_COLUMNAR_MEMORY_MODE_ENFORCING
+            };
+            wl_columnar_memory_governor_ref_t *governor =
+                wl_columnar_memory_governor_ref_create(&resolution);
+            CHECK(governor);
+            wl_session_options_t options; wl_session_options_init(&options);
+            options.evaluation_control = control;
+            options.memory_governor = governor;
+            wl_session_t *sessions[2] = {NULL, NULL};
+            CHECK(!wl_session_create_with_options(wl_backend_columnar(), plan,
+                1,
+                &options, &sessions[0])
+                && !wl_session_create(wl_backend_columnar(), plan, 1,
+                &sessions[1]));
+            const int64_t a[] = {1, 10, 2, 20, 3, 30, 4, 40};
+            const int64_t b[] = {10, 100, 20, 200, 30, 300, 40, 400};
+            const int64_t seed[] = {100, 9, 300, 7, 300, 8, 300, 7};
+            const int64_t absent[] = {500, 1};
+            const int64_t all[] = {100, 9, 200, 6, 300, 7, 400, 5};
+            const int64_t *right = variant == 2 ? absent : variant ==
+                3 ? all : seed;
+            uint32_t count = variant == 1 ? 0 : variant == 2 ? 1
+                : variant == 3 || variant == 4 ? 4 : 3;
+            unsigned expected = variant == 1 || variant == 2 ? 0
+                : variant == 3 ? 27 : 7;
+            for (unsigned i = 0; i < 2; ++i) {
+                wl_session_t *session = sessions[i];
+                wl_col_session_t *col = (wl_col_session_t *)session;
+                col->join_batch_bytes = batched ? 256 : 0;
+                if (reset_enabled && !i) CHECK(session->source_c1_admission);
+                CHECK(!wl_session_insert(session, "a", a, 4, 2)
+                    && !wl_session_insert(session, "b", b, 4, 2)
+                    && !wl_session_insert(session, "c", right, count, 2));
+                natural_events_t events = {0};
+                wl_session_set_delta_cb(session, natural_capture, &events);
+                if (!i) {
+                    natural_session = session; natural_control = control;
+                    natural_fault = fault; natural_fired = false;
+                    natural_variant = variant;
+                    natural_stopped_id = 0; natural_resumed = false;
+                    natural_starts = natural_builds = natural_rejected =
+                        natural_emits = 0;
+                    wl_columnar_join_test_attempt_checkpoint =
+                        natural_checkpoint;
+                }
+                const char *inputs[] = {"a", "b", "c"};
+                col_relation_snapshot_t input_before[3];
+                for (unsigned input = 0; input < 3; ++input)
+                    input_before[input] = wl_columnar_relation_snapshot(
+                        session_find_rel(col, inputs[input]));
+                uint64_t reserved_before = wl_columnar_memory_reserved(
+                    wl_columnar_memory_governor_ref_get(governor));
+                int rc = finish(session);
+                if (!i && fault) {
+                    wl_evaluation_control_report_t stopped_report;
+                    CHECK(!wl_evaluation_control_report(control,
+                        &stopped_report));
+                    for (unsigned input = 0; input < 3; ++input)
+                        CHECK(wl_columnar_relation_snapshot_equal(
+                                input_before[input],
+                                wl_columnar_relation_snapshot(session_find_rel(
+                                    col,
+                                    inputs[input]))));
+                    CHECK(col->pending_input_change);
+                    bool retained_work = batched && !(fault & 1);
+                    if (retained_work) {
+                        uint64_t owner[8], producer[6];
+                        CHECK(!wl_columnar_session_test_retained_work_owner(col,
+                            owner)
+                            && owner[0] && owner[1] && owner[2] && owner[3] == 8
+                            && owner[6] && owner[7]);
+                        CHECK(!wl_columnar_session_test_producer_view(col,
+                            producer)
+                            && producer[2] && producer[0] == producer[1]);
+                        CHECK(session->backend->session_controlled_step_state(
+                                session)
+                            == WL_CONTROLLED_STEP_PENDING);
+                        const int64_t denied[] = {5, 50};
+                        CHECK(wl_session_insert(session, "a", denied, 1,
+                            2) == EBUSY
+                            && wl_session_remove(session, "a", a, 1,
+                            2) == EBUSY);
+                        unsigned snapshot_calls = 0;
+                        CHECK(wl_session_snapshot(session,
+                            natural_snapshot_callback,
+                            &snapshot_calls) == EBUSY && !snapshot_calls);
+                        wl_session_t *same = session;
+                        CHECK(wl_session_try_destroy(&same) == EBUSY &&
+                            same == session);
+                        /* The genuine parent owns its private image/metadata.
+                         * No byte tolerance or refund is inferred from WORK. */
+                    } else CHECK(wl_columnar_memory_reserved(
+                                wl_columnar_memory_governor_ref_get(
+                                    governor)) == reserved_before);
+                    CHECK(natural_fired && !events.calls &&
+                        !session_find_rel(col, "output")
+                        && rc == (fault & 1 ? WL_EVALUATION_CONTROL_CANCELLED
+                        : WL_EVALUATION_CONTROL_WORK_LIMIT));
+                    wl_evaluation_control_report_t report;
+                    CHECK(!wl_evaluation_control_report(control, &report)
+                        && report.result == rc && report.consumed
+                        && !wl_evaluation_control_active_attempt_id(control)
+                        && !col->cleanup_active && !col->cleanup_pending
+                        && !col->cleanup_reserved_bytes);
+                    CHECK(report.attempt_id == stopped_report.attempt_id
+                        && report.limit == stopped_report.limit
+                        && report.consumed == stopped_report.consumed
+                        && report.stop_reason == stopped_report.stop_reason
+                        && report.execution_status ==
+                        stopped_report.execution_status
+                        && report.cleanup_status ==
+                        stopped_report.cleanup_status
+                        && report.result == stopped_report.result);
+                    natural_stopped_id = report.attempt_id;
+                    CHECK(!wl_evaluation_control_reset(control));
+                    natural_fault = 0;
+                    natural_starts = natural_builds = natural_rejected =
+                        natural_emits = 0;
+                    rc = finish(session);
+                    CHECK(natural_resumed);
+                }
+                CHECK(!rc && events.positive == expected && !events.negative);
+                if (!i) {
+                    CHECK(natural_starts && (!count || natural_builds)
+                        && (!expected || natural_emits));
+                    if (!variant || variant == 4) CHECK(natural_rejected);
+                    wl_columnar_join_test_attempt_checkpoint = NULL;
+                    natural_session = NULL; natural_control = NULL;
+                }
+                natural_content(session, expected);
+                wl_mem_ledger_snapshot_t before, after;
+                wl_mem_ledger_snapshot(&col->mem_ledger, &before);
+                unsigned old_calls = events.calls;
+                uint64_t complete_reserved = wl_columnar_memory_reserved(
+                    wl_columnar_memory_governor_ref_get(governor));
+                CHECK(!finish(session) && events.calls == old_calls
+                    && complete_reserved == wl_columnar_memory_reserved(
+                        wl_columnar_memory_governor_ref_get(governor)));
+                wl_mem_ledger_snapshot(&col->mem_ledger, &after);
+                CHECK(before.current_bytes == after.current_bytes);
+                if (!variant) {
+                    events = (natural_events_t){0};
+                    const int64_t added[] = {200, 6}, removed[] = {300, 7};
+                    if (reset_enabled && !i) {
+                        reset_session = session;
+                        reset_head = session_find_rel(col, "output");
+                        CHECK(reset_head);
+                        reset_head_snapshot =
+                            wl_columnar_relation_snapshot(reset_head);
+                        reset_event_calls = &events.calls;
+                        reset_fired = reset_recovery_pending = false;
+                        wl_columnar_session_test_step_reset_phase =
+                            reset_checkpoint;
+                    }
+                    CHECK(!wl_session_insert(session, "c", added, 1, 2)
+                        && !finish(session));
+                    CHECK(events.positive == 8 && !events.negative &&
+                        events.calls == 1);
+                    natural_content(session, 15);
+                    if (reset_enabled && !i) {
+                        CHECK(!reset_recovery_pending &&
+                            (reset_fired == reset_fault));
+                        wl_columnar_session_test_step_reset_phase = NULL;
+                        reset_session = NULL;
+                    }
+                    events = (natural_events_t){0};
+                    CHECK(!wl_session_remove(session, "c", removed, 1, 2)
+                        && !finish(session));
+                    CHECK(!events.positive && events.negative == 2 &&
+                        events.calls == 1);
+                    natural_content(session, 13);
+                }
+                CHECK(!wl_session_try_destroy(&sessions[i]) && !sessions[i]);
+            }
+            wl_evaluation_control_release(control); wl_plan_free(plan);
+            wirelog_program_free(program);
+            natural_emitted = natural_body = NULL;
+            CHECK(!wl_columnar_memory_reserved(
+                    wl_columnar_memory_governor_ref_get(governor)));
+            wl_columnar_memory_governor_ref_release(governor);
+        }
+}
+
 int
 main(int argc, char **argv)
 {
+    if (argc == 2 && !strcmp(argv[1], "reset-envelope")) {
+        reset_enabled = true;
+        /* Select the real configured constructor route. Setting the batch
+         * field after construction does not activate its Source owner. */
+        const char *old_value = getenv("WIRELOG_JOIN_BATCH_BYTES");
+        char *saved = NULL;
+        if (old_value) {
+            saved = malloc(strlen(old_value) + 1); CHECK(saved);
+            memcpy(saved, old_value, strlen(old_value) + 1);
+        }
+#if defined(_WIN32)
+        CHECK(!_putenv_s("WIRELOG_JOIN_BATCH_BYTES", "256"));
+#else
+        CHECK(!setenv("WIRELOG_JOIN_BATCH_BYTES", "256", 1));
+#endif
+        {
+            reset_fault = false;
+            natural_generated_semi(true);
+            CHECK(reset_bytes >= 128);
+            reset_fault = true;
+            for (reset_target = 0; reset_target != 7; ++reset_target)
+                for (unsigned after = 0; after != 2; ++after) {
+                    reset_after = after != 0;
+                    natural_generated_semi(true);
+                }
+        }
+#if defined(_WIN32)
+        CHECK(!_putenv_s("WIRELOG_JOIN_BATCH_BYTES", saved ? saved : ""));
+#else
+        CHECK(saved ? !setenv("WIRELOG_JOIN_BATCH_BYTES", saved, 1)
+            : !unsetenv("WIRELOG_JOIN_BATCH_BYTES"));
+#endif
+        free(saved);
+        return 0;
+    }
+    if (argc == 2 && !strcmp(argv[1], "natural-semi")) {
+        natural_generated_semi(false); return 0;
+    }
+    if (argc == 2 && !strcmp(argv[1], "natural-semi-batch")) {
+        natural_generated_semi(true); return 0;
+    }
     if (argc == 2 && !strcmp(argv[1], "filtered-numeric")) {
         filtered_generated_probes(0); return 0;
     }

@@ -1707,7 +1707,9 @@ wl_columnar_eval_plan_source_hold(wl_columnar_eval_plan_numeric_attempt_t *r)
 {
     /* The scalar reader also admits an INLINE EDB (#2301). */
     if (!r->source_bare)
-        return wl_columnar_relation_scalar_source_admit_retained_attempt_controlled(
+        return
+            wl_columnar_relation_scalar_source_admit_retained_attempt_controlled
+            (
             &r->source, r->source_selected, !r->source_empty,
             WL_COLUMNAR_RELATION_SOURCE_ADMIT_INLINE);
     bool done = false;

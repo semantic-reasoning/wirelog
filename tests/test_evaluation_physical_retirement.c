@@ -38,7 +38,76 @@ static uint64_t ledger_bytes(wl_mem_ledger_t *l)
     return s.current_bytes;
 }
 
-static void retirement(uint32_t width, bool governed, unsigned ledger_mode)
+static void
+staged_ledger(wl_columnar_relation_scalar_retirement_t *s,
+    wl_evaluation_control_t *c, wl_mem_ledger_t *ledger,
+    wl_columnar_memory_governor_ref_t *g)
+{
+    wl_columnar_mem_ledger_retirement_journal_t journal = {0};
+    uint64_t credit = reserved(g), before = ledger_bytes(ledger);
+    unsigned attempts = 0, acks = 0;
+    bool ack_refused = false, empty_refused = false;
+    bool billed = s->ledger && (s->ledger_bytes || s->ledger_timestamp_bytes);
+    for (unsigned turn = 0; s->phase == 12; ++turn) {
+        /* Three commit outcomes, each DESC/COMMIT/refusedACK/ACK, plus the
+         * no-ledger exact/one-short metadata alternative. */
+        CHECK(turn < 16);
+        wl_columnar_mem_ledger_description_t *d = &journal.description;
+        bool commit = d->phase == WL_COLUMNAR_MEM_LEDGER_DESCRIPTION_DESCRIBED;
+        bool ack = d->phase == WL_COLUMNAR_MEM_LEDGER_DESCRIPTION_CONSUMED;
+        uint64_t limit = !billed ? (empty_refused ? 128 : 127)
+            : commit ? (attempts == 0 ? 165 : attempts == 1 ? 193 : 194)
+            : ack ? (ack_refused ? 128 : 127) : 109;
+        restart(c, limit);
+        uint64_t id = wl_evaluation_control_active_attempt_id(c);
+        wl_evaluation_control_report_t captured = journal.report;
+        int rc = wl_columnar_relation_scalar_retirement_ledger_step_described(
+            s, &journal, &owner, c, id);
+        CHECK(rc == EAGAIN || rc == WL_EVALUATION_CONTROL_WORK_LIMIT);
+        CHECK(reserved(g) == credit && s->storage.relation);
+        if (commit) {
+            CHECK(d->phase == WL_COLUMNAR_MEM_LEDGER_DESCRIPTION_CONSUMED
+                && d->attempted_id == id && d->applied == (attempts == 2));
+            if (attempts < 2) CHECK(ledger_bytes(ledger) == before);
+            else {
+                CHECK(ledger_bytes(ledger) == 37);
+                wl_evaluation_control_request_cancel(c);
+                CHECK(wl_evaluation_control_charge_attempt(c, id, 0)
+                    == WL_EVALUATION_CONTROL_CANCELLED);
+            }
+            ++attempts;
+        } else if (ack) {
+            CHECK(!memcmp(&captured, &journal.report, sizeof(captured)));
+            if (!ack_refused) {
+                CHECK(rc == WL_EVALUATION_CONTROL_WORK_LIMIT
+                    && journal.report_valid && s->phase == 12);
+                ack_refused = true;
+            } else {
+                CHECK(!journal.report_valid && !d->identity);
+                ack_refused = false; ++acks;
+            }
+        } else if (!billed) empty_refused = true;
+        int financial = wl_evaluation_control_finish(c, &owner, 0, 0);
+        CHECK(!financial || financial == WL_EVALUATION_CONTROL_WORK_LIMIT
+            || financial == WL_EVALUATION_CONTROL_CANCELLED);
+        if (commit) {
+            CHECK(!wl_columnar_mem_ledger_retirement_capture_owned(&journal,
+                &owner, c, id));
+            CHECK(journal.report.consumed == (attempts == 1 ? 0
+                : attempts == 2 ? 166 : 194));
+        }
+    }
+    CHECK(s->phase == 10 && s->storage.relation
+        && !s->storage.relation->mem_ledger
+        && !s->storage.relation->ledger_ts_bytes
+        && !s->ledger && !s->ledger_bytes && !s->ledger_timestamp_bytes
+        && !journal.description.identity && !journal.report_valid
+        && (!billed || (attempts == 3 && acks == 3))
+        && ledger_bytes(ledger) == 37 && reserved(g) == credit);
+}
+
+static void retirement(uint32_t width, bool governed, unsigned ledger_mode,
+    bool described)
 {
     wl_columnar_memory_resolution_t resolution =
     {.budget_bytes = WL_COLUMNAR_MEMORY_MIN_BUDGET,
@@ -141,6 +210,8 @@ static void retirement(uint32_t width, bool governed, unsigned ledger_mode)
     CHECK(wl_columnar_relation_scalar_retirement_cancel(&receipt) == EINVAL);
     bool freed_ts = false, stopped_after_free = false; turns = 0;
     do{
+        if (described && receipt.phase == 12)
+            staged_ledger(&receipt, c, &ledger, g);
         bool timestamp_stage = receipt.phase == 14;
         restart(c, (receipt.storage.relation && receipt.phase != 12)
             || turns%2 ? 1 : 4096);
@@ -299,6 +370,18 @@ static const void *init_parent;
 static scalar_t *init_scalar;
 static col_rel_t *init_relation;
 static unsigned init_hooks[5];
+static bool init_cancel_after;
+static unsigned init_after_stops;
+
+static void
+init_after_step(initializer_t *i, wl_evaluation_control_t *c)
+{
+    CHECK(i->identity == i && i->busy);
+    if (!init_cancel_after) return;
+    init_cancel_after = false;
+    ++init_after_stops;
+    wl_evaluation_control_request_cancel(c);
+}
 
 static wl_evaluation_control_t *init_control(uint64_t limit)
 {
@@ -423,6 +506,9 @@ static void bounded_initializer(void)
         memset(init_hooks, 0, sizeof(init_hooks));
         wl_columnar_relation_scalar_retirement_init_test_checkpoint =
             init_reentry;
+        init_after_stops = 0;
+        wl_columnar_relation_scalar_retirement_init_test_after_step =
+            init_after_step;
         uint64_t consumed;
         CHECK(init_turn(&i, &parent, &s, r, 1, 127,
             &consumed) == WL_EVALUATION_CONTROL_WORK_LIMIT
@@ -446,16 +532,48 @@ static void bounded_initializer(void)
         CHECK(init_turn(&i, &parent, &s, r, 2, 255,
             &consumed) == WL_EVALUATION_CONTROL_WORK_LIMIT
             && !consumed && i.phase == WL_COLUMNAR_RELATION_SCALAR_INIT_ZERO);
-        CHECK(!init_turn(&i, &parent, &s, r, 2, 256,
-            &consumed) && consumed == 256
-            && i.phase == WL_COLUMNAR_RELATION_SCALAR_INIT_BIND &&
-            !s.storage.identity);
+        for (size_t offset = 0; offset < sizeof(s);) {
+            initializer_t unchanged = i;
+            scalar_t untouched = s;
+            CHECK(init_turn(&i, &parent, &s, r, 2, 255, &consumed)
+                == WL_EVALUATION_CONTROL_WORK_LIMIT && !consumed
+                && !memcmp(&i, &unchanged, sizeof(i))
+                && !memcmp(&s, &untouched, sizeof(s)));
+            size_t count = sizeof(s)-offset;
+            if (count > 64) count = 64;
+            bool stop = !offset || offset == 7*64 || offset+count == sizeof(s);
+            init_cancel_after = stop;
+            CHECK(init_turn(&i, &parent, &s, r, 2, 256, &consumed)
+                == (stop ? WL_EVALUATION_CONTROL_CANCELLED : 0)
+                && !init_cancel_after
+                && consumed == 256 && i.zero_offset == offset+count);
+            offset += count;
+            const unsigned char *bytes = (const unsigned char *)&s;
+            for (size_t byte = 0; byte < sizeof(s); ++byte)
+                CHECK(bytes[byte] == (byte < offset ? 0 : 0xa5));
+        }
+        CHECK(i.phase == WL_COLUMNAR_RELATION_SCALAR_INIT_TOKENS
+            && !s.storage.identity);
+        for (unsigned token = 0; token < 4; ++token) {
+            CHECK(init_turn(&i, &parent, &s, r, 2, 191, &consumed)
+                == WL_EVALUATION_CONTROL_WORK_LIMIT && !consumed
+                && i.token_index == token && !s.storage.identity);
+            init_cancel_after = true;
+            CHECK(init_turn(&i, &parent, &s, r, 2, 192, &consumed)
+                == WL_EVALUATION_CONTROL_CANCELLED && !init_cancel_after
+                && consumed == 192 && i.token_index == token+1
+                && !s.storage.identity);
+        }
+        CHECK(i.phase == WL_COLUMNAR_RELATION_SCALAR_INIT_BIND);
         CHECK(init_turn(&i, &parent, &s, r, 2, 191,
             &consumed) == WL_EVALUATION_CONTROL_WORK_LIMIT
             && !consumed && !s.storage.identity);
-        CHECK(!init_turn(&i, &parent, &s, r, 2, 192,
-            &consumed) && consumed == 192
-            && i.phase == WL_COLUMNAR_RELATION_SCALAR_INIT_DONE);
+        init_cancel_after = true;
+        CHECK(init_turn(&i, &parent, &s, r, 2, 192,
+            &consumed) == WL_EVALUATION_CONTROL_CANCELLED
+            && !init_cancel_after && consumed == 192
+            && i.phase == WL_COLUMNAR_RELATION_SCALAR_INIT_DONE
+            && init_after_stops == 8);
         bool parent_begun = true; /* Actual handoff survives reset refusal. */
         CHECK(init_turn(&i, &parent, &s, r, 3, 127,
             &consumed) == WL_EVALUATION_CONTROL_WORK_LIMIT
@@ -472,6 +590,7 @@ static void bounded_initializer(void)
             ledger_bytes(&ledger) == baseline_ledger);
         for (unsigned api = 1; api <= 4; ++api) CHECK(init_hooks[api]);
         wl_columnar_relation_scalar_retirement_init_test_checkpoint = NULL;
+        wl_columnar_relation_scalar_retirement_init_test_after_step = NULL;
         wl_evaluation_control_t *c = init_control(0);
         uint64_t id = wl_evaluation_control_active_attempt_id(c);
         int rc; do {
@@ -493,8 +612,12 @@ static void bounded_initializer(void)
         memset(&s, 0, sizeof(s));
         /* A fresh actual initialization of the same exclusively owned target. */
         CHECK(!init_turn(&i, &parent, &s, r, 1, 128, NULL));
-        CHECK(!init_turn(&i, &parent, &s, r, 2, 256, NULL));
-        CHECK(!init_turn(&i, &parent, &s, r, 2, 192, NULL));
+        for (unsigned turn = 0;
+            i.phase != WL_COLUMNAR_RELATION_SCALAR_INIT_DONE; ++turn) {
+            CHECK(turn < 1000 && !init_turn(&i, &parent, &s, r, 2,
+                i.phase == WL_COLUMNAR_RELATION_SCALAR_INIT_ZERO ? 256 : 192,
+                NULL));
+        }
         CHECK(!init_turn(&i, &parent, &s, r, 3, 128, NULL));
         do {
             rc = wl_columnar_relation_scalar_retirement_prepare(&s, c, id);
@@ -516,7 +639,10 @@ int main(void)
     for (unsigned w = 0; w < 4; ++w)for (unsigned governed = 0; governed < 2;
             ++governed)
             for (unsigned ledger = 0; ledger < 3;
-                ++ledger) retirement(widths[w], governed, ledger);
+                ++ledger) retirement(widths[w], governed, ledger, false);
+    for (unsigned governed = 0; governed < 2; ++governed)
+        for (unsigned ledger = 0; ledger < 3; ++ledger)
+            retirement(3, governed, ledger, true);
     deferred_projection(); malformed();
     puts(
         "physical retirement: reversible ownership, timestamp disposal and exact ledger credit passed");

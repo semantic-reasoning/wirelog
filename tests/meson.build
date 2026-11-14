@@ -195,6 +195,7 @@ testlib_prod_src = files(
     '../wirelog/wirelog_advanced.c',
   ) + thread_src
 testlib_prod_c_args = ['-DWL_SESSION_TEST_HOOKS=1', '-DWL_TDD_CHANNEL_TEST_HOOKS=1',
+                       '-DWL_SESSION_RETAINED_TEST_HOOKS=1',
                        '-DWL_TEST_RELATION_RESIZE_HOOK=1',
                        '-DWL_COLUMNAR_MEM_LEDGER_PUBLICATION_TEST_HOOKS=1',
                        '-DWL_TEST_JOIN_CACHE_HOOK=1',
@@ -3443,6 +3444,20 @@ test_plan_body_ops_exe = executable(
 )
 
 test('plan_body_ops', test_plan_body_ops_exe)
+
+test_evaluation_materialized_body_exe = executable(
+  'test_evaluation_materialized_body', files('test_evaluation_materialized_body.c'),
+  c_args: ['-DWL_SESSION_TEST_HOOKS=1'],
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
+  link_with: [testlib_prod],
+  install: false,
+)
+foreach materialized_body_mode : ['plain', 'batch', 'strict', 'limit', 'limit-denied', 'batch-cancel', 'batch-work', 'batch-ended', 'batch-successor', 'batch-error-ended']
+  test('evaluation_materialized_body_' + materialized_body_mode,
+       test_evaluation_materialized_body_exe, args: [materialized_body_mode],
+       suite: ['unit', 'tsan', 'evaluation_join_hosts'], timeout: 60)
+endforeach
 
 test_tdd_insert_manifest_exe = executable(
   'test_tdd_insert_manifest',
@@ -6780,6 +6795,39 @@ test_evaluation_source_finance_exe = executable(
 test('evaluation_source_finance', test_evaluation_source_finance_exe,
      suite: ['unit', 'tsan'], timeout: 60)
 
+test_session_source_unstarted_exe = executable(
+  'test_session_source_unstarted', files('test_session_source_unstarted.c'),
+  c_args: ['-DWL_SESSION_TEST_HOOKS=1'],
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
+  link_with: [testlib_prod],
+  install: false,
+)
+test('session_source_unstarted', test_session_source_unstarted_exe,
+     suite: ['unit', 'tsan'], timeout: 60)
+
+test_session_destroy_prepare_exe = executable(
+  'test_session_destroy_prepare', files('test_session_destroy_prepare.c'),
+  c_args: ['-DWL_SESSION_TEST_HOOKS=1'],
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
+  link_with: [testlib_prod],
+  install: false,
+)
+test('session_destroy_prepare', test_session_destroy_prepare_exe,
+     suite: ['unit', 'tsan'], timeout: 60)
+
+test_session_reset_turnover_exe = executable(
+  'test_session_reset_turnover', files('test_session_reset_turnover.c'),
+  c_args: ['-DWL_SESSION_TEST_HOOKS=1'],
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
+  link_with: [testlib_prod],
+  install: false,
+)
+test('session_reset_turnover', test_session_reset_turnover_exe,
+     suite: ['unit', 'tsan'], timeout: 60)
+
 # Genuine generations and condition-variable ordered stale-footer histories.
 test_evaluation_attempt_identity_exe = executable(
   'test_evaluation_attempt_identity',
@@ -7007,8 +7055,9 @@ test_evaluation_observer_resources_exe = executable(
   c_args: ['-DWL_SESSION_TEST_HOOKS=1', '-DWL_COLUMNAR_MEMORY_TEST_HOOKS=1'],
   link_with: [testlib_prod_memory_hooks],
 )
+# The complete retirement/refusal matrix takes about 127s under ASan.
 test('evaluation_observer_resources', test_evaluation_observer_resources_exe,
-     suite: ['unit', 'tsan'], timeout: 120)
+     suite: ['unit', 'tsan'], timeout: 180)
 
 test('evaluation_join_prepared_auto_domains', test_evaluation_join_prepared_auto_exe,
      env: ['WIRELOG_JOIN_BATCH_BYTES=', 'WIRELOG_JOIN_BATCH_STRICT='],
@@ -7016,12 +7065,54 @@ test('evaluation_join_prepared_auto_domains', test_evaluation_join_prepared_auto
 
 test('evaluation_serial', test_evaluation_serial_exe,
      suite: ['unit', 'tsan'], timeout: 120)
+test('evaluation_observer_error_metadata', test_evaluation_serial_exe,
+     args: ['--observer-error-metadata'],
+     env: ['WIRELOG_JOIN_BATCH_BYTES=', 'WIRELOG_JOIN_BATCH_STRICT='],
+     suite: ['unit', 'tsan'], timeout: 120)
+test('evaluation_prepared_close_validation', test_evaluation_serial_exe,
+     args: ['--staging-native-recovery'],
+     env: ['WIRELOG_JOIN_BATCH_BYTES=', 'WIRELOG_JOIN_BATCH_STRICT='],
+     suite: ['unit', 'tsan'], timeout: 60)
+test('evaluation_frontier_original_stops', test_evaluation_serial_exe,
+     args: ['--frontier-original-stops'],
+     env: ['WIRELOG_JOIN_BATCH_BYTES=', 'WIRELOG_JOIN_BATCH_STRICT='],
+     suite: ['unit', 'tsan'], timeout: 120)
+test('evaluation_frontier_main_stops', test_evaluation_serial_exe,
+     args: ['--frontier-main-stops'],
+     env: ['WIRELOG_JOIN_BATCH_BYTES=', 'WIRELOG_JOIN_BATCH_STRICT='],
+     suite: ['unit', 'tsan'], timeout: 120)
+test('evaluation_recursive_transaction_stops', test_evaluation_serial_exe,
+     args: ['--recursive-transaction-stops'],
+     env: ['WIRELOG_JOIN_BATCH_BYTES=', 'WIRELOG_JOIN_BATCH_STRICT='],
+     suite: ['unit', 'tsan'], timeout: 120)
+test('evaluation_recursive_post_finish_metadata', test_evaluation_serial_exe,
+     args: ['--recursive-post-finish-metadata'],
+     env: ['WIRELOG_JOIN_BATCH_BYTES=', 'WIRELOG_JOIN_BATCH_STRICT='],
+     suite: ['unit', 'tsan'], timeout: 120)
+test('evaluation_recursive_watchdog_policy', test_evaluation_serial_exe,
+     args: ['--recursive-watchdog-policy'],
+     suite: ['unit', 'tsan'], timeout: 30)
+test('evaluation_recursive_successor_work', test_evaluation_serial_exe,
+     args: ['--recursive-successor-work'],
+     env: ['WIRELOG_JOIN_BATCH_BYTES=', 'WIRELOG_JOIN_BATCH_STRICT='],
+     suite: ['unit', 'tsan'], timeout: 120)
+test('evaluation_recursive_single_join_work', test_evaluation_serial_exe,
+     args: ['--recursive-single-join-work'],
+     env: ['WIRELOG_JOIN_BATCH_BYTES=', 'WIRELOG_JOIN_BATCH_STRICT='],
+     suite: ['unit', 'tsan'], timeout: 120)
+test('evaluation_recursive_two_join_work', test_evaluation_serial_exe,
+     args: ['--recursive-two-join-work'],
+     env: ['WIRELOG_JOIN_BATCH_BYTES=', 'WIRELOG_JOIN_BATCH_STRICT='],
+     suite: ['unit', 'tsan'], timeout: 120)
 test('evaluation_observed_owner_recovery', test_evaluation_serial_exe,
      args: ['--observed-owner-recovery'], suite: ['unit', 'tsan'], timeout: 60)
 test('evaluation_observed_source_end_recovery', test_evaluation_serial_exe,
      args: ['--observed-source-end-recovery'], suite: ['unit', 'tsan'], timeout: 60)
 test('evaluation_observed_source_begin_recovery', test_evaluation_serial_exe,
      args: ['--observed-source-begin-recovery'], suite: ['unit', 'tsan'], timeout: 60)
+test('evaluation_metadata_backend_contract', test_evaluation_serial_exe,
+     args: ['--metadata-contract'],
+     suite: ['unit', 'tsan'], timeout: 120)
 test('evaluation_completion_backend_contract', test_evaluation_serial_exe,
      args: ['--completion-contract'],
      suite: ['unit', 'tsan'], timeout: 120)
@@ -7160,6 +7251,46 @@ test_arrangement_diff_drain_exe = executable(
 )
 test('arrangement_diff_drain', test_arrangement_diff_drain_exe,
      suite: ['unit', 'tsan', 'evaluation_differential'], timeout: 30)
+
+test_session_post_finish_tx_exe = executable(
+  'test_session_post_finish_tx', files('test_session_post_finish_tx.c'),
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
+  c_args: ['-DWL_SESSION_TEST_HOOKS=1'],
+  link_with: [testlib_prod],
+)
+test('session_post_finish_tx', test_session_post_finish_tx_exe,
+     args: ['--non-c1'],
+     suite: ['unit', 'tsan'], timeout: 60)
+test('session_post_finish_tx_c1', test_session_post_finish_tx_exe,
+     args: ['--c1'],
+     suite: ['unit', 'tsan'], timeout: 60)
+test('session_post_finish_tx_peer', test_session_post_finish_tx_exe,
+     args: ['--peer'],
+     suite: ['unit', 'tsan'], timeout: 60)
+test('session_post_finish_tx_endpoint_refusals', test_session_post_finish_tx_exe,
+     args: ['--death'],
+     suite: ['unit', 'tsan'], timeout: 60)
+
+test_session_retained_bridge_exe = executable(
+  'test_session_retained_bridge', files('test_session_retained_bridge.c'),
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
+  c_args: ['-DWL_SESSION_TEST_HOOKS=1'],
+  link_with: [testlib_prod],
+)
+test('session_retained_bridge', test_session_retained_bridge_exe,
+     suite: ['unit', 'tsan'], timeout: 60)
+
+test_session_snapshot_frontier_exe = executable(
+  'test_session_snapshot_frontier', files('test_session_snapshot_frontier.c'),
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
+  c_args: ['-DWL_SESSION_TEST_HOOKS=1'],
+  link_with: [testlib_prod],
+)
+test('session_snapshot_frontier', test_session_snapshot_frontier_exe,
+     suite: ['unit', 'tsan'], timeout: 60)
 
 # #2296: scalar source selectors and legal differential/removal routes.
 test_evaluation_differential_exe = executable(
@@ -7333,6 +7464,19 @@ foreach stop_case : [
        suite: ['unit', 'tsan', 'evaluation_empty_edb_sources'], timeout: 60)
 endforeach
 
+test_session_frontier_parent_exe = executable(
+  'test_session_frontier_parent', files('test_session_frontier_parent.c'),
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
+  c_args: ['-DWL_SESSION_TEST_HOOKS=1'],
+  link_with: [testlib_prod],
+)
+foreach frontier_parent_mode : ['plain', 'cancel', 'work', 'ended', 'successor', 'funding-before', 'funding-after', 'ended-zero', 'error-ended']
+  test('session_frontier_parent_' + frontier_parent_mode,
+       test_session_frontier_parent_exe, args: [frontier_parent_mode],
+       suite: ['unit', 'tsan', 'evaluation_join_hosts'], timeout: 60)
+endforeach
+
 test_evaluation_physical_retirement_exe = executable(
   'test_evaluation_physical_retirement', files('test_evaluation_physical_retirement.c'),
   include_directories: [wirelog_inc, wirelog_src_inc],
@@ -7369,6 +7513,7 @@ foreach join_probe_case : [
   'events0', 'events1', 'events2', 'events3', 'events4',
   'allocations0', 'allocations1', 'allocations2', 'schema-final-denial',
   'first-semi', 'first-anti', 'funding', 'filtered-numeric', 'filtered-scalar',
+  'natural-semi', 'natural-semi-batch', 'reset-envelope',
 ]
   test('evaluation_join_probes_' + join_probe_case,
        test_evaluation_join_probes_exe, args: [join_probe_case],
@@ -7436,7 +7581,7 @@ test_evaluation_join_host_lifecycle_exe = executable(
   c_args: ['-DWL_SESSION_TEST_HOOKS=1'],
   link_with: [testlib_prod],
 )
-foreach join_lifecycle_case : ['successors', 'snapshots', 'recovery', 'funding', 'snapshot-recovery', 'appends', 'strict', 'native-end', 'snapshot-end', 'bootstrap-end', 'snapshot-finance-birth', 'snapshot-exhaust-evaluating-end', 'snapshot-exhaust-evaluating-successor', 'snapshot-exhaust-completed-end', 'snapshot-exhaust-completed-successor', 'admission-strata-step', 'admission-strata-snapshot', 'admission-strata-refusal', 'admission-read-failure', 'private-cap']
+foreach join_lifecycle_case : ['successors', 'snapshots', 'recovery', 'funding', 'snapshot-recovery', 'appends', 'strict', 'native-end', 'snapshot-end', 'bootstrap-end', 'constructor-faults', 'snapshot-finish-refusal', 'snapshot-no-begin-prior', 'metadata-binding', 'metadata-head', 'snapshot-retained-overflow', 'constructor-exhaust-step', 'constructor-exhaust-snapshot', 'snapshot-finance-birth', 'snapshot-exhaust-evaluating-end', 'snapshot-exhaust-evaluating-successor', 'snapshot-exhaust-completed-end', 'snapshot-exhaust-completed-successor', 'admission-strata-step', 'admission-strata-snapshot', 'admission-strata-refusal', 'admission-read-failure', 'private-cap']
   # With the former 60 s the strict case took 224-227 s of the 240 s it had
   # on the gcc TSan leg (60 s x 4), on main e5b753fb and on PR #2352.
   test('evaluation_join_host_lifecycle_' + join_lifecycle_case,
@@ -7507,6 +7652,9 @@ map_recovery_exe = executable('test_evaluation_map_recovery',
 )
 test('evaluation_map_recovery_terminal', map_recovery_exe,
   suite: ['unit', 'tsan'], timeout: 120,
+)
+test('evaluation_unary_forward_refusals', map_recovery_exe,
+  args: ['unary-forward'], suite: ['unit', 'tsan'], timeout: 120,
 )
 
 expression_crypto_exe = executable('test_evaluation_expression_crypto',
@@ -7668,3 +7816,5 @@ recursive_cursor_parity_exe = executable('test_recursive_cursor_parity',
 test('recursive_cursor_parity', recursive_cursor_parity_exe,
   args: files('data/recursive_cursor_baseline.txt'),
   suite: ['unit', 'tsan'], timeout: 120)
+test('evaluation_join_forward_refusals', test_evaluation_expression_extensions_exe,
+     args: ['join-forward'], suite: ['unit', 'tsan'], timeout: 120)

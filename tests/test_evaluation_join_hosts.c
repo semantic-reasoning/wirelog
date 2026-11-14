@@ -1575,7 +1575,8 @@ public_grant_limit(const wl_col_session_t *session,
     CHECK(!wl_columnar_join_pipeline_numeric_funding_work(&ctx->child, &work));
     if (work != 384) return proposed;
     CHECK(wl_columnar_session_controlled_batch_authorized(session,
-        active->control, ctx->attempt_id, ctx->operation_identity));
+        active->control, ctx->attempt_id, ctx->operation_identity,
+        ctx->plan, ctx->private_bindings));
     selected_original = ctx->attempt_id;
     CHECK(!wl_evaluation_control_test_active_consumed(active->control,
         selected_original, &selected_original_work));

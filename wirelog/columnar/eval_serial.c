@@ -185,7 +185,7 @@ wl_columnar_eval_serial_framed_attempt_begin_internal(
     if (controlled_materialized_batch_fallback
         && (!session->join_batch_bytes
         || !wl_columnar_session_controlled_batch_authorized(session, control,
-        id, operation_identity)
+        id, operation_identity, plan, private_bindings)
         )) return ENOTSUP;
     rc = wl_columnar_eval_stack_framed_fresh(frame, ctx);
     if (rc) return rc;
@@ -234,6 +234,16 @@ wl_columnar_eval_serial_framed_attempt_begin_internal(
     ctx->thread_valid = true;
     ctx->phase = WL_COLUMNAR_EVAL_SERIAL_FRAMED_LOOKUP;
     ctx->identity = ctx;
+    /* Only the complete authentic header may turn the reserve producer's
+     * saved location into a fixed current slot/key binding. */
+    rc = wl_columnar_eval_stack_framed_authenticate(frame, session, ctx);
+    if (rc) goto fail_registered_header;
+    rc = indexed ? wl_columnar_eval_stack_cleanup_receipt_frame_index_bind(
+        frame, receipt_index, &ctx->cleanup_receipt_key) :
+        wl_columnar_eval_stack_cleanup_receipt_frame_birth_index_bind(frame,
+            &ctx->cleanup_receipt_key);
+    if (rc == ENOENT && !indexed) rc = 0; /* Genuine legacy path keeps its scan. */
+    if (rc) goto fail_registered_header;
     if (ordinary_capture) {
         rc = wl_columnar_session_unary_cleanup_register(session, ctx, funding,
                 funding_id, receipt_index, indexed);
@@ -241,21 +251,21 @@ wl_columnar_eval_serial_framed_attempt_begin_internal(
             rc = wl_columnar_session_join_cleanup_register(session, ctx,
                     funding,
                     funding_id, receipt_index, indexed);
-        if (rc) {
-            /* No child/callback ever ran. Registration publishes only after
-             * its final admission; bootstrap owns this exact empty rollback. */
-            ctx->identity = NULL; ctx->pin_owned = false;
-            ctx->thread_valid = false;
-            ctx->frame = NULL; ctx->session = NULL; ctx->plan = NULL;
-            ctx->control = NULL; ctx->private_bindings = NULL;
-            ctx->capture_out = NULL; ctx->capture_only = false;
-            ctx->attempt_id = ctx->operation_identity = 0;
-            ctx->phase = WL_COLUMNAR_EVAL_SERIAL_FRAMED_INERT;
-            wl_evaluation_control_release(control);
-            return rc;
-        }
+        if (rc) goto fail_registered_header;
     }
     return 0;
+fail_registered_header:
+    /* No child/callback ever ran. Registration publishes only after
+     * its final admission; bootstrap owns this exact empty rollback. */
+    ctx->identity = NULL; ctx->pin_owned = false;
+    ctx->thread_valid = false;
+    ctx->frame = NULL; ctx->session = NULL; ctx->plan = NULL;
+    ctx->control = NULL; ctx->private_bindings = NULL;
+    ctx->capture_out = NULL; ctx->capture_only = false;
+    ctx->attempt_id = ctx->operation_identity = 0;
+    ctx->phase = WL_COLUMNAR_EVAL_SERIAL_FRAMED_INERT;
+    wl_evaluation_control_release(control);
+    return rc;
 }
 
 int
@@ -1588,6 +1598,9 @@ wl_columnar_eval_serial_framed_relation_internal(const wl_plan_relation_t *rp,
                 }
                 return protocol;
             }
+            /* Selected initialization is owned by the early MAIN dispatcher;
+             * never lend partial target bytes to the legacy mutable host. */
+            if (view.prepared_initializer_pending) return EBUSY;
             if (view.prepared_unary_present) {
                 source_rc = source ? wl_session_source_finance_charge(source,
                         request->action ==
@@ -1849,7 +1862,7 @@ wl_columnar_eval_serial_framed_relation_internal(const wl_plan_relation_t *rp,
             && (!sess->join_batch_bytes
             || !wl_columnar_session_controlled_batch_authorized(sess,
             request->operation, request->operation_id,
-            request->operation_identity)
+            request->operation_identity, rp, request->private_bindings)
             )) return ENOTSUP;
         source_rc = wl_columnar_eval_serial_source_body(source);
         if (source_rc) return source_rc;

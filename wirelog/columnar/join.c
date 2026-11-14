@@ -6958,9 +6958,6 @@ wl_columnar_join_probe_op_attempt_start_owned_initialize(const wl_plan_op_t *op,
     rc = wl_columnar_join_attempt_charge(control, id,
             WL_COLUMNAR_JOIN_ATTEMPT_WORK);
     if (rc) goto done;
-    if (semi && op->project_count && !op->project_indices) {
-        rc = ENOTSUP; goto done;
-    }
     wl_columnar_join_source_metadata_t left_meta = {0}, right_meta = {0};
     rc = wl_columnar_join_attempt_source(&ctx->source,
             &ctx->source_empty_reader, &ctx->source_bare,
@@ -6994,6 +6991,9 @@ wl_columnar_join_probe_op_attempt_start_owned_initialize(const wl_plan_op_t *op,
     rc = wl_columnar_join_attempt_charge(control, id,
             WL_COLUMNAR_JOIN_ATTEMPT_WORK);
     if (rc) goto done;
+    if (semi && op->project_count && !op->project_indices) {
+        rc = ENOTSUP; goto done;
+    }
     wl_columnar_memory_governor_ref_t *governor = session->memory_governor
         ? session->memory_governor : left->memory_governor
         ? left->memory_governor : right ? right->memory_governor : NULL;

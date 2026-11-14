@@ -2150,7 +2150,7 @@ wl_columnar_filter_op_attempt_start_owned(const wl_plan_op_t *op,
         if (!ctx->source_initialized) ctx->source_bare = false;
     } else {
         rc = wl_columnar_eval_stack_scalar_source_begin_owned(frame, owner, op,
-            &ctx->source, input, true);
+                &ctx->source, input, true);
     }
     rc = wl_columnar_filter_attempt_return(control, attempt_id, rc);
     if (rc)
@@ -3468,8 +3468,8 @@ wl_columnar_filter_map_attempt_start_owned(const wl_plan_op_t *op,
          * its output from the projection, so an INLINE input yields a
          * relation with no compound layout, as the raw MAP does (#2301). */
         rc = wl_columnar_eval_stack_scalar_source_admit_owned(frame, owner, op,
-            &ctx->source, input, false,
-            WL_COLUMNAR_RELATION_SOURCE_ADMIT_INLINE);
+                &ctx->source, input, false,
+                WL_COLUMNAR_RELATION_SOURCE_ADMIT_INLINE);
     }
     rc = wl_columnar_filter_attempt_return(control, attempt_id, rc);
     if (rc)
@@ -3987,10 +3987,19 @@ wl_columnar_filter_source_end_context(
         && op->op != WL_PLAN_OP_JOIN && op->op != WL_PLAN_OP_SEMIJOIN
         && op->op != WL_PLAN_OP_ANTIJOIN && op->op != WL_PLAN_OP_REDUCE
         && op->op != WL_PLAN_OP_CONSOLIDATE) return EINVAL;
-    if (bare || right) {
+    if (right) {
         if (!ctx->join_decision_pending || ctx->join_operation != op
             || (op->op != WL_PLAN_OP_JOIN && op->op != WL_PLAN_OP_SEMIJOIN
             && op->op != WL_PLAN_OP_ANTIJOIN)) return EINVAL;
+    }
+    if (bare && !right) {
+        bool joined = ctx->join_decision_pending && ctx->join_operation == op
+            && (op->op == WL_PLAN_OP_JOIN || op->op == WL_PLAN_OP_SEMIJOIN
+            || op->op == WL_PLAN_OP_ANTIJOIN || op->op == WL_PLAN_OP_REDUCE);
+        bool unary = !ctx->join_decision_pending && !ctx->join_initialized
+            && !ctx->join_operation
+            && (op->op == WL_PLAN_OP_MAP || op->op == WL_PLAN_OP_FILTER);
+        if (!joined && !unary) return EINVAL;
     }
     if (bare) {
         const wl_columnar_relation_empty_source_t *source = right
@@ -4067,7 +4076,9 @@ wl_columnar_filter_source_end_step_owned(
                 ctx->stage = WL_COLUMNAR_FILTER_STAGE_JOIN_PHYSICAL;
             } else {
                 ctx->source_initialized = false; ctx->source_bare = false;
-                ctx->stage = WL_COLUMNAR_FILTER_STAGE_JOIN_DECIDE;
+                ctx->stage = ctx->join_decision_pending
+                    ? WL_COLUMNAR_FILTER_STAGE_JOIN_DECIDE
+                    : WL_COLUMNAR_FILTER_STAGE_DECIDE;
             }
         }
         wl_columnar_filter_attempt_status(ctx, status, done

@@ -116,6 +116,751 @@ lexical_reentry(void *payload)
     return 0;
 }
 
+/* Invalid nested issuers prove the enforced sealed financial contract.
+ * No Native Root/resource or synthetic permission is supplied by this test. */
+typedef struct {
+    wl_evaluation_control_source_bank_t *bank, *other;
+    wl_evaluation_control_t *original;
+    unsigned calls;
+} sealed_probe_t;
+
+static int
+sealed_nested_action(void *payload)
+{
+    sealed_probe_t *p = payload;
+    ++p->calls;
+    wl_evaluation_control_source_metadata_outcome_t out = {37, false};
+    CHECK(wl_evaluation_control_source_bank_run_metadata(p->bank,
+        WL_EVALUATION_CONTROL_SOURCE_OPERATION, &test_policy, count_action,
+        &p->calls,
+        &out) == EBUSY && !out.action_called && out.action_result == 37);
+    wl_evaluation_control_source_phase_result_t nested =
+        wl_evaluation_control_source_bank_run_lexical(p->other,
+            WL_EVALUATION_CONTROL_SOURCE_CLOSE, &test_policy,
+            count_action, &p->calls);
+    CHECK(nested.financial_result == EBUSY && !nested.action_called);
+    wl_evaluation_control_source_context_t issued = {0};
+    CHECK(wl_evaluation_control_source_metadata_enter_issued(p->other, &issued)
+        == -EBUSY && !issued.identity && !issued.bank && !issued.thread_cookie);
+    wl_evaluation_control_source_context_t context = {0};
+    CHECK(wl_evaluation_control_source_context_begin(p->other,
+        WL_EVALUATION_CONTROL_SOURCE_OPERATION, &context) == EBUSY
+        && !context.identity);
+    CHECK(wl_evaluation_control_source_bank_destroy(&p->other) == EBUSY
+        && p->other);
+    wl_evaluation_control_report_t report;
+    CHECK(!wl_evaluation_control_report(p->original, &report)
+        && report.limit == 9 && report.consumed == 3 && !report.result);
+    return 0;
+}
+
+static void
+sealed_metadata(wl_evaluation_control_source_bank_t *bank,
+    wl_evaluation_control_t *original)
+{
+    sealed_probe_t p = {.bank = bank, .original = original};
+    CHECK(!wl_evaluation_control_source_bank_create(&p.other));
+    wl_evaluation_control_report_t before, after;
+    CHECK(!wl_evaluation_control_report(original, &before));
+    for (unsigned mode = 0; mode < 3; ++mode) {
+        unsigned calls = p.calls;
+        wl_evaluation_control_source_metadata_outcome_t out = {29, false};
+        if (mode == 1)
+            wl_evaluation_control_test_source_lexical_cancel_before_action =
+                true;
+        if (mode == 2)
+            wl_evaluation_control_test_source_lexical_cancel_after_action =
+                true;
+        int rc = wl_evaluation_control_source_bank_run_metadata(bank,
+                WL_EVALUATION_CONTROL_SOURCE_OPERATION, &test_policy,
+                sealed_nested_action, &p, &out);
+        CHECK(rc == (mode ? WL_EVALUATION_CONTROL_CANCELLED : 0)
+            && out.action_called == (mode != 1)
+            && out.action_result == (mode == 1 ? 29 : 0)
+            && p.calls == calls + (mode == 1 ? 0u : 1u));
+        if (mode) CHECK(!wl_evaluation_control_test_source_final_reset_cancel(
+                    bank, WL_EVALUATION_CONTROL_SOURCE_OPERATION));
+        /* Both BANKs are usable after actual callback return/TLS cleanup. */
+        out = (wl_evaluation_control_source_metadata_outcome_t){0, false};
+        CHECK(!wl_evaluation_control_source_bank_run_metadata(p.other,
+            WL_EVALUATION_CONTROL_SOURCE_OPERATION, &test_policy,
+            count_action, &p.calls, &out) && out.action_called);
+        wl_evaluation_control_source_phase_result_t lexical =
+            wl_evaluation_control_source_bank_run_lexical(bank,
+                WL_EVALUATION_CONTROL_SOURCE_CLOSE, &test_policy,
+                count_action, &p.calls);
+        CHECK(!lexical.financial_result && lexical.action_called);
+    }
+    CHECK(!wl_evaluation_control_report(original, &after));
+    same_report(&before, &after);
+    CHECK(!wl_evaluation_control_source_bank_destroy(&p.other) && !p.other);
+}
+
+/* Financial-only kernel fixture: it proves real saved-generation checkpoint
+ * refusal and sealed preparation, not any columnar Root or Native permission. */
+typedef struct {
+    sealed_probe_t sealed;
+    unsigned groups, fail_group;
+    bool omit_action, omit_publication;
+} metadata_recipe_probe_t;
+
+static int
+metadata_recipe_prepare(const void *recipe, unsigned group,
+    wl_evaluation_control_source_metadata_preparation_t *prepared)
+{
+    metadata_recipe_probe_t *p = (metadata_recipe_probe_t *)recipe;
+    CHECK(group == p->groups && group < 3);
+    ++p->groups;
+    if (p->fail_group == group + 1) return EINVAL;
+    /* The no-nested-BANK guard applies to preparation as well as action. */
+    wl_evaluation_control_source_metadata_outcome_t nested = {17, false};
+    CHECK(wl_evaluation_control_source_bank_run_metadata(p->sealed.other,
+        WL_EVALUATION_CONTROL_SOURCE_CLOSE, &test_policy, count_action,
+        &p->sealed.calls, &nested) == EBUSY
+        && !nested.action_called && nested.action_result == 17);
+    if (group == 2) {
+        if (!p->omit_action) prepared->action = sealed_nested_action;
+        prepared->payload = &p->sealed;
+        if (!p->omit_publication) prepared->result_published = true;
+    }
+    return 0;
+}
+
+static void
+sealed_metadata_recipe(wl_evaluation_control_source_bank_t *bank,
+    wl_evaluation_control_t *original)
+{
+    metadata_recipe_probe_t p = {.sealed = {
+                                     .bank = bank, .original = original
+                                 }};
+    CHECK(!wl_evaluation_control_source_bank_create(&p.sealed.other));
+    wl_evaluation_control_report_t before, after;
+    CHECK(!wl_evaluation_control_report(original, &before));
+    /* Success, each real zero refusal, CURRENT refusal, and footer refusal. */
+    for (unsigned mode = 0; mode < 7; ++mode) {
+        p.groups = 0;
+        unsigned calls = p.sealed.calls;
+        wl_evaluation_control_source_metadata_preparation_t prepared = {0};
+        if (mode && mode <= 4)
+            wl_evaluation_control_test_source_metadata_cancel_at = mode;
+        if (mode == 5)
+            wl_evaluation_control_test_source_lexical_cancel_before_action =
+                true;
+        if (mode == 6)
+            wl_evaluation_control_test_source_lexical_cancel_after_action =
+                true;
+        int rc = wl_evaluation_control_source_bank_run_metadata_recipe(bank,
+                WL_EVALUATION_CONTROL_SOURCE_OPERATION, &test_policy,
+                metadata_recipe_prepare, &p, &prepared);
+        unsigned expected_groups = mode && mode <= 4 ? mode - 1 : 3;
+        bool called = !mode || mode == 6;
+        CHECK(rc == (mode ? WL_EVALUATION_CONTROL_CANCELLED : 0)
+            && p.groups == expected_groups
+            && prepared.groups_completed == expected_groups
+            && !prepared.preparation_protocol && prepared.entry.begun
+            && prepared.entry.settled
+            && prepared.entry.checkpoint_result ==
+            (mode == 1 ? WL_EVALUATION_CONTROL_CANCELLED : 0)
+            && prepared.result_published == (expected_groups == 3)
+            && prepared.outcome.action_called == called
+            && !prepared.outcome.action_result
+            && p.sealed.calls == calls + (called ? 1u : 0u)
+            && !wl_evaluation_control_test_source_metadata_cancel_at);
+        wl_evaluation_control_report_t actual;
+        CHECK(!wl_evaluation_control_test_source_early_report(bank,
+            WL_EVALUATION_CONTROL_SOURCE_OPERATION, &actual));
+        if (mode <= 1) {
+            /* Genuine fresh Normal BEGIN/check/FINISH supplies the reference
+             * semantics; no stopped fields are manufactured after BEGIN. */
+            int owner = 0;
+            wl_evaluation_control_t *reference = NULL;
+            CHECK(!wl_evaluation_control_create(actual.limit, &reference)
+                && !wl_evaluation_control_attach(reference, &owner)
+                && !wl_evaluation_control_begin(reference, &owner));
+            uint64_t id = wl_evaluation_control_active_attempt_id(reference);
+            CHECK(id == actual.attempt_id && id == 1);
+            if (mode) {
+                wl_evaluation_control_request_cancel(reference);
+                CHECK(wl_evaluation_control_charge_attempt(reference, id, 0)
+                    == WL_EVALUATION_CONTROL_CANCELLED);
+            } else {
+                CHECK(!wl_evaluation_control_charge_attempt(reference, id,
+                    test_policy.bootstrap_work)
+                    && !wl_evaluation_control_charge_attempt(reference, id,
+                    test_policy.current_work)
+                    && !wl_evaluation_control_charge_attempt(reference, id,
+                    test_policy.close_work));
+            }
+            CHECK(wl_evaluation_control_finish(reference, &owner, 0, 0)
+                == actual.result);
+            wl_evaluation_control_report_t expected;
+            CHECK(!wl_evaluation_control_report(reference, &expected));
+            same_report(&actual, &expected);
+            CHECK(!wl_evaluation_control_detach(reference, &owner));
+            wl_evaluation_control_release(reference);
+        }
+        if (mode) {
+            CHECK(!wl_evaluation_control_test_source_final_reset_cancel(
+                    bank, WL_EVALUATION_CONTROL_SOURCE_OPERATION));
+            wl_evaluation_control_report_t frozen;
+            CHECK(!wl_evaluation_control_test_source_early_report(bank,
+                WL_EVALUATION_CONTROL_SOURCE_OPERATION, &frozen));
+            same_report(&actual, &frozen);
+        }
+        /* Settlement really unbound the issuer, including early failure. */
+        wl_evaluation_control_source_phase_result_t usable =
+            wl_evaluation_control_source_bank_run_lexical(bank,
+                WL_EVALUATION_CONTROL_SOURCE_OPERATION, &test_policy,
+                count_action, &p.sealed.calls);
+        CHECK(!usable.financial_result && usable.action_called);
+    }
+    for (unsigned fault = 1; fault <= 5; ++fault) {
+        p.groups = 0;
+        p.fail_group = fault <= 3 ? fault : 0;
+        p.omit_action = fault == 4;
+        p.omit_publication = fault == 5;
+        unsigned calls = p.sealed.calls;
+        wl_evaluation_control_source_metadata_preparation_t prepared = {0};
+        CHECK(wl_evaluation_control_source_bank_run_metadata_recipe(bank,
+            WL_EVALUATION_CONTROL_SOURCE_OPERATION, &test_policy,
+            metadata_recipe_prepare, &p, &prepared) == EINVAL
+            && !prepared.outcome.action_called && p.sealed.calls == calls
+            && prepared.entry.begun && prepared.entry.settled
+            && !prepared.entry.checkpoint_result);
+        CHECK(prepared.preparation_protocol == (fault <= 3 ? EINVAL : 0)
+            && prepared.groups_completed == (fault <= 3 ? fault - 1 : 3)
+            && p.groups == (fault <= 3 ? fault : 3));
+    }
+    wl_evaluation_control_source_metadata_preparation_t untouched = {0};
+    untouched.outcome.action_result = 91;
+    const wl_evaluation_control_source_phase_policy_t bad_policy = {0, 1, 1};
+    CHECK(wl_evaluation_control_source_bank_run_metadata_recipe(bank,
+        WL_EVALUATION_CONTROL_SOURCE_OPERATION, &bad_policy,
+        metadata_recipe_prepare, &p, &untouched) == EINVAL
+        && !untouched.groups_completed && !untouched.outcome.action_called
+        && untouched.outcome.action_result == 91);
+    CHECK(!wl_evaluation_control_report(original, &after));
+    same_report(&before, &after);
+    CHECK(!wl_evaluation_control_source_bank_destroy(&p.sealed.other));
+}
+
+typedef struct {
+    unsigned cursor, calls[4], fail_role;
+    bool omit_advance;
+} metadata_bind_probe_t;
+
+static int
+metadata_bind_role(void *root, unsigned role)
+{
+    metadata_bind_probe_t *p = root;
+    CHECK(role < 4 && role == p->cursor);
+    ++p->calls[role];
+    if (p->fail_role == role + 1) return EINVAL;
+    if (!p->omit_advance) p->cursor = role + 1;
+    return 0;
+}
+
+static void
+sealed_metadata_binding(wl_evaluation_control_source_bank_t *bank,
+    wl_evaluation_control_t *original)
+{
+    wl_evaluation_control_report_t before, after;
+    CHECK(!wl_evaluation_control_report(original, &before));
+    for (unsigned stopped = 0; stopped <= 5; ++stopped) {
+        metadata_bind_probe_t p = {0};
+        wl_evaluation_control_test_source_metadata_cancel_at = stopped;
+        int rc = wl_evaluation_control_source_bank_bind_metadata_roles(bank,
+                WL_EVALUATION_CONTROL_SOURCE_OPERATION, &test_policy,
+                metadata_bind_role, &p, &p.cursor);
+        unsigned expected = stopped ? stopped - 1 : 4;
+        CHECK(rc == (stopped ? WL_EVALUATION_CONTROL_CANCELLED : 0)
+            && p.cursor == expected
+            && !wl_evaluation_control_test_source_metadata_cancel_at);
+        for (unsigned role = 0; role < 4; ++role)
+            CHECK(p.calls[role] == (role < expected ? 1u : 0u));
+        if (stopped) CHECK(
+                !wl_evaluation_control_test_source_final_reset_cancel(
+                    bank, WL_EVALUATION_CONTROL_SOURCE_OPERATION));
+        /* Resume from the true cursor. Completed roles are never rebound,
+         * including a refused zero after the fourth physical binding. */
+        if (p.cursor == 4) {
+            for (unsigned repeated = 0; repeated < 3; ++repeated) {
+                wl_evaluation_control_source_metadata_entry_t entry = {0};
+                if (repeated == 1)
+                    wl_evaluation_control_test_source_metadata_cancel_at = 1;
+                int observed =
+                    wl_evaluation_control_source_bank_observe_metadata(
+                    bank, WL_EVALUATION_CONTROL_SOURCE_OPERATION, &entry);
+                CHECK(observed ==
+                    (repeated == 1 ? WL_EVALUATION_CONTROL_CANCELLED : 0)
+                    && entry.begun && entry.settled
+                    && entry.checkpoint_result == observed);
+                wl_evaluation_control_report_t report;
+                CHECK(!wl_evaluation_control_test_source_early_report(bank,
+                    WL_EVALUATION_CONTROL_SOURCE_OPERATION, &report)
+                    && !report.consumed && !report.execution_status
+                    && !report.cleanup_status && report.stop_reason == observed
+                    && report.result == observed);
+                if (observed) CHECK(
+                        !wl_evaluation_control_test_source_final_reset_cancel(
+                            bank, WL_EVALUATION_CONTROL_SOURCE_OPERATION));
+            }
+        } else CHECK(!wl_evaluation_control_source_bank_bind_metadata_roles(
+                    bank,
+                    WL_EVALUATION_CONTROL_SOURCE_OPERATION, &test_policy,
+                    metadata_bind_role, &p, &p.cursor) && p.cursor == 4);
+        for (unsigned role = 0; role < 4; ++role) CHECK(p.calls[role] == 1);
+    }
+    for (unsigned role = 0; role < 4; ++role) {
+        metadata_bind_probe_t p = {.fail_role = role + 1};
+        CHECK(wl_evaluation_control_source_bank_bind_metadata_roles(bank,
+            WL_EVALUATION_CONTROL_SOURCE_OPERATION, &test_policy,
+            metadata_bind_role, &p, &p.cursor) == EINVAL
+            && p.cursor == role && p.calls[role] == 1);
+        p.fail_role = 0;
+        CHECK(!wl_evaluation_control_source_bank_bind_metadata_roles(bank,
+            WL_EVALUATION_CONTROL_SOURCE_OPERATION, &test_policy,
+            metadata_bind_role, &p, &p.cursor) && p.cursor == 4);
+        for (unsigned i = 0; i < 4; ++i)
+            CHECK(p.calls[i] == (i == role ? 2u : 1u));
+    }
+    metadata_bind_probe_t invalid = {.cursor = 5};
+    CHECK(wl_evaluation_control_source_bank_bind_metadata_roles(bank,
+        WL_EVALUATION_CONTROL_SOURCE_OPERATION, &test_policy,
+        metadata_bind_role, &invalid, &invalid.cursor) == EINVAL
+        && invalid.cursor == 5 && !invalid.calls[0]);
+    invalid.cursor = 0; invalid.omit_advance = true;
+    CHECK(wl_evaluation_control_source_bank_bind_metadata_roles(bank,
+        WL_EVALUATION_CONTROL_SOURCE_OPERATION, &test_policy,
+        metadata_bind_role, &invalid, &invalid.cursor) == EINVAL
+        && !invalid.cursor && invalid.calls[0] == 1 && !invalid.calls[1]);
+    CHECK(!wl_evaluation_control_report(original, &after));
+    same_report(&before, &after);
+}
+
+static void
+sealed_metadata_start_rejections(void)
+{
+    for (unsigned variant = 0; variant < 21; ++variant) {
+        unsigned fault = variant % 7 + 1;
+        unsigned issued = variant / 7;
+        wl_evaluation_control_source_bank_t *bank = NULL;
+        CHECK(!wl_evaluation_control_source_bank_create(&bank));
+        unsigned calls = 0;
+        wl_evaluation_control_source_metadata_outcome_t outcome = {0};
+        CHECK(!wl_evaluation_control_source_bank_run_metadata(bank,
+            WL_EVALUATION_CONTROL_SOURCE_OPERATION, &test_policy,
+            count_action, &calls,
+            &outcome) && outcome.action_called && calls == 1);
+        wl_evaluation_control_t *foreign = NULL;
+        int owner = 0;
+        wl_evaluation_control_report_t frozen = {0};
+        uint64_t successor = 0;
+        if (fault == 5 || fault == 7) {
+            CHECK(!wl_evaluation_control_create(17, &foreign)
+                && !wl_evaluation_control_attach(foreign, &owner)
+                && !wl_evaluation_control_begin(foreign, &owner)
+                && !wl_evaluation_control_charge_attempt(foreign, 1, 7)
+                && wl_evaluation_control_finish(foreign, &owner, 7, 0) == 7
+                && !wl_evaluation_control_report(foreign, &frozen));
+            if (fault == 5)
+                CHECK(!wl_evaluation_control_test_seed_attempt_id(foreign,
+                    &owner, UINT64_MAX));
+            else {
+                CHECK(!wl_evaluation_control_begin(foreign, &owner));
+                successor = wl_evaluation_control_active_attempt_id(foreign);
+                CHECK(successor == 2);
+            }
+        }
+        wl_evaluation_control_source_metadata_probe_t probe = {0};
+        CHECK(wl_evaluation_control_test_source_metadata_start_rejection(bank,
+            WL_EVALUATION_CONTROL_SOURCE_OPERATION, fault == 7 ? 5 : fault,
+            foreign, issued, &probe) == (issued ? -EBUSY : EBUSY)
+            && !probe.entry.begun && !probe.entry.settled
+            && !probe.entry.checkpoint_result);
+        CHECK(probe.before.counter == probe.after.counter
+            && probe.before.active_id == probe.after.active_id
+            && probe.before.consumed == probe.after.consumed
+            && probe.before.lane_id == probe.after.lane_id
+            && probe.before.charged == probe.after.charged
+            && probe.before.verified == probe.after.verified);
+        same_report(&probe.before.report, &probe.after.report);
+        CHECK(probe.before.counter == (fault == 5 ? UINT64_MAX :
+            fault == 3 ? 8 : fault == 7 ? 2 : 7));
+        if (foreign) {
+            wl_evaluation_control_report_t after;
+            CHECK(!wl_evaluation_control_report(foreign, &after));
+            same_report(&frozen, &after);
+            if (successor) {
+                uint64_t used = UINT64_MAX;
+                CHECK(wl_evaluation_control_active_attempt_id(foreign) ==
+                    successor
+                    && !wl_evaluation_control_test_active_consumed(foreign,
+                    successor, &used) && !used);
+                CHECK(!wl_evaluation_control_finish(foreign, &owner, 0, 0));
+            }
+            CHECK(!wl_evaluation_control_detach(foreign, &owner));
+            wl_evaluation_control_release(foreign);
+        }
+        CHECK(!wl_evaluation_control_source_bank_destroy(&bank) && !bank);
+    }
+}
+
+typedef struct {
+    wl_evaluation_control_source_context_t *context;
+    metadata_recipe_probe_t *probe;
+    int result;
+} issued_foreign_t;
+
+static void *
+issued_foreign_continue(void *payload)
+{
+    issued_foreign_t *p = payload;
+    /* A real other thread cannot begin over the still-live issued context.
+     * Its refused output stays untouched and the owning thread can resume. */
+    wl_evaluation_control_source_context_t competing = {0};
+    bool close = p->context->lane == WL_EVALUATION_CONTROL_SOURCE_CLOSE;
+    int entered = close ?
+        wl_evaluation_control_source_metadata_enter_close_owned(
+        p->context->bank,
+        &competing) : wl_evaluation_control_source_metadata_enter_issued(
+        p->context->bank, &competing);
+    CHECK(entered == -EBUSY && !competing.identity && !competing.bank
+        && !competing.thread_cookie);
+    wl_evaluation_control_source_metadata_preparation_t prepared = {0};
+    p->result = close ?
+        wl_evaluation_control_source_metadata_continue_close_owned(
+        p->context, &test_policy, metadata_recipe_prepare, p->probe,
+        &prepared) :
+        wl_evaluation_control_source_metadata_continue_issued(
+        p->context, &test_policy, metadata_recipe_prepare, p->probe, &prepared);
+    CHECK(!prepared.entry.begun && !prepared.entry.settled
+        && !prepared.outcome.action_called);
+    return NULL;
+}
+
+/* Isolated Core financial protocol, not an operator/Native issuer. Context
+ * copies and foreign-thread attempts are intentional invalid borrowers. */
+static void
+sealed_issued_metadata(wl_evaluation_control_source_bank_t *bank,
+    wl_evaluation_control_t *original, bool close)
+{
+    wl_evaluation_control_source_lane_t lane = close ?
+        WL_EVALUATION_CONTROL_SOURCE_CLOSE :
+        WL_EVALUATION_CONTROL_SOURCE_OPERATION;
+    int (*enter_owned)(wl_evaluation_control_source_bank_t *,
+        wl_evaluation_control_source_context_t *) = close ?
+        wl_evaluation_control_source_metadata_enter_close_owned :
+        wl_evaluation_control_source_metadata_enter_issued;
+    int (*continue_owned)(wl_evaluation_control_source_context_t *,
+        const wl_evaluation_control_source_phase_policy_t *,
+        wl_evaluation_control_source_metadata_prepare_fn, const void *,
+        wl_evaluation_control_source_metadata_preparation_t *) = close ?
+        wl_evaluation_control_source_metadata_continue_close_owned :
+        wl_evaluation_control_source_metadata_continue_issued;
+    metadata_recipe_probe_t p = {.sealed = {.bank = bank,
+                                            .original = original}};
+    CHECK(!wl_evaluation_control_source_bank_create(&p.sealed.other));
+    wl_evaluation_control_report_t before, after;
+    CHECK(!wl_evaluation_control_report(original, &before));
+    for (unsigned mode = 0; mode < 7; ++mode) {
+        p.groups = 0;
+        unsigned calls = p.sealed.calls;
+        wl_evaluation_control_source_context_t context = {0};
+        wl_evaluation_control_source_metadata_preparation_t prepared = {0};
+        if (mode == 1) wl_evaluation_control_test_source_metadata_cancel_at = 1;
+        int entered = enter_owned(bank,
+                &context);
+        if (mode == 1) {
+            CHECK(entered ==
+                WL_EVALUATION_CONTROL_SOURCE_METADATA_INITIAL_CANCELLED
+                && !context.identity && !context.bank && !context.thread_cookie
+                && !prepared.outcome.action_called && !p.groups);
+            /* Sticky actual cancellation, without a production reset. */
+            wl_evaluation_control_source_context_t again = {0};
+            CHECK(enter_owned(bank,
+                &again)
+                == WL_EVALUATION_CONTROL_SOURCE_METADATA_INITIAL_CANCELLED
+                && !again.identity && !again.bank && !again.thread_cookie);
+        } else {
+            CHECK(entered == WL_EVALUATION_CONTROL_SOURCE_METADATA_OPEN
+                && context.identity == &context && context.bank == bank
+                && context.lane == lane
+                && context.thread_cookie);
+            int wrong_lane = close ?
+                wl_evaluation_control_source_metadata_continue_issued(&context,
+                    &test_policy, metadata_recipe_prepare, &p, &prepared) :
+                wl_evaluation_control_source_metadata_continue_close_owned(
+                &context, &test_policy, metadata_recipe_prepare, &p, &prepared);
+            CHECK(wrong_lane == EINVAL && context.identity == &context
+                && !prepared.entry.begun && !prepared.entry.settled &&
+                !p.groups);
+            wl_evaluation_control_source_context_t another = {0};
+            CHECK(enter_owned(bank,
+                &another)
+                == -EBUSY && !another.identity && !another.bank);
+            wl_evaluation_control_source_context_t copied = context;
+            CHECK(continue_owned(&copied,
+                &test_policy, metadata_recipe_prepare, &p,
+                &prepared) == EINVAL);
+            copied.identity = &copied;
+            CHECK(continue_owned(&copied,
+                &test_policy, metadata_recipe_prepare, &p, &prepared) == EBUSY);
+            issued_foreign_t foreign = {&context, &p, 0}; wl_thread_t thread;
+            CHECK(!wl_thread_create(&thread, issued_foreign_continue,
+                &foreign));
+            CHECK(!wl_thread_join(&thread) && foreign.result == EINVAL
+                && context.identity == &context && !p.groups
+                && p.sealed.calls == calls);
+            if (mode >= 2 && mode <= 4)
+                wl_evaluation_control_test_source_metadata_cancel_at = mode;
+            if (mode == 5)
+                wl_evaluation_control_test_source_lexical_cancel_before_action =
+                    true;
+            if (mode == 6)
+                wl_evaluation_control_test_source_lexical_cancel_after_action =
+                    true;
+            int rc =
+                continue_owned(&context,
+                    &test_policy, metadata_recipe_prepare, &p, &prepared);
+            unsigned groups = mode >= 2 && mode <= 4 ? mode - 1 : 3;
+            CHECK(rc == (mode ? WL_EVALUATION_CONTROL_CANCELLED : 0)
+                && !context.identity && prepared.entry.begun
+                && prepared.entry.settled && !prepared.entry.checkpoint_result
+                && p.groups == groups && prepared.groups_completed == groups
+                && prepared.outcome.action_called == (!mode || mode == 6)
+                && p.sealed.calls == calls + (!mode || mode == 6 ? 1u : 0u));
+            CHECK(continue_owned(
+                    &context,
+                    &test_policy, metadata_recipe_prepare, &p,
+                    &prepared) == EINVAL);
+        }
+        wl_evaluation_control_report_t report;
+        CHECK(!wl_evaluation_control_test_source_early_report(bank,
+            lane, &report));
+        CHECK(report.stop_reason == (mode ? WL_EVALUATION_CONTROL_CANCELLED : 0)
+            && report.result == (mode ? WL_EVALUATION_CONTROL_CANCELLED : 0)
+            && !report.execution_status && !report.cleanup_status);
+        if (mode <= 1) {
+            int owner = 0; wl_evaluation_control_t *reference = NULL;
+            CHECK(!wl_evaluation_control_create(report.limit, &reference)
+                && !wl_evaluation_control_attach(reference, &owner)
+                && !wl_evaluation_control_begin(reference, &owner));
+            if (mode) {
+                wl_evaluation_control_request_cancel(reference);
+                CHECK(wl_evaluation_control_charge_attempt(reference, 1, 0)
+                    == WL_EVALUATION_CONTROL_CANCELLED && !report.consumed);
+            } else CHECK(!wl_evaluation_control_charge_attempt(reference, 1,
+                    256)
+                    && !wl_evaluation_control_charge_attempt(reference, 1, 256)
+                    && !wl_evaluation_control_charge_attempt(reference, 1,
+                    256));
+            CHECK(wl_evaluation_control_finish(reference, &owner, 0,
+                0) == report.result);
+            wl_evaluation_control_report_t expected;
+            CHECK(!wl_evaluation_control_report(reference, &expected));
+            same_report(&report, &expected);
+            CHECK(!wl_evaluation_control_detach(reference, &owner));
+            wl_evaluation_control_release(reference);
+        }
+        if (mode) {
+            CHECK(!wl_evaluation_control_test_source_final_reset_cancel(bank,
+                lane));
+            wl_evaluation_control_report_t frozen;
+            CHECK(!wl_evaluation_control_test_source_early_report(bank,
+                lane, &frozen));
+            same_report(&report, &frozen);
+        }
+    }
+    for (unsigned fault = 0; fault < 6; ++fault) {
+        p.groups = 0;
+        wl_evaluation_control_source_context_t context = {0};
+        CHECK(enter_owned(bank, &context)
+            == WL_EVALUATION_CONTROL_SOURCE_METADATA_OPEN);
+        wl_evaluation_control_source_metadata_preparation_t prepared = {0};
+        wl_evaluation_control_source_phase_policy_t policy = test_policy;
+        if (fault == 4) policy.bootstrap_work = 0;
+        if (fault == 5) policy.current_work = 257;
+        CHECK(continue_owned(&context,
+            fault == 0 ? NULL : &policy,
+            fault == 1 ? NULL : metadata_recipe_prepare,
+            fault == 2 ? NULL : &p,
+            fault == 3 ? NULL : &prepared) == EINVAL
+            && !context.identity && !p.groups &&
+            !prepared.outcome.action_called);
+        if (fault != 3) CHECK(prepared.entry.begun && prepared.entry.settled);
+        wl_evaluation_control_report_t report;
+        CHECK(!wl_evaluation_control_test_source_early_report(bank,
+            lane, &report)
+            && !report.consumed && !report.stop_reason && !report.result);
+    }
+    CHECK(!wl_evaluation_control_report(original, &after));
+    same_report(&before, &after);
+    CHECK(!wl_evaluation_control_source_bank_destroy(&p.sealed.other));
+}
+
+typedef struct {
+    unsigned cursor, groups, calls, fault;
+} issued_bind_probe_t;
+
+static int
+issued_bind_prepare(void *root, unsigned group,
+    wl_evaluation_control_source_metadata_bind_outcome_t *out)
+{
+    issued_bind_probe_t *p = root;
+    CHECK(group == p->groups && group < 2);
+    ++p->groups;
+    if (p->fault == group + 1) return EINVAL;
+    if (!group) {
+        out->cursor = &p->cursor; out->before_cursor = p->cursor;
+    }
+    return 0;
+}
+
+static int
+issued_bind_one(void *root, unsigned cursor)
+{
+    issued_bind_probe_t *p = root;
+    CHECK(cursor == p->cursor && cursor < 4);
+    ++p->calls; ++p->cursor;
+    return 0;
+}
+
+static void
+issued_bind_cases(wl_evaluation_control_source_bank_t *bank,
+    wl_evaluation_control_t *original)
+{
+    wl_evaluation_control_report_t before, after;
+    CHECK(!wl_evaluation_control_report(original, &before));
+    for (unsigned cursor = 0; cursor <= 4; ++cursor) {
+        for (unsigned stop = 0; stop <= 4; ++stop) {
+            issued_bind_probe_t p = {.cursor = cursor};
+            wl_evaluation_control_source_context_t context = {0};
+            if (stop == 1)
+                wl_evaluation_control_test_source_metadata_cancel_at = 1;
+            int entered = wl_evaluation_control_source_metadata_enter_issued(
+                bank, &context);
+            bool called = cursor < 4 && (!stop || stop == 4);
+            bool cancelled = stop && (cursor < 4 || stop < 4);
+            if (stop == 1) {
+                CHECK(entered ==
+                    WL_EVALUATION_CONTROL_SOURCE_METADATA_INITIAL_CANCELLED
+                    && !context.identity && !p.groups && !p.calls);
+            } else {
+                CHECK(entered == WL_EVALUATION_CONTROL_SOURCE_METADATA_OPEN);
+                wl_evaluation_control_source_metadata_bind_outcome_t out = {0};
+                wl_evaluation_control_source_context_t copy = context;
+                CHECK(
+                    wl_evaluation_control_source_metadata_bind_continue_issued(
+                        &copy, issued_bind_prepare, issued_bind_one, &p, &out)
+                    == EINVAL && !p.groups && !out.settled);
+                copy.identity = &copy;
+                CHECK(
+                    wl_evaluation_control_source_metadata_bind_continue_issued(
+                        &copy, issued_bind_prepare, issued_bind_one, &p, &out)
+                    == EBUSY && !p.groups && !out.settled);
+                if (stop > 1)
+                    wl_evaluation_control_test_source_metadata_cancel_at = stop;
+                int rc =
+                    wl_evaluation_control_source_metadata_bind_continue_issued(
+                    &context, issued_bind_prepare, issued_bind_one, &p, &out);
+                CHECK(rc == (cancelled ? WL_EVALUATION_CONTROL_CANCELLED : 0)
+                    && !context.identity && out.settled
+                    && out.role_called == called
+                    && out.complete_selected == (cursor == 4 && !cancelled)
+                    && p.calls == (called ? 1u : 0u)
+                    && p.cursor == cursor + (called ? 1u : 0u));
+                if (cursor == 4 && stop == 4)
+                    wl_evaluation_control_test_source_metadata_cancel_at = 0;
+            }
+            wl_evaluation_control_report_t report;
+            CHECK(!wl_evaluation_control_test_source_early_report(bank,
+                WL_EVALUATION_CONTROL_SOURCE_OPERATION, &report)
+                && report.consumed == (called ? 10u : 0u)
+                && report.result ==
+                (cancelled ? WL_EVALUATION_CONTROL_CANCELLED : 0)
+                && !report.execution_status && !report.cleanup_status);
+            if (cancelled)
+                CHECK(!wl_evaluation_control_test_source_final_reset_cancel(
+                        bank, WL_EVALUATION_CONTROL_SOURCE_OPERATION));
+        }
+    }
+    for (unsigned fault = 0; fault < 6; ++fault) {
+        issued_bind_probe_t p = {.fault = fault};
+        wl_evaluation_control_source_context_t context;
+        wl_evaluation_control_source_metadata_bind_outcome_t out;
+        CHECK(!wl_evaluation_control_source_metadata_enter_issued(bank,
+            &context));
+        CHECK(wl_evaluation_control_source_metadata_bind_continue_issued(
+                &context, fault == 3 ? NULL : issued_bind_prepare,
+                fault == 4 ? NULL : issued_bind_one, fault == 5 ? NULL : &p,
+                fault == 0 ? NULL : &out) == EINVAL && !context.identity
+            && !p.calls);
+        if (fault) CHECK(out.settled);
+    }
+    CHECK(!wl_evaluation_control_report(original, &after));
+    same_report(&before, &after);
+}
+
+/* Fixed observation is a financial component; it creates no operator/Native
+ * owner and never calls a supplied callback. Stops use the real cancel flag. */
+static void
+fixed_observation(wl_evaluation_control_source_bank_t *bank,
+    wl_evaluation_control_t *original)
+{
+    wl_evaluation_control_report_t frozen, after;
+    CHECK(!wl_evaluation_control_report(original, &frozen));
+    for (unsigned stop = 0; stop <= 3; ++stop) {
+        wl_evaluation_control_test_source_metadata_cancel_at = stop;
+        CHECK(wl_evaluation_control_source_operation_observe_owned(bank)
+            == (stop ? WL_EVALUATION_CONTROL_CANCELLED : 0));
+        CHECK(!wl_evaluation_control_test_source_metadata_cancel_at);
+        wl_evaluation_control_report_t report;
+        CHECK(!wl_evaluation_control_test_source_early_report(bank,
+            WL_EVALUATION_CONTROL_SOURCE_OPERATION, &report)
+            && report.attempt_id == 1 && report.limit == 768
+            && report.consumed == (stop == 1 || stop == 2 ? 0 : 10)
+            && report.result == (stop ? WL_EVALUATION_CONTROL_CANCELLED : 0)
+            && report.stop_reason == report.result
+            && !report.execution_status && !report.cleanup_status);
+        CHECK(!wl_evaluation_control_report(original, &after));
+        same_report(&frozen, &after);
+        if (stop) {
+            CHECK(!wl_evaluation_control_test_source_final_reset_cancel(bank,
+                WL_EVALUATION_CONTROL_SOURCE_OPERATION));
+            wl_evaluation_control_report_t preserved;
+            CHECK(!wl_evaluation_control_test_source_early_report(bank,
+                WL_EVALUATION_CONTROL_SOURCE_OPERATION, &preserved));
+            same_report(&report, &preserved);
+        }
+    }
+    /* A real other owner is active: refusal neither closes nor replaces it. */
+    wl_evaluation_control_source_context_t context;
+    CHECK(wl_evaluation_control_source_metadata_enter_issued(bank, &context)
+        == WL_EVALUATION_CONTROL_SOURCE_METADATA_OPEN);
+    CHECK(wl_evaluation_control_source_operation_observe_owned(bank) == EBUSY
+        && context.identity == &context);
+    wl_evaluation_control_source_metadata_preparation_t prepared = {0};
+    CHECK(wl_evaluation_control_source_metadata_continue_issued(&context,
+        NULL, NULL, NULL, &prepared) == EINVAL
+        && !context.identity && prepared.entry.settled);
+    CHECK(!wl_evaluation_control_source_operation_observe_owned(bank));
+}
+
+typedef struct { unsigned groups, calls; } issued_count_t;
+static int
+issued_count_prepare(const void *recipe, unsigned group,
+    wl_evaluation_control_source_metadata_preparation_t *prepared)
+{
+    issued_count_t *p = (issued_count_t *)recipe;
+    CHECK(group == p->groups++ && group < 3);
+    if (group == 2) {
+        prepared->action = count_action; prepared->payload = &p->calls;
+        prepared->result_published = true;
+    }
+    return 0;
+}
+
 static void
 lexical_lifetime(wl_evaluation_control_source_bank_t *bank,
     wl_evaluation_control_t *original)
@@ -1076,6 +1821,8 @@ fresh_source_birth_cases(void)
 static void
 fresh_source_birth_exhaustion(void)
 {
+    wl_evaluation_control_source_bank_t *bank = NULL;
+    CHECK(!wl_evaluation_control_source_bank_create(&bank));
     int owner = 0;
     CHECK(!wl_evaluation_control_test_seed_next_identity(UINT64_MAX - 1));
     wl_evaluation_control_lexical_finance_birth_result_t last =
@@ -1089,6 +1836,28 @@ fresh_source_birth_exhaustion(void)
     CHECK(!wl_evaluation_control_finish(last.control, &owner, 0, 0)
         && !wl_evaluation_control_detach(last.control, &owner));
     wl_evaluation_control_release(last.control);
+    wl_evaluation_control_source_context_t context = {0};
+    CHECK(wl_evaluation_control_source_metadata_enter_issued(bank, &context)
+        == WL_EVALUATION_CONTROL_SOURCE_METADATA_OPEN);
+    issued_count_t payload = {0};
+    wl_evaluation_control_source_metadata_preparation_t prepared = {0};
+    CHECK(!wl_evaluation_control_source_metadata_continue_issued(&context,
+        &test_policy, issued_count_prepare, &payload, &prepared)
+        && payload.groups == 3 && payload.calls == 1
+        && prepared.entry.begun && prepared.entry.settled && !context.identity);
+    wl_evaluation_control_t *still_exhausted = NULL;
+    CHECK(wl_evaluation_control_create(1, &still_exhausted) == EOVERFLOW
+        && !still_exhausted);
+    CHECK(!wl_evaluation_control_source_operation_observe_owned(bank));
+    payload = (issued_count_t){0};
+    prepared = (wl_evaluation_control_source_metadata_preparation_t){0};
+    CHECK(!wl_evaluation_control_source_metadata_enter_close_owned(bank,
+        &context));
+    CHECK(!wl_evaluation_control_source_metadata_continue_close_owned(&context,
+        &test_policy, issued_count_prepare, &payload, &prepared)
+        && payload.groups == 3 && payload.calls == 1
+        && prepared.entry.settled && !context.identity);
+    CHECK(!wl_evaluation_control_source_bank_destroy(&bank));
 }
 
 typedef struct {
@@ -1171,6 +1940,852 @@ early_close_refusal_cases(void)
     CHECK(!wl_evaluation_control_source_bank_destroy(&bank) && !bank);
 }
 
+typedef struct {
+    wl_evaluation_control_source_context_t *context;
+    int poll, end;
+} observation_peer_t;
+
+static void *
+observation_foreign(void *payload)
+{
+    observation_peer_t *peer = payload;
+    peer->poll = wl_evaluation_control_source_observation_poll(peer->context);
+    peer->end = wl_evaluation_control_source_observation_end(peer->context);
+    return NULL;
+}
+
+static void
+scoped_observation(wl_evaluation_control_source_bank_t *bank,
+    wl_evaluation_control_t *original)
+{
+    wl_evaluation_control_report_t before, after;
+    CHECK(!wl_evaluation_control_report(original, &before));
+    for (unsigned stop = 0; stop <= 5; ++stop) {
+        wl_evaluation_control_source_context_t context;
+        unsigned char untouched[sizeof(context)];
+        memset(&context, 0x5a, sizeof(context));
+        memcpy(untouched, &context, sizeof(context));
+        wl_evaluation_control_test_source_observation_cancel_at = stop <=
+            3 ? stop : 0;
+        int opened = wl_evaluation_control_source_observation_open(bank,
+                &context);
+        if (stop && stop <= 3) {
+            CHECK(opened ==
+                WL_EVALUATION_CONTROL_SOURCE_METADATA_INITIAL_CANCELLED
+                && !memcmp(untouched, &context, sizeof(context)));
+        } else {
+            CHECK(opened == WL_EVALUATION_CONTROL_SOURCE_METADATA_OPEN
+                && context.identity == &context);
+            wl_evaluation_control_source_context_t copy = context, busy;
+            memset(&busy, 0x5a, sizeof(busy));
+            copy.identity = &copy;
+            CHECK(wl_evaluation_control_source_observation_poll(&copy) == EINVAL
+                && wl_evaluation_control_source_observation_end(&copy) == EINVAL
+                && context.identity == &context);
+            CHECK(wl_evaluation_control_source_observation_open(bank, &busy)
+                == -EBUSY && context.identity == &context);
+            unsigned calls = 0;
+            wl_evaluation_control_source_phase_result_t wrong =
+                wl_evaluation_control_source_bank_run(&context, &test_policy,
+                    count_action, &calls);
+            CHECK(wrong.financial_result == EBUSY && !wrong.action_called &&
+                !calls
+                && wl_evaluation_control_source_context_end(&context) == EBUSY);
+            wl_evaluation_control_source_metadata_preparation_t prepared = {0};
+            CHECK(wl_evaluation_control_source_metadata_continue_issued(
+                    &context,
+                    NULL, NULL, NULL, &prepared) == EBUSY
+                && !prepared.entry.begun && !prepared.entry.settled
+                && context.identity == &context);
+            wl_evaluation_control_source_metadata_bind_outcome_t bound = {0};
+            CHECK(wl_evaluation_control_source_metadata_bind_continue_issued(
+                    &context, NULL, NULL, NULL,
+                    &bound) == EBUSY && !bound.settled
+                && context.identity == &context);
+            observation_peer_t peer = {&context, 0, 0};
+            wl_thread_t thread;
+            CHECK(!wl_thread_create(&thread, observation_foreign, &peer)
+                && !wl_thread_join(&thread) && peer.poll == EBUSY &&
+                peer.end == EBUSY
+                && context.identity == &context);
+            if (!stop) {
+                for (unsigned poll = 0; poll < 4096; ++poll)
+                    CHECK(!wl_evaluation_control_source_observation_poll(
+                            &context));
+                CHECK(!wl_evaluation_control_source_observation_end(&context));
+            } else {
+                wl_evaluation_control_test_source_observation_cancel_at = stop;
+                int result = stop == 4
+                    ? wl_evaluation_control_source_observation_poll(&context)
+                    : wl_evaluation_control_source_observation_end(&context);
+                CHECK(result == WL_EVALUATION_CONTROL_CANCELLED);
+            }
+            CHECK(!context.identity
+                && wl_evaluation_control_source_observation_poll(&context) ==
+                EINVAL
+                && wl_evaluation_control_source_observation_end(&context) ==
+                EINVAL);
+        }
+        wl_evaluation_control_report_t source;
+        CHECK(!wl_evaluation_control_test_source_early_report(bank,
+            WL_EVALUATION_CONTROL_SOURCE_OPERATION, &source)
+            && source.attempt_id == 1 && source.limit == 768
+            && source.consumed == (stop == 1 || stop == 2 ? 0u : 10u)
+            && source.result == (stop ? WL_EVALUATION_CONTROL_CANCELLED : 0)
+            && source.stop_reason == source.result
+            && !source.execution_status && !source.cleanup_status);
+        if (stop) CHECK(!wl_evaluation_control_test_source_final_reset_cancel(
+                    bank,
+                    WL_EVALUATION_CONTROL_SOURCE_OPERATION));
+        CHECK(!wl_evaluation_control_report(original, &after));
+        same_report(&before, &after);
+    }
+}
+
+static void
+retained_legacy_writers_refused(wl_evaluation_control_source_bank_t *bank)
+{
+    wl_evaluation_control_source_context_t context = {0};
+    unsigned calls = 0;
+    CHECK(wl_evaluation_control_source_context_begin(bank,
+        WL_EVALUATION_CONTROL_SOURCE_OPERATION,
+        &context) == EBUSY && !context.identity);
+    CHECK(wl_evaluation_control_source_metadata_enter_issued(bank,
+        &context) == -EBUSY
+        && !context.identity);
+    CHECK(wl_evaluation_control_source_observation_open(bank,
+        &context) == -EBUSY
+        && !context.identity);
+    wl_evaluation_control_source_phase_result_t run =
+        wl_evaluation_control_source_bank_run_lexical(bank,
+            WL_EVALUATION_CONTROL_SOURCE_OPERATION, &test_policy, count_action,
+            &calls);
+    CHECK(run.financial_result == EBUSY && !run.action_called && !calls);
+    run = wl_evaluation_control_source_bank_run_lexical_constructor(bank,
+            WL_EVALUATION_CONTROL_SOURCE_OPERATION, &test_policy, count_action,
+            &calls);
+    CHECK(run.financial_result == EBUSY && !run.action_called && !calls);
+    wl_evaluation_control_t *foreign = NULL;
+    CHECK(!wl_evaluation_control_create(1, &foreign));
+    wl_evaluation_control_source_metadata_probe_t probe;
+    unsigned char unchanged[sizeof(probe)];
+    memset(&probe, 0x5a, sizeof(probe));
+    memcpy(unchanged, &probe, sizeof(probe));
+    for (unsigned fault = 1; fault <= 6; ++fault)
+        for (unsigned issued = 0; issued != 2; ++issued)
+            CHECK(wl_evaluation_control_test_source_metadata_start_rejection(
+                    bank,
+                    WL_EVALUATION_CONTROL_SOURCE_OPERATION, fault, foreign,
+                    issued != 0,
+                    &probe) == EBUSY && !memcmp(unchanged, &probe,
+                sizeof(probe)));
+    wl_evaluation_control_release(foreign);
+}
+
+static void
+retained_observation(void)
+{
+    for (unsigned stop = 0; stop <= 5; ++stop) {
+        wl_evaluation_control_source_bank_t *bank = NULL;
+        CHECK(!wl_evaluation_control_source_bank_create(&bank));
+        wl_evaluation_control_source_bank_t *alias = bank;
+        wl_evaluation_control_source_retained_output_t result;
+        unsigned char unchanged[sizeof(result)];
+        memset(&result, 0x5a, sizeof(result));
+        memcpy(unchanged, &result, sizeof(result));
+        CHECK(wl_evaluation_control_source_standby_prepare_owned(&alias,
+            &result) == EINVAL
+            && !memcmp(unchanged, &result, sizeof(result)));
+        CHECK(wl_evaluation_control_source_standby_prepare_owned(&bank,
+            NULL) == EINVAL);
+        CHECK(wl_evaluation_control_source_standby_observe_owned(&bank,
+            &result) == EINVAL
+            && !memcmp(unchanged, &result, sizeof(result)));
+        wl_evaluation_control_test_source_observation_cancel_at = stop ==
+            1 ? 1 : 0;
+        CHECK(!wl_evaluation_control_source_standby_prepare_owned(&bank,
+            &result));
+        CHECK(!result.report_verified
+            && result.opened == (stop != 1));
+        retained_legacy_writers_refused(bank);
+        for (unsigned fault = 1; fault <= 6; ++fault) {
+            memcpy(unchanged, &result, sizeof(result));
+            int protocol = wl_evaluation_control_test_source_standby_rejection(
+                &bank, fault, &result);
+            CHECK(protocol == (fault == 4 || fault == 5 ? EINVAL : EBUSY)
+                && !memcmp(unchanged, &result, sizeof(result)));
+        }
+        wl_evaluation_control_report_t report;
+        CHECK(wl_evaluation_control_test_source_early_report(bank,
+            WL_EVALUATION_CONTROL_SOURCE_OPERATION, &report) == EBUSY);
+        wl_evaluation_control_source_context_t blocked = {0};
+        CHECK(wl_evaluation_control_source_context_begin(bank,
+            WL_EVALUATION_CONTROL_SOURCE_OPERATION, &blocked) == EBUSY
+            && !blocked.identity);
+        CHECK(wl_evaluation_control_source_bank_destroy(&bank) == EBUSY &&
+            bank);
+        uint64_t expected = stop <= 2 && stop ? 0 :
+            WL_EVALUATION_CONTROL_SOURCE_OBSERVATION_WORK;
+        if (stop != 1) {
+            CHECK(!wl_evaluation_control_source_standby_observe_owned(&bank,
+                &result));
+            CHECK(result.opened && !result.financial_result);
+            wl_evaluation_control_source_context_t context = {0};
+            wl_evaluation_control_test_source_observation_cancel_at =
+                stop == 2 || stop == 3 ? stop : 0;
+            CHECK(!wl_evaluation_control_source_standby_attach_owned(&bank,
+                &context, &result));
+            CHECK(result.opened == (stop != 2 && stop != 3));
+            if (result.opened) {
+                wl_evaluation_control_source_context_t copy = context;
+                memcpy(unchanged, &result, sizeof(result));
+                CHECK(wl_evaluation_control_source_standby_observe_owned(&bank,
+                    &result) == EBUSY
+                    && !memcmp(unchanged, &result, sizeof(result)));
+                CHECK(wl_evaluation_control_source_standby_attach_owned(&bank,
+                    &copy, &result) == EINVAL
+                    && !memcmp(unchanged, &result, sizeof(result)));
+                CHECK(wl_evaluation_control_source_standby_attach_owned(&bank,
+                    &context, &result) == EINVAL
+                    && !memcmp(unchanged, &result,
+                    sizeof(result)) && context.identity == &context);
+                CHECK(wl_evaluation_control_source_observation_poll(&copy) ==
+                    EINVAL);
+                observation_peer_t peer = {&context, 0, 0};
+                wl_thread_t thread;
+                CHECK(!wl_thread_create(&thread, observation_foreign, &peer)
+                    && !wl_thread_join(&thread)
+                    && peer.poll == EBUSY && peer.end == EBUSY);
+                wl_evaluation_control_test_source_observation_cancel_at = stop;
+                int rc = stop == 4
+                    ? wl_evaluation_control_source_observation_poll(&context)
+                    : wl_evaluation_control_source_observation_end(&context);
+                CHECK(rc == (stop ? WL_EVALUATION_CONTROL_CANCELLED : 0)
+                    && !context.identity);
+            }
+        }
+        if (stop) {
+            retained_legacy_writers_refused(bank);
+            for (unsigned repeat = 0; repeat != 3; ++repeat) {
+                CHECK(!wl_evaluation_control_source_standby_observe_owned(&bank,
+                    &result));
+                CHECK(!result.opened && !result.report_verified
+                    && result.financial_result ==
+                    WL_EVALUATION_CONTROL_CANCELLED
+                    && result.state ==
+                    WL_EVALUATION_CONTROL_SOURCE_STOPPED_STANDBY);
+            }
+            CHECK(wl_evaluation_control_test_source_early_report(bank,
+                WL_EVALUATION_CONTROL_SOURCE_OPERATION, &report) == EBUSY);
+            CHECK(!wl_evaluation_control_source_standby_handoff_owned(&bank,
+                &result));
+            CHECK(result.report_verified
+                && result.state == WL_EVALUATION_CONTROL_SOURCE_FINISH_PENDING
+                && result.financial_result == WL_EVALUATION_CONTROL_CANCELLED);
+        }
+        memcpy(unchanged, &result, sizeof(result));
+        CHECK(wl_evaluation_control_source_standby_prepare_owned(&bank,
+            &result) == EBUSY
+            && !memcmp(unchanged, &result, sizeof(result)));
+        CHECK(!wl_evaluation_control_source_standby_handoff_owned(&bank,
+            &result));
+        CHECK(result.report_verified
+            && result.state == WL_EVALUATION_CONTROL_SOURCE_QUIESCENT);
+        CHECK(!wl_evaluation_control_test_source_early_report(bank,
+            WL_EVALUATION_CONTROL_SOURCE_OPERATION, &report)
+            && report.consumed == expected && report.attempt_id == 1
+            && report.result == (stop ? WL_EVALUATION_CONTROL_CANCELLED : 0));
+        memcpy(unchanged, &result, sizeof(result));
+        CHECK(wl_evaluation_control_source_standby_handoff_owned(&bank,
+            &result) == EINVAL
+            && !memcmp(unchanged, &result, sizeof(result)));
+        CHECK(!wl_evaluation_control_source_bank_destroy(&bank) && !bank);
+    }
+}
+
+static void
+retained_metadata_ack(wl_evaluation_control_source_bank_t **bank,
+    wl_evaluation_control_source_retained_output_t *out,
+    uint64_t consumed, int financial)
+{
+    if (out->state == WL_EVALUATION_CONTROL_SOURCE_STOPPED_STANDBY)
+        CHECK(!wl_evaluation_control_source_standby_handoff_owned(bank, out));
+    CHECK(out->state == WL_EVALUATION_CONTROL_SOURCE_FINISH_PENDING
+        && out->report_verified && !out->opened
+        && out->financial_result == financial);
+    retained_legacy_writers_refused(*bank);
+    CHECK(!wl_evaluation_control_source_standby_handoff_owned(bank, out)
+        && out->state == WL_EVALUATION_CONTROL_SOURCE_QUIESCENT
+        && out->report_verified && out->financial_result == financial);
+    wl_evaluation_control_report_t report;
+    CHECK(!wl_evaluation_control_test_source_early_report(*bank,
+        WL_EVALUATION_CONTROL_SOURCE_OPERATION, &report)
+        && report.attempt_id == 1 && report.consumed == consumed
+        && report.limit == 3 * WL_EVALUATION_CONTROL_QUANTUM
+        && report.result == financial && report.stop_reason == financial
+        && !report.execution_status && !report.cleanup_status);
+}
+
+typedef struct {
+    unsigned groups, calls, fault;
+    int result;
+} retained_metadata_probe_t;
+
+static int
+retained_metadata_action(void *payload)
+{
+    retained_metadata_probe_t *p = payload;
+    ++p->calls;
+    return p->result;
+}
+
+static int
+retained_metadata_prepare(const void *recipe, unsigned group,
+    wl_evaluation_control_source_metadata_preparation_t *prepared)
+{
+    retained_metadata_probe_t *p = (void *)recipe;
+    CHECK(group == p->groups++ && group < 3);
+    if (p->fault == group + 1) return ERANGE;
+    if (group == 2) {
+        prepared->action = retained_metadata_action; prepared->payload = p;
+        prepared->result_published = true;
+    }
+    return 0;
+}
+
+typedef struct {
+    wl_evaluation_control_source_context_t *context;
+    retained_metadata_probe_t *probe;
+    int protocol;
+} retained_metadata_peer_t;
+
+static void *
+retained_metadata_foreign(void *payload)
+{
+    retained_metadata_peer_t *peer = payload;
+    wl_evaluation_control_source_retained_output_t out;
+    unsigned char unchanged[sizeof(out)];
+    memset(&out, 0x5a, sizeof(out)); memcpy(unchanged, &out, sizeof(out));
+    wl_evaluation_control_source_metadata_preparation_t prepared = {0};
+    peer->protocol =
+        wl_evaluation_control_source_metadata_continue_retained_owned(
+        peer->context, &test_policy, retained_metadata_prepare, peer->probe,
+        &prepared, &out);
+    CHECK(peer->protocol == EBUSY && !prepared.entry.begun
+        && !memcmp(unchanged, &out, sizeof(out)));
+    return NULL;
+}
+
+static void
+retained_metadata(wl_evaluation_control_t *original)
+{
+    const wl_evaluation_control_source_phase_policy_t policy = {10, 13, 6};
+    wl_evaluation_control_report_t before, after;
+    CHECK(!wl_evaluation_control_report(original, &before));
+    for (unsigned mode = 0; mode != 8; ++mode) {
+        wl_evaluation_control_source_bank_t *bank = NULL;
+        CHECK(!wl_evaluation_control_source_bank_create(&bank));
+        wl_evaluation_control_source_context_t context = {0};
+        wl_evaluation_control_source_retained_output_t out;
+        memset(&out, 0x5a, sizeof(out));
+        unsigned char unchanged[sizeof(out)];
+        memcpy(unchanged, &out, sizeof(out));
+        wl_evaluation_control_source_bank_t *alias = bank;
+        CHECK(wl_evaluation_control_source_metadata_enter_retained_owned(
+                &alias, &context, &out) == EINVAL
+            && !memcmp(unchanged, &out, sizeof(out)) && !context.identity);
+        CHECK(wl_evaluation_control_source_metadata_enter_retained_owned(
+                &bank, &context, NULL) == EINVAL && !context.identity);
+        wl_evaluation_control_test_source_metadata_cancel_at = mode >= 1 &&
+            mode <= 4 ? mode : 0;
+        CHECK(!wl_evaluation_control_source_metadata_enter_retained_owned(
+                &bank, &context, &out));
+        retained_legacy_writers_refused(bank);
+        retained_metadata_probe_t probe = {.result = mode == 7 ? 7 : 0};
+        wl_evaluation_control_source_metadata_preparation_t prepared = {0};
+        if (mode == 1) {
+            CHECK(!out.opened && !out.report_verified && !context.identity
+                && out.state == WL_EVALUATION_CONTROL_SOURCE_STOPPED_STANDBY
+                && out.financial_result == WL_EVALUATION_CONTROL_CANCELLED);
+        } else {
+            CHECK(out.opened && !out.report_verified && !out.financial_result
+                && context.identity == &context
+                && out.state == WL_EVALUATION_CONTROL_SOURCE_METADATA);
+            CHECK(wl_evaluation_control_source_metadata_enter_retained_owned(
+                    &bank, &context, &out) == EINVAL
+                && context.identity == &context);
+            if (!mode) {
+                retained_metadata_peer_t peer = {&context, &probe, 0};
+                wl_thread_t thread;
+                CHECK(!wl_thread_create(&thread, retained_metadata_foreign,
+                    &peer)
+                    && !wl_thread_join(&thread) && peer.protocol == EBUSY
+                    && context.identity == &context && !probe.calls &&
+                    !probe.groups);
+            }
+            wl_evaluation_control_source_context_t copy = context;
+            memcpy(unchanged, &out, sizeof(out));
+            CHECK(wl_evaluation_control_source_metadata_continue_retained_owned(
+                    &copy, &policy, retained_metadata_prepare, &probe,
+                    &prepared,
+                    &out) == EINVAL && !memcmp(unchanged, &out, sizeof(out)));
+            copy.identity = &copy;
+            CHECK(wl_evaluation_control_source_metadata_continue_retained_owned(
+                    &copy, &policy, retained_metadata_prepare, &probe,
+                    &prepared,
+                    &out) == EBUSY && !memcmp(unchanged, &out, sizeof(out)));
+            CHECK(wl_evaluation_control_source_metadata_continue_issued(
+                    &context, &policy, retained_metadata_prepare, &probe,
+                    &prepared) == EBUSY && context.identity == &context
+                && !prepared.entry.begun && !probe.groups && !probe.calls);
+            wl_evaluation_control_test_source_lexical_cancel_before_action =
+                mode == 5;
+            wl_evaluation_control_test_source_lexical_cancel_after_action =
+                mode == 6;
+            CHECK(
+                !wl_evaluation_control_source_metadata_continue_retained_owned(
+                    &context, &policy, retained_metadata_prepare, &probe,
+                    &prepared,
+                    &out) && !context.identity && prepared.entry.begun
+                && prepared.entry.settled && !prepared.preparation_protocol
+                && prepared.outcome.action_called == (mode == 0 || mode >= 6)
+                && prepared.outcome.action_result == probe.result
+                && probe.calls == (mode == 0 || mode >= 6 ? 1u : 0u));
+            CHECK(probe.groups == (mode >= 2 && mode <= 4 ? mode - 1 : 3));
+        }
+        int financial = mode >= 1 && mode <= 6 ?
+            WL_EVALUATION_CONTROL_CANCELLED : 0;
+        uint64_t charged = mode == 1 ? 0 : mode >= 2 && mode <= 5 ? 10 :
+            mode == 6 ? 23 : 29;
+        retained_metadata_ack(&bank, &out, charged, financial);
+        if (financial) CHECK(
+                !wl_evaluation_control_test_source_final_reset_cancel(
+                    bank, WL_EVALUATION_CONTROL_SOURCE_OPERATION));
+        CHECK(!wl_evaluation_control_source_standby_prepare_owned(&bank, &out)
+            && out.opened && out.state == WL_EVALUATION_CONTROL_SOURCE_STANDBY);
+        CHECK(!wl_evaluation_control_source_standby_handoff_owned(&bank, &out));
+        retained_metadata_ack(&bank, &out, 0, 0);
+        CHECK(!wl_evaluation_control_source_bank_destroy(&bank));
+    }
+    for (unsigned fault = 0; fault != 10; ++fault) {
+        wl_evaluation_control_source_bank_t *bank = NULL;
+        CHECK(!wl_evaluation_control_source_bank_create(&bank));
+        wl_evaluation_control_source_context_t context = {0};
+        wl_evaluation_control_source_retained_output_t out;
+        CHECK(!wl_evaluation_control_source_metadata_enter_retained_owned(
+                &bank, &context, &out) && out.opened);
+        retained_metadata_probe_t probe = {.fault = fault >= 7 ? fault - 6 : 0};
+        wl_evaluation_control_source_metadata_preparation_t prepared = {0};
+        wl_evaluation_control_source_phase_policy_t selected = policy;
+        if (fault == 1) selected.current_work = 0;
+        int rc = wl_evaluation_control_source_metadata_continue_retained_owned(
+            &context, fault == 0 ? NULL : &selected,
+            fault == 2 ? NULL : retained_metadata_prepare,
+            fault == 3 ? NULL : fault == 4 ? (void *)bank : (void *)&probe,
+            fault == 5 ? NULL : &prepared, fault == 6 ? NULL : &out);
+        CHECK(rc == (fault >= 7 ? ERANGE : EINVAL) && !context.identity
+            && !probe.calls);
+        if (fault != 5) CHECK(prepared.entry.begun && prepared.entry.settled);
+        if (fault == 6) {
+            CHECK(!wl_evaluation_control_source_standby_handoff_owned(&bank,
+                &out) && out.state == WL_EVALUATION_CONTROL_SOURCE_QUIESCENT);
+            wl_evaluation_control_report_t report;
+            CHECK(!wl_evaluation_control_test_source_early_report(bank,
+                WL_EVALUATION_CONTROL_SOURCE_OPERATION, &report)
+                && !report.consumed && !report.result);
+        } else retained_metadata_ack(&bank, &out, fault >= 7 ? 10 : 0, 0);
+        CHECK(!wl_evaluation_control_source_bank_destroy(&bank));
+    }
+    for (unsigned cursor = 0; cursor <= 4; ++cursor)
+        for (unsigned stop = 0; stop != 5; ++stop) {
+            wl_evaluation_control_source_bank_t *bank = NULL;
+            CHECK(!wl_evaluation_control_source_bank_create(&bank));
+            wl_evaluation_control_source_context_t context = {0};
+            wl_evaluation_control_source_retained_output_t out;
+            wl_evaluation_control_test_source_metadata_cancel_at = stop;
+            CHECK(!wl_evaluation_control_source_metadata_enter_retained_owned(
+                    &bank, &context, &out));
+            issued_bind_probe_t p = {.cursor = cursor};
+            wl_evaluation_control_source_metadata_bind_outcome_t bound;
+            if (out.opened) {
+                CHECK(
+                    !
+                    wl_evaluation_control_source_metadata_bind_continue_retained_owned
+                    (
+                        &context, issued_bind_prepare, issued_bind_one, &p,
+                        &bound,
+                        &out) && bound.settled && !context.identity
+                    && bound.role_called == (cursor < 4 && (!stop || stop == 4))
+                    && bound.complete_selected == (cursor == 4 &&
+                    (!stop || stop == 4))
+                    && p.cursor == cursor + (bound.role_called ? 1u : 0u));
+            } else CHECK(stop == 1 && !context.identity);
+            bool stopped = stop && (stop != 4 || cursor < 4);
+            retained_metadata_ack(&bank, &out,
+                cursor < 4 && (!stop || stop == 4) ? 10 : 0,
+                stopped ? WL_EVALUATION_CONTROL_CANCELLED : 0);
+            wl_evaluation_control_test_source_metadata_cancel_at = 0;
+            CHECK(!wl_evaluation_control_source_bank_destroy(&bank));
+        }
+    for (unsigned fault = 0; fault != 9; ++fault) {
+        wl_evaluation_control_source_bank_t *bank = NULL;
+        CHECK(!wl_evaluation_control_source_bank_create(&bank));
+        wl_evaluation_control_source_context_t context = {0};
+        wl_evaluation_control_source_retained_output_t out;
+        CHECK(!wl_evaluation_control_source_metadata_enter_retained_owned(
+                &bank, &context, &out) && out.opened);
+        issued_bind_probe_t probe = {
+            .cursor = fault == 8 ? 5 : 0,
+            .fault = fault >= 6 && fault <= 7 ? fault - 5 : 0
+        };
+        wl_evaluation_control_source_metadata_bind_outcome_t bound;
+        CHECK(
+            wl_evaluation_control_source_metadata_bind_continue_retained_owned(
+                &context, fault == 0 ? NULL : issued_bind_prepare,
+                fault == 1 ? NULL : issued_bind_one,
+                fault == 2 ? NULL : fault == 3 ? (void *)bank : (void *)&probe,
+                fault == 4 ? NULL : &bound, fault == 5 ? NULL : &out) == EINVAL
+            && !context.identity && !probe.calls);
+        if (fault != 4) CHECK(bound.settled);
+        if (fault == 5) {
+            CHECK(!wl_evaluation_control_source_standby_handoff_owned(&bank,
+                &out) && out.state == WL_EVALUATION_CONTROL_SOURCE_QUIESCENT);
+        } else retained_metadata_ack(&bank, &out, 0, 0);
+        CHECK(!wl_evaluation_control_source_bank_destroy(&bank));
+    }
+    /* Legitimate metadata need not have observation's fixed ten-cell extent. */
+    wl_evaluation_control_source_bank_t *bank = NULL;
+    CHECK(!wl_evaluation_control_source_bank_create(&bank));
+    wl_evaluation_control_source_context_t context = {0};
+    wl_evaluation_control_source_retained_output_t out;
+    CHECK(!wl_evaluation_control_source_metadata_enter_retained_owned(&bank,
+        &context, &out));
+    retained_metadata_probe_t probe = {0};
+    wl_evaluation_control_source_metadata_preparation_t prepared = {0};
+    CHECK(!wl_evaluation_control_source_metadata_continue_retained_owned(
+            &context, &test_policy, retained_metadata_prepare, &probe,
+            &prepared,
+            &out) && prepared.outcome.action_called && probe.calls == 1);
+    retained_metadata_ack(&bank, &out, 3 * WL_EVALUATION_CONTROL_QUANTUM, 0);
+    CHECK(!wl_evaluation_control_source_bank_destroy(&bank));
+    CHECK(!wl_evaluation_control_report(original, &after));
+    same_report(&before, &after);
+}
+
+static void
+retained_metadata_attach(wl_evaluation_control_t *original)
+{
+    wl_evaluation_control_report_t before, after;
+    CHECK(!wl_evaluation_control_report(original, &before));
+    for (unsigned stop = 0; stop != 2; ++stop) {
+        wl_evaluation_control_source_bank_t *bank = NULL;
+        CHECK(!wl_evaluation_control_source_bank_create(&bank));
+        wl_evaluation_control_source_retained_output_t out;
+        wl_evaluation_control_source_context_t context = {0};
+        CHECK(!wl_evaluation_control_source_standby_prepare_owned(&bank, &out)
+            && out.opened && out.state == WL_EVALUATION_CONTROL_SOURCE_STANDBY);
+        unsigned char unchanged[sizeof(out)];
+        memcpy(unchanged, &out, sizeof(out));
+        for (unsigned fault = 1; fault <= 6; ++fault) {
+            CHECK(wl_evaluation_control_test_source_metadata_attach_rejection(
+                    &bank, fault,
+                    &out) == (fault == 4 || fault == 5 ? EINVAL : EBUSY)
+                && !memcmp(unchanged, &out, sizeof(out)));
+        }
+        wl_evaluation_control_source_bank_t *alias = bank;
+        CHECK(wl_evaluation_control_source_metadata_attach_retained_owned(
+                &alias, &context, &out) == EINVAL
+            && !memcmp(unchanged, &out, sizeof(out)) && !context.identity);
+        CHECK(wl_evaluation_control_source_metadata_attach_retained_owned(
+                &bank, &context, NULL) == EINVAL && !context.identity);
+        wl_evaluation_control_test_source_metadata_cancel_at = stop;
+        CHECK(!wl_evaluation_control_source_metadata_attach_retained_owned(
+                &bank, &context, &out)
+            && out.opened == !stop && !out.report_verified);
+        retained_legacy_writers_refused(bank);
+        if (stop) {
+            CHECK(!context.identity && !context.bank && !context.thread_cookie
+                && !context.lane &&
+                out.financial_result == WL_EVALUATION_CONTROL_CANCELLED
+                && out.state == WL_EVALUATION_CONTROL_SOURCE_STOPPED_STANDBY);
+            memcpy(unchanged, &out, sizeof(out));
+            CHECK(wl_evaluation_control_source_metadata_attach_retained_owned(
+                    &bank, &context, &out) == EBUSY
+                && !memcmp(unchanged, &out, sizeof(out)));
+            retained_metadata_ack(&bank, &out, 0,
+                WL_EVALUATION_CONTROL_CANCELLED);
+        } else {
+            CHECK(context.identity == &context && context.bank == bank
+                && out.state == WL_EVALUATION_CONTROL_SOURCE_METADATA
+                && !out.financial_result);
+            wl_evaluation_control_source_context_t copy = context;
+            memcpy(unchanged, &out, sizeof(out));
+            CHECK(wl_evaluation_control_source_metadata_attach_retained_owned(
+                    &bank, &copy, &out) == EINVAL
+                && !memcmp(unchanged, &out, sizeof(out)));
+            CHECK(wl_evaluation_control_source_metadata_attach_retained_owned(
+                    &bank, &context, &out) == EINVAL
+                && !memcmp(unchanged, &out, sizeof(out)));
+            wl_evaluation_control_source_context_t empty = {0};
+            CHECK(wl_evaluation_control_source_metadata_attach_retained_owned(
+                    &bank, &empty, &out) == EBUSY && !empty.identity
+                && !memcmp(unchanged, &out, sizeof(out)));
+            retained_metadata_probe_t probe = {0};
+            wl_evaluation_control_source_metadata_preparation_t prepared = {0};
+            const wl_evaluation_control_source_phase_policy_t policy = {10, 13,
+                                                                        6};
+            CHECK(
+                !wl_evaluation_control_source_metadata_continue_retained_owned(
+                    &context, &policy, retained_metadata_prepare, &probe,
+                    &prepared,
+                    &out) && prepared.entry.settled &&
+                prepared.outcome.action_called
+                && probe.groups == 3 && probe.calls == 1);
+            CHECK(wl_evaluation_control_source_metadata_attach_retained_owned(
+                    &bank, &empty, &out) == EBUSY && !empty.identity);
+            retained_metadata_ack(&bank, &out, 29, 0);
+        }
+        context = (wl_evaluation_control_source_context_t){0};
+        memcpy(unchanged, &out, sizeof(out));
+        CHECK(wl_evaluation_control_source_metadata_attach_retained_owned(
+                &bank, &context, &out) == EBUSY && !context.identity
+            && !memcmp(unchanged, &out, sizeof(out)));
+        CHECK(!wl_evaluation_control_source_bank_destroy(&bank));
+    }
+    for (unsigned stop = 0; stop != 2; ++stop) {
+        wl_evaluation_control_source_bank_t *bank = NULL;
+        CHECK(!wl_evaluation_control_source_bank_create(&bank));
+        wl_evaluation_control_source_retained_output_t out;
+        wl_evaluation_control_source_context_t frame = {0}, destination = {0};
+        CHECK(!wl_evaluation_control_source_standby_prepare_owned(&bank, &out)
+            && !wl_evaluation_control_source_standby_attach_owned(&bank, &frame,
+            &out) && out.opened);
+        unsigned char unchanged[sizeof(out)];
+        memcpy(unchanged, &out, sizeof(out));
+        CHECK(wl_evaluation_control_source_metadata_attach_retained_owned(
+                &bank, &destination, &out) == EBUSY
+            && !memcmp(unchanged, &out, sizeof(out)) && !destination.identity
+            && frame.identity == &frame);
+        wl_evaluation_control_test_source_observation_cancel_at = stop ? 5 : 0;
+        CHECK(wl_evaluation_control_source_observation_end(&frame) ==
+            (stop ? WL_EVALUATION_CONTROL_CANCELLED : 0) && !frame.identity);
+        CHECK(wl_evaluation_control_source_metadata_attach_retained_owned(
+                &bank, &destination, &out) == EBUSY && !destination.identity);
+        if (stop) {
+            CHECK(!wl_evaluation_control_source_standby_handoff_owned(&bank,
+                &out));
+            retained_metadata_ack(&bank, &out, 10,
+                WL_EVALUATION_CONTROL_CANCELLED);
+        } else {
+            CHECK(!wl_evaluation_control_source_standby_handoff_owned(&bank,
+                &out)
+                && out.state == WL_EVALUATION_CONTROL_SOURCE_QUIESCENT
+                && out.report_verified && !out.financial_result);
+            wl_evaluation_control_report_t report;
+            CHECK(!wl_evaluation_control_test_source_early_report(bank,
+                WL_EVALUATION_CONTROL_SOURCE_OPERATION, &report)
+                && report.consumed == 10 && !report.result);
+        }
+        CHECK(!wl_evaluation_control_source_bank_destroy(&bank));
+    }
+    CHECK(!wl_evaluation_control_report(original, &after));
+    same_report(&before, &after);
+}
+
+static void
+financial_packets(wl_evaluation_control_t *original)
+{
+    const wl_evaluation_control_source_financial_state_t states[] = {
+        WL_EVALUATION_CONTROL_SOURCE_PF_FROZEN,
+        WL_EVALUATION_CONTROL_SOURCE_PF_HEADER_BUILT,
+        WL_EVALUATION_CONTROL_SOURCE_PF_BODY_BUILT,
+        WL_EVALUATION_CONTROL_SOURCE_PF_PUBLISHED,
+        WL_EVALUATION_CONTROL_SOURCE_PF_HEADER_CHECKED,
+        WL_EVALUATION_CONTROL_SOURCE_PF_TOTALS_CHECKED,
+        WL_EVALUATION_CONTROL_SOURCE_PF_VERIFIED,
+        WL_EVALUATION_CONTROL_SOURCE_QUIESCENT
+    };
+    wl_evaluation_control_report_t original_before, original_after;
+    CHECK(!wl_evaluation_control_report(original, &original_before));
+    const wl_evaluation_control_source_phase_policy_t policy = {10, 13, 6};
+    for (unsigned frame = 0; frame != 2; ++frame)
+        for (unsigned cancel_at = 0; cancel_at != 10; ++cancel_at) {
+            wl_evaluation_control_source_bank_t *bank = NULL;
+            CHECK(!wl_evaluation_control_source_bank_create(&bank));
+            unsigned calls = 0;
+            wl_evaluation_control_source_metadata_outcome_t outcome = {0};
+            CHECK(!wl_evaluation_control_source_bank_run_metadata(bank,
+                WL_EVALUATION_CONTROL_SOURCE_OPERATION, &policy, count_action,
+                &calls, &outcome) && outcome.action_called && calls == 1);
+            wl_evaluation_control_report_t old;
+            CHECK(!wl_evaluation_control_test_source_early_report(bank,
+                WL_EVALUATION_CONTROL_SOURCE_OPERATION, &old)
+                && old.consumed == 29 && !old.result);
+            wl_evaluation_control_source_retained_output_t out;
+            CHECK(!wl_evaluation_control_source_standby_prepare_owned(&bank,
+                &out)
+                && out.opened);
+            if (frame) {
+                wl_evaluation_control_source_context_t context = {0};
+                CHECK(!wl_evaluation_control_source_standby_attach_owned(&bank,
+                    &context, &out) && out.opened);
+                wl_evaluation_control_test_source_observation_cancel_at = 5;
+                CHECK(wl_evaluation_control_source_observation_end(&context) ==
+                    WL_EVALUATION_CONTROL_CANCELLED && !context.identity);
+            }
+            if (cancel_at == 1)
+                CHECK(!wl_evaluation_control_test_source_financial_cancel(
+                        &bank));
+            int expected = frame ||
+                cancel_at == 1 ? WL_EVALUATION_CONTROL_CANCELLED : 0;
+            for (unsigned step = 0; step != 8; ++step) {
+                unsigned char unchanged[sizeof(out)];
+                memcpy(unchanged, &out, sizeof(out));
+                wl_evaluation_control_source_bank_t *alias = bank;
+                CHECK(wl_evaluation_control_source_financial_progress_owned(
+                        &alias, &out) == EINVAL && !memcmp(unchanged, &out,
+                    sizeof(out)));
+                CHECK(wl_evaluation_control_source_financial_progress_owned(
+                        &bank, NULL) == EINVAL);
+                CHECK(!wl_evaluation_control_source_financial_progress_owned(
+                        &bank, &out) && out.state == states[step] && !out.opened
+                    && out.financial_result == expected
+                    && out.report_verified == (step >= 6));
+                if (cancel_at == step + 2)
+                    CHECK(!wl_evaluation_control_test_source_financial_cancel(
+                            &bank));
+                wl_evaluation_control_source_financial_view_t view;
+                CHECK(!wl_evaluation_control_test_source_financial_view(&bank,
+                    &view)
+                    && view.state == states[step] &&
+                    view.active_id == (step < 3 ? 1u : 0u)
+                    && view.charged == (frame ? 10u : 0u)
+                    && view.verified == (step >= 6));
+                if (step < 3) same_report(&old, &view.history);
+                else CHECK(view.history.attempt_id == 1
+                        && view.history.limit ==
+                        3 * WL_EVALUATION_CONTROL_QUANTUM
+                        && view.history.consumed == (frame ? 10u : 0u)
+                        && view.history.stop_reason == expected &&
+                        view.history.result == expected
+                        && !view.history.execution_status &&
+                        !view.history.cleanup_status);
+                if (step != 7) {
+                    retained_legacy_writers_refused(bank);
+                    for (unsigned fault = 1; fault <= 6; ++fault) {
+                        memcpy(unchanged, &out, sizeof(out));
+                        CHECK(
+                            wl_evaluation_control_test_source_financial_rejection
+                            (
+                                &bank, fault,
+                                &out) == (fault == 4 ||
+                            fault == 5 ? EINVAL : EBUSY)
+                            && !memcmp(unchanged, &out, sizeof(out)));
+                    }
+                    memcpy(unchanged, &out, sizeof(out));
+                    CHECK(wl_evaluation_control_source_standby_handoff_owned(
+                            &bank, &out) == EBUSY && !memcmp(unchanged, &out,
+                        sizeof(out)));
+                    CHECK(wl_evaluation_control_source_bank_destroy(&bank) ==
+                        EBUSY && bank);
+                    CHECK(wl_evaluation_control_test_source_final_reset_cancel(
+                            bank,
+                            WL_EVALUATION_CONTROL_SOURCE_OPERATION) == EBUSY);
+                    wl_evaluation_control_report_t report;
+                    unsigned char unreported[sizeof(report)];
+                    memset(&report, 0x5a, sizeof(report));
+                    memcpy(unreported, &report, sizeof(report));
+                    CHECK(wl_evaluation_control_test_source_early_report(bank,
+                        WL_EVALUATION_CONTROL_SOURCE_OPERATION,
+                        &report) == EBUSY
+                        && !memcmp(unreported, &report, sizeof(report)));
+                    if (step >= 3 && step <= 5) {
+                        unsigned first = step == 3 ? 1 : step == 4 ? 3 : 5;
+                        unsigned last = step == 3 ? 2 : step == 4 ? 4 : 7;
+                        for (unsigned fault = first; fault <= last; ++fault) {
+                            memcpy(unchanged, &out, sizeof(out));
+                            CHECK(
+                                wl_evaluation_control_test_source_financial_readback_rejection
+                                (
+                                    &bank, fault, &out) == EINVAL
+                                && !memcmp(unchanged, &out, sizeof(out)));
+                        }
+                        wl_evaluation_control_source_financial_view_t restored;
+                        CHECK(!wl_evaluation_control_test_source_financial_view(
+                                &bank,
+                                &restored) && restored.state == view.state
+                            && !restored.verified && !restored.active_id);
+                        same_report(&view.history, &restored.history);
+                    }
+                }
+            }
+            unsigned char unchanged[sizeof(out)];
+            memcpy(unchanged, &out, sizeof(out));
+            CHECK(wl_evaluation_control_source_financial_progress_owned(&bank,
+                &out) == EINVAL && !memcmp(unchanged, &out, sizeof(out)));
+            wl_evaluation_control_report_t completed;
+            CHECK(!wl_evaluation_control_test_source_early_report(bank,
+                WL_EVALUATION_CONTROL_SOURCE_OPERATION, &completed)
+                && completed.result == expected &&
+                completed.consumed == (frame ? 10u : 0u));
+            if (frame || cancel_at) {
+                /* A post-freeze request did not rewrite that report. It is
+                * genuinely observed by the following active generation. */
+                CHECK(!wl_evaluation_control_source_standby_prepare_owned(&bank,
+                    &out)
+                    && !out.opened && !out.report_verified
+                    && out.state == WL_EVALUATION_CONTROL_SOURCE_STOPPED_STANDBY
+                    && out.financial_result == WL_EVALUATION_CONTROL_CANCELLED);
+                for (unsigned step = 0; step != 8; ++step)
+                    CHECK(
+                        !wl_evaluation_control_source_financial_progress_owned(
+                            &bank,
+                            &out) && out.state == states[step]
+                        && out.financial_result ==
+                        WL_EVALUATION_CONTROL_CANCELLED);
+            }
+            CHECK(!wl_evaluation_control_source_bank_destroy(&bank) && !bank);
+        }
+    const uint64_t extents[] = {0, 10, 23, 29, 768};
+    for (unsigned i = 0; i != 5; ++i) {
+        wl_evaluation_control_source_bank_t *bank = NULL;
+        CHECK(!wl_evaluation_control_source_bank_create(&bank));
+        wl_evaluation_control_source_context_t context = {0};
+        wl_evaluation_control_source_retained_output_t out;
+        CHECK(!wl_evaluation_control_source_metadata_enter_retained_owned(&bank,
+            &context, &out) && out.opened);
+        retained_metadata_probe_t probe = {0};
+        wl_evaluation_control_source_metadata_preparation_t prepared = {0};
+        wl_evaluation_control_test_source_lexical_cancel_before_action = i == 1;
+        wl_evaluation_control_test_source_lexical_cancel_after_action = i == 2;
+        CHECK(wl_evaluation_control_source_metadata_continue_retained_owned(
+                &context,
+                i ? i == 4 ? &test_policy : &policy : NULL,
+                retained_metadata_prepare, &probe, &prepared,
+                &out) == (i ? 0 : EINVAL)
+            && out.state == WL_EVALUATION_CONTROL_SOURCE_FINISH_PENDING &&
+            out.report_verified);
+        wl_evaluation_control_source_financial_view_t before, after;
+        CHECK(!wl_evaluation_control_test_source_financial_view(&bank, &before)
+            && before.history.consumed == extents[i]);
+        CHECK(!wl_evaluation_control_source_financial_progress_owned(&bank,
+            &out)
+            && out.state == WL_EVALUATION_CONTROL_SOURCE_PF_VERIFIED &&
+            out.report_verified);
+        CHECK(wl_evaluation_control_source_standby_handoff_owned(&bank,
+            &out) == EBUSY);
+        CHECK(!wl_evaluation_control_test_source_financial_view(&bank, &after));
+        same_report(&before.history, &after.history);
+        CHECK(!wl_evaluation_control_source_financial_progress_owned(&bank,
+            &out)
+            && out.state == WL_EVALUATION_CONTROL_SOURCE_QUIESCENT &&
+            out.report_verified);
+        CHECK(!wl_evaluation_control_source_bank_destroy(&bank));
+    }
+    CHECK(!wl_evaluation_control_report(original, &original_after));
+    same_report(&original_before, &original_after);
+}
+
 int
 main(int argc, char **argv)
 {
@@ -1178,6 +2793,7 @@ main(int argc, char **argv)
         fresh_source_birth_exhaustion();
         return 0;
     }
+    retained_observation();
     fresh_source_birth_cases();
     early_close_refusal_cases();
     early_phase_cases();
@@ -1196,6 +2812,18 @@ main(int argc, char **argv)
 
     wl_evaluation_control_source_bank_t *bank = NULL;
     CHECK(!wl_evaluation_control_source_bank_create(&bank) && bank);
+    sealed_metadata(bank, original);
+    sealed_metadata_recipe(bank, original);
+    sealed_metadata_binding(bank, original);
+    sealed_metadata_start_rejections();
+    retained_metadata(original);
+    retained_metadata_attach(original);
+    financial_packets(original);
+    sealed_issued_metadata(bank, original, false);
+    sealed_issued_metadata(bank, original, true);
+    issued_bind_cases(bank, original);
+    fixed_observation(bank, original);
+    scoped_observation(bank, original);
     lexical_lifetime(bank, original);
     constructor_lifetime(bank, original);
     wl_evaluation_control_source_context_t context = {0};

@@ -2944,7 +2944,7 @@ wl_columnar_ops_reduce_attempt_start_owned(const wl_plan_op_t *op,
         if (!ctx->source_initialized) ctx->source_bare = false;
     } else {
         rc = wl_columnar_eval_stack_scalar_source_begin_owned(frame, owner, op,
-            &ctx->source, left, false);
+                &ctx->source, left, false);
     }
     rc = wl_columnar_ops_reduce_attempt_return(control, id, rc);
     if (rc) goto done;

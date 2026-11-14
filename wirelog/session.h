@@ -33,6 +33,141 @@ extern "C" {
 
 typedef struct wl_session_admission wl_session_admission_t;
 
+/* Persistent financial result only. The matching transient recipe lives in
+ * one admitted STEP scope; neither record grants Native permission. */
+typedef enum {
+    WL_SESSION_SOURCE_METADATA_FINANCIER = 1,
+    WL_SESSION_SOURCE_METADATA_CONSTRUCTION,
+    WL_SESSION_SOURCE_METADATA_FINANCIER_COMPLETED,
+    WL_SESSION_SOURCE_METADATA_FINANCIER_BEGIN_FAILURE,
+    WL_SESSION_SOURCE_METADATA_FINANCIER_SNAPSHOT_PRIOR,
+    WL_SESSION_SOURCE_METADATA_FINANCIER_PRE_RESOURCE
+} wl_session_source_metadata_kind_t;
+typedef struct wl_session_source_metadata_recipe
+    wl_session_source_metadata_recipe_t;
+typedef struct wl_session_source_metadata_result {
+    const void *identity, *owner, *admission, *thread_cookie;
+    wl_session_t *session;
+    uint64_t operation_id, operation_identity;
+    unsigned before_phase;
+    wl_session_source_metadata_kind_t kind;
+    wl_evaluation_control_source_metadata_outcome_t outcome;
+    int financial_result, preparation_protocol;
+    bool scheduled, ready;
+    /* Permanent stable-slot binding. semantic_valid distinguishes an actual
+     * prepared tuple from an unperformed early transport refusal. */
+    const wl_session_source_metadata_recipe_t *recipe;
+    bool semantic_valid;
+} wl_session_source_metadata_result_t;
+typedef struct {
+    wl_session_source_metadata_result_t *result;
+    const void *owner;
+    wl_evaluation_control_source_action_fn action;
+    void *payload;
+    bool *busy;
+    const unsigned *phase;
+    uint64_t operation_id, operation_identity;
+    unsigned before_phase;
+    wl_session_source_metadata_kind_t kind;
+#ifdef WL_SESSION_TEST_HOOKS
+    void (*after)(void *);
+#endif
+} wl_session_source_metadata_request_t;
+typedef enum {
+    WL_SESSION_SOURCE_METADATA_MAIN,
+    WL_SESSION_SOURCE_METADATA_MAINTENANCE,
+    WL_SESSION_SOURCE_METADATA_OBSERVER,
+    WL_SESSION_SOURCE_METADATA_CONSTRUCTOR,
+    WL_SESSION_SOURCE_METADATA_ROLE_COUNT
+} wl_session_source_metadata_role_t;
+/* Groups0..2 are sealed Core preparation. These extra selectors never supply
+ * financial/Native permission; AFTER is diagnostic-only outside BANK. */
+enum {
+    WL_SESSION_SOURCE_METADATA_SELECT = 3,
+    WL_SESSION_SOURCE_METADATA_TAKE,
+    WL_SESSION_SOURCE_METADATA_AFTER,
+    WL_SESSION_SOURCE_METADATA_CLAIM,
+    WL_SESSION_SOURCE_METADATA_BEFORE,
+    WL_SESSION_SOURCE_METADATA_RESULT_STORED,
+    WL_SESSION_SOURCE_METADATA_OBSERVATION_STOP,
+    WL_SESSION_SOURCE_METADATA_PRESENTATION_TAKEN,
+    WL_SESSION_SOURCE_METADATA_OFFER_PROVE
+};
+/* Automatic synchronous preparation, Core prefix first. Dynamic tuple
+ * fields are written by group1 before group2 reads them; not zero-filled or
+ * retained as a token. No controller/BANK/context/id loan is stored here. */
+typedef struct wl_session_source_metadata_preparation {
+    wl_evaluation_control_source_metadata_preparation_t source;
+    void *financial_record;
+    const void *owner;
+    uint64_t operation_id, operation_identity;
+    wl_session_source_metadata_kind_t kind;
+} wl_session_source_metadata_preparation_t;
+typedef enum {
+    WL_SESSION_SOURCE_METADATA_ACCOUNTING_LEGACY = 0,
+    WL_SESSION_SOURCE_METADATA_ACCOUNTING_COLUMNAR_ROLE
+} wl_session_source_metadata_accounting_t;
+typedef int (*wl_session_source_metadata_resolve_fn)(
+    const wl_session_source_metadata_recipe_t *, unsigned,
+    wl_session_source_metadata_preparation_t *);
+struct wl_session_source_metadata_recipe {
+    const wl_session_source_metadata_recipe_t *identity;
+    wl_session_t *session;
+    const void *root;
+    uint64_t root_identity;
+    wl_session_source_metadata_role_t role;
+    wl_session_source_metadata_result_t *result;
+    bool *busy;
+    const unsigned *phase;
+    wl_session_source_metadata_resolve_fn resolve;
+    wl_session_source_metadata_accounting_t accounting_class;
+};
+/* True only in an ordinary admitted OP frame of an opted-in backend.
+ * A live issued context, Snapshot and CLOSE cannot defer another issuer. */
+bool wl_session_source_step_metadata_can_defer(const wl_session_t *);
+int wl_session_source_step_metadata_select_recipe(wl_session_t *,
+    const wl_session_source_metadata_recipe_t *);
+/* On1, result.preparation_protocol is the consumed actual prepare refusal;
+ * callers propagate it rather than retrying structural errors as BANK stops. */
+int wl_session_source_step_metadata_take_recipe(wl_session_t *,
+    const wl_session_source_metadata_recipe_t *,
+    wl_evaluation_control_source_phase_result_t *, unsigned *);
+wl_evaluation_control_source_phase_result_t
+wl_session_source_metadata_immediate_recipe(wl_session_t *,
+    const wl_session_source_metadata_recipe_t *);
+/* Only canonical audited producers own this entry. Protocol belongs to this
+ * invocation even when first0 refuses before preparation exists. */
+typedef struct {
+    wl_evaluation_control_source_phase_result_t phase;
+    int preparation_protocol;
+} wl_session_source_metadata_role_result_t;
+wl_session_source_metadata_role_result_t
+wl_session_source_metadata_role_owned(wl_session_t *,
+    const wl_session_source_metadata_recipe_t *);
+int wl_session_source_metadata_bind_roles(wl_session_t *, void *, unsigned *,
+    wl_evaluation_control_source_metadata_bind_fn);
+int wl_session_source_metadata_bind_issued(wl_session_t *, void *,
+    wl_evaluation_control_source_metadata_bind_prepare_fn,
+    wl_evaluation_control_source_metadata_bind_fn,
+    wl_evaluation_control_source_metadata_bind_outcome_t *);
+/* Caller authenticates its canonical pending initializer, cursor4, actual
+ * prior outcome and all four published identity/result links before entry. */
+int wl_session_source_metadata_observe_bound_roles(wl_session_t *);
+
+/* 1 selected/taken, 0 no STEP scope/result, negative errno on refusal.
+ * Host first proves its real canonical descriptor/disposition. All referenced
+ * storage is stable, disjoint, and survives until result consumption. */
+int wl_session_source_step_metadata_select(wl_session_t *,
+    const wl_session_source_metadata_request_t *);
+int wl_session_source_step_metadata_take(wl_session_t *,
+    wl_session_source_metadata_result_t *, const void *owner,
+    uint64_t operation_id, uint64_t operation_identity,
+    wl_session_source_metadata_kind_t,
+    wl_evaluation_control_source_phase_result_t *, unsigned *before_phase);
+wl_evaluation_control_source_phase_result_t
+wl_session_source_metadata_immediate(wl_session_t *,
+    const wl_session_source_metadata_request_t *);
+
 #ifdef WL_SESSION_TEST_HOOKS
 /* Observe actual private Source construction without loaning its record,
  * BANK, controller or saved generation. */
@@ -46,6 +181,38 @@ typedef struct {
     uint64_t id, limit, charged;
     bool attached, active;
 } wl_session_source_finance_t;
+
+/* Lexical Snapshot observation owner; never copied or exposed to Native work.
+ * Bind only the actual outer record, and unbind before its physical release. */
+typedef struct wl_session_source_snapshot_observation {
+    const struct wl_session_source_snapshot_observation *identity;
+    wl_session_t *session;
+    const void *scope, *thread_cookie;
+    wl_session_source_finance_t *record;
+    wl_evaluation_control_t *control;
+    uint64_t control_identity;
+    bool outer;
+} wl_session_source_snapshot_observation_t;
+int wl_session_source_snapshot_observation_bind(wl_session_t *,
+    wl_session_source_snapshot_observation_t *, wl_session_source_finance_t *);
+int wl_session_source_snapshot_observation_unbind(wl_session_t *,
+    wl_session_source_snapshot_observation_t *);
+
+typedef struct {
+    bool selected;
+    int financial_result;
+} wl_session_source_snapshot_checkpoint_result_t;
+/* Fixed Source-only Columnar families use the actual current outer owner.
+ * No callback, financial record or Native permission crosses this interface. */
+wl_session_source_snapshot_checkpoint_result_t
+wl_session_source_snapshot_checkpoint(wl_session_t *);
+
+typedef wl_session_source_snapshot_checkpoint_result_t
+    wl_session_source_step_checkpoint_result_t;
+/* Actual nonrecursive source_c1 ordinary Scope only. A nonzero result is
+ * genuine refusal (or its owned stopped receipt), never a Native permit. */
+wl_session_source_step_checkpoint_result_t
+wl_session_source_step_checkpoint(wl_session_t *);
 
 typedef struct {
     wl_evaluation_control_source_phase_result_t phase;
@@ -119,6 +286,9 @@ struct wl_session {
     bool owns_evaluation_control;
     /* Selects SOURCE finance only; actual eligibility is always rechecked. */
     bool source_c1_admission;
+    /* Descriptive canonical Step address only; presence selects the complete
+     * provider callback. It never grants action or Native permission. */
+    const void *source_financial_head;
 };
 
 /* Internal: lease protects the session between controlled attempt calls.
@@ -238,8 +408,52 @@ wl_session_source_final_pair_result_t
     wl_evaluation_control_source_action_fn, void *, size_t, void *, size_t);
 
 #ifdef WL_SESSION_TEST_HOOKS
+typedef enum {
+    WL_SESSION_TEST_COMPLETED_BEFORE_SOURCE_END = 1,
+    WL_SESSION_TEST_COMPLETED_ENDPOINT_ACTIVE,
+    WL_SESSION_TEST_COMPLETED_ENDPOINT_REVOKED,
+    WL_SESSION_TEST_COMPLETED_BEFORE_COMMIT
+} wl_session_test_completed_event_t;
+/* Receipt is borrowed only for the synchronous callback. No admission or
+ * BANK lock is held, and the event supplies no Native or Source permit. */
+extern void (*wl_session_test_completed_event)(
+    wl_session_test_completed_event_t,
+    const wl_session_t *, const wl_backend_controlled_completion_t *,
+    wl_backend_completed_source_kind_t, int);
+typedef struct {
+    bool selected;
+    unsigned active_operations;
+    uint64_t ticket, operation_identity, completed_attempt_id;
+    int result;
+} wl_session_test_completed_pin_t;
+int wl_session_test_completed_pin_view(const wl_session_t *,
+    wl_session_test_completed_pin_t *);
+int wl_columnar_session_test_retained_bind_prove(const wl_session_t *,
+    const void *);
+struct wl_backend_financial_offer;
+extern const struct wl_backend_financial_offer *(*
+wl_session_test_retained_claim_offer)(
+    const struct wl_backend_financial_offer *);
+int wl_session_test_source_retained_arm(wl_session_t *);
+int wl_session_test_source_retained_view(wl_session_t *, unsigned *,
+    wl_evaluation_control_source_financial_view_t *);
 int wl_session_test_source_final_reset_cancel(wl_session_t *);
 int wl_session_test_source_early_report(wl_session_t *,
+    wl_evaluation_control_report_t *);
+/* Externally serialized pending STEP observation/reset under admission. */
+int wl_session_test_source_pending_reset_cancel(wl_session_t *,
+    wl_evaluation_control_report_t *);
+int wl_session_test_source_pending_report(wl_session_t *,
+    wl_evaluation_control_report_t *);
+extern void (*wl_session_test_before_source_observation)(wl_session_t *, bool);
+/* Different producer from a BANK metadata action/report. */
+extern void (*wl_session_test_metadata_observation_stop)(wl_session_t *, bool,
+    int);
+extern void (*wl_session_test_before_destroy_seal)(wl_session_t *);
+extern void (*wl_session_test_after_destroy_seal)(wl_session_t *);
+int wl_session_test_source_unstarted_reset_cancel(wl_session_t *,
+    wl_evaluation_control_report_t *);
+int wl_session_test_source_parked_close_reset_cancel(wl_session_t *,
     wl_evaluation_control_report_t *);
 #endif
 
@@ -251,7 +465,31 @@ wl_evaluation_control_source_final_result_t
     wl_evaluation_control_source_action_fn, void *, size_t, void *, size_t);
 
 /* Financial placement observation only; conveys no Native authority. */
+/* Locked Source lifetime pin inspection before any backend state reader. */
+bool wl_session_source_retained_pending(const wl_session_t *);
 bool wl_session_source_operation_scope_owned(const wl_session_t *session);
+bool wl_session_source_snapshot_scope_owned(const wl_session_t *session);
+/* Actual checked destroy_prepare financial scope only. Safe under BANK;
+ * no admission lock, escaped scope pointer or Native resource permission. */
+bool wl_session_source_checked_close_scope_owned(const wl_session_t *session);
+typedef struct {
+    int protocol;
+    uint64_t ticket;
+} wl_session_completed_owner_ticket_result_t;
+/* Reserve before completed-Tx dependencies. Descriptive identity only. */
+wl_session_completed_owner_ticket_result_t
+wl_session_completed_owner_ticket_reserve(wl_session_t *,
+    uint64_t operation_identity, uint64_t completed_attempt_id);
+/* Actual transient Core endpoint only; copied receipts, other threads and
+ * calls outside the real callback cannot authenticate this metadata event. */
+bool wl_session_source_completed_endpoint_owned(const wl_session_t *,
+    const wl_backend_controlled_completion_t *,
+    wl_backend_completed_source_kind_t, int source_result);
+/* Refusal-only guard for raw backend reentry during Core Source return. */
+bool wl_session_completed_postcall_pending(const wl_session_t *);
+/* Broader financial CLOSE placement, including the legacy destructor; it
+ * confers neither a checked claim nor a foreign Native ownership transfer. */
+bool wl_session_source_close_scope_owned(const wl_session_t *session);
 int wl_session_source_footer(wl_session_t *);
 /* Actual admitted SOURCE scope only. Read callbacks do at most 40 scalar
  * actions and never perform Native work; errors have no direct-read fallback. */
@@ -267,7 +505,9 @@ wl_evaluation_control_source_phase_result_t
 
 /* Observer financier close: one FINISH/report, saved-generation detach,
  * creation release or saved-value receipt action. No Native/BODY callback.
- * The expanded local callback envelope is196; containing carry is separate. */
+ * Also admits narrowly typed failed-constructor Original FINISH and fixed
+ * no-owner metadata stages; none may destroy Native objects or call users.
+ * Expanded callback/caller envelopes and containing carry are separate. */
 wl_evaluation_control_source_phase_result_t
     wl_session_source_operator_close_metadata(wl_session_t *,
     wl_evaluation_control_source_action_fn, void *);
