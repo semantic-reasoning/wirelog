@@ -2863,8 +2863,9 @@ The legacy observed preflight still refuses the undeclared width, which sends
 an observed STEP to the general observed transaction. A relation named only in
 a rule body, with neither a declaration nor facts, has no plan EDB. With the
 facts loaded both sessions refuse an insert of another width; while the EDB is
-never inserted both take the width of its first insert. Facts relations of
-arity zero, facts with compound terms, and relations without a declaration
+never inserted both take the width of its first insert. The parser refuses a
+compound term as a fact argument ("fact arguments must be constants"), so facts
+reach a compound column only as flat lanes. Relations without a declaration
 that have both facts and rules were not traced.
 
 `evaluation_empty_edb_sources` runs single-rule, two-column, integer
@@ -2887,3 +2888,14 @@ Once that EDB has rows it checks that both sessions refuse an insert of
 another width with EINVAL, on the observed and the unobserved STEP, and that a
 first insert of zero columns after a STEP, and a later insert of one column,
 get the same code from both sessions and leave the same head.
+
+`evaluation_facts_sources` loads facts into a controlled and an uncontrolled
+session, or into neither, and applies the same script of STEPs or evaluating
+SNAPSHOTs, observed and unobserved, inserts and removals to both, checking that
+each call returns the same code in both sessions, that the head images agree
+after each evaluation and, with the facts loaded, match the expected rows after
+the first, and that the events of the observed STEP agree. It runs flat facts
+in an EDB declared with an inline compound column, which session creation gives
+its INLINE layout before the facts load, so MAP reads an INLINE source, and a
+nullary facts EDB `flag().` under a nullary head, declared and undeclared,
+through a nullary insert, removal and reinsert.
