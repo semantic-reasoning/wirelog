@@ -1433,9 +1433,13 @@ static void unobserved_missing_matrix(void) {
         f.empty_known = raw_map.items[0].rel->column_types != NULL;
         CHECK(!eval_stack_drain(&raw_map)); bind_unobserved(&f);
         CHECK(!complete(f.controlled) && !complete(f.raw)); equal(&f);
+        /* numeric_frames counts frames that schema() saw while the general
+         * route held its initialized transaction (flags 5). After the
+         * healthy completion, the completed owner (#2368) has disposed of
+         * that transaction, so only the general-route bit remains. */
         CHECK(f.source_calls && f.numeric_frames && !f.events &&
             wl_columnar_session_test_general_route_flags(COL_SESSION(
-                f.controlled)) == 5u &&
+                f.controlled)) == 1u &&
             wl_columnar_relation_snapshot_equal(before,
             wl_columnar_relation_snapshot(f.input)));
         insert(&f, 2, false); CHECK(!wl_evaluation_control_reset(f.control));
