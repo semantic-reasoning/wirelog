@@ -88,7 +88,8 @@ equal_capture(capture_t *a, capture_t *b, const char *what, unsigned kind)
 
 enum {
     K_SINGLE, K_UNION_A, K_UNION_C, K_UNION_BOTH, K_FILTER, K_COUNT,
-    K_GROUPED, K_TWO_COL, K_INT_EXPR, K_INT32, K_UINT32, K_UINT64, K_BOOL,
+    K_GROUPED, K_TWO_COL, K_INT_EXPR, K_TWO_COL_EXPR, K_TWO_EDB_EXPR,
+    K_NARROW, K_NARROW_TWO_EDB, K_INT32, K_UINT32, K_UINT64, K_BOOL,
     K_FLOAT, K_FLOAT_EXPR, K_COUNT_KINDS
 };
 
@@ -121,6 +122,23 @@ static const struct {
      * general observed transaction (#2301). */
     { ".decl a(x:int64)\n.decl out(y:int64)\nout(x + 1) :- a(x).\n",
       { "a", NULL }, NULL, WL_PLAN_OP_MAP, "$map" },
+    /* The same expression over a two-column EDB, and beside a declared EDB
+     * the body does not read. */
+    { ".decl a(x:int64,y:int64)\n.decl out(y:int64)\n"
+      "out(x + 1) :- a(x,y).\n",
+      { "a", NULL }, NULL, WL_PLAN_OP_MAP, "$map" },
+    { ".decl a(x:int64)\n.decl b(x:int64)\n.decl out(y:int64)\n"
+      "out(x + 1) :- a(x).\n",
+      { "a", NULL }, NULL, WL_PLAN_OP_MAP, "$map" },
+    /* A column-0 projection of a two-column EDB, alone and beside an
+     * unread EDB. The observed STEP classifies it for the legacy observed
+     * route, whose preflight refuses the width and hands the STEP to the
+     * general observed transaction. */
+    { ".decl a(x:int64,y:int64)\n.decl out(x:int64)\nout(x) :- a(x,y).\n",
+      { "a", NULL }, NULL, WL_PLAN_OP_MAP, "$map" },
+    { ".decl a(x:int64,y:int64)\n.decl b(x:int64)\n.decl out(x:int64)\n"
+      "out(x) :- a(x,y).\n",
+      { "a", NULL }, NULL, WL_PLAN_OP_MAP, "$map" },
     { ".decl a(x:int32)\n.decl out(x:int32)\nout(x) :- a(x).\n",
       { "a", NULL }, NULL, WL_PLAN_OP_MAP, "$map" },
     /* The parser takes no uint32, uint64 or bool declaration; the fixture
@@ -139,6 +157,14 @@ static const struct {
       { NULL, NULL }, NULL, WL_PLAN_OP_MAP, "$map" },
 };
 
+/* The physical width of the bare EDB of a kind. */
+static unsigned
+edb_width(unsigned kind)
+{
+    return kind == K_GROUPED || kind == K_TWO_COL || kind == K_TWO_COL_EXPR
+           || kind == K_NARROW || kind == K_NARROW_TWO_EDB ? 2u : 1u;
+}
+
 static bool
 is_union(unsigned kind)
 {
@@ -151,8 +177,9 @@ static bool
 private_empty_step(unsigned kind)
 {
     return kind == K_SINGLE || kind == K_FILTER || kind == K_TWO_COL
-           || kind == K_INT_EXPR || kind == K_INT32 || kind == K_UINT32
-           || kind == K_UINT64 || kind == K_BOOL;
+           || kind == K_INT_EXPR || kind == K_TWO_COL_EXPR || kind == K_NARROW
+           || kind == K_INT32 || kind == K_UINT32 || kind == K_UINT64
+           || kind == K_BOOL;
 }
 
 static unsigned
@@ -505,7 +532,11 @@ run_cell(unsigned kind, bool snapshot, bool observed)
         still_bare(&f, kind, images);
     } else {
         CHECK(!bare_published && !record_count);
-        if (bare && (snapshot || kind != K_SINGLE)) private_trace(bare);
+        /* The general route builds one for every bare EDB,
+         * including a declared one the body does not read. */
+        if (bare && (snapshot || kind != K_SINGLE))
+            private_trace(bare + (kind == K_TWO_EDB_EXPR
+                || kind == K_NARROW_TWO_EDB));
         else CHECK(private_calls == 0);
         if (!snapshot && (kind == K_SINGLE || kind == K_FILTER)) {
             col_rel_t *a = session_find_rel((wl_col_session_t *)f.s, "a");
@@ -532,7 +563,7 @@ run_cell(unsigned kind, bool snapshot, bool observed)
         CHECK(!step(f.s) && !step(f.raw));
         still_bare(&f, kind, images);
         const int64_t rows[] = {5, 6, 7, 8};
-        unsigned width = kind == K_GROUPED || kind == K_TWO_COL ? 2u : 1u;
+        unsigned width = edb_width(kind);
         for (unsigned i = 0; i < 2; i++) {
             if (!cases[kind].bare[i] || kind == K_FLOAT
                 || kind == K_FLOAT_EXPR)
@@ -610,7 +641,7 @@ stopped(unsigned kind, unsigned mode, const char *at, unsigned empty_at,
     same_head(&f, kind);
     /* Both readers were drained: the first insert is admitted. */
     const int64_t rows[] = {9, 10};
-    unsigned width = kind == K_GROUPED || kind == K_TWO_COL ? 2u : 1u;
+    unsigned width = edb_width(kind);
     CHECK(!wl_session_insert(f.s, cases[kind].bare[0], rows, 2 / width,
         width));
     CHECK(!wl_session_insert(f.raw, cases[kind].bare[0], rows, 2 / width,
@@ -629,7 +660,8 @@ stopped(unsigned kind, unsigned mode, const char *at, unsigned empty_at,
  * uncontrolled session: the first call sees rows inserted before it, the
  * next a further insert with one repeated row, the last nothing new. The
  * head matches the uncontrolled session in rows, width and type. The INT64
- * integer-expression body runs the same rounds. */
+ * integer-expression bodies and column-0 projections run the same rounds,
+ * the two-column ones with the rows (1,0), then (0,1) and (1,0). */
 static void
 untyped_rows(unsigned kind, bool snapshot, bool observed)
 {
@@ -641,13 +673,15 @@ untyped_rows(unsigned kind, bool snapshot, bool observed)
         wl_session_set_delta_cb(f.s, on_delta, &ev);
         wl_session_set_delta_cb(f.raw, on_delta, &raw_ev);
     }
-    const int64_t rows[] = {1, 0, 1};
+    const int64_t rows[] = {1, 0, 1}, wide[] = {1, 0, 0, 1, 1, 0};
+    unsigned width = edb_width(kind);
     for (unsigned round = 0; round < 3; round++) {
         if (round < 2) {
-            const int64_t *r = round ? rows + 1 : rows;
+            const int64_t *r = width == 2 ? (round ? wide + 2 : wide)
+                : (round ? rows + 1 : rows);
             uint32_t n = round ? 2u : 1u;
-            CHECK(!wl_session_insert(f.s, "a", r, n, 1));
-            CHECK(!wl_session_insert(f.raw, "a", r, n, 1));
+            CHECK(!wl_session_insert(f.s, "a", r, n, width));
+            CHECK(!wl_session_insert(f.raw, "a", r, n, width));
         }
         capture_t image = {0}, raw_image = {0};
         int rc = snapshot ? wl_session_snapshot(f.s, on_tuple, &image)
@@ -704,9 +738,10 @@ run_matrix(void)
         for (unsigned snapshot = 0; snapshot < 2; snapshot++)
             for (unsigned observed = 0; observed < 2; observed++)
                 untyped_rows(kind, snapshot, observed);
-    for (unsigned snapshot = 0; snapshot < 2; snapshot++)
-        for (unsigned observed = 0; observed < 2; observed++)
-            untyped_rows(K_INT_EXPR, snapshot, observed);
+    for (unsigned kind = K_INT_EXPR; kind < K_INT32; kind++)
+        for (unsigned snapshot = 0; snapshot < 2; snapshot++)
+            for (unsigned observed = 0; observed < 2; observed++)
+                untyped_rows(kind, snapshot, observed);
 }
 
 static void
@@ -736,7 +771,7 @@ run_stops(unsigned kind)
 static int
 usage(const char *program)
 {
-    fprintf(stderr, "usage: %s [--matrix | --stops KIND(0..12)]\n", program);
+    fprintf(stderr, "usage: %s [--matrix | --stops KIND(0..16)]\n", program);
     return 2;
 }
 
