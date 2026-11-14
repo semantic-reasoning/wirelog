@@ -2724,10 +2724,13 @@ registered only for the general observed transaction, which replaces a bare
 EDB with a private empty relation before any consumer runs, and the test
 checks that no observed or SNAPSHOT cell publishes a bare input. A native
 join-class cleanup of a bare MAP, FILTER or REDUCE goes through the join-class
-latch, which reports a bare END; no test here drives that route, and it is
-left open. END work is paid on the host's separate funding, as for JOIN
-(#2297); the SOURCE lifecycle slot that MAP and FILTER pre-pay goes unused on
-this path.
+latch, which reports a bare END. Both registrations need private bindings with
+dynamic entries, which only the general observed transaction sets, and that
+transaction replaces a bare EDB before any consumer runs, so no route traced
+here reaches this latch with a bare EDB; bare IDB heads bound on the append
+path were not traced. END work is paid on the host's separate funding, as for
+JOIN (#2297); the SOURCE lifecycle slot that MAP and FILTER pre-pay goes
+unused on this path.
 
 `evaluation_empty_edb_sources` runs single-rule, UNION (either or both
 branches never inserted), FILTER, ungrouped and grouped COUNT, two-column,
@@ -2751,15 +2754,16 @@ exercised here each UNION branch ends in MAP.
 ### Int32-declared EDBs in the general observed transaction (#2301)
 
 Session creation gives an EDB its declared lane types when one of its columns
-is FLOAT or STRING. An EDB declared with int32 or int64 columns only, and no
-compound column, stays untyped, and its inserted rows are read as int64 lanes;
-the uncontrolled session reads it that way and its heads are INT64. The
-general observed transaction, which also serves SNAPSHOT and the controlled
-successor STEP, compared the public EDB's lane types with the declared ones
-and treated an untyped lane as INT64, so an int32-declared EDB with rows
-returned ENOTSUP. For a never-inserted EDB it built the private empty input
-with the declared types, so the head was INT32 where the uncontrolled head was
-INT64.
+is FLOAT or STRING, or it has an INLINE compound column and no SIDE column. An
+EDB declared with int32 or int64 columns only, and no compound column, stays
+untyped, and its inserted rows are read as int64 lanes; the uncontrolled
+session reads it that way and its heads are INT64. The general observed
+transaction, which also serves SNAPSHOT and the successor STEPs that the
+successor selection sends to it (others take the legacy observed route),
+compared the public EDB's lane types with the declared ones and treated an
+untyped lane as INT64, so an int32-declared EDB with rows returned ENOTSUP.
+For a never-inserted EDB it built the private empty input with the declared
+types, so the head was INT32 where the uncontrolled head was INT64.
 
 The schema phase now accepts an untyped lane for a declared INT32, INT64,
 UINT32, UINT64 or BOOL column and keeps the exact comparison for a typed lane.
