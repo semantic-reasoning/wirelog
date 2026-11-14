@@ -585,4 +585,9 @@ directly remain with #2300. It compares facts EDBs, among them flat facts in an
 inline compound column and nullary facts, with the uncontrolled session, and
 fixes an uncontrolled STEP that returned EINVAL for a rule head whose inline
 facts were not loaded. Controlled evaluation of a rule head that also holds
-input is refused and stays open with #2301.
+input is refused and stays open with #2301. The ledger also records why no
+route traced reaches a forced-empty VARIABLE over an INLINE source, that a
+refusal every SNAPSHOT retry repeats keeps the SNAPSHOT_RETRYABLE contract, and
+`docs/SEMANTICS.md` now states that a controlled evaluating SNAPSHOT served by
+the general private-head transaction delivers delta events (#2295), where an
+uncontrolled one fires none.

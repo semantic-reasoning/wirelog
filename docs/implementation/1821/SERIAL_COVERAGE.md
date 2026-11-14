@@ -2639,15 +2639,33 @@ returns before applying one when any declared column is SIDE.
 
 VARIABLE's source hold and MAP's source begin pass the INLINE bit. VARIABLE
 FULL/AUTO still borrows the original descriptor, so the source keeps its
-layout. A forced-empty VARIABLE (FORCE_EMPTY, or a seeded FORCE_DELTA without
-a delta) over an INLINE source builds its empty output from the scalar recipe,
-which carries no compound layout, so that output has compound_kind NONE where
-the uncontrolled `wl_columnar_ops_push_empty` copies the INLINE layout. Both
-are empty; no test here drives that path, and it is left open. MAP builds its
-output from the projection, so `$map` and the published head have
-compound_kind NONE, as the uncontrolled MAP's output does. In the generated
-bodies exercised here each UNION branch ends in MAP, so CONCAT and CONSOLIDATE
-receive NONE inputs and are unchanged.
+layout. A forced-empty VARIABLE (FORCE_EMPTY, or a seeded FORCE_DELTA without a
+delta; the controlled VARIABLE reads FORCE_EMPTY_AFTER_SEED, which the same
+multiway rewrite sets, as AUTO) over an INLINE source builds its empty output
+from the scalar recipe, which carries no compound layout, so that output has
+compound_kind NONE where the uncontrolled `wl_columnar_ops_push_empty` copies
+the INLINE layout. Both are empty. In the default build (`ENABLE_K_FUSION` 1),
+with one worker and the current preflight, no route traced here reaches it:
+FORCE_EMPTY is set only by the multiway rewrite of recursive strata in
+`exec_plan_gen.c`, which that build emits inside K_FUSION ops, with an EXCHANGE
+after a keyed join; `col_controlled_step_controlled_op` admits neither, the
+observed transaction refuses a K_FUSION slot, and it runs the preserved bodies
+with every op forced to FORCE_FULL. A seeded FORCE_DELTA needs `delta_seeded`,
+which only a TDD worker subpass sets (`eval.c`), and the controlled preflight
+refuses a TDD subpass and more than one worker. #2302 and the K-Fusion removal
+need to revisit this when they admit those plans. MAP builds its output from
+the projection, so `$map` and the published head have compound_kind NONE, as
+the uncontrolled MAP's output does. In the generated bodies exercised here each
+UNION branch ends in MAP, so CONCAT and CONSOLIDATE receive NONE inputs and are
+unchanged. In the lowering read here a non-aggregate rule root is a PROJECT, or
+the FLATMAP the fusion pass makes of one, and either lowers to a MAP, after a
+FILTER for a FLATMAP; the only rewrite that drops that MAP folds it into a
+JOIN; UNION emits CONCAT and CONSOLIDATE after its translated children; and the
+multiway rewrite of a recursive stratum appends a CONSOLIDATE after each copy's
+own CONSOLIDATE (`expand_multiway_k_fusion`) or, in a build without K-Fusion, a
+CONCAT after each copy (`expand_multiway_delta`). CONCAT and CONSOLIDATE
+therefore receive the outputs of MAP, of such a JOIN, of REDUCE, of CONCAT or
+of CONSOLIDATE; no route giving them a direct compound input was found.
 
 `evaluation_relation_creation` checks the admitted reader on real INLINE
 layouts (pair, arity-1 box, a ten-entry wide layout, and mixed INLINE/SIDE)
@@ -2670,7 +2688,11 @@ and the evaluating SNAPSHOT, with `wl_session_budget_denied` reporting it and
 the successful retry clearing it, and a typed ENOTSUP with nothing published
 for a JOIN body over an INLINE source on the observed STEP, the unobserved STEP
 and SNAPSHOT. After the refused SNAPSHOT the step can be retried only as
-SNAPSHOT: an insert and a STEP return EBUSY. `evaluation_map_recovery` pins the
+SNAPSHOT: an insert and a STEP return EBUSY. This is the
+`WL_CONTROLLED_STEP_SNAPSHOT_RETRYABLE` contract of `backend.h`, kept as it is:
+for a refusal that every retry repeats, as for this JOIN body, the controlled
+session takes no insert or STEP until a SNAPSHOT succeeds, while the
+uncontrolled session still accepts inserts. `evaluation_map_recovery` pins the
 same `WL_CONTROLLED_STEP_SNAPSHOT_RETRYABLE` state for a failed SNAPSHOT.
 
 Inline slots with declared types, `pair(int64,float) inline` and
@@ -2706,8 +2728,11 @@ Open after this bundle: JOIN, SEMIJOIN/ANTIJOIN, REDUCE and LFTJ reading an
 INLINE input directly; direct compound, segmented, timestamped/weighted and
 spill inputs to CONCAT and CONSOLIDATE; cold sources in controlled sessions,
 which `wl_columnar_session_cold_mode` excludes when an evaluation control is
-attached; and lazy-owner descriptors, which the reader refuses with ENOTSUP and
-whose session reachability was not traced. #2301 is not closed by this bundle.
+attached: begin and seal return `WL_COLUMNAR_SPILL_UNSUPPORTED` once their
+argument and busy checks pass, append and finish find no cold loader and return
+`WL_COLUMNAR_SPILL_INVALID`, and such a session never holds a cold source; and
+lazy-owner descriptors, which the reader refuses with ENOTSUP and whose session
+reachability was not traced. #2301 is not closed by this bundle.
 
 ### Never-inserted EDB sources through MAP, FILTER and REDUCE (#2301)
 
