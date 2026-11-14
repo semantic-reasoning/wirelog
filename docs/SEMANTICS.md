@@ -1308,16 +1308,23 @@ an incremental insert, `session_snapshot_insert` now brings the reached strata
 up to date with occurrence-bound instances
 (`wl_columnar_eval_tdd_insert_stratum`) and registers no `$d$` relation,
 whether or not a delta callback is installed (#2121); any other evaluation
-clears the derived rows and evaluates every stratum in full. A snapshot fires
-no delta events on either route, including when it first drains a refused
-plain step, which resumes without the delta observer; and a later step does
-not report the rows the snapshot derived.
+clears the derived rows and evaluates every stratum in full. An uncontrolled
+snapshot fires no delta events on either route, including when it first drains
+a refused plain step, which resumes without the delta observer; and a later
+step does not report the rows the snapshot derived.
 A stop between those heads' update and the bookkeeping leaves
 `last_inserted_relation`, `pending_input_change` and every `base_nrows` as
 they were, so a retry runs the insert route again from the same appended rows
 and finds nothing the heads do not already hold. A caller that installs a
 delta callback and steps instead of retrying is not told about the rows those
 heads already gained; the removed pre-seed route behaved the same way.
+
+A controlled evaluating SNAPSHOT differs from that uncontrolled no-event rule.
+One that the general private-head transaction serves admits observer events
+with its tuple batch before its publication cutoff, so an installed delta
+callback receives events for the rows it derives (#2295);
+`evaluation_compound_sources` compares those events with the derived rows on
+that route and expects none from the uncontrolled snapshot.
 
 A field's row does not mean both paths write it. Four do not: neither path
 touches the coordinator's `delta_seeded`, which a TDD worker sub-pass and the
@@ -1606,8 +1613,8 @@ the next relation.
 
 This enables the bounded preflight for supported serial nonrecursive STEP
 plans. Recursive, delta-observer, differential, multiworker/TDD, strict-batch,
-and unsupported operator routes remain fail-closed. Controlled SNAPSHOT is
-still unsupported.
+and unsupported operator routes remain fail-closed. Controlled SNAPSHOT was
+still unsupported in this slice; #2295 later integrated evaluating SNAPSHOT.
 
 
 ### COUNT operand and result domains
@@ -1904,10 +1911,11 @@ Supported serial nonrecursive STEP now uses the bounded default proof described
 above. The single-relation INT64 path plans described above are the only
 recursive routes admitted; other recursive plans and unsupported whole-session
 routes are rejected before evaluation. Controlled SNAPSHOT can deliver an
-already completed STEP; evaluating fresh or dirty state remains unsupported.
-TDD/multiworker, general differential, and unrestricted observer composition
-remain outside this slice. The restricted unary observed routes are described below.
-Raw references and coverage for those routes remain, with this split:
+already completed STEP; evaluating fresh or dirty state was unsupported in this
+slice and is integrated by #2295. TDD/multiworker, general differential, and
+unrestricted observer composition remain outside this slice. The restricted
+unary observed routes are described below. Raw references and coverage for
+those routes remain, with this split:
 
 | Former whole controlled expectation | Replacement or remaining scope |
 |---|---|
