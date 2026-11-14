@@ -573,4 +573,5 @@ A second bundle tests EDBs without a `.decl`, whose arity and types come from
 their facts or, for one named only by a directive such as `.input`, from their
 first insert, in the general observed transaction, which has read them at
 their source since f1f29724; see "EDBs without a declaration in the general
-observed transaction (#2301)".
+observed transaction (#2301)". It also reports a denied reservation of the
+private empty input of a never-inserted EDB as a budget denial.

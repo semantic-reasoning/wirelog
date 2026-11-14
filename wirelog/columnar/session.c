@@ -14240,6 +14240,9 @@ wl_columnar_session_observed_action(wl_col_session_t *sess,
                     (
                     tx->entries[i].name, r, plan->edb_column_types[i],
                     sess->memory_governor, &empty, control, step->operation_id);
+                /* A denied reservation is a budget denial, as for a
+                 * denied MAP scratch reservation (#2301). */
+                if (rc == ENOSPC) sess->memory_budget_denied = true;
                 if (rc) return rc;
                 tx->entries[i].relation = empty;
             }

@@ -2778,6 +2778,14 @@ observed STEP events with the uncontrolled session. The parser takes no
 uint32, uint64 or bool declaration, so the test also runs both checks with the
 plan's int32 lane of the EDB rewritten to UINT32, UINT64 and BOOL.
 
+A denied storage reservation of that private empty input returned ENOSPC while
+`wl_session_budget_denied` reported no denial, where a denied MAP scratch
+reservation reports one. The schema phase now records the denial.
+`evaluation_empty_edb_sources` denies that reservation for each bare EDB on
+every SNAPSHOT and on the observed STEPs that take the general observed
+transaction, and checks ENOSPC, the reported denial, that nothing is published
+and the EDB stays bare, and a retry and the first insert.
+
 ### Integer MAP expressions in observed steps (#2301)
 
 A single-rule body over one INT64 EDB, made of VARIABLE, a one-column MAP and
