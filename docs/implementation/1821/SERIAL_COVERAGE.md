@@ -2665,13 +2665,13 @@ uncontrolled results, and checks that MAP read an INLINE input, that the source
 keeps its layout and image, and that a stopped call publishes nothing and
 retries. It also covers later inserts and a removal, 300 rows, stops at each
 INLINE map-check charge of a real STEP (the same body over a scalar EDB records
-none), a denied MAP scratch reservation pinned at that reservation with
-`memory_budget_denied` set and a retry, and a typed ENOTSUP with nothing
-published for a JOIN body over an INLINE source on the observed STEP, the
-unobserved STEP and SNAPSHOT. After the refused SNAPSHOT the step can be
-retried only as SNAPSHOT: an insert and a STEP return EBUSY.
-`evaluation_map_recovery` pins the same `WL_CONTROLLED_STEP_SNAPSHOT_RETRYABLE`
-state for a failed SNAPSHOT.
+none), a denied MAP scratch reservation pinned at that reservation on the STEP
+and the evaluating SNAPSHOT, with `wl_session_budget_denied` reporting it and
+the successful retry clearing it, and a typed ENOTSUP with nothing published
+for a JOIN body over an INLINE source on the observed STEP, the unobserved STEP
+and SNAPSHOT. After the refused SNAPSHOT the step can be retried only as
+SNAPSHOT: an insert and a STEP return EBUSY. `evaluation_map_recovery` pins the
+same `WL_CONTROLLED_STEP_SNAPSHOT_RETRYABLE` state for a failed SNAPSHOT.
 
 Inline slots with declared types, `pair(int64,float) inline` and
 `pair(symbol,int64) inline`, give the source FLOAT or STRING lanes at session

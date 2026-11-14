@@ -992,7 +992,9 @@ compound_stops(void)
  * outputs exceed 16 values) is denied by a blocker installed at its own
  * reservation point; nothing is published and a retry after the blocker is
  * released completes. Phase 6 with progress 12 is MAP's scratch reservation
- * here: CONSOLIDATE's has progress 5 and the body has no FILTER. */
+ * here: CONSOLIDATE's has progress 5 and the body has no FILTER. The STEP
+ * and the evaluating SNAPSHOT both report the denial, and the successful
+ * retry clears it. */
 static wl_columnar_memory_governor_t *deny_governor;
 static wl_columnar_memory_reservation_t blocker;
 static unsigned deny_hits;
@@ -1012,12 +1014,13 @@ deny_map_scratch(wl_evaluation_control_t *c, unsigned phase, uint64_t progress)
 }
 
 static void
-map_scratch_denial(void)
+map_scratch_denial(bool snapshot)
 {
     fixture_t f;
     fixture(&f, K_WIDE);
     populate(f.s, K_WIDE, false);
     capture_t ev = {.head = "out"}, want = {.head = "out"};
+    capture_t image = {.head = "out"};
     literal(K_WIDE, false, &want);
     wl_session_set_delta_cb(f.s, on_delta, &ev);
     source_t src;
@@ -1026,18 +1029,23 @@ map_scratch_denial(void)
     deny_governor = wl_columnar_memory_governor_ref_get(f.governor);
     deny_hits = 0;
     wl_columnar_filter_test_attempt_checkpoint = deny_map_scratch;
-    int rc = step(f.s);
+    int rc = snapshot ? wl_session_snapshot(f.s, on_tuple, &image)
+        : step(f.s);
     wl_columnar_filter_test_attempt_checkpoint = NULL;
     if (rc != ENOSPC)
         fprintf(stderr, "map scratch denial: rc %d\n", rc);
-    CHECK(rc == ENOSPC && deny_hits >= 1 && !ev.count);
-    CHECK(((wl_col_session_t *)f.s)->memory_budget_denied);
+    CHECK(rc == ENOSPC && deny_hits >= 1 && !ev.count && !image.count);
+    CHECK(wl_session_budget_denied(f.s));
     source_kept(&src, f.s, true);
     CHECK(session_find_rel((wl_col_session_t *)f.s, "out") == old);
     CHECK(wl_columnar_memory_release(&blocker));
     CHECK(!wl_evaluation_control_reset(f.control));
-    CHECK(!step(f.s));
+    CHECK(!(snapshot ? wl_session_snapshot(f.s, on_tuple, &image)
+        : step(f.s)));
+    CHECK(!wl_session_budget_denied(f.s));
     equal_capture(&ev, &want, "events after a denied MAP scratch");
+    if (snapshot)
+        equal_capture(&image, &want, "image after a denied MAP scratch");
     fixture_destroy(&f);
 }
 
@@ -1056,7 +1064,8 @@ main(void)
     successors(true);
     scale();
     compound_stops();
-    map_scratch_denial();
+    map_scratch_denial(false);
+    map_scratch_denial(true);
     /* COUNT runs over the inserted rows, so the repeated row of id 1
      * counts twice in both sessions. The join matches x = 10 and x = 30. */
     static const int64_t counted[] = {1, 2, 2, 1};
