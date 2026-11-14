@@ -1,0 +1,60 @@
+name: Diagnostic Windows thread provider v1
+
+on:
+  push:
+    branches: ['diagnostic/windows-thread-provider-v1']
+
+permissions:
+  contents: read
+
+jobs:
+  collect:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/diagnostic/windows-thread-provider-v1'
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
+        with:
+          version: 0.12.13
+          enable-cache: false
+      - name: Parse and collect bounded diagnostic
+        shell: pwsh
+        run: |
+          $script = Join-Path $env:GITHUB_WORKSPACE 'scripts/diagnostics/windows-thread-provider-v1/run.ps1'
+          $tokens = $null
+          $errors = $null
+          [System.Management.Automation.Language.Parser]::ParseFile($script, [ref]$tokens, [ref]$errors) | Out-Null
+          if ($errors.Count) { throw 'Diagnostic PowerShell syntax check failed' }
+          & $script -OutputDirectory (Join-Path $env:RUNNER_TEMP "wirelog-thread-provider-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT")
+      - name: Check upload boundary even after collection failure
+        id: boundary
+        if: always()
+        shell: pwsh
+        run: |
+          $publish = Join-Path $env:RUNNER_TEMP "wirelog-thread-provider-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT/publish"
+          if (-not (Test-Path -LiteralPath (Join-Path $publish 'manifest.json') -PathType Leaf)) { throw 'No diagnostic manifest to upload' }
+          $entries = @((Get-Item -LiteralPath $publish)) + @(Get-ChildItem -LiteralPath $publish -Recurse -Force)
+          $allowed = @('.json', '.jsonl', '.txt', '.c', '.h', '.i', '.obj', '.asm', '.exe', '.pdb', '.map', '.ilk')
+          $bytes = 0L
+          foreach ($entry in $entries) {
+            if ($entry.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'Unsafe evidence reparse point' }
+            if (-not $entry.PSIsContainer) {
+              if ($allowed -notcontains $entry.Extension -or $entry.Length -gt 4194304) { throw 'Unsafe evidence file/size' }
+              $bytes += $entry.Length
+            }
+          }
+          if ($bytes -gt 25MB) { throw 'Diagnostic upload exceeds25MiB' }
+          Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value 'safe=true'
+      - name: Upload only bounded diagnostic evidence
+        if: always() && steps.boundary.outputs.safe == 'true'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: windows-thread-provider-${{ github.sha }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/wirelog-thread-provider-${{ github.run_id }}-${{ github.run_attempt }}/publish/
+          if-no-files-found: error
+          retention-days: 7
+          include-hidden-files: false
