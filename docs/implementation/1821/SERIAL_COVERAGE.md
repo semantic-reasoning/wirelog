@@ -2805,3 +2805,37 @@ runs that body, the same body beside a declared EDB it does not read, and
 with the stops and the `untyped_rows` rounds. `evaluation_compound_sources`
 runs a column-0 projection of an INLINE pair and a body over a one-lane INLINE
 box through its matrix.
+
+### EDBs without a declaration in the general observed transaction (#2301)
+
+An EDB without a `.decl` takes its arity and column types from its inline
+facts (#2231), and one named only by a directive such as `.input`, with
+neither a declaration nor facts, takes the width of its first insert. The plan
+gives either no declared width. Before f1f29724 the general observed
+transaction compared the declared width with the lane-type count and refused
+such an EDB, so an observed STEP or any SNAPSHOT of a body over it returned
+ENOTSUP while the uncontrolled session computed the rows, and mutation
+admission after a STEP refused an insert into it. Since f1f29724 the schema
+phase skips the declaration lanes of an undeclared EDB and reads its source,
+and both mutation admissions leave the width of an insert into it to the
+uncontrolled session's validator.
+
+The legacy observed preflight still refuses the undeclared width, which sends
+an observed STEP to the general observed transaction. A relation named only in
+a rule body, with neither a declaration nor facts, has no plan EDB. With the
+facts loaded both sessions refuse an insert of another width; while the EDB is
+never inserted both take the width of its first insert. Facts relations of
+arity zero, facts with compound terms, and relations without a declaration
+that have both facts and rules were not traced.
+
+`evaluation_empty_edb_sources` runs single-rule, two-column, integer
+expression and FILTER bodies over a facts EDB, never inserted, in all four
+STEP and SNAPSHOT, observed and unobserved columns with the stops of the other
+bodies, inserts the first rows after an unobserved STEP, and runs the
+`untyped_rows` rounds for all but the FILTER body, whose filter drops every
+row those rounds insert. With the facts loaded it runs those bodies and a
+symbol-facts control through a further insert with a repeated row, a new row
+and nothing new, comparing head rows, width and type, the SNAPSHOT image and
+the observed STEP events with the uncontrolled session. After a STEP it checks
+that both sessions return the same code for an insert of another width, with
+the facts loaded and without, and step to the same head.
