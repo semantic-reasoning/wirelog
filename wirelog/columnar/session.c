@@ -57,6 +57,12 @@ static bool wl_columnar_session_restartable_no_native_valid(
 static void wl_columnar_session_step_reset_restart_started(
     wl_col_session_t *, wl_columnar_controlled_step_t *, uint64_t);
 #ifdef WL_SESSION_TEST_HOOKS
+/* Test-only MAIN maintenance witness: the transaction whose settled MAIN
+ * packets are being summed and their total reported work. */
+static const void *wl_columnar_session_test_main_tx;
+static uint64_t wl_columnar_session_test_main_tx_work;
+#endif
+#ifdef WL_SESSION_TEST_HOOKS
 extern void (*wl_columnar_session_test_step_reset_phase)(wl_col_session_t *,
     unsigned, size_t, bool);
 #endif
@@ -11296,6 +11302,13 @@ wl_columnar_session_test_general_original_bytes(void)
 {
     return sizeof(wl_columnar_session_observed_original_t);
 }
+static bool wl_columnar_session_rollback_main_funded(const wl_col_session_t *,
+    const wl_columnar_controlled_step_t *,
+    const wl_columnar_session_observed_transaction_t *);
+/* Transaction maintenance is financed by the Step's MAIN, one re-begun packet
+ * per action. The report reads the work that settled MAIN packets of the
+ * current transaction actually consumed; the accumulator lives outside every
+ * charged record so it cannot move any geometry-derived price. */
 int
 wl_columnar_session_test_general_maintenance_consumed(
     const wl_col_session_t *sess,
@@ -11306,11 +11319,12 @@ wl_columnar_session_test_general_maintenance_consumed(
         step?step->transaction:NULL;
     if (!out || !step || !step->general_observed ||
         !step->transaction_initialized ||
-        !tx || !tx->maintenance || !tx->maintenance_id ||
-        !tx->metadata_admitted ||
-        tx->maintenance == sess->base.evaluation_control)return EINVAL;
-    return wl_evaluation_control_test_active_consumed(tx->maintenance,
-               tx->maintenance_id, out);
+        !tx || !tx->metadata_admitted ||
+        wl_columnar_session_test_main_tx != tx ||
+        !wl_columnar_session_rollback_main_funded(sess, step, tx))
+        return EINVAL;
+    *out = wl_columnar_session_test_main_tx_work;
+    return 0;
 }
 
 unsigned
@@ -21046,6 +21060,12 @@ wl_columnar_session_main_dispatch(wl_col_session_t *sess,
                 && wl_columnar_session_test_main_action_report)
                 wl_columnar_session_test_main_action_report(sess,
                     j->recipient, j->action, f->report, j->result);
+            /* Each MAIN action packet, EMPTY selections included, settles
+             * exactly once here before re-begin; the prepared-parent,
+             * frontier and terminal settles are not transaction work. */
+            if (step->transaction && j->transaction == step->transaction
+                && wl_columnar_session_test_main_tx == step->transaction)
+                wl_columnar_session_test_main_tx_work += f->report.consumed;
 #endif
             f->phase = WL_COLUMNAR_SESSION_FINANCE_REBEGIN;
             f->report_valid = false;
@@ -24299,6 +24319,10 @@ wl_columnar_session_observed_drive(wl_col_session_t *sess,
         origin->bootstrap_finance_pending = false;
         origin->disposal_registered = false;
         origin->disposal_kind = WL_COLUMNAR_SESSION_PRODUCER_NONE;
+#ifdef WL_SESSION_TEST_HOOKS
+        wl_columnar_session_test_main_tx = fresh;
+        wl_columnar_session_test_main_tx_work = 0;
+#endif
         origin->transaction = fresh;
         origin->control = sess->base.evaluation_control;
         origin->control_identity =
@@ -26347,6 +26371,29 @@ wl_columnar_session_retirement_begin_failure_drive(wl_col_session_t *sess,
     return rc;
 }
 
+/* MAIN custody that may carry observed rollback debt across turns is either
+ * an action already selected for this transaction or the Step's retained
+ * REBEGIN financier parked between packets. It is never the Original, its
+ * allocation is authentic, and no foreign attempt is running on it. */
+static bool
+wl_columnar_session_rollback_main_funded(const wl_col_session_t *sess,
+    const wl_columnar_controlled_step_t *step,
+    const wl_columnar_session_observed_transaction_t *tx)
+{
+    if (wl_columnar_session_main_selected(step))
+        return step->main_action.transaction == tx;
+    const wl_columnar_session_financier_t *f =
+        &step->observed_origin.terminal_funding;
+    return f->control && f->control != sess->base.evaluation_control
+           && f->owner == step && f->retained && f->id
+           && f->allocation_identity ==
+           wl_evaluation_control_identity(f->control)
+           && !wl_evaluation_control_active_attempt_id(f->control)
+           && f->phase == WL_COLUMNAR_SESSION_FINANCE_REBEGIN
+           && !f->report_valid
+           && wl_columnar_session_financier_metadata_quiet(f);
+}
+
 /* Admission-only recognition of genuine quiescent rollback debt. The actual
  * claim/reader/retirement owners still prove and perform every cleanup step.
  * No receipt, forward permission or control epoch is synthesized here. */
@@ -26379,7 +26426,12 @@ wl_columnar_session_general_rollback_pending(const wl_col_session_t *sess,
             tx->maintenance == sess->base.evaluation_control ||
             wl_evaluation_control_active_attempt_id(tx->maintenance) !=
             tx->maintenance_id) return false;
-    }else if (tx->maintenance_id || tx->rollback_index)return false;
+    }else if (tx->maintenance_id)return false;
+    /* Rollback past the first Original is MAIN debt: it is pending only
+     * while this Step's own MAIN either runs an action for this transaction
+     * or is parked between packets under authentic retained custody. */
+    if (tx->rollback_index && !wl_columnar_session_rollback_main_funded(sess,
+        step, tx)) return false;
     return true;
 }
 
