@@ -76,7 +76,7 @@ expressions. The numeric/composed child validation remains authoritative.
 | ID / family / operator | Controlled destination and variants | Entry level, bound, owner | Evidence / gap |
 |---|---|---|---|
 | O01 / S01 / VARIABLE | `wl_columnar_eval_plan_numeric_source_step`; full versus delta selection, missing/empty source, registry/name lookup, scalar materialization | Session/frame restricted; A lookup and Q256 relation lanes, nested representation setup U; F | `evaluation_numeric_plan`: `test_source_delta_modes`, `test_source_long_names`, `test_source_scan_stops`; representation/config qualification G5/G6; an INLINE compound EDB is admitted (#2301), `evaluation_compound_sources` |
-| O02 / S02 / FILTER | `wl_columnar_filter_op_attempt_start_owned`; predicate decode, accepted/rejected rows, empty input | Session/frame; A decode bytes/instructions/row tails; allocation/cleanup U; F | `test_entry_generated_filter_work_boundary`, `test_controlled_observed_filter_stops`; general expression domains G5; a never-inserted EDB input (#2301), `evaluation_empty_edb_sources` |
+| O02 / S02 / FILTER | `wl_columnar_filter_op_attempt_start_owned`; predicate decode, accepted/rejected rows, empty input | Session/frame; A decode bytes/instructions/row tails; allocation/cleanup U; F | `test_entry_generated_filter_work_boundary`, `test_controlled_observed_filter_stops`; general expression domains G5; a never-inserted EDB input (#2301), `evaluation_empty_edb_sources`; an INLINE compound input is admitted and yields a NONE output (#2301), `evaluation_compound_sources` |
 | O03 / S02 / MAP | `wl_columnar_filter_map_attempt_start_owned`; projection and numeric expression output, INT64/FLOAT, integer CRC/hash | Session/frame; A decode/evaluation/copy, nested allocation U; F | `test_entry_generated_map_work_limit`, `test_entry_generated_integer_crc`, `test_entry_generated_integer_hash`; unsupported expression families G5; an INLINE compound input is admitted and yields a NONE output (#2301), `evaluation_compound_sources`; a never-inserted EDB input (#2301), `evaluation_empty_edb_sources` |
 | O04 / S03 / JOIN | `wl_columnar_join_op_attempt_start_owned`; product/keyed, collisions, right predicate, projection; non-materialized ordinary route | Session/frame; A hash/probe/candidate/right-filter tails, nested source/scratch U; F | `test_controlled_session_join_step`, `test_entry_generated_right_filter_collisions_and_stop`, `test_entry_generated_right_filter_product_work_boundary`; materialized/differential/batch alternatives F01–F05 |
 | O05 / S04 / ANTIJOIN | `wl_columnar_join_probe_op_attempt_start_owned`; membership/nonmembership child | Session enum admitted, private scalar child restrictions; A child charges, whole host/config bound U; F | `test_entry_generated_operators`; complete predicate/type/fallback session matrix missing, G5 |
@@ -124,7 +124,7 @@ references, not interruption evidence.
 | F04a | Differential arrangement/trace persistent transaction versus ephemeral hash fallback | Raw fallback must leave no transaction state; controlled entry refuses active differential mode and active-attempt registry growth. Integrated stop owner absent; G3, #1820 |
 | F05a | Ordinary keyed persistent arrangement/probe bundle versus ephemeral hash; cached right filter versus operation-owned filtered relation | General serial STEP owns a private native index registry for full-right public EDB INT64 JOIN, with bounded creation/reuse/probes and a common head/index cutoff. Existing pins/pending/deferred entries refuse replacement. Filtered/private-head/batch representations retain their previous controlled disposition; this does not qualify raw cache alternatives, G5/G6 |
 | F06a | LFTJ cache/probe versus owned source rebuild and raw output callback versus private owned-row append | Controlled session uses per-attempt bounded rebuild, no unlimited raw fallback; actual writer/ROW/ACK/drain ownership and precommit/postcutoff delivery qualified | Host failure/native/microsteps/policy and `test_lftj_postcut_delivery`; current-generation raw probe/pin checks; [source map](../2298/LFTJ_SOURCE_ACCOUNTING.md) |
-| F07a | Scalar-source compound kind NONE versus INLINE/SIDE, declared schema/type validity, timestamps and row weights | Admission predicates differ by child; no cross-operator representation support inferred. Managed copies/readers can be bounded while a surrounding child refuses the representation; G5. #2301: VARIABLE and MAP admit compound_kind INLINE after a metered arity-map check; FILTER and JOIN keep a tested ENOTSUP for an INLINE input; compound_kind SIDE stays ENOTSUP |
+| F07a | Scalar-source compound kind NONE versus INLINE/SIDE, declared schema/type validity, timestamps and row weights | Admission predicates differ by child; no cross-operator representation support inferred. Managed copies/readers can be bounded while a surrounding child refuses the representation; G5. #2301: VARIABLE, MAP and FILTER admit compound_kind INLINE after a metered arity-map check; JOIN keeps a tested ENOTSUP for an INLINE input; compound_kind SIDE stays ENOTSUP |
 | F07b | Retained/borrowed/owned, contiguous/segmented/spill-backed storage and empty/nullary/wide rows | Source reader/descriptor and copy helpers must preserve representation and governor state; capacity/overflow errors remain errors. Enumerated qualification combinations, not an invitation to raw fallback; G5/G6. #2301: borrowed public INLINE descriptors, empty, wide and arity-1 INLINE layouts; controlled sessions refuse cold (spill-backed) sources at seal; a never-inserted EDB through MAP, FILTER and REDUCE on the unobserved STEP |
 
 ## Configuration predicates
@@ -2657,21 +2657,21 @@ values, EBUSY for a schema change while held, malformed maps, SIDE and an
 unknown kind, and cancellation, work exhaustion and attempt restart inside
 the map check followed by a clean retry.
 
-`evaluation_compound_sources` runs generated single-rule, UNION and wide
-bodies through controlled and uncontrolled sessions, for STEP and evaluating
-SNAPSHOT, observed and unobserved, with an empty INLINE source and with
-cancellation and work exhaustion at `$map` or `$concat`. It compares literal
-tuple sets and the uncontrolled results, and checks that MAP read an INLINE
-input, that the source keeps its layout and image, and that a stopped call
-publishes nothing and retries. It also covers later inserts and a removal, 300
-rows, stops at each INLINE map-check charge of a real STEP (the same body over
-a scalar EDB records none), a denied MAP scratch reservation pinned at that
-reservation with `memory_budget_denied` set and a retry, and a typed ENOTSUP
-with nothing published for FILTER and JOIN bodies over an INLINE source on the
-observed STEP, the unobserved STEP and SNAPSHOT. After the refused SNAPSHOT
-the step can be retried only as SNAPSHOT: an insert and a STEP return EBUSY.
-`evaluation_map_recovery` pins the same
-`WL_CONTROLLED_STEP_SNAPSHOT_RETRYABLE` state for a failed SNAPSHOT.
+`evaluation_compound_sources` runs generated single-rule, UNION and wide bodies
+through controlled and uncontrolled sessions, for STEP and evaluating SNAPSHOT,
+observed and unobserved, with an empty INLINE source and with cancellation and
+work exhaustion at `$map` or `$concat`. It compares literal tuple sets and the
+uncontrolled results, and checks that MAP read an INLINE input, that the source
+keeps its layout and image, and that a stopped call publishes nothing and
+retries. It also covers later inserts and a removal, 300 rows, stops at each
+INLINE map-check charge of a real STEP (the same body over a scalar EDB records
+none), a denied MAP scratch reservation pinned at that reservation with
+`memory_budget_denied` set and a retry, and a typed ENOTSUP with nothing
+published for a JOIN body over an INLINE source on the observed STEP, the
+unobserved STEP and SNAPSHOT. After the refused SNAPSHOT the step can be
+retried only as SNAPSHOT: an insert and a STEP return EBUSY.
+`evaluation_map_recovery` pins the same `WL_CONTROLLED_STEP_SNAPSHOT_RETRYABLE`
+state for a failed SNAPSHOT.
 
 Inline slots with declared types, `pair(int64,float) inline` and
 `pair(symbol,int64) inline`, give the source FLOAT or STRING lanes at session
@@ -2681,12 +2681,33 @@ creation. The same matrix runs over them with binary64 values, among them
 uncontrolled head's width and lane types. Both sessions consolidate a FLOAT
 zero to +0.0.
 
-Open after this bundle: FILTER, JOIN, SEMIJOIN/ANTIJOIN, REDUCE and LFTJ with an
-INLINE input; direct compound, segmented, timestamped/weighted and spill inputs
-to CONCAT and CONSOLIDATE; cold sources in controlled sessions, which
-`wl_columnar_session_cold_mode` excludes when an evaluation control is attached;
-and lazy-owner descriptors, which the reader refuses with ENOTSUP and whose
-session reachability was not traced. #2301 is not closed by this bundle.
+FILTER's source begin passes the same bit. FILTER addresses physical lanes by
+index and builds `$filter` from the scalar recipe, so `$filter` keeps the
+source's physical width and lane types with compound_kind NONE, where the
+uncontrolled `$filter` keeps the source's INLINE layout; the rows and lane
+types are the same, and the MAP after it builds the head from its projection.
+`evaluation_compound_sources` runs bodies with a FILTER between VARIABLE and
+MAP through the same matrix, with the stops at `$filter`: on an int64 slot, on
+a FLOAT slot, which drops -0.0, on a symbol slot, whose comparison lowers to
+two FILTER ops here, and on a scalar column after the compound, whose logical
+index 1 is physical lane 2. It checks that `$filter` read an INLINE input on
+each route and built a relation with the source's width and lane types and no
+compound layout, and it stops at each map-check charge, which VARIABLE and
+FILTER each pay. A JOIN after such a FILTER, here from the constant comparison
+`y = 20`, which lowers to a FILTER on the scan of `a`, also evaluates on each
+route and matches the uncontrolled rows. A COUNT over such a FILTER (VARIABLE,
+FILTER, REDUCE, CONSOLIDATE) now evaluates on each route, REDUCE reading
+`$filter`, and matches the uncontrolled rows; both sessions count a repeated
+inserted row twice. The JOIN body without a comparison, which joins `a` and `b`
+on the slot `x`, has no FILTER: its JOIN reads the INLINE EDB directly and
+keeps its ENOTSUP.
+
+Open after this bundle: JOIN, SEMIJOIN/ANTIJOIN, REDUCE and LFTJ reading an
+INLINE input directly; direct compound, segmented, timestamped/weighted and
+spill inputs to CONCAT and CONSOLIDATE; cold sources in controlled sessions,
+which `wl_columnar_session_cold_mode` excludes when an evaluation control is
+attached; and lazy-owner descriptors, which the reader refuses with ENOTSUP and
+whose session reachability was not traced. #2301 is not closed by this bundle.
 
 ### Never-inserted EDB sources through MAP, FILTER and REDUCE (#2301)
 

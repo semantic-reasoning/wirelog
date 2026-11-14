@@ -2149,8 +2149,12 @@ wl_columnar_filter_op_attempt_start_owned(const wl_plan_op_t *op,
             &ctx->source_initialized);
         if (!ctx->source_initialized) ctx->source_bare = false;
     } else {
-        rc = wl_columnar_eval_stack_scalar_source_begin_owned(frame, owner, op,
-                &ctx->source, input, true);
+        /* FILTER addresses physical lanes by index, as MAP does, and builds
+         * its output from the scalar recipe, so an INLINE input yields a
+         * relation with no compound layout (#2301). */
+        rc = wl_columnar_eval_stack_scalar_source_admit_owned(frame, owner, op,
+                &ctx->source, input, true,
+                WL_COLUMNAR_RELATION_SOURCE_ADMIT_INLINE);
     }
     rc = wl_columnar_filter_attempt_return(control, attempt_id, rc);
     if (rc)
