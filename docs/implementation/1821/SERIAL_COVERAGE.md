@@ -2673,6 +2673,14 @@ the step can be retried only as SNAPSHOT: an insert and a STEP return EBUSY.
 `evaluation_map_recovery` pins the same
 `WL_CONTROLLED_STEP_SNAPSHOT_RETRYABLE` state for a failed SNAPSHOT.
 
+Inline slots with declared types, `pair(int64,float) inline` and
+`pair(symbol,int64) inline`, give the source FLOAT or STRING lanes at session
+creation. The same matrix runs over them with binary64 values, among them
+-0.0, and with symbol ids from the program's intern table, and checks that
+`$map` gives the typed slot its FLOAT or STRING lane and that the head has the
+uncontrolled head's width and lane types. Both sessions consolidate a FLOAT
+zero to +0.0.
+
 Open after this bundle: FILTER, JOIN, SEMIJOIN/ANTIJOIN, REDUCE and LFTJ with an
 INLINE input; direct compound, segmented, timestamped/weighted and spill inputs
 to CONCAT and CONSOLIDATE; cold sources in controlled sessions, which
