@@ -7055,16 +7055,21 @@ test_evaluation_observer_resources_exe = executable(
   c_args: ['-DWL_SESSION_TEST_HOOKS=1', '-DWL_COLUMNAR_MEMORY_TEST_HOOKS=1'],
   link_with: [testlib_prod_memory_hooks],
 )
-# The complete retirement/refusal matrix takes about 127s under ASan.
+# The complete retirement/refusal matrix took 128-168 s under ASan on the
+# passing legs of PR run 43579525238 and 717 s of 720 s on the gcc TSan leg,
+# and timed out at 180 s (ASan clang) and 720 s (TSan clang) in that run.
 test('evaluation_observer_resources', test_evaluation_observer_resources_exe,
-     suite: ['unit', 'tsan'], timeout: 180)
+     suite: ['unit', 'tsan'], timeout: 600)
 
 test('evaluation_join_prepared_auto_domains', test_evaluation_join_prepared_auto_exe,
      env: ['WIRELOG_JOIN_BATCH_BYTES=', 'WIRELOG_JOIN_BATCH_STRICT='],
      suite: ['unit', 'tsan'], timeout: 120)
 
+# The suite grew with the retained cleanup matrices: 54-90 s under ASan and
+# 361 s on the gcc TSan leg of PR run 43579525238 (275 s in run 43565866587),
+# timing out at 120 s (ASan clang) and 480 s (TSan clang) on a slow runner.
 test('evaluation_serial', test_evaluation_serial_exe,
-     suite: ['unit', 'tsan'], timeout: 120)
+     suite: ['unit', 'tsan'], timeout: 300)
 test('evaluation_observer_error_metadata', test_evaluation_serial_exe,
      args: ['--observer-error-metadata'],
      env: ['WIRELOG_JOIN_BATCH_BYTES=', 'WIRELOG_JOIN_BATCH_STRICT='],
@@ -7117,9 +7122,11 @@ test('evaluation_completion_backend_contract', test_evaluation_serial_exe,
      args: ['--completion-contract'],
      suite: ['unit', 'tsan'], timeout: 120)
 # #2262: the fixtures must not inherit the bounded join knob.
+# Runs the whole grown evaluation_serial suite: 117 s of 120 s on the ASan
+# clang leg of PR run 43579525238 and timed out at 480 s on clang TSan.
 test('evaluation_serial_join_batch_env', test_evaluation_serial_exe,
      env: ['WIRELOG_JOIN_BATCH_BYTES=224'],
-     suite: ['unit'], timeout: 120)
+     suite: ['unit'], timeout: 300)
 
 # #1372 primitive spill I/O faults stay out of the production library.
 test_spill_segments_exe = executable(
@@ -7279,8 +7286,9 @@ test_session_retained_bridge_exe = executable(
   c_args: ['-DWL_SESSION_TEST_HOOKS=1'],
   link_with: [testlib_prod],
 )
+# 190 s of 240 s on the clang TSan leg of PR run 43579525238.
 test('session_retained_bridge', test_session_retained_bridge_exe,
-     suite: ['unit', 'tsan'], timeout: 60)
+     suite: ['unit', 'tsan'], timeout: 120)
 
 test_session_snapshot_frontier_exe = executable(
   'test_session_snapshot_frontier', files('test_session_snapshot_frontier.c'),
@@ -7597,10 +7605,21 @@ test_evaluation_join_host_lifecycle_exe = executable(
 foreach join_lifecycle_case : ['successors', 'snapshots', 'recovery', 'funding', 'snapshot-recovery', 'appends', 'strict', 'native-end', 'snapshot-end', 'bootstrap-end', 'constructor-faults', 'snapshot-finish-refusal', 'snapshot-no-begin-prior', 'metadata-binding', 'metadata-head', 'snapshot-retained-overflow', 'constructor-exhaust-step', 'constructor-exhaust-snapshot', 'snapshot-finance-birth', 'snapshot-exhaust-evaluating-end', 'snapshot-exhaust-evaluating-successor', 'snapshot-exhaust-completed-end', 'snapshot-exhaust-completed-successor', 'admission-strata-step', 'admission-strata-snapshot', 'admission-strata-refusal', 'admission-read-failure', 'private-cap']
   # With the former 60 s the strict case took 224-227 s of the 240 s it had
   # on the gcc TSan leg (60 s x 4), on main e5b753fb and on PR #2352.
+  # In PR run 43579525238 constructor-faults timed out at 60 s (ASan clang)
+  # and 240 s (both TSan legs), metadata-binding timed out at 240 s on clang
+  # TSan and used 57 s of 60 s under ASan clang, and bootstrap-end and
+  # snapshot-finish-refusal used 191 s and 182 s of 240 s on clang TSan.
+  # recovery used 194 s of 240 s on gcc TSan in run 43565866587.
+  join_lifecycle_timeout = 60
+  if join_lifecycle_case in ['constructor-faults', 'metadata-binding']
+    join_lifecycle_timeout = 240
+  elif join_lifecycle_case in ['strict', 'recovery', 'bootstrap-end', 'snapshot-finish-refusal']
+    join_lifecycle_timeout = 120
+  endif
   test('evaluation_join_host_lifecycle_' + join_lifecycle_case,
        test_evaluation_join_host_lifecycle_exe, args: [join_lifecycle_case],
        suite: ['unit', 'tsan', 'evaluation_join_hosts'],
-       timeout: join_lifecycle_case == 'strict' ? 120 : 60)
+       timeout: join_lifecycle_timeout)
 endforeach
 
 # #2298 actual composed aggregate admission under configured JOIN batches.
@@ -7727,8 +7746,10 @@ test_evaluation_expression_extensions_exe = executable(
   dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
   link_with: [testlib_prod],
 )
+# 375 s of 480 s on the clang TSan leg of PR run 43579525238 (179 s in run
+# 43565866587).
 test('evaluation_expression_extensions', test_evaluation_expression_extensions_exe,
-     suite: ['unit', 'tsan'], timeout: 120)
+     suite: ['unit', 'tsan'], timeout: 240)
 
 # #2299 actual scalar host intersections.
 expression_hosts_exe = executable('test_evaluation_expression_hosts',
