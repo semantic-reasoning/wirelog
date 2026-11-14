@@ -575,3 +575,10 @@ first insert, in the general observed transaction, which has read them at
 their source since f1f29724; see "EDBs without a declaration in the general
 observed transaction (#2301)". It also reports a denied reservation of the
 private empty input of a never-inserted EDB as a budget denial.
+
+A third bundle lets the controlled FILTER admit an INLINE source as VARIABLE
+and MAP do, so bodies with a FILTER between VARIABLE and MAP over an inline
+compound EDB, and a COUNT or a JOIN after such a FILTER, evaluate instead of
+returning ENOTSUP; see "Inline compound sources through VARIABLE and MAP
+(#2301)". JOIN, SEMIJOIN/ANTIJOIN, REDUCE and LFTJ reading an INLINE input
+directly remain with #2300.

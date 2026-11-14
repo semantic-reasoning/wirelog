@@ -2,10 +2,12 @@
  *
  * An EDB declared with an inline compound column and no side compound
  * column stores each compound as contiguous int64 lanes (compound_kind
- * INLINE). The generated rule bodies below read it through VARIABLE and
- * MAP, and the UNION body also through CONCAT and CONSOLIDATE. Each
- * controlled result is compared with a literal tuple set and with an
- * uncontrolled session over the same plan. */
+ * INLINE). The generated rule bodies below read it through VARIABLE, then
+ * MAP or a FILTER, and the UNION body also through CONCAT and CONSOLIDATE.
+ * Each controlled result is compared with a literal tuple set and with an
+ * uncontrolled session over the same plan. Further bodies read a FILTER's
+ * output through REDUCE or JOIN, and a JOIN body that reads the source
+ * directly is checked to be refused. */
 #include "../wirelog/columnar/internal.h"
 #include "../wirelog/exec_plan_gen.h"
 #include "../wirelog/session.h"
@@ -105,9 +107,12 @@ add(capture_t *c, unsigned width, const int64_t *v, int diff)
  * them to the head. */
 /* K_NARROW projects column 0 of a three-lane INLINE source and K_BOX
  * reads a one-lane INLINE source. */
+/* The K_FILTER kinds put a FILTER between VARIABLE and MAP: on an int64
+ * slot, on a FLOAT slot (dropping -0.0), on a STRING slot, and on a scalar
+ * column after the compound, whose logical index 1 is physical lane 2. */
 enum {
     K_PAIR, K_UNION, K_WIDE, K_FLOAT_PAIR, K_STRING_PAIR, K_NARROW, K_BOX,
-    K_COUNT
+    K_FILTER, K_FILTER_FLOAT, K_FILTER_STRING, K_FILTER_TAIL, K_COUNT
 };
 
 static const char *const programs[K_COUNT] = {
@@ -135,7 +140,37 @@ static const char *const programs[K_COUNT] = {
     ".decl a(b:box/1 inline)\n"
     ".decl out(v:int64)\n"
     "out(v) :- a(box(v)).\n",
+    ".decl a(id:int64,p:pair/2 inline)\n"
+    ".decl out(id:int64,y:int64)\n"
+    "out(i,y) :- a(i,pair(x,y)), x > 0.\n",
+    ".decl a(id:int64,p:pair(int64,float) inline)\n"
+    ".decl out(id:int64,y:float)\n"
+    "out(i,y) :- a(i,pair(x,y)), y > 0.0.\n",
+    ".decl a(id:int64,p:pair(symbol,int64) inline)\n"
+    ".decl out(id:int64,y:int64)\n"
+    "out(i,y) :- a(i,pair(x,y)), x = \"p\".\n",
+    ".decl a(p:pair/2 inline,id:int64)\n"
+    ".decl out(x:int64,id:int64)\n"
+    "out(x,i) :- a(pair(x,y),i), i > 1.\n",
 };
+
+static bool
+is_filter(unsigned kind)
+{
+    return kind >= K_FILTER && kind <= K_FILTER_TAIL;
+}
+
+static bool
+float_slot(unsigned kind)
+{
+    return kind == K_FLOAT_PAIR || kind == K_FILTER_FLOAT;
+}
+
+static bool
+string_slot(unsigned kind)
+{
+    return kind == K_STRING_PAIR || kind == K_FILTER_STRING;
+}
 
 /* Physical rows for a. The duplicate row collapses under set semantics. */
 static const int64_t pair_rows[] = {
@@ -152,6 +187,11 @@ static const int64_t wide_rows[] = {
 
 static const int64_t box_rows[] = {4, -1, 4, 0};
 
+/* pair_rows with the id after the pair: physical lanes x, y, id. */
+static const int64_t tail_rows[] = {
+    10, 20, 1,   30, 40, 2,   10, 20, 1,   -5, 6, 3,
+};
+
 static unsigned
 physical_width(unsigned kind)
 {
@@ -167,8 +207,8 @@ static int64_t typed_rows[12];
 static const int64_t *
 rows_of(unsigned kind)
 {
-    return kind == K_FLOAT_PAIR || kind == K_STRING_PAIR ? typed_rows
-           : pair_rows;
+    return float_slot(kind) || string_slot(kind) ? typed_rows
+           : kind == K_FILTER_TAIL ? tail_rows : pair_rows;
 }
 
 static void
@@ -178,9 +218,9 @@ fill_typed_rows(unsigned kind, wl_session_t *s)
     static const char *const x[] = {"p", "q", "p", "r"};
     memcpy(typed_rows, pair_rows, sizeof(typed_rows));
     for (unsigned r = 0; r < 4; r++) {
-        if (kind == K_FLOAT_PAIR) {
+        if (float_slot(kind)) {
             memcpy(&typed_rows[r * 3 + 2], &y[r], sizeof(int64_t));
-        } else if (kind == K_STRING_PAIR) {
+        } else if (string_slot(kind)) {
             typed_rows[r * 3 + 1] = wl_intern_put(
                 ((wl_col_session_t *)s)->intern, x[r]);
             CHECK(typed_rows[r * 3 + 1] >= 0);
@@ -233,6 +273,23 @@ literal(unsigned kind, bool empty, capture_t *e)
                 add(e, 1, &pair_rows[r * 3], 1);
         return;
     }
+    if (is_filter(kind)) {
+        /* x > 0, y > 0.0, x = "p" and i > 1 each keep the rows below; the
+         * repeated row collapses. */
+        static const unsigned keep[4][2] = {
+            {0, 1}, {0, 3}, {0, 0}, {1, 3},
+        };
+        const unsigned *k = keep[kind - K_FILTER];
+        for (unsigned j = 0; j < 2; j++) {
+            if (j && k[1] == k[0])
+                break;
+            /* (id, y), or (x, id) for K_FILTER_TAIL: lanes 0 and 2. */
+            const int64_t *src = &rows_of(kind)[k[j] * 3];
+            const int64_t row[2] = {src[0], src[2]};
+            add(e, 2, row, 1);
+        }
+        return;
+    }
     if (kind == K_WIDE) {
         const int64_t r1[] = {17, 102, 7, 1, 100};
         const int64_t r2[] = {27, 202, 8, 2, 200};
@@ -245,7 +302,7 @@ literal(unsigned kind, bool empty, capture_t *e)
         /* Both sessions consolidate a FLOAT zero to +0.0. */
         int64_t row[3];
         memcpy(row, &rows_of(kind)[r * 3], sizeof(row));
-        if (kind == K_FLOAT_PAIR)
+        if (float_slot(kind))
             row[2] = (int64_t)wl_columnar_float_canonical_bits(row[2]);
         add(e, 3, row, 1);
     }
@@ -265,8 +322,20 @@ check_body(const wl_plan_t *plan, unsigned kind)
         WL_PLAN_OP_VARIABLE, WL_PLAN_OP_MAP, WL_PLAN_OP_VARIABLE,
         WL_PLAN_OP_MAP, WL_PLAN_OP_CONCAT, WL_PLAN_OP_CONSOLIDATE,
     };
-    const wl_plan_op_type_t *want = kind == K_UNION ? unioned : single;
-    uint32_t count = kind == K_UNION ? 6u : 3u;
+    static const wl_plan_op_type_t filtered[] = {
+        WL_PLAN_OP_VARIABLE, WL_PLAN_OP_FILTER, WL_PLAN_OP_MAP,
+        WL_PLAN_OP_CONSOLIDATE,
+    };
+    /* This symbol comparison lowers to two FILTER ops. */
+    static const wl_plan_op_type_t filtered2[] = {
+        WL_PLAN_OP_VARIABLE, WL_PLAN_OP_FILTER, WL_PLAN_OP_FILTER,
+        WL_PLAN_OP_MAP, WL_PLAN_OP_CONSOLIDATE,
+    };
+    const wl_plan_op_type_t *want = kind == K_UNION ? unioned
+        : kind == K_FILTER_STRING ? filtered2
+        : is_filter(kind) ? filtered : single;
+    uint32_t count = kind == K_UNION ? 6u : kind == K_FILTER_STRING ? 5u
+        : is_filter(kind) ? 4u : 3u;
     const wl_plan_relation_t *out = NULL;
     for (uint32_t s = 0; s < plan->stratum_count; s++)
         for (uint32_t r = 0; r < plan->strata[s].relation_count; r++)
@@ -289,7 +358,7 @@ check_body(const wl_plan_t *plan, unsigned kind)
 
 static wl_session_t *active;
 static unsigned active_kind;
-static unsigned map_inline, concat_seen;
+static unsigned map_inline, filter_inline, concat_seen;
 static unsigned stop_mode; /* 0 none, 1 cancel, 2 work limit */
 static const char *stop_at;
 static bool stop_hit;
@@ -309,6 +378,17 @@ publication(wl_col_session_t *s, const col_rel_t *in, const col_rel_t *out)
             CHECK(lane_type(out, 2) == WIRELOG_TYPE_FLOAT);
         if (active_kind == K_STRING_PAIR)
             CHECK(lane_type(out, 1) == WIRELOG_TYPE_STRING);
+    }
+    /* FILTER keeps the source's physical lanes and their types, and builds
+     * its output with no compound layout. */
+    if (!strcmp(out->name, "$filter") && in
+        && in->compound_kind == WIRELOG_COMPOUND_KIND_INLINE) {
+        CHECK(out->compound_kind == WIRELOG_COMPOUND_KIND_NONE
+            && !out->compound_arity_map && !out->timestamps
+            && out->ncols == in->ncols);
+        for (uint32_t c = 0; c < out->ncols; c++)
+            CHECK(lane_type(out, c) == lane_type(in, c));
+        filter_inline++;
     }
     if (!strcmp(out->name, "$concat"))
         concat_seen++;
@@ -371,10 +451,10 @@ fixture(fixture_t *f, unsigned kind)
     CHECK(a && a->compound_kind == WIRELOG_COMPOUND_KIND_INLINE
         && a->ncols == physical_width(kind));
     fill_typed_rows(kind, f->s);
-    if (kind == K_FLOAT_PAIR)
+    if (float_slot(kind))
         CHECK(lane_type(a, 1) == WIRELOG_TYPE_INT64
             && lane_type(a, 2) == WIRELOG_TYPE_FLOAT);
-    if (kind == K_STRING_PAIR)
+    if (string_slot(kind))
         CHECK(lane_type(a, 1) == WIRELOG_TYPE_STRING
             && lane_type(a, 2) == WIRELOG_TYPE_INT64);
 }
@@ -448,9 +528,11 @@ run_case(unsigned kind, bool snapshot, bool observed, bool empty,
     source_save(&src, f.s);
     col_rel_t *old = session_find_rel((wl_col_session_t *)f.s, "out");
     col_relation_snapshot_t old_image = wl_columnar_relation_snapshot(old);
-    active = f.s; active_kind = kind; map_inline = concat_seen = 0;
+    active = f.s; active_kind = kind;
+    map_inline = filter_inline = concat_seen = 0;
     stop_mode = fault; stop_hit = false;
-    stop_at = kind == K_UNION ? "$concat" : "$map";
+    stop_at = kind == K_UNION ? "$concat" : is_filter(kind) ? "$filter"
+        : "$map";
     wl_columnar_eval_stack_test_physical_publication = publication;
     int rc = snapshot ? wl_session_snapshot(f.s, on_tuple, &image)
         : step(f.s);
@@ -484,9 +566,11 @@ run_case(unsigned kind, bool snapshot, bool observed, bool empty,
         : step(f.raw)));
     wl_columnar_eval_stack_test_physical_publication = NULL;
     source_kept(&src, f.s, false);
-    /* The controlled route did the work: MAP read the INLINE source, and
-     * the UNION body went through CONCAT. */
-    if (!empty)
+    /* The controlled route did the work: MAP, or the FILTER before it,
+     * read the INLINE source, and the UNION body went through CONCAT. */
+    if (!empty && is_filter(kind))
+        CHECK(filter_inline >= 1 && !map_inline);
+    else if (!empty)
         CHECK(map_inline >= 1);
     if (kind == K_UNION)
         CHECK(concat_seen >= 1);
@@ -500,6 +584,8 @@ run_case(unsigned kind, bool snapshot, bool observed, bool empty,
         CHECK(lane_type(head, c) == lane_type(raw_head, c));
     if (kind == K_FLOAT_PAIR)
         CHECK(lane_type(head, 2) == WIRELOG_TYPE_FLOAT);
+    if (kind == K_FILTER_FLOAT)
+        CHECK(lane_type(head, 1) == WIRELOG_TYPE_FLOAT);
     if (kind == K_STRING_PAIR)
         CHECK(lane_type(head, 1) == WIRELOG_TYPE_STRING);
     if (snapshot) {
@@ -599,6 +685,80 @@ refused_consumer(const char *text, const char *head, unsigned want_rows,
     } else {
         CHECK(raw_events.count == want_rows);
     }
+    CHECK(!wl_session_try_destroy(&s));
+    wl_session_destroy(raw);
+    wl_evaluation_control_release(control);
+    wl_plan_free(plan);
+    wirelog_program_free(program);
+    CHECK(wl_columnar_memory_reserved(
+            wl_columnar_memory_governor_ref_get(governor)) == 0);
+    wl_columnar_memory_governor_ref_release(governor);
+}
+
+/* A FILTER over the INLINE source feeding another consumer: the controlled
+ * session computes the uncontrolled rows on each route. want holds the
+ * expected head rows of width 2. */
+static void
+filtered_consumer(const char *text, const char *head, const int64_t *want,
+    unsigned want_rows, unsigned route)
+{
+    wirelog_error_t error;
+    wirelog_program_t *program = wirelog_parse_string(text, &error);
+    wl_plan_t *plan = NULL;
+    CHECK(program && !wl_plan_from_program(program, &plan));
+    wl_columnar_memory_resolution_t resolution = {
+        .budget_bytes = WL_COLUMNAR_MEMORY_MIN_BUDGET,
+        .usable_bytes = WL_COLUMNAR_MEMORY_MIN_BUDGET,
+        .mode = WL_COLUMNAR_MEMORY_MODE_ENFORCING,
+    };
+    wl_columnar_memory_governor_ref_t *governor =
+        wl_columnar_memory_governor_ref_create(&resolution);
+    wl_evaluation_control_t *control = NULL;
+    CHECK(governor && !wl_evaluation_control_create(UINT64_C(1000000000),
+        &control));
+    wl_session_options_t options;
+    wl_session_options_init(&options);
+    options.evaluation_control = control;
+    options.memory_governor = governor;
+    wl_session_t *s = NULL, *raw = NULL;
+    CHECK(!wl_session_create_with_options(wl_backend_columnar(), plan, 1,
+        &options, &s));
+    CHECK(!wl_session_create(wl_backend_columnar(), plan, 1, &raw));
+    const int64_t b[] = {10, 7, 30, 8};
+    for (unsigned i = 0; i < 2; i++) {
+        wl_session_t *x = i ? raw : s;
+        CHECK(!wl_session_insert(x, "a", pair_rows, 4, 3));
+        CHECK(!wl_session_insert(x, "b", b, 2, 2));
+    }
+    capture_t events = {.head = head}, raw_events = {.head = head};
+    capture_t expect = {.head = head};
+    for (unsigned r = 0; r < want_rows; r++)
+        add(&expect, 2, &want[r * 2], 1);
+    if (route == R_OBSERVED) {
+        wl_session_set_delta_cb(s, on_delta, &events);
+        wl_session_set_delta_cb(raw, on_delta, &raw_events);
+    }
+    active = s; active_kind = K_COUNT; filter_inline = 0;
+    stop_mode = 0;
+    wl_columnar_eval_stack_test_physical_publication = publication;
+    int rc = route == R_SNAPSHOT ? wl_session_snapshot(s, on_tuple, &events)
+        : step(s);
+    wl_columnar_eval_stack_test_physical_publication = NULL;
+    if (rc)
+        fprintf(stderr, "%s route %u: rc %d\n", head, route, rc);
+    CHECK(!rc && filter_inline >= 1);
+    CHECK(!(route == R_SNAPSHOT ? wl_session_snapshot(raw, on_tuple,
+        &raw_events) : step(raw)));
+    if (route != R_UNOBSERVED) {
+        equal_capture(&events, &expect, "filtered consumer events");
+        if (route == R_OBSERVED)
+            equal_capture(&raw_events, &expect, "raw filtered consumer");
+    }
+    capture_t final = {.head = head}, raw_final = {.head = head};
+    CHECK(!wl_session_snapshot(s, on_tuple, &final));
+    CHECK(!wl_session_snapshot(raw, on_tuple, &raw_final));
+    equal_capture(&final, &expect, "filtered consumer image");
+    equal_capture(&raw_final, &expect, "raw filtered consumer image");
     CHECK(!wl_session_try_destroy(&s));
     wl_session_destroy(raw);
     wl_evaluation_control_release(control);
@@ -751,6 +911,21 @@ count_compound_charges(const char *text, const int64_t *rows, unsigned n,
     return compound_hits;
 }
 
+/* The map-check charges of one STEP of a fixture kind, with its own rows. */
+static unsigned
+fixture_charges(unsigned kind)
+{
+    fixture_t f;
+    fixture(&f, kind);
+    populate(f.s, kind, false);
+    compound_hits = 0; compound_stop_at = 0;
+    wl_columnar_relation_test_work_checkpoint = compound_checkpoint;
+    CHECK(!step(f.s));
+    wl_columnar_relation_test_work_checkpoint = NULL;
+    fixture_destroy(&f);
+    return compound_hits;
+}
+
 static void
 compound_stops(void)
 {
@@ -759,8 +934,23 @@ compound_stops(void)
         pair_rows, 4, 3) == 0);
     CHECK(count_compound_charges(programs[K_PAIR], pair_rows, 4, 3) == 2);
     CHECK(count_compound_charges(programs[K_WIDE], wide_rows, 3, 12) == 4);
-    for (unsigned kind = K_PAIR; kind <= K_WIDE; kind += K_WIDE - K_PAIR)
-        for (unsigned at = 1; at <= (kind == K_WIDE ? 4u : 2u); at++)
+    /* VARIABLE and FILTER each check the map; MAP reads FILTER's output,
+     * which has no compound layout. */
+    CHECK(count_compound_charges(programs[K_FILTER], pair_rows, 4, 3) == 2);
+    static const unsigned stop_kinds[] = {
+        K_PAIR, K_WIDE, K_FILTER, K_FILTER_FLOAT, K_FILTER_STRING,
+        K_FILTER_TAIL,
+    };
+    static const unsigned charges[] = {2, 4, 2, 2, 2, 2};
+    for (unsigned i = 0; i < 6; i++) {
+        unsigned n = fixture_charges(stop_kinds[i]);
+        if (n != charges[i])
+            fprintf(stderr, "kind %u: %u map-check charges\n", stop_kinds[i],
+                n);
+        CHECK(n == charges[i]);
+    }
+    for (unsigned i = 0; i < 6; i++)
+        for (unsigned kind = stop_kinds[i], at = 1; at <= charges[i]; at++)
             for (compound_mode = 1; compound_mode < 3; compound_mode++) {
                 fixture_t f;
                 fixture(&f, kind);
@@ -867,11 +1057,21 @@ main(void)
     scale();
     compound_stops();
     map_scratch_denial();
-    /* x > 0 keeps ids 1 and 2; the join matches x = 10 and x = 30. */
+    /* COUNT runs over the inserted rows, so the repeated row of id 1
+     * counts twice in both sessions. The join matches x = 10 and x = 30. */
+    static const int64_t counted[] = {1, 2, 2, 1};
+    /* The constant comparison becomes a FILTER on a's scan, before the
+     * JOIN; the row with y = 20 joins b on x = 10. */
+    static const int64_t joined[] = {1, 7};
     for (unsigned route = 0; route < R_COUNT; route++) {
-        refused_consumer(".decl a(id:int64,p:pair/2 inline)\n"
-            ".decl b(k:int64,v:int64)\n.decl f(id:int64,y:int64)\n"
-            "f(i,y) :- a(i,pair(x,y)), x > 0.\n", "f", 2, route);
+        filtered_consumer(".decl a(id:int64,p:pair/2 inline)\n"
+            ".decl b(k:int64,v:int64)\n.decl n(id:int64,c:int64)\n"
+            "n(i,count(y)) :- a(i,pair(x,y)), x > 0.\n", "n", counted, 2,
+            route);
+        filtered_consumer(".decl a(id:int64,p:pair/2 inline)\n"
+            ".decl b(k:int64,v:int64)\n.decl j(id:int64,z:int64)\n"
+            "j(i,z) :- a(i,pair(x,y)), y = 20, b(x,z).\n", "j", joined, 1,
+            route);
         refused_consumer(".decl a(id:int64,p:pair/2 inline)\n"
             ".decl b(k:int64,v:int64)\n.decl j(id:int64,z:int64)\n"
             "j(i,z) :- a(i,pair(x,y)), b(x,z).\n", "j", 2, route);
