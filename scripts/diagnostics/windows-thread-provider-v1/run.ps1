@@ -186,9 +186,9 @@ try {
     $dumpbin = (Get-Command dumpbin.exe -CommandType Application).Source
     $uv = (Get-Command uv.exe -CommandType Application).Source
     $python = (Get-Command python.exe -CommandType Application).Source
-    if (-not $cl.StartsWith($vs + '\', [StringComparison]::OrdinalIgnoreCase)
-        -or -not $link.StartsWith($vs + '\', [StringComparison]::OrdinalIgnoreCase)
-        -or -not $dumpbin.StartsWith($vs + '\', [StringComparison]::OrdinalIgnoreCase)) {
+    if (-not $cl.StartsWith($vs + '\', [StringComparison]::OrdinalIgnoreCase) -or
+        -not $link.StartsWith($vs + '\', [StringComparison]::OrdinalIgnoreCase) -or
+        -not $dumpbin.StartsWith($vs + '\', [StringComparison]::OrdinalIgnoreCase)) {
         throw 'Tools are not from the selected Visual Studio installation'
     }
     Save-Json (Join-Path $publish 'toolchain.json') ([ordered]@{
@@ -299,8 +299,8 @@ try {
                     $inc = [regex]::Match($line, '^Note: including file:\s+(.+?)\s*$')
                     if ($inc.Success) {
                         $header = [IO.Path]::GetFullPath($inc.Groups[1].Value)
-                        if (-not ($header.StartsWith($vs + '\', [StringComparison]::OrdinalIgnoreCase)
-                            -or $header.StartsWith($env:WindowsSdkDir, [StringComparison]::OrdinalIgnoreCase))) {
+                        if (-not ($header.StartsWith($vs + '\', [StringComparison]::OrdinalIgnoreCase) -or
+                            $header.StartsWith($env:WindowsSdkDir, [StringComparison]::OrdinalIgnoreCase))) {
                             throw 'Unexpected header outside selected toolchain/SDK'
                         }
                         $includeFiles[$header] = $true
@@ -329,8 +329,8 @@ try {
                 $libraryMatch = [regex]::Match($libraryLine, '^\s*Searching\s+(.+?\.lib):?\s*$')
                 if ($libraryMatch.Success) {
                     $library = [IO.Path]::GetFullPath($libraryMatch.Groups[1].Value)
-                    if (-not ($library.StartsWith($vs + '\', [StringComparison]::OrdinalIgnoreCase)
-                        -or $library.StartsWith($env:WindowsSdkDir, [StringComparison]::OrdinalIgnoreCase))) { throw 'Unexpected linked library location' }
+                    if (-not ($library.StartsWith($vs + '\', [StringComparison]::OrdinalIgnoreCase) -or
+                        $library.StartsWith($env:WindowsSdkDir, [StringComparison]::OrdinalIgnoreCase))) { throw 'Unexpected linked library location' }
                     $libraries[$library] = $true
                 }
             }
@@ -350,17 +350,17 @@ try {
             $join = @($records | Where-Object { $_.kind -eq 'joined' })
             if ($layout.Count -ne 1 -or $checks.Count -ne 1 -or $join.Count -ne 1) { throw 'Incomplete live observation records' }
             Require-Command $ran
-            if (-not ($checks[0].same -and $checks[0].different_lr -and $checks[0].different_rl
-                -and $checks[0].foreign_self -and $checks[0].worker_self) -or $join[0].worker_result -ne 0) {
+            if (-not ($checks[0].same -and $checks[0].different_lr -and $checks[0].different_rl -and
+                $checks[0].foreign_self -and $checks[0].worker_self) -or $join[0].worker_result -ne 0) {
                 throw 'Live identity semantic checks failed'
             }
             $moduleRecords = @()
             foreach ($record in $records) {
                 if ($record.kind -eq 'module') {
                     $modulePath = [IO.Path]::GetFullPath($record.module_path)
-                    if (-not ($modulePath.StartsWith($env:SystemRoot + '\', [StringComparison]::OrdinalIgnoreCase)
-                        -or $modulePath.StartsWith($vs + '\', [StringComparison]::OrdinalIgnoreCase)
-                        -or $modulePath.StartsWith($profileDir + '\', [StringComparison]::OrdinalIgnoreCase))) {
+                    if (-not ($modulePath.StartsWith($env:SystemRoot + '\', [StringComparison]::OrdinalIgnoreCase) -or
+                        $modulePath.StartsWith($vs + '\', [StringComparison]::OrdinalIgnoreCase) -or
+                        $modulePath.StartsWith($profileDir + '\', [StringComparison]::OrdinalIgnoreCase))) {
                         throw 'Unexpected observed module outside allowed Windows/VS/probe roots'
                     }
                     $moduleRecords += File-Record $modulePath
