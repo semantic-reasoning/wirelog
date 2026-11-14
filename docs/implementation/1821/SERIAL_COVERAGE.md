@@ -2857,3 +2857,12 @@ and nothing new, comparing head rows, width and type, the SNAPSHOT image and
 the observed STEP events with the uncontrolled session. After a STEP it checks
 that both sessions return the same code for an insert of another width, with
 the facts loaded and without, and step to the same head.
+
+It runs single-rule, two-column and integer expression bodies over an EDB
+named only by `.input`, never inserted, in all four STEP and SNAPSHOT,
+observed and unobserved columns with the stops and the budget denial, inserts
+the first rows after an unobserved STEP, and runs the `untyped_rows` rounds.
+Once that EDB has rows it checks that both sessions refuse an insert of
+another width with EINVAL, on the observed and the unobserved STEP, and that a
+first insert of zero columns after a STEP, and a later insert of one column,
+get the same code from both sessions and leave the same head.

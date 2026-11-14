@@ -94,10 +94,11 @@ enum {
     K_SINGLE, K_UNION_A, K_UNION_C, K_UNION_BOTH, K_FILTER, K_COUNT,
     K_GROUPED, K_TWO_COL, K_INT_EXPR, K_TWO_COL_EXPR, K_TWO_EDB_EXPR,
     K_NARROW, K_NARROW_TWO_EDB, K_FACTS, K_FACTS_TWO, K_FACTS_EXPR,
-    K_FACTS_FILTER, K_INT32, K_UINT32, K_UINT64, K_BOOL, K_FLOAT,
-    K_FLOAT_EXPR, K_FACTS_STRING, K_COUNT_KINDS
+    K_FACTS_FILTER, K_INPUT, K_INPUT_TWO, K_INPUT_EXPR, K_INT32, K_UINT32,
+    K_UINT64, K_BOOL, K_FLOAT, K_FLOAT_EXPR, K_FACTS_STRING, K_COUNT_KINDS
 };
 
+#define INPUT_DIRECTIVE ".input a(filename=\"unused.csv\")\n"
 #define UNION_TEXT ".decl a(x:int64)\n.decl c(x:int64)\n.decl out(x:int64)\n" \
         "out(x) :- a(x).\nout(x) :- c(x).\n"
 
@@ -155,6 +156,15 @@ static const struct {
       { "a", NULL }, NULL, WL_PLAN_OP_MAP, "$map" },
     { "a(1).\na(2).\nout(x) :- a(x), x > 1.\n",
       { "a", NULL }, NULL, WL_PLAN_OP_FILTER, "$filter" },
+    /* An EDB named only by .input, with neither a declaration nor facts:
+     * the plan gives it no width and no lane types. Session creation reads
+     * no file. */
+    { INPUT_DIRECTIVE "out(x) :- a(x).\n",
+      { "a", NULL }, NULL, WL_PLAN_OP_MAP, "$map" },
+    { INPUT_DIRECTIVE "out(x) :- a(x,y).\n",
+      { "a", NULL }, NULL, WL_PLAN_OP_MAP, "$map" },
+    { INPUT_DIRECTIVE "out(x + 1) :- a(x).\n",
+      { "a", NULL }, NULL, WL_PLAN_OP_MAP, "$map" },
     { ".decl a(x:int32)\n.decl out(x:int32)\nout(x) :- a(x).\n",
       { "a", NULL }, NULL, WL_PLAN_OP_MAP, "$map" },
     /* The parser takes no uint32, uint64 or bool declaration; the fixture
@@ -182,7 +192,7 @@ edb_width(unsigned kind)
 {
     return kind == K_GROUPED || kind == K_TWO_COL || kind == K_TWO_COL_EXPR
            || kind == K_NARROW || kind == K_NARROW_TWO_EDB
-           || kind == K_FACTS_TWO ? 2u : 1u;
+           || kind == K_FACTS_TWO || kind == K_INPUT_TWO ? 2u : 1u;
 }
 
 static bool
@@ -190,6 +200,12 @@ is_facts(unsigned kind)
 {
     return kind == K_FACTS || kind == K_FACTS_TWO || kind == K_FACTS_EXPR
            || kind == K_FACTS_FILTER || kind == K_FACTS_STRING;
+}
+
+static bool
+is_input(unsigned kind)
+{
+    return kind == K_INPUT || kind == K_INPUT_TWO || kind == K_INPUT_EXPR;
 }
 
 static bool
@@ -205,8 +221,9 @@ private_empty_step(unsigned kind)
 {
     return kind == K_SINGLE || kind == K_FILTER || kind == K_TWO_COL
            || kind == K_INT_EXPR || kind == K_TWO_COL_EXPR || kind == K_NARROW
-           || (is_facts(kind) && kind != K_FACTS_STRING) || kind == K_INT32
-           || kind == K_UINT32 || kind == K_UINT64 || kind == K_BOOL;
+           || (is_facts(kind) && kind != K_FACTS_STRING) || is_input(kind)
+           || kind == K_INT32 || kind == K_UINT32 || kind == K_UINT64
+           || kind == K_BOOL;
 }
 
 static unsigned
@@ -442,6 +459,17 @@ fixture(fixture_t *f, unsigned kind)
                     == WL_PLAN_WIDTH_UNDECLARED
                     && f->plan->edb_column_type_counts[i]
                     == edb_width(kind));
+                found = true;
+            }
+        CHECK(found);
+    }
+    if (is_input(kind)) {
+        bool found = false;
+        for (uint32_t i = 0; i < f->plan->edb_count; i++)
+            if (!strcmp(f->plan->edb_relations[i], "a")) {
+                CHECK(f->plan->edb_declared_width[i]
+                    == WL_PLAN_WIDTH_UNDECLARED
+                    && !f->plan->edb_column_type_counts[i]);
                 found = true;
             }
         CHECK(found);
@@ -824,6 +852,69 @@ facts_width(bool loaded)
     fixture_destroy(&f);
 }
 
+/* An EDB named only by .input takes its first insert's width; once it has
+ * rows, both sessions refuse an insert of another width with the same code
+ * and step on to the same head. */
+static void
+input_width(bool observed)
+{
+    fixture_t f;
+    fixture(&f, K_INPUT);
+    capture_t ev = {0}, raw_ev = {0};
+    if (observed) {
+        wl_session_set_delta_cb(f.s, on_delta, &ev);
+        wl_session_set_delta_cb(f.raw, on_delta, &raw_ev);
+    }
+    CHECK(!step(f.s) && !step(f.raw));
+    const int64_t row[] = {5, 6};
+    CHECK(!wl_session_insert(f.s, "a", row, 1, 1));
+    CHECK(!wl_session_insert(f.raw, "a", row, 1, 1));
+    CHECK(!step(f.s) && !step(f.raw));
+    int rc = wl_session_insert(f.s, "a", row, 1, 2);
+    CHECK(rc == EINVAL && rc == wl_session_insert(f.raw, "a", row, 1, 2));
+    CHECK(!wl_session_insert(f.s, "a", row + 1, 1, 1));
+    CHECK(!wl_session_insert(f.raw, "a", row + 1, 1, 1));
+    CHECK(!step(f.s) && !step(f.raw));
+    capture_t a = {0}, b = {0};
+    head_capture(f.s, &a);
+    head_capture(f.raw, &b);
+    equal_capture(&a, &b, "input head", K_INPUT);
+    CHECK(a.count == 2);
+    if (observed)
+        equal_capture(&ev, &raw_ev, "input events", K_INPUT);
+    fixture_destroy(&f);
+}
+
+/* A first insert of zero columns into such an EDB after a STEP returns the
+ * uncontrolled session's code, and a later insert of one column then gets
+ * the same code from both sessions. */
+static void
+input_nullary(bool observed)
+{
+    fixture_t f;
+    fixture(&f, K_INPUT);
+    capture_t ev = {0}, raw_ev = {0};
+    if (observed) {
+        wl_session_set_delta_cb(f.s, on_delta, &ev);
+        wl_session_set_delta_cb(f.raw, on_delta, &raw_ev);
+    }
+    CHECK(!step(f.s) && !step(f.raw));
+    const int64_t row[] = {5};
+    int rc = wl_session_insert(f.s, "a", row, 1, 0);
+    CHECK(rc == wl_session_insert(f.raw, "a", row, 1, 0));
+    CHECK(!step(f.s) && !step(f.raw));
+    rc = wl_session_insert(f.s, "a", row, 1, 1);
+    CHECK(rc == wl_session_insert(f.raw, "a", row, 1, 1));
+    CHECK(!step(f.s) && !step(f.raw));
+    capture_t a = {0}, b = {0};
+    head_capture(f.s, &a);
+    head_capture(f.raw, &b);
+    equal_capture(&a, &b, "nullary input head", K_INPUT);
+    if (observed)
+        equal_capture(&ev, &raw_ev, "nullary input events", K_INPUT);
+    fixture_destroy(&f);
+}
+
 /* ---- deterministic stops in the general observed transaction ------------- */
 
 /* The general observed transaction builds a private empty input for each
@@ -1031,6 +1122,10 @@ run_matrix(void)
                     facts_rows(kind, snapshot, observed);
     facts_width(false);
     facts_width(true);
+    input_width(false);
+    input_width(true);
+    input_nullary(false);
+    input_nullary(true);
 }
 
 static void
@@ -1088,7 +1183,7 @@ run_stops(unsigned kind)
 static int
 usage(const char *program)
 {
-    fprintf(stderr, "usage: %s [--matrix | --stops KIND(0..20)]\n", program);
+    fprintf(stderr, "usage: %s [--matrix | --stops KIND(0..23)]\n", program);
     return 2;
 }
 
