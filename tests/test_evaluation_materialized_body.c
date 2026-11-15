@@ -39,6 +39,9 @@ static uint64_t successor_id;
 static wl_evaluation_control_report_t frozen_report;
 static wl_session_t *controlled_session;
 static bool producer_error_armed;
+static bool memory_mode, memory_armed, memory_denied;
+static wl_columnar_memory_reservation_t memory_peer;
+static uint64_t memory_denials_before;
 
 static void
 end_original(wl_evaluation_control_t *control)
@@ -57,6 +60,17 @@ end_original(wl_evaluation_control_t *control)
 static void
 first_producer_error(wl_evaluation_control_t *control, int result)
 {
+    if (memory_armed && !memory_denied && memory_peer.governor) {
+        CHECK(control == controlled_session->evaluation_control
+            && result == ENOSPC && !memory_denied);
+        CHECK(wl_columnar_memory_denials(memory_peer.governor)
+            > memory_denials_before);
+        memory_denied = true;
+        /* Actual admission has refused. Return peer capacity before mandatory
+         * cleanup, while preserving the selected error and pending input. */
+        wl_columnar_memory_release(&memory_peer);
+        return;
+    }
     if (interrupt_kind != 5 || canceled_body) return;
     CHECK(producer_error_armed && result == ENOMEM
         && !wl_columnar_join_batch_test_prepare_fail_allocation);
@@ -132,6 +146,17 @@ batch_prepare(const wl_columnar_join_batch_prepare_t *attempt)
          * rather than merely reaching the pre-admission checkpoint. */
         if (attempt->arrays_committed) {
             ++owned_joins;
+            if (memory_armed && !memory_peer.governor && !memory_denied) {
+                wl_columnar_memory_governor_t *governor =
+                    wl_columnar_memory_governor_ref_get(attempt->governor);
+                uint64_t available =
+                    atomic_load_explicit(&governor->usable_bytes,
+                        memory_order_relaxed) -
+                    wl_columnar_memory_reserved(governor);
+                memory_denials_before = wl_columnar_memory_denials(governor);
+                CHECK(available > 1 && wl_columnar_memory_reserve(governor,
+                    available - 1, &memory_peer));
+            }
             const wl_col_session_t *session = attempt->session;
             uint64_t identity = (uint64_t)(uintptr_t)session->controlled_step;
             CHECK(wl_columnar_session_controlled_batch_authorized(session,
@@ -229,6 +254,10 @@ int
 main(int argc, char **argv)
 {
     CHECK(argc == 2);
+    wl_columnar_memory_reservation_init(&memory_peer);
+    memory_mode = !strcmp(argv[1], "batch-memory-first")
+        || !strcmp(argv[1], "batch-memory-successor");
+    unsigned memory_stage = !strcmp(argv[1], "batch-memory-successor") ? 1 : 0;
     bool strict = !strcmp(argv[1], "strict");
     bool limited = !strcmp(argv[1], "limit");
     bool denied = !strcmp(argv[1], "limit-denied");
@@ -240,7 +269,7 @@ main(int argc, char **argv)
     cancel_body = interrupt_kind != 0;
     bool batch = strcmp(argv[1], "plain") != 0;
     CHECK(!batch || !strcmp(argv[1], "batch") || strict || limited || denied
-        || cancel_body);
+        || cancel_body || memory_mode);
     const int expected = strict ? ENOTSUP : denied ? EOVERFLOW : 0;
     environment("WIRELOG_JOIN_BATCH_BYTES", batch ? "256" : NULL);
     environment("WIRELOG_JOIN_BATCH_STRICT", strict ? "1" : NULL);
@@ -307,7 +336,36 @@ main(int argc, char **argv)
         wl_columnar_join_test_attempt_checkpoint = join_checkpoint;
         wl_columnar_join_batch_test_prepare_checkpoint = batch_prepare;
         wl_columnar_join_pipeline_test_first_error = first_producer_error;
+        memory_armed = memory_mode && stage == memory_stage;
         int rc = finish(sessions[0]);
+        if (memory_armed) {
+            CHECK(memory_denied && rc == ENOSPC && selected_body && whole_scc
+                && owned_joins && atomic_load_explicit(&memory_peer.state,
+                memory_order_relaxed) == WL_COLUMNAR_MEMORY_RESERVATION_RELEASED
+                && COL_SESSION(sessions[0])->memory_budget_denied
+                && COL_SESSION(sessions[0])->pending_input_change);
+            const events_t empty = {0};
+            CHECK(!memcmp(&events[0], &empty, sizeof(empty)));
+            if (stage) {
+                content(sessions[0], "path", path[stage - 1],
+                    path_count[stage - 1]);
+                content(sessions[0], "plain", edge[stage - 1],
+                    edge_count[stage - 1]);
+            } else {
+                const col_rel_t *failed =
+                    session_find_rel(COL_SESSION(sessions[0]), "path");
+                CHECK(!failed || !failed->nrows);
+                failed = session_find_rel(COL_SESSION(sessions[0]), "plain");
+                CHECK(!failed || !failed->nrows);
+            }
+            wl_evaluation_control_report_t report;
+            CHECK(!wl_evaluation_control_report(control, &report)
+                && report.result == ENOSPC && report.consumed
+                && !report.cleanup_status);
+            memory_armed = false;
+            CHECK(!wl_evaluation_control_reset(control));
+            rc = finish(sessions[0]);
+        }
         if (cancel_body && !stage) {
             int stopped = interrupt_kind == 1 ? WL_EVALUATION_CONTROL_CANCELLED
                 : interrupt_kind == 2 ? WL_EVALUATION_CONTROL_WORK_LIMIT
@@ -395,6 +453,10 @@ main(int argc, char **argv)
                     (int64_t[]){3, 4}, 1, 2));
         }
     }
+    CHECK(!memory_mode || memory_denied);
+    CHECK(atomic_load_explicit(&memory_peer.state, memory_order_relaxed)
+        == (memory_mode ? WL_COLUMNAR_MEMORY_RESERVATION_RELEASED
+            : WL_COLUMNAR_MEMORY_RESERVATION_EMPTY));
     for (unsigned i = 0; i != 2;
         ++i) CHECK(!wl_session_try_destroy(&sessions[i]));
     wl_evaluation_control_release(control); wl_plan_free(plan);
