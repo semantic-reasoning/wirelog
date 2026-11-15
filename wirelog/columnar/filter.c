@@ -4156,7 +4156,8 @@ wl_columnar_filter_registered_cleanup_latch_owned(
     /* Unconditional independent shape packet, including mixed JOIN cleanup.
      * Previous112 suffix8 + rc2 + call4 + controller42 + refusal2 =58.
      * Expanded context64/thread28/recognition18/shape48/tail24/next24 plus
-     * controller42 =248<=256. No context inspection precedes this debit. */
+     * controller42 =248; the CONSOLIDATE comparator adds at most4,
+     * giving252<=256. No context inspection precedes this debit. */
     rc = wl_evaluation_control_charge_attempt(funding, id, 256);
     if (rc) return rc;
     wl_columnar_filter_context_t *ctx = NULL;
@@ -4203,7 +4204,8 @@ wl_columnar_filter_registered_cleanup_latch_owned(
                 return EINVAL;
         } else if (ctx->join_initialized || ctx->join_right_initialized
             || ctx->join_decision_pending || ctx->source_bare
-            || (op->op != WL_PLAN_OP_FILTER && op->op != WL_PLAN_OP_MAP))
+            || (op->op != WL_PLAN_OP_FILTER && op->op != WL_PLAN_OP_MAP
+            && op->op != WL_PLAN_OP_CONSOLIDATE))
             return EINVAL;
     }
     /* Same-call routing only. The selected End callee still proves its real

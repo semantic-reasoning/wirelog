@@ -3958,6 +3958,8 @@ int wl_columnar_eval_delta_observer_prepare_start_with_override(
     wl_col_session_t *, const char *, col_rel_t *);
 int wl_columnar_eval_delta_observer_prepare_advance(wl_col_session_t *,
     wl_evaluation_control_t *, uint64_t, bool *ready);
+int wl_columnar_eval_delta_observer_prepare_reader_release_step(
+    wl_col_session_t *, bool *);
 int wl_columnar_eval_delta_observer_prepare_discard(wl_col_session_t *);
 int
 wl_columnar_eval_delta_observer_begin(wl_col_session_t *sess,

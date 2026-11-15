@@ -997,6 +997,18 @@ wl_session_source_operator_close_metadata(wl_session_t *session,
     return wl_session_source_run(session, &policy, action, payload);
 }
 
+/* Constructor authority comes from this actual OPERATION/CLOSE issuer. The
+ * callback publishes its own retained NORMAL owner, never a BANK control. */
+wl_evaluation_control_source_phase_result_t
+wl_session_source_private_financier_birth(wl_session_t *session,
+    wl_evaluation_control_source_action_fn action, void *payload)
+{
+    static const wl_evaluation_control_source_phase_policy_t policy = {
+        208, 144, 80
+    };
+    return wl_session_source_run_birth(session, &policy, action, payload);
+}
+
 int
 wl_session_source_finance_start(wl_session_t *session,
     wl_session_source_finance_t *record,

@@ -3033,6 +3033,34 @@ wl_columnar_eval_delta_observer_prepare_advance(wl_col_session_t *sess,
     return rc;
 }
 
+/* One real prepare reader release, before private candidate retirement.
+ * Parent maintenance256 funds this release-only NULL-control path. The caller
+ * returns before its separately paid binding transition: full owner256,
+ * descriptor-only244 including the complete signed public64 allowance. */
+int
+wl_columnar_eval_delta_observer_prepare_reader_release_step(
+    wl_col_session_t *sess, bool *done)
+{
+    if (!sess || !done) return EINVAL;
+    *done = false;
+    wl_columnar_eval_delta_observer_prepare_t *p = sess->delta_observer_prepare;
+    if (!p) {
+        *done = true; return 0;
+    }
+    if (p->identity != (uintptr_t)p || p->session != sess
+        || p->observer != sess->delta_observer) return EINVAL;
+    if (!p->reader_held) {
+        *done = true; return 0;
+    }
+    int rc = wl_columnar_relation_reader_step(p->relation, &p->reader, true,
+            NULL, 0);
+    if (rc) return rc;
+    p->reader_held = p->preflight_captured = p->relation_selected = false;
+    p->relation = NULL;
+    *done = true;
+    return 0;
+}
+
 int
 wl_columnar_eval_delta_observer_prepare_discard(wl_col_session_t *sess)
 {

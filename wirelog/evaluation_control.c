@@ -316,6 +316,25 @@ wl_evaluation_control_test_active_consumed(wl_evaluation_control_t *control,
     return rc;
 }
 
+/* Accelerate a reachable accounting history without changing the active
+ * generation, owner, stop, report, reference count or accounting disposition. */
+int
+wl_evaluation_control_test_seed_active_consumed(
+    wl_evaluation_control_t *control,
+    const void *owner, uint64_t id, uint64_t value)
+{
+    if (!control || !owner || !id) return EINVAL;
+    wl_mutex_lock(&control->mutex);
+    int rc = control->owner != owner || !control->active
+        || control->attempt_id != id || control->attempt_limit
+        || control->accounting_error ||
+        control->stop != WL_EVALUATION_CONTROL_NONE
+        || value < control->consumed ? EINVAL : 0;
+    if (!rc) control->consumed = value;
+    wl_mutex_unlock(&control->mutex);
+    return rc;
+}
+
 int
 wl_evaluation_control_test_seed_attempt_id(wl_evaluation_control_t *control,
     const void *owner, uint64_t value)

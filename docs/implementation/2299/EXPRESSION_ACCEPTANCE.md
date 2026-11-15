@@ -2538,3 +2538,60 @@ This stage supplies the real raw schedule seam. Bounded actual delta/radix/run
 and pool continuations, authenticated recursive source/frame ownership, typed
 controlled transport and ordinary/K expression activation remain separate
 integration work. The cursor alone does not close those acceptance rows.
+
+### Actual inline IDB seed Session integration after #2366
+
+Integration baseline is main `8266d893`. The canonical nonrecursive
+VARIABLE/[FILTER]/MAP/CONSOLIDATE host composes loaded inline IDB facts with
+the separately evaluated rule result. The physical seed actor owns its
+preparation, sorting/compaction, Take and End. Session owns the stable arena,
+private bindings, actual frame receipts/ACKs and publication. Numeric, string
+and float values, rejected FILTER rows, empty input, reversed declarations and
+loaded/unloaded facts have raw Session controls.
+
+The independent NORMAL financier belongs only to the selected seed producer.
+Its actual accounting overflow retains the old control and identity through
+PROBE, SETTLE, constructor-issued BIRTH, DETACH and SWAP. Pending construction
+precedes old detachment. A healthy zero probe retains the native terminal
+error rather than repeatedly replacing a healthy controller. No seed control
+is passed to shared scalar retirement, differential cleanup, observer cleanup,
+failed-retry or transaction disposal; those use current main's MAIN owner.
+
+Actor End and its reader/credit closure precede arena release. Financier close
+validates its actual FINISH report, detaches and releases its reference. It
+never frees the transaction or finalizes Original. Main alone disposes arrays,
+moves metadata credit, frees the transaction and releases the moved credit.
+Its completed-owner, prepared-close and terminal report/ACK protocols remain
+in force. Terminal entry and physical transaction free reject live seed debt.
+
+Precommit errors retain the public descriptor and events. Actual Original END
+and an unrelated successor do not finance cleanup: frozen reports and successor
+consumption are checked separately. The post-SOURCE observation callback keeps
+actual canonical custody pending through a settled MAIN READY result. This
+state-only observation creates no Native registration, grant, receipt or ACK;
+the Source state getter keeps main's behavior. Committed delivery remains a
+separate result from financial cleanup.
+
+The registered seed host suite partitions every discovered public frontier and
+partial-header boundary in32 interleaved shards per observer mode, including
+Original-END/successor histories. Header tests wait for actual initialized
+extents after current main's metadata binding; they do not infer ownership from
+public STEP counts. Accepted completed destruction checks the actual absence of
+seed financier/actor/arena debt, including a retained main-owned header when
+Original ended during publication. Unreachable old seed-only destructor birth
+injections are removed; live seed-debt refusal and current main's prepared-close
+and report refusal tests remain separate witnesses.
+
+Second-attempt arena ENOMEM regression cases exercise real seed accounting
+overflow before seed closure and separately stop the actual MAIN financier
+after moved metadata credit has been returned. The latter observes RELEASED,
+cleared moved-credit custody and the stopped report, then requires the original
+ENOMEM, unchanged output/events, frozen Original/successor0, actual cleanup,
+reset/raw retry parity, subsequent insertion and zero final resources.
+
+Generic and specialized JOIN Native dispatchers retain main's implementation;
+the qualified child ingress is the actual unary cleanup owner. The two-EDB
+empty-input expression controls also exercise the noncanonical general route.
+This bundle does not activate arbitrary JOIN/K, recursive cursor transport,
+pool or prepared-sort continuations, and does not claim whole-issue completion
+for #2299 despite its automatic closure with #2366.

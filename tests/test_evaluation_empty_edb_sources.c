@@ -214,13 +214,15 @@ is_union(unsigned kind)
     return kind == K_UNION_A || kind == K_UNION_C || kind == K_UNION_BOTH;
 }
 
-/* The sole-EDB VARIABLE,[FILTER],MAP,CONSOLIDATE missing-source route.
+/* Private-input VARIABLE,[FILTER],MAP,CONSOLIDATE routes. The two-EDB
+ * simple bodies use the general transaction and two private constructors.
  * UNION and REDUCE retain their real bare-source readers on unobserved STEP. */
 static bool
 private_empty_step(unsigned kind)
 {
     return kind == K_SINGLE || kind == K_FILTER || kind == K_TWO_COL
            || kind == K_INT_EXPR || kind == K_TWO_COL_EXPR || kind == K_NARROW
+           || kind == K_TWO_EDB_EXPR || kind == K_NARROW_TWO_EDB
            || (is_facts(kind) && kind != K_FACTS_STRING) || is_input(kind)
            || kind == K_INT32 || kind == K_UINT32 || kind == K_UINT64
            || kind == K_BOOL;
@@ -592,7 +594,8 @@ run_cell(unsigned kind, bool snapshot, bool observed)
     if (!snapshot && !observed) {
         if (private_empty_step(kind)) {
             CHECK(record_count == 0 && bare_published == 0);
-            private_trace(1);
+            private_trace(kind == K_TWO_EDB_EXPR || kind == K_NARROW_TWO_EDB
+                ? 2 : 1);
         } else {
             CHECK(private_calls == 0);
             CHECK(record_count == (bare ? 2u : 0u));
@@ -1093,7 +1096,9 @@ empty_calls_of(unsigned kind, unsigned *constructor_calls)
     unsigned n = empty_calls;
     *constructor_calls = private_calls;
     if (private_empty_step(kind)) {
-        CHECK(n == 0 && record_count == 0); private_trace(1);
+        CHECK(n == 0 && record_count == 0);
+        private_trace(kind == K_TWO_EDB_EXPR || kind == K_NARROW_TWO_EDB
+                ? 2 : 1);
     } else CHECK(private_calls == 0);
     fixture_destroy(&f);
     return n;

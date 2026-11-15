@@ -14,6 +14,7 @@
 #include "columnar/trace_store.h"
 #include "columnar/columnar_nanoarrow.h"
 #include "columnar/join_batch.h"
+#include "columnar/session_seed.h"
 #include "wirelog/util/log.h"
 
 #include "../wirelog-internal.h"
@@ -251,7 +252,67 @@ typedef enum {
     WL_SESSION_RECURSIVE_DIFFERENCE = 33,
     WL_SESSION_RECURSIVE_GATHER = 34,
     WL_SESSION_RECURSIVE_EMIT = 35,
+    WL_SESSION_SEED_MATCH_PREPARE = 64,
+    WL_SESSION_SEED_MATCH_BYTE,
+    WL_SESSION_SEED_MATCH_RESULT,
+    WL_SESSION_SEED_LOOKUP_ASSIGN,
+    WL_SESSION_SEED_SIZE = 80,
+    WL_SESSION_SEED_INPUT_NAME,
+    WL_SESSION_SEED_ARENA_INIT,
+    WL_SESSION_SEED_ARENA_RESERVE,
+    WL_SESSION_SEED_ARENA_ALLOCATE,
+    WL_SESSION_SEED_BIRTH,
+    WL_SESSION_SEED_INIT,
+    WL_SESSION_SEED_RECIPE,
+    WL_SESSION_SEED_PREPARE,
+    WL_SESSION_SEED_PRE_PROGRESS,
+    WL_SESSION_SEED_PRE_STEP,
+    WL_SESSION_SEED_PRE_MAINTENANCE,
+    WL_SESSION_SEED_HEAD_COMPLETE,
+    WL_SESSION_SEED_ATTACH,
+    WL_SESSION_SEED_POST_PROGRESS,
+    WL_SESSION_SEED_POST_STEP,
+    WL_SESSION_SEED_POST_MAINTENANCE,
+    WL_SESSION_SEED_FINALIZE,
+    WL_SESSION_SEED_COMPACT,
+    WL_SESSION_SEED_TAKE,
+    WL_SESSION_SEED_END,
+    WL_SESSION_SEED_RETIRE_RULE,
+    WL_SESSION_SEED_MOVE_FINAL,
+    WL_SESSION_SEED_REBIND,
+    WL_SESSION_SEED_ARENA_FREE,
+    WL_SESSION_SEED_ARENA_RELEASE,
+    WL_SESSION_SEED_PUBLIC_HEADER,
+    WL_SESSION_SEED_PUBLIC_YIELD,
+    WL_SESSION_SEED_CHILD_RESULT,
+    WL_SESSION_SEED_CLOSE,
 } wl_columnar_session_observed_phase_t;
+
+typedef enum {
+    WL_SESSION_SEED_CONTROL_EMPTY,
+    WL_SESSION_SEED_CONTROL_ACTIVE,
+    WL_SESSION_SEED_CONTROL_FINISHED,
+    WL_SESSION_SEED_CONTROL_DETACHED,
+    WL_SESSION_SEED_CONTROL_RELEASED
+} wl_columnar_session_seed_control_state_t;
+
+typedef enum {
+    WL_SESSION_SEED_OWNER_HEADER,
+    WL_SESSION_SEED_OWNER_ARENA,
+    WL_SESSION_SEED_OWNER_ACTOR
+} wl_columnar_session_seed_owner_t;
+
+typedef enum {
+    WL_SESSION_SEED_HEADER_NONE,
+    WL_SESSION_SEED_HEADER_RAW,
+    WL_SESSION_SEED_HEADER_CONSTRUCTOR
+} wl_columnar_session_seed_header_owner_t;
+
+typedef enum {
+    WL_SESSION_SEED_OBSERVATION_NONE,
+    WL_SESSION_SEED_OBSERVATION_ERROR,
+    WL_SESSION_SEED_OBSERVATION_COMMITTED
+} wl_columnar_session_seed_observation_t;
 
 typedef struct {
     wl_plan_relation_t plan;
@@ -312,7 +373,7 @@ typedef struct {
     bool snapshot_report_valid;
 } wl_columnar_session_frontier_t;
 
-typedef struct {
+typedef struct wl_columnar_session_observed_transaction {
     wl_columnar_arrangement_diff_attempt_t differential;
     wl_columnar_eval_private_bindings_t bindings;
     wl_columnar_eval_cleanup_receipt_key_t receipt_key, ack_key;
@@ -374,6 +435,40 @@ typedef struct {
     wl_columnar_session_frontier_t frontier_source;
     uint32_t old_row, new_row, degree_depth;
     uint8_t degrees[COL_STACK_MAX];
+    /* Construction markers describe completed work; phase ordinals do not. */
+    bool arrays_ready, originals_started, schema_started;
+    bool seed_selected, seed_route_started, seed_init_succeeded, seed_end_done;
+    bool seed_final_moved, seed_alias_rebound, seed_rule_retired;
+    bool seed_finish_ready, seed_disposal_ready, seed_direct_public_return;
+    bool seed_arena_admitted, seed_ready, seed_done, seed_retire_rebound;
+    uint32_t seed_slot, seed_other_slot, seed_model_original;
+    uint32_t seed_shadow_original, seed_match_edb, seed_match_count;
+    uint32_t seed_match_slot;
+    const char *seed_match_head_name;
+    size_t seed_match_byte, seed_arena_bytes;
+    wl_columnar_session_seed_t *seed_actor;
+    wl_columnar_session_seed_recipe_t seed_recipe;
+    wl_columnar_session_seed_progress_t seed_progress;
+    wl_columnar_memory_reservation_t seed_arena_credit;
+    col_rel_t *seed_shadow, *seed_taken, *seed_old_model;
+    col_rel_t *seed_public_candidate;
+    uintptr_t seed_old_model_address;
+    col_relation_snapshot_t seed_public_snapshot;
+    col_rel_t **published_registry;
+    uint32_t published_count;
+    wl_evaluation_control_t *seed_financier;
+    uint64_t seed_financier_id;
+    uint64_t seed_financier_identity;
+    wl_columnar_session_seed_control_state_t seed_financier_closure;
+    wl_columnar_session_seed_owner_t seed_owner;
+    wl_columnar_session_observed_phase_t seed_after_yield;
+    wl_columnar_session_observed_phase_t seed_child_next, seed_child_retry;
+    unsigned seed_cleanup_stage;
+    int (*seed_maintenance_next)(
+        struct wl_columnar_session_observed_transaction *);
+    wl_evaluation_control_t *seed_maintenance_pending;
+    uint64_t seed_maintenance_pending_id, seed_maintenance_pending_identity;
+    int seed_child_result, seed_first_error;
 } wl_columnar_session_observed_transaction_t;
 
 typedef struct wl_columnar_session_snapshot_payload
@@ -818,6 +913,9 @@ struct wl_columnar_controlled_step {
     wl_columnar_session_unary_cleanup_t unary_cleanup;
     wl_columnar_session_observed_transaction_t *transaction;
     bool general_observed, transaction_initialized, transaction_discard;
+    wl_columnar_session_observed_transaction_t *seed_pending_owner;
+    wl_columnar_session_seed_observation_t seed_observation_kind;
+    wl_columnar_session_seed_header_owner_t seed_header_cleanup_class;
     bool callback_changed;
     /* Borrowed only while the enclosing synchronous SNAPSHOT owns admission.
      * Its outer host closes the single evaluation+preparation control attempt. */
@@ -1762,6 +1860,7 @@ void (*wl_columnar_session_test_recursive_step_checkpoint)(
     wl_evaluation_control_t *, unsigned, uint32_t);
 size_t wl_columnar_session_test_observer_precharged_events;
 bool wl_columnar_session_test_fail_frontier_map_allocation;
+bool wl_columnar_session_test_fail_seed_arena_allocation;
 void (*wl_columnar_session_test_before_successor_registration)(col_rel_t *);
 void (*wl_columnar_session_test_staging_prepared)(wl_evaluation_control_t *);
 uint32_t wl_columnar_session_test_iteration_limit;
@@ -1774,6 +1873,61 @@ void (*wl_columnar_session_test_observed_transaction_checkpoint)(
     const wl_columnar_eval_private_bindings_t *);
 void (*wl_columnar_session_test_successor_registry_charge)(
     wl_evaluation_control_t *, unsigned, uint32_t);
+void (*wl_columnar_session_test_seed_parent_checkpoint)(
+    wl_evaluation_control_t *, uint64_t, unsigned, bool);
+int
+wl_columnar_session_test_seed_raw_header_view(const wl_col_session_t *sess,
+    uint64_t out[8])
+{
+    if (!sess || !out) return EINVAL;
+    const wl_columnar_controlled_step_t *step = sess->controlled_step;
+    if (!step) return ENOENT;
+    out[0] = step->transaction_initialized_bytes;
+    out[1] = sizeof(*step->transaction);
+    out[2] = step->transaction_initialized;
+    out[3] = (uintptr_t)step->transaction;
+    out[4] = (uintptr_t)step->seed_pending_owner;
+    out[5] = step->finish_source_pending;
+    out[6] = (uint64_t)(int64_t)step->primary_result;
+    out[7] = step->operation_id;
+    return 0;
+}
+/* Factual owner images only; this observer grants no execution authority. */
+int
+wl_columnar_session_test_seed_host_view(const wl_col_session_t *sess,
+    uint64_t out[32], wl_evaluation_control_t **maintenance)
+{
+    if (!sess || !out) return EINVAL;
+    const wl_columnar_controlled_step_t *step = sess->controlled_step;
+    if (!step || !step->transaction_initialized || !step->transaction)
+        return ENOENT;
+    const wl_columnar_session_observed_transaction_t *tx = step->transaction;
+    memset(out, 0, 32 * sizeof(*out));
+    out[0] = tx->phase; out[1] = tx->seed_selected;
+    out[2] = tx->seed_owner; out[3] = tx->seed_init_succeeded;
+    out[4] = tx->seed_end_done; out[5] = (uintptr_t)tx->seed_taken;
+    out[6] = tx->schema_started && tx->heads ?
+        (uintptr_t)tx->heads[0].candidate : 0;
+    out[7] = tx->schema_started && tx->entries && tx->seed_selected ?
+        (uintptr_t)tx->entries[tx->seed_slot].relation : 0;
+    out[8] = tx->seed_slot; out[9] = tx->count;
+    out[10] = tx->seed_financier_closure;
+    out[11] = tx->seed_arena_admitted; out[12] = tx->seed_cleanup_stage;
+    out[13] = step->published; out[14] = tx->committed;
+    out[15] = (uintptr_t)step->seed_pending_owner;
+    out[16] = tx->originals_started; out[17] = tx->schema_started;
+    out[18] = tx->arrays_ready; out[19] = tx->seed_rule_retired;
+    out[20] = tx->seed_final_moved; out[21] = tx->seed_retire_rebound;
+    out[22] = tx->seed_financier_id; out[23] = tx->child_active;
+    out[24] = tx->receipt_pending; out[25] = tx->receipt_ack;
+    out[26] = tx->generation; out[27] = tx->closed_generation;
+    out[28] = (uintptr_t)tx->seed_actor;
+    out[29] = tx->seed_disposal_ready;
+    out[30] = (uint64_t)(int64_t)step->primary_result;
+    out[31] = step->operation_id;
+    if (maintenance) *maintenance = tx->seed_financier;
+    return 0;
+}
 #endif
 
 int
@@ -9676,6 +9830,39 @@ wl_columnar_session_preflight_missing_header(void *payload)
     return 0;
 }
 
+/* A routing hint only. Paid name comparison and actual source lookup remain
+ * necessary before any canonical slot or owner can be selected. */
+static bool
+wl_columnar_session_seed_shape_metadata(const wl_plan_t *plan)
+{
+    if (!plan || plan->edb_count != 2 || plan->stratum_count != 1
+        || !plan->strata || plan->strata[0].is_recursive
+        || plan->strata[0].relation_count != 1
+        || !plan->strata[0].relations) return false;
+    const wl_plan_relation_t *r = &plan->strata[0].relations[0];
+    if (!r->ops || (r->op_count != 3 && r->op_count != 4)) return false;
+    return r->ops[0].op == WL_PLAN_OP_VARIABLE
+           && (r->op_count != 4 || r->ops[1].op == WL_PLAN_OP_FILTER)
+           && r->ops[r->op_count - 2].op == WL_PLAN_OP_MAP
+           && r->ops[r->op_count - 1].op == WL_PLAN_OP_CONSOLIDATE;
+}
+
+typedef struct {
+    wl_col_session_t *session;
+    const wl_plan_t *plan;
+    bool candidate;
+} wl_columnar_session_seed_route_read_t;
+
+static int
+wl_columnar_session_preflight_seed_metadata(void *payload)
+{
+    wl_columnar_session_seed_route_read_t *p = payload;
+    if (p->session->delta_cb || p->session->base.source_c1_admission
+        || p->session->join_batch_bytes) return 0;
+    p->candidate = wl_columnar_session_seed_shape_metadata(p->plan);
+    return 0;
+}
+
 static int
 wl_columnar_session_preflight_general_first(void *payload)
 {
@@ -9764,6 +9951,14 @@ wl_columnar_session_general_shape_read(wl_col_session_t *sess,
     /* Existing SOURCE/C1 admission keeps its exact read tariff. The new
      * ordinary no-observer match is DIRECT; skip both new actions in SOURCE. */
     if (mode == WL_COLUMNAR_SESSION_PREFLIGHT_DIRECT){
+        wl_columnar_session_seed_route_read_t seed;
+        seed.session = sess; seed.plan = sess->plan; seed.candidate = false;
+        rc = wl_columnar_session_preflight_read(mode, sess,
+                wl_columnar_session_preflight_seed_metadata, &seed);
+        if (rc) return rc;
+        if (seed.candidate) {
+            *shape = true; return 0;
+        }
         wl_columnar_session_missing_source_read_t missing;
         missing.session = sess; missing.plan = sess->plan;
         missing.source = NULL;
@@ -17091,6 +17286,10 @@ wl_columnar_session_observed_child(wl_col_session_t *sess,
         tx->child_active = false;
         if (!step->primary_result) step->primary_result = rc;
         step->transaction_discard = true;
+        if (tx->seed_route_started) {
+            step->seed_observation_kind = WL_SESSION_SEED_OBSERVATION_ERROR;
+            step->seed_pending_owner = tx;
+        }
         return EAGAIN;
     }
     if (rc == EAGAIN || step->reply.kind ==
@@ -17305,6 +17504,761 @@ wl_columnar_session_frontier_new(wl_col_session_t *sess,
     return EAGAIN;
 }
 
+/* A private NORMAL maintenance owner is born only inside the real Session
+ * constructor issuer. Its four publication stores survive issuer settlement. */
+static int
+wl_columnar_session_seed_host_birth(void *payload)
+{
+    wl_columnar_session_observed_transaction_t *tx = payload;
+    wl_evaluation_control_lexical_finance_birth_result_t born =
+        wl_evaluation_control_private_financier_birth_try(0, tx);
+    if (born.protocol) return born.protocol;
+    tx->seed_financier = born.control; tx->seed_financier_id = born.id;
+    tx->seed_financier_identity = born.identity;
+    tx->seed_financier_closure = WL_SESSION_SEED_CONTROL_ACTIVE;
+    return 0;
+}
+
+static int
+wl_columnar_session_seed_host_birth_step(wl_col_session_t *sess,
+    wl_columnar_controlled_step_t *step, bool cleanup)
+{
+    wl_columnar_session_observed_transaction_t *tx = step->transaction;
+    if (tx->seed_financier) return 0;
+    wl_evaluation_control_source_phase_result_t phase =
+        wl_session_source_private_financier_birth(&sess->base,
+            wl_columnar_session_seed_host_birth, tx);
+    int rc = phase.financial_result ? phase.financial_result :
+        !phase.action_called ? EINVAL : phase.action_result;
+    if (!cleanup && wl_evaluation_control_active_attempt_id(
+            sess->base.evaluation_control) != step->operation_id) return EINVAL;
+    return rc;
+}
+
+/* No callback, purchase or opaque query intervenes between the real terminal
+ * status and this descriptive root publication. It protects admission only. */
+static void
+wl_columnar_session_seed_host_error(wl_columnar_controlled_step_t *step,
+    int result)
+{
+    wl_columnar_session_observed_transaction_t *tx = step->transaction;
+    if (!step->primary_result) step->primary_result = result;
+    step->transaction_discard = true;
+    if (tx->seed_selected) {
+        step->seed_observation_kind = WL_SESSION_SEED_OBSERVATION_ERROR;
+        step->seed_pending_owner = tx;
+    }
+}
+
+/* These static continuations describe real owned financial cleanup. They
+ * grant no actor, receipt, Native or SOURCE getter permission. */
+static int wl_columnar_session_seed_maintenance_probe(
+    wl_columnar_session_observed_transaction_t *);
+static int wl_columnar_session_seed_maintenance_settle(
+    wl_columnar_session_observed_transaction_t *);
+static int wl_columnar_session_seed_maintenance_birth(
+    wl_columnar_session_observed_transaction_t *);
+static int wl_columnar_session_seed_maintenance_detach(
+    wl_columnar_session_observed_transaction_t *);
+static int wl_columnar_session_seed_maintenance_swap(
+    wl_columnar_session_observed_transaction_t *);
+static int
+wl_columnar_session_seed_maintenance_native_terminal(
+    wl_columnar_session_observed_transaction_t *tx)
+{
+    (void)tx;
+    return EOVERFLOW;
+}
+
+static int
+wl_columnar_session_seed_maintenance_probe(
+    wl_columnar_session_observed_transaction_t *tx)
+{
+    int rc = wl_evaluation_control_charge_attempt(tx->seed_financier,
+            tx->seed_financier_id, 0);
+    if (rc == EOVERFLOW) {
+        tx->seed_maintenance_next = wl_columnar_session_seed_maintenance_settle;
+        return 0;
+    }
+    if (!rc) {
+        tx->seed_maintenance_next =
+            wl_columnar_session_seed_maintenance_native_terminal;
+        return EOVERFLOW;
+    }
+    return rc;
+}
+
+/* Same saved-owner FINISH fields as the existing closure arm:113 including
+* its actual result/report checks. The one-tx callback replaces switch3. */
+static int
+wl_columnar_session_seed_maintenance_settle(
+    wl_columnar_session_observed_transaction_t *tx)
+{
+    wl_evaluation_control_attempt_finish_result_t finished =
+        wl_evaluation_control_finish_attempt(tx->seed_financier, tx,
+            tx->seed_financier_id, 0, 0);
+    int rc = finished.protocol;
+    if (!rc && (!finished.report_valid ||
+        (finished.kind != WL_EVALUATION_CONTROL_ATTEMPT_FINISH_OWN_FINISHED
+        && finished.kind != WL_EVALUATION_CONTROL_ATTEMPT_FINISH_ALREADY_ENDED)
+        || finished.report.attempt_id != tx->seed_financier_id)) rc = EINVAL;
+    if (!rc) tx->seed_maintenance_next =
+            wl_columnar_session_seed_maintenance_birth;
+    return rc;
+}
+
+/* Static BIRTH continuation identity is routed to the constructor issuer;
+ * it is never executed as a generic paid action. */
+static int
+wl_columnar_session_seed_maintenance_birth(
+    wl_columnar_session_observed_transaction_t *tx)
+{
+    (void)tx;
+    return EINVAL;
+}
+
+static int
+wl_columnar_session_seed_maintenance_birth_callback(void *payload)
+{
+    wl_columnar_session_observed_transaction_t *tx = payload;
+    wl_evaluation_control_lexical_finance_birth_result_t born =
+        wl_evaluation_control_private_financier_birth_try(0, tx);
+    if (born.protocol) return born.protocol;
+    tx->seed_maintenance_pending = born.control;
+    tx->seed_maintenance_pending_id = born.id;
+    tx->seed_maintenance_pending_identity = born.identity;
+    tx->seed_maintenance_next = wl_columnar_session_seed_maintenance_detach;
+    return 0;
+}
+
+static int
+wl_columnar_session_seed_maintenance_detach(
+    wl_columnar_session_observed_transaction_t *tx)
+{
+    int rc = wl_evaluation_control_detach(tx->seed_financier, tx);
+    if (!rc) {
+        tx->seed_financier_closure = WL_SESSION_SEED_CONTROL_DETACHED;
+        tx->seed_maintenance_next = wl_columnar_session_seed_maintenance_swap;
+    }
+    return rc;
+}
+
+static int
+wl_columnar_session_seed_maintenance_swap(
+    wl_columnar_session_observed_transaction_t *tx)
+{
+    wl_evaluation_control_t *old = tx->seed_financier;
+    tx->seed_financier = tx->seed_maintenance_pending;
+    tx->seed_financier_id = tx->seed_maintenance_pending_id;
+    tx->seed_financier_identity = tx->seed_maintenance_pending_identity;
+    tx->seed_financier_closure = WL_SESSION_SEED_CONTROL_ACTIVE;
+    tx->seed_maintenance_pending = NULL;
+    tx->seed_maintenance_pending_id = tx->seed_maintenance_pending_identity = 0;
+    tx->seed_maintenance_next = NULL;
+    wl_evaluation_control_release(old);
+    return 0;
+}
+
+/* BIRTH uses its real constructor issuer, never the generic224 action. The
+ * two static selectors add5 before issuer: ended247/active238/committed237.
+ * Paid PROBE47/SETTLE113/DETACH48/SWAP80 and next208 chain240 remain fixed.
+ * Actual action-result ternary adds2 to the post208/public252 =>254. */
+static int
+wl_columnar_session_seed_maintenance_recover(wl_col_session_t *sess,
+    wl_columnar_controlled_step_t *step)
+{
+    wl_columnar_session_observed_transaction_t *tx = step->transaction;
+    int (*action)(wl_columnar_session_observed_transaction_t *) =
+        tx->seed_maintenance_next;
+    if (action == wl_columnar_session_seed_maintenance_native_terminal)
+        return EOVERFLOW;
+    if (action == wl_columnar_session_seed_maintenance_birth) {
+        (void)wl_session_source_private_financier_birth(&sess->base,
+            wl_columnar_session_seed_maintenance_birth_callback, tx);
+        return EAGAIN;
+    }
+    static const wl_evaluation_control_source_phase_policy_t policy = {
+        248, 88, 104
+    };
+    wl_session_source_finance_t source;
+    source.control = NULL; source.id = 0; source.limit = 0; source.charged = 0;
+    source.attached = false; source.active = false;
+    if (wl_session_source_finance_start(&sess->base, &source, &policy, 240))
+        return EAGAIN;
+    if (wl_session_source_finance_charge(&source, 224)) abort();
+    int action_result = action(tx);
+    if (wl_evaluation_control_finish(source.control, &source, 0, 0)) abort();
+    source.active = false; source.id = 0;
+    if (wl_session_source_finance_rebegin(&source)) abort();
+    if (wl_session_source_finance_charge(&source, 208)) abort();
+    if (wl_evaluation_control_finish(source.control, &source, 0, 0)) abort();
+    source.active = false; source.id = 0;
+    if (wl_evaluation_control_detach(source.control, &source)) abort();
+    wl_evaluation_control_release(source.control);
+    return action_result ? action_result : EAGAIN;
+}
+
+#ifdef WL_SESSION_TEST_HOOKS
+/* Deliberate invariant-fault diagnostics only. The fixture first restores
+ * the real aggregate; no production path clears this terminal disposition.
+ * Only descriptive continuation changes: actual tokens/claims/receipts and
+ * first result remain for their ordinary owner methods to prove and drain. */
+int
+wl_columnar_session_test_seed_native_terminal_resolve(wl_col_session_t *sess,
+    uint64_t restored_total)
+{
+    if (!sess || !sess->memory_governor) return EINVAL;
+    wl_columnar_controlled_step_t *step = sess->controlled_step;
+    if (!step || !step->transaction_initialized || !step->transaction)
+        return EINVAL;
+    wl_columnar_session_observed_transaction_t *tx = step->transaction;
+    if (!tx->seed_route_started || step->seed_pending_owner != tx
+        || tx->seed_maintenance_next !=
+        wl_columnar_session_seed_maintenance_native_terminal
+        || (step->seed_observation_kind != WL_SESSION_SEED_OBSERVATION_ERROR
+        && step->seed_observation_kind != WL_SESSION_SEED_OBSERVATION_COMMITTED)
+        || !tx->seed_financier || tx->seed_financier_identity !=
+        wl_evaluation_control_identity(tx->seed_financier)
+        || wl_evaluation_control_active_attempt_id(tx->seed_financier) !=
+        tx->seed_financier_id
+        || wl_columnar_memory_reserved(wl_columnar_memory_governor_ref_get(
+            sess->memory_governor)) != restored_total
+        || wl_evaluation_control_charge_attempt(tx->seed_financier,
+        tx->seed_financier_id, 0)) return EINVAL;
+    tx->seed_maintenance_next = NULL;
+    return 0;
+}
+
+int
+wl_columnar_session_test_seed_maintenance_view(const wl_col_session_t *sess,
+    uint64_t out[8])
+{
+    if (!sess || !out) return EINVAL;
+    const wl_columnar_controlled_step_t *step = sess->controlled_step;
+    if (!step || !step->transaction_initialized || !step->transaction)
+        return ENOENT;
+    const wl_columnar_session_observed_transaction_t *tx = step->transaction;
+    if (!tx->seed_route_started) return ENOENT;
+    int (*action)(wl_columnar_session_observed_transaction_t *) =
+        tx->seed_maintenance_next;
+    out[0] = action == wl_columnar_session_seed_maintenance_probe ? 1
+        : action == wl_columnar_session_seed_maintenance_settle ? 2
+        : action == wl_columnar_session_seed_maintenance_birth ? 3
+        : action == wl_columnar_session_seed_maintenance_detach ? 4
+        : action == wl_columnar_session_seed_maintenance_swap ? 5
+        : action ==
+        wl_columnar_session_seed_maintenance_native_terminal ? 6 : 0;
+    out[1] = (uintptr_t)tx->seed_financier;
+    out[2] = tx->seed_financier_id; out[3] = tx->seed_financier_identity;
+    out[4] = tx->seed_financier_closure;
+    out[5] = (uintptr_t)tx->seed_maintenance_pending;
+    out[6] = tx->seed_maintenance_pending_id;
+    out[7] = tx->seed_maintenance_pending_identity;
+    return 0;
+}
+#endif
+
+/* The actual temporary financier has one224 generation, real completion,
+ * actual reBEGIN, and one208 return generation. It never lends its record or
+ * controller to BODY/user code. FINISH is completion, not a checkpoint. */
+static int
+wl_columnar_session_seed_host_close(wl_col_session_t *sess,
+    wl_columnar_controlled_step_t *step)
+{
+    static const wl_evaluation_control_source_phase_policy_t policy = {
+        248, 88, 104
+    };
+    wl_columnar_session_observed_transaction_t *tx = step->transaction;
+    wl_session_source_finance_t source;
+    source.control = NULL; source.id = 0; source.limit = 0; source.charged = 0;
+    source.attached = false; source.active = false;
+    bool released = false;
+    int rc = wl_session_source_finance_start(&sess->base, &source, &policy,
+            240);
+    if (rc) return EAGAIN;
+    rc = wl_session_source_finance_charge(&source, 224);
+    if (rc) abort(); /* Fresh private224 fits its actual240 generation. */
+    switch (tx->seed_financier_closure) {
+    case WL_SESSION_SEED_CONTROL_ACTIVE: {
+        wl_evaluation_control_attempt_finish_result_t finished =
+            wl_evaluation_control_finish_attempt(tx->seed_financier, tx,
+                tx->seed_financier_id, 0, 0);
+        rc = finished.protocol;
+        if (!rc && (!finished.report_valid ||
+            (finished.kind != WL_EVALUATION_CONTROL_ATTEMPT_FINISH_OWN_FINISHED
+            && finished.kind !=
+            WL_EVALUATION_CONTROL_ATTEMPT_FINISH_ALREADY_ENDED)
+            || finished.report.attempt_id !=
+            tx->seed_financier_id)) rc = EINVAL;
+        if (!rc) tx->seed_financier_closure = WL_SESSION_SEED_CONTROL_FINISHED;
+        break;
+    }
+    case WL_SESSION_SEED_CONTROL_FINISHED:
+        rc = wl_evaluation_control_detach(tx->seed_financier, tx);
+        if (!rc) tx->seed_financier_closure = WL_SESSION_SEED_CONTROL_DETACHED;
+        break;
+    case WL_SESSION_SEED_CONTROL_DETACHED: {
+        wl_evaluation_control_t *owned = tx->seed_financier;
+        tx->seed_financier = NULL;
+        tx->seed_financier_id = tx->seed_financier_identity = 0;
+        tx->seed_financier_closure = WL_SESSION_SEED_CONTROL_RELEASED;
+        wl_evaluation_control_release(owned);
+        released = true;
+        rc = 0;
+        break;
+    }
+    default: rc = EINVAL; break;
+    }
+    int action_result = rc;
+    if (wl_evaluation_control_finish(source.control, &source, 0, 0)) abort();
+    source.active = false; source.id = 0;
+    if (wl_session_source_finance_rebegin(&source)) abort();
+    if (wl_session_source_finance_charge(&source, 208)) abort();
+    if (wl_evaluation_control_finish(source.control, &source, 0, 0)) abort();
+    source.active = false; source.id = 0;
+    if (wl_evaluation_control_detach(source.control, &source)) abort();
+    wl_evaluation_control_release(source.control);
+    return action_result ? action_result : !released ? EAGAIN : 0;
+}
+
+/* These packets precede allocation. A routing hint never establishes a
+ * matching name, a descriptor, a lease or a canonical head owner. */
+static int
+wl_columnar_session_seed_count_action(wl_col_session_t *sess,
+    wl_columnar_controlled_step_t *step)
+{
+    wl_columnar_session_observed_transaction_t *tx = step->transaction;
+    const wl_plan_t *plan = sess->plan;
+    int rc = wl_evaluation_control_charge_attempt(sess->base.evaluation_control,
+            step->operation_id, 256);
+    if (rc) return rc;
+    switch (tx->phase) {
+    case WL_SESSION_SEED_MATCH_PREPARE:
+        if (!plan->edb_relations || !plan->edb_relations[0]
+            || !plan->edb_relations[1] || !plan->strata[0].relations[0].name)
+            return EINVAL;
+        tx->seed_match_head_name = plan->strata[0].relations[0].name;
+        tx->seed_match_edb = tx->seed_match_count = 0;
+        tx->seed_match_byte = 0; tx->seed_match_slot = UINT32_MAX;
+        tx->phase = WL_SESSION_SEED_MATCH_BYTE; return 0;
+    case WL_SESSION_SEED_MATCH_BYTE: {
+        char a = tx->seed_match_head_name[tx->seed_match_byte];
+        char b = plan->edb_relations[tx->seed_match_edb][tx->seed_match_byte];
+        if (a == b && a) {
+            if (tx->seed_match_byte == SIZE_MAX) return EOVERFLOW;
+            tx->seed_match_byte++; return 0;
+        }
+        if (a == b) {
+            tx->seed_match_count++;
+            tx->seed_match_slot = tx->seed_match_edb;
+        }
+        tx->seed_match_byte = 0;
+        if (++tx->seed_match_edb == 2)
+            tx->phase = WL_SESSION_SEED_MATCH_RESULT;
+        return 0;
+    }
+    case WL_SESSION_SEED_MATCH_RESULT:
+        if (tx->seed_match_count > 1) return EINVAL;
+        tx->seed_selected = tx->seed_match_count == 1;
+        tx->seed_route_started = tx->seed_selected;
+        if (tx->seed_selected) {
+            tx->seed_slot = tx->seed_match_slot;
+            tx->seed_other_slot = 1 - tx->seed_slot;
+            tx->seed_model_original = tx->seed_shadow_original = UINT32_MAX;
+            tx->count = 2;
+        } else tx->count = 3;
+        tx->old_count = sess->nrels;
+        if (tx->old_count > UINT32_MAX - tx->count) return EOVERFLOW;
+        tx->image_cap = tx->count + tx->old_count;
+        tx->image_count = tx->count; tx->old_registry = sess->rels;
+        tx->si = tx->ri = 0; tx->phase = WL_SESSION_OBSERVED_ALLOCATE;
+        return 0;
+    case WL_SESSION_SEED_LOOKUP_ASSIGN: {
+        wl_columnar_session_observed_original_t *original =
+            &tx->originals[tx->index];
+        col_rel_t *r = original->relation;
+        if (!tx->op) {
+            wl_columnar_eval_private_dynamic_binding_t *entry =
+                &tx->entries[tx->other];
+            if (entry->relation || entry->public_relation) return EINVAL;
+            entry->relation = entry->public_relation = r;
+            if (tx->other == tx->seed_slot) {
+                original->retire = true;
+                tx->seed_old_model = r;
+                tx->seed_model_original = tx->index;
+            }
+        } else if (tx->op == 3) {
+            if (tx->seed_shadow) return EINVAL;
+            original->preserve = true;
+            tx->seed_shadow = r; tx->seed_shadow_original = tx->index;
+        } else original->retire = true;
+        original->snapshot = wl_columnar_relation_snapshot(r);
+        if (!tx->op && tx->other == tx->seed_slot)
+            tx->entries[tx->seed_slot].snapshot = original->snapshot;
+        tx->index++; tx->other = tx->op = 0; tx->byte = 0;
+        tx->phase = WL_SESSION_OBSERVED_LOOKUP; return 0;
+    }
+    default: return EINVAL;
+    }
+}
+
+static void
+wl_columnar_session_seed_host_call_next(
+    wl_columnar_session_observed_transaction_t *tx,
+    wl_columnar_session_observed_phase_t call,
+    wl_columnar_session_observed_phase_t next)
+{
+    tx->seed_child_retry = call; tx->seed_child_next = next; tx->phase = call;
+}
+
+/* Three already captured arguments reach the next genuine purchase before
+ * any generic loop/phase redispatch. The bit is routing, never authority. */
+static int
+wl_columnar_session_seed_child_result_paid(wl_evaluation_control_t *control,
+    uint64_t id, wl_columnar_controlled_step_t *step)
+{
+#ifdef WL_SESSION_TEST_HOOKS
+    if (wl_columnar_session_test_seed_parent_checkpoint)
+        wl_columnar_session_test_seed_parent_checkpoint(control, id,
+            step->transaction->seed_child_retry, false);
+#endif
+    int rc = wl_evaluation_control_charge_attempt(control, id, 256);
+    if (rc) {
+        wl_columnar_session_observed_transaction_t *tx = step->transaction;
+        step->primary_result = rc;
+        step->transaction_discard = true;
+        step->seed_observation_kind = WL_SESSION_SEED_OBSERVATION_ERROR;
+        step->seed_pending_owner = tx;
+        return EAGAIN;
+    }
+    wl_columnar_session_observed_transaction_t *tx = step->transaction;
+    tx->seed_direct_public_return = false;
+    if (tx->seed_child_result) {
+        /* Only the actual retryable method contracts reach this packet. */
+        tx->phase = tx->seed_child_retry; return 0;
+    }
+    if (tx->seed_child_retry == WL_SESSION_SEED_FINALIZE) {
+        if (tx->seed_ready)
+            wl_columnar_session_seed_host_call_next(tx,
+                WL_SESSION_SEED_COMPACT, WL_SESSION_SEED_POST_PROGRESS);
+        else tx->phase = WL_SESSION_SEED_FINALIZE;
+    } else if (tx->seed_child_retry == WL_SESSION_SEED_COMPACT) {
+        if (tx->seed_ready)
+            wl_columnar_session_seed_host_call_next(tx,
+                WL_SESSION_SEED_TAKE, WL_SESSION_SEED_END);
+        else tx->phase = WL_SESSION_SEED_POST_PROGRESS;
+    } else if (tx->seed_child_retry == WL_SESSION_SEED_TAKE) {
+        tx->seed_done = false;
+        wl_columnar_session_seed_host_call_next(tx, WL_SESSION_SEED_END,
+            WL_SESSION_SEED_RETIRE_RULE);
+    } else if (tx->seed_child_retry == WL_SESSION_SEED_END) {
+        if (tx->seed_done) {
+            tx->seed_end_done = true;
+            tx->phase = WL_SESSION_SEED_RETIRE_RULE;
+        } else tx->phase = WL_SESSION_SEED_END;
+    } else tx->phase = tx->seed_child_next;
+    return 0;
+}
+
+static int
+wl_columnar_session_seed_public_yield_paid(wl_evaluation_control_t *control,
+    uint64_t id, wl_columnar_controlled_step_t *step)
+{
+#ifdef WL_SESSION_TEST_HOOKS
+    if (wl_columnar_session_test_seed_parent_checkpoint)
+        wl_columnar_session_test_seed_parent_checkpoint(control, id,
+            step->transaction->seed_child_retry, true);
+#endif
+    int rc = wl_evaluation_control_charge_attempt(control, id, 256);
+    if (rc) {
+        wl_columnar_session_observed_transaction_t *tx = step->transaction;
+        step->primary_result = rc;
+        step->transaction_discard = true;
+        step->seed_observation_kind = WL_SESSION_SEED_OBSERVATION_ERROR;
+        step->seed_pending_owner = tx;
+    }
+    return EAGAIN;
+}
+
+/* Called only for an explicit seed phase. Tight children return their status
+ * directly; probes and cursor decisions occur in the next paid packet. */
+static int
+wl_columnar_session_seed_host_action(wl_col_session_t *sess,
+    wl_columnar_controlled_step_t *step)
+{
+    wl_columnar_session_observed_transaction_t *tx = step->transaction;
+    wl_evaluation_control_t *control = sess->base.evaluation_control;
+    uint64_t id = step->operation_id;
+    int rc;
+#define WL_COLUMNAR_SESSION_SEED_CHILD(call_) do { \
+            tx->phase = WL_SESSION_SEED_CHILD_RESULT; \
+            tx->seed_direct_public_return = true; \
+            tx->seed_child_result = (call_); \
+            if (!tx->seed_child_result) \
+            return wl_columnar_session_seed_child_result_paid(control, id, \
+                       step); \
+            if (tx->seed_child_result == EAGAIN) \
+            return wl_columnar_session_seed_public_yield_paid(control, id, \
+                       step); \
+            step->primary_result = tx->seed_child_result; \
+            step->transaction_discard = true; \
+            step->seed_observation_kind = WL_SESSION_SEED_OBSERVATION_ERROR; \
+            step->seed_pending_owner = tx; \
+            return EAGAIN; \
+} while (0)
+#define WL_COLUMNAR_SESSION_SEED_MAINTENANCE_CHILD(call_) do { \
+            tx->phase = WL_SESSION_SEED_CHILD_RESULT; \
+            tx->seed_direct_public_return = true; \
+            tx->seed_child_result = (call_); \
+            if (!tx->seed_child_result) \
+            return wl_columnar_session_seed_child_result_paid(control, id, \
+                       step); \
+            if (tx->seed_child_result == EAGAIN) \
+            return wl_columnar_session_seed_public_yield_paid(control, id, \
+                       step); \
+            if (tx->seed_child_result == EOVERFLOW) \
+            tx->seed_maintenance_next = \
+                wl_columnar_session_seed_maintenance_probe; \
+            step->primary_result = tx->seed_child_result; \
+            step->transaction_discard = true; \
+            step->seed_observation_kind = WL_SESSION_SEED_OBSERVATION_ERROR; \
+            step->seed_pending_owner = tx; \
+            return EAGAIN; \
+} while (0)
+    switch (tx->phase) {
+    case WL_SESSION_SEED_BIRTH:
+        rc = wl_columnar_session_seed_host_birth_step(sess, step, false);
+        if (!rc) tx->phase = WL_SESSION_SEED_INIT;
+        return rc;
+    case WL_SESSION_SEED_ARENA_RESERVE:
+        tx->phase = WL_SESSION_SEED_CHILD_RESULT;
+        rc = wl_columnar_session_observed_reserve(sess,
+                tx->seed_arena_bytes,
+                &tx->seed_arena_credit, id);
+        if (!rc) tx->seed_arena_admitted = sess->memory_governor != NULL;
+        return (tx->seed_child_result = rc);
+    case WL_SESSION_SEED_INIT:
+        tx->phase = WL_SESSION_SEED_CHILD_RESULT;
+        tx->seed_direct_public_return = true;
+        rc = wl_columnar_session_seed_init(tx->seed_actor, control, id,
+                sess->memory_governor);
+        tx->seed_child_result = rc;
+        if (!rc) {
+            tx->seed_init_succeeded = true;
+            tx->seed_owner = WL_SESSION_SEED_OWNER_ACTOR;
+            return wl_columnar_session_seed_child_result_paid(control, id,
+                       step);
+        }
+        step->primary_result = rc;
+        step->transaction_discard = true;
+        step->seed_observation_kind = WL_SESSION_SEED_OBSERVATION_ERROR;
+        step->seed_pending_owner = tx;
+        return EAGAIN;
+    case WL_SESSION_SEED_CHILD_RESULT:
+        tx->seed_direct_public_return = true;
+        return wl_columnar_session_seed_child_result_paid(control, id,
+                   step);
+    case WL_SESSION_SEED_PREPARE:
+        WL_COLUMNAR_SESSION_SEED_CHILD(wl_columnar_session_seed_prepare(
+                tx->seed_actor,
+                tx->seed_old_model, tx->seed_shadow, &tx->seed_recipe));
+    case WL_SESSION_SEED_PRE_STEP:
+    case WL_SESSION_SEED_POST_STEP:
+        WL_COLUMNAR_SESSION_SEED_CHILD(wl_columnar_session_seed_step(
+                tx->seed_actor));
+    case WL_SESSION_SEED_PRE_MAINTENANCE:
+    case WL_SESSION_SEED_POST_MAINTENANCE:
+        WL_COLUMNAR_SESSION_SEED_MAINTENANCE_CHILD(
+            wl_columnar_session_seed_maintenance_step(
+                tx->seed_actor,
+                tx->seed_financier, tx->seed_financier_id));
+    case WL_SESSION_SEED_ATTACH:
+        WL_COLUMNAR_SESSION_SEED_CHILD(wl_columnar_session_seed_attach_rule(
+                tx->seed_actor,
+                tx->heads[0].candidate));
+    case WL_SESSION_SEED_FINALIZE:
+        WL_COLUMNAR_SESSION_SEED_MAINTENANCE_CHILD(
+            wl_columnar_session_seed_finalize(
+                tx->seed_actor,
+                tx->seed_financier, tx->seed_financier_id, &tx->seed_ready));
+    case WL_SESSION_SEED_COMPACT:
+        WL_COLUMNAR_SESSION_SEED_CHILD(
+            wl_columnar_session_seed_compact_final_step(
+                tx->seed_actor,
+                &tx->seed_ready));
+    case WL_SESSION_SEED_TAKE:
+        WL_COLUMNAR_SESSION_SEED_CHILD(wl_columnar_session_seed_take(
+                tx->seed_actor,
+                &tx->seed_taken));
+    case WL_SESSION_SEED_END:
+        WL_COLUMNAR_SESSION_SEED_MAINTENANCE_CHILD(wl_columnar_session_seed_end(
+                tx->seed_actor,
+                0,
+                tx->seed_financier, tx->seed_financier_id, &tx->seed_done));
+    default: break;
+    }
+#undef WL_COLUMNAR_SESSION_SEED_MAINTENANCE_CHILD
+#undef WL_COLUMNAR_SESSION_SEED_CHILD
+    rc = wl_evaluation_control_charge_attempt(control, id, 256);
+    if (rc) return rc;
+    switch (tx->phase) {
+    case WL_SESSION_SEED_INPUT_NAME: {
+        const char *input = tx->heads[0].plan.ops[0].relation_name;
+        const char *wanted = tx->entries[tx->seed_other_slot].name;
+        if (!input) return EINVAL;
+        char a = input[tx->seed_match_byte],
+            b = wanted[tx->seed_match_byte];
+        if (a != b) return ENOTSUP;
+        if (!a) {
+            tx->phase = WL_SESSION_SEED_SIZE; return 0;
+        }
+        if (tx->seed_match_byte == SIZE_MAX) return EOVERFLOW;
+        tx->seed_match_byte++; return 0;
+    }
+    case WL_SESSION_SEED_SIZE:
+        if (!tx->seed_old_model || tx->seed_model_original >= tx->old_count)
+            return EINVAL;
+        tx->seed_arena_bytes = wl_columnar_session_seed_size();
+        tx->seed_owner = WL_SESSION_SEED_OWNER_HEADER;
+        tx->phase = WL_SESSION_SEED_ARENA_INIT; return 0;
+    case WL_SESSION_SEED_ARENA_INIT:
+        wl_columnar_memory_reservation_init(&tx->seed_arena_credit);
+        wl_columnar_session_seed_host_call_next(tx,
+            WL_SESSION_SEED_ARENA_RESERVE, WL_SESSION_SEED_ARENA_ALLOCATE);
+        return 0;
+    case WL_SESSION_SEED_ARENA_ALLOCATE:
+#ifdef WL_SESSION_TEST_HOOKS
+        if (wl_columnar_session_test_fail_seed_arena_allocation) {
+            wl_columnar_session_test_fail_seed_arena_allocation = false;
+            return ENOMEM;
+        }
+#endif
+        tx->seed_actor = malloc(tx->seed_arena_bytes);
+        if (!tx->seed_actor) return ENOMEM;
+        tx->seed_owner = WL_SESSION_SEED_OWNER_ARENA;
+        tx->seed_child_retry = WL_SESSION_SEED_INIT;
+        tx->seed_child_next = WL_SESSION_SEED_RECIPE;
+        tx->phase = WL_SESSION_SEED_BIRTH; return 0;
+    case WL_SESSION_SEED_RECIPE:
+        tx->seed_recipe.reset = sess->delta_cb
+            ? WL_COLUMNAR_SESSION_SEED_DETACH_OBSERVED
+            : WL_COLUMNAR_SESSION_SEED_RESET_PLAIN;
+        tx->seed_recipe.name = tx->heads[0].plan.name;
+        tx->seed_recipe.target_snapshot =
+            tx->originals[tx->seed_model_original].snapshot;
+        wl_columnar_session_seed_host_call_next(tx, WL_SESSION_SEED_PREPARE,
+            WL_SESSION_SEED_PRE_PROGRESS); return 0;
+    case WL_SESSION_SEED_PRE_PROGRESS:
+        tx->seed_progress =
+            wl_columnar_session_seed_progress(tx->seed_actor);
+        if (tx->seed_progress == WL_COLUMNAR_SESSION_SEED_RULE_READY) {
+            tx->phase = WL_SESSION_OBSERVED_EVALUATE; return 0;
+        }
+        if (tx->seed_progress == WL_COLUMNAR_SESSION_SEED_FORWARD)
+            wl_columnar_session_seed_host_call_next(tx,
+                WL_SESSION_SEED_PRE_STEP, WL_SESSION_SEED_PRE_PROGRESS);
+        else if (tx->seed_progress ==
+            WL_COLUMNAR_SESSION_SEED_NEEDS_CLEANUP)
+            wl_columnar_session_seed_host_call_next(tx,
+                WL_SESSION_SEED_PRE_MAINTENANCE,
+                WL_SESSION_SEED_PRE_PROGRESS);
+        else return EINVAL;
+        return 0;
+    case WL_SESSION_SEED_HEAD_COMPLETE:
+        if (tx->child_active || tx->receipt_pending || tx->receipt_ack
+            || sess->cleanup_active ||
+            tx->generation != tx->closed_generation
+            || !tx->heads[0].candidate) return EINVAL;
+        wl_columnar_session_seed_host_call_next(tx, WL_SESSION_SEED_ATTACH,
+            WL_SESSION_SEED_POST_PROGRESS); return 0;
+    case WL_SESSION_SEED_POST_PROGRESS:
+        tx->seed_progress =
+            wl_columnar_session_seed_progress(tx->seed_actor);
+        if (tx->seed_progress == WL_COLUMNAR_SESSION_SEED_FORWARD)
+            wl_columnar_session_seed_host_call_next(tx,
+                WL_SESSION_SEED_POST_STEP, WL_SESSION_SEED_POST_PROGRESS);
+        else if (tx->seed_progress ==
+            WL_COLUMNAR_SESSION_SEED_NEEDS_CLEANUP)
+            wl_columnar_session_seed_host_call_next(tx,
+                WL_SESSION_SEED_POST_MAINTENANCE,
+                WL_SESSION_SEED_POST_PROGRESS);
+        else if (tx->seed_progress == WL_COLUMNAR_SESSION_SEED_COMPOSED) {
+            tx->seed_ready = false;
+            wl_columnar_session_seed_host_call_next(tx,
+                WL_SESSION_SEED_FINALIZE, WL_SESSION_SEED_POST_PROGRESS);
+        } else if (tx->seed_progress ==
+            WL_COLUMNAR_SESSION_SEED_RESULT_READY
+            || tx->seed_progress == WL_COLUMNAR_SESSION_SEED_COMPACTING)
+            wl_columnar_session_seed_host_call_next(tx,
+                WL_SESSION_SEED_COMPACT, WL_SESSION_SEED_POST_PROGRESS);
+        else return EINVAL;
+        return 0;
+    case WL_SESSION_SEED_RETIRE_RULE:
+        if (tx->heads[0].candidate || tx->disposal_progress.identity) {
+            wl_columnar_session_retirement_progress_t *p =
+                &tx->disposal_progress;
+            rc = wl_columnar_session_retirement_select(step, p, tx,
+                    &tx->disposal,
+                    p->identity ? p->target : tx->heads[0].candidate,
+                    &tx->heads[0].candidate, NULL, 5, tx->seed_slot);
+            if (rc) return rc;
+            tx->seed_direct_public_return = true;
+            rc = wl_columnar_session_retirement_drive(step, p,
+                    NULL, 0, 1);
+            if (rc == EOVERFLOW)
+                tx->seed_maintenance_next =
+                    wl_columnar_session_seed_maintenance_probe;
+            if (rc == EAGAIN)
+                return wl_columnar_session_seed_public_yield_paid(control,
+                           id, step);
+            tx->seed_direct_public_return = false;
+            return rc;
+        }
+        tx->seed_rule_retired = true;
+        tx->phase = WL_SESSION_SEED_MOVE_FINAL; return 0;
+    case WL_SESSION_SEED_MOVE_FINAL:
+        if (tx->heads[0].candidate || tx->disposal_progress.identity
+            || !tx->seed_taken) return EINVAL;
+        tx->heads[0].candidate = tx->seed_taken; tx->seed_taken = NULL;
+        tx->seed_final_moved = true; tx->phase = WL_SESSION_SEED_REBIND;
+        return 0;
+    case WL_SESSION_SEED_REBIND:
+        tx->entries[tx->seed_slot].relation = tx->heads[0].candidate;
+        tx->entries[tx->seed_slot].snapshot =
+            wl_columnar_relation_snapshot(tx->heads[0].candidate);
+        tx->seed_alias_rebound = true;
+        tx->head++; tx->phase = WL_SESSION_SEED_ARENA_FREE; return 0;
+    case WL_SESSION_SEED_ARENA_FREE:
+        free(tx->seed_actor); tx->seed_actor = NULL;
+        tx->seed_owner = WL_SESSION_SEED_OWNER_HEADER;
+        tx->phase = WL_SESSION_SEED_ARENA_RELEASE; return 0;
+    case WL_SESSION_SEED_ARENA_RELEASE:
+        if (tx->seed_arena_admitted) {
+            bool done = false;
+            rc = wl_columnar_memory_reservation_finish_step(
+                &tx->seed_arena_credit, true, &done);
+            if (rc || !done) return rc ? rc : EAGAIN;
+            tx->seed_arena_admitted = false; return 0;
+        }
+        tx->phase = WL_SESSION_OBSERVED_EVALUATE; return 0;
+    case WL_SESSION_SEED_PUBLIC_HEADER:
+        if (tx->count != 2 || tx->head_count != 1 || tx->seed_slot >= 2
+            || tx->heads[0].candidate == tx->seed_old_model
+            || tx->entries[tx->seed_slot].relation !=
+            tx->heads[0].candidate)
+            return EINVAL;
+        tx->seed_public_candidate = tx->heads[0].candidate;
+        tx->seed_public_snapshot = wl_columnar_relation_snapshot(
+            tx->seed_public_candidate);
+        tx->published_registry = tx->image;
+        tx->published_count = tx->image_count;
+        tx->seed_old_model_address = (uintptr_t)tx->seed_old_model;
+        step->seed_observation_kind = WL_SESSION_SEED_OBSERVATION_COMMITTED;
+        tx->phase = WL_SESSION_OBSERVED_RELEASE_READERS; return 0;
+    default: return EINVAL;
+    }
+}
+
 static int
 wl_columnar_session_observed_action(wl_col_session_t *sess,
     wl_columnar_controlled_step_t *step)
@@ -17325,6 +18279,13 @@ wl_columnar_session_observed_action(wl_col_session_t *sess,
         wl_columnar_session_test_observed_transaction_checkpoint(control, 24,
             tx->round, &tx->bindings);
 #endif
+    if (tx->phase == WL_SESSION_SEED_MATCH_PREPARE
+        || tx->phase == WL_SESSION_SEED_MATCH_BYTE
+        || tx->phase == WL_SESSION_SEED_MATCH_RESULT
+        || tx->phase == WL_SESSION_SEED_LOOKUP_ASSIGN)
+        return wl_columnar_session_seed_count_action(sess, step);
+    if (tx->seed_selected && tx->phase >= WL_SESSION_SEED_SIZE)
+        return wl_columnar_session_seed_host_action(sess, step);
     bool retirement_action = (tx->phase == WL_SESSION_OBSERVED_CLAIMS
         && tx->index < tx->old_count && tx->originals[tx->index].retire)
         || (tx->phase == WL_SESSION_RECURSIVE_RETIRE
@@ -17346,9 +18307,18 @@ wl_columnar_session_observed_action(wl_col_session_t *sess,
         if (rc) return rc;
     }
     switch (tx->phase) {
-    case WL_SESSION_OBSERVED_COUNT: /* Count immutable metadata before allocating stable arrays. */
+    case WL_SESSION_OBSERVED_COUNT:     /* Count immutable metadata before allocating stable arrays. */
         if (tx->si == plan->stratum_count) {
-            if (tx->head_count > UINT32_MAX - plan->edb_count) return EOVERFLOW;
+            if (tx->head_count >
+                UINT32_MAX - plan->edb_count) return EOVERFLOW;
+            if (!sess->base.source_c1_admission && !sess->join_batch_bytes
+                && !step->snapshot_owned && !step->snapshot &&
+                !step->snapshot_retry
+                && tx->head_count == 1
+                && wl_columnar_session_seed_shape_metadata(plan)) {
+                tx->seed_route_started = true;
+                tx->phase = WL_SESSION_SEED_MATCH_PREPARE; return 0;
+            }
             tx->count = tx->head_count + plan->edb_count;
             if (!tx->head_count || !tx->count) return ENOTSUP;
             tx->old_count = sess->nrels;
@@ -17379,7 +18349,8 @@ wl_columnar_session_observed_action(wl_col_session_t *sess,
             uint32_t count = body ? body->op_count : r->op_count;
             if (!r->name || !ops || !count
                 || ops[count - 1].op != WL_PLAN_OP_CONSOLIDATE
-                || (body && (!body->declared_int64 || !body->declared_width)))
+                || (body &&
+                (!body->declared_int64 || !body->declared_width)))
                 return ENOTSUP;
             if (tx->head_count == UINT32_MAX ||
                 count > UINT32_MAX - 2
@@ -17400,7 +18371,8 @@ wl_columnar_session_observed_action(wl_col_session_t *sess,
         switch (tx->allocation) {
         case 0:
             wl_columnar_memory_reservation_init(&tx->metadata_credit);
-            rc = wl_columnar_session_observed_reserve(sess, bytes + sizeof(*tx),
+            rc = wl_columnar_session_observed_reserve(sess,
+                    bytes + sizeof(*tx),
                     &tx->metadata_credit, step->operation_id);
             if (rc) return rc;
             tx->metadata_admitted = true;
@@ -17413,11 +18385,13 @@ wl_columnar_session_observed_action(wl_col_session_t *sess,
             tx->image_admitted = true;
             break;
         case 2:
-            tx->entries = malloc((size_t)tx->count * sizeof(*tx->entries));
+            tx->entries = malloc((size_t)tx->count *
+                    sizeof(*tx->entries));
             if (!tx->entries) return ENOMEM;
             break;
         case 3:
-            tx->heads = malloc((size_t)tx->head_count * sizeof(*tx->heads));
+            tx->heads = malloc((size_t)tx->head_count *
+                    sizeof(*tx->heads));
             if (!tx->heads) return ENOMEM;
             break;
         case 4:
@@ -17443,11 +18417,14 @@ wl_columnar_session_observed_action(wl_col_session_t *sess,
         case 8:
 #ifdef WL_SESSION_TEST_HOOKS
             if (wl_columnar_session_test_observed_transaction_checkpoint)
-                wl_columnar_session_test_observed_transaction_checkpoint(
+
+                wl_columnar_session_test_observed_transaction_checkpoint
+                (
                     control,
                     42, tx->allocation, NULL);
             if (wl_columnar_session_test_fail_frontier_map_allocation) {
-                wl_columnar_session_test_fail_frontier_map_allocation = false;
+                wl_columnar_session_test_fail_frontier_map_allocation =
+                    false;
                 return ENOMEM;
             }
 #endif
@@ -17465,7 +18442,7 @@ wl_columnar_session_observed_action(wl_col_session_t *sess,
 #endif
         return 0;
     }
-    case WL_SESSION_OBSERVED_ZERO: { /* No ownership-bearing record is live until zeroing completes. */
+    case WL_SESSION_OBSERVED_ZERO: {     /* No ownership-bearing record is live until zeroing completes. */
         unsigned char *data;
         size_t bytes;
         switch (tx->init_array) {
@@ -17474,19 +18451,24 @@ wl_columnar_session_observed_action(wl_col_session_t *sess,
         case 1: data = (unsigned char *)tx->heads;
             bytes = (size_t)tx->head_count * sizeof(*tx->heads); break;
         case 2: data = (unsigned char *)tx->overrides;
-            bytes = (size_t)tx->head_count * sizeof(*tx->overrides); break;
+            bytes = (size_t)tx->head_count * sizeof(*tx->overrides);
+            break;
         case 3: data = (unsigned char *)tx->originals;
-            bytes = (size_t)tx->old_count * sizeof(*tx->originals); break;
+            bytes = (size_t)tx->old_count * sizeof(*tx->originals);
+            break;
         case 4: data = (unsigned char *)tx->ops;
             bytes = (size_t)tx->op_count * sizeof(*tx->ops); break;
         case 5: data = (unsigned char *)tx->frontier_sources;
-            bytes = (size_t)tx->op_count * sizeof(*tx->frontier_sources); break;
-        default: tx->phase = WL_SESSION_OBSERVED_PLAN; return 0;
+            bytes = (size_t)tx->op_count *
+                sizeof(*tx->frontier_sources); break;
+        default: tx->arrays_ready = true;
+            tx->phase = WL_SESSION_OBSERVED_PLAN; return 0;
         }
 #ifdef WL_SESSION_TEST_HOOKS
         if (tx->init_array == 5 && tx->init_byte && tx->init_byte < bytes
             && wl_columnar_session_test_observed_transaction_checkpoint)
-            wl_columnar_session_test_observed_transaction_checkpoint(control,
+            wl_columnar_session_test_observed_transaction_checkpoint(
+                control,
                 41, (uint32_t)tx->init_byte, NULL);
 #endif
         size_t chunk = bytes - tx->init_byte;
@@ -17503,16 +18485,18 @@ wl_columnar_session_observed_action(wl_col_session_t *sess,
         }
         return 0;
     }
-    case WL_SESSION_OBSERVED_PLAN: /* Flatten head metadata without moving live records. */
+    case WL_SESSION_OBSERVED_PLAN:     /* Flatten head metadata without moving live records. */
         if (tx->index < plan->edb_count) {
             if (!plan->edb_relations || !plan->edb_relations[tx->index]
-                || !plan->edb_declared_width || !plan->edb_column_type_counts
+                || !plan->edb_declared_width ||
+                !plan->edb_column_type_counts
                 || !plan->edb_column_types) return ENOTSUP;
             tx->entries[tx->index].name = plan->edb_relations[tx->index];
             tx->index++; return 0;
         }
         if (tx->si == plan->stratum_count) {
-            tx->index = tx->other = 0; tx->phase = WL_SESSION_OBSERVED_NAMES;
+            tx->index = tx->other = 0;
+            tx->phase = WL_SESSION_OBSERVED_NAMES;
             return 0;
         }
         if (tx->ri == plan->strata[tx->si].relation_count) {
@@ -17526,7 +18510,8 @@ wl_columnar_session_observed_action(wl_col_session_t *sess,
             const wl_plan_body_t *body = stratum->is_recursive
                 ? &stratum->bodies[tx->ri] : NULL;
             const wl_plan_op_t *source_ops = body ? body->ops : source->ops;
-            uint32_t source_count = body ? body->op_count : source->op_count;
+            uint32_t source_count =
+                body ? body->op_count : source->op_count;
             if (!tx->op) {
                 head->stratum = tx->si;
                 head->recursive = stratum->is_recursive;
@@ -17539,8 +18524,8 @@ wl_columnar_session_observed_action(wl_col_session_t *sess,
                 head->plan.op_count = source_count;
                 head->plan.ops = tx->ops + tx->filled_ops;
                 head->op_base = tx->filled_ops;
-                tx->entries[plan->edb_count +
-                    tx->filled_heads].name = source->name;
+                tx->entries[tx->seed_selected ? tx->seed_slot :
+                    plan->edb_count + tx->filled_heads].name = source->name;
             }
             /* Audit every rewritten slot separately from the preserved body. */
             if (body && tx->audit_op < source->op_count) {
@@ -17586,16 +18571,18 @@ wl_columnar_session_observed_action(wl_col_session_t *sess,
             }
             tx->column = 0;
             tx->ops[tx->filled_ops + tx->op] = source_ops[tx->op];
-            tx->ops[tx->filled_ops + tx->op].delta_mode = WL_DELTA_FORCE_FULL;
+            tx->ops[tx->filled_ops +
+                tx->op].delta_mode = WL_DELTA_FORCE_FULL;
             if (++tx->op == source_count) {
                 tx->filled_ops += source_count + 2; tx->filled_heads++;
                 tx->op = tx->audit_op = 0; tx->ri++;
             }
             return 0;
         }
-    case WL_SESSION_OBSERVED_NAMES: /* Validate names and detect collisions, byte by byte. */
+    case WL_SESSION_OBSERVED_NAMES:     /* Validate names and detect collisions, byte by byte. */
         if (tx->index == tx->count) {
-            tx->index = tx->other = 0; tx->phase = WL_SESSION_OBSERVED_LOOKUP;
+            tx->index = tx->other = 0;
+            tx->phase = WL_SESSION_OBSERVED_LOOKUP;
             return 0;
         }
         if (tx->other == tx->index) {
@@ -17619,11 +18606,12 @@ wl_columnar_session_observed_action(wl_col_session_t *sess,
             if (tx->byte == SIZE_MAX) return EOVERFLOW;
             tx->byte++; return 0;
         }
-    case WL_SESSION_OBSERVED_LOOKUP: /* Match original slots to public bindings or consumed $r$ inputs. */
+    case WL_SESSION_OBSERVED_LOOKUP:     /* Match original slots to public bindings or consumed $r$ inputs. */
         if (sess->rels != tx->old_registry ||
             sess->nrels != tx->old_count) return EINVAL;
         if (tx->index == tx->old_count) {
             tx->index = tx->other = tx->op = 0;
+            tx->originals_started = true;
             tx->phase = WL_SESSION_OBSERVED_LEASES; return 0;
         } else {
             wl_columnar_session_observed_original_t *original =
@@ -17634,7 +18622,8 @@ wl_columnar_session_observed_action(wl_col_session_t *sess,
                 tx->index++; return 0;
             }
             if (!r->name) return EINVAL;
-            uint32_t limit = tx->op == 1 ? plan->edb_count : tx->count;
+            uint32_t limit = tx->op == 1 ? plan->edb_count :
+                tx->seed_selected && tx->op >= 2 ? 1 : tx->count;
             if (tx->other == limit) {
                 if (tx->op == 3) {
                     original->preserve = true;
@@ -17642,15 +18631,19 @@ wl_columnar_session_observed_action(wl_col_session_t *sess,
                     tx->index++; tx->other = tx->op = 0; tx->byte = 0;
                     return 0;
                 }
-                tx->op++; tx->other = tx->op > 1 ? plan->edb_count : 0;
+                tx->op++; tx->other = tx->op > 1 && !tx->seed_selected
+                    ? plan->edb_count : 0;
                 tx->byte = 0; return 0;
             }
             size_t prefix_length = tx->op == 1 ? 3 : tx->op == 2 ? 5 : 4;
             const char *prefix = tx->op == 1 ? "$r$" : tx->op ==
                 2 ? "$out$" : "$in$";
-            char wanted = (char)(!tx->op ? tx->entries[tx->other].name[tx->byte]
+            uint32_t name_slot = tx->seed_selected && tx->op >= 2
+                ? tx->seed_slot : tx->other;
+            char wanted =
+                (char)(!tx->op ? tx->entries[tx->other].name[tx->byte]
                 : tx->byte < prefix_length ? prefix[tx->byte]
-                : tx->entries[tx->other].name[tx->byte - prefix_length]);
+                : tx->entries[name_slot].name[tx->byte - prefix_length]);
             char actual = r->name[tx->byte];
             if (wanted != actual) {
                 tx->other++; tx->byte = 0; return 0;
@@ -17662,6 +18655,9 @@ wl_columnar_session_observed_action(wl_col_session_t *sess,
                 tx->byte++;
                 return 0;
             }
+            if (tx->seed_selected) {
+                tx->phase = WL_SESSION_SEED_LOOKUP_ASSIGN; return 0;
+            }
             if (!tx->op && tx->other < plan->edb_count) {
                 if (tx->entries[tx->other].relation) return EINVAL;
                 tx->entries[tx->other].relation = r;
@@ -17669,7 +18665,8 @@ wl_columnar_session_observed_action(wl_col_session_t *sess,
             } else {
                 original->retire = true;
                 if (!tx->op) {
-                    if (tx->entries[tx->other].public_relation) return EINVAL;
+                    if (tx->entries[tx->other].public_relation) return
+                            EINVAL;
                     tx->entries[tx->other].public_relation = r;
                 }
             }
@@ -17677,8 +18674,9 @@ wl_columnar_session_observed_action(wl_col_session_t *sess,
             tx->index++; tx->other = tx->op = 0; tx->byte = 0;
             return 0;
         }
-    case WL_SESSION_OBSERVED_LEASES: /* Acquire stable descriptor and source readers for the original view. */
+    case WL_SESSION_OBSERVED_LEASES:     /* Acquire stable descriptor and source readers for the original view. */
         if (tx->index == tx->old_count) {
+            tx->schema_started = true;
             tx->index = tx->op = 0; tx->phase = WL_SESSION_OBSERVED_SCHEMA;
             return 0;
         }
@@ -17693,8 +18691,16 @@ wl_columnar_session_observed_action(wl_col_session_t *sess,
                     original->relation))) return EINVAL;
         }
         tx->index++; return 0;
-    case WL_SESSION_OBSERVED_SCHEMA: /* Declared scalar input schemas and private empty input owners. */
+    case WL_SESSION_OBSERVED_SCHEMA:     /* Declared scalar input schemas and private empty input owners. */
+        if (tx->seed_selected && tx->index == tx->seed_slot) {
+            tx->index++; tx->op = 0; return 0;
+        }
         if (tx->index == plan->edb_count) {
+            if (tx->seed_selected) {
+                tx->append_active = false;
+                tx->index = tx->op = tx->other = 0; tx->byte = 0;
+                tx->phase = WL_SESSION_SEED_INPUT_NAME; return 0;
+            }
             tx->index = tx->op = tx->other = 0; tx->byte = 0;
             col_rel_t *input = step->append_source;
             tx->append_active = step->append_proven && sess->diff_enabled
@@ -17716,10 +18722,12 @@ wl_columnar_session_observed_action(wl_col_session_t *sess,
             /* Inferred type counts describe compiler context, not a physical
              * declaration. Actual arity (including nonempty nullary input)
              * remains owned by the source and its raw mutation validator. */
-            if (!r || (!undeclared && (plan->edb_column_type_counts[i] != width
+            if (!r ||
+                (!undeclared && (plan->edb_column_type_counts[i] != width
                 || (width && !plan->edb_column_types[i])))) return ENOTSUP;
             if (!undeclared && tx->op < width) {
-                wirelog_column_type_t type = plan->edb_column_types[i][tx->op];
+                wirelog_column_type_t type =
+                    plan->edb_column_types[i][tx->op];
                 if (!wl_columnar_session_observed_scalar_type(
                         type)) return ENOTSUP;
                 /* An untyped lane holds int64 values (#2301). The
@@ -17738,7 +18746,8 @@ wl_columnar_session_observed_action(wl_col_session_t *sess,
                     wl_columnar_relation_new_empty_input_operator_attempt_controlled
                     (
                     tx->entries[i].name, r, plan->edb_column_types[i],
-                    sess->memory_governor, &empty, control, step->operation_id);
+                    sess->memory_governor, &empty, control,
+                    step->operation_id);
                 /* A denied reservation is a budget denial, as for a
                  * denied MAP scratch reservation (#2301). */
                 if (rc == ENOSPC) sess->memory_budget_denied = true;
@@ -17761,10 +18770,14 @@ wl_columnar_session_observed_action(wl_col_session_t *sess,
         bool supported = !head->recursive
             && wl_columnar_session_recursive_positive_op(op)
             && tx->entries[plan->edb_count + tx->index].public_relation;
-        if (supported && op->op == WL_PLAN_OP_FILTER && op->filter_expr.size) {
+        if (supported && op->op == WL_PLAN_OP_FILTER &&
+            op->filter_expr.size){
             bool append_filter = false;
-            rc = wl_columnar_session_filter_append_supported_attempt_controlled(
-                &op->filter_expr, &append_filter, control, step->operation_id);
+            rc =
+                wl_columnar_session_filter_append_supported_attempt_controlled
+                (
+                &op->filter_expr, &append_filter, control,
+                step->operation_id);
             if (rc) return rc;
             /* Scalar FILTER takes the canonical private plan before any
              * append-copy or old-head CONCAT rewrite. Numeric FILTER keeps
@@ -17823,7 +18836,8 @@ wl_columnar_session_observed_action(wl_col_session_t *sess,
                     tx->frontier_sources[head->op_base + tx->op] = 1;
                     head->delta_reads++;
 #ifdef WL_SESSION_TEST_HOOKS
-                    if (wl_columnar_session_test_observed_transaction_checkpoint)
+                    if (
+                        wl_columnar_session_test_observed_transaction_checkpoint)
                     {
                         wl_columnar_session_test_observed_transaction_checkpoint
                         (
@@ -17836,7 +18850,8 @@ wl_columnar_session_observed_action(wl_col_session_t *sess,
         /* Prove linearity along every evaluated path, not across the UNION
          * alternatives as a whole. Partial maps are inactive after fallback. */
         if (supported) {
-            bool changed = tx->frontier_sources[head->op_base + tx->op] != 0;
+            bool changed = tx->frontier_sources[head->op_base + tx->op] !=
+                0;
             if (op->op == WL_PLAN_OP_VARIABLE) {
                 if (tx->degree_depth == COL_STACK_MAX) supported = false;
                 else tx->degrees[tx->degree_depth++] = changed ? 1 : 0;
@@ -17873,11 +18888,13 @@ wl_columnar_session_observed_action(wl_col_session_t *sess,
                 step->append_source->nrows, sess->memory_governor,
                 &tx->append_delta, control);
         if (rc) return rc;
-        tx->append_snapshot = wl_columnar_relation_snapshot(tx->append_delta);
+        tx->append_snapshot =
+            wl_columnar_relation_snapshot(tx->append_delta);
         tx->phase = WL_SESSION_APPEND_PLAN; return 0;
     case WL_SESSION_APPEND_PLAN: {
         if (tx->index == tx->head_count) {
-            tx->index = 0; tx->phase = WL_SESSION_OBSERVED_EVALUATE; return 0;
+            tx->index = 0; tx->phase = WL_SESSION_OBSERVED_EVALUATE;
+            return 0;
         }
         wl_columnar_session_observed_head_t *head = &tx->heads[tx->index];
         if (head->delta_reads) {
@@ -17903,11 +18920,12 @@ wl_columnar_session_observed_action(wl_col_session_t *sess,
             wl_columnar_eval_private_dynamic_binding_t *entry =
                 &tx->entries[plan->edb_count + tx->index];
             entry->relation = entry->public_relation;
-            entry->snapshot = wl_columnar_relation_snapshot(entry->relation);
+            entry->snapshot =
+                wl_columnar_relation_snapshot(entry->relation);
         }
         tx->index++; tx->byte = 0; return 0;
     }
-    case WL_SESSION_OBSERVED_EVALUATE: /* Complete each private child and ACK its cleanup before rebinding. */
+    case WL_SESSION_OBSERVED_EVALUATE:     /* Complete each private child and ACK its cleanup before rebinding. */
         if (tx->head == tx->head_count) {
             tx->phase = WL_SESSION_OBSERVED_BASELINE; return 0;
         }
@@ -17923,6 +18941,9 @@ wl_columnar_session_observed_action(wl_col_session_t *sess,
         if (rc) return rc;
         if (tx->child_active) return EAGAIN;
         if (!tx->heads[tx->head].candidate) return EINVAL;
+        if (tx->seed_selected) {
+            tx->phase = WL_SESSION_SEED_HEAD_COMPLETE; return 0;
+        }
         {
             col_rel_t *candidate = tx->heads[tx->head].candidate;
             if (tx->round_active) {
@@ -18074,7 +19095,8 @@ wl_columnar_session_observed_action(wl_col_session_t *sess,
             tx->phase = WL_SESSION_RECURSIVE_REBIND;
             return 0;
         }
-        wl_columnar_session_observed_head_t *head = &tx->heads[tx->round_index];
+        wl_columnar_session_observed_head_t *head =
+            &tx->heads[tx->round_index];
         col_rel_t *a = head->previous, *b = head->candidate;
         if (!a || !b || a->ncols != head->width || b->ncols != head->width)
             return EINVAL;
@@ -18112,7 +19134,8 @@ wl_columnar_session_observed_action(wl_col_session_t *sess,
     case WL_SESSION_RECURSIVE_FRONTIER:
         return wl_columnar_session_frontier_new(sess, step);
     case WL_SESSION_RECURSIVE_DIFFERENCE: {
-        wl_columnar_session_observed_head_t *head = &tx->heads[tx->round_index];
+        wl_columnar_session_observed_head_t *head =
+            &tx->heads[tx->round_index];
         const col_rel_t *a = head->previous, *b = head->candidate;
         /* Ordering comes from actual terminal controlled CONSOLIDATE outputs
          * (or empty bottom), never caller-supplied sorted-prefix hints. */
@@ -18137,7 +19160,8 @@ wl_columnar_session_observed_action(wl_col_session_t *sess,
         return 0;
     }
     case WL_SESSION_RECURSIVE_GATHER: {
-        wl_columnar_session_observed_head_t *head = &tx->heads[tx->round_index];
+        wl_columnar_session_observed_head_t *head =
+            &tx->heads[tx->round_index];
         head->next_frontier->row_scratch[tx->column] =
             head->candidate->columns[tx->column][tx->new_row];
         if (++tx->column == head->width)
@@ -18167,7 +19191,8 @@ wl_columnar_session_observed_action(wl_col_session_t *sess,
     case WL_SESSION_RECURSIVE_RETIRE:
         if (tx->round_index < tx->round_end) {
             if (tx->heads[tx->round_index].previous
-                || tx->round_owner == &tx->heads[tx->round_index].previous) {
+                || tx->round_owner ==
+                &tx->heads[tx->round_index].previous){
                 rc = wl_columnar_session_recursive_retire(step, tx,
                         &tx->heads[tx->round_index].previous, control,
                         step->operation_id);
@@ -18182,7 +19207,7 @@ wl_columnar_session_observed_action(wl_col_session_t *sess,
                 if (rc) return rc;
             }
             if (head->next_frontier ||
-                tx->round_owner == &head->next_frontier){
+                tx->round_owner == &head->next_frontier) {
                 if (tx->round_changed) {
                     head->frontier = head->next_frontier;
                     head->next_frontier = NULL;
@@ -18199,7 +19224,8 @@ wl_columnar_session_observed_action(wl_col_session_t *sess,
                 uint32_t slot = plan->edb_count + tx->round_index;
                 if (!tx->entries[slot].public_relation)
                     tx->overrides[tx->missing_count++] =
-                        (wl_columnar_eval_delta_binding_t){tx->entries[slot].
+                        (wl_columnar_eval_delta_binding_t){tx->entries[slot]
+                                                           .
                                                            name,
                                                            NULL,
                                                            tx->heads[tx->
@@ -18211,7 +19237,8 @@ wl_columnar_session_observed_action(wl_col_session_t *sess,
         /* A round is one effective serial sub-pass, not an outer stride.
          * The unchanged round that proves convergence consumes allowance too. */
         uint64_t effective_limit =
-            (uint64_t)wl_columnar_eval_serial_iteration_limit() * EVAL_STRIDE;
+            (uint64_t)wl_columnar_eval_serial_iteration_limit() *
+            EVAL_STRIDE;
 #ifdef WL_SESSION_TEST_HOOKS
         if (wl_columnar_session_test_iteration_limit)
             effective_limit = wl_columnar_session_test_iteration_limit;
@@ -18235,7 +19262,8 @@ wl_columnar_session_observed_action(wl_col_session_t *sess,
         return 0;
     case WL_SESSION_OBSERVED_BASELINE:
         if (!sess->delta_cb) {
-            tx->index = 0; tx->phase = WL_SESSION_OBSERVED_REGISTRY; return 0;
+            tx->index = 0; tx->phase = WL_SESSION_OBSERVED_REGISTRY;
+            return 0;
         }
         if (!tx->observer_started) {
             rc = tx->missing_count
@@ -18256,7 +19284,8 @@ wl_columnar_session_observed_action(wl_col_session_t *sess,
     case WL_SESSION_OBSERVED_EVENTS:
         if (tx->index < tx->head_count) {
             tx->overrides[tx->index] = (wl_columnar_eval_delta_binding_t){
-                tx->heads[tx->index].plan.name, tx->heads[tx->index].candidate,
+                tx->heads[tx->index].plan.name,
+                tx->heads[tx->index].candidate,
                 tx->heads[tx->index].candidate->ncols
             };
             tx->index++; return 0;
@@ -18274,11 +19303,12 @@ wl_columnar_session_observed_action(wl_col_session_t *sess,
         if (rc) return rc;
         if (!tx->prepare_ready) return EAGAIN;
         tx->index = 0; tx->phase = WL_SESSION_OBSERVED_REGISTRY; return 0;
-    case WL_SESSION_OBSERVED_REGISTRY: /* Coordinated complete registry image; no independent registrations. */
+    case WL_SESSION_OBSERVED_REGISTRY:     /* Coordinated complete registry image; no independent registrations. */
         if (tx->index < tx->count) {
             uint32_t i = tx->index++;
             tx->image[i] = tx->entries[i].relation;
-            if (i < plan->edb_count) {
+            if (i < plan->edb_count
+                && !(tx->seed_selected && i == tx->seed_slot)) {
                 tx->image[i] = tx->entries[i].public_relation;
             }
             return 0;
@@ -18297,9 +19327,11 @@ wl_columnar_session_observed_action(wl_col_session_t *sess,
                     tx->image, tx->image_count);
             if (rc) return rc;
         }
-        tx->index = 0; tx->phase = WL_SESSION_OBSERVED_RELEASE_READERS;
+        tx->index = 0;
+        tx->phase = tx->seed_selected ? WL_SESSION_SEED_PUBLIC_HEADER
+            : WL_SESSION_OBSERVED_RELEASE_READERS;
         return 0;
-    case WL_SESSION_OBSERVED_RELEASE_READERS: /* Relinquish readers only for descriptors to be exclusively retired. */
+    case WL_SESSION_OBSERVED_RELEASE_READERS:     /* Relinquish readers only for descriptors to be exclusively retired. */
         if (tx->index == tx->old_count) {
             tx->index = 0; tx->phase = WL_SESSION_OBSERVED_CLAIMS; return 0;
         }
@@ -18311,10 +19343,12 @@ wl_columnar_session_observed_action(wl_col_session_t *sess,
             if (rc) return rc;
         }
         tx->index++; return 0;
-    case WL_SESSION_OBSERVED_CLAIMS: /* Every claim is reversible until the single publication cutoff. */
+    case WL_SESSION_OBSERVED_CLAIMS:     /* Every claim is reversible until the single publication cutoff. */
         if (tx->index == tx->old_count) {
-            rc = wl_columnar_arrangement_diff_attempt_prepare(&tx->differential,
-                    sess, control, step->operation_id);
+            rc =
+                wl_columnar_arrangement_diff_attempt_prepare(
+                &tx->differential,
+                sess, control, step->operation_id);
             if (rc) return rc;
             tx->phase = WL_SESSION_OBSERVED_CUTOFF; return 0;
         }
@@ -18345,11 +19379,13 @@ wl_columnar_session_observed_action(wl_col_session_t *sess,
         }
         rc = wl_columnar_session_main_ensure(step);
         if (rc) return rc;
-        rc = wl_evaluation_control_charge_attempt(control, step->operation_id,
-                (uint64_t)tx->old_count + tx->count + 16
+        rc = wl_evaluation_control_charge_attempt(control,
+                step->operation_id,
+                (uint64_t)tx->old_count + tx->count + 18
                 + (tx->differential.started ? 128 : 0));
         if (rc) return rc;
-        rc = wl_evaluation_control_charge_attempt(control, step->operation_id,
+        rc = wl_evaluation_control_charge_attempt(control,
+                step->operation_id,
                 0);
         if (rc) return rc;
         for (uint32_t i = 0; i < tx->old_count; ++i) {
@@ -18359,7 +19395,7 @@ wl_columnar_session_observed_action(wl_col_session_t *sess,
                 rc =
                     wl_columnar_relation_scalar_retirement_commit(
                     &original->retirement);
-                if (rc) abort(); /* READY claims were verified before cutoff. */
+                if (rc) abort();     /* READY claims were verified before cutoff. */
             }
         }
         tx->old_hash_head = sess->rel_hash_head;
@@ -18374,8 +19410,9 @@ wl_columnar_session_observed_action(wl_col_session_t *sess,
                 tx->old_registry_held = true;
             }
             if (sess->rel_hash_head || sess->rel_hash_next) {
-                if (!wl_columnar_memory_reservation_move(&tx->old_hash_credit,
-                    &sess->rel_hash_reservation)) abort();
+                if (!wl_columnar_memory_reservation_move(
+                        &tx->old_hash_credit,
+                        &sess->rel_hash_reservation)) abort();
                 tx->old_hash_held = true;
             }
         }
@@ -18383,7 +19420,8 @@ wl_columnar_session_observed_action(wl_col_session_t *sess,
         sess->rel_hash_nbuckets = sess->rel_hash_chain_cap = 0;
         if (sess->memory_governor && !wl_columnar_memory_reservation_move(
                 &sess->rels_reservation, &tx->image_credit)) abort();
-        wl_columnar_arrangement_diff_attempt_commit(&tx->differential, sess);
+        wl_columnar_arrangement_diff_attempt_commit(&tx->differential,
+            sess);
         sess->rels = tx->image; tx->image = NULL;
         sess->nrels = tx->image_count; sess->rel_cap = tx->image_cap;
         for (uint32_t i = 0; i < tx->count; ++i) {
@@ -18399,14 +19437,33 @@ wl_columnar_session_observed_action(wl_col_session_t *sess,
         tx->committed = step->published = true;
         step->observer_cleanup_pending = tx->observer_started;
         tx->index = 0; tx->phase = WL_SESSION_OBSERVED_RETIRE;
+        step->seed_pending_owner = step->seed_observation_kind ==
+            WL_SESSION_SEED_OBSERVATION_COMMITTED ? tx : NULL;
         /* Both batches were fully admitted before the single cutoff. Late
          * cancellation can affect the next attempt, never this delivery. */
-        if (tx->observer_started) wl_columnar_eval_delta_observer_publish(sess);
+        if (tx->observer_started) wl_columnar_eval_delta_observer_publish(
+                sess);
         if (step->snapshot) wl_columnar_session_snapshot_deliver(
                 step->snapshot);
         return 0;
     }
     case WL_SESSION_OBSERVED_RETIRE:
+        if (tx->seed_selected && !tx->seed_retire_rebound) {
+            rc = wl_evaluation_control_charge_attempt(tx->seed_financier,
+                    tx->seed_financier_id, 256);
+            if (rc) {
+                if (rc == EOVERFLOW) tx->seed_maintenance_next =
+                        wl_columnar_session_seed_maintenance_probe;
+                return rc;
+            }
+            wl_columnar_eval_private_dynamic_binding_t *entry =
+                &tx->entries[tx->seed_slot];
+            entry->relation = entry->public_relation =
+                tx->seed_public_candidate;
+            entry->snapshot = tx->seed_public_snapshot;
+            tx->seed_retire_rebound = true;
+            return 0;
+        }
         rc = wl_columnar_session_main_action(sess, step,
                 WL_COLUMNAR_SESSION_MAIN_DIFF, &tx->differential, NULL, 0);
         if (rc) return rc;
@@ -18445,7 +19502,7 @@ wl_columnar_session_observed_action(wl_col_session_t *sess,
                     &tx->disposal_progress);
             if (rc) return rc;
             if (entry->relation != entry->public_relation ||
-                tx->disposal_progress.identity){
+                tx->disposal_progress.identity) {
                 wl_columnar_session_retirement_progress_t *p =
                     &tx->disposal_progress;
                 rc = wl_columnar_session_retirement_select(step, p, tx,
@@ -18472,6 +19529,9 @@ wl_columnar_session_observed_action(wl_col_session_t *sess,
             if (rc) return rc;
         }
         step->observer_cleanup_pending = false;
+        if (tx->seed_selected && tx->seed_financier) {
+            tx->seed_finish_ready = true; return EAGAIN;
+        }
         step->complete = true; tx->phase = WL_SESSION_OBSERVED_DONE;
         return 0;
     case WL_SESSION_OBSERVED_DONE: return 0;
@@ -20778,6 +21838,8 @@ wl_columnar_session_main_native_prove(wl_col_session_t *sess,
                 || p->receipt != &tx->disposal || p->index >= tx->count)
                 return EINVAL;
             col_rel_t **slot = p->role == 4 ? &tx->entries[p->index].relation :
+                tx->seed_selected && p->index == tx->seed_slot
+                && tx->head_count == 1 && tx->heads ? &tx->heads[0].candidate :
                 p->index >= sess->plan->edb_count ?
                 &tx->heads[p->index-sess->plan->edb_count].candidate : NULL;
             if (!slot || p->slot != slot) return EINVAL;
@@ -23126,6 +24188,12 @@ wl_columnar_session_terminal_finish_observe(wl_col_session_t *sess,
     if (result != EAGAIN) wl_columnar_session_terminal_ack(step);
 }
 
+static bool wl_columnar_session_seed_quiet(
+    const wl_columnar_controlled_step_t *);
+
+static bool wl_columnar_session_seed_resources_quiet(
+    const wl_columnar_controlled_step_t *);
+
 static int
 wl_columnar_session_terminal_action(wl_col_session_t *sess,
     wl_columnar_controlled_step_t *step)
@@ -23229,6 +24297,7 @@ wl_columnar_session_terminal_action(wl_col_session_t *sess,
         } else if (tx->metadata_admitted) return EINVAL;
         break;
     case WL_COLUMNAR_SESSION_TERMINAL_TX_FREE:
+        if (!wl_columnar_session_seed_quiet(step)) return EBUSY;
         if (o->terminal_maintenance.control || o->terminal_maintenance.phase)
             return EBUSY;
 #ifdef WL_SESSION_TEST_HOOKS
@@ -23277,6 +24346,14 @@ wl_columnar_session_terminal_action(wl_col_session_t *sess,
     }
     ++o->terminal_phase;
     return 0;
+}
+
+static bool
+wl_columnar_session_seed_quiet(const wl_columnar_controlled_step_t *step)
+{
+    return !step->seed_pending_owner && !step->seed_observation_kind
+           && !step->seed_header_cleanup_class
+           && wl_columnar_session_seed_resources_quiet(step);
 }
 
 static int
@@ -23432,6 +24509,9 @@ static int
 wl_columnar_session_terminal_begin(wl_col_session_t *sess,
     wl_columnar_controlled_step_t *step, bool native)
 {
+    if (!wl_columnar_session_seed_resources_quiet(step)
+        || (step->seed_pending_owner &&
+        step->seed_pending_owner != step->transaction)) return EBUSY;
     wl_columnar_session_observed_transaction_t *selected_tx = step->transaction;
     if (wl_columnar_session_failed_retry_own_forward(sess, step)
         && selected_tx && !native && !selected_tx->committed
@@ -23541,6 +24621,8 @@ wl_columnar_session_terminal_begin(wl_col_session_t *sess,
 #endif
     o->terminal_thread_valid = true;
     o->terminal_phase = WL_COLUMNAR_SESSION_TERMINAL_REGISTER;
+    step->seed_pending_owner = NULL;
+    step->seed_observation_kind = WL_SESSION_SEED_OBSERVATION_NONE;
     if (o->terminal_funding.phase && o->terminal_funding.phase !=
         WL_COLUMNAR_SESSION_FINANCE_REBEGIN)
         (void)wl_columnar_session_metadata_defer(sess, step,
@@ -23983,6 +25065,118 @@ wl_columnar_session_test_frontier_source_current(const wl_col_session_t *sess,
 }
 #endif
 
+static int
+wl_columnar_session_seed_host_dispose(wl_col_session_t *sess,
+    wl_columnar_controlled_step_t *step, bool native_error)
+{
+    wl_columnar_session_observed_transaction_t *tx = step->transaction;
+    int rc;
+    if (!tx->seed_financier)
+        return wl_columnar_session_seed_host_birth_step(sess, step, true);
+    if (tx->seed_cleanup_stage == 1) {
+        tx->seed_cleanup_stage = 2;
+        rc = wl_columnar_session_seed_end(tx->seed_actor,
+                step->primary_result ? step->primary_result :
+                step->native_error_result,
+                tx->seed_financier, tx->seed_financier_id, &tx->seed_done);
+        if (rc == EOVERFLOW) {
+            tx->seed_maintenance_next =
+                wl_columnar_session_seed_maintenance_probe;
+            return native_error ? EAGAIN : rc;
+        }
+        return rc;
+    }
+    if (tx->seed_cleanup_stage == 4 &&
+        (tx->heads[0].candidate || tx->disposal_progress.identity)) {
+        wl_columnar_session_retirement_progress_t *p = &tx->disposal_progress;
+        rc = wl_columnar_session_retirement_select(step, p, tx,
+                &tx->disposal, p->identity ? p->target : tx->heads[0].candidate,
+                &tx->heads[0].candidate, NULL, 5, tx->seed_slot);
+        if (rc) return rc;
+        rc = native_error
+            ? wl_columnar_session_native_error_retirement_drive(step, p,
+                NULL, 0, 1)
+            : wl_columnar_session_retirement_drive(step, p,
+                NULL, 0, 1);
+        if (rc == EOVERFLOW) {
+            tx->seed_maintenance_next =
+                wl_columnar_session_seed_maintenance_probe;
+            return native_error ? EAGAIN : rc;
+        }
+        return rc;
+    }
+    rc = wl_evaluation_control_charge_attempt(tx->seed_financier,
+            tx->seed_financier_id, 256);
+    if (rc) {
+        if (rc == EOVERFLOW) {
+            tx->seed_maintenance_next =
+                wl_columnar_session_seed_maintenance_probe;
+            return native_error ? EAGAIN : rc;
+        }
+        return rc;
+    }
+    switch (tx->seed_cleanup_stage) {
+    case 0:
+        tx->seed_done = false;
+        tx->seed_cleanup_stage = tx->seed_init_succeeded &&
+            !tx->seed_end_done
+            ? 1 : 3;
+        return EAGAIN;
+    case 2:
+        if (tx->seed_done) {
+            tx->seed_end_done = true; tx->seed_cleanup_stage = 3;
+        } else tx->seed_cleanup_stage = 1;
+        return EAGAIN;
+    case 3:
+        if (tx->observer_started && !tx->committed) {
+            rc = wl_columnar_session_observed_observer_resources(sess, step,
+                    native_error, true);
+            if (rc) return rc;
+            tx->seed_cleanup_stage = 9;
+            return EAGAIN;
+        }
+    /* fall through */
+    case 9:
+        /* Observer reader closure and this binding use separate real256
+         * packets. Stage3 full-owner chain is256; this binding chain103.
+         * This is a nonowning binding. Originals alone owns the public model.
+         * A published candidate is never a disposal target. */
+        if (tx->schema_started && tx->heads && !tx->committed) {
+            tx->entries[tx->seed_slot].relation = tx->seed_old_model;
+            tx->seed_cleanup_stage = 4;
+        } else tx->seed_cleanup_stage = 6;
+        return EAGAIN;
+    case 4:
+        tx->seed_rule_retired = true;
+        tx->seed_cleanup_stage = 5;
+        return EAGAIN;
+    case 5:
+        if (tx->seed_taken) {
+            tx->heads[0].candidate = tx->seed_taken; tx->seed_taken = NULL;
+            tx->seed_final_moved = true; tx->seed_cleanup_stage = 4;
+        } else tx->seed_cleanup_stage = 6;
+        return EAGAIN;
+    case 6:
+        free(tx->seed_actor); tx->seed_actor = NULL;
+        tx->seed_owner = WL_SESSION_SEED_OWNER_HEADER;
+        tx->seed_cleanup_stage = 7;
+        return EAGAIN;
+    case 7:
+        if (tx->seed_arena_admitted) {
+            bool done = false;
+            rc = wl_columnar_memory_reservation_finish_step(
+                &tx->seed_arena_credit, true, &done);
+            if (rc || !done) return rc ? rc : EAGAIN;
+            tx->seed_arena_admitted = false;
+            return EAGAIN;
+        }
+        tx->seed_cleanup_stage = 8;
+        return EAGAIN;
+    case 8: return 0;
+    default: return EINVAL;
+    }
+}
+
 static int wl_columnar_session_observed_dispose(wl_col_session_t *,
     wl_columnar_controlled_step_t *);
 
@@ -24164,6 +25358,69 @@ wl_columnar_session_failed_retry_forward_register(wl_col_session_t *sess,
     o->disposal_operation_id = step->operation_id;
     o->disposal_result = cause;
     o->disposal_registered = true;
+    return 0;
+}
+
+static bool
+wl_columnar_session_seed_resources_quiet(
+    const wl_columnar_controlled_step_t *step)
+{
+    if (!step->transaction || !step->transaction_initialized) return true;
+    const wl_columnar_session_observed_transaction_t *tx = step->transaction;
+    return !tx->seed_actor && !tx->seed_taken && !tx->seed_arena_admitted
+           && !tx->seed_financier && !tx->seed_financier_id
+           && !tx->seed_financier_identity
+           && (!tx->seed_init_succeeded || tx->seed_end_done)
+           && (tx->seed_financier_closure == WL_SESSION_SEED_CONTROL_EMPTY
+           || tx->seed_financier_closure == WL_SESSION_SEED_CONTROL_RELEASED)
+           && !tx->seed_maintenance_pending
+           && !tx->seed_maintenance_pending_id
+           && !tx->seed_maintenance_pending_identity &&
+           !tx->seed_maintenance_next;
+}
+
+/* Only the outer OPERATION/CLOSE driver enters the independent seed issuer.
+ * MAIN/frontier/bootstrap custody has already been serviced by this caller. */
+static int
+wl_columnar_session_seed_outer_drain(wl_col_session_t *sess,
+    wl_columnar_controlled_step_t *step, bool closing, bool *selected)
+{
+    *selected = false;
+    if (!step || !step->transaction || !step->transaction_initialized)
+        return 0;
+    wl_columnar_session_observed_transaction_t *tx = step->transaction;
+    if (!tx->seed_selected) return 0;
+    if (tx->child_active || sess->cleanup_active ||
+        sess->cleanup_pending) return 0;
+    if (!closing && !tx->committed && !step->primary_result
+        && wl_evaluation_control_active_attempt_id(
+            sess->base.evaluation_control)
+        != step->operation_id)
+        wl_columnar_session_seed_host_error(step, EINVAL);
+    if (tx->seed_maintenance_next) {
+        *selected = true;
+        return wl_columnar_session_seed_maintenance_recover(sess, step);
+    }
+    if (!closing && tx->committed && !tx->seed_finish_ready) return 0;
+    if (!closing && !step->transaction_discard && !tx->seed_finish_ready
+        && wl_evaluation_control_active_attempt_id(
+            sess->base.evaluation_control)
+        == step->operation_id) return 0;
+    if (!wl_columnar_session_seed_resources_quiet(step)) {
+        *selected = true;
+        if (tx->seed_cleanup_stage != 8) {
+            int rc = wl_columnar_session_seed_host_dispose(sess, step,
+                    step->unary_cleanup.registered);
+            if (rc == EOVERFLOW && tx->seed_maintenance_next ==
+                wl_columnar_session_seed_maintenance_probe) return EAGAIN;
+            return rc ? rc : EAGAIN;
+        }
+        if (tx->seed_financier) {
+            int rc = wl_columnar_session_seed_host_close(sess, step);
+            return rc ? rc : EAGAIN;
+        }
+        return EBUSY; /* A live resource must have an actual owning action. */
+    }
     return 0;
 }
 
@@ -24427,6 +25684,11 @@ wl_columnar_session_observed_drive(wl_col_session_t *sess,
             wl_columnar_session_test_observed_transaction_checkpoint(
                 sess->base.evaluation_control, 54, tx->head_count, NULL);
 #endif
+        if (tx->seed_route_started && rc && rc != EAGAIN && rc != EBUSY
+            && !tx->child_active) {
+            if (!tx->committed) wl_columnar_session_seed_host_error(step, rc);
+            return EAGAIN;
+        }
         if (rc == EAGAIN || rc == EBUSY) return EAGAIN;
         if (rc) {
             /* An active child must drain on its original attempt before the
@@ -24492,9 +25754,13 @@ wl_columnar_session_observed_dispose(wl_col_session_t *sess,
     if (step->observed_origin.disposal_registered
         && step->observed_origin.disposal_kind ==
         WL_COLUMNAR_SESSION_PRODUCER_MATCHING_ORIGINAL_ENDED
-        && tx->phase < WL_SESSION_OBSERVED_SCHEMA)
+        && !tx->originals_started)
         return wl_columnar_session_terminal_begin(sess, step, false);
     if (tx->child_active || sess->cleanup_active) return EBUSY;
+    bool seed_selected;
+    int seed_result = wl_columnar_session_seed_outer_drain(sess, step, true,
+            &seed_selected);
+    if (seed_selected) return seed_result;
     int rc = wl_columnar_session_observed_observer_resources(sess, step,
             false, true);
     if (rc) return rc;
@@ -24513,8 +25779,7 @@ wl_columnar_session_observed_dispose(wl_col_session_t *sess,
     if (rc) return rc;
     if (source_successor && wl_session_source_footer(&sess->base))
         return EAGAIN;
-    uint32_t originals = tx->phase <
-        WL_SESSION_OBSERVED_LEASES ? 0 : tx->old_count;
+    uint32_t originals = !tx->originals_started ? 0 : tx->old_count;
     if (originals > tx->old_count) originals = tx->old_count;
     if (tx->cleanup_index < originals) {
         wl_columnar_session_observed_original_t *original =
@@ -24546,7 +25811,7 @@ wl_columnar_session_observed_dispose(wl_col_session_t *sess,
     rc = wl_columnar_session_observed_observer_resources(sess, step,
             false, false);
     if (rc) return rc;
-    if (tx->phase >= WL_SESSION_OBSERVED_SCHEMA && tx->heads) {
+    if (tx->schema_started && tx->heads) {
         if (tx->round_owner) {
             rc = wl_columnar_session_recursive_retire(step, tx, tx->round_owner,
                     NULL, 0);
@@ -24591,7 +25856,7 @@ wl_columnar_session_observed_dispose(wl_col_session_t *sess,
                 NULL, 0, 1);
         return rc ? rc : EAGAIN;
     }
-    uint32_t entries = tx->phase < WL_SESSION_OBSERVED_SCHEMA ? 0 : tx->count;
+    uint32_t entries = !tx->schema_started ? 0 : tx->count;
     if (entries > tx->count) entries = tx->count;
     if (tx->dispose_index < entries) {
         if (!tx->entries || !tx->heads) return EINVAL;
@@ -24645,6 +25910,10 @@ wl_columnar_session_native_error_observed_dispose(wl_col_session_t *sess,
     if (!step->transaction_initialized)
         return wl_columnar_session_terminal_begin(sess, step, true);
     if (tx->child_active || sess->cleanup_active) return EBUSY;
+    bool seed_selected;
+    int seed_result = wl_columnar_session_seed_outer_drain(sess, step, true,
+            &seed_selected);
+    if (seed_selected) return seed_result;
     int rc = wl_columnar_session_observed_observer_resources(sess, step,
             true, true);
     if (rc) return rc;
@@ -24653,8 +25922,7 @@ wl_columnar_session_native_error_observed_dispose(wl_col_session_t *sess,
     rc = wl_columnar_session_main_action(sess, step,
             WL_COLUMNAR_SESSION_MAIN_DIFF, &tx->differential, NULL, 0);
     if (rc) return rc;
-    uint32_t originals = tx->phase <
-        WL_SESSION_OBSERVED_LEASES ? 0 : tx->old_count;
+    uint32_t originals = !tx->originals_started ? 0 : tx->old_count;
     if (originals > tx->old_count) originals = tx->old_count;
     if (tx->cleanup_index < originals) {
         wl_columnar_session_observed_original_t *original =
@@ -24687,7 +25955,7 @@ wl_columnar_session_native_error_observed_dispose(wl_col_session_t *sess,
     rc = wl_columnar_session_observed_observer_resources(sess, step,
             true, false);
     if (rc) return rc;
-    if (tx->phase >= WL_SESSION_OBSERVED_SCHEMA && tx->heads) {
+    if (tx->schema_started && tx->heads) {
         if (tx->round_owner) {
             rc = wl_columnar_session_native_error_recursive_retire(step, tx,
                     tx->round_owner,
@@ -24736,7 +26004,7 @@ wl_columnar_session_native_error_observed_dispose(wl_col_session_t *sess,
                 NULL, 0, 1);
         return rc ? rc : EAGAIN;
     }
-    uint32_t entries = tx->phase < WL_SESSION_OBSERVED_SCHEMA ? 0 : tx->count;
+    uint32_t entries = !tx->schema_started ? 0 : tx->count;
     if (entries > tx->count) entries = tx->count;
     if (tx->dispose_index < entries) {
         if (!tx->entries || !tx->heads) return EINVAL;
@@ -27754,6 +29022,7 @@ static bool
 wl_columnar_session_step_reset_quiet(const wl_col_session_t *sess,
     const wl_columnar_controlled_step_t *step, bool allow_pre_resource)
 {
+    if (!wl_columnar_session_seed_quiet(step)) return false;
     const wl_columnar_session_prepared_parent_t *p = step ?
         &step->prepared_parent : NULL;
     const wl_columnar_session_financier_t *f = step ?
@@ -28211,6 +29480,10 @@ col_controlled_step(wl_col_session_t *sess,
         if (observed) return observed;
     }
     wl_columnar_controlled_step_t *step = sess->controlled_step;
+    bool seed_selected;
+    int seed_result = wl_columnar_session_seed_outer_drain(sess, step, false,
+            &seed_selected);
+    if (seed_selected) return seed_result;
     wl_columnar_session_native_error_dispatch_result_t typed =
         wl_columnar_session_join_cleanup_dispatch(sess, step);
     if (!typed.selected) typed =
@@ -28494,6 +29767,8 @@ col_controlled_step(wl_col_session_t *sess,
     return col_controlled_step_drive(sess, sess->controlled_step, false);
 }
 
+/* Accepted close retains main's prepared/MAIN/terminal ownership. Independent
+ * seed resources close before main may dispose their transaction header. */
 static int
 wl_columnar_session_controlled_step_drain_for_destroy(wl_col_session_t *sess)
 {
@@ -28560,6 +29835,10 @@ wl_columnar_session_controlled_step_drain_for_destroy(wl_col_session_t *sess)
         wl_columnar_session_observer_error_dispatch(sess, step, true);
     if (observer_error.selected)
         return observer_error.protocol ? observer_error.protocol : EBUSY;
+    bool seed_selected;
+    int seed_result = wl_columnar_session_seed_outer_drain(sess, step, true,
+            &seed_selected);
+    if (seed_selected) return seed_result ? seed_result : EBUSY;
     int rc = 0;
     wl_columnar_session_native_error_dispatch_result_t terminal =
         wl_columnar_session_terminal_dispatch(sess, step);
@@ -29155,6 +30434,43 @@ col_session_controlled_step_state(const wl_session_t *session)
         : WL_CONTROLLED_STEP_PENDING;
 }
 
+/* Read-only admission protection for the real committed private financier.
+ * Construction proved the arrays/slot/snapshot lifetimes before publication.
+ * This helper neither selects a completion ticket nor authorizes Native work. */
+static bool
+wl_columnar_session_seed_committed_debt(const wl_col_session_t *sess,
+    const wl_columnar_controlled_step_t *step,
+    const wl_columnar_session_observed_transaction_t *tx)
+{
+    if (!tx || !tx->seed_selected || !tx->entries || !tx->heads
+        || tx->seed_slot >= tx->count || tx->head_count != 1
+        || !tx->seed_public_candidate) return false;
+    const col_rel_t *candidate = tx->seed_public_candidate;
+    const wl_columnar_eval_private_dynamic_binding_t *entry =
+        &tx->entries[tx->seed_slot];
+    if (!step->operation_active || !step->published || !tx->committed
+        || (tx->phase != WL_SESSION_OBSERVED_RETIRE
+        && tx->phase != WL_SESSION_OBSERVED_FINISH)) return false;
+    if (sess->rels != tx->published_registry ||
+        sess->nrels != tx->published_count
+        || sess->rels[tx->seed_slot] != candidate
+        || tx->heads[0].candidate != candidate) return false;
+    if ((uintptr_t)candidate == tx->seed_old_model_address
+        || candidate->relation_identity !=
+        tx->seed_public_snapshot.relation_identity
+        || candidate->view_generation !=
+        tx->seed_public_snapshot.view_generation
+        || candidate->storage_generation !=
+        tx->seed_public_snapshot.storage_generation)
+        return false;
+    if (entry->relation != candidate
+        || (tx->seed_retire_rebound ? entry->public_relation != candidate :
+        (uintptr_t)entry->public_relation !=
+        tx->seed_old_model_address)) return false;
+    return wl_columnar_session_observed_origin_current(sess, step)
+           && step->observed_origin.transaction == tx;
+}
+
 /* The optional handoff interface is paired even for a state-only observer.
  * No completion ticket is ever selected; consuming one is a protocol
  * violation, not a no-op acknowledgement. */
@@ -29176,12 +30492,39 @@ wl_columnar_session_controlled_step_observe(const wl_session_t *session,
     wl_backend_controlled_completion_t *selected_out)
 {
     (void)selected_out;
+    const wl_col_session_t *sess = COL_SESSION((wl_session_t *)session);
+    const wl_columnar_controlled_step_t *step = sess->controlled_step;
+    if (step && kind == WL_BACKEND_CONTROLLED_COMPLETION_STEP && dispatched
+        && !step->complete && step->operation_active
+        && step->transaction_initialized && step->transaction
+        && step->transaction->seed_selected
+        && wl_columnar_session_observed_origin_current(sess, step)
+        && step->observed_origin.transaction == step->transaction)
+        return WL_CONTROLLED_STEP_NATIVE_ERROR_CLEANUP_PENDING;
+    if (step && kind == WL_BACKEND_CONTROLLED_COMPLETION_STEP && dispatched
+        && step->transaction_initialized && step->transaction
+        && step->transaction->seed_selected && step->transaction->committed
+        && wl_columnar_session_seed_committed_debt(sess, step,
+        step->transaction))
+        return WL_CONTROLLED_STEP_NATIVE_ERROR_CLEANUP_PENDING;
+    if (step && step->seed_pending_owner) {
+        if (step->seed_pending_owner == step->transaction
+            && kind == WL_BACKEND_CONTROLLED_COMPLETION_STEP && dispatched) {
+            if (step->seed_observation_kind ==
+                WL_SESSION_SEED_OBSERVATION_ERROR) {
+                if (step->primary_result != 0)
+                    return WL_CONTROLLED_STEP_NATIVE_ERROR_CLEANUP_PENDING;
+            } else if (step->seed_observation_kind ==
+                WL_SESSION_SEED_OBSERVATION_COMMITTED
+                && wl_columnar_session_seed_committed_debt(sess, step,
+                step->transaction))
+                return WL_CONTROLLED_STEP_NATIVE_ERROR_CLEANUP_PENDING;
+        }
+    }
     wl_controlled_step_state_t state =
         col_session_controlled_step_state(session);
     if (kind != WL_BACKEND_CONTROLLED_COMPLETION_STEP || !dispatched ||
         state != WL_CONTROLLED_STEP_PENDING)return state;
-    const wl_col_session_t *sess = COL_SESSION((wl_session_t *)session);
-    const wl_columnar_controlled_step_t *step = sess->controlled_step;
     if (!step || !step->general_observed || !step->transaction_initialized ||
         !step->transaction || !step->transaction->rollback)return state;
     bool stale =
