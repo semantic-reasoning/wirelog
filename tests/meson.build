@@ -3467,7 +3467,7 @@ test_evaluation_materialized_body_exe = executable(
   link_with: [testlib_prod],
   install: false,
 )
-foreach materialized_body_mode : ['plain', 'batch', 'strict', 'limit', 'limit-denied', 'batch-cancel', 'batch-work', 'batch-ended', 'batch-successor', 'batch-error-ended']
+foreach materialized_body_mode : ['plain', 'batch', 'strict', 'limit', 'limit-denied', 'batch-cancel', 'batch-work', 'batch-ended', 'batch-successor', 'batch-error-ended', 'batch-memory-first', 'batch-memory-successor']
   test('evaluation_materialized_body_' + materialized_body_mode,
        test_evaluation_materialized_body_exe, args: [materialized_body_mode],
        suite: ['unit', 'tsan', 'evaluation_join_hosts'], timeout: 60)
