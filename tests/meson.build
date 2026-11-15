@@ -7839,8 +7839,21 @@ seed_physical_exe = executable('test_evaluation_seed_physical',
   dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
   link_with: [testlib_prod],
 )
-test('evaluation_seed_physical', seed_physical_exe,
-  suite: ['unit', 'tsan'], timeout: 120)
+# The complete physical matrix exceeded its 120-second CI watchdog in
+# PR run 43610325434. Preserve every family and its original timeout.
+foreach family : [
+  ['matrix', '--matrix'],
+  ['histories', '--histories'],
+  ['component_1', '--component-1'],
+  ['component_5', '--component-5'],
+  ['resource', '--resource-only'],
+  ['paid_tails', '--paid-tails'],
+  ['malformed', '--malformed'],
+  ['init', '--init'],
+]
+  test('evaluation_seed_physical_' + family[0], seed_physical_exe,
+    args: [family[1]], suite: ['unit', 'tsan', 'evaluation_seed_physical'], timeout: 120)
+endforeach
 
 seed_private_compact_exe = executable('test_evaluation_seed_private_compact',
   files('test_evaluation_seed_private_compact.c'),
@@ -7892,3 +7905,58 @@ test('recursive_cursor_parity', recursive_cursor_parity_exe,
   suite: ['unit', 'tsan'], timeout: 120)
 test('evaluation_join_forward_refusals', test_evaluation_expression_extensions_exe,
      args: ['join-forward'], suite: ['unit', 'tsan'], timeout: 120)
+
+# #2299 actual inline-seed canonical host and owning cleanup tails.
+seed_hosts_exe = executable('test_evaluation_seed_hosts',
+  files('test_evaluation_seed_hosts.c'),
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  c_args: ['-DWL_SESSION_TEST_HOOKS=1', '-DWL_COLUMNAR_MEMORY_TEST_HOOKS=1'],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
+  link_with: [testlib_prod_memory_hooks],
+)
+# All dynamic frontiers are partitioned by ordinal modulo32; no coverage cap
+# depends on how many actual turns a profile discovers. Keep the full no-arg
+# runner available locally, with bounded CI jobs under allocator perturbation.
+foreach family : [
+  'healthy-successor',
+  'maintenance-overflows',
+  'maintenance-credit',
+  'maintenance-native-underflows',
+  'maintenance-refusals',
+  'maintenance-native-dispose',
+  'positives',
+  'stops',
+  'child-error',
+  'governor-denials',
+  'name-vectors',
+  'committed-end',
+  'unloaded',
+  'snapshot-boundary',
+  'partial-init',
+  'birth-failures',
+  'compact-recompute',
+  'retained-header-end',
+  'parent-gate-literals',
+  'arena-attempt-restoration',
+  'partial-header-close',
+]
+  test('evaluation_seed_hosts_' + family, seed_hosts_exe,
+    args: [family], suite: ['unit', 'tsan', 'evaluation_seed_hosts'], timeout: 120)
+endforeach
+test('evaluation_seed_hosts_inactive_destructor', seed_hosts_exe,
+  args: ['inactive-destructor'], suite: ['unit', 'tsan', 'evaluation_seed_hosts'], timeout: 120)
+foreach observed : range(2)
+  test('evaluation_seed_hosts_retry_suffix_' + observed.to_string(), seed_hosts_exe,
+    args: ['retry-suffix', observed.to_string()],
+    suite: ['unit', 'tsan', 'evaluation_seed_hosts'], timeout: 120)
+  test('evaluation_seed_hosts_reader_binding_' + observed.to_string(), seed_hosts_exe,
+    args: ['reader-binding', observed.to_string()],
+    suite: ['unit', 'tsan', 'evaluation_seed_hosts'], timeout: 120)
+  foreach shard : range(32)
+    foreach family : ['frontier', 'partial-headers']
+      test('evaluation_seed_hosts_' + family + '_' + observed.to_string() + '_' + shard.to_string(),
+        seed_hosts_exe, args: [family, observed.to_string(), shard.to_string()],
+        suite: ['unit', 'tsan', 'evaluation_seed_hosts'], timeout: 120)
+    endforeach
+  endforeach
+endforeach

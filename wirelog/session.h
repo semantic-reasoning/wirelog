@@ -502,6 +502,9 @@ int wl_session_source_admission_state_read(wl_session_t *,
 wl_evaluation_control_source_phase_result_t
     wl_session_source_snapshot_metadata(wl_session_t *,
     wl_evaluation_control_source_action_fn, void *);
+wl_evaluation_control_source_phase_result_t
+    wl_session_source_private_financier_birth(wl_session_t *,
+    wl_evaluation_control_source_action_fn, void *);
 
 /* Observer financier close: one FINISH/report, saved-generation detach,
  * creation release or saved-value receipt action. No Native/BODY callback.

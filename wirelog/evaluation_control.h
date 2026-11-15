@@ -113,6 +113,9 @@ int wl_evaluation_control_begin(wl_evaluation_control_t *control,
 uint64_t wl_evaluation_control_active_attempt_id(
     const wl_evaluation_control_t *control);
 #ifdef WL_SESSION_TEST_HOOKS
+/* Active unlimited owner only: advance consumed, preserving all dispositions. */
+int wl_evaluation_control_test_seed_active_consumed(wl_evaluation_control_t *,
+    const void *owner, uint64_t id, uint64_t value);
 /* Inactive attached owner only; advance the generator without changing report. */
 int wl_evaluation_control_test_seed_attempt_id(wl_evaluation_control_t *control,
     const void *owner, uint64_t value);

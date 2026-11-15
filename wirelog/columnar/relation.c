@@ -28603,6 +28603,10 @@ wl_columnar_session_seed_step(wl_columnar_session_seed_t *a)
                     &a->sources[3], a->indices[a->position], a->values,
                     a->width));
         case 27:
+            if (!a->sources[3].timestamps)
+                WL_COLUMNAR_SESSION_SEED_CHILD(28,
+                    wl_columnar_relation_append_batch_numeric_row_operator_controlled
+                        (&a->batch, a->values, a->control, a->id));
             WL_COLUMNAR_SESSION_SEED_CHILD(28,
                 wl_columnar_relation_append_batch_selected_source_row_operator_controlled
                 (
@@ -28950,6 +28954,21 @@ wl_columnar_session_seed_end(wl_columnar_session_seed_t *a, int initiating,
 }
 
 #ifdef WL_SESSION_TEST_HOOKS
+int
+wl_columnar_session_seed_test_reader_view(const wl_columnar_session_seed_t *a,
+    uint64_t out[8])
+{
+    if (!a || a->identity != a || !out) return EINVAL;
+    out[0] = a->cleanup_stage;
+    out[1] = (uintptr_t)a->target_reader.token.owner;
+    out[2] = a->target_reader.descriptor_held;
+    out[3] = (uintptr_t)a->shadow_reader.token.owner;
+    out[4] = a->shadow_reader.descriptor_held;
+    out[5] = (uintptr_t)a->rule_reader.token.owner;
+    out[6] = a->rule_reader.descriptor_held;
+    out[7] = a->progress;
+    return 0;
+}
 int
 wl_columnar_session_seed_test_view(const wl_columnar_session_seed_t *a,
     uint64_t out[16])

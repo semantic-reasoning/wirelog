@@ -1001,14 +1001,45 @@ static void initialization_failures(void) {
     injection_mode = 0;
     fprintf(stderr, "physical seed: %zu Init cuts x5 passed\n", actions);
 }
+static void component_one(void) {
+    component_failures(1);
+}
+static void component_five(void) {
+    component_failures(5);
+}
+static void malformed_inputs(void) {
+    for (malformed_format = 1; malformed_format <= 3; malformed_format++)
+        run(1, 1, 1, 1);
+    malformed_format = 0;
+}
+typedef struct {
+    const char *selector;
+    void (*run)(void);
+} physical_family_t;
+static const physical_family_t physical_families[] = {
+    {"--matrix", matrix},
+    {"--histories", histories},
+    {"--component-1", component_one},
+    {"--component-5", component_five},
+    {"--resource-only", resource_order},
+    {"--paid-tails", paid_tails},
+    {"--malformed", malformed_inputs},
+    {"--init", initialization_failures},
+};
 int main(int argc, char **argv) {
-    if (argc == 2 && !strcmp(argv[1], "--resource-only")) {
-        resource_order(); return 0;
+    if (argc == 1) {
+        for (unsigned i = 0;
+            i < sizeof(physical_families) / sizeof(*physical_families); ++i)
+            physical_families[i].run();
+        return 0;
     }
-    CHECK(argc == 1);
-    matrix(); histories(); component_failures(1); component_failures(5);
-    resource_order(); paid_tails();
-    for (malformed_format = 1; malformed_format <= 3;
-        malformed_format++) run(1, 1, 1, 1);
-    malformed_format = 0; initialization_failures(); return 0;
+    if (argc == 2) {
+        for (unsigned i = 0;
+            i < sizeof(physical_families) / sizeof(*physical_families); ++i)
+            if (!strcmp(argv[1], physical_families[i].selector)) {
+                physical_families[i].run();
+                return 0;
+            }
+    }
+    return 2;
 }
