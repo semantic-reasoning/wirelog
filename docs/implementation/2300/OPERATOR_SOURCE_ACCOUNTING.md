@@ -941,3 +941,30 @@ exactly one diagnostic completion per grant, unchanged Original reports and
 successor consumption0, future unique signed events and actual governor
 balances. Direct controller tests separately prove live and ended foreign
 generation detach refusal, then clean up through the authentic current tuple.
+
+
+## JOIN qualification bundle for #2371
+
+The scenario inventory in [JOIN_DOMAIN_QUALIFICATION.md](JOIN_DOMAIN_QUALIFICATION.md)
+adds public numeric/STRING constant RHS histories and genuine materialized
+selected-body admission-denial/retry witnesses. The test commits do not change
+production operators, prices, quantum or support predicates, and do not admit
+new Source bounds. A real `charge_attempt(..., UINT64_MAX)` WORK injection is
+a stop/recovery witness, not an independently derived exact/one-short oracle.
+
+For #2370, bind the actual compiler-selected ordinary JOIN and materialized
+preserved-body owners, private filtered hash/unfiltered persistent destinations,
+producer preparation, caller/return, prepublication abort, report and ACK routes
+to the integrated source/configuration. Keep Original tariff, performed lower,
+Source upper, promise identity and inherited carry distinct. Positive row work,
+phase7 used_delta, a phase47 diagnostic or successful peer-credit release is
+not a certificate for a containing interval or simultaneous Native/Source carry.
+The materialized pressure test releases its real peer reservation only after
+producer ENOSPC/denial selection, before mandatory cleanup; it supplies a route
+witness and ownership assertion, not a changed funding boundary or cap.
+
+Complete accepted predicate/type/selector/representation intersections, remaining
+RUNNING/FINISH paths and required platform profiles remain open as listed in the
+inventory and closure matrix. In particular, Linux qualification does not waive
+the outstanding MSVC-C11 actor layout or full Source/caller proof. These precise
+handoffs preserve each enabling operator change's own X-row obligations.

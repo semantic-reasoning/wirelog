@@ -1,7 +1,7 @@
 # Issue #2300 completion matrix
 
 This ledger tracks the complete outcome of #2300 across its child issues.
-PR #2364 delivers the combined #2367/#2368 prepared-owner and retirement
+Merged PR #2364 delivered the combined #2367/#2368 prepared-owner and retirement
 bundle; it does not close #2300. An implemented component or passing functional
 test does not close a containing production row. No row below authorizes
 unlimited raw fallback, a new refusal of an otherwise accepted domain, or a
@@ -35,15 +35,15 @@ a prerequisite for this operator issue.
 
 | Row | Accepted domain and actual destination | Existing evidence | Remaining closure evidence | State |
 |---|---|---|---|---|
-| O04.1 | Ordinary keyed/product JOIN, projection, collision and right predicate | `evaluation_join`, serial JOIN and host tests; numeric selection and compact ordinal map | Complete accepted expression/representation matrix, caller intervals and financial obligations | OPEN |
-| O04.2 | Numeric and scalar/string right predicates, missing/present-empty/all-rejected | Numeric public ANTI and component JOIN/probes; scalar integration in progress | Full current expression context, accepted failure semantics, created-owner refusal/cleanup, actual generated destinations | OPEN |
-| O04.3 | Full/delta/empty right selection and future calls | Existing ordinary JOIN/host selectors; #2299 joined-string suffix full/deletion tests | Match each newly enabled predicate/materialized route to actual selector, signed metadata and retry | OPEN |
+| O04.1 | Ordinary keyed/product JOIN, projection, collision and right predicate | `evaluation_join`, serial JOIN and host tests; physical-row filtered hash chains; new public numeric/STRING RHS keyed/product histories with literal signed results and positive-work CANCEL/WORK retry | Complete accepted expression/representation matrix, caller intervals and financial obligations | OPEN |
+| O04.2 | Numeric and scalar/string right predicates, missing/present-empty/all-rejected | Numeric public ANTI and component JOIN/probes; public numeric/STRING constant RHS all-rejected/mixed histories and present-empty state; positive scalar post-JOIN composition | Full current expression context, accepted failure semantics, created-owner refusal/cleanup, actual generated destinations | OPEN |
+| O04.3 | Full/delta/empty right selection and future calls | Existing ordinary JOIN/host selectors; #2299 joined-string suffix full/deletion tests; new public RHS/left append and multiplicity-aware deletion histories (phase7 is only used_delta, not source identity) | Match each newly enabled predicate/materialized route to actual selector, signed metadata and retry | OPEN |
 | O05 | ANTI keyed/unkeyed, right filtering, absent/empty, keep-all | Numeric compiler-selected ANTI, literal/raw component cases | Remaining accepted predicates/types, resource/representation/caller/source profiles | OPEN |
 | O09 | SEMI keyed/unkeyed/projected and right filtering | Numeric explicit-IR probes and generated SIP components; 18 public-optimizer natural SEMI histories in plain/configured batch modes prove the actual owned probe, five RHS partitions, rejected/private-emit CANCEL/WORK, new-generation retry, literal signed future insert/delete, retained WORK ownership and final governor0 | Remaining accepted predicate/type/representation/policy/recursive products and containing Source/carry proof; generated final projection is separate from the SEMI leaf | OPEN |
 | O06.1 | Grouped/ungrouped COUNT and accepted numeric SUM/MIN/MAX/FLOAT AVG | `evaluation_numeric_operators`, generated serial/grouped tests | Computed operands, full type/group/result and empty/error/projection matrix | OPEN |
 | O06.2 | Accepted STRING SUM/MIN/MAX and computed operands | Generated STRING/computed literal/raw/public cases; bounded rank comparison; actual created-scalar-owner failure cleanup | Remaining type/group/result/error crossproducts and containing source/carry/representation profiles | OPEN |
-| F05 | Accepted materialized JOIN selection and its actual controlled destination | Compiler-bound K-fusion lineage selects the incrementally audited positive preserved body; natural plain/configured-batch histories verify actual whole-SCC/owned receivers, literal9→12→6, exact signed events and unchanged repeats; strict/output refusals match raw; genuine CANCEL/WORK, END7/live successor0 and earlier ENOMEM-before-END preserve cause and permit healthy retry | Complete policy/selector/representation and tight-memory/cache-equivalence partitions, remaining interruption boundaries, containing Source/carry and parent disposal | OPEN |
-| F05a | Persistent ordinary index/cache and filtered/private destination | Existing serial native-index owner; existing bounded fallback paths | Actual predicate/representation intersections, retained pins/deferred state, future reuse and error/cap behavior | OPEN |
+| F05 | Accepted materialized JOIN selection and its actual controlled destination | Compiler-bound K-fusion lineage selects the incrementally audited positive preserved body; natural plain/configured-batch histories verify actual whole-SCC/owned receivers, literal9→12→6, exact signed events and unchanged repeats; strict/output refusals match raw; genuine CANCEL/WORK, END7/live successor0 and earlier ENOMEM-before-END preserve cause and permit healthy retry; actual governor denial after committed selected-body preparation preserves ENOSPC, initial/prior public images and pending input, then retries the literal histories | Complete policy/selector/representation and tight-memory/cache-equivalence partitions, remaining interruption boundaries, containing Source/carry and parent disposal | OPEN |
+| F05a | Persistent ordinary index/cache and filtered/private destination | Existing serial native-index owner/reuse/refusal cases; public literal unfiltered keyed/plain build and filtered/private hash histories; configured unfiltered batch PRODUCE witness | Actual predicate/representation intersections, retained pins/deferred state, future reuse and error/cap behavior | OPEN |
 | X.P | Legal batch/pipeline operator intersections | Existing LFTJ, ordinary JOIN hosts, probes, aggregate batch owner, #2299 string suffix | Every newly enabled domain's producer/consumer/consume/ACK and policy/cutoff qualification | OPEN |
 | X.R | Legal recursive/frontier/deletion intersections | Existing narrow recursive routes and shared recovery contracts | Actual selected operator/type/representation paths, signed changes, interruption and future-call uniqueness | OPEN |
 | X.V | Accepted empty/nullary/wide/typed/owned/borrowed/segmented and metadata representations | Existing scalar/source/row/copy components and direct cases | Explicit operator-by-representation assertions; source adapters cannot imply absent algorithm support | OPEN |
@@ -112,12 +112,15 @@ component upper covers are distinct from the full Session caller, return and
 simultaneous Native/Source carry obligations. Production activation remains a
 required part of S.FIN.
 
-Preserve meaningful atomic commits inside the existing PR #2364. Its delivery
-gate is the complete acceptance of both #2367 and #2368: integrated prepared
-ownership and retirement, their actual local funding/caller/ACK bounds,
-independent raw/design/risk reviews and current platform CI including MSVC.
-Only that evidence permits Ready and `Closes #2367` / `Closes #2368`.
-Intermediate component tests do not close either child issue.
+PR #2364 is merged. Its remaining #2367/#2368 qualification obligations are
+not closed by that merge or by the JOIN test bundle. Subsequent work preserves
+meaningful atomic commits in coherent PR bundles, including the separate
+#2371 JOIN qualification work described in
+[JOIN_DOMAIN_QUALIFICATION.md](JOIN_DOMAIN_QUALIFICATION.md). That inventory
+separates actual public routes, component-only evidence and outstanding
+selector/representation/lifecycle/accounting/platform predicates. Its new
+tests do not close O04, F05/F05a or #2371. Issue-closing keywords require the
+complete corresponding acceptance, rather than an intermediate green suite.
 
 The remaining RUNNING/stream adapters belong to #2369; containing Source
 issuance, activation and correlated accounting belong to #2370. The bundle
