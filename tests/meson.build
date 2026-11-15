@@ -3445,6 +3445,20 @@ test_plan_body_ops_exe = executable(
 
 test('plan_body_ops', test_plan_body_ops_exe)
 
+test_evaluation_join_domains_exe = executable(
+  'test_evaluation_join_domains', files('test_evaluation_join_domains.c'),
+  c_args: ['-DWL_SESSION_TEST_HOOKS=1'],
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
+  link_with: [testlib_prod],
+  install: false,
+)
+foreach join_domain_mode : ['plain', 'batch']
+  test('evaluation_join_domains_' + join_domain_mode,
+       test_evaluation_join_domains_exe, args: [join_domain_mode],
+       suite: ['unit', 'tsan', 'evaluation_join_hosts'], timeout: 120)
+endforeach
+
 test_evaluation_materialized_body_exe = executable(
   'test_evaluation_materialized_body', files('test_evaluation_materialized_body.c'),
   c_args: ['-DWL_SESSION_TEST_HOOKS=1'],
