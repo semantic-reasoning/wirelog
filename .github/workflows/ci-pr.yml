@@ -601,6 +601,8 @@ jobs:
           echo "$(brew --prefix coreutils)/libexec/gnubin" >> "$GITHUB_PATH"
           echo "$(brew --prefix gnu-tar)/libexec/gnubin" >> "$GITHUB_PATH"
 
+      # Instrumentation coverage does not require repeated whole-program LTO;
+      # production LTO and its size/profile checks remain in the build jobs.
       # -Dexamples=false: skip the examples/ demos under sanitizers (each re-compiles the
       # full wirelog_sources instrumented); they are already covered by the non-sanitized legs.
       - name: Configure with sanitizers
@@ -608,6 +610,7 @@ jobs:
           meson setup builddir-san
           -Db_sanitize=address,undefined
           -Db_lundef=false
+          -Db_lto=false
           -Dtests=true
           -Dexamples=false
           --buildtype=debugoptimized

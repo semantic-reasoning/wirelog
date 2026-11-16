@@ -208,8 +208,9 @@ testlib_prod = static_library(
   include_directories: [wirelog_inc, wirelog_src_inc],
   dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
   c_args: testlib_prod_c_args,
+  # Native hook objects avoid repeating whole-engine LTO in every test link.
   # The MEMORY-hook variant below extracts a strict subset of these objects.
-  override_options: ['unity=off'],
+  override_options: ['unity=off', 'b_lto=false'],
 )
 
 # Hook-heavy fixtures need one governor/control implementation per executable.
@@ -234,22 +235,14 @@ testlib_prod_memory_hooks = static_library(
   include_directories: [wirelog_inc, wirelog_src_inc],
   dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
   c_args: testlib_prod_c_args + ['-DWL_COLUMNAR_MEMORY_TEST_HOOKS=1'],
-  override_options: ['unity=off'],
+  override_options: ['unity=off', 'b_lto=false'],
 )
 
-# Linux allocation wrappers need native objects throughout the link so Clang
-# can link with LTO disabled and --wrap can intercept production allocations.
+# Hook archives contain native engine objects: hundreds of test links must not
+# re-optimize the full engine with LTO. Production libraries retain project LTO.
+# Allocation wrappers use the same sources, hooks and dependencies, so this
+# alias also preserves their native-object interposition guarantee.
 testlib_prod_no_lto = testlib_prod
-if host_machine.system() == 'linux'
-  testlib_prod_no_lto = static_library(
-    'testlib_prod_no_lto',
-    testlib_prod_src,
-    include_directories: [wirelog_inc, wirelog_src_inc],
-    dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
-    c_args: testlib_prod_c_args,
-    override_options: ['b_lto=false'],
-  )
-endif
 
 source_access_exe = executable(
   'test_source_access',
@@ -7866,7 +7859,8 @@ radix_workspace_hook_lib = static_library('testlib_radix_workspace_hooks',
   include_directories: [wirelog_inc, wirelog_src_inc],
   dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
   c_args: testlib_prod_c_args + ['-DWL_COLUMNAR_MEMORY_TEST_HOOKS=1',
-    '-DWL_TEST_CONSOLIDATE_ALLOC_HOOK=1'], override_options: ['unity=off'])
+    '-DWL_TEST_CONSOLIDATE_ALLOC_HOOK=1'],
+  override_options: ['unity=off', 'b_lto=false'])
 radix_workspace_attempt_exe = executable('test_evaluation_radix_workspace',
   files('test_evaluation_radix_workspace.c'),
   include_directories: [wirelog_inc, wirelog_src_inc],
