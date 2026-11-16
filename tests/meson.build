@@ -3445,6 +3445,22 @@ test_plan_body_ops_exe = executable(
 
 test('plan_body_ops', test_plan_body_ops_exe)
 
+test_evaluation_join_inline_exe = executable(
+  'test_evaluation_join_inline', files('test_evaluation_join_inline.c'),
+  c_args: ['-DWL_SESSION_TEST_HOOKS=1'],
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
+  link_with: [testlib_prod],
+  install: false,
+)
+foreach join_inline_mode : ['observed', 'plain', 'snapshot']
+  test('evaluation_join_inline_' + join_inline_mode,
+       test_evaluation_join_inline_exe, args: [join_inline_mode],
+       env: ['WIRELOG_JOIN_BATCH_BYTES=', 'WIRELOG_JOIN_BATCH_STRICT=',
+             'WIRELOG_JOIN_OUTPUT_LIMIT='],
+       suite: ['unit', 'tsan', 'evaluation_join_hosts'], timeout: 120)
+endforeach
+
 test_evaluation_join_domains_exe = executable(
   'test_evaluation_join_domains', files('test_evaluation_join_domains.c'),
   c_args: ['-DWL_SESSION_TEST_HOOKS=1'],
