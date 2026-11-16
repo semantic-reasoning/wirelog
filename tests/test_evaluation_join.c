@@ -2731,9 +2731,43 @@ right_scalar_function_cases(void)
         }
 }
 
+/* Constructed internal descriptors verify the admission/error boundary;
+ * public compiler-selected representation histories live in join_inline. */
+static void
+inline_admission_boundaries(void)
+{
+    for (unsigned side = 0; side < 2; ++side)
+        for (unsigned kind = 0; kind < 4; ++kind) {
+            fixture_t f; fixture_init(&f, 2, 3, 5, 0);
+            col_rel_t *input = side ? f.registry[0] : f.left;
+            const col_rel_logical_col_t schema[] = {
+                {WIRELOG_COMPOUND_KIND_INLINE, 2, 1}
+            };
+            CHECK(!col_rel_apply_compound_schema(input, schema, 1));
+            CHECK(input->compound_kind == WIRELOG_COMPOUND_KIND_INLINE
+                && input->ncols == 2 && input->compound_arity_map[0] == 2);
+            if (kind == 1) input->compound_arity_map[0] = 3;
+            if (kind == 2) f.op.op = WL_PLAN_OP_SEMIJOIN;
+            if (kind == 3) f.op.op = WL_PLAN_OP_ANTIJOIN;
+            run(&f);
+            int expected = kind == 1 ? EINVAL : kind >= 2 ? ENOTSUP : 0;
+            CHECK(f.status.semantic_result == expected
+                && f.status.execution_result == expected
+                && !f.status.cleanup_result && f.status.committed == !expected);
+            eval_stack_t *stack = wl_columnar_eval_stack_cleanup_stack(f.frame);
+            CHECK(stack && stack->top == 1);
+            if (expected) CHECK(stack->items[0].rel == f.left);
+            else CHECK(stack->items[0].rel->nrows == 15
+                    && stack->items[0].rel->ncols == 4);
+            if (kind == 1) input->compound_arity_map[0] = 2;
+            fixture_close(&f);
+        }
+}
+
 int
 main(void)
 {
+    inline_admission_boundaries();
     filtered_probe_cases(); filtered_probe_error_and_stop_cases();
     probe_semantics(); probe_metadata(); probe_float_keys(); probe_rejections();
     probe_interrupts();
