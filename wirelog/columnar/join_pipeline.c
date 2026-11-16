@@ -1892,8 +1892,9 @@ wl_columnar_join_host_forward(wl_columnar_join_host_t *h)
         if (!rc) h->phase = WL_COLUMNAR_JOIN_HOST_LEFT_HOLD;
         return rc;
     case WL_COLUMNAR_JOIN_HOST_LEFT_HOLD:
-        rc = wl_columnar_relation_scalar_source_begin_attempt_controlled(
-            &h->left_source, h->left, false);
+        rc = wl_columnar_relation_scalar_source_admit_attempt_controlled(
+            &h->left_source, h->left, false, h->streaming ? 0u
+            : WL_COLUMNAR_RELATION_SOURCE_ADMIT_INLINE);
         if (!rc) h->phase = WL_COLUMNAR_JOIN_HOST_FULL;
         return rc;
     case WL_COLUMNAR_JOIN_HOST_FULL:
@@ -1968,8 +1969,9 @@ wl_columnar_join_host_forward(wl_columnar_join_host_t *h)
         if (!rc) h->phase = WL_COLUMNAR_JOIN_HOST_RIGHT_HOLD;
         return rc;
     case WL_COLUMNAR_JOIN_HOST_RIGHT_HOLD: {
-        rc = wl_columnar_relation_scalar_source_begin_attempt_controlled(
-            &h->right_source, h->right, false);
+        rc = wl_columnar_relation_scalar_source_admit_attempt_controlled(
+            &h->right_source, h->right, false, h->streaming ? 0u
+            : WL_COLUMNAR_RELATION_SOURCE_ADMIT_INLINE);
         if (rc) return rc;
         if (!h->left_source.width || !h->right_source.width) return EINVAL;
         uint64_t width = op->project_count ? op->project_count
@@ -2221,6 +2223,19 @@ wl_columnar_join_host_forward(wl_columnar_join_host_t *h)
         }
         if (!h->row_fits) {
             if (r->session->join_batch_strict) return ENOTSUP;
+            r->join_host_declined = true;
+            h->phase = WL_COLUMNAR_JOIN_HOST_ABORT;
+            return 0;
+        }
+        /* INLINE lanes are consumed by the ordinary bounded JOIN, after
+         * the same strict successor/cache/row-fit checks as a scalar host.
+         * Drain both authenticated readers before handing off. Streaming
+         * tails retain their scalar-only admission and post-consumer caps. */
+        if (!h->streaming &&
+            (h->left_source.descriptor->compound_kind ==
+            WIRELOG_COMPOUND_KIND_INLINE ||
+            h->right_source.descriptor->compound_kind ==
+            WIRELOG_COMPOUND_KIND_INLINE)) {
             r->join_host_declined = true;
             h->phase = WL_COLUMNAR_JOIN_HOST_ABORT;
             return 0;
