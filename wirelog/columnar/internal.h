@@ -9345,10 +9345,22 @@ typedef struct wl_columnar_eval_stack_unary_prepared {
     /* Confirmation is earned by the paid ordinary JOIN context proof. */
     bool join_mode, publication_is_delta;
 } wl_columnar_eval_stack_unary_prepared_t;
-typedef char wl_columnar_eval_stack_prepared_size_fits_t[
-        sizeof(wl_columnar_eval_stack_unary_prepared_t) <= 392 ? 1 : -1];
-typedef char wl_columnar_eval_stack_prepared_work_fits_t[
-        sizeof(wl_columnar_eval_stack_unary_prepared_work_t) <= 256 ? 1 : -1];
+/* Construction, cancellation and work clearing zero the owner and its work
+ * in separately funded steps of at most one chunk: INIT_CLEAR and
+ * INIT_CANCEL under the 256 INIT action (at most 252), CLEAR_WORK under 128
+ * (at most 92) and FINISH_CLEAR_WORK under 128 (at most 98), as inventoried
+ * in docs/implementation/1821/SERIAL_COVERAGE.md. A step is priced by the
+ * chunk, not by the layout; the target ABI only sets how many funded steps
+ * run, e.g. 7 owner and at most 4 work steps on Linux LP64, 6 and 4 on
+ * native MSVC x64, and 7 and 5 with MSVC C11 threads (16-byte thrd_t). The
+ * byte cursors are uint32_t. */
+enum { WL_COLUMNAR_EVAL_STACK_PREPARED_CLEAR_CHUNK = 64 };
+typedef char wl_columnar_eval_stack_prepared_clear_steps_fit_t[
+        WL_COLUMNAR_EVAL_STACK_PREPARED_CLEAR_CHUNK == 64
+        && (uint64_t)sizeof(wl_columnar_eval_stack_unary_prepared_t)
+        <= UINT32_MAX
+        && (uint64_t)sizeof(wl_columnar_eval_stack_unary_prepared_work_t)
+        <= UINT32_MAX ? 1 : -1];
 
 typedef struct {
     wl_columnar_eval_stack_unary_prepared_phase_t phase;
