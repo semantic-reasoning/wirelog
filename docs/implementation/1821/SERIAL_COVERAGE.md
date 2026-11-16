@@ -81,8 +81,8 @@ expressions. The numeric/composed child validation remains authoritative.
 | O04 / S03 / JOIN | `wl_columnar_join_op_attempt_start_owned`; product/keyed, collisions, right predicate, projection; non-materialized ordinary route | Session/frame; A hash/probe/candidate/right-filter tails, nested source/scratch U; F | `test_controlled_session_join_step`, `test_entry_generated_right_filter_collisions_and_stop`, `test_entry_generated_right_filter_product_work_boundary`; materialized/differential/batch alternatives F01–F05 |
 | O05 / S04 / ANTIJOIN | `wl_columnar_join_probe_op_attempt_start_owned`; membership/nonmembership child | Session enum admitted, private scalar child restrictions; A child charges, whole host/config bound U; F | `test_entry_generated_operators`; complete predicate/type/fallback session matrix missing, G5 |
 | O06 / S02 / REDUCE | `wl_columnar_ops_reduce_attempt_start_owned`; grouped/ungrouped COUNT and numeric aggregates | Session/frame restricted; charged input/group/sort/projection; whole region U; F | `test_entry_generated_reduce_work_limit`, `test_entry_generated_grouped_count_work_limit`, `test_entry_generated_grouped_numeric_reduce_work_limit`; remaining aggregate/type/error matrix G5; a never-inserted EDB input (#2301), `evaluation_empty_edb_sources` |
-| O07 / S05 / CONCAT | Composed dispatcher → `wl_columnar_merge_concat_attempt_start_owned`; stack union inputs | Session/frame; charged source/copy/handoff; Q256 managed copies, complete ownership combinations U; F | `test_generated_union`, `test_entry_generated_operators`; owned/borrowed/segmented/typed combinations G5; UNION bodies whose branch reads an INLINE EDB (#2301), `evaluation_compound_sources`; CONCAT inputs there are MAP outputs with no compound layout, so direct compound, segmented, timestamped and spill inputs stay open |
-| O08 / S05 / CONSOLIDATE | `wl_columnar_filter_consolidate_attempt_start_owned`; sort/dedup, ordinary versus differential selection | Session/frame ordinary; charged comparison/copy, cleanup U; F | `evaluation_consolidate`, `evaluation_numeric_plan`: `test_owned_consolidate_successor`; differential branch F04, remaining representations G5/G6; the same compound-sourced UNION and single-rule bodies (#2301), with NONE inputs |
+| O07 / S05 / CONCAT | Composed dispatcher → `wl_columnar_merge_concat_attempt_start_owned`; stack union inputs | Session/frame; charged source/copy/handoff; Q256 managed copies, complete ownership combinations U; F | `test_generated_union`, `test_entry_generated_operators`; owned/borrowed/segmented/typed combinations G5; UNION bodies whose branch reads an INLINE EDB (#2301), `evaluation_compound_sources`; CONCAT inputs there are MAP outputs with no compound layout; `evaluation_source_shapes` and a search found no direct compound, segmented or timestamped/weighted CONCAT input in controlled single-worker sessions, and spill sources stay excluded; see "Source shapes in controlled single-worker sessions (#2301)" |
+| O08 / S05 / CONSOLIDATE | `wl_columnar_filter_consolidate_attempt_start_owned`; sort/dedup, ordinary versus differential selection | Session/frame ordinary; charged comparison/copy, cleanup U; F | `evaluation_consolidate`, `evaluation_numeric_plan`: `test_owned_consolidate_successor`; differential branch F04, remaining representations G5/G6; the same compound-sourced UNION and single-rule bodies (#2301), with NONE inputs; no direct compound, segmented or timestamped/weighted input found in controlled single-worker sessions (#2301), see "Source shapes in controlled single-worker sessions (#2301)" |
 | O09 / S04 / SEMIJOIN | Same owned probe child as ANTIJOIN, membership output | Session enum admitted, restricted scalar child; A child charges, whole host/config bound U; F | `test_entry_generated_operators`; SIP/predicate/fallback session qualification G5 |
 | O10 / S07,S13 / K_FUSION | Raw `col_op_k_fusion`; rejected by controlled session operator preflight | P scheduling, R serial payload; Refused; no controlled session owner | Admission matrix proves refusal before frame; #1822 for coordination, serial fallback G3/G4 |
 | O11 / S06 / LFTJ | Real default serial session → framed composed LFTJ child; source resolution/readers, allocation, copy, merge-sort, seek/join, output and retirement | Session/frame, nonrecursive one-worker admitted domain; A scalar work and sliced preparation; complete changed source uppers ≤256 plus named narrow native/library boundaries; S/F/L/O | `evaluation_lftj_hosts` domains/recovery/failures/admission/native/metadata-native/microsteps/policy/qualification, numeric-plan exact oracles; [#2298 acceptance](../2298/LFTJ_ACCEPTANCE.md) |
@@ -103,7 +103,7 @@ controlled fallback.
 | F04 / S08 | `diff_operators_active` selects `wl_columnar_join_diff_op` and `col_op_consolidate_diff`; trace/arrangement updates and `diff_join_batch.c` | R, refused at controlled host/numeric/composed entry; U; no integrated stop owner | `diff_join` is raw reference only. `arrangement.c:diff_registry_grow` also refuses an active evaluation attempt; G3 must integrate trace/registry/retraction ownership with #1820 |
 | F05 / S03 | Materialized JOIN versus named ordinary right source | R, owned ordinary child explicitly excludes `op->materialized`; unsupported private variants must not fall through raw execution; U for required materialized path | Composed abort-support validation distinguishes materialized JOIN; `test_entry_abort_and_unsupported_abort`; execution/refusal coverage by representation still G5 |
 | F06 / S06 | Raw sorted/cache inputs replaced by controlled per-attempt owned copy/sort/seek under real session owner | Qualified bounded alternative; raw cache reuse is optional, full materialized source/typed output and signed successor effects preserved; S/F/L | `test_successors`, `qualification_cache`, `test_lftj_nonoutput_seek`, `test_lftj_aggregate_successors`, raw `lftj_integration`; [acceptance](../2298/LFTJ_ACCEPTANCE.md) |
-| F07 / S01,S05 | Scalar source/owned output versus retained, segmented, compound, timestamped/weighted or spill-backed relation representations | R; each child/source admission must have a disposition; no blanket representation support claimed; F / U | `evaluation_copy`, `evaluation_relation_creation`, `evaluation_output_materialization`, retained-input fixtures; qualify source rejection/materialization and signed metadata, G5. PR #2270 owns its spill-weight feature, not this audit. #2301 first bundle: INLINE sources through VARIABLE and MAP; see the section on inline compound sources |
+| F07 / S01,S05 | Scalar source/owned output versus retained, segmented, compound, timestamped/weighted or spill-backed relation representations | R; each child/source admission must have a disposition; no blanket representation support claimed; F / U | `evaluation_copy`, `evaluation_relation_creation`, `evaluation_output_materialization`, retained-input fixtures; qualify source rejection/materialization and signed metadata, G5. PR #2270 owns its spill-weight feature, not this audit. #2301 first bundle: INLINE sources through VARIABLE and MAP; see the section on inline compound sources. #2301: no lazy-owner, aliased, pool- or arena-owned, segmented or timestamped/weighted source found in controlled single-worker sessions, `evaluation_source_shapes`; see "Source shapes in controlled single-worker sessions (#2301)" |
 | F08 / S05,S07 | Legacy recursive merge/dedup versus managed incremental candidate/union | R; `wl_columnar_merge_incremental_delta_attempt_advance` caps a call at Q256; generic legacy recursive path remains U; S/F | Restricted recursive session tests and `evaluation_work`/`evaluation_consolidate` primitives; general frontier/retraction integration G3 |
 | F09 / S11 | Governor admission, allocator/Arrow release, CAS/control references, receipt retirement and registry replacement | R engine setup/cleanup; external allocator body is noninterruptible, engine copies/scans are not thereby excluded; U unless separately precharged/bounded | Allocation/copy/receipt tests establish local tariffs, not all nested bounds; G6 must name each finite region, charge before allocation, retain resources on every failure |
 | F10 / S10,S12 | Observer/snapshot preparation → final poll → prepaid callback batch | H for callback duration; R for charged engine preparation/assembly/traversal/lookup, retained mandatory cleanup; O, A/Q64 before cutoff | `test_controlled_snapshot_preparation` and the G2 multihead/wide/budget fixtures cover preparation stops, late cancellation and finite publication. Nested policy/configuration obligations remain G6 |
@@ -124,8 +124,8 @@ references, not interruption evidence.
 | F04a | Differential arrangement/trace persistent transaction versus ephemeral hash fallback | Raw fallback must leave no transaction state; controlled entry refuses active differential mode and active-attempt registry growth. Integrated stop owner absent; G3, #1820 |
 | F05a | Ordinary keyed persistent arrangement/probe bundle versus ephemeral hash; cached right filter versus operation-owned filtered relation | General serial STEP owns a private native index registry for full-right public EDB INT64 JOIN, with bounded creation/reuse/probes and a common head/index cutoff. Existing pins/pending/deferred entries refuse replacement. Filtered/private-head/batch representations retain their previous controlled disposition; this does not qualify raw cache alternatives, G5/G6 |
 | F06a | LFTJ cache/probe versus owned source rebuild and raw output callback versus private owned-row append | Controlled session uses per-attempt bounded rebuild, no unlimited raw fallback; actual writer/ROW/ACK/drain ownership and precommit/postcutoff delivery qualified | Host failure/native/microsteps/policy and `test_lftj_postcut_delivery`; current-generation raw probe/pin checks; [source map](../2298/LFTJ_SOURCE_ACCOUNTING.md) |
-| F07a | Scalar-source compound kind NONE versus INLINE/SIDE, declared schema/type validity, timestamps and row weights | Admission predicates differ by child; no cross-operator representation support inferred. Managed copies/readers can be bounded while a surrounding child refuses the representation; G5. #2301: VARIABLE, MAP and FILTER admit compound_kind INLINE after a metered arity-map check; ordinary JOIN also admits INLINE through the existing bounded reader (#2371); SEMIJOIN/ANTIJOIN remain scalar-only; compound_kind SIDE stays ENOTSUP |
-| F07b | Retained/borrowed/owned, contiguous/segmented/spill-backed storage and empty/nullary/wide rows | Source reader/descriptor and copy helpers must preserve representation and governor state; capacity/overflow errors remain errors. Enumerated qualification combinations, not an invitation to raw fallback; G5/G6. #2301: borrowed public INLINE descriptors, empty, wide and arity-1 INLINE layouts; controlled sessions refuse cold (spill-backed) sources at seal; a never-inserted EDB through MAP, FILTER and REDUCE on the unobserved STEP |
+| F07a | Scalar-source compound kind NONE versus INLINE/SIDE, declared schema/type validity, timestamps and row weights | Admission predicates differ by child; no cross-operator representation support inferred. Managed copies/readers can be bounded while a surrounding child refuses the representation; G5. #2301: VARIABLE, MAP and FILTER admit compound_kind INLINE after a metered arity-map check; ordinary JOIN also admits INLINE through the existing bounded reader (#2371); SEMIJOIN/ANTIJOIN remain scalar-only; compound_kind SIDE stays ENOTSUP; no timestamped/weighted source found in controlled single-worker sessions, `evaluation_source_shapes` (#2301), see "Source shapes in controlled single-worker sessions (#2301)" |
+| F07b | Retained/borrowed/owned, contiguous/segmented/spill-backed storage and empty/nullary/wide rows | Source reader/descriptor and copy helpers must preserve representation and governor state; capacity/overflow errors remain errors. Enumerated qualification combinations, not an invitation to raw fallback; G5/G6. #2301: borrowed public INLINE descriptors, empty, wide and arity-1 INLINE layouts; controlled sessions refuse cold (spill-backed) sources at seal; a never-inserted EDB through MAP, FILTER and REDUCE on the unobserved STEP; no lazy-owner, aliased or segmented source found in controlled single-worker sessions, `evaluation_source_shapes`, see "Source shapes in controlled single-worker sessions (#2301)" |
 
 ## Configuration predicates
 
@@ -2742,7 +2742,10 @@ attached: begin and seal return `WL_COLUMNAR_SPILL_UNSUPPORTED` once their
 argument and busy checks pass, append and finish find no cold loader and return
 `WL_COLUMNAR_SPILL_INVALID`, and such a session never holds a cold source; and
 lazy-owner descriptors, which the reader refuses with ENOTSUP and whose session
-reachability was not traced. #2301 is not closed by this bundle.
+reachability was not traced. #2301 is not closed by this bundle. A later unit
+records the search for the segmented, timestamped/weighted and lazy-owner
+items, and for the timestamps and owners also a test; see "Source shapes in
+controlled single-worker sessions (#2301)".
 
 ### Never-inserted EDB sources through MAP, FILTER and REDUCE (#2301)
 
@@ -2967,3 +2970,112 @@ financier overflow, constructor/terminal failure, committed END, reader closure,
 failed arena return and MAIN moved-credit ENOMEM. The original numeric fixture
 entries retain their programs and assertions. The new fixture does not grant
 recursive, SOURCE/C1, batch or evaluating SNAPSHOT authority.
+
+### Source shapes in controlled single-worker sessions (#2301)
+
+The controlled scalar source reader
+(`wl_columnar_relation_constructor_attempt_source_acquire`) refuses with
+ENOTSUP a relation whose `storage_owner` is NULL, a lazy owner, and the
+controlled admissions refuse an alias, a pool- or arena-owned relation and a
+shared column, with ENOTSUP or, at the seed quiesce and retraction checks, with
+EBUSY. Neither refuses a timestamped relation: the reader keeps or drops the
+timestamps as its caller asks. A search at e93020a3 for the writers of
+`storage_owner`, the callers of `col_rel_install_shared_view`, of
+`wl_columnar_session_install_shared_view` and of the pool allocators
+(`col_rel_pool_new_like`, `col_rel_pool_new_auto` and
+`wl_columnar_relation_pool_new_like_governed_checked`), the writers of a
+non-NULL `seg_boundaries` and the callers of `col_rel_enable_timestamps` found
+none of these shapes on a path that a controlled single-worker session takes.
+
+The relation constructors and commit paths found (`col_rel_alloc`,
+`wl_columnar_relation_alloc_governed`, the pool allocators,
+`col_rel_deep_copy`, the controlled constructors, the seed base step, the image
+and replacement commits and `session_pool_rel_promote`) set the owner to the
+relation itself; the one assignment of another relation found is the shared
+view install, whose callers follow. The NULL assignments found are destruction
+and retirement tombstones, rollbacks to a NULL that was already there, and the
+reset of a recycled pool slot in `session_pool_rel_promote`. A second
+lazy-owner refusal, J1, is in
+`wl_columnar_relation_new_like_governed_checked_mode_controlled`, which is
+reached directly and through
+`wl_columnar_relation_new_like_governed_checked_controlled` only from
+`evaluation_relation_creation`. The callers of `col_rel_install_shared_view`
+found are TDD, worker and K-Fusion code, and those of
+`wl_columnar_session_install_shared_view`, which installs a view with a lease,
+are TDD code. The pool allocators set the pool and arena flags, and their
+callers found are uncontrolled: the operator implementations (`col_op_*`,
+`wl_columnar_join_op` and its spill, cold, diff, semijoin and antijoin
+siblings, `wl_columnar_filter_op` and its right filters), the plan body and
+empty-push helpers, the join pipeline setup, the framed and recursive serial
+paths and K-Fusion; `session_add_rel` promotes a pool slot to the heap.
+
+A segmented input is a stack entry with `seg_boundaries`, not a relation, and
+the reader does not see it; the controlled stack paths check the boundaries
+themselves. The search found a non-NULL value written by the uncontrolled
+`col_op_concat` (`merge.c`) and by a `WL_SESSION_TEST_HOOKS` hook in
+`eval_stack.c`, and copied from an input entry to an output entry. Timestamps,
+which carry the row weights, are enabled by the uncontrolled serial recursion
+(`eval_serial.c`), by TDD and worker code, by propagation from an input that
+already has them, and by `col_session_remove_incremental` when the relation or
+its previous delta already has them. The controlled recursive route and the
+general observed transaction refuse a timestamped relation; no other refusal of
+one on a controlled evaluation route was found, so the disposition for a
+timestamped source on another controlled route is the absence the search and
+the test below record, not a refusal.
+
+`evaluation_source_shapes` runs a corpus of generated programs through a
+controlled session and an uncontrolled one with the same scripted operations:
+UNIONs of two and three EDBs, removals, observed and unobserved STEPs and
+evaluating SNAPSHOTs, negation, COUNT and COUNT over a UNION, a JOIN with a
+FILTER, a self-join UNION, FLOAT and expression UNIONs, two strata, loaded
+facts, transitive closures (snapshot first, removals, a reversed body, a UNION
+body, mutual recursion and downstream strata), an INLINE compound UNION, heads
+declared with an inline compound column, among them one read back as a compound
+by a later stratum, and facts loaded into a rule head. The controlled session
+runs under the minimum memory budget and returns EAGAIN many times before an
+evaluation completes; the calls of the two sessions are not compared one by
+one. After each scripted operation, and after each EAGAIN return of a
+controlled evaluation, the test checks that every relation registered in the
+controlled session, seed shadows among them, owns its storage and has no
+timestamps, no pool or arena ownership, no shared column and no alias borrow,
+and it checks the same for the output of every publication that the
+`WL_SESSION_TEST_HOOKS` physical-publication hook observes in the controlled
+session and for its input, the left input of a binary operator. Both sessions
+return 0 for each scripted insert, removal and fact load, complete each
+evaluation with 0 and hold the same image of the head each case names after it,
+and every relation registered in the controlled session after it, other than an
+EDB and a `$` relation, intermediate heads among them, has an uncontrolled
+counterpart and compound_kind NONE in both sessions. For five of the programs,
+a cancellation and a work-limit stop at the first publication of each listed
+operator (`$map`, `$join`, `$concat`, `$reduce`, `$consol`) in the first
+evaluation are checked: the stop code and a clean walk after the stop, a clean
+walk after the reset, and all of the above after the retry. Later publications
+of the same operator are not stopped.
+
+The checker is tested on synthetic descriptors, and the layout check on the
+inline-declared EDB of one case, which carries compound_kind INLINE. At every
+stamp of the uncontrolled serial recursion the checker sees the timestamps on
+the stamped delta. That delta is not registered and its head gets timestamps
+after the stamp hook, so the walk finds a registered timestamped relation only
+where another head of the recursion already carries them: in the corpus, at
+stamps of the mutual recursion, and the test requires such a find there. The
+test requires that no controlled evaluation of the run, the stopped and retried
+ones included, reaches that stamp. The parser refuses a rule that copies a
+whole compound into a head, by a compound term in the head or by a variable
+bound to a whole inline column, and the test checks both refusals; a head with
+an inline compound column is written from its slots. In the corpus, the left
+input of each CONCAT and CONSOLIDATE that the hook observes, and every output
+it observes, has compound_kind NONE, so no observed CONCAT or CONSOLIDATE
+received a direct compound input on its left; the limits below say how far that
+covers a right input. No retired `$out$` relation appeared in the controlled
+session at any of the walks above; `evaluation_facts_sources` checks the
+controlled evaluation of heads with input, and its broader support stays open.
+
+Limits: plans that the controlled preflight refuses (K_FUSION, EXCHANGE, worker
+and TDD plans), SIDE compound EDBs, more than one worker, cold and spill
+sources and memory-budget denials were not run; segments are covered by the
+search only, since a test cannot see stack entries; the right input of a binary
+operator is checked only through the codes it yields and, when it is the output
+of a publication the hook observes, at that publication; relations that exist
+only within a single call are checked only when the hook passes them;
+publications at sites the hook does not observe are not checked.
