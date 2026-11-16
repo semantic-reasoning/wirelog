@@ -2958,3 +2958,12 @@ removal and overlap with a rule-derived row. Precommit cancellation leaves the
 seed shadow's pending boundary unchanged; successful publication commits that
 boundary beside the head, so an old seed row is not reported again. Broader
 heads-with-input and SNAPSHOT support stays open in #2301.
+
+
+The declared observed canonical seed route additionally has its own32 dynamic
+public-frontier shards and `declared-lifecycle` family. They use the actual
+fully declared identity program for every census/replay and for memory denial,
+financier overflow, constructor/terminal failure, committed END, reader closure,
+failed arena return and MAIN moved-credit ENOMEM. The original numeric fixture
+entries retain their programs and assertions. The new fixture does not grant
+recursive, SOURCE/C1, batch or evaluating SNAPSHOT authority.
