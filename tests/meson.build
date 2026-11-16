@@ -3458,7 +3458,8 @@ test_evaluation_join_inline_exe = executable(
   link_with: [testlib_prod],
   install: false,
 )
-foreach join_inline_mode : ['observed', 'plain', 'snapshot']
+foreach join_inline_mode : ['observed', 'plain', 'snapshot',
+                            'configured-observed', 'configured-plain', 'configured-snapshot']
   test('evaluation_join_inline_' + join_inline_mode,
        test_evaluation_join_inline_exe, args: [join_inline_mode],
        env: ['WIRELOG_JOIN_BATCH_BYTES=', 'WIRELOG_JOIN_BATCH_STRICT=',

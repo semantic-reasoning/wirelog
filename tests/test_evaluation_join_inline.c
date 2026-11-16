@@ -1,4 +1,7 @@
 /* Natural ordinary JOIN over INLINE sources: physical lanes and real retry. */
+#ifndef _WIN32
+#define _DEFAULT_SOURCE 1
+#endif
 #include "../wirelog/columnar/internal.h"
 #include "../wirelog/exec_plan_gen.h"
 #include "../wirelog/session.h"
@@ -24,6 +27,16 @@ typedef struct {
     capture_t events;
 } fixture_t;
 static fixture_t *active;
+static bool configured;
+static void
+configure(const char *name, const char *value)
+{
+#ifdef _WIN32
+    CHECK(!_putenv_s(name, value ? value : ""));
+#else
+    CHECK(value ? !setenv(name, value, 1) : !unsetenv(name));
+#endif
+}
 static unsigned inline_seen, pairs, filter_rows, mode;
 static uint32_t right_row;
 static bool stopped, joined_rejected;
@@ -225,8 +238,19 @@ run(unsigned kind, unsigned route, unsigned fault)
         ".decl b(k:int64,p:pair(symbol,int64) inline,flag:int64)\n"
         ".decl out(x:int64,y:string)\nout(x,y):-a(pair(tag,v),k,x),b(j,pair(y,w),1),strlen(y)>2.\n"
     };
+    const char *unfiltered[] = {
+        ".decl a(p:pair/2 inline,k:int64,x:int64)\n.decl b(k:int64,y:int64,flag:int64)\n"
+        ".decl out(x:int64,y:int64)\nout(x,y):-a(pair(v,w),k,x),b(k,y,flag).\n",
+        ".decl a(k:int64,x:int64)\n.decl b(p:pair/2 inline,k:int64,y:int64,flag:int64)\n"
+        ".decl out(x:int64,y:int64)\nout(x,y):-a(k,x),b(pair(v,w),k,y,flag).\n",
+        ".decl a(p:pair(symbol,float) inline,k:int64,x:int64)\n"
+        ".decl b(k:int64,p:pair(symbol,int64) inline,flag:int64)\n"
+        ".decl out(x:int64,y:string)\nout(x,y):-a(pair(tag,v),k,x),b(k,pair(y,w),flag).\n"
+    };
     wirelog_error_t error;
-    f.program = wirelog_parse_string(texts[kind], &error);
+    f.program =
+        wirelog_parse_string(configured ? unfiltered[kind] : texts[kind],
+            &error);
     CHECK(f.program && !wl_plan_from_program(f.program, &f.plan));
     CHECK(f.plan->stratum_count == 1 && f.plan->strata[0].relation_count == 1);
     const wl_plan_relation_t *p = &f.plan->strata[0].relations[0];
@@ -236,7 +260,9 @@ run(unsigned kind, unsigned route, unsigned fault)
             CHECK(!join); join = &p->ops[i];
         }
     CHECK(join && !strcmp(join->right_relation,
-        "b") && join->right_filter_expr.size
+        "b") &&
+        (configured ? !join->right_filter_expr.size :
+        join->right_filter_expr.size)
         && join->key_count == (kind == 3 ? 0u : 1u));
     if (kind != 3) CHECK(!strcmp(join->left_keys[0],
             kind == 1 ? "col0" : "col2")
@@ -261,6 +287,9 @@ run(unsigned kind, unsigned route, unsigned fault)
     wl_session_options_t options; wl_session_options_init(&options);
     options.evaluation_control = f.control;
     options.memory_governor = f.governor;
+    configure("WIRELOG_JOIN_BATCH_BYTES", configured ? "256" : NULL);
+    configure("WIRELOG_JOIN_BATCH_STRICT", NULL);
+    configure("WIRELOG_JOIN_OUTPUT_LIMIT", NULL);
     CHECK(!wl_session_create_with_options(wl_backend_columnar(), f.plan, 1,
         &options, &f.s));
     CHECK(!wl_session_create(wl_backend_columnar(), f.plan, 1, &f.raw));
@@ -279,7 +308,10 @@ run(unsigned kind, unsigned route, unsigned fault)
     for (unsigned stage = 0; stage < 3; ++stage) {
         for (unsigned i = 0; i < 2; ++i) {
             if (!stage) for (unsigned n = 0; n < 4;
-                    ++n) right_change(&f, sessions[i], n, false);
+                    ++n) {
+                    if (!configured || n == 0 || n == 3)
+                        right_change(&f, sessions[i], n, false);
+                }
             else if (stage == 1) {
                 if (kind) insert_left(&f, sessions[i], 1, 3);
                 else right_change(&f, sessions[i], 4, false);
@@ -344,7 +376,8 @@ run(unsigned kind, unsigned route, unsigned fault)
         }
     }
     CHECK(inline_seen == (kind == 0 ? 1u : kind == 1 ? 2u : 3u)
-        && pairs && filter_rows && joined_rejected);
+        && pairs &&
+        (configured ? !filter_rows : filter_rows && joined_rejected));
     wl_columnar_join_test_attempt_checkpoint = NULL; active = NULL;
     CHECK(!wl_session_try_destroy(&f.s) && !wl_session_try_destroy(&f.raw));
     wl_evaluation_control_release(f.control); wl_plan_free(f.plan);
@@ -355,10 +388,13 @@ run(unsigned kind, unsigned route, unsigned fault)
 }
 int main(int argc, char **argv)
 {
-    CHECK(argc == 2); unsigned route = !strcmp(argv[1], "observed") ? 0
-        : !strcmp(argv[1], "plain") ? 1 : 2;
-    CHECK(route != 2 || !strcmp(argv[1], "snapshot"));
-    for (unsigned kind = 0; kind < 4; ++kind)
+    CHECK(argc == 2);
+    configured = !strncmp(argv[1], "configured-", 11);
+    const char *name = configured ? argv[1] + 11 : argv[1];
+    unsigned route = !strcmp(name, "observed") ? 0 : !strcmp(name,
+            "plain") ? 1 : 2;
+    CHECK(route != 2 || !strcmp(name, "snapshot"));
+    for (unsigned kind = 0; kind < (configured ? 3u : 4u); ++kind)
         for (unsigned fault = 0; fault < 3; ++fault) run(kind, route, fault);
     puts("INLINE JOIN physical source/predicate/signed retry histories passed");
     return 0;
