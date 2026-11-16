@@ -228,7 +228,7 @@ These exist so struct fields can be declared portably; the audit in
 
 Every `atomic_*` call site in `wirelog/` production sources. Counted
 mechanically by `scripts/ci/check-threading-doc.sh`; row count must
-match the script's count (currently **621**).
+match the script's count (currently **619**).
 
 Format: `file:function[#N]` | field | operation | order | justification.
 
@@ -302,12 +302,10 @@ The 64-byte padding between `tail` and `head`
 cache-line ping-pong between producer and consumer collapses
 throughput by 2-10x.
 
-### 5.3 Init and relation identity/nonce allocators (12 rows)
+### 5.3 Relation identity/nonce allocators (17 rows)
 
 | Anchor (`file:function[#N]`) | Field | Op | Order | Justification |
 |---|---|---|---|---|
-| `io_adapter.c:init_mutex` | `s_mutex_init_ok` | `atomic_store` | `seq_cst` (default) | One-shot mutex-init publish; the bare API used here gives sequential consistency which is the strongest order and safe for an init publisher |
-| `io_adapter.c:ensure_builtins` | `s_mutex_init_ok` | `atomic_load` | `seq_cst` (default) | Pairs with the init publish; gates all later mutex operations |
 | `relation.c:col_rel_new_identity` | `wl_next_relation_identity` | `atomic_load_explicit` | `relaxed` | Read the candidate identity before the non-wrapping CAS reservation loop; the counter only has to hand out distinct values, no other memory is published through it |
 | `relation.c:col_rel_new_identity#2` | `wl_next_relation_identity` | `atomic_compare_exchange_weak_explicit` | `relaxed`/`relaxed` | Reserve a unique relation identity and retry with the observed value after a lost race; uniqueness comes from the RMW, not from ordering |
 | `relation.c:wl_columnar_relation_constructor_identity` | `wl_next_relation_identity` | `atomic_load_explicit` | `relaxed` | Charged initial observation for fresh controlled construction; identity uniqueness does not publish payload |
@@ -326,9 +324,8 @@ throughput by 2-10x.
 | `relation.c:wl_columnar_relation_test_set_mutation_nonce` | `wl_next_mutation_set_nonce` | `atomic_store_explicit` | `relaxed` | Test-only seam selects allocator exhaustion or retry states before test admissions; tests do not race this reset with nonce allocation |
 | `relation.c:wl_columnar_relation_test_mutation_nonce_peek` | `wl_next_mutation_set_nonce` | `atomic_load_explicit` | `relaxed` | Test-only seam reads the next nonce so a single-threaded window can count the mutation sets acquired in it; only the delta matters, and no other state is read through it |
 
-Only the two `io_adapter.c` rows use non-explicit atomic APIs, which default
-to `memory_order_seq_cst`. The relation identity and mutation-set nonce
-allocator rows use the explicit relaxed order shown in the table: their CAS
+The relation identity and mutation-set nonce allocator rows use the
+explicit relaxed order shown in the table: their CAS
 operations reserve unique nonwrapping values and do not publish payload state.
 The test-only stores reset allocator state before tests and do not race with
 allocation.
@@ -670,7 +667,7 @@ concurrent alias removals cannot underflow the count.
 | `session.c:session_pool_rel_promote#3` | `src->storage_alias_borrows` | `atomic_store_explicit` | relaxed | Leave the closed pool tombstone with no child aliases |
 
 112 + 21 + 37 = **170 atomic call sites** in the summarized groups; the full
-symbol-anchored inventory below covers 621 sites.
+symbol-anchored inventory below covers 619 sites.
 
 The `#N` suffix counts all atomic sites in a symbol, regardless of operation;
 the first site remains unsuffixed. `scripts/ci/check-threading-doc.sh` uses
@@ -1182,7 +1179,10 @@ The I/O adapter registry at `wirelog/io/io_adapter.c` is a
 **process-global, mutex-protected** singleton. The mutex is published
 exactly once via `call_once(&s_mutex_once, init_mutex)` (POSIX) or
 the equivalent `InterlockedCompareExchange` ladder (Windows), gated
-by the `s_mutex_init_ok` atomic from §5.3.
+by the plain `s_mutex_init_ok` flag that `init_mutex` writes inside
+`call_once`; completing `call_once` synchronizes with every later
+`call_once` on the same flag (C11 7.26.2.1p2), so it is not an atomic
+object.
 
 After a `fork()`:
 
@@ -1805,7 +1805,7 @@ DONE. If a stop leaves the receipt holding a claim, its caller preserves that
 receipt and resumes with a fresh live maintenance attempt; it cannot abandon or
 reinitialize the receipt/token while the claim remains held.
 
-The complete current atomic-source inventory contains 621 call sites.
+The complete current atomic-source inventory contains 619 call sites.
 
 ### Caller-attempt-bound single mutation admission
 
