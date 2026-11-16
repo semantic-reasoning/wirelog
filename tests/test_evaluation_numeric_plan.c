@@ -11891,6 +11891,151 @@ test_prepared_initializer_external_journal(void)
     initializer_case = NULL;
 }
 
+/* One INIT turn as in test_prepared_construct_staged: a fresh support
+ * generation, the real step, its FINISH/report and the one-use prepaid ACK.
+ * With refuse, a fresh one-short support is offered first; the 256 charge
+ * precedes every mutation, so it must leave the owner bytes untouched, consume
+ * nothing and leave no ACK to take. */
+static int
+prepared_init_chunk_turn(prepared_case_t *m, bool refuse, bool *published,
+    uint64_t *consumed)
+{
+    wl_columnar_eval_stack_cleanup_frame_t *frame = m->fixture.frame;
+    const wl_columnar_eval_plan_numeric_attempt_t *owner = &m->fixture.record;
+    if (refuse) {
+        wl_columnar_eval_stack_unary_prepared_t before;
+        memcpy(&before, &m->prepared, sizeof(before));
+        int short_owner = 0;
+        wl_evaluation_control_t *s = control_new(255, &short_owner);
+        uint64_t sid = wl_evaluation_control_active_attempt_id(s);
+        bool done = false;
+        CHECK(wl_columnar_eval_stack_unary_prepared_init_step_owned(frame,
+            owner, s, sid, &done) == WL_EVALUATION_CONTROL_WORK_LIMIT
+            && !done);
+        CHECK(!memcmp(&before, &m->prepared, sizeof(before)));
+        (void)wl_evaluation_control_finish(s, &short_owner, 0, 0);
+        wl_evaluation_control_report_t short_report;
+        CHECK(!wl_evaluation_control_report(s, &short_report)
+            && short_report.attempt_id == sid && short_report.consumed == 0);
+        /* With the refused generation finished, a pending action would be
+         * ACKable here; none was recorded. */
+        CHECK(wl_columnar_eval_stack_unary_prepared_init_action_ack_owned(
+                frame, owner, s, sid) != 0);
+        CHECK(!wl_evaluation_control_detach(s, &short_owner));
+        wl_evaluation_control_release(s);
+    }
+    int support_owner = 0;
+    wl_evaluation_control_t *support = control_new(256, &support_owner);
+    uint64_t id = wl_evaluation_control_active_attempt_id(support);
+    *published = false;
+    int rc = wl_columnar_eval_stack_unary_prepared_init_step_owned(frame,
+            owner, support, id, published);
+    CHECK(wl_columnar_eval_stack_unary_prepared_init_action_ack_owned(
+            frame, owner, support, id) == EBUSY);
+    (void)wl_evaluation_control_finish(support, &support_owner, 0, 0);
+    wl_evaluation_control_report_t report;
+    CHECK(!wl_evaluation_control_report(support, &report)
+        && report.attempt_id == id && report.consumed == 256);
+    *consumed += report.consumed;
+    CHECK(!wl_columnar_eval_stack_unary_prepared_init_action_ack_owned(
+            frame, owner, support, id));
+    CHECK(!wl_evaluation_control_detach(support, &support_owner));
+    wl_evaluation_control_release(support);
+    return rc;
+}
+
+/* The owner is cleared and cancelled in CHUNK-byte steps under one 256 INIT
+ * action each, so the step count, not the price of a step, follows the
+ * target layout. Construction is CAPTURE, ADMIT, STEPS CLEAR, three RESTORE
+ * and PUBLISH; a cancellation after ADMIT restarts the clear from byte zero
+ * and one before ADMIT owns no target bytes. Every count below is derived
+ * from those named stages and the compiled sizeof. */
+static void
+test_prepared_init_chunk_exact(void)
+{
+    const unsigned chunk = WL_COLUMNAR_EVAL_STACK_PREPARED_CLEAR_CHUNK;
+    const unsigned steps = (unsigned)
+        ((sizeof(wl_columnar_eval_stack_unary_prepared_t) + chunk - 1u)
+        / chunk);
+    const unsigned work_steps = (unsigned)
+        ((sizeof(wl_columnar_eval_stack_unary_prepared_work_t) + chunk - 1u)
+        / chunk);
+    const unsigned capture = 1u, admit = 1u, restore = 3u, publish = 1u;
+    const unsigned construct = capture + admit + steps + restore + publish;
+    const unsigned first_clear = capture + admit;
+    const unsigned clears[] = {
+        first_clear, first_clear + steps / 2u, first_clear + steps - 1u
+    };
+    const wl_columnar_eval_stack_unary_prepared_t *layout = NULL;
+    CHECK(chunk == 64u && steps >= 2u);
+    printf("prepared owner %u B (%u steps), work %u B (%u steps), "
+        "owner thread id %u B\n",
+        (unsigned)sizeof(wl_columnar_eval_stack_unary_prepared_t), steps,
+        (unsigned)sizeof(wl_columnar_eval_stack_unary_prepared_work_t),
+        work_steps, (unsigned)sizeof(layout->owner_thread));
+
+    for (unsigned refuse = 0; refuse != 2; ++refuse) {
+        prepared_case_t m; prepared_case_init(&m, false, 0);
+        bool selected = false;
+        (void)wl_columnar_eval_stack_unary_prepared_begin(&m.prepared,
+            m.fixture.frame, &m.fixture.record, &selected);
+        CHECK(selected);
+        unsigned turns = 0;
+        uint64_t total = 0;
+        bool published = false;
+        while (!published && turns != construct) {
+            bool r = refuse && (turns == clears[0] || turns == clears[1]
+                || turns == clears[2]);
+            CHECK(!prepared_init_chunk_turn(&m, r, &published, &total));
+            ++turns;
+        }
+        CHECK(published && turns == construct
+            && total == 256u * (uint64_t)construct
+            && m.prepared.identity == &m.prepared
+            && !wl_columnar_eval_stack_auto_initializer_pending(
+                m.fixture.frame));
+        /* A published owner retires only through its own cancellation. */
+        prepared_case_close(&m, ERANGE);
+    }
+
+    const unsigned stops[] = {
+        0u, admit, clears[0], clears[1], clears[2]
+    };
+    for (unsigned k = 0; k != sizeof(stops) / sizeof(stops[0]); ++k) {
+        const unsigned stop = stops[k];
+        const unsigned cancel = stop == 0u ? 1u : steps;
+        prepared_case_t m; prepared_case_init(&m, false, 0);
+        bool selected = false;
+        (void)wl_columnar_eval_stack_unary_prepared_begin(&m.prepared,
+            m.fixture.frame, &m.fixture.record, &selected);
+        CHECK(selected);
+        unsigned turns = 0;
+        uint64_t total = 0;
+        bool published = false;
+        int cause = 0;
+        while (turns != stop + 1u + cancel && !published
+            && (turns <= stop
+            || wl_columnar_eval_stack_auto_initializer_pending(
+                m.fixture.frame))) {
+            int rc = prepared_init_chunk_turn(&m,
+                    stop != 0u && turns == stop + 1u, &published, &total);
+            if (rc && !cause) cause = rc;
+            if (turns == stop)
+                wl_evaluation_control_request_cancel(m.fixture.operation);
+            ++turns;
+        }
+        CHECK(!published && turns == stop + 1u + cancel
+            && total == 256u * (uint64_t)(stop + 1u + cancel)
+            && cause == WL_EVALUATION_CONTROL_CANCELLED
+            && !m.prepared.identity
+            && !wl_columnar_eval_stack_auto_initializer_pending(
+                m.fixture.frame));
+        const unsigned char *bytes = (const void *)&m.prepared;
+        for (size_t i = 0; i != sizeof(m.prepared); ++i) CHECK(!bytes[i]);
+        prepared_case_close(&m, cause);
+    }
+}
+
 static void
 test_prepared_unary_original_boundaries(void)
 {
@@ -17051,6 +17196,7 @@ main(void)
     test_prepared_join_finish_foreign_context();
     test_prepared_join_finish_wide();
     test_prepared_initializer_external_journal();
+    test_prepared_init_chunk_exact();
     test_prepared_unary_actual_lifecycle();
     test_prepared_unary_original_boundaries();
     test_prepared_unary_cancelled_parent_cleanup();

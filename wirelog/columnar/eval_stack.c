@@ -5203,7 +5203,8 @@ wl_columnar_eval_stack_prepared_init_action(
         break;
     case WL_COLUMNAR_EVAL_STACK_PREPARED_INIT_CLEAR: {
         size_t count = sizeof(*p) - i->clear_cursor;
-        if (count > 64) count = 64;
+        if (count > WL_COLUMNAR_EVAL_STACK_PREPARED_CLEAR_CHUNK)
+            count = WL_COLUMNAR_EVAL_STACK_PREPARED_CLEAR_CHUNK;
         memset((unsigned char *)p + i->clear_cursor, 0, count);
         i->clear_cursor += (uint32_t)count;
         if (i->clear_cursor == sizeof(*p))
@@ -5254,7 +5255,8 @@ wl_columnar_eval_stack_prepared_init_action(
             break;
         }
         size_t count = sizeof(*p) - i->cancel_cursor;
-        if (count > 64) count = 64;
+        if (count > WL_COLUMNAR_EVAL_STACK_PREPARED_CLEAR_CHUNK)
+            count = WL_COLUMNAR_EVAL_STACK_PREPARED_CLEAR_CHUNK;
         memset((unsigned char *)p + i->cancel_cursor, 0, count);
         i->cancel_cursor += (uint32_t)count;
         if (i->cancel_cursor == sizeof(*p)) {
@@ -5897,7 +5899,8 @@ wl_columnar_eval_stack_prepared_clear_work(
         return EBUSY;
     if (p->alias_cursor >= sizeof(p->work)) return EINVAL;
     size_t count = sizeof(p->work)-p->alias_cursor;
-    if (count > 64) count = 64;
+    if (count > WL_COLUMNAR_EVAL_STACK_PREPARED_CLEAR_CHUNK)
+        count = WL_COLUMNAR_EVAL_STACK_PREPARED_CLEAR_CHUNK;
     memset((unsigned char *)&p->work+p->alias_cursor, 0, count);
     p->alias_cursor += (uint32_t)count;
     if (p->alias_cursor == sizeof(p->work)) {

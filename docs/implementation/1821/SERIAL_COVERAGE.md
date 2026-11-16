@@ -1377,9 +1377,17 @@ record/session storage must remain live; this is not arbitrary pointer validatio
 ### Prepared unary replacement: Mode B ordinary JOIN primitive
 
 A separate typed constructor now binds the actual quiescent ordinary
-JOIN_DECIDE context. It preserves the final-address receipt layout ceiling
-of392 bytes and work ceiling of256 bytes using target-compiled size guards;
-these are portable upper bounds, not measurements of the Windows ABI.
+JOIN_DECIDE context. The receipt and its work are cleared in separately
+funded steps of at most 64 bytes (INIT under 256, CLEAR_WORK and
+FINISH_CLEAR_WORK under 128), so a step's price does not depend on the
+layout and only the number of funded steps follows the target ABI. The
+former 392/256 byte ceilings were Linux layout values, not price bounds;
+the target-compiled guard now pins the chunk and the uint32 cursors, and
+`test_prepared_init_chunk_exact` pins the exact and one-short step counts.
+Layouts (data, not bounds): Linux LP64 receipt 392 as recorded below and
+work at most 256, the former guard (7 and at most 4 steps; the test prints
+the actual values); measured on Windows, native MSVC x64 368/240 (6/4) and
+MSVC with C11 threads and its 16-byte `thrd_t` 416/272 (7/5).
 The constructor leaves confirmation false. Paid header proof authenticates
 the actual JOIN operation and REPLACE disposition, pending parent binding,
 native ownership, original control identity and both borrowed output pointers.
