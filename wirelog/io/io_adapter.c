@@ -78,14 +78,16 @@ static uint32_t s_count;
  *               use a two-phase flag + InterlockedCompareExchange.
  *               See Issue #459 for background. */
 #if defined(WL_HAVE_C11_THREADS)
-#include <stdatomic.h>
 static wl_mutex_t s_mutex;
 static once_flag s_mutex_once = ONCE_FLAG_INIT;
-static atomic_int s_mutex_init_ok;
+/* Written only inside init_mutex. Completing call_once synchronizes with
+ * every later call_once on the same flag (C11 7.26.2.1p2), so the read
+ * after call_once needs no atomic object. */
+static int s_mutex_init_ok;
 static void
 init_mutex(void)
 {
-    atomic_store(&s_mutex_init_ok, (wl_mutex_init(&s_mutex) == 0) ? 1 : 0);
+    s_mutex_init_ok = (wl_mutex_init(&s_mutex) == 0) ? 1 : 0;
 }
 #elif defined(_WIN32) || defined(_WIN64)
 static wl_mutex_t s_mutex;
@@ -109,7 +111,7 @@ ensure_builtins(void)
     /* Lazy mutex initialization for backends without static initializers. */
 #if defined(WL_HAVE_C11_THREADS)
     call_once(&s_mutex_once, init_mutex);
-    if (!atomic_load(&s_mutex_init_ok)) {
+    if (!s_mutex_init_ok) {
         set_error("mutex initialization failed");
         return;
     }
