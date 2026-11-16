@@ -13,8 +13,12 @@ the preserved seed shadow's `base_nrows` only at successful publication, so a
 later observed STEP reports new rows rather than reporting an unchanged seed
 again. Precommit cancellation, reset/retry, unchanged STEPs and host head
 insert/remove overlap are covered. Unloaded seed actors still refuse width
-repair even though the raw evaluator succeeds; evaluating SNAPSHOT and the
-fully declared observed fixture remain outside this qualified intersection.
+repair even though the raw evaluator succeeds; evaluating SNAPSHOT remains
+outside this qualified intersection. The following ordinary routing increment
+also admits the fully declared observed identity-MAP fixture: the same immutable
+seed shape hint now selects the existing general host before legacy observer
+preflight. DIRECT-only routing, paid canonical name matching and the C1/batch/
+SNAPSHOT exclusions remain distinct; the hint grants no actor or Native owner.
 
 ## Finite tag inventory
 

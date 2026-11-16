@@ -9857,7 +9857,7 @@ static int
 wl_columnar_session_preflight_seed_metadata(void *payload)
 {
     wl_columnar_session_seed_route_read_t *p = payload;
-    if (p->session->delta_cb || p->session->base.source_c1_admission
+    if (p->session->base.source_c1_admission
         || p->session->join_batch_bytes) return 0;
     p->candidate = wl_columnar_session_seed_shape_metadata(p->plan);
     return 0;
@@ -9949,7 +9949,7 @@ wl_columnar_session_general_shape_read(wl_col_session_t *sess,
     int rc = wl_columnar_session_recursive_shape_read(sess, mode, shape);
     if (rc || *shape) return rc;
     /* Existing SOURCE/C1 admission keeps its exact read tariff. The new
-     * ordinary no-observer match is DIRECT; skip both new actions in SOURCE. */
+    * ordinary seed match is DIRECT; skip both new actions in SOURCE. */
     if (mode == WL_COLUMNAR_SESSION_PREFLIGHT_DIRECT){
         wl_columnar_session_seed_route_read_t seed;
         seed.session = sess; seed.plan = sess->plan; seed.candidate = false;
