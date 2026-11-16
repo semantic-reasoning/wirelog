@@ -7,6 +7,15 @@ when integrating scalar domains. #1819 and #1953 have merged. Existing numeric
 qualification remains in `docs/implementation/1821/SERIAL_COVERAGE.md` and
 `test_evaluation_numeric{,_operators,_plan}.c`; it is not reimplemented here.
 
+PR #2375's integration with main `3bdf3c45` qualifies loaded ordinary seed
+STEPs against the head-input fixtures in `evaluation_facts_sources`. It commits
+the preserved seed shadow's `base_nrows` only at successful publication, so a
+later observed STEP reports new rows rather than reporting an unchanged seed
+again. Precommit cancellation, reset/retry, unchanged STEPs and host head
+insert/remove overlap are covered. Unloaded seed actors still refuse width
+repair even though the raw evaluator succeeds; evaluating SNAPSHOT and the
+fully declared observed fixture remain outside this qualified intersection.
+
 ## Finite tag inventory
 
 Every enumerated expression tag has exactly one row below. Admission columns

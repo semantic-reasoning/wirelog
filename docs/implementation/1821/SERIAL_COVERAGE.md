@@ -2932,13 +2932,19 @@ the rule's rows beside the facts. With the facts not loaded, its first STEP or
 SNAPSHOT returned EINVAL: the head was a bare EDB without a schema, and the
 non-recursive append into it took the rule's width only for a recursive head.
 The append now gives such a head the rule's width either way. The physical seed
-actor, which no library caller hosts yet, still refuses that width change with
-EINVAL, and `evaluation_seed_physical` expects that refusal beside the
-uncontrolled success when its target has no schema. The controlled session
-refuses these bodies with ENOTSUP or EINVAL before it publishes anything, with
-the facts loaded or not; the general observed transaction, for one, finds the
-head's name among the EDB names and returns EINVAL. Controlled evaluation of
-heads with input stays open in #2301. `evaluation_facts_sources` runs three
-such programs through STEP and SNAPSHOT, observed and unobserved, loaded and
-not, and checks the refusal with nothing published and the uncontrolled rows
-before and after an insert into the body's EDB.
+actor still refuses that width change with EINVAL, and
+`evaluation_seed_physical` expects that refusal beside the uncontrolled success
+when its target has no schema.
+
+The canonical Session seed host admits the loaded ordinary STEP cases in
+`evaluation_facts_sources`: all three declaration variants without an observer,
+and the undeclared-body variants with an observer. The fully declared observed
+variant still returns ENOTSUP; evaluating SNAPSHOT and unloaded seed heads still
+return EINVAL (the fully declared observed STEP returns ENOTSUP unloaded too).
+Refused cases retain the old head and emit nothing. Successful cases require
+literal rows `{1,2,7}`, then `{1,2,3,7}` after a body insert, raw schema/event
+parity, and no events on an unchanged STEP. Head writes also check insertion,
+removal and overlap with a rule-derived row. Precommit cancellation leaves the
+seed shadow's pending boundary unchanged; successful publication commits that
+boundary beside the head, so an old seed row is not reported again. Broader
+heads-with-input and SNAPSHOT support stays open in #2301.

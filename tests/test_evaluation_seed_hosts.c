@@ -808,9 +808,18 @@ static void unloaded(void) {
         for (unsigned observed = 0; observed < 2; ++observed) {
             fixture_t f = create(sources[source], observed, true);
             fixture_hook(&f, observed);
+            col_rel_t *old = session_find_rel(COL_SESSION(f.session), "out");
+            col_relation_snapshot_t before = wl_columnar_relation_snapshot(old);
             int actual = complete(&f), raw = wl_session_step(f.raw);
-            CHECK(actual == raw && actual == EINVAL && !f.events);
-            equal(&f);
+            /* Main gives the bare raw head its rule width. The physical
+             * seed actor still refuses that schema change. */
+            col_rel_t *reference = session_find_rel(COL_SESSION(f.raw), "out");
+            CHECK(actual == EINVAL && !raw && !f.events);
+            CHECK(session_find_rel(COL_SESSION(f.session), "out") == old
+                && wl_columnar_relation_snapshot_equal(before,
+                wl_columnar_relation_snapshot(old)));
+            CHECK(!old->ncols && reference->ncols == 1
+                && !old->nrows && !reference->nrows);
             CHECK(!wl_evaluation_control_reset(f.control));
             CHECK(!wl_session_load_facts(f.raw, f.program) &&
                 !wl_session_load_facts(f.session, f.program));

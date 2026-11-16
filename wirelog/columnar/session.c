@@ -19382,6 +19382,7 @@ wl_columnar_session_observed_action(wl_col_session_t *sess,
         rc = wl_evaluation_control_charge_attempt(control,
                 step->operation_id,
                 (uint64_t)tx->old_count + tx->count + 18
+                + (tx->seed_selected ? 1 : 0)
                 + (tx->differential.started ? 128 : 0));
         if (rc) return rc;
         rc = wl_evaluation_control_charge_attempt(control,
@@ -19428,6 +19429,10 @@ wl_columnar_session_observed_action(wl_col_session_t *sess,
             col_rel_t *published = sess->rels[i];
             published->base_nrows = published->nrows;
         }
+        /* The preserved shadow follows the canonical entries in the image.
+         * Its host rows become committed at this same publication cutoff. */
+        if (tx->seed_selected && tx->seed_shadow)
+            tx->seed_shadow->base_nrows = tx->seed_shadow->nrows;
         sess->last_inserted_relation = sess->last_removed_relation = NULL;
         sess->pending_input_change = sess->pending_full_input_eval = false;
         sess->retraction_seeded = false;
