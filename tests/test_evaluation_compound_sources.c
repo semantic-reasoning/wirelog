@@ -6,8 +6,8 @@
  * MAP or a FILTER, and the UNION body also through CONCAT and CONSOLIDATE.
  * Each controlled result is compared with a literal tuple set and with an
  * uncontrolled session over the same plan. Further bodies read a FILTER's
- * output through REDUCE or JOIN, and a JOIN body that reads the source
- * directly is checked to be refused. */
+ * output through REDUCE or JOIN, and ordinary JOIN reads the source
+ * directly through its bounded INLINE admission. */
 #include "../wirelog/columnar/internal.h"
 #include "../wirelog/exec_plan_gen.h"
 #include "../wirelog/session.h"
@@ -358,7 +358,7 @@ check_body(const wl_plan_t *plan, unsigned kind)
 
 static wl_session_t *active;
 static unsigned active_kind;
-static unsigned map_inline, filter_inline, concat_seen;
+static unsigned map_inline, filter_inline, concat_seen, join_inline;
 static unsigned stop_mode; /* 0 none, 1 cancel, 2 work limit */
 static const char *stop_at;
 static bool stop_hit;
@@ -389,6 +389,12 @@ publication(wl_col_session_t *s, const col_rel_t *in, const col_rel_t *out)
         for (uint32_t c = 0; c < out->ncols; c++)
             CHECK(lane_type(out, c) == lane_type(in, c));
         filter_inline++;
+    }
+    if (!strcmp(out->name, "$join") && in
+        && in->compound_kind == WIRELOG_COMPOUND_KIND_INLINE) {
+        CHECK(in == session_find_rel(s, "a") && out->nrows
+            && out->compound_kind == WIRELOG_COMPOUND_KIND_NONE);
+        ++join_inline;
     }
     if (!strcmp(out->name, "$concat"))
         concat_seen++;
@@ -609,103 +615,31 @@ run_case(unsigned kind, bool snapshot, bool observed, bool empty,
     fixture_destroy(&f);
 }
 
-/* Consumers that still refuse an INLINE input keep a typed ENOTSUP: the
- * controlled session publishes nothing and leaves the source as it was,
- * while the uncontrolled session computes the rows (open in #2301). Each
- * route is run: the observed STEP, the unobserved STEP and the evaluating
- * SNAPSHOT. */
+/* Public observed/unobserved STEP and evaluating SNAPSHOT are separate routes. */
 enum { R_OBSERVED, R_UNOBSERVED, R_SNAPSHOT, R_COUNT };
 
-static void
-refused_consumer(const char *text, const char *head, unsigned want_rows,
-    unsigned route)
-{
-    wirelog_error_t error;
-    wirelog_program_t *program = wirelog_parse_string(text, &error);
-    wl_plan_t *plan = NULL;
-    CHECK(program && !wl_plan_from_program(program, &plan));
-    wl_columnar_memory_resolution_t resolution = {
-        .budget_bytes = WL_COLUMNAR_MEMORY_MIN_BUDGET,
-        .usable_bytes = WL_COLUMNAR_MEMORY_MIN_BUDGET,
-        .mode = WL_COLUMNAR_MEMORY_MODE_ENFORCING,
-    };
-    wl_columnar_memory_governor_ref_t *governor =
-        wl_columnar_memory_governor_ref_create(&resolution);
-    wl_evaluation_control_t *control = NULL;
-    CHECK(governor && !wl_evaluation_control_create(UINT64_C(1000000000),
-        &control));
-    wl_session_options_t options;
-    wl_session_options_init(&options);
-    options.evaluation_control = control;
-    options.memory_governor = governor;
-    wl_session_t *s = NULL, *raw = NULL;
-    CHECK(!wl_session_create_with_options(wl_backend_columnar(), plan, 1,
-        &options, &s));
-    CHECK(!wl_session_create(wl_backend_columnar(), plan, 1, &raw));
-    const int64_t b[] = {10, 7, 30, 8};
-    for (unsigned i = 0; i < 2; i++) {
-        wl_session_t *x = i ? raw : s;
-        CHECK(!wl_session_insert(x, "a", pair_rows, 4, 3));
-        CHECK(!wl_session_insert(x, "b", b, 2, 2));
-    }
-    source_t src;
-    source_save(&src, s);
-    capture_t events = {.head = head}, raw_events = {.head = head};
-    if (route == R_OBSERVED) {
-        wl_session_set_delta_cb(s, on_delta, &events);
-        wl_session_set_delta_cb(raw, on_delta, &raw_events);
-    }
-    col_rel_t *old = session_find_rel((wl_col_session_t *)s, head);
-    int rc = route == R_SNAPSHOT ? wl_session_snapshot(s, on_tuple, &events)
-        : step(s);
-    if (rc != ENOTSUP)
-        fprintf(stderr, "%s route %u: rc %d, expected ENOTSUP\n", head,
-            route, rc);
-    CHECK(rc == ENOTSUP && !events.count);
-    source_kept(&src, s, true);
-    CHECK(session_find_rel((wl_col_session_t *)s, head) == old);
-    if (route == R_SNAPSHOT) {
-        /* An evaluating SNAPSHOT that failed after admission may only be
-         * retried as SNAPSHOT: mutations and STEP wait
-         * (test_evaluation_map_recovery pins the same state). */
-        CHECK(s->backend->session_controlled_step_state(s)
-            == WL_CONTROLLED_STEP_SNAPSHOT_RETRYABLE);
-        CHECK(wl_session_insert(s, "b", b, 1, 2) == EBUSY);
-        CHECK(step(s) == EBUSY);
-        source_kept(&src, s, true);
-        CHECK(!wl_session_snapshot(raw, on_tuple, &raw_events));
-    } else {
-        CHECK(!step(raw));
-    }
-    if (route == R_UNOBSERVED) {
-        col_rel_t *raw_head = session_find_rel((wl_col_session_t *)raw,
-                head);
-        CHECK(!raw_events.count && raw_head
-            && raw_head->nrows == want_rows);
-    } else {
-        CHECK(raw_events.count == want_rows);
-    }
-    CHECK(!wl_session_try_destroy(&s));
-    wl_session_destroy(raw);
-    wl_evaluation_control_release(control);
-    wl_plan_free(plan);
-    wirelog_program_free(program);
-    CHECK(wl_columnar_memory_reserved(
-            wl_columnar_memory_governor_ref_get(governor)) == 0);
-    wl_columnar_memory_governor_ref_release(governor);
-}
-
-/* A FILTER over the INLINE source feeding another consumer: the controlled
+/* A FILTER or ordinary JOIN over the INLINE source: the controlled
  * session computes the uncontrolled rows on each route. want holds the
  * expected head rows of width 2. */
 static void
-filtered_consumer(const char *text, const char *head, const int64_t *want,
-    unsigned want_rows, unsigned route)
+inline_consumer(const char *text, const char *head, const int64_t *want,
+    unsigned want_rows, unsigned route, bool filtered)
 {
     wirelog_error_t error;
     wirelog_program_t *program = wirelog_parse_string(text, &error);
     wl_plan_t *plan = NULL;
     CHECK(program && !wl_plan_from_program(program, &plan));
+    if (!filtered) {
+        const wl_plan_relation_t *r = &plan->strata[0].relations[0];
+        CHECK(plan->stratum_count == 1 && plan->strata[0].relation_count == 1
+            && r->op_count == 3 && r->ops[1].op == WL_PLAN_OP_JOIN
+            && r->ops[1].key_count == 1
+            && !strcmp(r->ops[1].left_keys[0], "col1")
+            && !strcmp(r->ops[1].right_keys[0], "col0")
+            && r->ops[1].project_count == 2
+            && r->ops[1].project_indices[0] == 0
+            && r->ops[1].project_indices[1] == 4);
+    }
     wl_columnar_memory_resolution_t resolution = {
         .budget_bytes = WL_COLUMNAR_MEMORY_MIN_BUDGET,
         .usable_bytes = WL_COLUMNAR_MEMORY_MIN_BUDGET,
@@ -738,7 +672,9 @@ filtered_consumer(const char *text, const char *head, const int64_t *want,
         wl_session_set_delta_cb(s, on_delta, &events);
         wl_session_set_delta_cb(raw, on_delta, &raw_events);
     }
-    active = s; active_kind = K_COUNT; filter_inline = 0;
+    source_t src;
+    source_save(&src, s);
+    active = s; active_kind = K_COUNT; filter_inline = join_inline = 0;
     stop_mode = 0;
     wl_columnar_eval_stack_test_physical_publication = publication;
     int rc = route == R_SNAPSHOT ? wl_session_snapshot(s, on_tuple, &events)
@@ -746,7 +682,8 @@ filtered_consumer(const char *text, const char *head, const int64_t *want,
     wl_columnar_eval_stack_test_physical_publication = NULL;
     if (rc)
         fprintf(stderr, "%s route %u: rc %d\n", head, route, rc);
-    CHECK(!rc && filter_inline >= 1);
+    CHECK(!rc && (filtered ? filter_inline >= 1 : join_inline >= 1));
+    source_kept(&src, s, false);
     CHECK(!(route == R_SNAPSHOT ? wl_session_snapshot(raw, on_tuple,
         &raw_events) : step(raw)));
     if (route != R_UNOBSERVED) {
@@ -1072,18 +1009,20 @@ main(void)
     /* The constant comparison becomes a FILTER on a's scan, before the
      * JOIN; the row with y = 20 joins b on x = 10. */
     static const int64_t joined[] = {1, 7};
+    static const int64_t direct_joined[] = {1, 7, 2, 8};
     for (unsigned route = 0; route < R_COUNT; route++) {
-        filtered_consumer(".decl a(id:int64,p:pair/2 inline)\n"
+        inline_consumer(".decl a(id:int64,p:pair/2 inline)\n"
             ".decl b(k:int64,v:int64)\n.decl n(id:int64,c:int64)\n"
             "n(i,count(y)) :- a(i,pair(x,y)), x > 0.\n", "n", counted, 2,
-            route);
-        filtered_consumer(".decl a(id:int64,p:pair/2 inline)\n"
+            route, true);
+        inline_consumer(".decl a(id:int64,p:pair/2 inline)\n"
             ".decl b(k:int64,v:int64)\n.decl j(id:int64,z:int64)\n"
             "j(i,z) :- a(i,pair(x,y)), y = 20, b(x,z).\n", "j", joined, 1,
-            route);
-        refused_consumer(".decl a(id:int64,p:pair/2 inline)\n"
+            route, true);
+        inline_consumer(".decl a(id:int64,p:pair/2 inline)\n"
             ".decl b(k:int64,v:int64)\n.decl j(id:int64,z:int64)\n"
-            "j(i,z) :- a(i,pair(x,y)), b(x,z).\n", "j", 2, route);
+            "j(i,z) :- a(i,pair(x,y)), b(x,z).\n", "j", direct_joined, 2, route,
+            false);
     }
     puts("evaluation_compound_sources: OK");
     return 0;

@@ -6159,9 +6159,12 @@ wl_columnar_join_attempt_source(wl_columnar_relation_scalar_source_t *source,
     rc = wl_columnar_join_attempt_return(control, id, rc);
     if (!rc) rc = wl_columnar_join_attempt_charge(control, id,
                 WL_COLUMNAR_JOIN_ATTEMPT_WORK);
-    if (!rc) rc = wl_columnar_eval_stack_scalar_source_begin_owned(frame, owner,
-                op,
-                source, relation, false);
+    /* Ordinary JOIN consumes the validated physical lanes of INLINE inputs.
+     * The same helper serves existence probes, whose admission stays scalar. */
+    uint32_t admit = op->op == WL_PLAN_OP_JOIN
+        ? WL_COLUMNAR_RELATION_SOURCE_ADMIT_INLINE : 0;
+    if (!rc) rc = wl_columnar_eval_stack_scalar_source_admit_owned(frame, owner,
+                op, source, relation, false, admit);
     if (rc) return rc;
     metadata->width = source->width; metadata->nrows = source->nrows;
     metadata->types = source->types; metadata->names = source->names;
