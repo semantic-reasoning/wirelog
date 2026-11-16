@@ -968,3 +968,25 @@ RUNNING/FINISH paths and required platform profiles remain open as listed in the
 inventory and closure matrix. In particular, Linux qualification does not waive
 the outstanding MSVC-C11 actor layout or full Source/caller proof. These precise
 handoffs preserve each enabling operator change's own X-row obligations.
+
+
+## Ordinary INLINE JOIN admission increment (#2371)
+
+`wl_columnar_join_attempt_source` selects INLINE admission only for ordinary
+JOIN and calls the existing `scalar_source_admit_owned` protocol. Its four
+call sites are two ordinary sources and two SEMI/ANTI sources; probe flags
+remain zero. The scalar-source reader validates the INLINE arity map in
+charged chunks of at most eight logical entries while holding its original
+descriptor and storage-owner readers. It snapshots physical width/names/types;
+JOIN key lookup, hash/probe/gather, private output and retained END remain the
+existing bounded mechanisms. There is no new struct, cap, price or quantum.
+
+The direct public regression and `evaluation_join_inline_*` bind real physical
+source/lane predicates and matching-row stops to this consuming destination.
+A real active-attempt WORK refusal and successful cleanup/retry are behavior
+and ownership evidence. They do not assign a new SOURCE promise or turn the
+compound-check tariff into a whole-call upper. Existing local reader checks
+remain distinct from containing caller/return, refused entry, inherited carry,
+platform actor layout and publication/FINISH obligations owned by #2370.
+Materialized INLINE and remaining policy/selector/timestamp/cache products are
+not certified by this admission bit or by the finite public histories.
