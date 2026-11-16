@@ -2,9 +2,9 @@
 
 This is an evidence inventory for ordinary and materialized JOIN. It records
 what the implementation bundle actually exercises; it does not close #2371,
-#2300 or any lifecycle/accounting sibling. The current INLINE increment starts from main
+#2300 or any lifecycle/accounting sibling. The earlier unconfigured INLINE increment started from main
 `3bdf3c458bc85b91345f10d900c3fc0d94de7eea`, including merged #2377 and the
-latest #2301 source changes. It changes ordinary JOIN source admission through
+latest #2301 source changes. That increment changed ordinary JOIN source admission through
 an existing bounded adapter; no price, quantum, public ABI or layout changes.
 The evaluation quantum remains256.
 
@@ -15,6 +15,66 @@ not change production C. The new ordinary INLINE admission is `8c5a28dc`, with
 consuming/retirement tests `f7e234dc`. Use the reviewed PR HEAD/configuration
 for subsequent certificates; earlier green runs and experimental Native/Source
 snapshots are not current route certificates.
+
+## Configured no-tail INLINE policy increment
+
+This bundle starts from merged #2378, main `803381f1`. That merge contains
+ordinary INLINE admission `6a895a0e`, physical-lane/recovery tests `d0d794ff`
+and its ledger `803381f1`. The configured dispatch repair is `14f07675`;
+expanded qualification is `cd4e4d99`. All36 earlier public INLINE histories
+have an RHS predicate and bypass the otherwise eligible configured host.
+
+Before this repair, six unfiltered keyed cases (left/right/both INLINE,
+strict off/on, bytes256) returned controlled ENOTSUP while raw succeeded
+with literal `(7,8)`. Nonstreaming host HOLD now authenticates INLINE through
+the existing bounded reader. It retains RHS selection, key/type work and
+strict successor/cache/row-fit policy before draining through ABORT and
+handing off to ordinary controlled JOIN. It does not enter the compound-
+excluding batch producer. Streaming candidates retain zero admission flags.
+
+`evaluation_join_inline_policy` runs89 finite scenarios:
+
+- 40 original matrix cases: left/right/both INLINE plus scalar control,
+  strict off/on, fitting/undersized bytes, empty left, materializing successor
+  and selective streaming tail. Scalar controls witness PRODUCE; successful
+  INLINE controls witness actual ordinary gather with HELD descriptors.
+- 18 numeric cap cases test limits1/2/3 against literal two-row output in
+  permissive and strict modes. Equality refuses with EOVERFLOW.
+- 12 authentic canonical arrangement-pin cases test usable versus stale/
+  rebuild-deferred pins and bytes256/1. Stale-pin EBUSY precedes row-fit refusal.
+- 18 internal descriptor cases test malformed-map EINVAL, SIDE ENOTSUP and
+  unknown-kind EINVAL before row-fit/successor policy. Only the controlled
+  descriptor is corrupted; raw is an uncorrupted semantic reference.
+- One generated two-head successor consumes same-name transaction-private
+  RHS while an actual stale public RHS pin stays held. No canonical-cache
+  walk occurs. Pin pressure applies only to controlled execution; raw has no
+  equivalent transaction-private publication and supplies literal results.
+
+Refusals preserve pending input and no output, with positive work and cleanup0.
+For no-tail nonempty refusals, restoring metadata/policy and releasing pins
+permits reset/retry on the same session/input. Policy knobs and descriptor
+corruption are explicitly internal fixtures, not public setter coverage.
+
+The three `evaluation_join_inline_configured-*` modes add27 public histories
+(observed STEP, plain STEP, evaluating SNAPSHOT; three INLINE shapes; healthy/
+CANCEL/WORK), bringing the total with previous modes to63. They use unfiltered
+keyed compiler-selected plans and strict off, including STRING/FLOAT physical
+lanes and STRING output. Initial empty, RHS/left append, RHS removal and
+unchanged repeats match independent literal images and signed differences.
+Stops occur after real matching gather with INLINE readers HELD; old public
+head/content, source snapshots/maps, pending input and absence of early
+callbacks/tuples survive. A real reset retries successfully; final governor
+reservations are zero.
+
+Clang23 host suite108/108, GCC16 focused7/7 and ASan/UBSan focused7/7 passed
+on the integrated code/test tree before this ledger-only unit. Strict numeric
+policy, numeric cap boundaries and typed strict-off histories are separate
+certificates, not a complete typed-cap/strict-recovery cross-product. No new
+INLINE ENOSPC pressure certificate is supplied. Full selector/cache reuse,
+streamed INLINE producer/ACK and selective-tail caps, materialized INLINE,
+signed timestamps/weights and containing Source/carry remain OPEN. #2371
+and #2300 remain OPEN. Final broader results belong to the published PR HEAD;
+MSVC and LLVM22-specific tidy evidence remain outstanding locally.
 
 ## Finite scenario inventory
 
@@ -179,7 +239,8 @@ python -m mesonbuild.mesonmain test -C build --no-rebuild --print-errorlogs \
 CC=clang python -m mesonbuild.mesonmain setup build-asan -DmbedTLS=disabled \
   -Dexamples=false -Db_lto=false -Db_sanitize=address,undefined
 python -m mesonbuild.mesonmain compile -C build-asan \
-  test_evaluation_join_inline test_evaluation_join test_evaluation_compound_sources \
+  test_evaluation_join_inline test_evaluation_join_inline_policy \
+  test_evaluation_join test_evaluation_compound_sources \
   test_evaluation_join_domains test_evaluation_materialized_body \
   test_relation_scalar_source_end test_evaluation_facts_sources \
   test_evaluation_empty_edb_sources
@@ -198,3 +259,22 @@ commit. The final PR body records the exact published HEAD and final broader
 run; do not infer a final-SHA full-suite result from an earlier in-flight run.
 MSVC and its conditional C11 actor profile have not been run in this Linux
 workspace. Passing Linux tests do not close those acceptance items or #2371.
+
+For the configured increment alone, after the same uv activation and Meson
+availability, the sanitizer setup above can be followed by:
+
+```sh
+python -m mesonbuild.mesonmain compile -C build-asan \
+  test_evaluation_join_inline test_evaluation_join_inline_policy
+python -m mesonbuild.mesonmain test -C build-asan --no-rebuild --print-errorlogs \
+  'evaluation_join_inline_*'
+CC=gcc python -m mesonbuild.mesonmain setup build-gcc -DmbedTLS=disabled \
+  -Dexamples=false -Db_lto=false
+python -m mesonbuild.mesonmain compile -C build-gcc \
+  test_evaluation_join_inline test_evaluation_join_inline_policy
+python -m mesonbuild.mesonmain test -C build-gcc --no-rebuild --print-errorlogs \
+  'evaluation_join_inline_*'
+```
+
+The wildcard selects seven tests, including the policy executable; both
+executables must be compiled before using `--no-rebuild`.
