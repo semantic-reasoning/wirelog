@@ -74,6 +74,85 @@ Temporary branch: `diagnostic/windows-thread-provider-v1`, head `64ab0edd2096a4d
 - If reusing that diagnostic, resolve exactly one application path (for git/cl/link/dumpbin/uv/python) using `Select-Object -First 1` and verify selected VS paths. This is an identified NEXT FIX, not applied in the handoff.
 - Historical successful main run `43347427613`, Windows job `131635604437`, cl19.44.35228/link14.44.35228, selected Windows-native after real C11 create/join links:NO. Failure cause was not in its published log. Conditional MSVC-C11 is not proven unsupported and cannot be silently waived.
 
+## Local MSVC C11 build and layout record (#2367, not qualification)
+
+Recorded on a local Windows 11 x64 host with Visual Studio 2022 Build Tools,
+`cl` 19.44.35228 (x64) and `link` 14.44.35228.0, after PR #2364 was merged.
+Both builds use `-Dtests=true -DmbedTLS=disabled`; each directory keeps its
+`meson-logs/meson-log.txt`.
+
+| Build | Setup | C11 `<threads.h>` probe | Threading backend |
+|---|---|---|---|
+| `build-msvc` | default `c_std` | `links: NO` | `Windows MSVC` |
+| `build-msvc-c11` | `-Dc_std=c11` | `links: YES` | `C11 <threads.h>` |
+
+The C11 probe links `/std:c11 /MD` against the MSVC `include\threads.h`. The
+library's `compile_commands.json` builds `../wirelog/thread_c11.c` with
+`/std:c11 /D__STDC_NO_ATOMICS__`. `WL_HAVE_C11_THREADS` was not forced, and
+`thrd_t` is the C header's 16-byte `{ void *_Handle; uint32_t _Tid; }`,
+not a `DWORD` substitute.
+
+Sizes measured on the two builds, in bytes.
+`test_prepared_init_chunk_exact` prints the prepared owner and work sizes and
+the size of the owner's thread-id field. The other rows came from temporary, uncommitted `sizeof` probes.
+Each probe compiled a one-line translation unit that includes
+`columnar/internal.h`, using the library's own `eval_stack.c` command from
+`compile_commands.json`, and read each size back from the compiler's
+array-type diagnostic.
+
+| Type | native MSVC x64 | MSVC C11 threads |
+|---|---|---|
+| owner thread id | 4 (`DWORD`; this build has no `thrd_t`) | 16 (`thrd_t`) |
+| `wl_columnar_source_access_reader_t` | 32 | 48 |
+| `col_arrangement_t` | 160 | 176 |
+| `col_rel_t` | 904 | 984 |
+| prepared unary owner | 368 (6 clear steps) | 416 (7 clear steps) |
+| prepared unary work | 240 (4 clear steps) | 272 (5 clear steps) |
+| `wl_columnar_relation_scalar_retirement_t` | 912 | 1056 |
+
+Changes this record depends on, all `Refs #2367`:
+
+- The `io_adapter.c` mutex-ready flag is a plain `int` published through
+  `call_once`, and no longer includes `<stdatomic.h>`. That header is
+  unavailable when MSVC compiles C11 with `__STDC_NO_ATOMICS__`.
+- The prepared owner and work are cleared in 64-byte steps that are each
+  separately funded. The former 392/256 `sizeof` guards are replaced with a
+  per-step bound, as `SERIAL_COVERAGE.md` describes. They were not raised.
+  `test_prepared_init_chunk_exact` checks the exact turn and consumption counts
+  on both builds. It also checks a one-short refusal on the first, middle and
+  last clear steps, and on the first cancellation step.
+- The parallel keyed diff denial in `memory_admission_join` now reads its
+  budget from the governor reserve at the twin-copy admission, and checks that
+  every term of it is named. Previously the fixture took the peak on the
+  parallel path but ran the denial on the serial path.
+
+`meson test` totals after these changes:
+
+| Build | OK | FAIL | SKIP |
+|---|---|---|---|
+| `build-msvc` | 663 | 3 | 29 |
+| `build-msvc-c11` | 663 | 3 | 29 |
+
+On both builds the three failures are `example_04_hash_functions_golden`,
+`example_05_crc32_checksum_golden` and `example_06_timestamp_lww_golden`.
+They are CRLF golden comparisons and are unrelated to threading.
+
+#2367 stays open. This record does not qualify the full C11 actor layout or
+thread identity. Still outstanding:
+
+- **Thread identity.** The C11 `thrd_t` holds `_Handle` and `_Tid`, `thrd_equal`
+  takes both arguments by value, and the sret/byval endpoints of
+  `thrd_current` still need the trusted identity binding listed under
+  remaining work item 2.
+- **Scalar retirement one-shot clears.** Four 256-fee actions each zero the
+  whole `wl_columnar_relation_scalar_retirement_t` in one step. It is 912
+  bytes on native MSVC and 1056 with MSVC C11, from the probes above, and
+  984 on Linux LP64 as recorded in `SERIAL_COVERAGE.md`. Only
+  `FINISH_CLEAR_SCALAR` has a sourced inventory: at most 210 within its 256
+  fee. The layout bound in `SERIAL_COVERAGE.md` for these owners has no
+  compile-time guard.
+- The remaining method and resource items below.
+
 ## Remaining method/resource work
 
 1. **Prepared Native initialization.** Isolated tree `4a449288`, Native `9caf60fd`, header `a7805f1a`, CoreControl `777940e6`, CoreSession `9e3dda26` has finite initializer/owned-return experiments; Root CoreSession `89479e79` is a DIFFERENT historical authority. Do not misattribute 777940 to session.c. Actual 28 returns/23 owned exits, all 40 inert checks and 12 tuple fields, initializer/clear/ACK/helper/ABI effects, chronological positive payers and true claim-release branches need complete qualification. Old linear/partial counts are not maxima. Root ABORT1920, NC3072 and unary4096 capacities were real old caller limits; unchanged current policies and quantum256 must be reverified rather than raised.

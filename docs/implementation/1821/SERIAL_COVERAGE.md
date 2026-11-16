@@ -1381,7 +1381,7 @@ JOIN_DECIDE context. The receipt and its work are cleared in separately
 funded steps of at most 64 bytes (INIT under 256, CLEAR_WORK and
 FINISH_CLEAR_WORK under 128), so a step's price does not depend on the
 layout and only the number of funded steps follows the target ABI. The
-former 392/256 byte ceilings were Linux layout values, not price bounds;
+former 392/256 byte ceilings were Linux layout ceilings, not price bounds;
 the target-compiled guard now pins the chunk and the uint32 cursors, and
 `test_prepared_init_chunk_exact` pins the exact and one-short step counts.
 Layouts (data, not bounds): Linux LP64 receipt 392 as recorded below and
