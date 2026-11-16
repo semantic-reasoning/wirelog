@@ -124,7 +124,7 @@ references, not interruption evidence.
 | F04a | Differential arrangement/trace persistent transaction versus ephemeral hash fallback | Raw fallback must leave no transaction state; controlled entry refuses active differential mode and active-attempt registry growth. Integrated stop owner absent; G3, #1820 |
 | F05a | Ordinary keyed persistent arrangement/probe bundle versus ephemeral hash; cached right filter versus operation-owned filtered relation | General serial STEP owns a private native index registry for full-right public EDB INT64 JOIN, with bounded creation/reuse/probes and a common head/index cutoff. Existing pins/pending/deferred entries refuse replacement. Filtered/private-head/batch representations retain their previous controlled disposition; this does not qualify raw cache alternatives, G5/G6 |
 | F06a | LFTJ cache/probe versus owned source rebuild and raw output callback versus private owned-row append | Controlled session uses per-attempt bounded rebuild, no unlimited raw fallback; actual writer/ROW/ACK/drain ownership and precommit/postcutoff delivery qualified | Host failure/native/microsteps/policy and `test_lftj_postcut_delivery`; current-generation raw probe/pin checks; [source map](../2298/LFTJ_SOURCE_ACCOUNTING.md) |
-| F07a | Scalar-source compound kind NONE versus INLINE/SIDE, declared schema/type validity, timestamps and row weights | Admission predicates differ by child; no cross-operator representation support inferred. Managed copies/readers can be bounded while a surrounding child refuses the representation; G5. #2301: VARIABLE, MAP and FILTER admit compound_kind INLINE after a metered arity-map check; JOIN keeps a tested ENOTSUP for an INLINE input; compound_kind SIDE stays ENOTSUP |
+| F07a | Scalar-source compound kind NONE versus INLINE/SIDE, declared schema/type validity, timestamps and row weights | Admission predicates differ by child; no cross-operator representation support inferred. Managed copies/readers can be bounded while a surrounding child refuses the representation; G5. #2301: VARIABLE, MAP and FILTER admit compound_kind INLINE after a metered arity-map check; ordinary JOIN also admits INLINE through the existing bounded reader (#2371); SEMIJOIN/ANTIJOIN remain scalar-only; compound_kind SIDE stays ENOTSUP |
 | F07b | Retained/borrowed/owned, contiguous/segmented/spill-backed storage and empty/nullary/wide rows | Source reader/descriptor and copy helpers must preserve representation and governor state; capacity/overflow errors remain errors. Enumerated qualification combinations, not an invitation to raw fallback; G5/G6. #2301: borrowed public INLINE descriptors, empty, wide and arity-1 INLINE layouts; controlled sessions refuse cold (spill-backed) sources at seal; a never-inserted EDB through MAP, FILTER and REDUCE on the unobserved STEP |
 
 ## Configuration predicates
@@ -2685,15 +2685,13 @@ retries. It also covers later inserts and a removal, 300 rows, stops at each
 INLINE map-check charge of a real STEP (the same body over a scalar EDB records
 none), a denied MAP scratch reservation pinned at that reservation on the STEP
 and the evaluating SNAPSHOT, with `wl_session_budget_denied` reporting it and
-the successful retry clearing it, and a typed ENOTSUP with nothing published
-for a JOIN body over an INLINE source on the observed STEP, the unobserved STEP
-and SNAPSHOT. After the refused SNAPSHOT the step can be retried only as
-SNAPSHOT: an insert and a STEP return EBUSY. This is the
-`WL_CONTROLLED_STEP_SNAPSHOT_RETRYABLE` contract of `backend.h`, kept as it is:
-for a refusal that every retry repeats, as for this JOIN body, the controlled
-session takes no insert or STEP until a SNAPSHOT succeeds, while the
-uncontrolled session still accepts inserts. `evaluation_map_recovery` pins the
-same `WL_CONTROLLED_STEP_SNAPSHOT_RETRYABLE` state for a failed SNAPSHOT.
+the successful retry clearing it, and the ordinary direct INLINE JOIN success added by #2371 on observed STEP,
+unobserved STEP and evaluating SNAPSHOT. The previous ENOTSUP for that exact
+JOIN is replaced by the literal `(1,7)`/`(2,8)` oracle, actual physical keys and
+fused projection, source publication/layout witnesses and zero final governed
+reservation. `evaluation_map_recovery` continues to pin the general
+`WL_CONTROLLED_STEP_SNAPSHOT_RETRYABLE` contract for genuine failed SNAPSHOTs;
+ordinary direct INLINE JOIN no longer supplies a permanently refused example.
 
 Inline slots with declared types, `pair(int64,float) inline` and
 `pair(symbol,int64) inline`, give the source FLOAT or STRING lanes at session
@@ -2721,11 +2719,23 @@ route and matches the uncontrolled rows. A COUNT over such a FILTER (VARIABLE,
 FILTER, REDUCE, CONSOLIDATE) now evaluates on each route, REDUCE reading
 `$filter`, and matches the uncontrolled rows; both sessions count a repeated
 inserted row twice. The JOIN body without a comparison, which joins `a` and `b`
-on the slot `x`, has no FILTER: its JOIN reads the INLINE EDB directly and
-keeps its ENOTSUP.
+on the slot `x`, has no FILTER: its ordinary JOIN now reads the validated
+INLINE physical lanes directly through the opt-in reader (#2371).
 
-Open after this bundle: JOIN, SEMIJOIN/ANTIJOIN, REDUCE and LFTJ reading an
-INLINE input directly; direct compound, segmented, timestamped/weighted and
+`evaluation_join_inline_observed/plain/snapshot` adds36 generated ordinary JOIN
+histories covering left/right/both INLINE, displaced key/flag columns, typed
+STRING/FLOAT prefixes, keyed/product and real RHS/post-JOIN rejection. It
+observes current HELD readers and INLINE descriptors at matching-row gather,
+stops with CANCEL/WORK after prior publication, verifies retained input/maps and
+old output, then resets/retries and checks later signed changes or Snapshot
+images. Eight explicitly constructed `evaluation_join` cases preserve ordinary
+admission, malformed-map EINVAL and probe ENOTSUP on each side. See the finite
+inventory in [JOIN_DOMAIN_QUALIFICATION.md](../2300/JOIN_DOMAIN_QUALIFICATION.md).
+These cases do not qualify all INLINE policy/selector/materialized/cache or
+signed timestamp intersections.
+
+Open after this increment: SEMIJOIN/ANTIJOIN, REDUCE and LFTJ reading an
+INLINE input directly, and remaining ordinary JOIN intersections above; direct compound, segmented, timestamped/weighted and
 spill inputs to CONCAT and CONSOLIDATE; cold sources in controlled sessions,
 which `wl_columnar_session_cold_mode` excludes when an evaluation control is
 attached: begin and seal return `WL_COLUMNAR_SPILL_UNSUPPORTED` once their

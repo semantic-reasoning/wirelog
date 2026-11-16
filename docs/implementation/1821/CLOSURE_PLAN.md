@@ -580,8 +580,11 @@ A third bundle lets the controlled FILTER admit an INLINE source as VARIABLE
 and MAP do, so bodies with a FILTER between VARIABLE and MAP over an inline
 compound EDB, and a COUNT or a JOIN after such a FILTER, evaluate instead of
 returning ENOTSUP; see "Inline compound sources through VARIABLE and MAP
-(#2301)". JOIN, SEMIJOIN/ANTIJOIN, REDUCE and LFTJ reading an INLINE input
-directly remain with #2300. It compares facts EDBs, among them flat facts in an
+(#2301)". Ordinary JOIN now uses the same bounded INLINE reader in the
+#2371 follow-up, with direct public projection and36 left/right/both-side,
+predicate and held-reader retry histories. SEMIJOIN/ANTIJOIN, REDUCE and LFTJ
+reading INLINE directly and remaining ordinary policy/selector/materialized
+intersections stay with #2300; no containing row is closed. It compares facts EDBs, among them flat facts in an
 inline compound column and nullary facts, with the uncontrolled session, and
 fixes an uncontrolled STEP that returned EINVAL for a rule head whose inline
 facts were not loaded. Controlled evaluation of a rule head that also holds
