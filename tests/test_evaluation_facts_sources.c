@@ -10,7 +10,7 @@
  * that the general private-head transaction serves delivers observer events
  * (#2295) while the uncontrolled one fires none, so events are compared on
  * the STEP only. Each head of head_input_programs[] has both inline facts
- * and a rule, a body the controlled session refuses; see head_input(). */
+ * and a rule; head_input() checks the qualified STEP and refusal boundaries. */
 #include "../wirelog/columnar/internal.h"
 #include "../wirelog/exec_plan_gen.h"
 #include "../wirelog/session.h"
@@ -326,20 +326,37 @@ static const program_t programs[] = {
     },
 };
 
-/* A rule head that also has inline facts holds them in its seed shadow
- * (#1994, #2100). The plan lists such a head as an EDB as well, declared or
- * not. The uncontrolled session derives the rule's rows beside the facts,
- * and with the facts not loaded it derives the rule's rows alone. The
- * controlled session refuses the body with ENOTSUP or EINVAL before it
- * publishes anything; the general observed transaction, for one, finds the
- * head's name among the EDBs and returns EINVAL. Heads with input stay open
- * in #2301. */
+/* Loaded canonical seed heads can run an ordinary STEP. Evaluating SNAPSHOT
+ * and schema-less seed heads remain refused; the fully declared observed
+ * variant below also remains outside the admitted route. The raw session
+ * gives a bare head its rule width even when its facts were not loaded. */
 static const char *const head_input_programs[] = {
     "a(1).\na(2).\nout(7).\nout(x) :- a(x).\n",
     ".decl a(x:int64)\n.decl out(x:int64)\n"
     "a(1).\na(2).\nout(7).\nout(x) :- a(x).\n",
     "a(1).\na(2).\n.decl out(x:int64)\nout(7).\nout(x) :- a(x).\n",
 };
+
+extern void (*wl_columnar_session_test_observed_transaction_checkpoint)(
+    wl_evaluation_control_t *, unsigned, uint32_t,
+    const wl_columnar_eval_private_bindings_t *);
+static wl_evaluation_control_t *cutoff_control;
+static col_rel_t *cutoff_shadow;
+static unsigned cutoff_calls;
+
+static void
+cancel_head_cutoff(wl_evaluation_control_t *control, unsigned phase,
+    uint32_t index, const wl_columnar_eval_private_bindings_t *bindings)
+{
+    (void)index;
+    (void)bindings;
+    if (phase != 14 || cutoff_calls)
+        return;
+    CHECK(control == cutoff_control && cutoff_shadow->nrows == 1
+        && !cutoff_shadow->base_nrows);
+    cutoff_calls++;
+    wl_evaluation_control_request_cancel(control);
+}
 
 static void
 head_input(unsigned which, bool snapshot, bool observed, bool loaded)
@@ -351,45 +368,123 @@ head_input(unsigned which, bool snapshot, bool observed, bool loaded)
         "loaded%u", which, snapshot, observed, loaded);
     where = label;
     if (loaded) {
-        CHECK(wl_session_load_facts(f.s, f.program) == 0);
-        CHECK(wl_session_load_facts(f.raw, f.program) == 0);
+        CHECK(!wl_session_load_facts(f.s, f.program));
+        CHECK(!wl_session_load_facts(f.raw, f.program));
     }
     capture_t ev = {.head = "out"}, raw_ev = {.head = "out"};
     if (observed) {
         wl_session_set_delta_cb(f.s, on_delta, &ev);
         wl_session_set_delta_cb(f.raw, on_delta, &raw_ev);
     }
-    col_rel_t *old = session_find_rel((wl_col_session_t *)f.s, "out");
+    bool supported = loaded && !snapshot && (!observed || which != 1);
+    int refusal = !snapshot && observed && which == 1 ? ENOTSUP : EINVAL;
+    col_rel_t *old = session_find_rel(COL_SESSION(f.s), "out");
     col_relation_snapshot_t old_image = wl_columnar_relation_snapshot(old);
-    capture_t img = {.head = "out"};
-    int rc = snapshot ? wl_session_snapshot(f.s, on_tuple, &img) : step(f.s);
-    if (rc != ENOTSUP && rc != EINVAL)
-        fprintf(stderr, "%s: rc %d\n", where, rc);
-    CHECK((rc == ENOTSUP || rc == EINVAL) && !img.count && !ev.count);
-    CHECK(session_find_rel((wl_col_session_t *)f.s, "out") == old);
-    CHECK(wl_columnar_relation_snapshot_equal(old_image,
-        wl_columnar_relation_snapshot(old)));
-    /* The uncontrolled rows: the facts with the rule's rows, then an insert
-     * into the body's EDB. */
+    col_rel_t *shadow = wl_columnar_session_seed_rows(COL_SESSION(f.s), "out");
+    if (supported && which == 0) {
+        CHECK(shadow && shadow->nrows == 1 && !shadow->base_nrows);
+        cutoff_control = f.control;
+        cutoff_shadow = shadow;
+        cutoff_calls = 0;
+        wl_columnar_session_test_observed_transaction_checkpoint =
+            cancel_head_cutoff;
+        CHECK(step(f.s) == WL_EVALUATION_CONTROL_CANCELLED);
+        wl_columnar_session_test_observed_transaction_checkpoint = NULL;
+        CHECK(cutoff_calls == 1 && !ev.count && !shadow->base_nrows);
+        CHECK(session_find_rel(COL_SESSION(f.s), "out") == old
+            && wl_columnar_relation_snapshot_equal(old_image,
+            wl_columnar_relation_snapshot(old)));
+        CHECK(!wl_evaluation_control_reset(f.control));
+        cutoff_control = NULL;
+        cutoff_shadow = NULL;
+    }
     static const int64_t first[] = {1, 2, 7}, second[] = {1, 2, 3, 7};
-    for (unsigned round = 0; round < 2; round++) {
-        if (round) {
+    for (unsigned round = 0; round < 3; round++) {
+        if (round == 1) {
             const int64_t row[] = {3};
             CHECK(!wl_session_insert(f.raw, "a", row, 1, 1));
+            if (supported)
+                CHECK(!wl_session_insert(f.s, "a", row, 1, 1));
+        }
+        ev.count = raw_ev.count = 0;
+        capture_t img = {.head = "out"};
+        if (supported || !round) {
+            int rc = snapshot ? wl_session_snapshot(f.s, on_tuple, &img)
+                : step(f.s);
+            CHECK(rc == (supported ? 0 : refusal) && !img.count);
+            if (!supported) {
+                CHECK(!ev.count);
+                CHECK(session_find_rel(COL_SESSION(f.s), "out") == old);
+                CHECK(wl_columnar_relation_snapshot_equal(old_image,
+                    wl_columnar_relation_snapshot(old)));
+            }
         }
         capture_t raw_img = {.head = "out"};
-        rc = snapshot ? wl_session_snapshot(f.raw, on_tuple, &raw_img)
-            : step(f.raw);
-        if (rc)
-            fprintf(stderr, "%s round %u: raw rc %d\n", where, round, rc);
-        CHECK(!rc);
+        CHECK(!(snapshot ? wl_session_snapshot(f.raw, on_tuple, &raw_img)
+            : step(f.raw)));
         capture_t got, expect = {.head = "out"};
         image(f.raw, "out", &got);
         const int64_t *rows = round ? second : first;
         for (unsigned r = 0; r < (round ? 4u : 3u); r++)
-            if (loaded ? true : rows[r] == 3)
+            if (loaded || rows[r] == 3)
                 on_delta("out", &rows[r], 1, 1, &expect);
         equal_capture(&got, &expect, "uncontrolled head");
+        if (supported) {
+            capture_t actual;
+            image(f.s, "out", &actual);
+            equal_capture(&actual, &expect, "controlled head");
+            col_rel_t *a = session_find_rel(COL_SESSION(f.s), "out");
+            col_rel_t *b = session_find_rel(COL_SESSION(f.raw), "out");
+            CHECK(a->ncols == b->ncols && a->schema_ok == b->schema_ok
+                && a->declared_ncols == b->declared_ncols);
+            CHECK(shadow == wl_columnar_session_seed_rows(COL_SESSION(f.s),
+                "out") && shadow->base_nrows == shadow->nrows);
+            capture_t events = {.head = "out"};
+            if (observed) {
+                if (!round)
+                    for (unsigned r = 0; r < 3; r++)
+                        on_delta("out", &first[r], 1, 1, &events);
+                else if (round == 1) {
+                    const int64_t row[] = {3};
+                    on_delta("out", row, 1, 1, &events);
+                }
+            }
+            equal_capture(&ev, &events, "literal events");
+            equal_capture(&ev, &raw_ev, "head events");
+        }
+    }
+    /* Head writes still obey set difference when a seed overlaps a rule row. */
+    if (supported) {
+        const op_t writes[] = {
+            {OP_INSERT, "out", {9}, 1}, {OP_REMOVE, "out", {9}, 1},
+            {OP_INSERT, "out", {2}, 1}, {OP_REMOVE, "out", {2}, 1},
+        };
+        for (unsigned i = 0; i < sizeof(writes) / sizeof(*writes); i++) {
+            const op_t *op = &writes[i];
+            CHECK(!(op->op == OP_INSERT
+                ? wl_session_insert(f.s, op->rel, op->row, 1, 1)
+                : wl_session_remove(f.s, op->rel, op->row, 1, 1)));
+            CHECK(!(op->op == OP_INSERT
+                ? wl_session_insert(f.raw, op->rel, op->row, 1, 1)
+                : wl_session_remove(f.raw, op->rel, op->row, 1, 1)));
+            ev.count = raw_ev.count = 0;
+            CHECK(!step(f.s) && !step(f.raw));
+            capture_t actual, reference, expect = {.head = "out"};
+            image(f.s, "out", &actual);
+            image(f.raw, "out", &reference);
+            for (unsigned r = 0; r < 4; r++)
+                on_delta("out", &second[r], 1, 1, &expect);
+            if (!i)
+                on_delta("out", op->row, 1, 1, &expect);
+            equal_capture(&actual, &expect, "head writes");
+            equal_capture(&actual, &reference, "raw head writes");
+            capture_t events = {.head = "out"};
+            if (observed && i < 2)
+                on_delta("out", op->row, 1, i ? -1 : 1, &events);
+            equal_capture(&ev, &events, "head write events");
+            equal_capture(&ev, &raw_ev, "raw head write events");
+            CHECK(shadow->base_nrows == shadow->nrows);
+        }
     }
     fixture_destroy(&f);
 }
