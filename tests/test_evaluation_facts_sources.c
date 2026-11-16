@@ -327,8 +327,7 @@ static const program_t programs[] = {
 };
 
 /* Loaded canonical seed heads can run an ordinary STEP. Evaluating SNAPSHOT
- * and schema-less seed heads remain refused; the fully declared observed
- * variant below also remains outside the admitted route. The raw session
+ * and schema-less seed heads remain refused. The raw session
  * gives a bare head its rule width even when its facts were not loaded. */
 static const char *const head_input_programs[] = {
     "a(1).\na(2).\nout(7).\nout(x) :- a(x).\n",
@@ -340,7 +339,10 @@ static const char *const head_input_programs[] = {
 extern void (*wl_columnar_session_test_observed_transaction_checkpoint)(
     wl_evaluation_control_t *, unsigned, uint32_t,
     const wl_columnar_eval_private_bindings_t *);
+extern int wl_columnar_session_test_seed_host_view(const wl_col_session_t *,
+    uint64_t[32], wl_evaluation_control_t **);
 static wl_evaluation_control_t *cutoff_control;
+static wl_session_t *cutoff_session;
 static col_rel_t *cutoff_shadow;
 static unsigned cutoff_calls;
 
@@ -354,6 +356,9 @@ cancel_head_cutoff(wl_evaluation_control_t *control, unsigned phase,
         return;
     CHECK(control == cutoff_control && cutoff_shadow->nrows == 1
         && !cutoff_shadow->base_nrows);
+    uint64_t seed[32];
+    CHECK(!wl_columnar_session_test_seed_host_view(COL_SESSION(cutoff_session),
+        seed, NULL) && seed[1] && seed[3] && seed[4] && seed[9] == 2);
     cutoff_calls++;
     wl_evaluation_control_request_cancel(control);
 }
@@ -376,14 +381,15 @@ head_input(unsigned which, bool snapshot, bool observed, bool loaded)
         wl_session_set_delta_cb(f.s, on_delta, &ev);
         wl_session_set_delta_cb(f.raw, on_delta, &raw_ev);
     }
-    bool supported = loaded && !snapshot && (!observed || which != 1);
-    int refusal = !snapshot && observed && which == 1 ? ENOTSUP : EINVAL;
+    bool supported = loaded && !snapshot;
+    int refusal = EINVAL;
     col_rel_t *old = session_find_rel(COL_SESSION(f.s), "out");
     col_relation_snapshot_t old_image = wl_columnar_relation_snapshot(old);
     col_rel_t *shadow = wl_columnar_session_seed_rows(COL_SESSION(f.s), "out");
-    if (supported && which == 0) {
+    if (supported && (which == 0 || (which == 1 && observed))) {
         CHECK(shadow && shadow->nrows == 1 && !shadow->base_nrows);
         cutoff_control = f.control;
+        cutoff_session = f.s;
         cutoff_shadow = shadow;
         cutoff_calls = 0;
         wl_columnar_session_test_observed_transaction_checkpoint =
@@ -396,6 +402,7 @@ head_input(unsigned which, bool snapshot, bool observed, bool loaded)
             wl_columnar_relation_snapshot(old)));
         CHECK(!wl_evaluation_control_reset(f.control));
         cutoff_control = NULL;
+        cutoff_session = NULL;
         cutoff_shadow = NULL;
     }
     static const int64_t first[] = {1, 2, 7}, second[] = {1, 2, 3, 7};

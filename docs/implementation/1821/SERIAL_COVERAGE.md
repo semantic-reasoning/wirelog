@@ -2947,10 +2947,10 @@ actor still refuses that width change with EINVAL, and
 when its target has no schema.
 
 The canonical Session seed host admits the loaded ordinary STEP cases in
-`evaluation_facts_sources`: all three declaration variants without an observer,
-and the undeclared-body variants with an observer. The fully declared observed
-variant still returns ENOTSUP; evaluating SNAPSHOT and unloaded seed heads still
-return EINVAL (the fully declared observed STEP returns ENOTSUP unloaded too).
+`evaluation_facts_sources`: all three declaration variants with or without an observer. The ordinary DIRECT
+seed hint routes the fully declared identity MAP to the same existing host;
+paid name matching still proves the canonical slot. Evaluating SNAPSHOT and
+unloaded seed heads still return EINVAL.
 Refused cases retain the old head and emit nothing. Successful cases require
 literal rows `{1,2,7}`, then `{1,2,3,7}` after a body insert, raw schema/event
 parity, and no events on an unchanged STEP. Head writes also check insertion,

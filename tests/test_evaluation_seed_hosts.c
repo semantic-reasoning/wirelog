@@ -108,6 +108,8 @@ static void event(const char *name, const int64_t *row, uint32_t width,
     CHECK(view[13] && view[14]);
     if (!f->ordinary)
         CHECK(view[1] && view[15]);
+    else
+        CHECK(!view[1] && !view[28]);
     if (!f->ordinary)
         CHECK(!view[21]); /* Public delivery precedes paid RETIRE rebind. */
     int64_t value = 99;
@@ -262,6 +264,9 @@ static void destroy(fixture_t *f) {
 static const char *numeric =
     ".decl input(x:int64)\n.decl out(y:int64)\n"
     "input(1). out(7). out(strlen(to_string(x))):-input(x).";
+static const char *declared_identity =
+    ".decl input(x:int64)\n.decl out(y:int64)\n"
+    "input(1). out(7). out(x):-input(x).";
 static void checkpoint(wl_evaluation_control_t *control, unsigned phase,
     uint32_t index,
     const wl_columnar_eval_private_bindings_t *bindings) {
@@ -326,7 +331,10 @@ static void positives(void) {
         ".decl input(x:int64)\n.decl out(y:int64)\n"
         "input(1). out(7). out(strlen(to_string(x))):-input(x),x>0.",
         ".decl input(x:int64)\n.decl out(y:int64)\n"
-        "out(7). out(strlen(to_string(x))):-input(x)."
+        "out(7). out(strlen(to_string(x))):-input(x).",
+        declared_identity,
+        ".decl out(y:int64)\n.decl input(x:int64)\n"
+        "out(7). input(1). out(x):-input(x)."
     };
     for (unsigned source = 0; source < sizeof(sources) / sizeof(*sources);
         ++source)
@@ -362,7 +370,7 @@ static void positives(void) {
                 destroy(&f);
             }
 }
-static void stops(void) {
+static void stops_for(const char *source) {
     /* Actual parent phases: before arena, failed Init, prepared actor,
      * real rule, after Take, closed actor, and reversible publication claims. */
     const unsigned phases[] = {64, 65, 66, 80,  83,  86,  88, 90,
@@ -373,7 +381,7 @@ static void stops(void) {
             for (unsigned mode = 0; mode < 6; ++mode) {
                 if (mode >= 4 && phases[phase] > 66)
                     continue;
-                fixture_t f = create(numeric, observed, true);
+                fixture_t f = create(source, observed, true);
                 fixture_hook(&f, observed);
                 f.phase = phases[phase];
                 f.mode = mode;
@@ -389,7 +397,8 @@ static void stops(void) {
                 int rc = complete(&f);
                 if (!f.injected ||
                     rc !=
-                    (mode == 0                ? WL_EVALUATION_CONTROL_CANCELLED
+                    (mode ==
+                    0                ? WL_EVALUATION_CONTROL_CANCELLED
                    : mode == 1 || mode >= 4 ? WL_EVALUATION_CONTROL_WORK_LIMIT
                                             : EINVAL))
                     fprintf(stderr,
@@ -397,7 +406,8 @@ static void stops(void) {
                         f.phase, mode, observed, rc, f.injected);
                 CHECK(f.injected && f.hits == 1);
                 CHECK(rc ==
-                    (mode == 0                ? WL_EVALUATION_CONTROL_CANCELLED
+                    (mode ==
+                    0                ? WL_EVALUATION_CONTROL_CANCELLED
                      : mode == 1 || mode >= 4 ? WL_EVALUATION_CONTROL_WORK_LIMIT
                                               : EINVAL));
                 uint64_t closed[32];
@@ -422,13 +432,15 @@ static void stops(void) {
                         !used);
                     wl_evaluation_control_attempt_finish_result_t ended =
                         wl_evaluation_control_finish_attempt(
-                        f.control, f.session->operation_admission, f.successor,
+                        f.control, f.session->operation_admission,
+                        f.successor,
                         0, 0);
                     CHECK(!ended.protocol && ended.report_valid &&
                         !ended.report.consumed);
                 }
 
-                wl_columnar_session_test_observed_transaction_checkpoint = NULL;
+                wl_columnar_session_test_observed_transaction_checkpoint =
+                    NULL;
                 CHECK(!wl_evaluation_control_reset(f.control) &&
                     !wl_evaluation_control_configure(f.control, 0));
                 int retry = complete(&f);
@@ -438,6 +450,10 @@ static void stops(void) {
                 equal(&f);
                 destroy(&f);
             }
+}
+static void stops(void) {
+    stops_for(numeric);
+    stops_for(declared_identity);
 }
 static void child_error(void) {
     const char *source =
@@ -695,19 +711,65 @@ static void name_vectors(void) {
     const char *ordinary = ".decl input(x:int64)\n.decl seed(y:int64)\n"
         ".decl out(z:int64)\ninput(1). seed(7). "
         "out(strlen(to_string(x))):-input(x).";
-    for (unsigned canonical = 0; canonical < 2; ++canonical)
-        for (unsigned observed = 0; observed < 2; ++observed) {
-            fixture_t f = create(canonical ? numeric : ordinary, observed,
-                    true);
-            f.ordinary = !canonical;
-            f.name_expected = canonical ? 7 : 4;
-            fixture_hook(&f, observed);
-            wl_columnar_session_test_observed_transaction_checkpoint =
-                name_checkpoint;
-            CHECK(!complete(&f) && f.name_finished && !wl_session_step(f.raw));
-            equal(&f);
-            destroy(&f);
+    const char *ordinary_identity =
+        ".decl input(x:int64)\n.decl seed(y:int64)\n"
+        ".decl out(z:int64)\ninput(1). seed(7). out(x):-input(x).";
+    for (unsigned identity = 0; identity < 2; ++identity)
+        for (unsigned canonical = 0; canonical < 2; ++canonical)
+            for (unsigned observed = 0; observed < 2; ++observed) {
+                fixture_t f =
+                    create(canonical ? (identity ? declared_identity : numeric)
+                    : (identity ? ordinary_identity : ordinary), observed,
+                        true);
+                f.ordinary = !canonical;
+                f.name_expected = canonical ? 7 : 4;
+                fixture_hook(&f, observed);
+                wl_columnar_session_test_observed_transaction_checkpoint =
+                    name_checkpoint;
+                CHECK(!complete(&f) && f.name_finished &&
+                    !wl_session_step(f.raw));
+                equal(&f);
+                destroy(&f);
+            }
+    /* The immutable hint is not proof that an EDB is the head. This actual
+     * two-EDB identity plan selects ordinary general ownership instead. */
+    for (unsigned mode = 0; mode < 4; ++mode) {
+        fixture_t f = create(ordinary_identity, true, true);
+        f.ordinary = true;
+        fixture_hook(&f, true);
+        f.phase = 14;
+        f.mode = mode;
+        if (mode == 1)
+            CHECK(!wl_evaluation_control_configure(f.control, UINT64_MAX));
+        CHECK(!session_find_rel(COL_SESSION(f.session), "out"));
+        wl_columnar_session_test_observed_transaction_checkpoint = checkpoint;
+        CHECK(complete(&f) == (mode == 0 ? WL_EVALUATION_CONTROL_CANCELLED
+            : mode == 1 ? WL_EVALUATION_CONTROL_WORK_LIMIT : EINVAL));
+        CHECK(f.injected && f.hits == 1 && !f.events && !f.image[1]
+            && f.image[9] == 3 && !f.image[28]
+            && !session_find_rel(COL_SESSION(f.session), "out"));
+        wl_evaluation_control_report_t report;
+        CHECK(!wl_evaluation_control_report(f.control, &report));
+        if (mode >= 2)
+            CHECK(report_equal(&f.frozen, &report));
+        if (f.successor) {
+            uint64_t used = 999;
+            CHECK(!wl_evaluation_control_test_active_consumed(f.control,
+                f.successor, &used) && !used);
+            wl_evaluation_control_attempt_finish_result_t ended =
+                wl_evaluation_control_finish_attempt(f.control,
+                    f.session->operation_admission, f.successor, 0, 0);
+            CHECK(!ended.protocol && ended.report_valid &&
+                !ended.report.consumed);
         }
+        wl_columnar_session_test_observed_transaction_checkpoint = NULL;
+        CHECK(!wl_evaluation_control_reset(f.control)
+            && !wl_evaluation_control_configure(f.control, 0));
+        CHECK(!complete(&f) && !wl_session_step(f.raw));
+        equal(&f);
+        destroy(&f);
+    }
+
 }
 static void committed_end(void) {
     for (unsigned point = 0; point < 4; ++point)
@@ -774,9 +836,9 @@ static void snapshot_tuple(const char *relation, const int64_t *row,
     (void)relation; (void)row; (void)width;
     ++*(unsigned *)context;
 }
-static void snapshot_boundary(void) {
+static void snapshot_boundary_for(const char *source) {
     for (unsigned observed = 0; observed < 2; ++observed) {
-        fixture_t f = create(numeric, observed, true);
+        fixture_t f = create(source, observed, true);
         fixture_hook(&f, observed);
         unsigned tuples = 0;
         wl_columnar_session_test_fail_seed_arena_allocation = true;
@@ -794,10 +856,15 @@ static void snapshot_boundary(void) {
         CHECK(!seed);
         if (!viewed) CHECK(!v[1] && !v[3] && !v[11] && !v[28]);
         destroy(&f);
-        f = create(numeric, observed, true); fixture_hook(&f, observed);
+        f = create(source, observed, true);
+        fixture_hook(&f, observed);
         CHECK(!complete(&f) && !wl_session_step(f.raw)); equal(&f);
         destroy(&f);
     }
+}
+static void snapshot_boundary(void) {
+    snapshot_boundary_for(numeric);
+    snapshot_boundary_for(declared_identity);
 }
 static void unloaded(void) {
     const char *sources[] = {
