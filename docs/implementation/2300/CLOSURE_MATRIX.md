@@ -122,6 +122,14 @@ selector/representation/lifecycle/accounting/platform predicates. Its new
 tests do not close O04, F05/F05a or #2371. Issue-closing keywords require the
 complete corresponding acceptance, rather than an intermediate green suite.
 
+A local MSVC build with genuine C11 `<threads.h>` now compiles and passes
+the suite apart from three CRLF example goldens. The build and its layout
+record are in
+[windows-handoff-2364/WINDOWS_HANDOFF.md](windows-handoff-2364/WINDOWS_HANDOFF.md).
+That record does not close #2367. Thread identity across the 16-byte
+`thrd_t`, the scalar retirement one-shot clears and the other handoff
+items remain open.
+
 The remaining RUNNING/stream adapters belong to #2369; containing Source
 issuance, activation and correlated accounting belong to #2370. The bundle
 must identify exact handoff predicates and satisfy any certificate actually
