@@ -72,6 +72,17 @@ static const col_rel_t *test_diff_commit_cache_original;
 static const col_rel_t *test_diff_commit_control_cache;
 static uint32_t *test_diff_commit_segments;
 static bool test_diff_commit_refusal_witnessed;
+/* Armed for one parallel keyed diff join: the governor reserve when the
+ * output's twin copy for the cache is admitted, and when the arrangement
+ * transaction commits, with the two arrangements that transaction holds. */
+static wl_col_session_t *diff_peak_sess;
+static uint32_t diff_peak_copy_admissions;
+static uint32_t diff_peak_commits;
+static uint64_t diff_peak_copy_reserved;
+static uint64_t diff_peak_commit_reserved;
+static uint64_t diff_peak_persistent_bytes;
+static uint64_t diff_peak_working_bytes;
+static const col_diff_arrangement_t *diff_peak_working;
 
 void wl_columnar_relation_test_fail_next_governed_copy_payload_alloc(void);
 extern bool wl_columnar_join_test_fail_next_key_scratch_alloc;
@@ -122,9 +133,34 @@ fail_join_submit_at(wl_work_queue_t *wq, void (*work_fn)(void *), void *ctx)
     return wl_workqueue_submit(wq, work_fn, ctx);
 }
 
+static uint64_t
+diff_peak_reserved(void)
+{
+    return wl_columnar_memory_reserved(
+        wl_columnar_memory_governor_ref_get(diff_peak_sess->memory_governor));
+}
+
+static void
+arm_diff_peak(wl_col_session_t *sess)
+{
+    diff_peak_sess = sess;
+    diff_peak_copy_admissions = 0;
+    diff_peak_commits = 0;
+    diff_peak_copy_reserved = 0;
+    diff_peak_commit_reserved = 0;
+    diff_peak_persistent_bytes = 0;
+    diff_peak_working_bytes = 0;
+    diff_peak_working = NULL;
+}
+
 static void
 try_reclaim_during_governed_copy(const col_rel_t *source)
 {
+    if (diff_peak_sess
+        && source->memory_governor == diff_peak_sess->memory_governor) {
+        diff_peak_copy_admissions++;
+        diff_peak_copy_reserved = diff_peak_reserved();
+    }
     if (!test_cache_reclaim_attempt)
         return;
     test_cache_reclaim_attempt = false;
@@ -167,6 +203,15 @@ static void
 fail_next_diff_commit_after_mutation(
     wl_columnar_arrangement_diff_txn_t *txn)
 {
+    if (diff_peak_sess && txn && txn->session == diff_peak_sess) {
+        diff_peak_commits++;
+        diff_peak_commit_reserved = diff_peak_reserved();
+        diff_peak_persistent_bytes = txn->persistent
+            ? txn->persistent->reserved_bytes : 0;
+        diff_peak_working_bytes = txn->working
+            ? txn->working->reserved_bytes : 0;
+        diff_peak_working = txn->working;
+    }
     if (!test_fail_diff_commit || !txn || !txn->entry)
         return;
     if (test_diff_commit_stack) {
@@ -3701,8 +3746,8 @@ measure_parallel_diff_peak(uint64_t *peak_out)
     eval_entry_t result = { 0 };
     const col_rel_t *governed;
     uint64_t final_bytes;
-    uint64_t initial_bytes;
-    uint64_t other_bytes;
+    uint64_t at_copy;
+    uint64_t after_commit;
     bool ok = false;
 
     setenv("WIRELOG_JOIN_PAR_MIN_LEFT_ROWS", "2", 1);
@@ -3712,33 +3757,46 @@ measure_parallel_diff_peak(uint64_t *peak_out)
         goto out;
     right = NULL;
     init_diff_keyed_op(&op);
+    arm_diff_peak(sess);
     if (run_diff_join(sess, left, &op, &result) != 0)
         goto out;
+    diff_peak_sess = NULL;
     governed = cached_output(sess, left);
     if (!governed || governed->nrows != expected_rows
         || governed->capacity != expected_rows
         || governed->pool_owned || governed->memory_governor == NULL
         || sess->wq == NULL || sess->diff_arr_count != 1
-        || !admission_invariant(governed))
+        || !admission_invariant(governed)
+        || !result.owned || !result.rel || result.rel == governed)
         goto out_entry;
     if (!col_rel_retained_live_bytes(governed, &final_bytes)
-        || !col_rel_retained_bytes_for(governed, COL_REL_INIT_CAP,
-        &initial_bytes)
         || governed->retained_reserved_bytes != final_bytes)
         goto out_entry;
-    other_bytes = reserved_of(sess) - relation_charge(governed);
-    /* A diff transaction deep-copies the persistent arrangement while the
-     * output grows, so include that second arrangement footprint and the
-     * output's initial token in the one-byte-short budget. */
-    if (other_bytes > UINT64_MAX - initial_bytes
-        || reserved_of(sess) > UINT64_MAX - other_bytes - initial_bytes)
+    /* The output's twin copy for the cache is the last admission: the
+     * transaction commits with exactly that reserve, then releases only the
+     * persistent arrangement its working copy replaces. */
+    if (diff_peak_copy_admissions != 1 || diff_peak_commits != 1
+        || diff_peak_commit_reserved != diff_peak_copy_reserved
+        || sess->diff_arr_entries[0].diff_arr != diff_peak_working
+        || diff_peak_working->reserved_bytes != diff_peak_working_bytes)
         goto out_entry;
-    *peak_out = reserved_of(sess) + other_bytes + initial_bytes;
+    /* Every reserved byte at the copy is named: the session registry, the
+     * cached output, its published twin and both arrangements. */
+    at_copy = registry_charge(sess) + relation_charge(governed)
+        + relation_charge(result.rel) + diff_peak_persistent_bytes
+        + diff_peak_working_bytes;
+    after_commit = registry_charge(sess) + relation_charge(governed)
+        + relation_charge(result.rel) + diff_peak_working_bytes;
+    if (diff_peak_copy_reserved != at_copy
+        || reserved_of(sess) != after_commit)
+        goto out_entry;
+    *peak_out = diff_peak_copy_reserved;
     ok = *peak_out > 0;
 out_entry:
     if (result.owned && result.rel)
         col_rel_destroy(result.rel);
 out:
+    diff_peak_sess = NULL;
     unsetenv("WIRELOG_JOIN_PAR_MIN_LEFT_ROWS");
     col_rel_destroy(left);
     col_rel_destroy(right);
@@ -4232,23 +4290,22 @@ out:
     destroy_session(sess);
 }
 
-static void
-test_parallel_diff_denial(void)
+/* One parallel keyed diff join under @budget.  With @copy_admitted the
+ * output's twin copy must be admitted with the budget exactly reserved;
+ * otherwise only that copy is denied and the transaction still commits the
+ * result as one accounted owner. */
+static bool
+parallel_diff_at_budget(uint64_t budget, bool copy_admitted)
 {
-    wl_col_session_t *sess = NULL;
+    wl_col_session_t *sess = make_session_workers(budget, 2);
     col_rel_t *right = make_right(1, 2);
     col_rel_t *left = make_left(65, 1);
     wl_plan_op_t op;
-    uint64_t peak = 0;
-    eval_entry_t denied_result = { 0 };
+    eval_entry_t result = { 0 };
+    bool ok = false;
+    int rc;
 
-    TEST("parallel keyed diff copy OOM publishes one accounted result");
     setenv("WIRELOG_JOIN_PAR_MIN_LEFT_ROWS", "2", 1);
-    if (!measure_parallel_diff_peak(&peak) || peak <= 1u) {
-        FAIL("could not measure the parallel diff overlap peak");
-        goto out;
-    }
-    sess = make_session_workers(peak - 1u, 2);
     if (!sess || !right || !left) {
         FAIL("fixture");
         goto out;
@@ -4259,27 +4316,55 @@ test_parallel_diff_denial(void)
     }
     right = NULL;
     init_diff_keyed_op(&op);
-    int rc = run_diff_join(sess, left, &op, &denied_result);
-    if (rc != 0 || !denied_result.rel || !denied_result.owned
-        || denied_result.rel->memory_governor != sess->memory_governor
-        || !admission_invariant(denied_result.rel)
-        || cached_output(sess, left) != NULL || sess->diff_arr_count != 1) {
+    arm_diff_peak(sess);
+    rc = run_diff_join(sess, left, &op, &result);
+    diff_peak_sess = NULL;
+    if (rc != 0 || !result.rel || !result.owned || sess->wq == NULL
+        || result.rel->memory_governor != sess->memory_governor
+        || !admission_invariant(result.rel) || sess->diff_arr_count != 1
+        || diff_peak_commits != 1) {
+        FAIL("parallel keyed diff did not commit its transaction");
+        goto out;
+    }
+    if (copy_admitted) {
+        if (diff_peak_copy_admissions != 1
+            || diff_peak_copy_reserved != budget
+            || cached_output(sess, left) == NULL) {
+            FAIL("the measured peak did not admit the twin copy exactly");
+            goto out;
+        }
+    } else if (diff_peak_copy_admissions != 0
+        || cached_output(sess, left) != NULL
+        || reserved_of(sess) < result.rel->retained_reserved_bytes) {
         FAIL(
             "twin-copy OOM did not commit the differential result as one owner");
         goto out;
     }
-    if (reserved_of(sess) < denied_result.rel->retained_reserved_bytes) {
-        FAIL("single-owner fallback reservation is missing");
-        goto out;
-    }
-    col_rel_destroy(denied_result.rel);
-    denied_result.rel = NULL;
-    PASS();
+    ok = true;
 out:
+    diff_peak_sess = NULL;
     unsetenv("WIRELOG_JOIN_PAR_MIN_LEFT_ROWS");
+    if (result.owned && result.rel)
+        col_rel_destroy(result.rel);
     col_rel_destroy(left);
     col_rel_destroy(right);
     destroy_session(sess);
+    return ok;
+}
+
+static void
+test_parallel_diff_denial(void)
+{
+    uint64_t peak = 0;
+
+    TEST("parallel keyed diff copy OOM publishes one accounted result");
+    if (!measure_parallel_diff_peak(&peak) || peak <= 1u) {
+        FAIL("could not measure the parallel diff overlap peak");
+        return;
+    }
+    if (parallel_diff_at_budget(peak, true)
+        && parallel_diff_at_budget(peak - 1u, false))
+        PASS();
 }
 
 static void
