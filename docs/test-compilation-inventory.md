@@ -7,6 +7,25 @@ shared production static library `testlib_prod`, why each reuse group is
 build-configuration equivalent (and therefore safe), and why every
 retained target keeps its independent compilation.
 
+## Current CI link policy
+
+The counts and inherited-LTO configuration below record the original #1572
+conversion. The current hook archives `testlib_prod`,
+`testlib_prod_memory_hooks` and `radix_workspace_hook_lib` explicitly compile
+native engine objects with `b_lto=false` and `unity=off`. This avoids repeating
+whole-engine LTO at every fixture link. The MEMORY and radix archives still
+extract only their common objects and replace their own hooked translation
+units; fixtures must not also link the original governor/control implementation.
+The allocation-wrapper alias `testlib_prod_no_lto` reuses this same native
+archive instead of compiling another copy.
+
+This exception applies to internal hook archives, not installed libraries.
+The project production default remains `b_lto=true`, including the primary CI
+library and its strict size/profile comparison. Fixture translation units and
+independently compiled targets retain their own options. Sanitizer CI disables
+LTO explicitly while preserving ASan/UBSan instrumentation. Test registrations,
+arguments, suites and watchdogs are unchanged by this link policy.
+
 ## 1. What changed
 
 One internal static library was added to `tests/meson.build`,
