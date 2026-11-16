@@ -2608,3 +2608,49 @@ empty-input expression controls also exercise the noncanonical general route.
 This bundle does not activate arbitrary JOIN/K, recursive cursor transport,
 pool or prepared-sort continuations, and does not claim whole-issue completion
 for #2299 despite its automatic closure with #2366.
+
+
+### Declared observed canonical seed STEP qualification
+
+On main `e93020a3`, the fully declared INT64 identity MAP in
+`evaluation_facts_sources`, with a loaded head seed, reached legacy observed
+preflight phase6 and returned ENOTSUP; the raw
+session produced the three expected rows. The matching undeclared controls
+reached canonical phase64. The ordinary DIRECT seed hint now admits observers
+before legacy identity-MAP classification. The actual paid name matcher still
+selects the head slot, and a two-EDB non-head match uses ordinary count3 with no
+seed actor. SOURCE/C1 skips the hint; C1, batches and evaluating SNAPSHOT retain
+their separate gates. No actor, financier, MAIN, Native or report/ACK authority
+is added by the hint.
+
+`evaluation_facts_sources` checks every declaration/load/observer/STEP/SNAPSHOT
+cell, literal initial and later rows, signed events, unchanged evaluation,
+head insert/remove overlap, schema parity and real cutoff cancellation with
+unchanged shadow/publication before retry. The declared and reversed-declaration
+host positives prove actual seed ownership, and the existing stop matrix now
+also runs the declared identity program. Unmatched observed identity candidates
+exercise cancellation, work exhaustion, Original END and an unrelated successor,
+with no actor/publication and raw retry parity. Unloaded seed width repair and
+evaluating SNAPSHOT remain explicitly refused.
+
+The `declared-lifecycle` family executes the actual declared program through
+arena governor denial with raised-limit retry and a subsequent insert; committed
+END/delivery; constructor/FINISH failures; real financier accounting overflow,
+settlement and replacement; failed arena admission/return; observer reader
+closure; and second-attempt arena ENOMEM after MAIN moved-credit return. It
+retains precise first-error, frozen Original/successor0, no duplicate credit or
+events, raw image/schema and final resource assertions. These are actual parsed
+program arguments to the original helpers, not production flags used to pretend
+selection.
+
+Thirty-two `declared-frontier` shards discover the current declared observed
+public frontier census independently, replay every ordinal modulo32 with and
+without a successor, and require the matching phase/witness before ending
+Original. Each drain checks frozen reports, successor0 and the unpublished old
+image/events. Reader binding has its own positive owner witness. The full local
+runner retains the unpartitioned completeness oracle; no observed successful
+work allowance is used as a primitive price.
+
+This closes the qualified loaded ordinary declared observed seed intersection.
+Recursive/K cursor transport, pool and prepared-sort integration, schema-less
+seed repair, evaluating SNAPSHOT and broader contexts remain separate work.

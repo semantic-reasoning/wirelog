@@ -7919,6 +7919,7 @@ foreach family : [
   'maintenance-refusals',
   'maintenance-native-dispose',
   'positives',
+  'declared-lifecycle',
   'stops',
   'child-error',
   'governor-denials',
@@ -7953,4 +7954,12 @@ foreach observed : range(2)
         suite: ['unit', 'tsan', 'evaluation_seed_hosts'], timeout: 120)
     endforeach
   endforeach
+endforeach
+
+# Every frontier discovered on the newly admitted declared observed plan is
+# replayed exactly once across these shards, with both Original-END histories.
+foreach shard : range(32)
+  test('evaluation_seed_hosts_declared_frontier_' + shard.to_string(), seed_hosts_exe,
+    args: ['declared-frontier', '1', shard.to_string()],
+    suite: ['unit', 'tsan', 'evaluation_seed_hosts', 'evaluation_declared_seed'], timeout: 120)
 endforeach

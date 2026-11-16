@@ -771,10 +771,10 @@ static void name_vectors(void) {
     }
 
 }
-static void committed_end(void) {
+static void committed_end_for(const char *program) {
     for (unsigned point = 0; point < 4; ++point)
         for (unsigned successor = 0; successor < 2; ++successor) {
-            fixture_t f = create(numeric, true, true);
+            fixture_t f = create(program, true, true);
             fixture_hook(&f, true);
             f.mode = successor ? 3 : 2;
             f.end_on_event = point == 0;
@@ -831,6 +831,9 @@ static void committed_end(void) {
         }
 }
 extern bool wl_columnar_session_test_fail_seed_arena_allocation;
+static void committed_end(void) {
+    committed_end_for(numeric);
+}
 static void snapshot_tuple(const char *relation, const int64_t *row,
     uint32_t width, void *context) {
     (void)relation; (void)row; (void)width;
@@ -988,10 +991,10 @@ birth_checkpoint(wl_evaluation_control_t *control, unsigned phase,
     else
         wl_evaluation_control_test_finance_birth_fail = f->mode == 2 ? 2 : 1;
 }
-static void birth_failures(void) {
+static void birth_failures_for(const char *program) {
     for (unsigned site = 0; site < 3; ++site)
         for (unsigned observed = 0; observed < 2; ++observed) {
-            fixture_t f = create(numeric, observed, true);
+            fixture_t f = create(program, observed, true);
             fixture_hook(&f, observed);
             f.phase = site == 0 ? 84 : 85;
             f.mode = site;
@@ -1013,7 +1016,7 @@ static void birth_failures(void) {
             destroy(&f);
         }
     for (unsigned stage = 1; stage <= 3; ++stage) {
-        fixture_t f = create(numeric, true, true);
+        fixture_t f = create(program, true, true);
         fixture_hook(&f, true);
         if (stage == 1) {
             f.phase = 16;
@@ -1045,6 +1048,9 @@ static void birth_failures(void) {
         equal(&f);
         destroy(&f);
     }
+}
+static void birth_failures(void) {
+    birth_failures_for(numeric);
 }
 static void compact_recompute(void) {
     const char *source =
@@ -1341,12 +1347,12 @@ static void arena_tail(wl_evaluation_control_t *control, uint64_t work) {
         control == f->control && work == 29)
         checkpoint(control, 83, 0, NULL);
 }
-static void arena_attempt_restoration(void) {
+static void arena_attempt_restoration_for(const char *program, bool observed) {
     for (unsigned injected = 0; injected < 2; ++injected)
         for (unsigned tail = 0; tail < 2; ++tail)
             for (unsigned mode = 0; mode < 4; ++mode) {
-                fixture_t f = create(numeric, false, injected);
-                fixture_hook(&f, false);
+                fixture_t f = create(program, observed, injected);
+                fixture_hook(&f, observed);
                 f.phase = 83;
                 f.mode = mode;
                 f.arena_tail = tail;
@@ -1411,6 +1417,9 @@ static void arena_attempt_restoration(void) {
                 destroy(&f);
             }
 }
+static void arena_attempt_restoration(void) {
+    arena_attempt_restoration_for(numeric, false);
+}
 /* Census records actual forward turns, independent from the modulo partition.
 * Every discovered ordinal belongs to exactly one of the registered shards. */
 typedef struct {
@@ -1420,12 +1429,12 @@ static unsigned frontier_witness(const uint64_t view[32]) {
     return ((view[0] == 2 && !view[18]) ? 1u : 0u) | (view[23] ? 2u : 0u) |
            (view[3] ? 4u : 0u) | (view[5] ? 8u : 0u);
 }
-static frontier_point_t *frontier_census(unsigned observed,
+static frontier_point_t *frontier_census(const char *program, unsigned observed,
     unsigned *count_out) {
     frontier_point_t *points = NULL;
     unsigned count = 0, witnesses = 0;
     size_t capacity = 0;
-    fixture_t census = create(numeric, observed, true);
+    fixture_t census = create(program, observed, true);
     fixture_hook(&census, observed);
     int rc = EAGAIN;
     for (unsigned turn = 1; turn < 10000 && rc == EAGAIN; ++turn) {
@@ -1458,10 +1467,11 @@ static frontier_point_t *frontier_census(unsigned observed,
     *count_out = count;
     return points;
 }
-static bool frontier_replay(unsigned observed, const frontier_point_t *point,
+static bool frontier_replay(const char *program, unsigned observed,
+    const frontier_point_t *point,
     unsigned ordinal, unsigned successor) {
     bool saw_reader_binding_packet = false;
-    fixture_t f = create(numeric, observed, true);
+    fixture_t f = create(program, observed, true);
     fixture_hook(&f, observed);
     col_rel_t *old = session_find_rel(COL_SESSION(f.session), "out");
     col_relation_snapshot_t image = wl_columnar_relation_snapshot(old);
@@ -1471,7 +1481,7 @@ static bool frontier_replay(unsigned observed, const frontier_point_t *point,
     CHECK(!wl_columnar_session_test_seed_host_view(COL_SESSION(f.session), view,
         NULL));
     CHECK(view[1] && !view[14]);
-    CHECK(frontier_witness(view) == point->witness);
+    CHECK(view[0] == point->phase && frontier_witness(view) == point->witness);
     if (view[23])
         CHECK(view[0] == 8 && !view[15]);
     end_original(&f, successor);
@@ -1541,10 +1551,11 @@ static bool frontier_replay(unsigned observed, const frontier_point_t *point,
     destroy(&f);
     return saw_reader_binding_packet;
 }
-static void public_frontier_selected(unsigned observed, unsigned shard,
+static void public_frontier_selected(const char *program, unsigned observed,
+    unsigned shard,
     unsigned partitions) {
     unsigned count = 0, replayed = 0;
-    frontier_point_t *points = frontier_census(observed, &count);
+    frontier_point_t *points = frontier_census(program, observed, &count);
     bool saw_reader_binding_packet = false;
     for (unsigned point = 0; point < count; ++point) {
         if (point % partitions != shard)
@@ -1552,9 +1563,13 @@ static void public_frontier_selected(unsigned observed, unsigned shard,
         ++replayed;
         for (unsigned successor = 0; successor < 2; ++successor)
             saw_reader_binding_packet |=
-                frontier_replay(observed, &points[point], point, successor);
+                frontier_replay(program, observed, &points[point], point,
+                    successor);
     }
     CHECK(replayed == count / partitions + (shard < count % partitions));
+    if (program == declared_identity)
+        printf("declared observed%u census%u shard%u/%u replayed%u\n",
+            observed, count, shard, partitions, replayed);
     /* Full local runs retain the old aggregate oracle. Registered partitions
      * each retain the literal binding checks; the separate qualification below
      * requires the positive observer witness independently of membership. */
@@ -1562,9 +1577,10 @@ static void public_frontier_selected(unsigned observed, unsigned shard,
         CHECK(saw_reader_binding_packet == (observed != 0));
     free(points);
 }
-static void reader_binding_qualification(unsigned observed) {
+static void reader_binding_qualification_for(const char *program,
+    unsigned observed) {
     unsigned count = 0;
-    frontier_point_t *points = frontier_census(observed, &count);
+    frontier_point_t *points = frontier_census(program, observed, &count);
     unsigned point = 0;
     /* Actual EVENTS follows observer build, so its real owner must traverse
      * reader closure. The unobserved negative control selects a genuine live
@@ -1575,9 +1591,13 @@ static void reader_binding_qualification(unsigned observed) {
         ++point;
     CHECK(point < count);
     for (unsigned successor = 0; successor < 2; ++successor)
-        CHECK(frontier_replay(observed, &points[point], point, successor) ==
+        CHECK(frontier_replay(program, observed, &points[point], point,
+            successor) ==
             (observed != 0));
     free(points);
+}
+static void reader_binding_qualification(unsigned observed) {
+    reader_binding_qualification_for(numeric, observed);
 }
 /* A compressed reachable history on the actual attached private owner. The
  * next genuine positive purchase, not this hook, creates sticky overflow. */
@@ -1896,12 +1916,12 @@ static void maintenance_native_underflows(void) {
             destroy(&f);
         }
 }
-static void maintenance_overflows(void) {
+static void maintenance_overflows_for(const char *program) {
     const unsigned sites[] = {1501, 1503, 15};
     for (unsigned observed = 0; observed < 2; observed++)
         for (unsigned site = 0; site < 3; site++)
             for (unsigned ended = 0; ended < 3; ended++) {
-                fixture_t f = create(numeric, observed, true);
+                fixture_t f = create(program, observed, true);
                 fixture_hook(&f, observed);
                 f.phase = sites[site];
                 wl_columnar_session_seed_test_checkpoint =
@@ -1985,6 +2005,9 @@ static void maintenance_overflows(void) {
                 equal(&f);
                 destroy(&f);
             }
+}
+static void maintenance_overflows(void) {
+    maintenance_overflows_for(numeric);
 }
 static void maintenance_recovery_refusals(void) {
     for (unsigned observed = 0; observed < 2; observed++)
@@ -2458,9 +2481,9 @@ static void retry_terminal_finished(const wl_col_session_t *session,
         && report.stop_reason == WL_EVALUATION_CONTROL_CANCELLED);
     ++terminal_credit_reports;
 }
-static void retry_terminal_report(unsigned observed) {
+static void retry_terminal_report_for(const char *program, unsigned observed) {
     for (unsigned ended = 0; ended < 3; ++ended) {
-        fixture_t f = create(numeric, observed, true);
+        fixture_t f = create(program, observed, true);
         fixture_hook(&f, observed);
         CHECK(!complete(&f) && !wl_session_step(f.raw)); equal(&f);
         col_rel_t *old = session_find_rel(COL_SESSION(f.session), "out");
@@ -2523,7 +2546,81 @@ static void retry_suffix(unsigned observed)
             saw_recovery |= recovered;
         }
     CHECK(saw_recovery);
-    retry_terminal_report(observed);
+    retry_terminal_report_for(numeric, observed);
+}
+
+static void declared_arena_denial(wl_evaluation_control_t *control,
+    unsigned phase, uint32_t index,
+    const wl_columnar_eval_private_bindings_t *bindings) {
+    (void)index;
+    (void)bindings;
+    fixture_t *f = active;
+    if (!f || f->injected || phase != 83)
+        return;
+    CHECK(control == f->control);
+    uint64_t view[32];
+    CHECK(!wl_columnar_session_test_seed_host_view(COL_SESSION(f->session),
+        view, NULL) && view[1] && !view[11] && !view[28]);
+    wl_columnar_memory_governor_t *g =
+        wl_columnar_memory_governor_ref_get(f->governor);
+    CHECK(g == wl_columnar_memory_governor_ref_get(f->actual_governors[0]));
+    f->saved_usable = atomic_load_explicit(&g->usable_bytes,
+            memory_order_acquire);
+    f->reserved_floor = wl_columnar_memory_reserved(g);
+    f->denial_before = wl_columnar_memory_denials(g);
+    CHECK(f->reserved_floor < f->saved_usable);
+    atomic_store_explicit(&g->usable_bytes, f->reserved_floor,
+        memory_order_release);
+    f->injected = true;
+}
+static void declared_governor_denial(void) {
+    fixture_t f = create(declared_identity, true, true);
+    fixture_hook(&f, true);
+    col_rel_t *old = session_find_rel(COL_SESSION(f.session), "out");
+    col_relation_snapshot_t image = wl_columnar_relation_snapshot(old);
+    col_rel_t *shadow = wl_columnar_session_seed_rows(COL_SESSION(f.session),
+            "out");
+    CHECK(shadow && !shadow->base_nrows);
+    wl_columnar_memory_governor_t *g =
+        wl_columnar_memory_governor_ref_get(f.governor);
+    uint64_t reserved = wl_columnar_memory_reserved(g);
+    wl_columnar_session_test_observed_transaction_checkpoint =
+        declared_arena_denial;
+    CHECK(complete(&f) == ENOSPC && f.injected && !f.events);
+    CHECK(wl_columnar_memory_denials(g) > f.denial_before
+        && wl_columnar_memory_reserved(g) == reserved && !shadow->base_nrows
+        && session_find_rel(COL_SESSION(f.session), "out") == old
+        && wl_columnar_relation_snapshot_equal(image,
+        wl_columnar_relation_snapshot(old)));
+    wl_evaluation_control_report_t report;
+    CHECK(!wl_evaluation_control_report(f.control, &report)
+        && report.result == ENOSPC && report.execution_status == ENOSPC
+        && report.stop_reason == WL_EVALUATION_CONTROL_NONE &&
+        !report.cleanup_status);
+    atomic_store_explicit(&g->usable_bytes, f.saved_usable,
+        memory_order_release);
+    wl_columnar_session_test_observed_transaction_checkpoint = NULL;
+    CHECK(!wl_evaluation_control_reset(f.control));
+    CHECK(!complete(&f) && !wl_session_step(f.raw));
+    equal(&f);
+    CHECK(f.events == 2 && shadow->base_nrows == shadow->nrows);
+    int64_t value = 3;
+    CHECK(!wl_session_insert(f.session, "input", &value, 1, 1)
+        && !wl_session_insert(f.raw, "input", &value, 1, 1)
+        && !wl_evaluation_control_reset(f.control));
+    CHECK(!complete(&f) && !wl_session_step(f.raw));
+    equal(&f);
+    CHECK(f.events == 3 && f.positive == 3 && !f.negative);
+    destroy(&f);
+}
+static void declared_lifecycle(void) {
+    declared_governor_denial();
+    committed_end_for(declared_identity);
+    birth_failures_for(declared_identity);
+    maintenance_overflows_for(declared_identity);
+    arena_attempt_restoration_for(declared_identity, true);
+    reader_binding_qualification_for(declared_identity, true);
+    retry_terminal_report_for(declared_identity, true);
 }
 typedef struct {
     const char *name;
@@ -2538,6 +2635,7 @@ static const seed_family_t seed_families[] = {
     {"maintenance-refusals", maintenance_recovery_refusals},
     {"maintenance-native-dispose", maintenance_native_dispose_overflows},
     {"positives", positives},
+    {"declared-lifecycle", declared_lifecycle},
     {"stops", stops},
     {"child-error", child_error},
     {"governor-denials", governor_denials},
@@ -2577,10 +2675,11 @@ int main(int argc, char **argv) {
             seed_families[i].run();
         for (unsigned observed = 0; observed < 2; ++observed) {
             partial_headers_selected(observed, 0, 1);
-            public_frontier_selected(observed, 0, 1);
+            public_frontier_selected(numeric, observed, 0, 1);
             reader_binding_qualification(observed);
             retry_suffix(observed);
         }
+        public_frontier_selected(declared_identity, true, 0, 1);
     } else if (argc == 2) {
         unsigned i = 0;
         while (i < sizeof(seed_families) / sizeof(*seed_families) &&
@@ -2598,13 +2697,16 @@ int main(int argc, char **argv) {
             reader_binding_qualification(observed);
         else retry_suffix(observed);
     } else if (argc == 4 && (!strcmp(argv[1], "frontier") ||
-        !strcmp(argv[1], "partial-headers"))){
+        !strcmp(argv[1], "partial-headers") || !strcmp(argv[1],
+        "declared-frontier"))){
         unsigned observed, shard;
         if (!selector_unsigned(argv[2], 1, &observed) ||
             !selector_unsigned(argv[3], 31, &shard))
             return 2;
-        if (!strcmp(argv[1], "frontier"))
-            public_frontier_selected(observed, shard, 32);
+        if (!strcmp(argv[1], "declared-frontier"))
+            public_frontier_selected(declared_identity, observed, shard, 32);
+        else if (!strcmp(argv[1], "frontier"))
+            public_frontier_selected(numeric, observed, shard, 32);
         else
             partial_headers_selected(observed, shard, 32);
     } else
