@@ -3438,6 +3438,18 @@ test_plan_body_ops_exe = executable(
 
 test('plan_body_ops', test_plan_body_ops_exe)
 
+test_evaluation_join_inline_policy_exe = executable(
+  'test_evaluation_join_inline_policy', files('test_evaluation_join_inline_policy.c'),
+  c_args: ['-DWL_SESSION_TEST_HOOKS=1'],
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
+  link_with: [testlib_prod], install: false,
+)
+test('evaluation_join_inline_policy', test_evaluation_join_inline_policy_exe,
+     env: ['WIRELOG_JOIN_BATCH_BYTES=', 'WIRELOG_JOIN_BATCH_STRICT=',
+           'WIRELOG_JOIN_OUTPUT_LIMIT='],
+     suite: ['unit', 'tsan', 'evaluation_join_hosts'], timeout: 120)
+
 test_evaluation_join_inline_exe = executable(
   'test_evaluation_join_inline', files('test_evaluation_join_inline.c'),
   c_args: ['-DWL_SESSION_TEST_HOOKS=1'],
