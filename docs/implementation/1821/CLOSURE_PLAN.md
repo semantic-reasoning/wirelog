@@ -594,3 +594,20 @@ refusal every SNAPSHOT retry repeats keeps the SNAPSHOT_RETRYABLE contract, and
 `docs/SEMANTICS.md` now states that a controlled evaluating SNAPSHOT served by
 the general private-head transaction delivers delta events (#2295), where an
 uncontrolled one fires none.
+
+A fourth bundle records a search for the producers of lazy-owner, aliased,
+pool- or arena-owned, segmented and timestamped/weighted sources, which found
+none on a path that a controlled single-worker session takes, and adds
+`evaluation_source_shapes`, which checks the relations of such sessions, and
+the outputs and left inputs of the operator publications that its test hook
+observes, over a corpus with stops and retries; see "Source shapes in
+controlled single-worker sessions (#2301)". A lazy owner meets the reader's
+ENOTSUP and an alias, a pool- or arena-owned relation or a shared column the
+admissions' ENOTSUP, or EBUSY at the seed quiesce and retraction checks; the
+search found a refusal of a timestamped source only on the controlled recursive
+route and in the general observed transaction. Refused plans, SIDE compound
+EDBs, more than one worker, cold sources and memory-budget denials are outside
+its evidence, segments rest on the search alone, and right inputs and relations
+that live within one call are covered only in part; broader controlled
+evaluation of heads with input, cold sources and the consumers reading an
+INLINE input directly (#2300) stay open.
