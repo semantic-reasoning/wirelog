@@ -8423,6 +8423,7 @@ typedef struct wl_columnar_lftj_attempt {
 #endif
     bool thread_valid, busy;
     bool retirement_started, retirement_committed, retirement_drained;
+    uint8_t retirement_clear_chunk;
     wl_columnar_relation_private_batch_drain_t writer_drain;
 } wl_columnar_lftj_attempt_t;
 

@@ -10360,15 +10360,48 @@ static void test_lftj_scalar_cleanup_grants(void)
         CHECK(!scalar_lftj_turn(&f, direct != 0, 384, &work) && work == 256
             && !a->retirement_initializer.identity && a->retirement_started);
         bool saw_commit = false, saw_drained = false;
+        unsigned lftj_clears = 0;
         for (unsigned turn = 0;
             f.record.phase != WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_DONE;
             ++turn) {
             CHECK(turn < 10000);
+            const bool clearing = a->retirement_drained;
+            if (clearing) {
+                /* Each drained chunk is one 256 action after the 128
+                 * cleanup admission; one short of that total spends only
+                 * the admission and leaves the receipt and index. */
+                const unsigned index = lftj_clears % scalar_clear_steps();
+                CHECK(a->retirement_clear_chunk == index);
+                if (scalar_clear_refused_at(index)) {
+                    /* Everything from the receipt to the attempt's end. */
+                    const size_t from =
+                        offsetof(wl_columnar_lftj_attempt_t, retirement);
+                    unsigned char image[sizeof(*a)];
+                    memcpy(image, (unsigned char *)a + from,
+                        sizeof(*a) - from);
+                    CHECK(scalar_lftj_turn(&f, direct != 0, 128 + 256 - 1,
+                        &work) == WL_EVALUATION_CONTROL_WORK_LIMIT
+                        && work == 128 && a->retirement_drained
+                        && a->retirement_clear_chunk == index
+                        && !memcmp(image, (unsigned char *)a + from,
+                        sizeof(*a) - from));
+                    if (!direct) CHECK(
+                            !
+                            wl_columnar_eval_plan_numeric_composed_consume_result
+                            (
+                                &f.record, WL_EVALUATION_CONTROL_WORK_LIMIT,
+                                f.funding, f.funding_id));
+                }
+            }
             bool scalar = a->output_owned || a->retirement_started ||
                 a->retirement_drained;
             CHECK(!scalar_lftj_turn(&f, direct != 0, scalar ? 384 : 386,
                 &work));
             CHECK(work <= (scalar ? 384u : 386u));
+            if (clearing) {
+                CHECK(work == 128u + 256u);
+                ++lftj_clears;
+            }
             if (a->retirement_committed) {
                 saw_commit = true; CHECK(!a->output && !a->output_owned);
             }
@@ -10380,6 +10413,8 @@ static void test_lftj_scalar_cleanup_grants(void)
         }
         CHECK(saw_commit && saw_drained && scalar_lftj_reentry_count >= 4
             && !a->retirement_started && !a->output);
+        CHECK(lftj_clears == scalar_clear_steps()
+            && !a->retirement_clear_chunk);
         wl_columnar_relation_scalar_retirement_init_test_checkpoint = NULL;
         scalar_lftj_fixture = NULL;
         CHECK(wl_columnar_memory_reserved(wl_columnar_memory_governor_ref_get(
