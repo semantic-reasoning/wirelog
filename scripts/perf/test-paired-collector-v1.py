@@ -13,6 +13,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import time
 from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
@@ -414,7 +415,32 @@ signal.pause()
             process.stderr.close()
 
     def test_termination_signals_persist_active_launch_and_reap_group(self):
-        for iteration, number in ((i, s) for i in range(5) for s in (signal.SIGTERM, signal.SIGHUP)):
+        self.termination_signals_persist_active_launch_and_reap_group(False)
+
+    def test_stopped_termination_signals_reap_adopted_descendant(self):
+        self.termination_signals_persist_active_launch_and_reap_group(True)
+
+    def reap_terminated_descendant(self, pidfd, descendant, require_adopted=False):
+        self.assertTrue(select.select([pidfd], [], [], 10)[0],
+                        'descendant survived collector cleanup')
+        try:
+            pid, _ = os.waitpid(descendant, 0)
+            self.assertEqual(pid, descendant)
+        except ChildProcessError:
+            # The ordinary launcher may already have reaped its own child.
+            # A stopped launcher cannot do so before mandatory SIGKILL.
+            self.assertFalse(require_adopted, 'stopped launcher child was not adopted')
+
+    def termination_signals_persist_active_launch_and_reap_group(self, stopped):
+        # As in the exited-leader fixture, own an orphan's actual reap rather
+        # than relying on the runner's PID 1 before checking group absence.
+        libc = ctypes.CDLL(None, use_errno=True)
+        previous = ctypes.c_int()
+        self.assertEqual(libc.prctl(37, ctypes.byref(previous), 0, 0, 0), 0)
+        self.assertEqual(libc.prctl(36, 1, 0, 0, 0), 0)
+        self.addCleanup(lambda: self.assertEqual(libc.prctl(36, previous.value, 0, 0, 0), 0))
+        for iteration, number in ((i, s) for i in range(1 if stopped else 5)
+                                  for s in (signal.SIGTERM, signal.SIGHUP)):
             with self.subTest(signal=number, iteration=iteration):
                 self.args.out_dir = self.root / f'output-{number}-{iteration}'
                 ready = self.root / f'ready-{number}-{iteration}'
@@ -446,20 +472,41 @@ signal.pause()
                 environment = dict(os.environ, WIRELOG_TEST_READY=str(ready))
                 collector = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                              text=True, env=environment, encoding='utf-8')
-                group = None
+                group = descendant = pidfd = leader_pidfd = None
+                group_gone = False
                 try:
                     self.assertTrue(select.select([read_fd], [], [], 10)[0], 'benchmark did not become ready')
                     group, descendant = map(int, os.read(read_fd, 1024).decode().split())
+                    leader_pidfd = os.pidfd_open(group)
+                    pidfd = os.pidfd_open(descendant)
+                    if stopped:
+                        os.kill(group, signal.SIGSTOP)
+                        deadline = time.monotonic() + 10
+                        while True:
+                            status = Path(f'/proc/{group}/status').read_text(encoding='utf-8')
+                            state = next(line.split()[1] for line in status.splitlines()
+                                         if line.startswith('State:'))
+                            if state in ('T', 't'):
+                                break
+                            self.assertLess(time.monotonic(), deadline,
+                                            'launcher did not stop')
+                            time.sleep(0.01)
                     os.kill(collector.pid, number)
                     stdout, stderr = collector.communicate(timeout=10)
                     self.assertEqual(collector.returncode, -number, (stdout, stderr))
-                    with self.assertRaises(ProcessLookupError):
-                        os.killpg(group, 0)
-                    for pid in (group, descendant):
-                        self.assertFalse(Path(f'/proc/{pid}').exists())
                     lines = (self.args.out_dir / 'raw-attempts.jsonl').read_text(encoding='utf-8').splitlines()
                     self.assertEqual(len(lines), 1)
                     raw = json.loads(lines[0])
+                    with self.subTest(cleanup_exit=raw['exit_code'],
+                                      escalation=raw.get('cleanup_escalation')):
+                        self.reap_terminated_descendant(pidfd, descendant, stopped)
+                        with self.assertRaises(ProcessLookupError):
+                            os.killpg(group, 0)
+                        group_gone = True
+                        for pid in (group, descendant):
+                            self.assertFalse(Path(f'/proc/{pid}').exists())
+                    if stopped:
+                        self.assertEqual(raw['exit_code'], -signal.SIGKILL)
                     self.assertTrue(raw['interrupted'])
                     self.assertEqual(raw['signal_number'], number)
                     self.assertEqual(raw['signal_name'], signal.Signals(number).name)
@@ -477,14 +524,30 @@ signal.pause()
                     self.assertFalse((self.args.out_dir / 'evaluation-report.json').exists())
                 finally:
                     os.close(read_fd)
-                    if group is not None:
+                    if group is not None and not group_gone:
                         try:
                             os.killpg(group, signal.SIGKILL)
                         except ProcessLookupError:
                             pass
                     if collector.poll() is None:
                         collector.kill()
-                    collector.communicate(timeout=5)
+                    try:
+                        collector.communicate(timeout=5)
+                    finally:
+                        try:
+                            if pidfd is not None:
+                                try:
+                                    self.reap_terminated_descendant(pidfd, descendant)
+                                finally:
+                                    os.close(pidfd)
+                        finally:
+                            # A failed assertion can kill the collector before
+                            # it reaps the launcher; adopt/reap that PID too.
+                            if leader_pidfd is not None:
+                                try:
+                                    self.reap_terminated_descendant(leader_pidfd, group)
+                                finally:
+                                    os.close(leader_pidfd)
 
     def test_library_signal_handlers_restore_and_preserve_cause(self):
         previous = {number: signal.getsignal(number) for number in M['TERMINATION_SIGNALS']}
