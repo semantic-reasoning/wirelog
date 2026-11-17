@@ -7125,6 +7125,10 @@ test('evaluation_frontier_main_stops', test_evaluation_serial_exe,
      args: ['--frontier-main-stops'],
      env: ['WIRELOG_JOIN_BATCH_BYTES=', 'WIRELOG_JOIN_BATCH_STRICT='],
      suite: ['unit', 'tsan'], timeout: 120)
+test('evaluation_committed_observer_main_stops', test_evaluation_serial_exe,
+     args: ['--committed-observer-main-stops'],
+     env: ['WIRELOG_JOIN_BATCH_BYTES=', 'WIRELOG_JOIN_BATCH_STRICT='],
+     suite: ['unit', 'tsan'], timeout: 120)
 test('evaluation_diff_main_stops', test_evaluation_serial_exe,
      args: ['--diff-main-stops'],
      env: ['WIRELOG_JOIN_BATCH_BYTES=', 'WIRELOG_JOIN_BATCH_STRICT='],
