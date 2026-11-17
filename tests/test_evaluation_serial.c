@@ -5028,6 +5028,8 @@ typedef struct {
     unsigned effective, refused, cancelled, grants;
     unsigned targets[3], refusals[3], cancel_at;
     bool refusing, cancelling, cancel_done;
+    bool refuse_after_stop;
+    unsigned after_stop_refused, after_stop_effective;
     controlled_recursive_main_hook_t previous_advanced;
 } merge_ack_main_probe_t;
 
@@ -5046,6 +5048,12 @@ merge_ack_main_limit(const wl_col_session_t *session, unsigned recipient,
         return capacity;
     CHECK(capacity == MERGE_ACK_MAIN_FEE && !p->refusing && !p->cancelling);
     ++p->grants;
+    if (p->refuse_after_stop && controlled_recursive_stop_fired
+        && !p->after_stop_refused) {
+        ++p->after_stop_refused;
+        p->refusing = true;
+        return capacity - 1u;
+    }
     if (p->inject) {
         for (unsigned t = 0; t < 3; ++t)
             if (p->effective == p->targets[t]
@@ -5098,6 +5106,8 @@ merge_ack_main_report(const wl_col_session_t *session, unsigned recipient,
         CHECK(!result);
     }
     ++p->effective;
+    if (p->refuse_after_stop && controlled_recursive_stop_fired)
+        ++p->after_stop_effective;
 }
 
 static unsigned
@@ -5166,6 +5176,75 @@ test_controlled_recursive_merge_ack_main_stops(void)
         healthy);
     CHECK(healthy >= 3u);
     CHECK(merge_ack_main_history(true, healthy) == healthy);
+}
+
+/* A stop of the original control after a merge sends the recursive step to
+ * its abort cleanup, which acknowledges the merge through MAIN as well. A
+ * refused first MERGE_ACK grant there is retried, the stopped epoch keeps
+ * the published path, and a healthy retry completes it. */
+static void
+test_controlled_recursive_merge_ack_abort_refusal(void)
+{
+    const int64_t edges[] = { 1, 2, 2, 3, 3, 4 };
+    const int64_t later_edge[] = { 4, 5 };
+    wl_plan_t *plan = NULL;
+    wirelog_program_t *program = NULL;
+    wl_evaluation_control_t *control = NULL;
+    wl_session_t *session = controlled_recursive_session(edges, 3, &plan,
+            &program, &control);
+    wl_col_session_t *columnar = (wl_col_session_t *)session;
+    CHECK(!controlled_recursive_run(session, control));
+    const col_rel_t *old_path = session_find_rel(columnar, "path");
+    CHECK(old_path && old_path->nrows == 6);
+    CHECK(!wl_session_insert(session, "edge", later_edge, 1, 2));
+
+    /* A finite original limit makes the checkpoint's exhaustion a WORK stop,
+     * as in the other recursive stop cases. */
+    CHECK(!wl_evaluation_control_configure(control, UINT64_C(1000000)));
+    merge_ack_main_probe_t *p = &merge_ack_main_probe;
+    memset(p, 0, sizeof(*p));
+    p->session = columnar;
+    p->refuse_after_stop = true;
+    p->previous_advanced = wl_columnar_session_test_main_action_advanced;
+    wl_columnar_session_test_main_limit = merge_ack_main_limit;
+    wl_columnar_session_test_main_action_report = merge_ack_main_report;
+    wl_columnar_session_test_main_action_advanced = merge_ack_main_advanced;
+    controlled_recursive_stop_phase =
+        WL_COLUMNAR_SESSION_TEST_RECURSIVE_AFTER_MERGE;
+    controlled_recursive_stop_fired = false;
+    controlled_recursive_stop_enabled = true;
+    controlled_recursive_session_under_test = columnar;
+    wl_columnar_session_test_recursive_step_checkpoint =
+        controlled_recursive_stop_checkpoint;
+    int rc = controlled_recursive_run(session, control);
+    wl_columnar_session_test_recursive_step_checkpoint = NULL;
+    controlled_recursive_session_under_test = NULL;
+    controlled_recursive_stop_enabled = false;
+    wl_columnar_session_test_main_limit = NULL;
+    wl_columnar_session_test_main_action_report = NULL;
+    wl_columnar_session_test_main_action_advanced = p->previous_advanced;
+    /* The checkpoint exhausts the original control's work. */
+    CHECK(controlled_recursive_stop_fired
+        && rc == WL_EVALUATION_CONTROL_WORK_LIMIT);
+    CHECK(p->after_stop_refused == 1u && p->after_stop_effective != 0u
+        && !p->refusing && !p->cancelling);
+    wl_evaluation_control_report_t report;
+    CHECK(!wl_evaluation_control_report(control, &report)
+        && report.result == rc);
+    CHECK(session_find_rel(columnar, "path") == old_path
+        && old_path->nrows == 6 && !columnar->cleanup_active
+        && !columnar->cleanup_pending);
+    p->session = NULL;
+
+    CHECK(!wl_evaluation_control_reset(control));
+    CHECK(!wl_evaluation_control_configure(control, 0));
+    CHECK(!controlled_recursive_run(session, control));
+    const col_rel_t *path = session_find_rel(columnar, "path");
+    CHECK(path && path->nrows == 10);
+    wl_session_destroy(session);
+    wl_evaluation_control_release(control);
+    wl_plan_free(plan);
+    wirelog_program_free(program);
 }
 
 static void
@@ -19939,7 +20018,8 @@ main(int argc, char **argv)
         test_controlled_recursive_frontier_main_stops(); return 0;
     }
     if (argc == 2 && !strcmp(argv[1], "--merge-ack-main-stops")) {
-        test_controlled_recursive_merge_ack_main_stops(); return 0;
+        test_controlled_recursive_merge_ack_main_stops();
+        test_controlled_recursive_merge_ack_abort_refusal(); return 0;
     }
     if (argc == 2 && !strcmp(argv[1], "--recursive-post-finish-metadata")) {
         test_controlled_recursive_post_finish_metadata();
