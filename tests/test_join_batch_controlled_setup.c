@@ -336,6 +336,65 @@ prepare_retirement_checkpoint(
         &done) == EINVAL && done);
 }
 
+static unsigned prepare_clear_sequences;
+
+static unsigned
+prepare_clear_steps(void)
+{
+    const size_t chunk = WL_COLUMNAR_RELATION_SCALAR_CLEAR_CHUNK;
+    return (unsigned)((sizeof(wl_columnar_relation_scalar_retirement_t)
+           + chunk - 1u) / chunk);
+}
+
+/* A drained abort zeroes its scalar receipt one CHUNK per 256 action, from
+ * the end. A one-short grant at the first, middle and last chunk changes
+ * no byte of the owner; an exact grant clears exactly one chunk. */
+static void
+prepare_clear_turn(wl_columnar_join_batch_prepare_t *a, unsigned index)
+{
+    const unsigned steps = prepare_clear_steps();
+    const size_t chunk = WL_COLUMNAR_RELATION_SCALAR_CLEAR_CHUNK;
+    const size_t size = sizeof(a->retirement);
+    const size_t end = size - (size_t)index * chunk;
+    const size_t begin = end > chunk ? end - chunk : 0;
+    const bool refuse = index == 0u || index == steps / 2u
+        || index == steps - 1u;
+    CHECK(a->retirement_drained && a->retirement_clear_chunk == index);
+    for (unsigned exact = refuse ? 0u : 1u; exact < 2u; ++exact) {
+        wl_columnar_join_batch_prepare_t image;
+        memcpy(&image, a, sizeof(image));
+        int owner;
+        wl_evaluation_control_t *funding = NULL;
+        CHECK(!wl_evaluation_control_create(256u - !exact, &funding));
+        CHECK(!wl_evaluation_control_attach(funding, &owner));
+        CHECK(!wl_evaluation_control_begin(funding, &owner));
+        uint64_t id = wl_evaluation_control_active_attempt_id(funding);
+        bool done = true;
+        int rc = wl_columnar_join_batch_prepare_abort_step(a, funding, id,
+                &done);
+        CHECK(wl_evaluation_control_finish(funding, &owner, rc, 0) == rc);
+        wl_evaluation_control_report_t report;
+        CHECK(!wl_evaluation_control_report(funding, &report));
+        CHECK(!wl_evaluation_control_detach(funding, &owner));
+        wl_evaluation_control_release(funding);
+        if (!exact) {
+            CHECK(rc == WL_EVALUATION_CONTROL_WORK_LIMIT && !report.consumed
+                && !done && !memcmp(&image, a, sizeof(image)));
+            continue;
+        }
+        const unsigned char *bytes = (const unsigned char *)&a->retirement;
+        CHECK(!rc && report.consumed == 256u && !done
+            && !memcmp(bytes, &image.retirement, begin));
+        for (size_t i = begin; i != size; ++i) CHECK(!bytes[i]);
+        if (index + 1u < steps)
+            CHECK(a->retirement_drained
+                && a->retirement_clear_chunk == index + 1u);
+        else
+            CHECK(!a->retirement_drained && !a->retirement_clear_chunk
+                && !a->retirement_started && !a->retirement_committed);
+    }
+}
+
 static void
 prepare_drain(wl_columnar_join_batch_prepare_t *a)
 {
@@ -346,8 +405,14 @@ prepare_drain(wl_columnar_join_batch_prepare_t *a)
     memset(retirement_callbacks, 0, sizeof(retirement_callbacks));
     wl_columnar_relation_scalar_retirement_init_test_checkpoint =
         prepare_retirement_checkpoint;
+    unsigned clear_turns = 0;
     for (unsigned turn = 0; !done; ++turn) {
         CHECK(turn < 100000);
+        if (a->retirement_drained) {
+            prepare_clear_turn(a, clear_turns % prepare_clear_steps());
+            ++clear_turns;
+            continue;
+        }
         unsigned phase = a->retirement_initializer.phase;
         bool short_grant = phase && !tried[phase];
         uint64_t limit = 384;
@@ -387,6 +452,8 @@ prepare_drain(wl_columnar_join_batch_prepare_t *a)
     }
     wl_columnar_relation_scalar_retirement_init_test_checkpoint = NULL;
     retirement_parent = NULL;
+    CHECK(clear_turns % prepare_clear_steps() == 0u);
+    prepare_clear_sequences += clear_turns / prepare_clear_steps();
     if (retirement_callbacks[1]) CHECK(retirement_callbacks[2] &&
             retirement_callbacks[3]
             && retirement_callbacks[4] && tried[1] && tried[2] && tried[3]);
@@ -1050,5 +1117,10 @@ main(void)
         if (invalid != 2) test_inline_prepare(1, invalid, 0);
     for (unsigned stop = 1; stop <= 6; ++stop)
         test_inline_prepare(stop % 2 ? 1 : 2, 1, stop);
+    printf("join batch abort scalar receipt %u B (%u clear steps), "
+        "%u cleared receipts\n",
+        (unsigned)sizeof(wl_columnar_relation_scalar_retirement_t),
+        prepare_clear_steps(), prepare_clear_sequences);
+    CHECK(prepare_clear_sequences != 0u);
     return 0;
 }
