@@ -7954,6 +7954,8 @@ foreach family : [
   'committed-end',
   'unloaded',
   'unloaded-stops',
+  'unloaded-history',
+  'unloaded-lifecycle',
   'snapshot-boundary',
   'partial-init',
   'birth-failures',
@@ -7990,4 +7992,14 @@ foreach shard : range(32)
   test('evaluation_seed_hosts_declared_frontier_' + shard.to_string(), seed_hosts_exe,
     args: ['declared-frontier', '1', shard.to_string()],
     suite: ['unit', 'tsan', 'evaluation_seed_hosts', 'evaluation_declared_seed'], timeout: 120)
+endforeach
+
+# Genuine unloaded head, with empty and preinserted body inputs. Every ordinal
+# is replayed with and without a successor across the complete modulo32 census.
+foreach observed : range(2)
+  foreach shard : range(32)
+    test('evaluation_seed_hosts_unloaded_frontier_' + observed.to_string() + '_' + shard.to_string(),
+      seed_hosts_exe, args: ['unloaded-frontier', observed.to_string(), shard.to_string()],
+      suite: ['unit', 'tsan', 'evaluation_seed_hosts', 'evaluation_unloaded_seed'], timeout: 120)
+  endforeach
 endforeach

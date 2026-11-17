@@ -3098,3 +3098,16 @@ The additional physical unloaded-component and Session unloaded-stop families
 check cancellation, exhaustion, Original END/successor, constructor failures,
 real budget denial/raised retry, untouched public snapshots and final resources.
 Snapshot, C1/batch and recursive/K/pool/prepared-sort scope is unchanged.
+
+The unloaded follow-on retains literal first row5, later facts rows1/5/7,
+unchanged silence, signed head9 insertion/removal and rule/seed row5 overlap.
+It runs the actual unloaded program through arena denial/raised retry,
+committed delivery/END, constructor/FINISH failures, real financier overflow,
+arena restoration, reader binding and MAIN moved-credit ENOMEM. Sixty-four
+new public-frontier registrations cover both observer modes and both empty and
+preinserted body input, preserving every discovered phase/witness and both
+Original-END/successor histories. Existing loaded lifecycle and frontier
+registrations remain separate. Local added-work source-front counts and their
+ordinary/Source qualification limits are in the
+[expression acceptance ledger](../2299/EXPRESSION_ACCEPTANCE.md); no whole
+Source/carry certificate or whole-issue completion is claimed.

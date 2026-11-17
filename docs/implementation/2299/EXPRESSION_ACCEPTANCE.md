@@ -2701,3 +2701,38 @@ retries a genuine post-promotion allocation failure.
 This increment admits empty bare ordinary heads only. Evaluating SNAPSHOT,
 C1/batch, arbitrary schemaful width repair, recursive/K, pool and prepared-sort
 activation retain their separate ownership and qualification requirements.
+
+The follow-on unloaded qualification uses the actual fully declared identity
+program both with no loaded facts and with a real body row5 inserted into each
+Session before the first STEP. The history fixture requires literal row5,
+then rows1/5/7 after loading facts, no events on a no-op, signed insertion and
+removal of head row9, and no extra event when a seed row5 overlaps the rule.
+Empty declared/undeclared numeric, STRING and FLOAT controls also load their
+facts after their first empty evaluation and retain raw schema/geometry parity.
+
+The unloaded lifecycle family covers real arena denial/raised retry on the bare
+head, then a nonempty rule through committed END/delivery, constructor and
+FINISH refusals, actual financier overflow/replacement, arena return, the
+observer reader-binding purchase and second-attempt ENOMEM after MAIN moved
+credit returned. Existing loaded fixtures retain their literal two-event
+oracles; the new one-row fixture supplies its separate literal one-event oracle.
+
+Sixty-four registered shards independently discover all public precommit
+frontiers for each observer mode and for empty/nonempty body input. Each actual
+ordinal is replayed modulo32 with Original ended, with and without an unrelated
+successor. The replay requires the same phase and ownership witness, frozen
+Original and successor0, unchanged public image/events, reset/raw retry parity
+and final resource closure. The complete local runner retains the unpartitioned
+oracle. No successful total work allowance is treated as a primitive price.
+
+Static source inspection bounds the added fixed C fronts conservatively:
+TARGET eligibility64, NULL-working dispatch12, source-init/begin caller20,
+rule-donor/base-begin caller32, base completion24, identity selection10,
+observer provenance72 and width-promotion24. Counts include evaluated member,
+address, predicate, store and call/return fronts; they are local added-work
+bounds, not fees or complete ancestor certificates. RULE12 executes the actual
+step1402 and base1000 admissions (256 each); their financial sum512 is not a
+Source distance. Existing staged builder/source/reader children keep their own
+actual admissions. No new data-sized loop, synchronous typed constructor or
+Source/Native permission is introduced. Complete containing observer/Source
+and carry proofs outside this ordinary intersection are not certified here.
