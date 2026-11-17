@@ -186,8 +186,6 @@ typedef struct {
     pthread_t retirement_thread;
 #endif
     session_rel_registration_t *registration;
-    wl_evaluation_control_t *maintenance_control;
-    uint64_t maintenance_id;
     wl_columnar_eval_cleanup_receipt_key_t receipt_key;
     col_rel_t *edge;
     col_rel_t *working;
@@ -212,7 +210,6 @@ typedef struct {
     int primary_result;
     bool body_active;
     bool merge_result_taken;
-    bool maintenance_active;
     bool edge_held;
     bool committed;
     bool postcommit_yielded;
@@ -15514,23 +15511,6 @@ col_controlled_recursive_maintenance_begin(wl_columnar_controlled_step_t *step,
     return wl_columnar_session_main_ensure(step);
 }
 
-static void
-col_controlled_recursive_maintenance_end(
-    col_controlled_recursive_step_t *recursive)
-{
-    if (!recursive->maintenance_control) return;
-    if (wl_evaluation_control_active_attempt_id(
-            recursive->maintenance_control))
-        (void)wl_evaluation_control_finish(recursive->maintenance_control,
-            recursive, 0, 0);
-    (void)wl_evaluation_control_detach(recursive->maintenance_control,
-        recursive);
-    wl_evaluation_control_release(recursive->maintenance_control);
-    recursive->maintenance_control = NULL;
-    recursive->maintenance_id = 0;
-    recursive->maintenance_active = false;
-}
-
 /* Actual managed initialization/clear is chunked outside the receipt;
  * a TOKENS action initializes only one full platform reservation. */
 typedef char wl_columnar_session_managed_init_bound[
@@ -16150,7 +16130,6 @@ col_controlled_recursive_abort_cleanup(wl_col_session_t *sess,
     rc = col_controlled_recursive_dispose(step, recursive,
             &recursive->frontier);
     if (rc) return rc;
-    col_controlled_recursive_maintenance_end(recursive);
     recursive->phase = COL_CONTROLLED_RECURSIVE_DONE;
     return 0;
 }
@@ -16575,7 +16554,6 @@ col_controlled_step_recursive_drive(wl_col_session_t *sess,
                 col_controlled_recursive_fail(recursive, rc);
                 return EAGAIN;
             }
-            col_controlled_recursive_maintenance_end(recursive);
             recursive->working = recursive->replacement;
             recursive->replacement = NULL;
             recursive->phase = COL_CONTROLLED_RECURSIVE_CHECK_CONVERGENCE;
@@ -16601,7 +16579,6 @@ col_controlled_step_recursive_drive(wl_col_session_t *sess,
                 if (rc) {
                     col_controlled_recursive_fail(recursive, rc); return EAGAIN;
                 }
-                col_controlled_recursive_maintenance_end(recursive);
                 recursive->phase = COL_CONTROLLED_RECURSIVE_DISPOSE_FRONTIER;
                 continue;
             }
@@ -16649,7 +16626,6 @@ col_controlled_step_recursive_drive(wl_col_session_t *sess,
                 col_controlled_recursive_fail(recursive, rc);
                 return EAGAIN;
             }
-            col_controlled_recursive_maintenance_end(recursive);
             recursive->phase = COL_CONTROLLED_RECURSIVE_DISPOSE_FRONTIER;
             continue;
         }
@@ -16680,7 +16656,6 @@ col_controlled_step_recursive_drive(wl_col_session_t *sess,
                         recursive,
                         &recursive->delta);
             if (rc == EAGAIN || rc == EBUSY) return EAGAIN;
-            if (!rc) col_controlled_recursive_maintenance_end(recursive);
             if (!rc) rc = col_controlled_recursive_dispose(step, recursive,
                         &recursive->frontier);
             if (rc == EAGAIN || rc == EBUSY) return EAGAIN;
@@ -16878,7 +16853,6 @@ col_controlled_step_recursive_drive(wl_col_session_t *sess,
                     recursive->primary_result = rc;
                 return EAGAIN;
             }
-            col_controlled_recursive_maintenance_end(recursive);
             step->complete = true;
             recursive->phase = COL_CONTROLLED_RECURSIVE_DONE;
             continue;
