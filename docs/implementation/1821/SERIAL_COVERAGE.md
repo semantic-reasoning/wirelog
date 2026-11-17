@@ -124,7 +124,7 @@ references, not interruption evidence.
 | F04a | Differential arrangement/trace persistent transaction versus ephemeral hash fallback | Raw fallback must leave no transaction state; controlled entry refuses active differential mode and active-attempt registry growth. Integrated stop owner absent; G3, #1820 |
 | F05a | Ordinary keyed persistent arrangement/probe bundle versus ephemeral hash; cached right filter versus operation-owned filtered relation | General serial STEP owns a private native index registry for full-right public EDB INT64 JOIN, with bounded creation/reuse/probes and a common head/index cutoff. Existing pins/pending/deferred entries refuse replacement. Filtered/private-head/batch representations retain their previous controlled disposition; this does not qualify raw cache alternatives, G5/G6 |
 | F06a | LFTJ cache/probe versus owned source rebuild and raw output callback versus private owned-row append | Controlled session uses per-attempt bounded rebuild, no unlimited raw fallback; actual writer/ROW/ACK/drain ownership and precommit/postcutoff delivery qualified | Host failure/native/microsteps/policy and `test_lftj_postcut_delivery`; current-generation raw probe/pin checks; [source map](../2298/LFTJ_SOURCE_ACCOUNTING.md) |
-| F07a | Scalar-source compound kind NONE versus INLINE/SIDE, declared schema/type validity, timestamps and row weights | Admission predicates differ by child; no cross-operator representation support inferred. Managed copies/readers can be bounded while a surrounding child refuses the representation; G5. #2301: VARIABLE, MAP and FILTER admit compound_kind INLINE after a metered arity-map check; ordinary JOIN also admits INLINE through the existing bounded reader (#2371); SEMIJOIN/ANTIJOIN remain scalar-only; compound_kind SIDE stays ENOTSUP; no timestamped/weighted source found in controlled single-worker sessions, `evaluation_source_shapes` (#2301), see "Source shapes in controlled single-worker sessions (#2301)" |
+| F07a | Scalar-source compound kind NONE versus INLINE/SIDE, declared schema/type validity, timestamps and row weights | Admission predicates differ by child; no cross-operator representation support inferred. Managed copies/readers can be bounded while a surrounding child refuses the representation; G5. #2301: VARIABLE, MAP and FILTER admit compound_kind INLINE after a metered arity-map check; ordinary JOIN also admits INLINE through the existing bounded reader (#2371); SEMIJOIN/ANTIJOIN remain scalar-only; compound_kind SIDE stays ENOTSUP at the scalar source reader, and an EDB declared with a side compound column has compound_kind NONE in sessions, with controlled make_compound after a completed evaluation admitted on the ordinary and general observed hosts, `evaluation_side_compounds` (#2301), see "SIDE compound EDBs in controlled single-worker sessions (#2301)"; no timestamped/weighted source found in controlled single-worker sessions, `evaluation_source_shapes` (#2301), see "Source shapes in controlled single-worker sessions (#2301)" |
 | F07b | Retained/borrowed/owned, contiguous/segmented/spill-backed storage and empty/nullary/wide rows | Source reader/descriptor and copy helpers must preserve representation and governor state; capacity/overflow errors remain errors. Enumerated qualification combinations, not an invitation to raw fallback; G5/G6. #2301: borrowed public INLINE descriptors, empty, wide and arity-1 INLINE layouts; controlled sessions refuse cold (spill-backed) sources at seal; a never-inserted EDB through MAP, FILTER and REDUCE on the unobserved STEP; no lazy-owner, aliased or segmented source found in controlled single-worker sessions, `evaluation_source_shapes`, see "Source shapes in controlled single-worker sessions (#2301)" |
 
 ## Configuration predicates
@@ -3079,8 +3079,9 @@ session at any of the walks above; `evaluation_facts_sources` checks the
 controlled evaluation of heads with input, and its broader support stays open.
 
 Limits: plans that the controlled preflight refuses (K_FUSION, EXCHANGE, worker
-and TDD plans), SIDE compound EDBs, more than one worker, cold and spill
-sources and memory-budget denials were not run; segments are covered by the
+and TDD plans), SIDE compound EDBs (see "SIDE compound EDBs in controlled
+single-worker sessions (#2301)"), more than one worker, cold and spill sources
+and memory-budget denials were not run there; segments are covered by the
 search only, since a test cannot see stack entries; the right input of a binary
 operator is checked only through the codes it yields and, when it is the output
 of a publication the hook observes, at that publication; relations that exist
@@ -3111,3 +3112,66 @@ registrations remain separate. Local added-work source-front counts and their
 ordinary/Source qualification limits are in the
 [expression acceptance ledger](../2299/EXPRESSION_ACCEPTANCE.md); no whole
 Source/carry certificate or whole-issue completion is claimed.
+
+### SIDE compound EDBs in controlled single-worker sessions (#2301)
+
+A column declared with a side compound type, such as `pair/2 side`, holds the
+handle that `wl_session_make_compound` returns. The compound's arguments are a
+row of the side relation `__compound_<f>_<n>`, which the first make_compound
+for that functor and arity registers, and a body that destructures the column
+is lowered by `build_side_compound_scan` to a JOIN with that relation.
+`wl_columnar_session_inline_schema` returns before it applies a layout when a
+declared column is SIDE, so such an EDB has compound_kind NONE, also beside an
+inline column. A search at 6771da6e found `col_rel_apply_compound_schema_impl`
+as the only layout-based assignment of compound_kind SIDE, reached from that
+function and from the cold scan without MAP in `wl_columnar_ops_cold_scan`,
+which `wl_columnar_session_cold_mode` excludes when an evaluation control is
+attached; relation copies keep their source's kind. None of the relations the
+test below checks has compound_kind SIDE, so the scalar source reader's ENOTSUP
+for it was not met there.
+
+Before this unit `wl_session_make_compound` took the plain operation gate,
+which returns EBUSY once a controlled evaluation has completed: a controlled
+session made no compound after its first STEP or SNAPSHOT, where the
+uncontrolled session did. It now takes the mutation gate that an insert takes.
+The columnar backend admits it with the busy checks of an EDB insert and
+without the EDB name and width check, and records it as an insert of one row
+into the side relation, which marks the successor evaluation as an insert does.
+The recursive edge host, the observed single-rule host and failed-retry custody
+still return EBUSY.
+
+`evaluation_side_compounds` runs side compound programs through a controlled
+session (an evaluation control, a minimum-budget enforcing governor, one
+worker) and an uncontrolled one with the same operations. It checks that
+make_compound returns 0 after a completed STEP, SNAPSHOT and observed STEP,
+also before the side relation exists, that the next evaluation's image and
+events include the new compound, both through a row inserted with it and
+through a row inserted earlier with the handle it was then given, and that the
+recursive edge host and the observed single-rule host return EBUSY beside an
+insert they admit in the same state. Its corpus copies the handle column,
+destructures it, filters on a field, matches a constant or a repeated field,
+joins it after a flat atom, UNIONs it with a flat EDB, reads it beside an
+inline column, COUNTs over it and closes it transitively, through STEPs,
+SNAPSHOTs, an observed STEP, removals and a row whose handle no compound holds.
+Both sessions return 0 and hold the image that a model of the rows and
+compounds gives, and an observed STEP delivers the model's change. The test
+walks the controlled session after each operation and after each EAGAIN return
+outside the transitive closure, checks the input and output of each publication
+that the physical publication hook observes, and checks that e, the copy head
+and the side relation have no compound layout in both sessions, the side
+relation with one row per compound made. At the first EAGAIN return of a marked
+evaluation, make_compound and an insert return EBUSY. A cancellation and a
+work-limit stop at the first publication of listed operators of a first or
+second evaluation are followed by the same code for an insert and a
+make_compound after the stop and after the reset: 0 after a cancellation of a
+first evaluation and EBUSY in the other stopped and reset states of the run.
+The retry is checked as above.
+
+The checker is tested on synthetic descriptors, and an EDB with an inline
+column and no side column carries compound_kind INLINE in both sessions. The
+parser refuses a fact and a rule head that write a side compound term.
+
+Limits: more than one worker, cold and spill sources, memory-budget denials,
+plans that the controlled preflight refuses, make_compound inside a delta
+callback, failed-retry custody, and side compounds of other functors and
+arities were not run; the handle values of the two sessions are not compared.
