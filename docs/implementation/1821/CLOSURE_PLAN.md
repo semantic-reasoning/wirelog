@@ -611,3 +611,15 @@ its evidence, segments rest on the search alone, and right inputs and relations
 that live within one call are covered only in part; broader controlled
 evaluation of heads with input, cold sources and the consumers reading an
 INLINE input directly (#2300) stay open.
+
+A fifth bundle lets `wl_session_make_compound` take the mutation gate that an
+insert takes, so a controlled session admits it after a completed evaluation on
+the ordinary and general observed hosts, where it returned EBUSY, and adds
+`evaluation_side_compounds`, which compares side compound programs in a
+controlled single-worker session with an uncontrolled one; see "SIDE compound
+EDBs in controlled single-worker sessions (#2301)". An EDB declared with a side
+compound column has compound_kind NONE in sessions, and the scalar source
+reader's ENOTSUP for compound_kind SIDE was not met in the test. The recursive
+edge host, the observed single-rule host and failed-retry custody still refuse
+make_compound with EBUSY; more than one worker, cold sources and memory-budget
+denials are outside its evidence.
