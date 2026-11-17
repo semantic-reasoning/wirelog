@@ -15940,23 +15940,31 @@ col_controlled_step_recursive_drive(wl_col_session_t *sess,
                 recursive->phase = COL_CONTROLLED_RECURSIVE_RETIRE_OLD_WORKING;
                 return EAGAIN;
             }
-            rc = wl_columnar_session_main_action(sess, step,
-                    WL_COLUMNAR_SESSION_MAIN_MERGE, recursive, NULL, 1);
-            if (rc == EAGAIN || rc == EBUSY) return EAGAIN;
-            if (rc) {
-                col_controlled_recursive_fail(recursive, rc);
-                return EAGAIN;
-            }
-            wl_columnar_managed_candidate_phase_t phase;
+            wl_columnar_managed_candidate_phase_t phase =
+                WL_COLUMNAR_MANAGED_CANDIDATE_INERT;
             int terminal = 0;
-            rc = wl_columnar_managed_candidate_merge_status(
-                &recursive->merge, &phase, &terminal);
-            if (rc) {
-                col_controlled_recursive_fail(recursive, rc);
-                return EAGAIN;
+            /* A refused or stopped MERGE_ACK BEGIN leaves the merge DONE with
+             * no acknowledgement pending. Retry the acknowledgement; stepping
+             * the finished merge again is invalid. */
+            if (wl_columnar_managed_candidate_merge_status(&recursive->merge,
+                &phase, &terminal)
+                || phase != WL_COLUMNAR_MANAGED_CANDIDATE_DONE) {
+                rc = wl_columnar_session_main_action(sess, step,
+                        WL_COLUMNAR_SESSION_MAIN_MERGE, recursive, NULL, 1);
+                if (rc == EAGAIN || rc == EBUSY) return EAGAIN;
+                if (rc) {
+                    col_controlled_recursive_fail(recursive, rc);
+                    return EAGAIN;
+                }
+                rc = wl_columnar_managed_candidate_merge_status(
+                    &recursive->merge, &phase, &terminal);
+                if (rc) {
+                    col_controlled_recursive_fail(recursive, rc);
+                    return EAGAIN;
+                }
+                if (phase != WL_COLUMNAR_MANAGED_CANDIDATE_DONE)
+                    return EAGAIN;
             }
-            if (phase != WL_COLUMNAR_MANAGED_CANDIDATE_DONE)
-                return EAGAIN;
             rc = col_controlled_recursive_merge_ack_drive(sess, step,
                     recursive);
             if (rc == EAGAIN || rc == EBUSY) return EAGAIN;

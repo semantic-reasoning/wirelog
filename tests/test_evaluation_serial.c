@@ -5018,6 +5018,156 @@ test_controlled_recursive_frontier_stops(void)
     frontier_stop_cases(false);
 }
 
+/* The managed-merge acknowledgement recipient of the session's private MAIN
+ * recipient enum. Every MERGE_ACK action is one 256 MAIN grant. */
+enum { MERGE_ACK_MAIN_RECIPIENT = 16, MERGE_ACK_MAIN_FEE = 256 };
+
+typedef struct {
+    const wl_col_session_t *session;
+    bool inject;
+    unsigned effective, refused, cancelled, grants;
+    unsigned targets[3], refusals[3], cancel_at;
+    bool refusing, cancelling, cancel_done;
+    controlled_recursive_main_hook_t previous_advanced;
+} merge_ack_main_probe_t;
+
+static merge_ack_main_probe_t merge_ack_main_probe;
+
+/* Refusal targets are positions in the healthy action sequence, so each
+ * refused grant is retried by the same action. The middle target is refused
+ * twice in a row. */
+static uint64_t
+merge_ack_main_limit(const wl_col_session_t *session, unsigned recipient,
+    unsigned action, uint64_t capacity)
+{
+    merge_ack_main_probe_t *p = &merge_ack_main_probe;
+    (void)action;
+    if (session != p->session || recipient != MERGE_ACK_MAIN_RECIPIENT)
+        return capacity;
+    CHECK(capacity == MERGE_ACK_MAIN_FEE && !p->refusing && !p->cancelling);
+    ++p->grants;
+    if (p->inject) {
+        for (unsigned t = 0; t < 3; ++t)
+            if (p->effective == p->targets[t]
+                && p->refusals[t] < (t == 1 ? 2u : 1u)) {
+                ++p->refusals[t];
+                p->refusing = true;
+                return capacity - 1u;
+            }
+        p->cancelling = !p->cancel_done && p->effective == p->cancel_at;
+    }
+    return capacity;
+}
+
+/* After the action and before its report, a stop latched on the MAIN grant
+ * cancels it without undoing the work the action already did. */
+static void
+merge_ack_main_advanced(wl_col_session_t *session,
+    wl_evaluation_control_t *funding, uint64_t id, unsigned recipient,
+    unsigned before, unsigned after, int result)
+{
+    merge_ack_main_probe_t *p = &merge_ack_main_probe;
+    if (session == p->session && recipient == MERGE_ACK_MAIN_RECIPIENT
+        && p->cancelling && !result) {
+        wl_evaluation_control_request_cancel(funding);
+        CHECK(wl_evaluation_control_charge_attempt(funding, id, 0)
+            == WL_EVALUATION_CONTROL_CANCELLED);
+    }
+    if (p->previous_advanced)
+        p->previous_advanced(session, funding, id, recipient, before, after,
+            result);
+}
+
+static void
+merge_ack_main_report(const wl_col_session_t *session, unsigned recipient,
+    unsigned action, wl_evaluation_control_report_t report, int result)
+{
+    merge_ack_main_probe_t *p = &merge_ack_main_probe;
+    (void)action;
+    if (session != p->session || recipient != MERGE_ACK_MAIN_RECIPIENT) return;
+    if (p->refusing) {
+        /* One short of the fee: nothing is spent and the action is retried. */
+        CHECK(result == WL_EVALUATION_CONTROL_WORK_LIMIT && !report.consumed);
+        p->refusing = false; ++p->refused;
+        return;
+    }
+    CHECK(report.consumed == MERGE_ACK_MAIN_FEE);
+    if (p->cancelling) {
+        p->cancelling = false; p->cancel_done = true; ++p->cancelled;
+    } else {
+        CHECK(!result);
+    }
+    ++p->effective;
+}
+
+static unsigned
+merge_ack_main_history(bool inject, unsigned healthy)
+{
+    const int64_t edges[] = { 1, 2, 2, 3, 3, 4 };
+    const int64_t later_edge[] = { 4, 5 };
+    wl_plan_t *plan = NULL;
+    wirelog_program_t *program = NULL;
+    wl_evaluation_control_t *control = NULL;
+    wl_session_t *session = controlled_recursive_session(edges, 3, &plan,
+            &program, &control);
+    wl_col_session_t *columnar = (wl_col_session_t *)session;
+    merge_ack_main_probe_t *p = &merge_ack_main_probe;
+    memset(p, 0, sizeof(*p));
+    p->session = columnar;
+    p->inject = inject;
+    if (inject) {
+        p->targets[0] = 0; p->targets[1] = healthy / 2u;
+        p->targets[2] = healthy - 1u; p->cancel_at = healthy / 3u;
+    }
+    p->previous_advanced = wl_columnar_session_test_main_action_advanced;
+    wl_columnar_session_test_main_limit = merge_ack_main_limit;
+    wl_columnar_session_test_main_action_report = merge_ack_main_report;
+    wl_columnar_session_test_main_action_advanced = merge_ack_main_advanced;
+    CHECK(!controlled_recursive_run(session, control));
+    const col_rel_t *path = session_find_rel(columnar, "path");
+    CHECK(path && path->nrows == 6);
+    CHECK(!wl_session_insert(session, "edge", later_edge, 1, 2));
+    CHECK(!wl_evaluation_control_reset(control));
+    CHECK(!wl_evaluation_control_configure(control, 0));
+    CHECK(!controlled_recursive_run(session, control));
+    path = session_find_rel(columnar, "path");
+    CHECK(path && path->nrows == 10 && !columnar->cleanup_active
+        && !columnar->cleanup_pending);
+    wl_columnar_session_test_main_limit = NULL;
+    wl_columnar_session_test_main_action_report = NULL;
+    wl_columnar_session_test_main_action_advanced = p->previous_advanced;
+    CHECK(!p->refusing && !p->cancelling);
+    if (inject) {
+        CHECK(p->refusals[0] == 1u && p->refusals[1] == 2u
+            && p->refusals[2] == 1u && p->refused == 4u
+            && p->cancel_done && p->cancelled == 1u
+            && p->grants == p->effective + p->refused);
+    } else {
+        CHECK(!p->refused && !p->cancelled && p->grants == p->effective);
+    }
+    unsigned effective = p->effective;
+    p->session = NULL;
+    wl_session_destroy(session);
+    wl_evaluation_control_release(control);
+    wl_plan_free(plan);
+    wirelog_program_free(program);
+    return effective;
+}
+
+/* Actual recursive sessions acknowledge every managed merge through MAIN.
+ * A refused or cancelled MERGE_ACK grant is neither replayed nor lost: the
+ * injected run performs exactly the healthy run's 256 actions and publishes
+ * the same path. */
+static void
+test_controlled_recursive_merge_ack_main_stops(void)
+{
+    const unsigned healthy = merge_ack_main_history(false, 0);
+    printf("recursive MERGE_ACK: %u MAIN actions per healthy history\n",
+        healthy);
+    CHECK(healthy >= 3u);
+    CHECK(merge_ack_main_history(true, healthy) == healthy);
+}
+
 static void
 test_controlled_recursive_frontier_main_stops(void)
 {
@@ -19777,6 +19927,9 @@ main(int argc, char **argv)
     }
     if (argc == 2 && !strcmp(argv[1], "--frontier-main-stops")) {
         test_controlled_recursive_frontier_main_stops(); return 0;
+    }
+    if (argc == 2 && !strcmp(argv[1], "--merge-ack-main-stops")) {
+        test_controlled_recursive_merge_ack_main_stops(); return 0;
     }
     if (argc == 2 && !strcmp(argv[1], "--recursive-post-finish-metadata")) {
         test_controlled_recursive_post_finish_metadata();
