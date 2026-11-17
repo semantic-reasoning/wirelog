@@ -76,6 +76,8 @@ typedef struct {
 static fixture_t *active;
 static wirelog_extension_snapshot_t *test_snapshot;
 static bool load_facts = true;
+/* Actual fixture input mutations, never a production route/authority flag. */
+static unsigned unloaded_rows;
 static void end_original(fixture_t *f, bool successor) {
     uint64_t id = wl_evaluation_control_active_attempt_id(f->control);
     CHECK(id && !f->injected);
@@ -150,6 +152,12 @@ static fixture_t create(const char *source, bool observed,
     if (load_facts)
         CHECK(!wl_session_load_facts(f.raw, f.program) &&
             !wl_session_load_facts(f.session, f.program));
+    else
+        for (unsigned row = 0; row < unloaded_rows; ++row) {
+            int64_t value = 5 + row;
+            CHECK(!wl_session_insert(f.raw, "input", &value, 1, 1) &&
+                !wl_session_insert(f.session, "input", &value, 1, 1));
+        }
     if (observed)
         wl_session_set_delta_cb(f.session, event, NULL);
     return f;
@@ -772,7 +780,7 @@ static void name_vectors(void) {
     }
 
 }
-static void committed_end_for(const char *program) {
+static void committed_end_for(const char *program, unsigned expected_events) {
     for (unsigned point = 0; point < 4; ++point)
         for (unsigned successor = 0; successor < 2; ++successor) {
             fixture_t f = create(program, true, true);
@@ -811,7 +819,8 @@ static void committed_end_for(const char *program) {
                         1) == EBUSY);
                 }
             }
-            CHECK(!rc && f.injected && f.events == 2 && f.published);
+            CHECK(!rc && f.injected && f.events == expected_events &&
+                f.published);
             CHECK(!wl_session_step(f.raw));
             equal(&f);
             uint64_t view[32];
@@ -833,7 +842,7 @@ static void committed_end_for(const char *program) {
 }
 extern bool wl_columnar_session_test_fail_seed_arena_allocation;
 static void committed_end(void) {
-    committed_end_for(numeric);
+    committed_end_for(numeric, 2);
 }
 static void snapshot_tuple(const char *relation, const int64_t *row,
     uint32_t width, void *context) {
@@ -872,10 +881,16 @@ static void snapshot_boundary(void) {
 }
 static void unloaded(void) {
     const char *sources[] = {
-        numeric, "input(1). out(7). out(strlen(to_string(x))):-input(x)."
+        numeric, "input(1). out(7). out(strlen(to_string(x))):-input(x).",
+        declared_identity,
+        ".decl input(x:string)\n.decl out(y:string)\n"
+        "input(\"a\"). out(\"z\"). out(cat(x,\"!\")):-input(x).",
+        ".decl input(x:float)\n.decl out(y:float)\n"
+        "input(1.5). out(7.5). out(x):-input(x)."
     };
     load_facts = false;
-    for (unsigned source = 0; source < 2; ++source)
+    for (unsigned source = 0; source < sizeof(sources) / sizeof(*sources);
+        ++source)
         for (unsigned observed = 0; observed < 2; ++observed) {
             fixture_t f = create(sources[source], observed, true);
             fixture_hook(&f, observed);
@@ -991,7 +1006,7 @@ birth_checkpoint(wl_evaluation_control_t *control, unsigned phase,
     else
         wl_evaluation_control_test_finance_birth_fail = f->mode == 2 ? 2 : 1;
 }
-static void birth_failures_for(const char *program) {
+static void birth_failures_for(const char *program, unsigned expected_events) {
     for (unsigned site = 0; site < 3; ++site)
         for (unsigned observed = 0; observed < 2; ++observed) {
             fixture_t f = create(program, observed, true);
@@ -1043,14 +1058,14 @@ static void birth_failures_for(const char *program) {
                 refused = true;
             }
         }
-        CHECK(!rc && f.injected && refused && f.events == 2);
+        CHECK(!rc && f.injected && refused && f.events == expected_events);
         CHECK(!wl_session_step(f.raw));
         equal(&f);
         destroy(&f);
     }
 }
 static void birth_failures(void) {
-    birth_failures_for(numeric);
+    birth_failures_for(numeric, 2);
 }
 static void compact_recompute(void) {
     const char *source =
@@ -1567,9 +1582,15 @@ static void public_frontier_selected(const char *program, unsigned observed,
                     successor);
     }
     CHECK(replayed == count / partitions + (shard < count % partitions));
-    if (program == declared_identity)
-        printf("declared observed%u census%u shard%u/%u replayed%u\n",
-            observed, count, shard, partitions, replayed);
+    if (program == declared_identity) {
+        if (load_facts)
+            printf("declared observed%u census%u shard%u/%u replayed%u\n",
+                observed, count, shard, partitions, replayed);
+        else
+            printf(
+                "unloaded observed%u initial%u census%u shard%u/%u replayed%u\n",
+                observed, unloaded_rows, count, shard, partitions, replayed);
+    }
     /* Full local runs retain the old aggregate oracle. Registered partitions
      * each retain the literal binding checks; the separate qualification below
      * requires the positive observer witness independently of membership. */
@@ -2573,14 +2594,15 @@ static void declared_arena_denial(wl_evaluation_control_t *control,
         memory_order_release);
     f->injected = true;
 }
-static void declared_governor_denial(void) {
+static void seed_governor_denial(bool loaded) {
+    CHECK(load_facts == loaded && !unloaded_rows);
     fixture_t f = create(declared_identity, true, true);
     fixture_hook(&f, true);
     col_rel_t *old = session_find_rel(COL_SESSION(f.session), "out");
     col_relation_snapshot_t image = wl_columnar_relation_snapshot(old);
     col_rel_t *shadow = wl_columnar_session_seed_rows(COL_SESSION(f.session),
             "out");
-    CHECK(shadow && !shadow->base_nrows);
+    CHECK(loaded ? shadow && !shadow->base_nrows : !shadow);
     wl_columnar_memory_governor_t *g =
         wl_columnar_memory_governor_ref_get(f.governor);
     uint64_t reserved = wl_columnar_memory_reserved(g);
@@ -2588,7 +2610,8 @@ static void declared_governor_denial(void) {
         declared_arena_denial;
     CHECK(complete(&f) == ENOSPC && f.injected && !f.events);
     CHECK(wl_columnar_memory_denials(g) > f.denial_before
-        && wl_columnar_memory_reserved(g) == reserved && !shadow->base_nrows
+        && wl_columnar_memory_reserved(g) == reserved &&
+        (!shadow || !shadow->base_nrows)
         && session_find_rel(COL_SESSION(f.session), "out") == old
         && wl_columnar_relation_snapshot_equal(image,
         wl_columnar_relation_snapshot(old)));
@@ -2603,24 +2626,80 @@ static void declared_governor_denial(void) {
     CHECK(!wl_evaluation_control_reset(f.control));
     CHECK(!complete(&f) && !wl_session_step(f.raw));
     equal(&f);
-    CHECK(f.events == 2 && shadow->base_nrows == shadow->nrows);
+    CHECK(f.events == (loaded ? 2u : 0u) &&
+        (!shadow || shadow->base_nrows == shadow->nrows));
     int64_t value = 3;
     CHECK(!wl_session_insert(f.session, "input", &value, 1, 1)
         && !wl_session_insert(f.raw, "input", &value, 1, 1)
         && !wl_evaluation_control_reset(f.control));
     CHECK(!complete(&f) && !wl_session_step(f.raw));
     equal(&f);
-    CHECK(f.events == 3 && f.positive == 3 && !f.negative);
+    CHECK(f.events == (loaded ? 3u : 1u) && f.positive == f.events &&
+        !f.negative);
     destroy(&f);
 }
 static void declared_lifecycle(void) {
-    declared_governor_denial();
-    committed_end_for(declared_identity);
-    birth_failures_for(declared_identity);
+    seed_governor_denial(true);
+    committed_end_for(declared_identity, 2);
+    birth_failures_for(declared_identity, 2);
     maintenance_overflows_for(declared_identity);
     arena_attempt_restoration_for(declared_identity, true);
     reader_binding_qualification_for(declared_identity, true);
     retry_terminal_report_for(declared_identity, true);
+}
+static void unloaded_history(void) {
+    load_facts = false;
+    unloaded_rows = 1;
+    fixture_t f = create(declared_identity, true, true);
+    fixture_hook(&f, true);
+    CHECK(!complete(&f) && !wl_session_step(f.raw)); equal(&f);
+    col_rel_t *head = session_find_rel(COL_SESSION(f.session), "out");
+    CHECK(head && head->ncols == 1 && head->nrows == 1 &&
+        col_rel_get(head, 0, 0) == 5 && f.events == 1 && f.positive == 1 &&
+        !f.negative);
+    CHECK(!wl_session_load_facts(f.session, f.program) &&
+        !wl_session_load_facts(f.raw, f.program));
+    CHECK(!wl_evaluation_control_reset(f.control) && !complete(&f) &&
+        !wl_session_step(f.raw)); equal(&f);
+    head = session_find_rel(COL_SESSION(f.session), "out");
+    CHECK(head->nrows == 3 && col_rel_get(head, 0, 0) == 1 &&
+        col_rel_get(head, 1, 0) == 5 && col_rel_get(head, 2, 0) == 7 &&
+        f.events == 3 && f.positive == 3 && !f.negative);
+    CHECK(!wl_evaluation_control_reset(f.control) && !complete(&f) &&
+        !wl_session_step(f.raw)); equal(&f);
+    CHECK(f.events == 3);
+    const int64_t rows[] = {9, 9, 5, 5};
+    for (unsigned action = 0; action < 4; ++action) {
+        CHECK(!(action % 2
+            ? wl_session_remove(f.session, "out", &rows[action], 1, 1)
+            : wl_session_insert(f.session, "out", &rows[action], 1, 1)));
+        CHECK(!(action % 2
+            ? wl_session_remove(f.raw, "out", &rows[action], 1, 1)
+            : wl_session_insert(f.raw, "out", &rows[action], 1, 1)));
+        CHECK(!wl_evaluation_control_reset(f.control) && !complete(&f) &&
+            !wl_session_step(f.raw)); equal(&f);
+        CHECK(f.positive == 4 && f.negative == (action ? 1u : 0u));
+        col_rel_t *shadow =
+            wl_columnar_session_seed_rows(COL_SESSION(f.session),
+                "out");
+        CHECK(shadow && shadow->base_nrows == shadow->nrows);
+    }
+    destroy(&f);
+    unloaded_rows = 0;
+    load_facts = true;
+}
+static void unloaded_lifecycle(void) {
+    load_facts = false;
+    seed_governor_denial(false);
+    unloaded_rows = 1;
+    committed_end_for(declared_identity, 1);
+    birth_failures_for(declared_identity, 1);
+    maintenance_overflows_for(declared_identity);
+    arena_attempt_restoration_for(declared_identity, true);
+    reader_binding_qualification_for(declared_identity, true);
+    retry_terminal_report_for(declared_identity, true);
+    unloaded_rows = 0;
+    load_facts = true;
 }
 typedef struct {
     const char *name;
@@ -2643,6 +2722,8 @@ static const seed_family_t seed_families[] = {
     {"committed-end", committed_end},
     {"unloaded", unloaded},
     {"unloaded-stops", unloaded_stops},
+    {"unloaded-history", unloaded_history},
+    {"unloaded-lifecycle", unloaded_lifecycle},
     {"snapshot-boundary", snapshot_boundary},
     {"partial-init", partial_init},
     {"birth-failures", birth_failures},
@@ -2681,6 +2762,12 @@ int main(int argc, char **argv) {
             retry_suffix(observed);
         }
         public_frontier_selected(declared_identity, true, 0, 1);
+        load_facts = false;
+        for (unloaded_rows = 0; unloaded_rows < 2; ++unloaded_rows)
+            for (unsigned observed = 0; observed < 2; ++observed)
+                public_frontier_selected(declared_identity, observed, 0, 1);
+        unloaded_rows = 0;
+        load_facts = true;
     } else if (argc == 2) {
         unsigned i = 0;
         while (i < sizeof(seed_families) / sizeof(*seed_families) &&
@@ -2699,12 +2786,19 @@ int main(int argc, char **argv) {
         else retry_suffix(observed);
     } else if (argc == 4 && (!strcmp(argv[1], "frontier") ||
         !strcmp(argv[1], "partial-headers") || !strcmp(argv[1],
-        "declared-frontier"))){
+        "declared-frontier") || !strcmp(argv[1], "unloaded-frontier"))){
         unsigned observed, shard;
         if (!selector_unsigned(argv[2], 1, &observed) ||
             !selector_unsigned(argv[3], 31, &shard))
             return 2;
-        if (!strcmp(argv[1], "declared-frontier"))
+        if (!strcmp(argv[1], "unloaded-frontier")) {
+            load_facts = false;
+            for (unloaded_rows = 0; unloaded_rows < 2; ++unloaded_rows)
+                public_frontier_selected(declared_identity, observed, shard,
+                    32);
+            unloaded_rows = 0;
+            load_facts = true;
+        } else if (!strcmp(argv[1], "declared-frontier"))
             public_frontier_selected(declared_identity, observed, shard, 32);
         else if (!strcmp(argv[1], "frontier"))
             public_frontier_selected(numeric, observed, shard, 32);
