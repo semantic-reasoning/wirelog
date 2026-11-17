@@ -142,8 +142,22 @@ not an approved implementation or a requirement to preserve unused variants.
 
 The configured INLINE increment is inventoried in
 [JOIN_DOMAIN_QUALIFICATION.md](JOIN_DOMAIN_QUALIFICATION.md#configured-no-tail-inline-policy-increment).
-Its63 public histories and89 policy scenarios do not close these rows. Typed
-strict-off recovery, numeric strict/cap policies and internal cache/descriptor
-fixtures are distinct finite partitions. Streaming INLINE, complete cache
-reuse/selector intersections, new INLINE governor-pressure admission,
-materialized representation, Source/carry and MSVC remain outstanding.
+Its63 public histories and89 policy scenarios are the historical #2380
+checkpoint. The subsequent
+[streamed INLINE increment](JOIN_DOMAIN_QUALIFICATION.md#streamed-inline-producer-and-consuming-increment)
+adds actual keyed INLINE producer/scalar-consumer/ACK support, bringing the
+history file to219 cases and policy runner to141 scenarios. Cap3 success with
+three candidates/two survivors, all-rejected cap1, genuine successor stops and
+same-input retries qualify finite reached paths. Producer cell-write stops are
+the typed FLOAT-key subset; internal policy pressure and controlled-only private
+pin pressure do not imply a public setter or equal raw pressure. Raw stale-pin
+streamed ENOMEM versus controlled strict EBUSY is an explicit diagnostic gap.
+
+The [local interval derivation](OPERATOR_SOURCE_ACCOUNTING.md#streamed-inline-join-local-intervals)
+keeps logical tariffs, prepare action counts and scalar SOURCE distance distinct.
+It does not supply whole-caller, four-platform or inherited financial-carry
+certification. Complete cache reuse/selector intersections, new INLINE governor
+pressure, materialized/recursive representation, INLINE probe RHS, required
+signed timestamps/weights, containing Source/carry and current MSVC/platform
+qualification remain outstanding. All corresponding rows and #2371/#2300 remain
+OPEN.
