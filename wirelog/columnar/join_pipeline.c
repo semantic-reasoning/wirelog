@@ -1244,6 +1244,7 @@ typedef struct {
     bool busy;
     bool retirement_started, retirement_committed, retirement_drained;
     bool retiring_output;
+    uint8_t retirement_clear_chunk;
     eval_entry_t retiring_entry;
     wl_columnar_join_host_stage_t *stages;
     uint64_t stages_bytes, stages_initialized;
@@ -2621,9 +2622,14 @@ wl_columnar_join_host_retire(wl_columnar_join_host_t *h, eval_entry_t *entry,
     if (h->retirement_entry != entry ||
         h->retiring_output != output) return EINVAL;
     if (h->retirement_drained) {
+        /* One funded chunk per action; the drained latch holds until the
+         * receipt is fully zeroed. */
         rc = wl_evaluation_control_charge_attempt(funding, id, 256);
         if (rc) return rc;
-        memset(&h->retirement, 0, sizeof(h->retirement));
+        bool cleared = false;
+        rc = wl_columnar_relation_scalar_retirement_clear_chunk(
+            &h->retirement, &h->retirement_clear_chunk, &cleared);
+        if (rc || !cleared) return rc;
         h->retirement_started = h->retirement_committed =
             h->retirement_drained = false;
         h->retiring_output = false; h->retirement_entry = NULL; *done = true;
@@ -2679,6 +2685,39 @@ wl_columnar_join_host_shape_retire(wl_columnar_join_host_t *h,
     h->shape_retiring = h->retirement_entry != NULL;
     return rc;
 }
+
+#ifdef WL_SESSION_TEST_HOOKS
+int
+wl_columnar_join_pipeline_test_retirement_view(const void *owner,
+    bool *drained, unsigned *chunk, void *receipt, size_t bytes)
+{
+    const wl_columnar_eval_plan_numeric_attempt_t *r = owner;
+    const wl_columnar_join_host_t *h = r
+        ? wl_columnar_join_host_valid(r, r->frame) : NULL;
+    if (!h || !drained || !chunk || !receipt
+        || bytes != sizeof(h->retirement)) return EINVAL;
+    *drained = h->retirement_drained;
+    *chunk = h->retirement_clear_chunk;
+    memcpy(receipt, &h->retirement, bytes);
+    return 0;
+}
+
+/* Drives the same drained retirement step the host's own cleanup would take
+ * next, against a caller-supplied grant. */
+int
+wl_columnar_join_pipeline_test_retirement_clear(void *owner,
+    wl_evaluation_control_t *funding, uint64_t id, bool *done)
+{
+    wl_columnar_eval_plan_numeric_attempt_t *r = owner;
+    wl_columnar_join_host_t *h = r
+        ? (wl_columnar_join_host_t *)wl_columnar_join_host_valid(r, r->frame)
+        : NULL;
+    if (!h || !done || !h->retirement_drained || !h->retirement_entry)
+        return EINVAL;
+    return wl_columnar_join_host_retire(h, h->retirement_entry, funding, id,
+               h->retiring_output, done);
+}
+#endif
 
 static int
 wl_columnar_join_host_cleanup(wl_columnar_join_host_t *h,
