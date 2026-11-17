@@ -599,6 +599,7 @@ wl_columnar_ops_lftj_attempt_begin(wl_columnar_lftj_attempt_t *attempt,
         WL_COLUMNAR_RELATION_SCALAR_INIT_INERT;
     attempt->retirement_started = attempt->retirement_committed =
         attempt->retirement_drained = false;
+    attempt->retirement_clear_chunk = 0;
     attempt->busy = false; attempt->thread_valid = true;
 #if defined(WL_HAVE_C11_THREADS)
     attempt->owner_thread = thrd_current();
@@ -664,6 +665,7 @@ wl_columnar_lftj_attempt_begin_prevalidated(wl_columnar_lftj_attempt_t *attempt,
         WL_COLUMNAR_RELATION_SCALAR_INIT_INERT;
     attempt->retirement_started = attempt->retirement_committed =
         attempt->retirement_drained = false;
+    attempt->retirement_clear_chunk = 0;
     attempt->busy = false; attempt->thread_valid = true;
 #if defined(WL_HAVE_C11_THREADS)
     attempt->owner_thread = thrd_current();
@@ -1534,9 +1536,14 @@ wl_columnar_lftj_attempt_release(wl_columnar_lftj_attempt_t *a, bool *done,
         wl_columnar_relation_scalar_retirement_initializer_t *i =
             &a->retirement_initializer;
         if (a->retirement_drained) {
+            /* One funded chunk per action; the drained latch holds until
+             * the receipt is fully zeroed. */
             rc = wl_evaluation_control_charge_attempt(funding, funding_id, 256);
             if (rc) return rc;
-            memset(&a->retirement, 0, sizeof(a->retirement));
+            bool cleared = false;
+            rc = wl_columnar_relation_scalar_retirement_clear_chunk(
+                &a->retirement, &a->retirement_clear_chunk, &cleared);
+            if (rc || !cleared) return rc;
             a->retirement_started = a->retirement_committed =
                 a->retirement_drained = false;
             return 0;

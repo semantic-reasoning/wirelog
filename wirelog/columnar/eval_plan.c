@@ -2872,7 +2872,13 @@ wl_columnar_eval_plan_lftj_retirement_class(
     if (i->identity && (i->identity != i || i->parent != a
         || i->retirement != &a->retirement ||
         i->relation != a->output)) return EINVAL;
-    if (a->retirement_started &&
+    /* A pending chunked clear has already zeroed the receipt's tail; only
+     * its storage identity, cleared last, still vouches for it. */
+    if (a->retirement_clear_chunk
+        && (!a->retirement_drained || !a->retirement_committed
+        || a->retirement.storage.identity
+        != (uintptr_t)&a->retirement.storage)) return EINVAL;
+    if (a->retirement_started && !a->retirement_clear_chunk &&
         (a->retirement.storage.identity != (uintptr_t)&a->retirement.storage
         || a->retirement.committed != a->retirement_committed)) return EINVAL;
     if (a->retirement_drained && !a->retirement_started) return EINVAL;
@@ -4323,7 +4329,11 @@ wl_columnar_eval_plan_native_lftj_owner(
     if (i->identity && (i->identity != i || i->parent != a
         || i->retirement != &a->retirement || i->relation != a->output))
         return EINVAL;
-    if (a->retirement_started
+    if (a->retirement_clear_chunk
+        && (!a->retirement_drained || !a->retirement_committed
+        || a->retirement.storage.identity
+        != (uintptr_t)&a->retirement.storage)) return EINVAL;
+    if (a->retirement_started && !a->retirement_clear_chunk
         && (a->retirement.storage.identity != (uintptr_t)&a->retirement.storage
         || a->retirement.committed != a->retirement_committed)) return EINVAL;
     if (a->retirement_drained && !a->retirement_started) return EINVAL;
