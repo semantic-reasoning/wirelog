@@ -326,9 +326,8 @@ static const program_t programs[] = {
     },
 };
 
-/* Loaded canonical seed heads can run an ordinary STEP. Evaluating SNAPSHOT
- * and schema-less seed heads remain refused. The raw session
- * gives a bare head its rule width even when its facts were not loaded. */
+/* Canonical seed heads can run an ordinary STEP with or without loaded facts.
+ * Evaluating SNAPSHOT remains a separate refused route. */
 static const char *const head_input_programs[] = {
     "a(1).\na(2).\nout(7).\nout(x) :- a(x).\n",
     ".decl a(x:int64)\n.decl out(x:int64)\n"
@@ -381,12 +380,12 @@ head_input(unsigned which, bool snapshot, bool observed, bool loaded)
         wl_session_set_delta_cb(f.s, on_delta, &ev);
         wl_session_set_delta_cb(f.raw, on_delta, &raw_ev);
     }
-    bool supported = loaded && !snapshot;
+    bool supported = !snapshot;
     int refusal = EINVAL;
     col_rel_t *old = session_find_rel(COL_SESSION(f.s), "out");
     col_relation_snapshot_t old_image = wl_columnar_relation_snapshot(old);
     col_rel_t *shadow = wl_columnar_session_seed_rows(COL_SESSION(f.s), "out");
-    if (supported && (which == 0 || (which == 1 && observed))) {
+    if (supported && loaded && (which == 0 || (which == 1 && observed))) {
         CHECK(shadow && shadow->nrows == 1 && !shadow->base_nrows);
         cutoff_control = f.control;
         cutoff_session = f.s;
@@ -445,10 +444,10 @@ head_input(unsigned which, bool snapshot, bool observed, bool loaded)
             CHECK(a->ncols == b->ncols && a->schema_ok == b->schema_ok
                 && a->declared_ncols == b->declared_ncols);
             CHECK(shadow == wl_columnar_session_seed_rows(COL_SESSION(f.s),
-                "out") && shadow->base_nrows == shadow->nrows);
+                "out") && (!shadow || shadow->base_nrows == shadow->nrows));
             capture_t events = {.head = "out"};
             if (observed) {
-                if (!round)
+                if (!round && loaded)
                     for (unsigned r = 0; r < 3; r++)
                         on_delta("out", &first[r], 1, 1, &events);
                 else if (round == 1) {
@@ -461,7 +460,7 @@ head_input(unsigned which, bool snapshot, bool observed, bool loaded)
         }
     }
     /* Head writes still obey set difference when a seed overlaps a rule row. */
-    if (supported) {
+    if (supported && loaded) {
         const op_t writes[] = {
             {OP_INSERT, "out", {9}, 1}, {OP_REMOVE, "out", {9}, 1},
             {OP_INSERT, "out", {2}, 1}, {OP_REMOVE, "out", {2}, 1},

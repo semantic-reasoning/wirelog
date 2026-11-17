@@ -12,9 +12,8 @@ STEPs against the head-input fixtures in `evaluation_facts_sources`. It commits
 the preserved seed shadow's `base_nrows` only at successful publication, so a
 later observed STEP reports new rows rather than reporting an unchanged seed
 again. Precommit cancellation, reset/retry, unchanged STEPs and host head
-insert/remove overlap are covered. Unloaded seed actors still refuse width
-repair even though the raw evaluator succeeds; evaluating SNAPSHOT remains
-outside this qualified intersection. The following ordinary routing increment
+insert/remove overlap are covered. The later bare-head increment below admits a genuinely empty unloaded head;
+evaluating SNAPSHOT remains outside this qualified intersection. The following ordinary routing increment
 also admits the fully declared observed identity-MAP fixture: the same immutable
 seed shape hint now selects the existing general host before legacy observer
 preflight. DIRECT-only routing, paid canonical name matching and the C1/batch/
@@ -2630,8 +2629,7 @@ unchanged shadow/publication before retry. The declared and reversed-declaration
 host positives prove actual seed ownership, and the existing stop matrix now
 also runs the declared identity program. Unmatched observed identity candidates
 exercise cancellation, work exhaustion, Original END and an unrelated successor,
-with no actor/publication and raw retry parity. Unloaded seed width repair and
-evaluating SNAPSHOT remain explicitly refused.
+with no actor/publication and raw retry parity. Other width mismatches and evaluating SNAPSHOT remain explicitly refused.
 
 The `declared-lifecycle` family executes the actual declared program through
 arena governor denial with raised-limit retry and a subsequent insert; committed
@@ -2652,5 +2650,54 @@ runner retains the unpartitioned completeness oracle; no observed successful
 work allowance is used as a primitive price.
 
 This closes the qualified loaded ordinary declared observed seed intersection.
-Recursive/K cursor transport, pool and prepared-sort integration, schema-less
-seed repair, evaluating SNAPSHOT and broader contexts remain separate work.
+Recursive/K cursor transport, pool and prepared-sort integration, evaluating SNAPSHOT and broader contexts
+remain separate work.
+
+
+### Bare unloaded canonical seed heads
+
+On main `d7950d60`, ordinary canonical seed STEPs with facts not loaded
+returned EINVAL while the uncontrolled Session succeeded. The physical actor
+built a width-zero working descriptor before seeing the actual rule result.
+It then refused that result's width. The target and shadow readers now prove
+an empty bare target and no seed rows before deferring private construction.
+The public head and its snapshot stay unchanged. RULE_READY may then own no
+working descriptor; End drains the actual initialized sources and readers.
+
+After attaching the actual rule result, its real reader and scalar source
+precede construction. The existing staged base builder takes the actual rule
+width and names, the normal schema-initialization capacity and no timestamps.
+The head retains its own declaration and graph identity metadata. Initial
+column types remain absent, as in raw schema initialization; the existing
+append metadata owner copies actual rule types only for nonempty output.
+Empty results still publish their schema. Existing schemaful paths keep their
+original construction, width checks, restoration and normalization.
+
+The next observed Session refusal was EVENTS phase10: baseline construction
+already accepted the real bare head, but prepare compared its width0 with the
+new width1. No baseline schema validator or missing-head permission changes.
+During COPY, under the actual source reader, an internal provenance bit records
+only a real empty bare head with no physical payload or retired/seed companions
+and zero baseline/pending rows. Under the actual candidate reader, prepare may
+then give that zero-cell private baseline its first actual candidate width
+before checked staging allocation, clearing the bit. Schemaful nullary heads,
+nonempty baseline and pending/retired history retain their width refusals.
+An allocation failure after promotion retains a coherent empty baseline for
+same-width retry; no public schema or event is committed by this operation.
+
+The physical matrix compares the existing INT64/STRING/FLOAT controls with the
+uncontrolled evaluator. The additional unloaded component family runs a real
+body insert through discovered component identities, cancellation, exhaustion,
+Original END, cleanup funding and every actual constructor allocation prefix;
+real governor denials require raised-limit retries and final resource closure.
+`evaluation_facts_sources` now compares all ordinary declaration/load/observer
+cells through empty evaluation, body insertion and unchanged evaluation.
+The unloaded host also compares empty schema and later facts loading, and its
+separate stop family retains the old bare descriptor/image and no events before
+reset/retry. The observer fixture separately rejects schemaful empty/present
+nullary, nonempty different-width and pending/retired history controls, and
+retries a genuine post-promotion allocation failure.
+
+This increment admits empty bare ordinary heads only. Evaluating SNAPSHOT,
+C1/batch, arbitrary schemaful width repair, recursive/K, pool and prepared-sort
+activation retain their separate ownership and qualification requirements.

@@ -881,9 +881,112 @@ static void wide_schema_exact_boundary(void)
     }
 }
 
+/* A bare descriptor is distinct from a schemaful nullary baseline. Even an
+ * empty schemaful model cannot silently change width through this path. */
+static void bare_baseline_width(void)
+{
+    for (unsigned kind = 0; kind < 6; ++kind) {
+        wl_plan_relation_t head = {.name = "head"};
+        wl_plan_stratum_t stratum = {.relations = &head, .relation_count = 1};
+        wl_plan_t plan = {.strata = &stratum, .stratum_count = 1};
+        col_rel_t *baseline = NULL;
+        assert(!col_rel_alloc(&baseline, "head"));
+        if (kind == 1 || kind == 2)
+            assert(!col_rel_set_schema(baseline, 0, NULL));
+        if (kind == 2) {
+            int64_t ignored = 0;
+            assert(!col_rel_append_row(baseline, &ignored));
+        }
+        if (kind == 3) {
+            int64_t row = 7;
+            assert(!col_rel_set_schema(baseline, 2, NULL));
+            int64_t pair[] = {row, row};
+            assert(!col_rel_append_row(baseline, pair));
+        }
+        col_rel_t *relations[] = {baseline, NULL};
+        if (kind >= 4) {
+            relations[1] = col_rel_new_auto(
+                kind == 4 ? "$in$head" : "$out$head", 0);
+            int64_t ignored = 0;
+            assert(relations[1] && !col_rel_append_row(relations[1], &ignored));
+        }
+        wl_col_session_t sess = {.plan = &plan, .rels = relations,
+                                 .nrels = kind >= 4 ? 2 : 1};
+        wl_columnar_memory_reservation_init(
+            &sess.delta_observer_retirement_metadata);
+        col_relation_snapshot_t before =
+            wl_columnar_relation_snapshot(baseline);
+        wl_evaluation_control_t *ctl = control(0);
+        uint64_t id = wl_evaluation_control_active_attempt_id(ctl);
+        assert(!wl_columnar_eval_delta_observer_build_start(&sess, UINT64_MAX));
+        bool ready = false;
+        int rc;
+        do {
+            rc = wl_columnar_eval_delta_observer_build_advance(&sess, ctl,
+                    id, &ready);
+        } while (rc == EAGAIN);
+        assert(!rc && ready);
+        col_rel_t *candidate = col_rel_new_auto("head", 1);
+        int64_t value = 12;
+        assert(candidate && !col_rel_append_row(candidate, &value));
+        assert(!wl_columnar_eval_delta_observer_prepare_start_with_override(
+                &sess, "head", candidate));
+        if (!kind)
+            wl_columnar_eval_delta_test_fail_prepare_current_alloc = true;
+        ready = false;
+        do {
+            rc = wl_columnar_eval_delta_observer_prepare_advance(&sess, ctl,
+                    id, &ready);
+        } while (rc == EAGAIN);
+        if (!kind) {
+            assert(rc == ENOMEM && !ready
+                && !wl_columnar_eval_delta_test_fail_prepare_current_alloc);
+            do {
+                rc = wl_columnar_eval_delta_observer_prepare_discard(&sess);
+            } while (rc == EAGAIN);
+            assert(!rc);
+            col_rel_t *other = col_rel_new_auto("head", 2);
+            assert(other);
+            assert(!wl_columnar_eval_delta_observer_prepare_start_with_override(
+                    &sess, "head", other));
+            do {
+                rc = wl_columnar_eval_delta_observer_prepare_advance(&sess,
+                        ctl, id, &ready);
+            } while (rc == EAGAIN);
+            assert(rc == ENOTSUP && !ready);
+            do {
+                rc = wl_columnar_eval_delta_observer_prepare_discard(&sess);
+            } while (rc == EAGAIN);
+            assert(!rc && !col_rel_destroy_checked(other));
+            assert(!wl_columnar_eval_delta_observer_prepare_start_with_override(
+                    &sess, "head", candidate));
+            do {
+                rc = wl_columnar_eval_delta_observer_prepare_advance(&sess,
+                        ctl, id, &ready);
+            } while (rc == EAGAIN);
+        }
+        assert(rc == (kind ? ENOTSUP : 0) && ready == !kind);
+        assert(wl_columnar_relation_snapshot_equal(before,
+            wl_columnar_relation_snapshot(baseline)));
+        if (!kind)
+            assert(wl_columnar_eval_delta_observer_event_count(&sess) == 1);
+        do {
+            rc = wl_columnar_eval_delta_observer_prepare_discard(&sess);
+        } while (rc == EAGAIN);
+        assert(!rc && !wl_columnar_eval_delta_observer_discard(&sess));
+        close_control(ctl);
+        session_rel_free_hash(&sess);
+        assert(!col_rel_destroy_checked(candidate));
+        assert(!col_rel_destroy_checked(baseline));
+        if (relations[1])
+            assert(!col_rel_destroy_checked(relations[1]));
+    }
+}
+
 int main(void)
 {
     assert(wl_columnar_eval_delta_observer_prepare(NULL) == EINVAL);
+    bare_baseline_width();
     wide_schema_exact_boundary();
     wide_observer_reference();
     reader_steps(); build(false); build(true);

@@ -2952,16 +2952,15 @@ an EDB too, whether `out` is declared or not. The uncontrolled session derives
 the rule's rows beside the facts. With the facts not loaded, its first STEP or
 SNAPSHOT returned EINVAL: the head was a bare EDB without a schema, and the
 non-recursive append into it took the rule's width only for a recursive head.
-The append now gives such a head the rule's width either way. The physical seed
-actor still refuses that width change with EINVAL, and
-`evaluation_seed_physical` expects that refusal beside the uncontrolled success
-when its target has no schema.
+The append now gives such a head the rule's width either way. The physical seed actor now defers construction for a genuinely empty bare
+head until the actual rule result supplies the schema, using its existing
+staged builder and preserving the public head until publication.
 
 The canonical Session seed host admits the loaded ordinary STEP cases in
 `evaluation_facts_sources`: all three declaration variants with or without an observer. The ordinary DIRECT
 seed hint routes the fully declared identity MAP to the same existing host;
-paid name matching still proves the canonical slot. Evaluating SNAPSHOT and
-unloaded seed heads still return EINVAL.
+paid name matching still proves the canonical slot. Evaluating SNAPSHOT still returns EINVAL. Ordinary unloaded empty bare heads
+now receive their actual rule schema and match the uncontrolled session.
 Refused cases retain the old head and emit nothing. Successful cases require
 literal rows `{1,2,7}`, then `{1,2,3,7}` after a body insert, raw schema/event
 parity, and no events on an unchanged STEP. Head writes also check insertion,
@@ -3087,3 +3086,15 @@ operator is checked only through the codes it yields and, when it is the output
 of a publication the hook observes, at that publication; relations that exist
 only within a single call are checked only when the hook passes them;
 publications at sites the hook does not observe are not checked.
+
+The bare unloaded seed increment on main `d7950d60` retains declaration metadata
+from the old head and width/names from the actual reader-owned rule result.
+It preserves raw empty scratch/type/capacity geometry and takes types only when
+actual rows append. Observer COPY records a real bare-empty, zero-history
+baseline; prepare adopts its first width under the candidate reader before
+staging allocation. Schemaful nullary and nonempty/pending/retired width
+mismatches remain refused, and post-promotion allocation failure is retried.
+The additional physical unloaded-component and Session unloaded-stop families
+check cancellation, exhaustion, Original END/successor, constructor failures,
+real budget denial/raised retry, untouched public snapshots and final resources.
+Snapshot, C1/batch and recursive/K/pool/prepared-sort scope is unchanged.

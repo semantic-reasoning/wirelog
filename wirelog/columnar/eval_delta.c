@@ -821,6 +821,7 @@ typedef struct {
     uint32_t pending_nrows;
     uint32_t current_nrows, current_ncols;
     wl_columnar_source_access_reader_t reader;
+    bool bare_empty_baseline;
 } wl_columnar_eval_delta_observer_entry_t;
 
 struct wl_columnar_eval_delta_observer {
@@ -1808,6 +1809,14 @@ wl_columnar_eval_delta_build_action(wl_col_session_t *sess,
         col_rel_t *r = b->sources[b->kind];
         if (!wl_columnar_eval_delta_build_schema(r))
             return ENOTSUP;
+        /* COPY owns the actual source reader, including for an empty head.
+         * This provenance excludes schemaful nullary and all row history. */
+        if (!b->kind && !r->schema_ok && !r->ncols && !r->nrows
+            && !r->capacity && !r->columns && !r->col_names
+            && !r->column_types && !r->row_scratch && !r->timestamp_capacity
+            && !b->sources[1] && !b->sources[2] && !e->ncols
+            && !e->nrows && !e->pending_nrows && !e->rows)
+            e->bare_empty_baseline = true;
         uint32_t start = b->kind == 2 ? r->base_nrows : 0;
         if (start > r->nrows || b->row > r->nrows - start
             || b->copied > e->nrows + e->pending_nrows)
@@ -2783,7 +2792,15 @@ wl_columnar_eval_delta_observer_prepare_advance_action(wl_col_session_t *sess,
             } else if (!p->preflight_captured) {
                 if (!wl_columnar_eval_delta_build_schema(p->relation))
                     return ENOTSUP;
-                if (p->relation->ncols != e->ncols) return ENOTSUP;
+                if (p->relation->ncols != e->ncols) {
+                    /* An empty bare baseline owns no cells whose stride
+                     * could change. The actual candidate reader supplies
+                     * its first width before checked staging allocation. */
+                    if (!e->bare_empty_baseline || e->ncols || e->nrows
+                        || e->pending_nrows || e->rows) return ENOTSUP;
+                    e->ncols = p->relation->ncols;
+                    e->bare_empty_baseline = false;
+                }
                 if (p->column < p->relation->ncols) {
                     uint32_t c = p->column++;
                     if ((p->relation->nrows && !p->relation->columns[c])

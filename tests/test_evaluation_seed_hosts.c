@@ -232,8 +232,9 @@ static void equal(fixture_t *f) {
     for (uint32_t c = 0; c < a->ncols; ++c) {
         CHECK((a->column_types ? a->column_types[c] : WIRELOG_TYPE_INT64) ==
             (b->column_types ? b->column_types[c] : WIRELOG_TYPE_INT64));
-        CHECK(!memcmp(a->columns[c], b->columns[c],
-            a->nrows * sizeof(int64_t)));
+        if (a->nrows)
+            CHECK(!memcmp(a->columns[c], b->columns[c],
+                a->nrows * sizeof(int64_t)));
     }
     CHECK(!!a->timestamps == !!b->timestamps);
     if (a->timestamps)
@@ -878,18 +879,11 @@ static void unloaded(void) {
         for (unsigned observed = 0; observed < 2; ++observed) {
             fixture_t f = create(sources[source], observed, true);
             fixture_hook(&f, observed);
-            col_rel_t *old = session_find_rel(COL_SESSION(f.session), "out");
-            col_relation_snapshot_t before = wl_columnar_relation_snapshot(old);
             int actual = complete(&f), raw = wl_session_step(f.raw);
-            /* Main gives the bare raw head its rule width. The physical
-             * seed actor still refuses that schema change. */
-            col_rel_t *reference = session_find_rel(COL_SESSION(f.raw), "out");
-            CHECK(actual == EINVAL && !raw && !f.events);
-            CHECK(session_find_rel(COL_SESSION(f.session), "out") == old
-                && wl_columnar_relation_snapshot_equal(before,
-                wl_columnar_relation_snapshot(old)));
-            CHECK(!old->ncols && reference->ncols == 1
-                && !old->nrows && !reference->nrows);
+            CHECK(!actual && !raw && !f.events);
+            equal(&f);
+            col_rel_t *head = session_find_rel(COL_SESSION(f.session), "out");
+            CHECK(head->ncols == 1 && !head->nrows && head->schema_ok);
             CHECK(!wl_evaluation_control_reset(f.control));
             CHECK(!wl_session_load_facts(f.raw, f.program) &&
                 !wl_session_load_facts(f.session, f.program));
@@ -898,6 +892,12 @@ static void unloaded(void) {
             CHECK(!observed || f.events == 2);
             destroy(&f);
         }
+    load_facts = true;
+}
+static void unloaded_stops(void) {
+    load_facts = false;
+    stops_for(numeric);
+    stops_for(declared_identity);
     load_facts = true;
 }
 static void init_checkpoint(const wl_columnar_session_seed_t *actor,
@@ -2642,6 +2642,7 @@ static const seed_family_t seed_families[] = {
     {"name-vectors", name_vectors},
     {"committed-end", committed_end},
     {"unloaded", unloaded},
+    {"unloaded-stops", unloaded_stops},
     {"snapshot-boundary", snapshot_boundary},
     {"partial-init", partial_init},
     {"birth-failures", birth_failures},

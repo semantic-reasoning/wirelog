@@ -26887,7 +26887,7 @@ struct wl_columnar_session_seed {
     int order;
     int64_t left_bits, right_bits;
     wirelog_column_type_t compare_type;
-    bool have_previous, normalize;
+    bool have_previous, normalize, deferred_schema;
     wl_columnar_session_seed_base_t base_build;
     wl_columnar_session_seed_resize_t resize;
     wl_columnar_session_seed_metadata_t metadata;
@@ -27581,9 +27581,14 @@ wl_columnar_session_seed_base_step(wl_columnar_session_seed_t *a)
         case 1: r->timestamps = b->timestamps;
             r->timestamp_capacity = b->ts_capacity;
             r->row_scratch = b->scratch; r->column_types = b->types; return 0;
-        case 2: r->col_names = b->names; r->declared_ncols = s->declared_ncols;
-            r->has_graph_column = s->has_graph_column;
-            r->graph_col_idx = s->graph_col_idx; return 0;
+        case 2: {
+            const col_rel_t *identity = a->deferred_schema && !b->output
+                ? a->target : s;
+            r->col_names = b->names;
+            r->declared_ncols = identity->declared_ncols;
+            r->has_graph_column = identity->has_graph_column;
+            r->graph_col_idx = identity->graph_col_idx; return 0;
+        }
         case 3: r->schema_ok = b->schema_ok; r->memory_governor = a->governor;
             r->descriptor_reserved_bytes = a->governor?b->descriptor_bytes:0;
             r->metadata_reserved_bytes = a->governor?b->metadata_bytes:0;
@@ -28214,6 +28219,20 @@ wl_columnar_session_seed_step(wl_columnar_session_seed_t *a)
         default:
             a->width = a->target->ncols;
             a->seed_rows = a->shadow?a->shadow->nrows:0;
+            /* Both descriptors are held by their actual readers. A genuinely
+            * bare head has no model or seed rows to restore. Its rule result
+            * supplies the schema later, without publishing into the head. */
+            if (!a->target->schema_ok && !a->target->ncols &&
+                !a->target->nrows && !a->target->capacity &&
+                !a->target->timestamps && !a->target->timestamp_capacity &&
+                !a->target->columns && !a->target->col_names &&
+                !a->target->column_types && !a->target->row_scratch &&
+                !a->seed_rows) {
+                a->deferred_schema = true;
+                a->progress = WL_COLUMNAR_SESSION_SEED_RULE_READY;
+                a->phase = WL_COLUMNAR_SESSION_SEED_A_WAIT;
+                a->stage = 0; return 0;
+            }
             a->phase = WL_COLUMNAR_SESSION_SEED_A_BASE; a->stage = 0; return 0;
         }
     case WL_COLUMNAR_SESSION_SEED_A_BASE:
@@ -28344,6 +28363,10 @@ wl_columnar_session_seed_step(wl_columnar_session_seed_t *a)
             if (rc) return rc;
             a->stage++; return 0;
         case 1:
+            if (!a->working) {
+                if (!a->deferred_schema) return EINVAL;
+                a->stage = 10; return 0;
+            }
             if (a->working->ncols != a->rule->ncols)return EINVAL;
             a->rule_rows = a->rule->nrows;
             if (!a->rule_rows) {
@@ -28382,6 +28405,38 @@ wl_columnar_session_seed_step(wl_columnar_session_seed_t *a)
                 a->row++; a->column = 0; return 0;
             }
             a->row = 0; a->stage = 5; return 0;
+        case 10:
+            WL_COLUMNAR_SESSION_SEED_CHILD(11,
+                wl_columnar_relation_scalar_source_init_attempt_controlled(
+                    &a->sources[2], &a->source_initialized[2], a->control,
+                    a->id));
+        case 11:
+            WL_COLUMNAR_SESSION_SEED_CHILD(12,
+                wl_columnar_relation_scalar_source_begin_attempt_controlled(
+                    &a->sources[2], a->rule, true));
+        case 12: {
+            /* insert_merge gives a bare head the actual result's width and
+             * names with the ordinary initial capacity. It retains the old
+             * head identity metadata and takes types only when rows append. */
+            const col_rel_t *donor = a->rule->ncols ? a->rule : a->target;
+            a->output = 0; a->stage = 13;
+            rc = wl_columnar_session_seed_base_begin(a, donor,
+                    a->rule->ncols ? COL_REL_INIT_CAP : 0, 0,
+                    donor->schema_ok);
+            if (!rc) a->base_build.types_present = false;
+            return rc;
+        }
+        case 13:
+            if (a->base_build.active)
+                return wl_columnar_session_seed_base_step(a);
+            if (!a->working || !a->owned[0]) return EINVAL;
+            a->width = a->working->ncols;
+            a->rule_rows = a->rule->nrows;
+            if (!a->rule_rows) {
+                a->phase = WL_COLUMNAR_SESSION_SEED_A_SORT;
+                a->stage = 0; return 0;
+            }
+            a->column = 0; a->stage = 3; return 0;
         default: a->phase = WL_COLUMNAR_SESSION_SEED_A_APPEND; a->stage = 0;
             return 0;
         }

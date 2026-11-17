@@ -16,7 +16,8 @@ static const char *programs[] = {
     "input(1). out(7). out(strlen(to_string(x))):-input(x).",
     ".decl input(x:int64)\n.decl out(y:int64)\ninput(1). out(7). out(strlen(to_string(x))):-input(x),x>9.",
     ".decl input(x:int64)\n.decl out(y:int64)\ninput(1). out(7). out(x+1):-input(x).",
-    ".decl input(x:int64)\n.decl out(y:int64)\ninput(1). out(7). out(@call(\"seed.effect\",x)):-input(x)."
+    ".decl input(x:int64)\n.decl out(y:int64)\ninput(1). out(7). out(@call(\"seed.effect\",x)):-input(x).",
+    "input(). out(). out():-input()."
 };
 static unsigned effect_calls, pre_rule_denials, post_rule_denials;
 static int effect(const wirelog_extension_value_t *args, uint32_t n,
@@ -649,13 +650,9 @@ static int run(unsigned k, unsigned loaded, unsigned observed, unsigned ts) {
     if (untyped_target && !result.rel) CHECK(rc);
     if (injection_mode != 6 && (!untyped_target || result.rel))
         raw_rc = raw_reference(raw, rt, result.rel);
-    /* A head that is also a plan EDB can have no schema before its first
-     * row. The raw STEP gives it the rule's width (#2301); this physical
-     * actor still refuses the width change. */
-    bool unschemaed = !untyped_target && !t->ncols;
     if (!injection_mode && !allocation_failure &&
         !malformed_format && !paid_enabled)
-        CHECK(unschemaed ? rc == EINVAL && !raw_rc : rc == raw_rc);
+        CHECK(rc == raw_rc);
     if (malformed_format)CHECK(rc == ENOTSUP);
     col_rel_t *out = NULL; if (!rc){
         bool ready = false; for (unsigned i = 0;
@@ -794,6 +791,9 @@ static void matrix(void) {
                 observed++) for (unsigned ts = 0;
                     ts < 2; ts++)
                     run(k, loaded, observed, ts);
+    for (unsigned observed = 0; observed < 2; ++observed)
+        for (unsigned ts = 0; ts < 2; ++ts)
+            run(7, 0, observed, ts);
 }
 static void histories(void) {
     prior_steps = 1;
@@ -809,12 +809,13 @@ static void histories(void) {
     extra_input = 1100; run(5, 1, 1, 1); extra_input = 0;
     CHECK(saw_detached_ts && saw_zero_grid);
 }
-static void component_failures(unsigned fixture) {
+static void component_failures(unsigned fixture, bool loaded) {
     /* Select a real typed STRING source and observed timestamped history.
      * The baseline captures independent phase identities including metadata,
      * normalized output, B2 drain and physical retirement. */
-    cut_count = 0; extra_input = fixture == 5?70:0; census_enabled = true;
-    run(fixture, 1, 1, 1); census_enabled = false;
+    cut_count = 0; extra_input = !loaded?1:fixture == 5?70:0;
+    census_enabled = true;
+    run(fixture, loaded, 1, 1); census_enabled = false;
     size_t count = cut_count, replays = 0;
     for (size_t i = 0; i < count;
         i++) for (unsigned mode = 1; mode <= 5; mode++) {
@@ -824,17 +825,17 @@ static void component_failures(unsigned fixture) {
             selected_cut = i; injection_mode = mode; injected = false;
             original_ended = cleanup_ended = false;
             replays++;
-            run(fixture, 1, 1, 1);
+            run(fixture, loaded, 1, 1);
         }
     for (size_t i = 0; i < count; i++) {
         const cut_t *c = &cuts[i];
         if (!admission_site(c)) continue;
         selected_cut = i; injection_mode = 6; injected = false;
-        original_ended = cleanup_ended = false; run(fixture, 1, 1, 1);
+        original_ended = cleanup_ended = false; run(fixture, loaded, 1, 1);
     }
     injection_mode = 0;
     for (unsigned i = 1; i < 512; i++) {
-        allocation_failure = i; int rc = run(fixture, 1, 1, 1);
+        allocation_failure = i; int rc = run(fixture, loaded, 1, 1);
         if (!rc) break;
         CHECK(i < 511);
     }
@@ -1002,10 +1003,13 @@ static void initialization_failures(void) {
     fprintf(stderr, "physical seed: %zu Init cuts x5 passed\n", actions);
 }
 static void component_one(void) {
-    component_failures(1);
+    component_failures(1, true);
 }
 static void component_five(void) {
-    component_failures(5);
+    component_failures(5, true);
+}
+static void component_unloaded(void) {
+    component_failures(0, false);
 }
 static void malformed_inputs(void) {
     for (malformed_format = 1; malformed_format <= 3; malformed_format++)
@@ -1018,6 +1022,7 @@ typedef struct {
 } physical_family_t;
 static const physical_family_t physical_families[] = {
     {"--matrix", matrix},
+    {"--component-unloaded", component_unloaded},
     {"--histories", histories},
     {"--component-1", component_one},
     {"--component-5", component_five},
