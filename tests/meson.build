@@ -781,6 +781,9 @@ test('bench_flowlog_tdd_bdx_smoke', bench_flowlog,
 
 bench_flowlog_json_py3 = find_program('python3', 'python', required: true)
 bench_flowlog_tdd_json_validator = files('validate_bench_flowlog_tdd_json.py')
+test('bench_flowlog_tdd_json_validator', bench_flowlog_json_py3,
+     args: [files('test_validate_bench_flowlog_tdd_json.py')[0]],
+     suite: ['unit', 'bench'], timeout: 30)
 test('bench_flowlog_tdd_bdx_json', bench_flowlog_json_py3,
      args: [
        bench_flowlog_tdd_json_validator[0],
