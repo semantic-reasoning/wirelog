@@ -16060,20 +16060,29 @@ col_controlled_recursive_abort_cleanup(wl_col_session_t *sess,
         recursive->registration_prepared = false;
     }
     if (recursive->merge.identity) {
-        if (!recursive->merge_result_taken)
+        wl_columnar_managed_candidate_phase_t phase =
+            WL_COLUMNAR_MANAGED_CANDIDATE_INERT;
+        int terminal = 0;
+        /* As in CLEANUP_MERGE, a refused or stopped MERGE_ACK BEGIN leaves
+         * the merge DONE with no acknowledgement pending; neither abort nor
+         * step the finished merge again. */
+        bool done = !wl_columnar_managed_candidate_merge_status(
+            &recursive->merge, &phase, &terminal)
+            && phase == WL_COLUMNAR_MANAGED_CANDIDATE_DONE;
+        if (!done && !recursive->merge_result_taken)
             (void)wl_columnar_managed_candidate_merge_abort(&recursive->merge);
         if (col_controlled_recursive_maintenance_begin(step, recursive))
             return EAGAIN;
-        rc = wl_columnar_session_main_action(sess, step,
-                WL_COLUMNAR_SESSION_MAIN_MERGE, recursive, NULL, 1);
-        if (rc == EAGAIN || rc == EBUSY) return EAGAIN;
-        if (rc) return rc;
-        wl_columnar_managed_candidate_phase_t phase;
-        int terminal = 0;
-        rc = wl_columnar_managed_candidate_merge_status(&recursive->merge,
-                &phase, &terminal);
-        if (rc) return rc;
-        if (phase != WL_COLUMNAR_MANAGED_CANDIDATE_DONE) return EAGAIN;
+        if (!done) {
+            rc = wl_columnar_session_main_action(sess, step,
+                    WL_COLUMNAR_SESSION_MAIN_MERGE, recursive, NULL, 1);
+            if (rc == EAGAIN || rc == EBUSY) return EAGAIN;
+            if (rc) return rc;
+            rc = wl_columnar_managed_candidate_merge_status(
+                &recursive->merge, &phase, &terminal);
+            if (rc) return rc;
+            if (phase != WL_COLUMNAR_MANAGED_CANDIDATE_DONE) return EAGAIN;
+        }
         rc = col_controlled_recursive_merge_ack_drive(sess, step, recursive);
         if (rc) return rc;
         recursive->merge_result_taken = false;
