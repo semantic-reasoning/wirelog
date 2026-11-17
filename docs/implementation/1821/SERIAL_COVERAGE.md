@@ -987,10 +987,12 @@ from the runtime grants used to demonstrate composition.
 Cancellation of old input preserves its relation/debt. Before BIND no writer
 claim exists; after BIND a separately paid256 validates/releases the actual
 two-writer round, invalidates ready and latches cancel-clear before return.
-A later256 clears scalar storage. Private output remains with its parent
-until genuine scalar commit transfers disposal responsibility. Physical DONE
-latches a drained state and returns; another256 clears terminal storage
-without dereferencing the freed target or repeating physical retirement.
+Later separately paid256 actions clear scalar storage, one 64-byte chunk
+each from its end, so the target layout sets only how many run. Private
+output remains with its parent until genuine scalar commit transfers
+disposal responsibility. Physical DONE latches a drained state and returns;
+further256 chunk actions clear terminal storage without dereferencing the
+freed target or repeating physical retirement.
 Parent busy/selection flags prevent reentrant mutation, retarget or cleanup.
 
 Failed composed LFTJ output retirement has an authenticated narrow funding
@@ -1482,10 +1484,14 @@ and advances context RESET before marker/ref ACK. ACKED history uses local bytes
 
 Each real action has its own source ledger. Constructor204/256, header149/192,
 segment81/128, selection94/128, scalar commit189/192, non-ledger disposal160/256,
-ledger wrapper120/128, scalar clear at most210/256, claim release188/256,
+ledger wrapper120/128, scalar clear chunk at most95/256, claim release188/256,
 decline restoration70/128, work clear98/128 and existing ACK125/192 fit their
-admissions. Complete step scaffolding is at most64, including fee selection,
-error/disposition handling and busy/return tails. Payload body including its
+admissions. The scalar clear chunk keeps the former clear's87 fixed caller
+units and replaces its123 eight-byte receipt units with the eight of one
+64-byte chunk; `eval_stack.c` guards that sum at compile time. Clear and
+decline clear each run one such action per chunk. Complete step scaffolding
+is at most64, including fee selection, error/disposition handling and
+busy/return tails. Payload body including its
 actual caller tail is191/192, with no room for uncounted additions. Its unchanged
 generic formula expands all three grids, timestamp products, scratch and checked
 sums; the local zero backup fields justify the separately documented bound.
