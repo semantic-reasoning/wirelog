@@ -1,6 +1,7 @@
 /* Controlled typed/stamped scratch prerequisite for session JOIN batches. */
 #include "../wirelog/columnar/internal.h"
 #include "../wirelog/columnar/join_batch.h"
+#include "../wirelog/thread.h"
 #include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -762,6 +763,278 @@ test_schema_preparation(void)
     }
 }
 
+/* Constructed physical INLINE descriptors for direct prepare authority tests. */
+static void
+inline_metadata(col_rel_t *r)
+{
+    CHECK(r->ncols == 10 && !r->compound_arity_map);
+    r->compound_arity_map = malloc(9 * sizeof(uint32_t));
+    CHECK(r->compound_arity_map);
+    for (unsigned i = 0; i < 9; ++i) r->compound_arity_map[i] = i ? 1 : 2;
+    r->compound_arity_len = 9; r->compound_count = 1;
+    r->compound_kind = WIRELOG_COMPOUND_KIND_INLINE;
+    wl_columnar_relation_touch_view(r);
+}
+
+static void
+writers(const col_rel_t *left, const col_rel_t *right, bool busy)
+{
+    const col_rel_t *sources[] = {left, right};
+    for (unsigned i = 0; i < 2; ++i) {
+        wl_columnar_source_access_writer_t writer = {0};
+        int rc = col_rel_source_writer_acquire(sources[i], &writer);
+        CHECK(rc == (busy ? EBUSY : 0));
+        if (!rc) CHECK(!wl_columnar_source_access_writer_release(&writer));
+    }
+}
+
+static void
+inline_consume(wl_columnar_join_batch_prepare_t *a)
+{
+    unsigned rows = 0, batches = 0;
+    for (unsigned turn = 0; ; ++turn) {
+        CHECK(turn < 100000);
+        col_join_batch_control_result_t result;
+        col_join_batch_control_status_t status = col_join_batch_control_step(
+            a->continuation, 256, &result);
+        if (status == COL_JOIN_BATCH_CONTROL_DONE) break;
+        if (status == COL_JOIN_BATCH_CONTROL_PROGRESS) continue;
+        CHECK(status == COL_JOIN_BATCH_CONTROL_BATCH_READY);
+        const col_rel_t *batch = NULL; uint64_t generation = 0;
+        CHECK(!col_join_batch_control_peek(a->continuation, &batch,
+            &generation));
+        CHECK(batch && batch->ncols == 20 && batch->nrows == 1
+            && batch->compound_kind == WIRELOG_COMPOUND_KIND_NONE
+            && generation == ++batches);
+        for (unsigned c = 0; c < 20; ++c) {
+            unsigned lane = c % 10;
+            CHECK(col_rel_get(batch, 0, c) == (lane ? (int64_t)lane + 10 : 1));
+            CHECK(batch->column_types[c] == WIRELOG_TYPE_INT64);
+        }
+        ++rows;
+        CHECK(!col_join_batch_control_precommit(a->continuation, generation)
+            && !col_join_batch_control_ack(a->continuation, generation));
+    }
+    CHECK(rows == 4 && batches == 4);
+}
+
+static unsigned inline_auth_stop;
+static void
+inline_auth_checkpoint(wl_evaluation_control_t *control, uint64_t work)
+{
+    if (work != 256 || !inline_auth_stop) return;
+    unsigned stop = inline_auth_stop; inline_auth_stop = 0;
+    if (stop == 3) wl_evaluation_control_request_cancel(control);
+    else CHECK(wl_evaluation_control_charge_attempt(control,
+            wl_evaluation_control_active_attempt_id(control),
+            UINT64_C(1000000000))
+            == WL_EVALUATION_CONTROL_WORK_LIMIT);
+}
+
+static void
+test_inline_prepare(unsigned sides, unsigned invalid, unsigned stop)
+{
+    fixture_t f; fixture_begin(&f, 16u * 1024u * 1024u,
+        stop == 2 || stop == 4 ? UINT64_C(1000000000) : 0);
+    col_rel_t *left = prepare_source(&f, "left", 10, false, false, false);
+    col_rel_t *right = prepare_source(&f, "right", 10, false, false, true);
+    if (sides & 1) inline_metadata(left);
+    if (sides & 2) inline_metadata(right);
+    col_rel_t *bad = sides & 1 ? left : right;
+    uint32_t *map = bad->compound_arity_map;
+    if (invalid == 1 || invalid == 9) map[8] = invalid == 1 ? 0 : 2;
+    else if (invalid == 2) left->compound_count = 1; /* NONE metadata */
+    else if (invalid == 3) bad->compound_arity_map = NULL;
+    else if (invalid == 4) bad->compound_kind = WIRELOG_COMPOUND_KIND_SIDE;
+    else if (invalid == 5) bad->compound_kind = (wirelog_compound_kind_t)99;
+    else if (invalid == 6) bad->compound_arity_len = UINT32_MAX;
+    else if (invalid == 7) bad->inline_physical_offset = 10;
+    else if (invalid == 8) bad->compound_count = 0;
+    uint64_t baseline = reserved(&f);
+    wl_col_session_t session = {0}; wl_mem_ledger_init(&session.mem_ledger, 0);
+    session.memory_governor = f.governor;
+    session.base.evaluation_control = f.control;
+    wl_plan_op_t op = {.op = WL_PLAN_OP_JOIN, .right_relation = "right",
+                       .key_count = 1};
+    uint32_t key = 0;
+    wl_columnar_join_batch_prepare_t a = {0};
+    CHECK(!wl_columnar_join_batch_prepare_begin(&a, &session, &op, left, right,
+        false, &key, &key, 1, 160, f.control, f.id));
+    bool done = false, stopped = false;
+    unsigned chunks = 0, returned_chunks = 0;
+    int rc = 0;
+    for (unsigned turn = 0; !done && !rc; ++turn) {
+        CHECK(turn < 100000);
+        uint32_t phase = a.phase;
+        uint64_t cursor = a.cursor, before = 0, after = 0;
+        CHECK(!wl_evaluation_control_test_active_consumed(f.control, f.id,
+            &before));
+        rc = wl_columnar_join_batch_prepare_step(&a, 1, &done);
+        CHECK(!wl_evaluation_control_test_active_consumed(f.control, f.id,
+            &after));
+        if ((phase == 15 || phase == 16) && !rc) {
+            ++chunks;
+            CHECK(after - before == 1 + 256 + 88);
+            if (a.phase == phase) {
+                CHECK(!done && !cursor && a.cursor == 8 && a.row == 9);
+                ++returned_chunks;
+                writers(left, right, true);
+                if (stop && !stopped) {
+                    stopped = true;
+                    if (stop ==
+                        1) wl_evaluation_control_request_cancel(f.control);
+                    else if (stop ==
+                        2) CHECK(wl_evaluation_control_charge_attempt(f.control,
+                            f.id,
+                            UINT64_C(1000000000)) ==
+                            WL_EVALUATION_CONTROL_WORK_LIMIT);
+                    else if (stop <= 4) {
+                        inline_auth_stop = stop;
+                        wl_columnar_relation_test_work_checkpoint =
+                            inline_auth_checkpoint;
+                    }
+                    uint64_t saved = a.cursor, saved_id = a.attempt_id;
+                    uint32_t width = a.row;
+                    wl_evaluation_control_t *foreign = NULL;
+                    if (stop == 5) ++a.attempt_id;
+                    else if (stop == 6) {
+                        CHECK(!wl_evaluation_control_create(0, &foreign));
+                        a.control = foreign; /* inactive wrong bound pair */
+                    }
+                    rc = wl_columnar_join_batch_prepare_step(&a, 1, &done);
+                    a.attempt_id = saved_id; a.control = f.control;
+                    if (foreign) wl_evaluation_control_release(foreign);
+                    wl_columnar_relation_test_work_checkpoint = NULL;
+                    CHECK(!inline_auth_stop);
+                    CHECK(a.cursor == saved && a.row == width);
+                    writers(left, right, true);
+                }
+            }
+        }
+    }
+    int expected = stop == 1 || stop == 3 ? WL_EVALUATION_CONTROL_CANCELLED
+        : stop == 2 || stop == 4 ? WL_EVALUATION_CONTROL_WORK_LIMIT
+        : stop ? EINVAL
+        : invalid == 4 ? ENOTSUP : invalid ? EINVAL : 0;
+    if (rc != expected) fprintf(stderr,
+            "inline sides=%u invalid=%u stop=%u phase=%u rc=%d/%d\n", sides,
+            invalid, stop, a.phase, rc, expected);
+    CHECK(rc == expected && stopped == (stop != 0));
+    if (!rc) {
+        CHECK(done &&
+            chunks == 2u * ((sides & 1 ? 1u : 0u) + (sides & 2 ? 1u : 0u))
+            && returned_chunks == chunks / 2);
+        writers(left, right, true); inline_consume(&a);
+    }
+    CHECK(wl_evaluation_control_finish(f.control, &f.owner, rc, 0) == rc);
+    wl_evaluation_control_report_t report;
+    CHECK(!wl_evaluation_control_report(f.control, &report)
+        && report.result == rc && report.consumed && !report.cleanup_status);
+    prepare_drain(&a);
+    CHECK(reserved(&f) == baseline);
+    writers(left, right, false);
+    /* Restore deliberately malformed metadata only after the genuine readers
+     * drain. This is an internal refusal fixture, not a public corruption API. */
+    if (sides & 1) {
+        left->compound_kind = WIRELOG_COMPOUND_KIND_INLINE;
+        left->compound_count = 1; left->compound_arity_len = 9;
+        left->inline_physical_offset = 0; left->compound_arity_map = map;
+    } else if (invalid == 2) left->compound_count = 0;
+    if (sides & 2) {
+        right->compound_kind = WIRELOG_COMPOUND_KIND_INLINE;
+        right->compound_count = 1; right->compound_arity_len = 9;
+        right->inline_physical_offset = 0;
+        if (!(sides & 1)) right->compound_arity_map = map;
+    }
+    if (map) map[8] = 1;
+    if (rc) {
+        CHECK(!wl_evaluation_control_reset(f.control)
+            && !wl_evaluation_control_begin(f.control, &f.owner));
+        f.id = wl_evaluation_control_active_attempt_id(f.control);
+        wl_columnar_join_batch_prepare_t retry = {0};
+        CHECK(!wl_columnar_join_batch_prepare_begin(&retry, &session, &op,
+            left, right, false, &key, &key, 1, 160, f.control, f.id));
+        done = false;
+        for (unsigned turn = 0; !done; ++turn) {
+            CHECK(turn < 100000);
+            CHECK(!wl_columnar_join_batch_prepare_step(&retry, 1, &done));
+        }
+        inline_consume(&retry);
+        CHECK(!wl_evaluation_control_finish(f.control, &f.owner, 0, 0));
+        prepare_drain(&retry);
+        CHECK(reserved(&f) == baseline); writers(left, right, false);
+    }
+    CHECK(!col_rel_destroy_checked(left) && !col_rel_destroy_checked(right));
+    fixture_end(&f, 0);
+}
+
+struct inline_foreign {
+    const col_rel_t *relation;
+    const wl_columnar_source_access_reader_t *reader;
+};
+static void *
+inline_foreign_thread(void *payload)
+{
+    const struct inline_foreign *p = payload;
+    fixture_t f; fixture_begin(&f, 16u * 1024u * 1024u, 0);
+    uint64_t cursor = 0; uint32_t width = 0; bool done = true;
+    CHECK(wl_columnar_relation_compound_map_step_controlled(p->relation,
+        p->reader, &cursor, &width, &done, f.control, f.id) == EINVAL);
+    CHECK(!cursor && !width && !done);
+    fixture_end(&f, 0); return NULL;
+}
+
+static void
+test_inline_reader_authority(void)
+{
+    fixture_t f; fixture_begin(&f, 16u * 1024u * 1024u, 0);
+    col_rel_t *left = prepare_source(&f, "left", 10, false, false, false);
+    col_rel_t *right = prepare_source(&f, "right", 10, false, false, true);
+    inline_metadata(left);
+    wl_columnar_source_access_reader_t reader = {0}, wrong = {0};
+    CHECK(!col_rel_source_reader_acquire(left, &reader)
+        && !col_rel_source_reader_acquire(right, &wrong));
+    wl_columnar_source_access_reader_t copied = reader, partial = reader;
+    partial.identity = (uintptr_t)&partial; partial.acquire_stage = 1;
+    const wl_columnar_source_access_reader_t *invalid[] = {&copied, &partial,
+                                                           &wrong};
+    for (unsigned i = 0; i < 3; ++i) {
+        uint64_t cursor = 0; uint32_t width = 0; bool done = true;
+        CHECK(wl_columnar_relation_compound_map_step_controlled(left,
+            invalid[i],
+            &cursor, &width, &done, f.control, f.id) == EINVAL);
+        CHECK(!cursor && !width && !done); writers(left, right, true);
+    }
+    struct inline_foreign p = {left, &reader}; wl_thread_t thread;
+    CHECK(!wl_thread_create(&thread, inline_foreign_thread, &p)
+        && !wl_thread_join(&thread));
+    uint64_t saved_generation = left->storage_owner_generation;
+    left->storage_owner_generation = saved_generation + 1;
+    uint64_t rejected_cursor = 0; uint32_t rejected_width = 0;
+    bool rejected_done = true;
+    CHECK(wl_columnar_relation_compound_map_step_controlled(left, &reader,
+        &rejected_cursor, &rejected_width, &rejected_done, f.control,
+        f.id) == EINVAL);
+    CHECK(!rejected_cursor && !rejected_width && !rejected_done);
+    left->storage_owner_generation = saved_generation;
+    writers(left, right, true);
+    uint64_t cursor = 0; uint32_t width = 0; bool done = true;
+    CHECK(wl_columnar_relation_compound_map_step_controlled(left, &reader,
+        &cursor, &width, &done, f.control, f.id + 1) == EINVAL);
+    CHECK(!cursor && !width && !done); writers(left, right, true);
+    CHECK(!wl_columnar_relation_compound_map_step_controlled(left, &reader,
+        &cursor, &width, &done, f.control,
+        f.id) && !done && cursor == 8 && width == 9);
+    CHECK(!wl_columnar_relation_compound_map_step_controlled(left, &reader,
+        &cursor, &width, &done, f.control,
+        f.id) && done && cursor == 9 && width == 10);
+    CHECK(!col_rel_source_reader_release(&reader)
+        && !col_rel_source_reader_release(&wrong));
+    writers(left, right, false);
+    CHECK(!col_rel_destroy_checked(left) && !col_rel_destroy_checked(right));
+    fixture_end(&f, 0);
+}
+
 int
 main(void)
 {
@@ -769,5 +1042,13 @@ main(void)
     test_failures();
     test_preparation();
     test_schema_preparation();
+    test_inline_reader_authority();
+    for (unsigned sides = 1; sides <= 3;
+        ++sides) test_inline_prepare(sides, 0, 0);
+    test_inline_prepare(0, 2, 0);
+    for (unsigned invalid = 1; invalid <= 9; ++invalid)
+        if (invalid != 2) test_inline_prepare(1, invalid, 0);
+    for (unsigned stop = 1; stop <= 6; ++stop)
+        test_inline_prepare(stop % 2 ? 1 : 2, 1, stop);
     return 0;
 }

@@ -19485,41 +19485,146 @@ wl_columnar_relation_scalar_source_begin_mode(
     wl_columnar_relation_scalar_source_t *source, const col_rel_t *relation,
     bool preserve_timestamps, bool retain_on_error, uint32_t admit);
 
-/* Validates a held INLINE descriptor's arity map in metered chunks of eight
- * logical entries, with the same predicates as
- * col_rel_compound_map_valid_for(). The map is read only while both reader
- * gates are held; col_rel_apply_compound_schema() needs the writer. */
+/* One metadata chunk, under already-authenticated descriptor/owner readers.
+ * Both callers retain their existing charges and ownership protocols. */
+static int
+wl_columnar_relation_inline_map_chunk(const col_rel_t *relation,
+    uint32_t *entry, uint32_t *width, bool *done)
+{
+    const uint32_t ncols = relation->ncols, len = relation->compound_arity_len;
+    *done = false;
+    /* Both callers establish pointer pairing and valid carried scratch.
+     * Keep the scalar caller's original first-chunk predicates/tariff. */
+    bool ok = true;
+    if (!*entry)
+        ok = len && relation->compound_count && relation->compound_count <= len
+            && len <= ncols && relation->inline_physical_offset < ncols;
+    uint32_t count = ok ? len - *entry : 0;
+    if (count > 8) count = 8;
+    for (uint32_t i = 0; i < count && ok; ++i) {
+        uint32_t arity = relation->compound_arity_map[*entry + i];
+        if (!arity || arity > ncols - *width) ok = false;
+        else *width += arity;
+    }
+    *entry += count;
+    if (ok && *entry == len) {
+        ok = *width == ncols;
+        *done = ok;
+    }
+    return ok ? 0 : EINVAL;
+}
+
+/* Keep the established scalar-source loop and88-unit per-chunk tariff. */
 static int
 wl_columnar_relation_scalar_source_compound_check(
     wl_evaluation_control_t *control, uint64_t id, const col_rel_t *relation)
 {
-    const uint32_t ncols = relation->ncols;
-    const uint32_t len = relation->compound_arity_len;
-    bool ok = false;
     uint32_t entry = 0, width = 0;
+    bool done = false;
     do {
         int rc = wl_columnar_relation_constructor_attempt_charge(control, id,
                 WL_COLUMNAR_RELATION_SCALAR_SOURCE_COMPOUND_WORK);
-        if (rc)
-            return rc;
-        if (!entry)
-            ok = len != 0 && relation->compound_count != 0
-                && relation->compound_count <= len && len <= ncols
-                && relation->inline_physical_offset < ncols;
-        uint32_t count = ok ? len - entry : 0;
-        if (count > 8) count = 8;
-        for (uint32_t i = 0; i < count && ok; i++) {
-            uint32_t arity = relation->compound_arity_map[entry + i];
-            if (arity == 0 || arity > ncols - width) ok = false;
-            else width += arity;
-        }
-        entry += count;
-        if (ok && entry == len) ok = width == ncols;
+        if (rc) return rc;
+        rc = wl_columnar_relation_inline_map_chunk(relation, &entry, &width,
+                &done);
         int tail = wl_columnar_relation_constructor_attempt_tail(control, id,
                 WL_COLUMNAR_RELATION_SCALAR_SOURCE_COMPOUND_WORK);
-        if (tail > 0 || (!tail && !ok))
-            return tail > 0 ? tail : EINVAL;
-    } while (entry < len);
+        if (tail > 0 || (!tail && rc)) return tail > 0 ? tail : rc;
+    } while (entry < relation->compound_arity_len);
+    return 0;
+}
+
+int
+wl_columnar_relation_compound_reader_check_controlled(const col_rel_t *relation,
+    const wl_columnar_source_access_reader_t *reader,
+    wl_evaluation_control_t *control, uint64_t id)
+{
+    int rc = wl_columnar_relation_constructor_attempt_charge(control, id, 256);
+    if (rc) return rc;
+    if (!relation || !reader
+        || reader->identity != (uintptr_t)reader || !reader->thread_valid
+        || reader->acquire_stage || reader->release_stage ||
+        reader->transferable
+        || !wl_columnar_source_access_reader_thread_equal(reader)
+        || reader->secondary_owner != &relation->descriptor_access
+        || !reader->owner) return EINVAL;
+    uint64_t descriptor = atomic_load_explicit(&reader->secondary_owner->state,
+            memory_order_acquire);
+    if (!descriptor || descriptor == WL_COLUMNAR_SOURCE_ACCESS_WRITER)
+        return EINVAL;
+    col_rel_t *owner = NULL;
+    rc = col_rel_storage_owner_resolve(relation, &owner);
+    if (rc) return rc;
+    if (reader->owner != &owner->source_access) return EINVAL;
+    uint64_t storage = atomic_load_explicit(&reader->owner->state,
+            memory_order_acquire);
+    if (!storage || storage == WL_COLUMNAR_SOURCE_ACCESS_WRITER) return EINVAL;
+    /* End the fixed reader/gate/owner front before the independent geometry
+     * front. A zero poll issues no additional logical admission. */
+    rc = wl_columnar_relation_constructor_attempt_charge(control, id, 0);
+    if (rc) return rc;
+    if (!relation->relation_identity ||
+        relation->relation_identity == UINT64_MAX
+        || !owner->relation_identity || owner->relation_identity == UINT64_MAX
+        || !wl_columnar_relation_generation_valid(relation->view_generation)
+        || !wl_columnar_relation_generation_valid(relation->storage_generation)
+        || !wl_columnar_relation_generation_valid(owner->storage_generation)
+        || owner->storage_owner_generation != owner->storage_generation
+        || relation->storage_owner_identity != owner->relation_identity
+        || relation->storage_owner_generation != owner->storage_generation)
+        return EINVAL;
+    if (!relation->schema_ok) return ENOTSUP;
+    if (!wl_columnar_relation_snapshot_valid(wl_columnar_relation_snapshot(
+            relation))
+        || relation->nrows > relation->capacity
+        || (relation->ncols && relation->capacity && !relation->columns)
+        || (relation->timestamps &&
+        relation->timestamp_capacity < relation->nrows)
+        || ((relation->compound_arity_map == NULL) !=
+        (relation->compound_arity_len == 0))) return EINVAL;
+    if (relation->compound_kind == WIRELOG_COMPOUND_KIND_SIDE) return ENOTSUP;
+    if (relation->compound_kind != WIRELOG_COMPOUND_KIND_NONE
+        && relation->compound_kind !=
+        WIRELOG_COMPOUND_KIND_INLINE) return EINVAL;
+    return wl_columnar_relation_constructor_attempt_tail(control, id, 256);
+}
+
+int
+wl_columnar_relation_compound_map_step_controlled(const col_rel_t *relation,
+    const wl_columnar_source_access_reader_t *reader, uint64_t *cursor,
+    uint32_t *width, bool *done, wl_evaluation_control_t *control, uint64_t id)
+{
+    if (!done) return EINVAL;
+    *done = false;
+    /* The fixed reader/schema front and one map packet poll independently.
+    * max_work counts prepare actions, not their nested monetary debits. */
+    int rc = wl_columnar_relation_compound_reader_check_controlled(relation,
+            reader, control, id);
+    if (rc) return rc;
+    if (!cursor || !width) return EINVAL;
+    rc = wl_columnar_relation_constructor_attempt_charge(control, id,
+            WL_COLUMNAR_RELATION_SCALAR_SOURCE_COMPOUND_WORK);
+    if (rc) return rc;
+    uint32_t entry = 0, physical = *width;
+    bool complete = false;
+    if (relation->compound_kind == WIRELOG_COMPOUND_KIND_NONE) {
+        if (relation->compound_count || relation->compound_arity_map
+            || relation->compound_arity_len || relation->inline_physical_offset
+            || *cursor || physical) return EINVAL;
+        complete = true;
+    } else {
+        if (*cursor > UINT32_MAX || *cursor >= relation->compound_arity_len
+            || physical > relation->ncols || (!*cursor && physical))
+            return EINVAL;
+        entry = (uint32_t)*cursor;
+        rc = wl_columnar_relation_inline_map_chunk(relation, &entry, &physical,
+                &complete);
+    }
+    int tail = wl_columnar_relation_constructor_attempt_tail(control, id,
+            WL_COLUMNAR_RELATION_SCALAR_SOURCE_COMPOUND_WORK);
+    if (tail) return tail;
+    if (rc) return rc;
+    *cursor = entry; *width = physical; *done = complete;
     return 0;
 }
 
