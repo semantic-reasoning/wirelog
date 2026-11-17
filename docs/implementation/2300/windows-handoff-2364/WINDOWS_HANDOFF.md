@@ -144,13 +144,15 @@ thread identity. Still outstanding:
   takes both arguments by value, and the sret/byval endpoints of
   `thrd_current` still need the trusted identity binding listed under
   remaining work item 2.
-- **Scalar retirement one-shot clears.** Four 256-fee actions each zero the
-  whole `wl_columnar_relation_scalar_retirement_t` in one step. It is 912
-  bytes on native MSVC and 1056 with MSVC C11, from the probes above, and
-  984 on Linux LP64 as recorded in `SERIAL_COVERAGE.md`. Only
-  `FINISH_CLEAR_SCALAR` has a sourced inventory: at most 210 within its 256
-  fee. The layout bound in `SERIAL_COVERAGE.md` for these owners has no
-  compile-time guard.
+- **Scalar retirement one-shot clears (moved to #2368).** Seven 256-fee
+  actions zeroed the whole `wl_columnar_relation_scalar_retirement_t` in one
+  step. It is 912 bytes on native MSVC and 1056 with MSVC C11, from the
+  probes above, and 984 on Linux LP64 as recorded in `SERIAL_COVERAGE.md`.
+  The four `eval_stack.c` owners (frame cancel and drained clears, prepared
+  `FINISH_CLEAR_SCALAR` and `DECLINE_CLEAR`) now clear one 64-byte chunk per
+  funded action under a compile-time bound; the prepare abort in
+  `join_batch.c`, `wl_columnar_join_host_retire` and
+  `wl_columnar_lftj_attempt_release` still clear in one step.
 - The remaining method and resource items below.
 
 ## Remaining method/resource work

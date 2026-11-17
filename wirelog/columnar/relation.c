@@ -4813,6 +4813,22 @@ wl_columnar_relation_scalar_retirement_release_claims_controlled(
 #undef WL_COLUMNAR_RELATION_SCALAR_INIT_HOOK
 
 int
+wl_columnar_relation_scalar_retirement_clear_chunk(
+    wl_columnar_relation_scalar_retirement_t *r, uint8_t *chunk, bool *done)
+{
+    const size_t size = sizeof(*r);
+    const size_t step = WL_COLUMNAR_RELATION_SCALAR_CLEAR_CHUNK;
+    if (!r || !chunk || !done || *chunk >= (size + step - 1u) / step)
+        return EINVAL;
+    const size_t end = size - (size_t)*chunk * step;
+    const size_t begin = end > step ? end - step : 0;
+    memset((unsigned char *)r + begin, 0, end - begin);
+    *done = begin == 0;
+    *chunk = *done ? 0 : (uint8_t)(*chunk + 1u);
+    return 0;
+}
+
+int
 wl_columnar_relation_scalar_retirement_prepare(
     wl_columnar_relation_scalar_retirement_t *s,
     wl_evaluation_control_t *control, uint64_t id)
