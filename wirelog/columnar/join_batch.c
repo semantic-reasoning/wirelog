@@ -3002,9 +3002,14 @@ wl_columnar_join_batch_prepare_abort_body(wl_columnar_join_batch_prepare_t *a,
         (p->batch || a->retirement_started || a->retirement_drained ||
         i->identity)){
         if (a->retirement_drained) {
+            /* One funded chunk per action; the drained latch holds until
+             * the receipt is fully zeroed. */
             rc = wl_evaluation_control_charge_attempt(funding, funding_id, 256);
             if (rc) return rc;
-            memset(&a->retirement, 0, sizeof(a->retirement));
+            bool cleared = false;
+            rc = wl_columnar_relation_scalar_retirement_clear_chunk(
+                &a->retirement, &a->retirement_clear_chunk, &cleared);
+            if (rc || !cleared) return rc;
             a->retirement_started = a->retirement_committed =
                 a->retirement_drained = false;
             return 0;

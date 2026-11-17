@@ -92,6 +92,10 @@ extern void (*wl_columnar_join_pipeline_test_first_error)(
     wl_evaluation_control_t *, int);
 int wl_columnar_join_pipeline_test_stream_view(const void *,
     const col_rel_t **, uint64_t *, bool *, const wl_plan_op_t **);
+int wl_columnar_join_pipeline_test_retirement_view(const void *, bool *,
+    unsigned *, void *, size_t);
+int wl_columnar_join_pipeline_test_retirement_clear(void *,
+    wl_evaluation_control_t *, uint64_t, bool *);
 #endif
 
 typedef enum {

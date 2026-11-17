@@ -311,6 +311,7 @@ typedef struct wl_columnar_join_batch_prepare {
 #endif
     bool prepare_thread_valid, cleanup_busy;
     bool retirement_started, retirement_committed, retirement_drained;
+    uint8_t retirement_clear_chunk;
     uint32_t phase, row, key, byte, hash;
     uint64_t cursor;
     uint64_t hash_value;

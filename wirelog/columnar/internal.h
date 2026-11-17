@@ -868,6 +868,21 @@ typedef struct {
     unsigned phase;
     bool ready, committed;
 } wl_columnar_relation_scalar_retirement_t;
+/* Controlled owners zero this receipt in separately funded steps of at most
+ * one CHUNK, from its end toward its start, so the storage identity at its
+ * first byte is the last field cleared. Other storage fields, including its
+ * phase, may be gone before the final step; callers prove them before the
+ * first one. The target ABI sets only how many steps run, never the price of
+ * a step. The caller keeps the step index in a uint8_t that is zero whenever
+ * no clear is pending. */
+enum { WL_COLUMNAR_RELATION_SCALAR_CLEAR_CHUNK = 64 };
+typedef char wl_columnar_relation_scalar_clear_steps_fit_t[
+        WL_COLUMNAR_RELATION_SCALAR_CLEAR_CHUNK == 64
+        && (sizeof(wl_columnar_relation_scalar_retirement_t)
+        + WL_COLUMNAR_RELATION_SCALAR_CLEAR_CHUNK - 1u)
+        / WL_COLUMNAR_RELATION_SCALAR_CLEAR_CHUNK <= UINT8_MAX ? 1 : -1];
+int wl_columnar_relation_scalar_retirement_clear_chunk(
+    wl_columnar_relation_scalar_retirement_t *, uint8_t *, bool *);
 int wl_columnar_relation_scalar_retirement_begin(
     wl_columnar_relation_scalar_retirement_t *, col_rel_t *);
 int wl_columnar_relation_scalar_retirement_prepare(
@@ -8408,6 +8423,7 @@ typedef struct wl_columnar_lftj_attempt {
 #endif
     bool thread_valid, busy;
     bool retirement_started, retirement_committed, retirement_drained;
+    uint8_t retirement_clear_chunk;
     wl_columnar_relation_private_batch_drain_t writer_drain;
 } wl_columnar_lftj_attempt_t;
 
@@ -9500,6 +9516,10 @@ typedef struct {
     int first_result;
     bool owned, is_delta, committed, result_saved, scalar_started, scalar_ready;
     bool scalar_ledger_pending, credit_started[4], credit_empty[4];
+    bool scalar_cancel_clear, scalar_drained;
+    unsigned scalar_clear_chunk;
+    unsigned char scalar_receipt[
+        sizeof(wl_columnar_relation_scalar_retirement_t)];
 } wl_columnar_eval_stack_test_unary_observation_t;
 int wl_columnar_eval_stack_test_unary_observe(
     wl_columnar_eval_stack_cleanup_frame_t *, const void *,
