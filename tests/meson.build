@@ -7511,6 +7511,16 @@ test_evaluation_source_shapes_exe = executable(
 test('evaluation_source_shapes', test_evaluation_source_shapes_exe,
      suite: ['unit', 'tsan'], timeout: 60)
 
+test_evaluation_side_compounds_exe = executable(
+  'test_evaluation_side_compounds', files('test_evaluation_side_compounds.c'),
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
+  c_args: ['-DWL_SESSION_TEST_HOOKS=1'],
+  link_with: [testlib_prod],
+)
+test('evaluation_side_compounds', test_evaluation_side_compounds_exe,
+     suite: ['unit', 'tsan'], timeout: 60)
+
 test_evaluation_empty_edb_sources_exe = executable(
   'test_evaluation_empty_edb_sources', files('test_evaluation_empty_edb_sources.c'),
   include_directories: [wirelog_inc, wirelog_src_inc],

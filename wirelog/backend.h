@@ -282,6 +282,14 @@ typedef struct {
     void (*session_controlled_mutation_committed)(wl_session_t *session,
         bool insert, const char *relation, uint32_t num_rows,
         uint32_t num_cols);
+    /* Optional: admit session_make_compound for @functor/@arity after a
+     * completed controlled evaluation, as a controlled successor mutation;
+     * 0 admits. Without both compound hooks the call returns EBUSY there. */
+    int (*session_controlled_compound_admit)(wl_session_t *session,
+        const char *functor, uint32_t arity);
+    /* Record an admitted compound allocation after the backend made it. */
+    void (*session_controlled_compound_committed)(wl_session_t *session,
+        const char *functor, uint32_t arity);
     /* Opt in explicitly before a controlled SNAPSHOT may evaluate fresh or
      * dirty inputs. A read-only completed-snapshot backend need not opt in. */
     bool session_controlled_snapshot_evaluates;

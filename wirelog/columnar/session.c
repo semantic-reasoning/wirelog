@@ -30540,9 +30540,16 @@ wl_columnar_session_controlled_step_observe(const wl_session_t *session,
     return state;
 }
 
+/* Admit a controlled successor mutation. With @side the mutation is a
+ * compound allocation, which appends to a side relation rather than to a
+ * plan EDB: @relation is the functor and @num_cols the arity. Its admission
+ * keeps the busy checks of an EDB insert, skips the EDB name and width
+ * check, and stays EBUSY in failed-retry custody, on the recursive edge host
+ * and on the observed single-rule host. */
 static int
-col_session_controlled_mutation_admit(wl_session_t *session, bool insert,
-    const char *relation, uint32_t num_rows, uint32_t num_cols)
+col_session_controlled_mutation_admit_impl(wl_session_t *session,
+    bool insert, bool side, const char *relation, uint32_t num_rows,
+    uint32_t num_cols)
 {
     if (!session) return EINVAL;
     if (session &&
@@ -30575,6 +30582,9 @@ col_session_controlled_mutation_admit(wl_session_t *session, bool insert,
         || wl_columnar_session_frontier_pending(step)
         || wl_columnar_session_frontier_disposition_pending(step)
         || wl_columnar_session_producer_pending(sess, step)) return EBUSY;
+    if (side && (step->recursive_route
+        || wl_columnar_session_failed_retry_valid(sess, step, true)))
+        return EBUSY;
     if (step->recursive_route && !insert) {
         /* The qualified binary host has retired its frame. Authenticate the
          * old closure before the EDB changes; a successful removal will use
@@ -30610,6 +30620,7 @@ col_session_controlled_mutation_admit(wl_session_t *session, bool insert,
             step, true)) ||
             step->operation_active ||
             step->observer_cleanup_pending) return EBUSY;
+        if (side) return relation ? 0 : EINVAL;
         if (!relation || !sess->plan || !sess->plan->edb_declared_width
             || !sess->plan->edb_relations)
             return ENOTSUP;
@@ -30633,6 +30644,7 @@ col_session_controlled_mutation_admit(wl_session_t *session, bool insert,
             || !step->transaction_initialized || !tx->committed
             || tx->phase != WL_SESSION_OBSERVED_DONE || !tx->entries
             || step->observer_cleanup_pending) return EBUSY;
+        if (side) return 0;
         for (uint32_t i = 0; i < sess->plan->edb_count; ++i) {
             col_rel_t *r = tx->entries[i].public_relation;
             if (r && (num_cols == sess->plan->edb_declared_width[i]
@@ -30642,6 +30654,7 @@ col_session_controlled_mutation_admit(wl_session_t *session, bool insert,
         }
         return ENOTSUP;
     }
+    if (side) return EBUSY;
     if (!relation || num_cols != 1 || num_rows > 1)
         return ENOTSUP;
     if (!step->complete || !step->published
@@ -30777,6 +30790,36 @@ col_session_controlled_mutation_committed(wl_session_t *session,
         sess->plan->strata[0].relations[0].ops[0].relation_name,
         step->observed_input_name_length + 1) == 0)
         step->successor_mutation_seen = true;
+}
+
+static int
+col_session_controlled_mutation_admit(wl_session_t *session, bool insert,
+    const char *relation, uint32_t num_rows, uint32_t num_cols)
+{
+    return col_session_controlled_mutation_admit_impl(session, insert, false,
+               relation, num_rows, num_cols);
+}
+
+static int
+col_session_controlled_compound_admit(wl_session_t *session,
+    const char *functor, uint32_t arity)
+{
+    return col_session_controlled_mutation_admit_impl(session, true, true,
+               functor, 1, arity);
+}
+
+/* An admitted compound allocation appended one row to its side relation,
+ * which no plan EDB names; record it as that insert. */
+static void
+col_session_controlled_compound_committed(wl_session_t *session,
+    const char *functor, uint32_t arity)
+{
+    char name[WL_COMPOUND_SIDE_NAME_MAX];
+    if (arity == UINT32_MAX
+        || wl_compound_side_name(functor, arity, name, sizeof(name)) != 0)
+        return;
+    col_session_controlled_mutation_committed(session, true, name, 1,
+        arity + 1u);
 }
 
 static int
@@ -32573,6 +32616,10 @@ static const wl_compute_backend_t col_backend = {
         col_session_controlled_mutation_admit,
     .session_controlled_mutation_committed =
         col_session_controlled_mutation_committed,
+    .session_controlled_compound_admit =
+        col_session_controlled_compound_admit,
+    .session_controlled_compound_committed =
+        col_session_controlled_compound_committed,
     .session_source_query = col_session_source_query,
 };
 

@@ -637,11 +637,17 @@ wl_session_memory_governor(wl_session_t *session);
  *
  * Allocate a handle-backed side-tier compound and append its side-relation row.
  *
+ * In a session with an evaluation control, a completed controlled evaluation
+ * admits the call as a successor mutation, as it admits an insert into an
+ * EDB, on the hosts whose admission accepts it; the recursive edge host and
+ * the observed single-rule host, among others, still return EBUSY then.
+ *
  * Returns:
  *    0 on success.
  *    ENOSPC if the compound arena is saturated.
  *    EBUSY if the compound arena is temporarily frozen, an observed or plain
- *    step is pending retry, or a delta callback is running.
+ *    step is pending retry, a delta callback is running, or a controlled
+ *    host does not admit it.
  *    ENOMEM on allocation failure.
  *    EINVAL or another errno-style value for invalid arguments/backend errors.
  */

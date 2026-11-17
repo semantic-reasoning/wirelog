@@ -1925,13 +1925,23 @@ wl_session_operation_begin(wl_session_t *session)
 
 static void wl_session_operation_end(wl_session_t *session);
 
+/* What a mutation changes: an insert into or a removal from @relation, or a
+ * compound allocation, where @relation is the functor and @num_cols the
+ * arity. */
+typedef enum {
+    WL_SESSION_MUTATION_INSERT,
+    WL_SESSION_MUTATION_REMOVE,
+    WL_SESSION_MUTATION_COMPOUND,
+} wl_session_mutation_kind_t;
+
 /* Reserve the operation before querying backend mutation policy, so neither
  * STEP nor an exclusive attempt can race authorization and commit. */
 static int
-wl_session_operation_begin_mutation(wl_session_t *session, bool insert,
-    const char *relation, uint32_t num_rows, uint32_t num_cols,
-    bool *controlled_mutation)
+wl_session_operation_begin_mutation(wl_session_t *session,
+    wl_session_mutation_kind_t kind, const char *relation, uint32_t num_rows,
+    uint32_t num_cols, bool *controlled_mutation)
 {
+    bool insert = kind == WL_SESSION_MUTATION_INSERT;
     *controlled_mutation = false;
     wl_session_admission_t *admission = session->operation_admission;
     if (!admission)
@@ -1960,16 +1970,27 @@ wl_session_operation_begin_mutation(wl_session_t *session, bool insert,
     if (state == WL_CONTROLLED_STEP_COMPLETE
         || state == WL_CONTROLLED_STEP_RETRYABLE
         || state == WL_CONTROLLED_STEP_DIRTY) {
-        if (insert && session->backend->session_controlled_step_authorize_insert
-            && session->backend->session_controlled_step_authorize_insert(
-                session, relation, num_rows, num_cols))
-            return 0;
-        if (session->backend->session_controlled_mutation_admit
-            && session->backend->session_controlled_mutation_committed) {
-            rc = session->backend->session_controlled_mutation_admit(session,
-                    insert, relation, num_rows, num_cols);
-            if (!rc)
-                *controlled_mutation = true;
+        if (kind == WL_SESSION_MUTATION_COMPOUND) {
+            if (session->backend->session_controlled_compound_admit
+                && session->backend->session_controlled_compound_committed) {
+                rc = session->backend->session_controlled_compound_admit(
+                    session, relation, num_cols);
+                if (!rc)
+                    *controlled_mutation = true;
+            }
+        } else {
+            if (insert
+                && session->backend->session_controlled_step_authorize_insert
+                && session->backend->session_controlled_step_authorize_insert(
+                    session, relation, num_rows, num_cols))
+                return 0;
+            if (session->backend->session_controlled_mutation_admit
+                && session->backend->session_controlled_mutation_committed) {
+                rc = session->backend->session_controlled_mutation_admit(
+                    session, insert, relation, num_rows, num_cols);
+                if (!rc)
+                    *controlled_mutation = true;
+            }
         }
     }
     if (rc)
@@ -3623,8 +3644,9 @@ wl_session_insert(wl_session_t *session, const char *relation,
     bool controlled_mutation = false;
     if (!session)
         return -1;
-    rc = wl_session_operation_begin_mutation(session, true, relation,
-            num_rows, num_cols, &controlled_mutation);
+    rc = wl_session_operation_begin_mutation(session,
+            WL_SESSION_MUTATION_INSERT, relation, num_rows, num_cols,
+            &controlled_mutation);
     if (rc != 0)
         return rc;
     if (!session->backend || !session->backend->session_insert
@@ -3664,9 +3686,11 @@ wl_session_make_compound(wl_session_t *session, const char *functor,
     uint64_t *handle_out)
 {
     int rc;
+    bool controlled = false;
     if (!session)
         return EINVAL;
-    rc = wl_session_operation_begin(session);
+    rc = wl_session_operation_begin_mutation(session,
+            WL_SESSION_MUTATION_COMPOUND, functor, 1, arity, &controlled);
     if (rc != 0)
         return rc;
     if (!session->backend || !session->backend->session_make_compound)
@@ -3674,6 +3698,9 @@ wl_session_make_compound(wl_session_t *session, const char *functor,
     else
         rc = session->backend->session_make_compound(session, functor, arity,
                 args, handle_out);
+    if (controlled && rc == 0)
+        session->backend->session_controlled_compound_committed(session,
+            functor, arity);
     wl_session_operation_end(session);
     return rc;
 }
@@ -3686,8 +3713,9 @@ wl_session_remove(wl_session_t *session, const char *relation,
     bool controlled_mutation = false;
     if (!session)
         return -1;
-    rc = wl_session_operation_begin_mutation(session, false, relation,
-            num_rows, num_cols, &controlled_mutation);
+    rc = wl_session_operation_begin_mutation(session,
+            WL_SESSION_MUTATION_REMOVE, relation, num_rows, num_cols,
+            &controlled_mutation);
     if (rc != 0)
         return rc;
     if (!session->backend || !session->backend->session_remove)
