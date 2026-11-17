@@ -13,6 +13,40 @@ def extract_json(stdout):
     return json.loads(stdout[start : end + 1])
 
 
+def validate_exchange_phases(row):
+    tdd_phase = row.get("tdd_phase_ms")
+    exchange_phase = row.get("tdd_exchange_phase_ms")
+    if not isinstance(tdd_phase, dict):
+        raise AssertionError("missing tdd_phase_ms object")
+    if not isinstance(exchange_phase, dict):
+        raise AssertionError("missing tdd_exchange_phase_ms object")
+
+    exchange = tdd_phase.get("exchange")
+    if not isinstance(exchange, (int, float)) or exchange < 0:
+        raise AssertionError("tdd_phase_ms.exchange must be nonnegative")
+
+    keys = ("matrix", "coordinator", "scatter", "gather", "broadcast")
+    subtotal = 0.0
+    for key in keys:
+        value = exchange_phase.get(key)
+        if not isinstance(value, (int, float)):
+            raise AssertionError(f"missing numeric exchange phase: {key}")
+        if value < 0:
+            raise AssertionError(f"negative exchange phase: {key}")
+        subtotal += float(value)
+
+    # Separate short measurements may all quantize to zero even when the
+    # enclosing timer crosses a tick (MSVC uses GetTickCount64). The parent
+    # also includes unclassified overhead. Timings cannot prove work happened;
+    # main checks the actual strategy, rounds, tasks and result instead.
+    # Allow that overhead and printed millisecond rounding in the subtotal.
+    tolerance = max(1.0, exchange * 0.25)
+    if subtotal > exchange + tolerance:
+        raise AssertionError(
+            f"exchange sub-counters exceed parent: {subtotal} > {exchange}"
+        )
+
+
 def main():
     if len(sys.argv) != 3:
         print("usage: validate_bench_flowlog_tdd_json.py BENCH_FLOWLOG DATA")
@@ -84,39 +118,7 @@ def main():
                               env=adaptive_env, timeout=20, check=True, encoding="utf-8")
     assert extract_json(adaptive.stdout)["tuples"] == 4950
     assert "selected_workers=1 submitted_tasks=0 completed_rounds=0" in adaptive.stderr
-    tdd_phase = row.get("tdd_phase_ms")
-    exchange_phase = row.get("tdd_exchange_phase_ms")
-    if not isinstance(tdd_phase, dict):
-        raise AssertionError("missing tdd_phase_ms object")
-    if not isinstance(exchange_phase, dict):
-        raise AssertionError("missing tdd_exchange_phase_ms object")
-
-    exchange = tdd_phase.get("exchange")
-    if not isinstance(exchange, (int, float)) or exchange < 0:
-        raise AssertionError("tdd_phase_ms.exchange must be nonnegative")
-
-    keys = ("matrix", "coordinator", "scatter", "gather", "broadcast")
-    subtotal = 0.0
-    positive = False
-    for key in keys:
-        value = exchange_phase.get(key)
-        if not isinstance(value, (int, float)):
-            raise AssertionError(f"missing numeric exchange phase: {key}")
-        if value < 0:
-            raise AssertionError(f"negative exchange phase: {key}")
-        subtotal += float(value)
-        positive = positive or value > 0
-
-    if exchange > 0.01 and not positive:
-        raise AssertionError("exchange sub-counters are all zero")
-
-    # The parent exchange timer has small unclassified overhead around the
-    # sub-counters.  Printed millisecond precision can also round tiny runs.
-    tolerance = max(1.0, exchange * 0.25)
-    if subtotal > exchange + tolerance:
-        raise AssertionError(
-            f"exchange sub-counters exceed parent: {subtotal} > {exchange}"
-        )
+    validate_exchange_phases(row)
 
     return 0
 
