@@ -18,7 +18,7 @@ snapshots are not current route certificates.
 
 ## Configured no-tail INLINE policy increment
 
-This bundle starts from merged #2378, main `803381f1`. That merge contains
+This historical #2380 increment starts from merged #2378, main `803381f1`. That merge contains
 ordinary INLINE admission `6a895a0e`, physical-lane/recovery tests `d0d794ff`
 and its ledger `803381f1`. The configured dispatch repair is `14f07675`;
 expanded qualification is `cd4e4d99`. All36 earlier public INLINE histories
@@ -30,7 +30,8 @@ with literal `(7,8)`. Nonstreaming host HOLD now authenticates INLINE through
 the existing bounded reader. It retains RHS selection, key/type work and
 strict successor/cache/row-fit policy before draining through ABORT and
 handing off to ordinary controlled JOIN. It does not enter the compound-
-excluding batch producer. Streaming candidates retain zero admission flags.
+excluding batch producer. At that checkpoint, streaming candidates retained zero admission flags;
+the next increment below supersedes that refusal.
 
 `evaluation_join_inline_policy` runs89 finite scenarios:
 
@@ -70,11 +71,111 @@ Clang23 host suite108/108, GCC16 focused7/7 and ASan/UBSan focused7/7 passed
 on the integrated code/test tree before this ledger-only unit. Strict numeric
 policy, numeric cap boundaries and typed strict-off histories are separate
 certificates, not a complete typed-cap/strict-recovery cross-product. No new
-INLINE ENOSPC pressure certificate is supplied. Full selector/cache reuse,
-streamed INLINE producer/ACK and selective-tail caps, materialized INLINE,
-signed timestamps/weights and containing Source/carry remain OPEN. #2371
+INLINE ENOSPC pressure certificate was supplied. At that checkpoint, full
+selector/cache reuse, streamed INLINE producer/ACK and selective-tail caps,
+materialized INLINE, signed timestamps/weights and containing Source/carry
+remained OPEN. The streamed increment below adds finite evidence. #2371
 and #2300 remain OPEN. Final broader results belong to the published PR HEAD;
 MSVC and LLVM22-specific tidy evidence remain outstanding locally.
+
+## Streamed INLINE producer and consuming increment
+
+This increment starts from merged #2380, main `675d8441`. Before the repair,
+six fitting strict-off/on left/right/both INLINE cases returned controlled
+ENOTSUP while raw produced literal `(7,8),(9,10)`. There are three matching
+JOIN candidates, including rejected `(7,6)`, but only two post-FILTER survivors;
+cap3 distinguishes genuine streaming from ordinary intermediate materialization.
+
+The configured host now admits INLINE for a legal streamed keyed JOIN. Direct
+prepare independently authenticates the actual dual reader and validates the
+compound map in resumable chunks of at most eight logical entries. Existing
+phase values1..14 stay unchanged; LEFT_MAP15/RIGHT_MAP16 carry cursor/physical
+width across prepare actions. NONE keeps its existing debit/phase sequence.
+Physical typed keys feed the existing producer, whose scratch batches are scalar.
+INLINE SEMI/ANTI probe RHS remains unsupported. No-tail INLINE still takes the
+previous strict-preflight/ordinary-consumer handoff.
+
+At ENTER, the parked INLINE Original must be the ready prepare's exact left
+source, bound to the actual owner/host/control/attempt and both held gates.
+The by-value serialized move and restore protocol remains intact. Restore does
+not rerun forward Original admission after CANCEL/WORK. Source readers outlive
+restore and are then released by the existing finite prepare retirement.
+
+`join_batch_controlled_setup` adds18 direct prepare cases and separate authority
+checks. Left/right/both INLINE with nine logical map entries complete as typed
+scalar batches with four literal duplicate pairs and four unique ACK generations.
+A max_work1 map action returns at cursor8/physical-width9; the next action can
+observe genuine CANCEL/WORK before the intentionally malformed ninth entry.
+Footer refusal leaves scratch unpublished. Copied, partial, wrong-source,
+wrong-thread, wrong-id/inactive-control readers cannot confer authority. Real
+writers remain excluded while readers are held and succeed after genuine drain;
+reset/fresh preparation on the same sources returns to the saved live-source
+reservation baseline after prepare drain. Final source teardown reaches zero.
+Malformed NONE/INLINE maps, unknown kind and SIDE retain explicit protocol errors.
+Here max_work counts prepare actions: one map action can debit1+256+88 logical
+work. It is not a monetary upper for the whole nested call.
+
+`evaluation_join_inline_policy` now runs141 finite scenarios (the previous89,
+nine ENTER/restore cases and43 additional streamed-policy cases):
+
+- The earlier selective shape2 now succeeds for fitting INLINE and witnesses
+  PRODUCE, scalar consumers, unique before/after ACK and held prepared sources.
+  Additional cap1/2/3 cases cover all three INLINE shapes, strict off/on, bytes64:
+  equality with the two surviving rows refuses; cap3 succeeds despite three
+  matching candidates. Six all-rejected cases succeed at cap1 across real batches.
+- Six undersized-byte cases distinguish strict refusal from permissive ordinary
+  fallback. Twelve fitting/undersized valid/stale canonical-pin cases check actual
+  cache policy. Controlled strict stale pins return EBUSY before row-fit. The
+  legacy raw streamed arrangement pointer API instead reports ENOMEM for the
+  same stale pin, including undersized bytes. This observed errno difference is
+  explicit; these cases do not certify raw/controlled error parity or fix that
+  legacy pointer-API diagnostic.
+- A second generated two-head case consumes a transaction-private streamed RHS
+  despite a held stale same-name public pin. Pin pressure applies to controlled
+  execution only; unpressured raw supplies the independent semantic comparison.
+  No canonical cache walk occurs. The original no-tail case remains intact.
+- Exact parked/restored pointer/ownership/delta state, malformed helper authority,
+  terminal zero-row schema exchange and CANCEL/WORK after exchange are checked.
+  The source's Original control remains stopped while separately funded restore
+  succeeds. Reports retain the first cause with positive work and cleanup0.
+
+The18 `evaluation_join_inline_streamed_*` test registrations add156 public
+histories: observed STEP/plain STEP/evaluating SNAPSHOT, strict off/on, left/right/
+both INLINE and the finite fault partitions below. Together with the unchanged
+36 filtered ordinary and27 configured no-tail histories, the file runs219.
+The streamed plans include a real accepting/rejecting row-local numeric FILTER,
+a MAP `x+1` composition, STRING/FLOAT prefix lanes, FLOAT keys and STRING output.
+The typed predicate is numeric `x<flag`; STRING function expressions retain their
+existing materializing policy. Literal images and signed differences are derived
+independently of both raw and production expression evaluation.
+
+All streamed histories cover initial empty, mixed accepted/rejected matches,
+RHS/left append, removal and unchanged repeat. Duplicate input remains in the
+ordinary controls; streamed cap histories use distinct input facts so the cap
+boundary measures pre-DISTINCT post-consumer extent rather than final set size.
+Each streamed shape exercises healthy execution, CANCEL/WORK at genuine consumer
+rejection and before/after generation2 ACK, and successor cap overflow/retry.
+Only the FLOAT-key GENERAL producer adds CANCEL/WORK after the first private
+cell write: the INT-key producer has no equivalent cell checkpoint. These are
+156 selected histories, not a full fault/site/type cross-product.
+
+Successor failures retain exact public head/content, pending input, source maps/
+snapshots and zero early callbacks/tuples. Reset retries the same pending input
+without duplicate eventual events. Successor cap3 refuses at three survivors;
+cap4 retry succeeds despite more intermediate candidates. That live policy knob
+is an internal controlled-only pressure fixture; raw stays unpressured. Both
+sessions ultimately agree with literal output and every final governor is0.
+
+Clang23 host tests126/126, GCC16 changed tests25/25 and ASan/UBSan changed tests
+25/25 passed on the integrated code/test tree. U1 also passed six affected
+producer/source components. These results do not replace MSVC CI or LLVM22 tidy.
+Local poll/interval derivations are recorded in
+[OPERATOR_SOURCE_ACCOUNTING.md](OPERATOR_SOURCE_ACCOUNTING.md#streamed-inline-join-local-intervals).
+They distinguish tariffs from SOURCE distance and do not certify containing
+caller/return or inherited correlated carry. Full cache/selector intersections,
+materialized INLINE, INLINE probe RHS, timestamp/weight propagation, new INLINE
+ENOSPC pressure, full platform and Native/Source/carry obligations remain OPEN.
+No row or issue is closed by this finite increment.
 
 ## Finite scenario inventory
 
@@ -260,8 +361,8 @@ run; do not infer a final-SHA full-suite result from an earlier in-flight run.
 MSVC and its conditional C11 actor profile have not been run in this Linux
 workspace. Passing Linux tests do not close those acceptance items or #2371.
 
-For the configured increment alone, after the same uv activation and Meson
-availability, the sanitizer setup above can be followed by:
+For the configured and streamed increments, after the same uv activation and
+Meson availability, the sanitizer setup above can be followed by:
 
 ```sh
 python -m mesonbuild.mesonmain compile -C build-asan \
@@ -276,5 +377,6 @@ python -m mesonbuild.mesonmain test -C build-gcc --no-rebuild --print-errorlogs 
   'evaluation_join_inline_*'
 ```
 
-The wildcard selects seven tests, including the policy executable; both
-executables must be compiled before using `--no-rebuild`.
+The wildcard now selects25 tests, including the policy executable and18
+streamed registrations (it selected seven at the historical #2380 checkpoint).
+Both executables must be compiled before using `--no-rebuild`.

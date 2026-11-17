@@ -990,3 +990,124 @@ remain distinct from containing caller/return, refused entry, inherited carry,
 platform actor layout and publication/FINISH obligations owned by #2370.
 Materialized INLINE and remaining policy/selector/timestamp/cache products are
 not certified by this admission bit or by the finite public histories.
+
+
+## Streamed INLINE JOIN local intervals
+
+The finite streamed INLINE extension from baseline `675d8441` adds a held-reader
+checker, single-chunk map wrapper and exact stream-Original binding. This is the
+reviewed local derivation supporting those paths, published alongside the
+[finite JOIN evidence](JOIN_DOMAIN_QUALIFICATION.md#streamed-inline-producer-and-consuming-increment).
+Containing caller/return, four-platform Native/Source and correlated financial
+carry obligations remain OPEN; these bounds do not close a matrix row.
+
+The counting convention is this document's existing convention: evaluated predicates,
+scalar stores, arithmetic/address fronts, actual arguments/calls/results/returns.
+Controller/native interiors reuse only the existing narrow controller42 and
+fixed atomic/thread primitives. No allocator, map scan, ancestor or destructor
+is excluded as a library interior. Test-only callbacks are injection code,
+not an asserted production SOURCE path.
+
+These are local source-expansion bounds for independent review. They are not
+a machine-instruction count, complete four-platform Native/Source certificate,
+or a bound on total nested work in prepare_step(max_work). The containing
+caller/return/financial carry obligations remain OPEN.
+
+### Poll boundaries
+
+`wl_columnar_relation_compound_reader_check_controlled` now executes:
+
+1. Positive Original admission256, before reader inspection.
+2. Fixed identity/thread/descriptor/source-gate and canonical-owner proof.
+3. A real zero-priced Original check, before identity/generation/schema/geometry.
+4. Fixed identity/generation/schema/geometry/kind proof and the constructor
+   footer (active-attempt proof and real zero-priced check).
+
+The middle check splits the held-reader proof. It changes no
+logical debit, reader ownership, receipt state or map cursor. It is not a
+claim that a larger debit fixes a longer SOURCE interval.
+
+The map wrapper then makes a separately successful88 admission, performs one
+chunk, and executes its real footer before publishing cursor/width/done. At
+most8 entries occur in this call. The next chunk needs another prepare action;
+max_work1 genuinely returns at cursor8/width9 on the nine-entry fixture.
+
+The shared pure chunk retains the scalar caller's original predicates:
+initial len/count/offset/width check, <=8 arities and final physical-width
+check. Pointer pairing and carried-state bounds are checked by the actual
+callers. In particular, the new wrapper checks cursor<len, width<=ncols and
+zero initial width before entering it. The scalar caller retains its old
+entry<len loop and88 charge/footer; it does not repeat all new wrapper guards.
+
+### Expanded local SOURCE intervals
+
+The bounds below include the success path and shallower error/refusal exits.
+A fixed group counts its complete selected condition, field/address front,
+actual callee arguments/result and stores; reserves cover branch/return joins.
+Groups that can be repeated have explicit multiplicity, rather than treating
+an entire helper as one scalar instruction.
+
+| Actual interval | Upper | Expansion |
+|---|---:|---|
+| Reader-check entry through first256 check/refusal/direct return | 48 | Parameters/charge arguments, wrapper and actual controller first/returned front; no descriptor payload before this check |
+| Auth256 through new middle0, including failed reader/owner proof returns | 240 | Charge result/branch4 + null/self/thread/stage/transfer/secondary pointer fronts26 + full thread predicate20 + descriptor atomic/state14 + canonical-owner resolver including args/call/return44 + exact owner-gate comparison6 + storage atomic/state14 + zero-check/controller/refusal/return64 =192, reserve48 |
+| Middle0 through geometry/kind footer0, including invalid exits | 224 | Returned-check branch4 + relation/owner identity/generation guards48 + schema2 + snapshot construction and validity32 + row/capacity/columns/timestamp/map-pointer pairing24 + kind6 + actual footer64 =180, reserve44 |
+| Map88 through constructor footer0 | 240 | Wrapper locals/carried-state bounds18 + pure-chunk call/return9 + initial map predicates/count/cap20 + at most8 arity actions at14 each (load/address, positivity, remaining-width arithmetic/compare, width store and loop fronts)112 + entry/final-width/done/return joins12 + footer64 =235, reserve5 |
+| Map footer0 through scratch publication, prepare phase/reset/result and next actual check | 128 | Three scratch/result stores and return8 + selected phase/reset/return join16 + prepare returned/error/ready loop fronts24 + actual next check/refusal/controller front64 =112, reserve16 |
+| Scalar caller map88 through its existing footer0 | 224 | Same pure chunk without new carried-state wrapper: call/locals8 + first-entry metadata/count20 +8*14 arity/loop112 + final joins12 + footer64 =216, reserve8 |
+| Scalar footer0 through entry<len branch and next real charge/refusal | 96 | Returned tail/cause branch, actual loop predicate and call/arguments/return through controller front; no payload loop in this suffix |
+| Stream-original helper entry through first128 check/refusal | 160 | Full numeric owner/thread and host-binding getter80 + local/null/host return fronts12 + actual host-charge/controller/returned refusal64 =156, reserve4 |
+| Stream128 through the reader helper's actual256 check/refusal | 240 | Returned branch4 + repeated numeric/host getter80 + full ENTER context/action/phase32 + exact original/prepare/control/id/op pointer tuple28 + actual reader-helper argument/call/entry/charge64 =208, reserve32 |
+| Reader footer0 through original kind/snapshot and stream helper footer0 | 128 | Returned helper branch4 + kind2 + complete snapshot equality32 + actual host zero footer/controller/return64 =102, reserve26 |
+| Stream helper footer0 through existing serialized-move128 admission/refusal | 96 | Returned helper result, stack branch and actual move-charge arguments/controller/return; the subsequent existing move body remains unchanged |
+
+`col_rel_storage_owner_resolve` is the fixed function at relation.c, not a
+scan through aliases: null checks, one canonical pointer, owner self/identity/
+generation tests, selected src equality and output/return. The44 group includes
+its generation-valid subcall and the wrapper's actual call/result. Thread
+alternatives are bounded fixed C11/POSIX equality or the MSVC current-ID front;
+there is no user-sized iteration. Snapshot construction/validity/equality
+copies/tests only three fields. Atomic gate loads do not acquire/release a
+reader. No payload column loop occurs in the auth proof.
+
+The per-arity14 expansion deliberately counts both count/ok loop predicates,
+index/address/load, zero and remaining-width predicates, width arithmetic/store,
+index progress and selected branches. The loop's bound is min(8,len-entry).
+Actual map access remains under both authenticated gates throughout.
+
+The standalone scalar-source metadata caller's other INIT/RESOLVE/VALIDATE/
+SNAPSHOT/COLUMN intervals and their tariffs are unchanged. NONE prepare skips
+the added map states after fixed malformed-NONE checks, keeping its historical
+phase IDs and debit sequence. New map states participate in the existing
+post-SHAPE snapshot check.
+
+### Logical tariffs and what the tests prove
+
+New held-reader admission256 prices one fixed authentication/schema action.
+Its payload inventory is bounded (reader identity/thread/stages/gates,
+canonical owner, relation/owner identity/generations, schema/geometry and kind);
+there is no data-dependent array iteration. Using256 is a conservative fixed
+action tariff, not substitution of256 for either SOURCE upper above. The
+middle and footer checks price0 and create no additional logical admission.
+
+The map88 tariff is retained from the original <=8-entry map action. Its
+new wrapper's fixed cursor/publication work belongs to the separately priced
+checked-reader action, not an increased scalar-map tariff. The scalar caller
+uses precisely its original loop and initial metadata predicates. New
+stream-original128 prices the fixed owner/ENTER/exact-source tuple and final
+snapshot binding; actual reader/schema proof has its own independently polled
+checked-reader admission. The128 serialized move is a distinct unchanged
+admission; no allocation, callback or poll enters its move region.
+
+A prepare map action therefore records1+256+88 logical work, not1 or256.
+The direct fixture asserts that actual debit, cursor return after eight entries,
+refusal at the next action and refusal at the authentication footer before
+malformed later metadata. It does not turn that monetary equality into a
+SOURCE proof. Wrong bound id/inactive control, wrong reader/source/thread,
+copied/partial tokens and source-writer exclusion/release are independent
+ownership checks. Continuous readers, not the debit, authorize metadata access.
+
+No unused logical reservation is refunded, counted as completed work or
+reissued as a SOURCE promise by this argument. Simultaneous inherited financial
+carry and all actual containing caller intervals still require their own
+certificates. This finite JOIN extension does not close #2371/#2300 or S.FIN.
