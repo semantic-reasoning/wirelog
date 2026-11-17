@@ -879,8 +879,159 @@ setup_grant_end(setup_fixture_t *s)
     s->consumed = report.consumed;
 }
 
+static unsigned host_clear_sequences, host_clear_real_sequences;
+static bool host_clear_last_pending;
+static int setup_turn_raw(setup_fixture_t *, uint64_t);
+
+static int
+host_clear_grant(setup_fixture_t *s, uint64_t limit, uint64_t *consumed,
+    bool *done)
+{
+    int owner;
+    wl_evaluation_control_t *funding = NULL;
+    CHECK(!wl_evaluation_control_create(limit, &funding));
+    CHECK(!wl_evaluation_control_attach(funding, &owner));
+    CHECK(!wl_evaluation_control_begin(funding, &owner));
+    int rc = wl_columnar_join_pipeline_test_retirement_clear(&s->record,
+            funding, wl_evaluation_control_active_attempt_id(funding), done);
+    CHECK(wl_evaluation_control_finish(funding, &owner, rc, 0) == rc);
+    wl_evaluation_control_report_t report;
+    CHECK(!wl_evaluation_control_report(funding, &report));
+    *consumed = report.consumed;
+    CHECK(!wl_evaluation_control_detach(funding, &owner));
+    wl_evaluation_control_release(funding);
+    return rc;
+}
+
+/* A drained host retirement zeroes its scalar receipt one CHUNK per 256
+ * action, from the end. Every chunk but the last is driven here through
+ * the host's own retirement step: one short of 256 at the first and middle
+ * chunk changes nothing, and 256 clears exactly one chunk. The last chunk
+ * is left to the host's cleanup, so the caller's turns are those of the
+ * former one-action clear. */
+static void
+host_clear_until_last(setup_fixture_t *s)
+{
+    const size_t chunk = WL_COLUMNAR_RELATION_SCALAR_CLEAR_CHUNK;
+    const size_t size = sizeof(wl_columnar_relation_scalar_retirement_t);
+    const unsigned steps = (unsigned)((size + chunk - 1u) / chunk);
+    unsigned char before[sizeof(wl_columnar_relation_scalar_retirement_t)];
+    unsigned char after[sizeof(before)];
+    bool drained = false;
+    unsigned index = 0;
+    if (!s->record.join_host
+        || wl_columnar_join_pipeline_test_retirement_view(&s->record,
+        &drained, &index, before, sizeof(before))) return;
+    if (host_clear_last_pending) {
+        /* Only the host's own cleanup turn may finish the last chunk. */
+        CHECK(drained ? index == steps - 1u : !index);
+        host_clear_last_pending = drained;
+        return;
+    }
+    CHECK(!index);
+    if (!drained) return;
+    for (; index + 1u < steps; ++index) {
+        const size_t end = size - (size_t)index * chunk;
+        const size_t begin = end - chunk;
+        uint64_t consumed = 0;
+        bool done = true, now = false;
+        unsigned at = 0;
+        if (index == 0u || index == steps / 2u) {
+            CHECK(host_clear_grant(s, 255, &consumed, &done)
+                == WL_EVALUATION_CONTROL_WORK_LIMIT && !consumed && !done);
+            CHECK(!wl_columnar_join_pipeline_test_retirement_view(&s->record,
+                &now, &at, after, sizeof(after)) && now && at == index
+                && !memcmp(before, after, sizeof(before)));
+        }
+        done = true;
+        CHECK(!host_clear_grant(s, 256, &consumed, &done) && consumed == 256
+            && !done);
+        CHECK(!wl_columnar_join_pipeline_test_retirement_view(&s->record,
+            &now, &at, after, sizeof(after)) && now && at == index + 1u
+            && !memcmp(before, after, begin));
+        for (size_t i = begin; i != size; ++i) CHECK(!after[i]);
+        memcpy(before, after, sizeof(before));
+    }
+    ++host_clear_sequences;
+    host_clear_last_pending = true;
+}
+
+/* The first drained host retirement is instead cleared only through real
+ * setup turns: each chunk is one composed step paying HOST_WORK, the 256
+ * numeric step admission, the host's current phase fee and the 256 chunk.
+ * One short of that at the first, middle and last chunk spends everything but
+ * the chunk and leaves the receipt and index, and the drained state ends only
+ * with the last chunk. */
+static void
+host_clear_real(setup_fixture_t *s)
+{
+    const size_t chunk = WL_COLUMNAR_RELATION_SCALAR_CLEAR_CHUNK;
+    const size_t size = sizeof(wl_columnar_relation_scalar_retirement_t);
+    const unsigned steps = (unsigned)((size + chunk - 1u) / chunk);
+    unsigned char before[sizeof(wl_columnar_relation_scalar_retirement_t)];
+    unsigned char after[sizeof(before)];
+    bool drained = false, now = false;
+    unsigned index = 0, at = 0;
+    for (unsigned turns = 0;; ++turns) {
+        CHECK(turns < 100000);
+        CHECK(!wl_columnar_join_pipeline_test_retirement_view(&s->record,
+            &drained, &at, before, sizeof(before)));
+        if (!drained) break;
+        CHECK(at == index);
+        if (s->record.phase == WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_PENDING) {
+            CHECK(!setup_turn_raw(s, 384));
+            continue;
+        }
+        uint64_t work = 0;
+        CHECK(!wl_columnar_join_pipeline_numeric_funding_work(&s->record,
+            &work));
+        /* Composed HOST_WORK, the 256 numeric step admission, the phase
+         * fee and the 256 chunk. */
+        const uint64_t exact = WL_COLUMNAR_EVAL_PLAN_NUMERIC_HOST_WORK
+            + 256u + work + 256u;
+        const size_t end = size - (size_t)index * chunk;
+        const size_t begin = end > chunk ? end - chunk : 0;
+        if (index == 0u || index == steps / 2u || index + 1u == steps) {
+            CHECK(setup_turn_raw(s, exact - 1u)
+                == WL_EVALUATION_CONTROL_WORK_LIMIT
+                && s->consumed == exact - 256u);
+            CHECK(!wl_columnar_join_pipeline_test_retirement_view(&s->record,
+                &now, &at, after, sizeof(after)) && now && at == index
+                && !memcmp(before, after, sizeof(before)));
+            CHECK(s->record.phase
+                == WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_PENDING
+                && !setup_turn_raw(s, 384));
+        }
+        CHECK(!setup_turn_raw(s, exact) && s->consumed == exact);
+        CHECK(!wl_columnar_join_pipeline_test_retirement_view(&s->record,
+            &now, &at, after, sizeof(after)));
+        if (index + 1u < steps) CHECK(now && at == index + 1u
+                && !memcmp(before, after, begin));
+        else CHECK(!now && !at);
+        for (size_t i = begin; i != size; ++i) CHECK(!after[i]);
+        ++index;
+    }
+    CHECK(index == steps);
+    ++host_clear_real_sequences;
+}
+
 static int
 setup_turn(setup_fixture_t *s, uint64_t limit)
+{
+    bool drained = false;
+    unsigned index = 0;
+    unsigned char receipt[sizeof(wl_columnar_relation_scalar_retirement_t)];
+    if (!host_clear_real_sequences && !host_clear_last_pending
+        && s->record.join_host
+        && !wl_columnar_join_pipeline_test_retirement_view(&s->record,
+        &drained, &index, receipt, sizeof(receipt)) && drained && !index)
+        host_clear_real(s);
+    host_clear_until_last(s);
+    return setup_turn_raw(s, limit);
+}
+
+static int
+setup_turn_raw(setup_fixture_t *s, uint64_t limit)
 {
     setup_grant_begin(s, limit);
     bool pending = s->record.phase ==
@@ -1825,6 +1976,11 @@ funding(void)
     funding_metadata(); funding_metadata_cancel(); funding_metadata_authority();
     funding_start_boundaries();
     funding_composed(); funding_public(); funding_ack_boundaries();
+    printf("join host scalar receipt %u B, %u real-turn and %u hook-driven "
+        "drained clears\n",
+        (unsigned)sizeof(wl_columnar_relation_scalar_retirement_t),
+        host_clear_real_sequences, host_clear_sequences);
+    CHECK(host_clear_real_sequences == 1u && host_clear_sequences != 0u);
 }
 
 int
