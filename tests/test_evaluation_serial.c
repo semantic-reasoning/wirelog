@@ -6896,6 +6896,276 @@ test_controlled_persistent_diff_main_stops(void)
     free(healthy); free(injected);
 }
 
+/* Observer recipients of the session's private MAIN recipient enum. Each
+ * observer action pays the 128 of wl_columnar_session_main_observer_execute. */
+enum {
+    OBSERVER_MAIN_REGISTER = 13,
+    OBSERVER_MAIN_OBSERVE = 14,
+    OBSERVER_MAIN_FINISH = 15,
+    OBSERVER_MAIN_RELEASE = 17,
+    OBSERVER_MAIN_FEE = 128,
+    OBSERVER_MAIN_MAX = 4096,
+    /* Observer reason recorded when the transaction committed and its step
+     * published (session.c observer FINISH selection). */
+    OBSERVER_MAIN_COMMITTED_REASON = 3
+};
+
+typedef struct {
+    const wl_col_session_t *session;
+    bool inject;
+    unsigned count, refused, cancelled, committed_finishes;
+    unsigned recipient[OBSERVER_MAIN_MAX], action[OBSERVER_MAIN_MAX];
+    unsigned targets[8], cancel_at;
+    bool done[8], cancel_done, refusing, cancelling;
+    controlled_recursive_main_hook_t previous_advanced;
+    wl_mem_ledger_snapshot_t ledger;
+    wl_evaluation_control_report_t original;
+} observer_main_probe_t;
+
+static observer_main_probe_t *observer_main_probe;
+
+static bool
+observer_main_recipient(unsigned recipient)
+{
+    return recipient == OBSERVER_MAIN_REGISTER
+           || recipient == OBSERVER_MAIN_OBSERVE
+           || recipient == OBSERVER_MAIN_FINISH
+           || recipient == OBSERVER_MAIN_RELEASE;
+}
+
+static uint64_t
+observer_main_limit(const wl_col_session_t *session, unsigned recipient,
+    unsigned action, uint64_t capacity)
+{
+    observer_main_probe_t *p = observer_main_probe;
+    (void)action;
+    if (!p || session != p->session || !observer_main_recipient(recipient))
+        return capacity;
+    CHECK(capacity == 256u && !p->refusing && !p->cancelling);
+    if (!p->inject) return capacity;
+    for (unsigned t = 0; t < 8; ++t)
+        if (p->count == p->targets[t] && !p->done[t]) {
+            p->done[t] = true; p->refusing = true;
+            return OBSERVER_MAIN_FEE - 1u;
+        }
+    if (p->count == p->cancel_at && !p->cancel_done) {
+        p->cancel_done = true; p->cancelling = true;
+    }
+    return capacity;
+}
+
+static void
+observer_main_advanced(wl_col_session_t *session,
+    wl_evaluation_control_t *funding, uint64_t id, unsigned recipient,
+    unsigned before, unsigned after, int result)
+{
+    observer_main_probe_t *p = observer_main_probe;
+    if (p && session == p->session && observer_main_recipient(recipient)
+        && p->cancelling) {
+        CHECK(!result || result == EAGAIN);
+        wl_evaluation_control_request_cancel(funding);
+        CHECK(wl_evaluation_control_charge_attempt(funding, id, 0)
+            == WL_EVALUATION_CONTROL_CANCELLED);
+    }
+    if (p && p->previous_advanced)
+        p->previous_advanced(session, funding, id, recipient, before, after,
+            result);
+}
+
+static void
+observer_main_report(const wl_col_session_t *session, unsigned recipient,
+    unsigned action, wl_evaluation_control_report_t report, int result)
+{
+    observer_main_probe_t *p = observer_main_probe;
+    if (!p || session != p->session || !observer_main_recipient(recipient))
+        return;
+    if (p->refusing) {
+        CHECK(result == WL_EVALUATION_CONTROL_WORK_LIMIT && !report.consumed);
+        p->refusing = false; ++p->refused;
+        return;
+    }
+    CHECK(report.consumed == OBSERVER_MAIN_FEE && p->count < OBSERVER_MAIN_MAX);
+    if (p->cancelling) {
+        p->cancelling = false; ++p->cancelled;
+    }
+    if (recipient == OBSERVER_MAIN_FINISH) {
+        uint64_t view[16];
+        CHECK(!wl_columnar_session_test_observer_main_view(session, view)
+            && view[0] && view[6] == OBSERVER_MAIN_COMMITTED_REASON);
+        ++p->committed_finishes;
+    }
+    p->recipient[p->count] = recipient;
+    p->action[p->count++] = action;
+}
+
+static void
+observer_main_history(observer_main_probe_t *p,
+    const observer_main_probe_t *healthy)
+{
+    const char *source = ".decl l(x:int64)\n.decl r(x:int64,y:int64)\n"
+        ".decl a(x:int64,y:int64)\n.decl b(x:int64,y:int64)\n"
+        "a(x,y) :- l(x), r(x,y).\nb(x,y) :- l(x), r(x,y).\n";
+    wirelog_error_t error;
+    wirelog_program_t *program = wirelog_parse_string(source, &error);
+    CHECK(program);
+    wl_plan_t *plan = NULL;
+    CHECK(!wl_plan_from_program(program, &plan));
+    wl_evaluation_control_t *control = NULL;
+    CHECK(!wl_evaluation_control_create(0, &control));
+    wl_session_options_t options;
+    wl_session_options_init(&options);
+    options.evaluation_control = control;
+    wl_columnar_memory_resolution_t resolution = {
+        .budget_bytes = WL_COLUMNAR_MEMORY_MIN_BUDGET,
+        .usable_bytes = WL_COLUMNAR_MEMORY_MIN_BUDGET,
+        .mode = WL_COLUMNAR_MEMORY_MODE_ENFORCING
+    };
+    wl_columnar_memory_governor_ref_t *governor =
+        wl_columnar_memory_governor_ref_create(&resolution);
+    CHECK(governor); options.memory_governor = governor;
+    wl_session_t *session = NULL, *reference = NULL;
+    CHECK(!wl_session_create_with_options(wl_backend_columnar(), plan, 1,
+        &options, &session));
+    CHECK(!wl_session_create(wl_backend_columnar(), plan, 1, &reference));
+    ((wl_col_session_t *)reference)->diff_enabled = false;
+    const int64_t left[] = {1, 2}, right[] = {1, 1, 2, 2};
+    CHECK(!wl_session_insert(session, "l", left, 2, 1));
+    CHECK(!wl_session_insert(reference, "l", left, 2, 1));
+    CHECK(!wl_session_insert(session, "r", right, 2, 2));
+    CHECK(!wl_session_insert(reference, "r", right, 2, 2));
+    observed_multi_capture_t *actual = calloc(1, sizeof(*actual));
+    observed_multi_capture_t *expected = calloc(1, sizeof(*expected));
+    CHECK(actual && expected);
+    wl_session_set_delta_cb(session, observed_multi_capture, actual);
+    wl_session_set_delta_cb(reference, observed_multi_capture, expected);
+    CHECK(!observed_multi_step(session) && !wl_session_step(reference));
+    actual->count = expected->count = 0;
+    /* The second epoch commits and publishes, so its observer is the
+     * committed one: REGISTER, the resource BEGIN, OBSERVE and STEP calls,
+     * FINISH, ACK and RELEASE. */
+    const int64_t extra[] = {1, 3};
+    CHECK(!wl_session_insert(session, "r", extra, 1, 2));
+    CHECK(!wl_session_insert(reference, "r", extra, 1, 2));
+
+    p->session = (wl_col_session_t *)session;
+    if (p->inject) {
+        /* REGISTER and RELEASE have their own recipients and FINISH has
+         * recipient 15; BEGIN, OBSERVE, STEP and ACK share recipient 14 and
+         * are told apart by their resource call. */
+        const unsigned none = UINT_MAX;
+        unsigned reg = none, begin = none, step = none, finish = none;
+        unsigned ack = none, release = none, observe[3] = {none, none, none};
+        unsigned observes = 0;
+        for (unsigned i = 0; i < healthy->count; ++i) {
+            unsigned r = healthy->recipient[i], a = healthy->action[i];
+            if (r == OBSERVER_MAIN_REGISTER && reg == none) reg = i;
+            if (r == OBSERVER_MAIN_RELEASE && release == none) release = i;
+            if (r == OBSERVER_MAIN_FINISH && finish == none) finish = i;
+            if (r != OBSERVER_MAIN_OBSERVE) continue;
+            if (a == WL_COLUMNAR_EVAL_DELTA_RESOURCE_CALL_BEGIN
+                && begin == none) begin = i;
+            if (a == WL_COLUMNAR_EVAL_DELTA_RESOURCE_CALL_STEP && step == none)
+                step = i;
+            if (a == WL_COLUMNAR_EVAL_DELTA_RESOURCE_CALL_ACK && ack == none)
+                ack = i;
+            if (a == WL_COLUMNAR_EVAL_DELTA_RESOURCE_CALL_OBSERVE) {
+                if (observes < 2) observe[observes] = i;
+                ++observes;
+            }
+        }
+        CHECK(observes >= 4u);
+        /* The middle OBSERVE, counted among all OBSERVE calls. */
+        for (unsigned i = 0, k = 0; i < healthy->count; ++i)
+            if (healthy->recipient[i] == OBSERVER_MAIN_OBSERVE
+                && healthy->action[i] ==
+                WL_COLUMNAR_EVAL_DELTA_RESOURCE_CALL_OBSERVE
+                && k++ == observes / 2u) observe[2] = i;
+        CHECK(reg != none && begin != none && step != none && finish != none
+            && ack != none && release != none && observe[2] != observe[1]);
+        p->targets[0] = reg; p->targets[1] = begin;
+        p->targets[2] = observe[0]; p->targets[3] = observe[2];
+        p->targets[4] = step; p->targets[5] = finish;
+        p->targets[6] = ack; p->targets[7] = release;
+        /* The second OBSERVE is cancelled after its effect. */
+        p->cancel_at = observe[1];
+    }
+    p->previous_advanced = wl_columnar_session_test_main_action_advanced;
+    observer_main_probe = p;
+    wl_columnar_session_test_main_limit = observer_main_limit;
+    wl_columnar_session_test_main_action_report = observer_main_report;
+    wl_columnar_session_test_main_action_advanced = observer_main_advanced;
+    int rc = observed_multi_step(session);
+    wl_columnar_session_test_main_limit = NULL;
+    wl_columnar_session_test_main_action_report = NULL;
+    wl_columnar_session_test_main_action_advanced = p->previous_advanced;
+    observer_main_probe = NULL;
+    CHECK(!rc && !wl_session_step(reference) && !p->refusing
+        && !p->cancelling);
+
+    wl_col_session_t *cs = (wl_col_session_t *)session;
+    CHECK(!cs->diff_txn_count && actual->count == expected->count);
+    wl_mem_ledger_snapshot(&cs->mem_ledger, &p->ledger);
+    CHECK(!wl_evaluation_control_report(control, &p->original));
+    qsort(actual->events, actual->count, sizeof(actual->events[0]),
+        observed_multi_order);
+    qsort(expected->events, expected->count, sizeof(expected->events[0]),
+        observed_multi_order);
+    CHECK(!memcmp(actual->events, expected->events,
+        actual->count * sizeof(actual->events[0])));
+    /* Nothing is delivered again once the committed epoch is acknowledged. */
+    unsigned delivered = actual->count;
+    CHECK(!observed_multi_step(session) && actual->count == delivered);
+    CHECK(!wl_session_try_destroy(&session));
+    wl_session_destroy(reference);
+    wl_evaluation_control_release(control);
+    wl_plan_free(plan); wirelog_program_free(program);
+    CHECK(!wl_columnar_memory_reserved(
+            wl_columnar_memory_governor_ref_get(governor)));
+    wl_columnar_memory_governor_ref_release(governor);
+    free(actual); free(expected);
+    p->session = NULL;
+}
+
+/* A committed observed epoch runs its observer through MAIN REGISTER, the
+ * resource BEGIN, OBSERVE, STEP, FINISH and ACK calls, and RELEASE. One short
+ * of the 128 fee at REGISTER, BEGIN, the first and a middle OBSERVE, STEP,
+ * FINISH, ACK and RELEASE spends nothing, and a cancel after an OBSERVE keeps
+ * its effect. The injected history performs exactly the healthy sequence of
+ * recipients and calls, delivers the reference events once, and settles the
+ * ledger and the original control as the healthy one does. */
+static void
+test_controlled_committed_observer_main_stops(void)
+{
+    observer_main_probe_t *healthy = calloc(1, sizeof(*healthy));
+    observer_main_probe_t *injected = calloc(1, sizeof(*injected));
+    CHECK(healthy && injected);
+    observer_main_history(healthy, NULL);
+    printf("committed observer: %u MAIN actions per healthy epoch\n",
+        healthy->count);
+    CHECK(!healthy->refused && !healthy->cancelled
+        && healthy->committed_finishes != 0u);
+    injected->inject = true;
+    observer_main_history(injected, healthy);
+    CHECK(injected->refused == 8u && injected->cancelled == 1u
+        && injected->count == healthy->count
+        && !memcmp(injected->recipient, healthy->recipient,
+        healthy->count * sizeof(healthy->recipient[0]))
+        && !memcmp(injected->action, healthy->action,
+        healthy->count * sizeof(healthy->action[0])));
+    CHECK(injected->ledger.current_bytes == healthy->ledger.current_bytes
+        && !memcmp(injected->ledger.subsys_bytes, healthy->ledger.subsys_bytes,
+        sizeof(healthy->ledger.subsys_bytes)));
+    CHECK(injected->original.consumed == healthy->original.consumed
+        && injected->original.limit == healthy->original.limit
+        && injected->original.stop_reason == healthy->original.stop_reason
+        && injected->original.execution_status
+        == healthy->original.execution_status
+        && injected->original.cleanup_status
+        == healthy->original.cleanup_status
+        && injected->original.result == healthy->original.result);
+    free(healthy); free(injected);
+}
+
 static unsigned persistent_stop_phase, persistent_stop_hits;
 static bool persistent_stop_work, persistent_stopped;
 static void
@@ -20302,6 +20572,9 @@ main(int argc, char **argv)
     }
     if (argc == 2 && !strcmp(argv[1], "--frontier-main-stops")) {
         test_controlled_recursive_frontier_main_stops(); return 0;
+    }
+    if (argc == 2 && !strcmp(argv[1], "--committed-observer-main-stops")) {
+        test_controlled_committed_observer_main_stops(); return 0;
     }
     if (argc == 2 && !strcmp(argv[1], "--diff-main-stops")) {
         test_controlled_persistent_diff_main_stops(); return 0;
