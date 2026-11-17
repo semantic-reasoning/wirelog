@@ -228,7 +228,7 @@ These exist so struct fields can be declared portably; the audit in
 
 Every `atomic_*` call site in `wirelog/` production sources. Counted
 mechanically by `scripts/ci/check-threading-doc.sh`; row count must
-match the script's count (currently **619**).
+match the script's count (currently **621**).
 
 Format: `file:function[#N]` | field | operation | order | justification.
 
@@ -667,7 +667,7 @@ concurrent alias removals cannot underflow the count.
 | `session.c:session_pool_rel_promote#3` | `src->storage_alias_borrows` | `atomic_store_explicit` | relaxed | Leave the closed pool tombstone with no child aliases |
 
 112 + 21 + 37 = **170 atomic call sites** in the summarized groups; the full
-symbol-anchored inventory below covers 619 sites.
+symbol-anchored inventory below covers 621 sites.
 
 The `#N` suffix counts all atomic sites in a symbol, regardless of operation;
 the first site remains unsuffixed. `scripts/ci/check-threading-doc.sh` uses
@@ -1805,7 +1805,7 @@ DONE. If a stop leaves the receipt holding a claim, its caller preserves that
 receipt and resumes with a fresh live maintenance attempt; it cannot abandon or
 reinitialize the receipt/token while the claim remains held.
 
-The complete current atomic-source inventory contains 619 call sites.
+The complete current atomic-source inventory contains 621 call sites.
 
 ### Caller-attempt-bound single mutation admission
 
@@ -3118,3 +3118,20 @@ lifetime and exclusion; they neither acquire a reader nor refund credit.
 | `eval_delta.c:wl_columnar_eval_delta_close_stream#2` | relation descriptor gate | `atomic_load_explicit` | acquire | Confirm the same retained reader protects the descriptor |
 | `eval_delta.c:wl_columnar_eval_delta_close_credit` | reservation state | `atomic_load_explicit` | acquire | Validate the prepared token state before inspecting its live payload |
 | `eval_delta.c:wl_columnar_eval_delta_close_credit#2` | reservation owner | `atomic_load_explicit` | acquire | Confirm the prepared observer owns committed credit without following released history |
+
+
+### Streamed INLINE JOIN reader validation
+
+The compound reader checker authenticates the original nontransferable reader's
+address, thread, stage and exact descriptor binding before loading its descriptor
+gate. It then resolves the storage owner and verifies the reader's exact source
+gate binding before loading that gate. Both acquire loads confirm live non-writer
+gate states while the reader retains both gates. They neither acquire or transfer
+a reader nor make
+a nonzero count independent authority to access metadata. Source lifetime and
+reader provenance remain required throughout the checked operation.
+
+| Source anchor | Object | Atomic operation | Ordering | Synchronization purpose |
+| --- | --- | --- | --- | --- |
+| `relation.c:wl_columnar_relation_compound_reader_check_controlled` | `reader->secondary_owner->state` | `atomic_load_explicit` | acquire | Confirm the authenticated original reader still protects the exact descriptor gate before protected metadata validation; no reader acquisition or transfer |
+| `relation.c:wl_columnar_relation_compound_reader_check_controlled#2` | `reader->owner->state` | `atomic_load_explicit` | acquire | Confirm the same reader still protects the resolved storage-owner source gate before geometry/map validation; gate state alone grants no source authority |
