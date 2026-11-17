@@ -6610,6 +6610,292 @@ test_controlled_frontier_map_failures(void)
         }
 }
 
+/* MAIN_DIFF recipient of the session's private MAIN recipient enum. A DIFF
+ * action pays the 128 differential fee, or one of the ledger publication
+ * fees of mem_ledger_publication.c: DESCRIBE is PREPARE 109, COMMIT charges
+ * INITIAL 26 + APPLY 117 + RELEASE 23 and then ROUND 28. */
+enum {
+    DIFF_MAIN_RECIPIENT = 3,
+    DIFF_MAIN_PAY = 128,
+    DIFF_MAIN_DESCRIBE = 109,
+    DIFF_MAIN_COMMIT_FIRST = 26 + 117 + 23,
+    DIFF_MAIN_COMMIT = DIFF_MAIN_COMMIT_FIRST + 28,
+    DIFF_MAIN_MAX = 4096
+};
+
+typedef struct {
+    const wl_col_session_t *session;
+    bool inject;
+    unsigned count, refused, inserted, cancelled;
+    uint64_t consumed[DIFF_MAIN_MAX];
+    /* Injection plan in healthy-sequence positions. */
+    unsigned pay_first, describe_first, commit_first, commit_second;
+    unsigned pay_cancel, last;
+    bool done_pay_first, done_describe, done_commit_first, done_commit_second;
+    bool done_last, done_cancel;
+    uint64_t refusing; /* expected consumption of the refused grant + 1 */
+    bool cancelling, refusing_commit;
+    controlled_recursive_main_hook_t previous_advanced;
+    /* Settled state after the retirement, compared across histories. */
+    wl_mem_ledger_snapshot_t ledger;
+    wl_evaluation_control_report_t original;
+} diff_main_probe_t;
+
+static diff_main_probe_t *diff_main_probe;
+
+static bool
+diff_main_fee(uint64_t fee)
+{
+    return fee == DIFF_MAIN_PAY || fee == DIFF_MAIN_DESCRIBE
+           || fee == DIFF_MAIN_COMMIT;
+}
+
+static uint64_t
+diff_main_limit(const wl_col_session_t *session, unsigned recipient,
+    unsigned action, uint64_t capacity)
+{
+    diff_main_probe_t *p = diff_main_probe;
+    (void)action;
+    if (!p || session != p->session || recipient != DIFF_MAIN_RECIPIENT)
+        return capacity;
+    CHECK(capacity == 256u && !p->refusing && !p->cancelling);
+    if (!p->inject || p->count < p->inserted) return capacity;
+    const unsigned h = p->count - p->inserted;
+    if (h == p->pay_first && !p->done_pay_first) {
+        p->done_pay_first = true; p->refusing = 1;
+        return DIFF_MAIN_PAY - 1u;
+    }
+    if (h == p->describe_first && !p->done_describe) {
+        p->done_describe = true; p->refusing = 1;
+        return DIFF_MAIN_DESCRIBE - 1u;
+    }
+    if (h == p->commit_first && !p->done_commit_first) {
+        /* Refused at its first charge: nothing is spent. */
+        p->done_commit_first = true; p->refusing = 1;
+        p->refusing_commit = true;
+        return DIFF_MAIN_COMMIT_FIRST - 1u;
+    }
+    if (h == p->commit_second && !p->done_commit_second) {
+        /* Refused at its ROUND charge after the first charge. */
+        p->done_commit_second = true; p->refusing = DIFF_MAIN_COMMIT_FIRST + 1u;
+        p->refusing_commit = true;
+        return DIFF_MAIN_COMMIT - 1u;
+    }
+    if (h == p->last && !p->done_last) {
+        p->done_last = true; p->refusing = 1;
+        return DIFF_MAIN_PAY - 1u;
+    }
+    if (h == p->pay_cancel && !p->done_cancel) {
+        p->done_cancel = true; p->cancelling = true;
+    }
+    return capacity;
+}
+
+static void
+diff_main_advanced(wl_col_session_t *session, wl_evaluation_control_t *funding,
+    uint64_t id, unsigned recipient, unsigned before, unsigned after,
+    int result)
+{
+    diff_main_probe_t *p = diff_main_probe;
+    if (p && session == p->session && recipient == DIFF_MAIN_RECIPIENT
+        && p->cancelling) {
+        /* A drain step that progressed returns 0 or EAGAIN; the stop latches
+         * on the MAIN grant after its effect. */
+        CHECK(!result || result == EAGAIN);
+        wl_evaluation_control_request_cancel(funding);
+        CHECK(wl_evaluation_control_charge_attempt(funding, id, 0)
+            == WL_EVALUATION_CONTROL_CANCELLED);
+    }
+    if (p && p->previous_advanced)
+        p->previous_advanced(session, funding, id, recipient, before, after,
+            result);
+}
+
+static void
+diff_main_report(const wl_col_session_t *session, unsigned recipient,
+    unsigned action, wl_evaluation_control_report_t report, int result)
+{
+    diff_main_probe_t *p = diff_main_probe;
+    (void)action;
+    if (!p || session != p->session || recipient != DIFF_MAIN_RECIPIENT)
+        return;
+    if (p->refusing) {
+        CHECK(result == WL_EVALUATION_CONTROL_WORK_LIMIT
+            && report.consumed == p->refusing - 1u);
+        if (p->refusing_commit) {
+            /* COMMIT consumes its description before charging, so either
+             * refusal is followed by an acknowledgement and a fresh
+             * description before the retried commit. */
+            p->inserted += 2u;
+            p->refusing_commit = false;
+        }
+        p->refusing = 0; ++p->refused;
+        return;
+    }
+    CHECK(p->count < DIFF_MAIN_MAX && diff_main_fee(report.consumed));
+    if (p->cancelling) {
+        p->cancelling = false; ++p->cancelled;
+    }
+    p->consumed[p->count++] = report.consumed;
+}
+
+static void
+diff_main_history(diff_main_probe_t *p, const diff_main_probe_t *healthy)
+{
+    const char *source = ".decl l(x:int64)\n.decl r(x:int64,y:int64)\n"
+        ".decl a(x:int64,y:int64)\n.decl b(x:int64,y:int64)\n"
+        "a(x,y) :- l(x), r(x,y).\nb(x,y) :- l(x), r(x,y).\n";
+    wirelog_error_t error;
+    wirelog_program_t *program = wirelog_parse_string(source, &error);
+    CHECK(program);
+    wl_plan_t *plan = NULL;
+    CHECK(!wl_plan_from_program(program, &plan));
+    wl_evaluation_control_t *control = NULL;
+    CHECK(!wl_evaluation_control_create(0, &control));
+    wl_session_options_t options;
+    wl_session_options_init(&options);
+    options.evaluation_control = control;
+    wl_columnar_memory_resolution_t resolution = {
+        .budget_bytes = WL_COLUMNAR_MEMORY_MIN_BUDGET,
+        .usable_bytes = WL_COLUMNAR_MEMORY_MIN_BUDGET,
+        .mode = WL_COLUMNAR_MEMORY_MODE_ENFORCING
+    };
+    wl_columnar_memory_governor_ref_t *governor =
+        wl_columnar_memory_governor_ref_create(&resolution);
+    CHECK(governor); options.memory_governor = governor;
+    wl_session_t *session = NULL, *reference = NULL;
+    CHECK(!wl_session_create_with_options(wl_backend_columnar(), plan, 1,
+        &options, &session));
+    CHECK(!wl_session_create(wl_backend_columnar(), plan, 1, &reference));
+    ((wl_col_session_t *)reference)->diff_enabled = false;
+    const int64_t left[] = {1, 2}, right[] = {1, 1, 2, 2};
+    CHECK(!wl_session_insert(session, "l", left, 2, 1));
+    CHECK(!wl_session_insert(reference, "l", left, 2, 1));
+    CHECK(!wl_session_insert(session, "r", right, 2, 2));
+    CHECK(!wl_session_insert(reference, "r", right, 2, 2));
+    observed_multi_capture_t *actual = calloc(1, sizeof(*actual));
+    observed_multi_capture_t *expected = calloc(1, sizeof(*expected));
+    CHECK(actual && expected);
+    wl_session_set_delta_cb(session, observed_multi_capture, actual);
+    wl_session_set_delta_cb(reference, observed_multi_capture, expected);
+    CHECK(!observed_multi_step(session) && !wl_session_step(reference));
+    actual->count = expected->count = 0;
+    /* Two changed EDBs rebuild the arrangement and retire the old one. */
+    const int64_t extra[] = {1, 3};
+    CHECK(!wl_session_insert(session, "r", extra, 1, 2));
+    CHECK(!wl_session_insert(reference, "r", extra, 1, 2));
+    CHECK(!wl_session_insert(session, "l", left, 1, 1));
+    CHECK(!wl_session_insert(reference, "l", left, 1, 1));
+
+    p->session = (wl_col_session_t *)session;
+    if (p->inject) {
+        /* The healthy retirement opens and closes with payments; the
+         * description precedes each commit and the cancelled payment lies
+         * between the two refused commits, so every target fires once. */
+        CHECK(healthy->consumed[0] == DIFF_MAIN_PAY
+            && healthy->consumed[healthy->count - 1u] == DIFF_MAIN_PAY);
+        p->pay_first = 0; p->last = healthy->count - 1u;
+        p->describe_first = p->commit_first = p->commit_second = UINT_MAX;
+        for (unsigned i = 0; i < healthy->count; ++i) {
+            if (healthy->consumed[i] == DIFF_MAIN_DESCRIBE
+                && p->describe_first == UINT_MAX) p->describe_first = i;
+            if (healthy->consumed[i] == DIFF_MAIN_COMMIT) {
+                if (p->commit_first == UINT_MAX) p->commit_first = i;
+                else if (p->commit_second == UINT_MAX) p->commit_second = i;
+            }
+        }
+        CHECK(p->describe_first != UINT_MAX && p->commit_second != UINT_MAX);
+        p->pay_cancel = UINT_MAX;
+        for (unsigned i = p->commit_first + 1u; i < p->commit_second; ++i)
+            if (healthy->consumed[i] == DIFF_MAIN_PAY) {
+                p->pay_cancel = i; break;
+            }
+        CHECK(p->pay_cancel != UINT_MAX);
+    }
+    p->previous_advanced = wl_columnar_session_test_main_action_advanced;
+    diff_main_probe = p;
+    wl_columnar_session_test_main_limit = diff_main_limit;
+    wl_columnar_session_test_main_action_report = diff_main_report;
+    wl_columnar_session_test_main_action_advanced = diff_main_advanced;
+    int rc = observed_multi_step(session);
+    wl_columnar_session_test_main_limit = NULL;
+    wl_columnar_session_test_main_action_report = NULL;
+    wl_columnar_session_test_main_action_advanced = p->previous_advanced;
+    diff_main_probe = NULL;
+    CHECK(!rc && !wl_session_step(reference) && !p->refusing
+        && !p->cancelling);
+
+    wl_col_session_t *cs = (wl_col_session_t *)session;
+    CHECK(!cs->diff_txn_count && actual->count == expected->count);
+    wl_mem_ledger_snapshot(&cs->mem_ledger, &p->ledger);
+    CHECK(!wl_evaluation_control_report(control, &p->original));
+    qsort(actual->events, actual->count, sizeof(actual->events[0]),
+        observed_multi_order);
+    qsort(expected->events, expected->count, sizeof(expected->events[0]),
+        observed_multi_order);
+    CHECK(!memcmp(actual->events, expected->events,
+        actual->count * sizeof(actual->events[0])));
+    CHECK(!wl_session_try_destroy(&session));
+    wl_session_destroy(reference);
+    wl_evaluation_control_release(control);
+    wl_plan_free(plan); wirelog_program_free(program);
+    CHECK(!wl_columnar_memory_reserved(
+            wl_columnar_memory_governor_ref_get(governor)));
+    wl_columnar_memory_governor_ref_release(governor);
+    free(actual); free(expected);
+    p->session = NULL;
+}
+
+/* An actual observed transaction retires its old differential arrangement
+ * through MAIN_DIFF. One short of a payment or description refuses it with
+ * nothing spent. A COMMIT refused at its first charge spends nothing, and at
+ * its ROUND charge keeps the first charge; either way its description was
+ * consumed, so an acknowledgement and a fresh description precede the retry.
+ * A cancel after a payment keeps its effect. The injected history performs
+ * exactly the healthy sequence with those two actions before each refused
+ * commit, and delivers the reference session's events. */
+static void
+test_controlled_persistent_diff_main_stops(void)
+{
+    diff_main_probe_t *healthy = calloc(1, sizeof(*healthy));
+    diff_main_probe_t *injected = calloc(1, sizeof(*injected));
+    CHECK(healthy && injected);
+    diff_main_history(healthy, NULL);
+    printf("observed MAIN_DIFF: %u actions per healthy retirement\n",
+        healthy->count);
+    CHECK(healthy->count >= 3u && !healthy->refused && !healthy->cancelled);
+    injected->inject = true;
+    diff_main_history(injected, healthy);
+    CHECK(injected->refused == 5u && injected->cancelled == 1u
+        && injected->inserted == 4u
+        && injected->count == healthy->count + 4u);
+    unsigned j = 0;
+    for (unsigned i = 0; i < healthy->count; ++i) {
+        if (i == injected->commit_first || i == injected->commit_second) {
+            CHECK(injected->consumed[j] == DIFF_MAIN_PAY
+                && injected->consumed[j + 1u] == DIFF_MAIN_DESCRIBE);
+            j += 2u;
+        }
+        CHECK(injected->consumed[j++] == healthy->consumed[i]);
+    }
+    CHECK(j == injected->count);
+    /* MAIN refusals, cancels and the repeated acknowledgement and
+     * description leave the ledger settled exactly as the healthy history
+     * does, and never touch the original control's work or result. */
+    CHECK(injected->ledger.current_bytes == healthy->ledger.current_bytes
+        && !memcmp(injected->ledger.subsys_bytes, healthy->ledger.subsys_bytes,
+        sizeof(healthy->ledger.subsys_bytes)));
+    CHECK(injected->original.consumed == healthy->original.consumed
+        && injected->original.limit == healthy->original.limit
+        && injected->original.stop_reason == healthy->original.stop_reason
+        && injected->original.execution_status
+        == healthy->original.execution_status
+        && injected->original.cleanup_status
+        == healthy->original.cleanup_status
+        && injected->original.result == healthy->original.result);
+    free(healthy); free(injected);
+}
+
 static unsigned persistent_stop_phase, persistent_stop_hits;
 static bool persistent_stop_work, persistent_stopped;
 static void
@@ -20006,6 +20292,9 @@ main(int argc, char **argv)
     }
     if (argc == 2 && !strcmp(argv[1], "--frontier-main-stops")) {
         test_controlled_recursive_frontier_main_stops(); return 0;
+    }
+    if (argc == 2 && !strcmp(argv[1], "--diff-main-stops")) {
+        test_controlled_persistent_diff_main_stops(); return 0;
     }
     if (argc == 2 && !strcmp(argv[1], "--merge-ack-main-stops")) {
         test_controlled_recursive_merge_ack_main_stops();
