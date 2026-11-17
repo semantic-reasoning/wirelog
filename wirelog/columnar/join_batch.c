@@ -2614,7 +2614,11 @@ enum {
     WL_COLUMNAR_JOIN_BATCH_PREP_SCRATCH,
     WL_COLUMNAR_JOIN_BATCH_PREP_CONTINUATION,
     WL_COLUMNAR_JOIN_BATCH_PREP_BIND,
-    WL_COLUMNAR_JOIN_BATCH_PREP_READY
+    WL_COLUMNAR_JOIN_BATCH_PREP_READY,
+    /* Keep existing setup phase IDs stable. Each map action returns after
+    * one authenticated chunk, independently of the logical map length. */
+    WL_COLUMNAR_JOIN_BATCH_PREP_LEFT_MAP,
+    WL_COLUMNAR_JOIN_BATCH_PREP_RIGHT_MAP
 };
 
 #ifdef WL_SESSION_TEST_HOOKS
@@ -2727,8 +2731,15 @@ wl_columnar_join_batch_prepare_action(wl_columnar_join_batch_prepare_t *a)
         if (!wl_columnar_relation_snapshot_valid(a->left_snapshot)
             || !wl_columnar_relation_snapshot_valid(a->right_snapshot)
             || l->nrows > l->capacity || r->nrows > r->capacity) return EINVAL;
-        if (l->compound_kind != WIRELOG_COMPOUND_KIND_NONE
-            || r->compound_kind != WIRELOG_COMPOUND_KIND_NONE) return ENOTSUP;
+        /* Existing acquired descriptor/owner readers protect this fixed
+         * NONE check too. Ordinary scalar preparation keeps its old phases
+         * and tariffs; malformed scalar metadata cannot bypass validation. */
+        if ((l->compound_kind == WIRELOG_COMPOUND_KIND_NONE &&
+            (l->compound_count || l->compound_arity_map || l->compound_arity_len
+            || l->inline_physical_offset)) ||
+            (r->compound_kind == WIRELOG_COMPOUND_KIND_NONE &&
+            (r->compound_count || r->compound_arity_map || r->compound_arity_len
+            || r->inline_physical_offset))) return EINVAL;
         if (a->op->project_count && !a->op->project_indices) return EINVAL;
         uint64_t width = a->op->project_count ? a->op->project_count
             : (uint64_t)l->ncols + r->ncols;
@@ -2744,8 +2755,30 @@ wl_columnar_join_batch_prepare_action(wl_columnar_join_batch_prepare_t *a)
             ? a->rows_per_batch : COL_REL_INIT_CAP;
         a->arrangement.generation = 1;
         a->arrangement.nbuckets = r->nrows ? 1 : 16;
-        a->phase = WL_COLUMNAR_JOIN_BATCH_PREP_KEYS;
+        a->cursor = 0; a->row = 0;
+        a->phase = l->compound_kind != WIRELOG_COMPOUND_KIND_NONE
+            ? WL_COLUMNAR_JOIN_BATCH_PREP_LEFT_MAP
+            : r->compound_kind != WIRELOG_COMPOUND_KIND_NONE
+            ? WL_COLUMNAR_JOIN_BATCH_PREP_RIGHT_MAP :
+            WL_COLUMNAR_JOIN_BATCH_PREP_KEYS;
         return 0;
+    }
+    case WL_COLUMNAR_JOIN_BATCH_PREP_LEFT_MAP:
+    case WL_COLUMNAR_JOIN_BATCH_PREP_RIGHT_MAP: {
+        bool left = a->phase == WL_COLUMNAR_JOIN_BATCH_PREP_LEFT_MAP;
+        bool complete = false;
+        rc = wl_columnar_relation_compound_map_step_controlled(
+            left ? a->left : a->right,
+            left ? &a->left_reader : &a->right_reader,
+            &a->cursor, &a->row, &complete, a->control, a->attempt_id);
+        if (!rc && complete) {
+            a->cursor = 0; a->row = 0;
+            a->phase = left &&
+                a->right->compound_kind != WIRELOG_COMPOUND_KIND_NONE
+                ? WL_COLUMNAR_JOIN_BATCH_PREP_RIGHT_MAP :
+                WL_COLUMNAR_JOIN_BATCH_PREP_KEYS;
+        }
+        return rc;
     }
     case WL_COLUMNAR_JOIN_BATCH_PREP_KEYS:
         if (a->cursor < a->key_count) {

@@ -2342,8 +2342,16 @@ wl_columnar_eval_stack_stream_enter_owned(
         return EBUSY;
     eval_entry_t *entry = &stack->items[stack->top - 1];
     if (entry->seg_boundaries || entry->seg_count
-        || entry->rel == input || entry->rel->compound_kind
-        != WIRELOG_COMPOUND_KIND_NONE) return ENOTSUP;
+        || entry->rel == input) return ENOTSUP;
+    /* Kind is only the existing routing hint. No compound original may be
+     * parked until the real host binds its exact prepared source/readers. */
+    if (entry->rel->compound_kind != WIRELOG_COMPOUND_KIND_NONE) {
+        if (entry->rel->compound_kind != WIRELOG_COMPOUND_KIND_INLINE)
+            return ENOTSUP;
+        rc = wl_columnar_join_pipeline_stream_original_admit(owner, frame,
+                host, entry->rel);
+        if (rc) return rc;
+    }
     const wl_columnar_eval_plan_numeric_attempt_t *numeric = owner;
     rc = wl_evaluation_control_charge_attempt(numeric->control,
             numeric->attempt_id, 128);
@@ -2432,6 +2440,10 @@ wl_columnar_eval_stack_stream_restore_owned(
     frame->stream_host = NULL; frame->stream_input = NULL;
     frame->stream_generation = 0; frame->stream_top = 0;
     frame->stream_schema = false;
+#ifdef WL_SESSION_TEST_HOOKS
+    if (wl_columnar_join_pipeline_test_after_restore)
+        wl_columnar_join_pipeline_test_after_restore(owner, frame, host);
+#endif
     return 0;
 }
 
@@ -7590,6 +7602,21 @@ wl_columnar_eval_stack_auto_close_ready(
 }
 
 #ifdef WL_SESSION_TEST_HOOKS
+int
+wl_columnar_eval_stack_test_stream_original(
+    const wl_columnar_eval_stack_cleanup_frame_t *f, const void *owner,
+    eval_entry_t *out)
+{
+    if (!f || !owner || !f->session || f->session->cleanup_active != f
+        || f->numeric_plan_owner != owner
+        || !wl_columnar_eval_plan_numeric_owner_valid(owner, f)
+        || !wl_columnar_eval_stack_unary_frame_valid(f)
+        || !wl_columnar_eval_stack_protocol_copy_output(f, out, sizeof(*out)))
+        return EINVAL;
+    *out = f->stream_original;
+    return 0;
+}
+
 /* Test-only bounded copied observation. Pointer values are comparison tokens,
  * never permits to query/mutate a native receipt via the manual API. */
 int

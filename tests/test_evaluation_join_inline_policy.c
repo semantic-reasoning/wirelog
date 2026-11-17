@@ -4,10 +4,12 @@
 #endif
 #include "../wirelog/columnar/internal.h"
 #include "../wirelog/columnar/join_pipeline.h"
+#include "../wirelog/columnar/join_batch.h"
 #include "../wirelog/exec_plan_gen.h"
 #include "../wirelog/session.h"
 #include "../wirelog/session_options.h"
 #include "../wirelog/wirelog.h"
+#include "../wirelog/thread.h"
 #include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -18,6 +20,12 @@
 
 static wl_session_t *active;
 static unsigned held, produced, successors, cache_steps;
+static unsigned consumers, before_acks, after_acks, prepared_inline;
+static uint64_t ack_generation;
+static const wl_columnar_join_batch_prepare_t *actual_prepare;
+static eval_entry_t saved_original;
+static unsigned restored, exchanged, schema_exchanges, stream_stop;
+static bool stream_stopped;
 static unsigned cap_limit, cache_mode, descriptor_mode;
 static void
 configure(const char *name, const char *value)
@@ -45,6 +53,144 @@ host(wl_evaluation_control_t *control, unsigned event, uint64_t gen,
     if (event == WL_COLUMNAR_JOIN_PIPELINE_TEST_PRODUCE) ++produced;
     if (event == WL_COLUMNAR_JOIN_PIPELINE_TEST_STRICT_SUCCESSOR) ++successors;
     if (event == WL_COLUMNAR_JOIN_PIPELINE_TEST_STRICT_CACHE) ++cache_steps;
+    if (event == WL_COLUMNAR_JOIN_PIPELINE_TEST_CONSUMER) ++consumers;
+    if (event == WL_COLUMNAR_JOIN_PIPELINE_TEST_EXCHANGED) {
+        ++exchanged;
+        wl_columnar_eval_stack_cleanup_frame_t *frame =
+            COL_SESSION(active)->cleanup_active;
+        wl_columnar_eval_serial_framed_attempt_t *root = NULL;
+        CHECK(!wl_columnar_eval_stack_framed_context(frame, COL_SESSION(active),
+            &root));
+        eval_entry_t parked;
+        CHECK(!wl_columnar_eval_stack_test_stream_original(frame, &root->child,
+            &parked));
+        const col_rel_t *input = NULL; const wl_plan_op_t *op = NULL;
+        uint64_t generation = 0; bool schema = false;
+        CHECK(!wl_columnar_join_pipeline_test_stream_view(&root->child, &input,
+            &generation, &schema, &op));
+        CHECK(parked.rel == saved_original.rel &&
+            parked.owned == saved_original.owned
+            && parked.is_delta == saved_original.is_delta
+            && input && input->compound_kind == WIRELOG_COMPOUND_KIND_NONE);
+        if (stream_stop && !stream_stopped) {
+            stream_stopped = true;
+            if (stream_stop == 1) wl_evaluation_control_request_cancel(control);
+            else CHECK(wl_evaluation_control_charge_attempt(control,
+                    wl_evaluation_control_active_attempt_id(control),
+                    UINT64_C(1000000000)) == WL_EVALUATION_CONTROL_WORK_LIMIT);
+        }
+    }
+    if (event == WL_COLUMNAR_JOIN_PIPELINE_TEST_BEFORE_ACK) ++before_acks;
+    if (event == WL_COLUMNAR_JOIN_PIPELINE_TEST_AFTER_ACK) {
+        CHECK(gen == ++ack_generation); ++after_acks;
+    }
+}
+static void
+prepare_observe(const wl_columnar_join_batch_prepare_t *a)
+{
+    actual_prepare = a;
+    if (a->phase < 4) return;
+    const col_rel_t *sources[] = {a->left, a->right};
+    const wl_columnar_source_access_reader_t *readers[] =
+    {&a->left_reader, &a->right_reader};
+    for (unsigned i = 0; i < 2; ++i) {
+        CHECK(readers[i]->identity == (uintptr_t)readers[i]
+            && readers[i]->secondary_owner == &sources[i]->descriptor_access
+            && readers[i]->owner == &sources[i]->storage_owner->source_access);
+        if (sources[i]->compound_kind == WIRELOG_COMPOUND_KIND_INLINE)
+            prepared_inline |= 1u << i;
+    }
+}
+struct original_foreign {
+    const void *owner, *host;
+    wl_columnar_eval_stack_cleanup_frame_t *frame;
+    const col_rel_t *original;
+};
+static void *
+original_foreign_thread(void *payload)
+{
+    const struct original_foreign *p = payload;
+    CHECK(wl_columnar_join_pipeline_stream_original_admit(p->owner, p->frame,
+        p->host, p->original) == EINVAL);
+    return NULL;
+}
+static void
+before_exchange(const void *owner,
+    wl_columnar_eval_stack_cleanup_frame_t *frame,
+    const void *host_owner, const col_rel_t *input, uint64_t generation,
+    bool schema)
+{
+    eval_stack_t *stack = wl_columnar_eval_stack_cleanup_stack(frame);
+    eval_entry_t parked;
+    CHECK(stack && stack->top &&
+        !wl_columnar_eval_stack_test_stream_original(frame, owner,
+        &parked) && !parked.rel);
+    eval_entry_t *entry = &stack->items[stack->top - 1];
+    saved_original = *entry;
+    if (schema) ++schema_exchanges;
+    CHECK(actual_prepare && actual_prepare->left == entry->rel
+        && actual_prepare->ready && !actual_prepare->aborting);
+    CHECK(!wl_columnar_join_pipeline_stream_authorized(owner, frame, host_owner,
+        WL_COLUMNAR_JOIN_STREAM_ENTER, NULL, input, generation + 1, schema));
+    CHECK(wl_columnar_eval_stack_stream_enter_owned(frame, owner, host_owner,
+        entry->rel, generation, schema, false) == EINVAL);
+    if (entry->rel->compound_kind == WIRELOG_COMPOUND_KIND_INLINE) {
+        col_rel_t foreign = *entry->rel;
+        CHECK(wl_columnar_join_pipeline_stream_original_admit(owner, frame,
+            host_owner, &foreign) == EINVAL);
+        CHECK(wl_columnar_join_pipeline_stream_original_admit(owner, frame,
+            (const void *)(uintptr_t)1, entry->rel) == EINVAL);
+        wl_columnar_eval_plan_numeric_attempt_t copy =
+            *(const wl_columnar_eval_plan_numeric_attempt_t *)owner;
+        CHECK(wl_columnar_join_pipeline_stream_original_admit(&copy, frame,
+            host_owner, entry->rel) == EINVAL);
+        wl_columnar_join_batch_prepare_t *p =
+            (wl_columnar_join_batch_prepare_t *)actual_prepare;
+        uintptr_t identity = p->left_reader.identity;
+        p->left_reader.identity = 0;
+        CHECK(wl_columnar_join_pipeline_stream_original_admit(owner, frame,
+            host_owner, entry->rel) == EINVAL);
+        p->left_reader.identity = identity;
+        p->left_reader.acquire_stage = 1;
+        CHECK(wl_columnar_join_pipeline_stream_original_admit(owner, frame,
+            host_owner, entry->rel) == EINVAL);
+        p->left_reader.acquire_stage = 0;
+        uint64_t id = p->attempt_id; ++p->attempt_id;
+        CHECK(wl_columnar_join_pipeline_stream_original_admit(owner, frame,
+            host_owner, entry->rel) == EINVAL);
+        p->attempt_id = id;
+        struct original_foreign payload = {owner, host_owner, frame,
+                                           entry->rel};
+        wl_thread_t thread;
+        CHECK(!wl_thread_create(&thread, original_foreign_thread, &payload)
+            && !wl_thread_join(&thread));
+        CHECK(!wl_columnar_join_pipeline_stream_original_admit(owner, frame,
+            host_owner, entry->rel));
+    }
+    CHECK(entry->rel == saved_original.rel &&
+        entry->owned == saved_original.owned
+        && entry->is_delta == saved_original.is_delta
+        && !wl_columnar_eval_stack_test_stream_original(frame, owner,
+        &parked) && !parked.rel);
+}
+static void
+after_restore(const void *owner, wl_columnar_eval_stack_cleanup_frame_t *frame,
+    const void *host_owner)
+{
+    (void)owner; (void)host_owner;
+    eval_stack_t *stack = wl_columnar_eval_stack_cleanup_stack(frame);
+    eval_entry_t parked;
+    CHECK(stack && stack->top &&
+        !wl_columnar_eval_stack_test_stream_original(frame, owner,
+        &parked) && !parked.rel);
+    eval_entry_t *entry = &stack->items[stack->top - 1];
+    CHECK(entry->rel == saved_original.rel &&
+        entry->owned == saved_original.owned
+        && entry->is_delta == saved_original.is_delta
+        && actual_prepare->left_reader.owner
+        && actual_prepare->left_reader.secondary_owner ==
+        &entry->rel->descriptor_access);
+    ++restored;
 }
 static void
 gather(wl_evaluation_control_t *control, unsigned phase, uint64_t progress)
@@ -122,7 +268,7 @@ run(unsigned kind, bool strict, unsigned bytes, unsigned shape, bool empty)
     CHECK(!strcmp(p->ops[ji].left_keys[0], li ? "col2" : "col0")
         && !strcmp(p->ops[ji].right_keys[0], ri ? "col2" : "col0"));
     wl_evaluation_control_t *control = NULL;
-    CHECK(!wl_evaluation_control_create(0, &control));
+    CHECK(!wl_evaluation_control_create(UINT64_C(1000000000), &control));
     wl_session_options_t options; wl_session_options_init(&options);
     options.evaluation_control = control;
     wl_session_t *s = NULL, *raw = NULL;
@@ -137,13 +283,21 @@ run(unsigned kind, bool strict, unsigned bytes, unsigned shape, bool empty)
     configure("WIRELOG_JOIN_BATCH_BYTES", NULL);
     configure("WIRELOG_JOIN_BATCH_STRICT", NULL);
     const int64_t left[] = {91, 92, 1, 7, 93, 94, 2, 9, 95, 96, 3, 11};
-    const int64_t right[] = {81, 82, 1, 8, 83, 84, 2, 10, 85, 86, 4, 12};
-    const int64_t ls[] = {1, 7, 2, 9, 3, 11}, rs[] = {1, 8, 2, 10, 4, 12};
+    const int64_t right[] = {81, 82, 1, 8, 83, 84, 2, 10, 85, 86, 4, 12,
+                             87, 88, 1, 6};
+    const int64_t ls[] = {1, 7, 2, 9, 3, 11}, rs[] = {1, 8, 2, 10, 4, 12, 1, 6};
     wl_session_t *sessions[] = {s, raw};
     for (unsigned i = 0; i < 2; ++i) {
         CHECK(!wl_session_insert(sessions[i], "a", li ? left : ls,
             empty ? 0 : 3, li ? 4 : 2));
-        CHECK(!wl_session_insert(sessions[i], "b", ri ? right : rs, 3,
+        if (empty && shape == 2) {
+            CHECK(!wl_session_insert(sessions[i], "a", li ? left : ls, 1,
+                li ? 4 : 2));
+            CHECK(!wl_session_remove(sessions[i], "a", li ? left : ls, 1,
+                li ? 4 : 2));
+        }
+        CHECK(!wl_session_insert(sessions[i], "b", ri ? right : rs,
+            shape == 2 ? 4 : 3,
             ri ? 4 : 2));
     }
     /* Internal cache/error fixtures use genuine cache insertion and pins;
@@ -171,11 +325,21 @@ run(unsigned kind, bool strict, unsigned bytes, unsigned shape, bool empty)
             : (wirelog_compound_kind_t)99;
     }
     active = s; held = produced = successors = cache_steps = 0;
+    consumers = before_acks = after_acks = prepared_inline = 0;
+    ack_generation = 0;
+    restored = exchanged = schema_exchanges = 0;
+    stream_stopped = false;
+    wl_columnar_join_pipeline_test_before_exchange = before_exchange;
+    wl_columnar_join_pipeline_test_after_restore = after_restore;
+    wl_columnar_join_batch_test_prepare_checkpoint = prepare_observe;
     wl_columnar_join_pipeline_test_numeric_checkpoint = host;
     wl_columnar_join_test_attempt_checkpoint = gather;
     int rc = finish(s);
+    wl_columnar_join_batch_test_prepare_checkpoint = NULL;
     wl_columnar_join_test_attempt_checkpoint = NULL;
     wl_columnar_join_pipeline_test_numeric_checkpoint = NULL;
+    wl_columnar_join_pipeline_test_before_exchange = NULL;
+    wl_columnar_join_pipeline_test_after_restore = NULL;
     if (descriptor_mode == 1) bad->compound_arity_map[0] = saved_map;
     else if (descriptor_mode) bad->compound_kind = saved_kind;
     int rr = finish(raw);
@@ -183,12 +347,18 @@ run(unsigned kind, bool strict, unsigned bytes, unsigned shape, bool empty)
         : strict && !empty && cache_mode == 2 ? EBUSY
         : strict && !empty && bytes < 16 ? ENOTSUP
         : !empty && shape != 1 && cap_limit && cap_limit <= 2 ? EOVERFLOW : 0;
-    int expected = descriptor_mode == 1 ? EINVAL
+    int expected = stream_stop == 1 ? WL_EVALUATION_CONTROL_CANCELLED
+        : stream_stop == 2 ? WL_EVALUATION_CONTROL_WORK_LIMIT
+        : descriptor_mode == 1 ? EINVAL
         : descriptor_mode == 2 ? ENOTSUP : descriptor_mode == 3 ? EINVAL
-        : shape == 2 && kind != 3 ? ENOTSUP : raw_expected;
+        : raw_expected;
     if (rc != expected || rr != raw_expected) fprintf(stderr,
             "kind=%u strict=%u bytes=%u shape=%u empty=%u rc=%d/%d raw=%d/%d\n",
             kind, strict, bytes, shape, empty, rc, expected, rr, raw_expected);
+    if (rc != expected) fprintf(stderr,
+            "prepared_inline=%u produce=%u consumer=%u ack=%u phase=%u\n",
+            prepared_inline, produced, consumers, after_acks,
+            wl_columnar_session_test_native_error_phase(COL_SESSION(s)));
     CHECK(rc == expected && rr == raw_expected);
     verify(s, expected || empty || shape == 1);
     verify(raw, raw_expected || empty || shape == 1);
@@ -199,6 +369,16 @@ run(unsigned kind, bool strict, unsigned bytes, unsigned shape, bool empty)
     if (!expected && !empty && !shape) {
         CHECK(kind == 3 && bytes >= 16 ? produced > 0 : !produced);
         CHECK(held == (kind == 3 ? 0u : kind == 2 ? 3u : kind == 0 ? 1u : 2u));
+    }
+    if (shape == 2 && !expected && !empty) {
+        CHECK(produced && consumers && before_acks &&
+            before_acks == after_acks);
+        CHECK(prepared_inline ==
+            (kind == 3 ? 0u : kind == 2 ? 3u : kind == 0 ? 1u : 2u));
+    }
+    if (shape == 2 && empty) CHECK(schema_exchanges && restored == exchanged);
+    if (stream_stop) {
+        CHECK(stream_stopped && exchanged == 1 && restored == exchanged);
     }
     if (strict && shape != 2 && !empty &&
         !descriptor_mode) CHECK(successors > 0);
@@ -211,6 +391,10 @@ run(unsigned kind, bool strict, unsigned bytes, unsigned shape, bool empty)
          * stopped session/input is retried after restoring these policies. */
         COL_SESSION(s)->join_output_limit = 3;
         COL_SESSION(s)->join_batch_bytes = 256;
+        CHECK(!wl_evaluation_control_reset(control) && !finish(s));
+        verify(s, false);
+    }
+    if (stream_stop) {
         CHECK(!wl_evaluation_control_reset(control) && !finish(s));
         verify(s, false);
     }
@@ -244,7 +428,7 @@ private_right(void)
         }
     CHECK(found);
     wl_evaluation_control_t *control = NULL;
-    CHECK(!wl_evaluation_control_create(0, &control));
+    CHECK(!wl_evaluation_control_create(UINT64_C(1000000000), &control));
     wl_session_options_t options; wl_session_options_init(&options);
     options.evaluation_control = control;
     wl_session_t *s = NULL, *raw = NULL;
@@ -313,6 +497,12 @@ main(void)
             run(kind, true, 256, 1, false); /* source before successor */
         }
         descriptor_mode = 0;
+    }
+    for (unsigned kind = 0; kind < 3; ++kind) {
+        run(kind, true, 256, 2, true);
+        for (stream_stop = 1; stream_stop <= 2; ++stream_stop)
+            run(kind, false, 256, 2, false);
+        stream_stop = 0;
     }
     private_right();
     return 0;

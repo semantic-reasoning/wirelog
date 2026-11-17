@@ -5781,6 +5781,20 @@ int col_rel_source_reader_acquire_step(const col_rel_t *,
     wl_columnar_source_access_reader_t *, bool *);
 int col_rel_source_reader_acquire_transferable(const col_rel_t *,
     wl_columnar_source_access_reader_t *);
+/* Authenticate this original nontransferable dual reader, then validate at
+ * most eight INLINE arities. cursor/width are caller-owned algorithm scratch,
+ * initially0, reset for each source; done is true only at the end. No lease is
+ * acquired/released. The prepare caller retains its saved Original binding;
+ * reader tokens themselves do not encode a control. NONE is also checked,
+ * SIDE stays unsupported. A stopped/refused call does not advance scratch. */
+/* Fixed held-reader/schema check without scanning or admitting a map. */
+int wl_columnar_relation_compound_reader_check_controlled(const col_rel_t *,
+    const wl_columnar_source_access_reader_t *, wl_evaluation_control_t *,
+    uint64_t);
+int wl_columnar_relation_compound_map_step_controlled(const col_rel_t *,
+    const wl_columnar_source_access_reader_t *, uint64_t *cursor,
+    uint32_t *width, bool *done, wl_evaluation_control_t *, uint64_t);
+
 /* One transferable reader transition per call. Original token storage and
  * canonical relation remain live and externally serialized until both gates
  * are released. EAGAIN means retry, including a successful descriptor-only
@@ -8654,6 +8668,13 @@ int wl_columnar_eval_stack_numeric_source_install(
 int wl_columnar_eval_stack_numeric_source_release(
     wl_columnar_eval_stack_cleanup_frame_t *, wl_col_session_t *,
     wl_columnar_eval_plan_numeric_attempt_t *);
+
+#ifdef WL_SESSION_TEST_HOOKS
+/* Copied parked-entry observation at actual stream hooks; no authority loan. */
+int wl_columnar_eval_stack_test_stream_original(
+    const wl_columnar_eval_stack_cleanup_frame_t *, const void *,
+    eval_entry_t *);
+#endif
 
 /* Exact segment authority routes; NULL denotes an unbound standalone frame.
  * Owner arguments are original stable records, not transferable capabilities. */

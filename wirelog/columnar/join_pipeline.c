@@ -1488,6 +1488,14 @@ wl_columnar_join_host_valid(const void *owner,
            && h->op == &r->plan->ops[r->cursor] ? h : NULL;
 }
 
+#ifdef WL_SESSION_TEST_HOOKS
+void (*wl_columnar_join_pipeline_test_before_exchange)(const void *,
+    wl_columnar_eval_stack_cleanup_frame_t *, const void *, const col_rel_t *,
+    uint64_t, bool);
+void (*wl_columnar_join_pipeline_test_after_restore)(const void *,
+    wl_columnar_eval_stack_cleanup_frame_t *, const void *);
+#endif
+
 bool
 wl_columnar_join_pipeline_stream_authorized(const void *owner,
     const wl_columnar_eval_stack_cleanup_frame_t *frame, const void *host,
@@ -1525,6 +1533,35 @@ wl_columnar_join_pipeline_stream_authorized(const void *owner,
                && h->consumer_status.progress ==
                WL_COLUMNAR_FILTER_PROGRESS_DONE);
     return false;
+}
+
+int
+wl_columnar_join_pipeline_stream_original_admit(const void *owner,
+    const wl_columnar_eval_stack_cleanup_frame_t *frame, const void *host,
+    const col_rel_t *original)
+{
+    const wl_columnar_join_host_t *h = wl_columnar_join_host_valid(owner,
+            frame);
+    if (!h || h != host) return EINVAL;
+    int rc = wl_columnar_join_host_original((wl_columnar_join_host_t *)h, 128);
+    if (rc) return rc;
+    if (!wl_columnar_join_pipeline_stream_authorized(owner, frame, host,
+        WL_COLUMNAR_JOIN_STREAM_ENTER, NULL, h->pending, h->generation,
+        h->schema_exchange)
+        || original != h->left || original != h->prepare.left
+        || h->prepare.identity != &h->prepare || h->prepare.op != h->op
+        || h->prepare.control != h->parent->control
+        || h->prepare.attempt_id != h->parent->attempt_id) return EINVAL;
+    /* Exact pointer binding precedes any supplied-original payload reads.
+     * READY already completed the map check; both prepare readers stay held
+     * through every exchange/restore, so no rescan or new lease is needed. */
+    rc = wl_columnar_relation_compound_reader_check_controlled(original,
+            &h->prepare.left_reader, h->parent->control, h->parent->attempt_id);
+    if (rc) return rc;
+    if (original->compound_kind != WIRELOG_COMPOUND_KIND_INLINE) return ENOTSUP;
+    if (!wl_columnar_relation_snapshot_equal(h->prepare.left_snapshot,
+        wl_columnar_relation_snapshot(original))) return EAGAIN;
+    return wl_columnar_join_host_original((wl_columnar_join_host_t *)h, 0);
 }
 
 int
@@ -1893,8 +1930,8 @@ wl_columnar_join_host_forward(wl_columnar_join_host_t *h)
         return rc;
     case WL_COLUMNAR_JOIN_HOST_LEFT_HOLD:
         rc = wl_columnar_relation_scalar_source_admit_attempt_controlled(
-            &h->left_source, h->left, false, h->streaming ? 0u
-            : WL_COLUMNAR_RELATION_SOURCE_ADMIT_INLINE);
+            &h->left_source, h->left, false,
+            WL_COLUMNAR_RELATION_SOURCE_ADMIT_INLINE);
         if (!rc) h->phase = WL_COLUMNAR_JOIN_HOST_FULL;
         return rc;
     case WL_COLUMNAR_JOIN_HOST_FULL:
@@ -1970,8 +2007,8 @@ wl_columnar_join_host_forward(wl_columnar_join_host_t *h)
         return rc;
     case WL_COLUMNAR_JOIN_HOST_RIGHT_HOLD: {
         rc = wl_columnar_relation_scalar_source_admit_attempt_controlled(
-            &h->right_source, h->right, false, h->streaming ? 0u
-            : WL_COLUMNAR_RELATION_SOURCE_ADMIT_INLINE);
+            &h->right_source, h->right, false,
+            WL_COLUMNAR_RELATION_SOURCE_ADMIT_INLINE);
         if (rc) return rc;
         if (!h->left_source.width || !h->right_source.width) return EINVAL;
         uint64_t width = op->project_count ? op->project_count
@@ -2227,10 +2264,10 @@ wl_columnar_join_host_forward(wl_columnar_join_host_t *h)
             h->phase = WL_COLUMNAR_JOIN_HOST_ABORT;
             return 0;
         }
-        /* INLINE lanes are consumed by the ordinary bounded JOIN, after
+        /* No-tail INLINE lanes use the ordinary bounded JOIN, after
          * the same strict successor/cache/row-fit checks as a scalar host.
          * Drain both authenticated readers before handing off. Streaming
-         * tails retain their scalar-only admission and post-consumer caps. */
+         * tails use their authenticated producer and post-consumer caps. */
         if (!h->streaming &&
             (h->left_source.descriptor->compound_kind ==
             WIRELOG_COMPOUND_KIND_INLINE ||
@@ -2375,6 +2412,11 @@ wl_columnar_join_host_forward(wl_columnar_join_host_t *h)
         return 0;
     }
     case WL_COLUMNAR_JOIN_HOST_EXCHANGE:
+#ifdef WL_SESSION_TEST_HOOKS
+        if (wl_columnar_join_pipeline_test_before_exchange)
+            wl_columnar_join_pipeline_test_before_exchange(r, r->frame, h,
+                h->pending, h->generation, h->schema_exchange);
+#endif
         rc = wl_columnar_eval_stack_stream_enter_owned(r->frame, r, h,
                 h->pending, h->generation, h->schema_exchange, false);
         if (!rc) {
