@@ -149,10 +149,12 @@ thread identity. Still outstanding:
   step. It is 912 bytes on native MSVC and 1056 with MSVC C11, from the
   probes above, and 984 on Linux LP64 as recorded in `SERIAL_COVERAGE.md`.
   The four `eval_stack.c` owners (frame cancel and drained clears, prepared
-  `FINISH_CLEAR_SCALAR` and `DECLINE_CLEAR`) now clear one 64-byte chunk per
-  funded action under a compile-time bound; the prepare abort in
-  `join_batch.c`, `wl_columnar_join_host_retire` and
-  `wl_columnar_lftj_attempt_release` still clear in one step.
+  `FINISH_CLEAR_SCALAR` and `DECLINE_CLEAR`) and the drained prepare abort in
+  `join_batch.c` now clear one 64-byte chunk per funded action; a
+  compile-time guard keeps the step count within its `uint8_t` index. The
+  per-action price bound is sourced only for the `eval_stack.c` owners.
+  `wl_columnar_join_host_retire` and `wl_columnar_lftj_attempt_release`
+  still clear in one step.
 - The remaining method and resource items below.
 
 ## Remaining method/resource work
