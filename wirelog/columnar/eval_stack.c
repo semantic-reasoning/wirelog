@@ -361,6 +361,7 @@ struct wl_columnar_eval_stack_cleanup_frame {
         unary_scalar_initializer;
     col_rel_t *unary_scalar_init_target;
     bool unary_scalar_cancel_clear, unary_scalar_drained, unary_scalar_busy;
+    uint8_t unary_scalar_clear_chunk;
     wl_columnar_filter_context_t filter;
     const void *numeric_plan_owner;
     const void *stream_host;
@@ -1891,6 +1892,14 @@ wl_columnar_eval_stack_unary_prepare_scalar_retirement_owned_body(
     return 0;
 }
 
+/* SERIAL_COVERAGE prices a scalar clear action as the receipt's eight-byte
+ * units plus at most 87 fixed caller units (210/256 with the 123-unit Linux
+ * LP64 receipt). A chunked action replaces the receipt term with one chunk,
+ * so every clear action fits its 256 whatever the receipt layout. */
+typedef char wl_columnar_eval_stack_scalar_clear_action_bound[
+        WL_COLUMNAR_RELATION_SCALAR_CLEAR_CHUNK / 8u + (210u - 123u) <= 256u
+        ? 1 : -1];
+
 static int
 wl_columnar_eval_stack_unary_finish_scalar_funded_owned_body(
     wl_columnar_eval_stack_cleanup_frame_t *frame, int initiating_result,
@@ -1954,8 +1963,11 @@ wl_columnar_eval_stack_unary_finish_scalar_funded_owned_body(
         if (frame->unary_scalar_cancel_clear) {
             rc = wl_evaluation_control_charge_attempt(funding, funding_id, 256);
             if (rc) return rc;
-            memset(&frame->unary_scalar_retirement, 0,
-                sizeof(frame->unary_scalar_retirement));
+            bool cleared = false;
+            rc = wl_columnar_relation_scalar_retirement_clear_chunk(
+                &frame->unary_scalar_retirement,
+                &frame->unary_scalar_clear_chunk, &cleared);
+            if (rc || !cleared) return rc;
             frame->unary_scalar_started = frame->unary_scalar_prepared = false;
             frame->unary_scalar_for_old = frame->unary_scalar_cancel_clear =
                 false;
@@ -1973,8 +1985,11 @@ wl_columnar_eval_stack_unary_finish_scalar_funded_owned_body(
     if (frame->unary_scalar_drained) {
         rc = wl_evaluation_control_charge_attempt(funding, funding_id, 256);
         if (rc) return rc;
-        memset(&frame->unary_scalar_retirement, 0,
-            sizeof(frame->unary_scalar_retirement));
+        bool cleared = false;
+        rc = wl_columnar_relation_scalar_retirement_clear_chunk(
+            &frame->unary_scalar_retirement,
+            &frame->unary_scalar_clear_chunk, &cleared);
+        if (rc || !cleared) return rc;
         frame->unary_scalar_started = frame->unary_scalar_committed = false;
         frame->unary_scalar_for_old = frame->unary_scalar_drained = false;
         frame->unary_cleanup_result = 0;
@@ -4949,6 +4964,7 @@ wl_columnar_eval_stack_test_unary_output_segments_owned(
         f->unary_scalar_drained
         || f->unary_scalar_initializer.identity ||
         f->unary_scalar_retirement.storage.identity
+        || f->unary_scalar_clear_chunk
         || ctx->identity != ctx || ctx->frame != f || ctx->session != f->session
         || ctx->stage != WL_COLUMNAR_FILTER_STAGE_FINISH || ctx->busy
         || !ctx->thread_valid || !ctx->unary_started || ctx->committed
@@ -5010,6 +5026,11 @@ wl_columnar_eval_stack_test_unary_observe(
         && frame->unary_scalar_retirement.ledger
         && (frame->unary_scalar_retirement.ledger_bytes
         || frame->unary_scalar_retirement.ledger_timestamp_bytes);
+    out->scalar_cancel_clear = frame->unary_scalar_cancel_clear;
+    out->scalar_drained = frame->unary_scalar_drained;
+    out->scalar_clear_chunk = frame->unary_scalar_clear_chunk;
+    memcpy(out->scalar_receipt, &frame->unary_scalar_retirement,
+        sizeof(out->scalar_receipt));
     for (unsigned i = 0; i < 4; ++i) {
         out->credit_started[i] = frame->unary_scalar_started
             && frame->unary_scalar_retirement.storage.receipt_started[i];
@@ -5734,7 +5755,8 @@ wl_columnar_eval_stack_prepared_join_confirm(
         f->unary_scalar_prepared
         || f->unary_scalar_committed || f->unary_scalar_for_old
         || f->unary_scalar_initializer.identity ||
-        f->unary_scalar_retirement.storage.identity)
+        f->unary_scalar_retirement.storage.identity
+        || f->unary_scalar_clear_chunk)
         return EINVAL;
     return p->join_mode && p->publication_is_delta != ctx->join_result_is_delta
            ? EINVAL : 0;
@@ -6365,7 +6387,8 @@ wl_columnar_eval_stack_prepared_operator_finish_state(
         || f->unary_scalar_for_old || f->unary_scalar_busy
         || f->unary_scalar_init_target || f->unary_scalar_cancel_clear
         || f->unary_scalar_drained || f->unary_scalar_initializer.identity
-        || f->unary_scalar_retirement.storage.identity) return EBUSY;
+        || f->unary_scalar_retirement.storage.identity
+        || f->unary_scalar_clear_chunk) return EBUSY;
     return 0;
 }
 
@@ -6504,7 +6527,8 @@ wl_columnar_eval_stack_prepared_finish_head(
         f->unary_scalar_prepared
         || f->unary_scalar_committed || f->unary_scalar_for_old
         || f->unary_scalar_initializer.identity ||
-        f->unary_scalar_retirement.storage.identity)
+        f->unary_scalar_retirement.storage.identity
+        || f->unary_scalar_clear_chunk)
         return EINVAL;
     eval_entry_t *entry =
         f->unary_committed ? &f->unary_retired : &f->unary_output;
@@ -6730,10 +6754,17 @@ wl_columnar_eval_stack_prepared_finish_body(
     case WL_COLUMNAR_EVAL_STACK_PREPARED_FINISH_CLEAR_SCALAR:
         if (f->unary_scalar_init_target || f->unary_scalar_initializer.identity
             || (f->unary_scalar_started
-            && s->storage.phase !=
+            && !f->unary_scalar_clear_chunk && s->storage.phase !=
             WL_COLUMNAR_RELATION_MANAGED_RETIREMENT_DONE))
+            /* Physical DONE is proven before the first chunk; later chunks
+             * may already have zeroed the storage phase. */
             return EBUSY;
-        memset(s, 0, sizeof(*s));
+        {
+            bool cleared = false;
+            int rc = wl_columnar_relation_scalar_retirement_clear_chunk(s,
+                    &f->unary_scalar_clear_chunk, &cleared);
+            if (rc || !cleared) return rc;
+        }
         f->unary_scalar_mode = f->unary_scalar_started =
             f->unary_scalar_prepared = false;
         f->unary_scalar_committed = f->unary_scalar_for_old = false;
@@ -6764,8 +6795,12 @@ wl_columnar_eval_stack_prepared_finish_body(
         p->phase = WL_COLUMNAR_EVAL_STACK_PREPARED_FINISH_DECLINE_CLEAR;
         return 0;
     }
-    case WL_COLUMNAR_EVAL_STACK_PREPARED_FINISH_DECLINE_CLEAR:
-        memset(s, 0, sizeof(*s));
+    case WL_COLUMNAR_EVAL_STACK_PREPARED_FINISH_DECLINE_CLEAR: {
+        bool cleared = false;
+        int rc = wl_columnar_relation_scalar_retirement_clear_chunk(s,
+                &f->unary_scalar_clear_chunk, &cleared);
+        if (rc || !cleared) return rc;
+    }
         f->unary_scalar_started = f->unary_scalar_prepared =
             f->unary_scalar_committed = false;
         f->unary_scalar_for_old = f->unary_scalar_cancel_clear =

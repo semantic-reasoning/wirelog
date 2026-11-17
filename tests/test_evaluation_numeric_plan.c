@@ -8239,10 +8239,118 @@ test_composed_concat_stopped_retirement_retry(void)
     composed_close(&f);
 }
 
+/* A scalar retirement receipt is zeroed in CHUNK-byte steps, one funded
+ * action each, so the step count follows the compiled receipt layout while
+ * the price of a step stays 256. */
+static unsigned
+scalar_clear_steps(void)
+{
+    const size_t chunk = WL_COLUMNAR_RELATION_SCALAR_CLEAR_CHUNK;
+    return (unsigned)((sizeof(wl_columnar_relation_scalar_retirement_t)
+           + chunk - 1u) / chunk);
+}
+
+static bool
+scalar_clear_refused_at(unsigned index)
+{
+    const unsigned steps = scalar_clear_steps();
+    return index == 0u || index == steps / 2u || index == steps - 1u;
+}
+
+/* One frame-owned clear turn: a one-short grant at the first, middle and last
+ * chunk changes nothing, and the exact grant clears exactly one chunk. */
+static void
+scalar_clear_turn(fixture_t *f, unsigned index, int initiating, int *semantic,
+    bool *done)
+{
+    wl_columnar_eval_stack_test_unary_observation_t before, after;
+    memset(&before, 0, sizeof(before));
+    CHECK(!wl_columnar_eval_stack_test_unary_observe(f->frame, &f->record,
+        &before));
+    for (unsigned exact = scalar_clear_refused_at(index) ? 0u : 1u;
+        exact < 2u; ++exact) {
+        int owner;
+        wl_evaluation_control_t *funding = control_new(256u - !exact, &owner);
+        uint64_t id = wl_evaluation_control_active_attempt_id(funding);
+        int rc = wl_columnar_eval_stack_unary_finish_scalar_funded_owned(
+            f->frame, initiating, &f->record, funding, id, semantic, done);
+        wl_evaluation_control_report_t report;
+        CHECK(wl_evaluation_control_finish(funding, &owner,
+            rc == WL_EVALUATION_CONTROL_WORK_LIMIT ? rc : 0, 0)
+            == (rc == WL_EVALUATION_CONTROL_WORK_LIMIT ? rc : 0));
+        CHECK(!wl_evaluation_control_report(funding, &report));
+        CHECK(!wl_evaluation_control_detach(funding, &owner));
+        wl_evaluation_control_release(funding);
+        memset(&after, 0, sizeof(after));
+        CHECK(!wl_columnar_eval_stack_test_unary_observe(f->frame, &f->record,
+            &after));
+        if (!exact) {
+            CHECK(rc == WL_EVALUATION_CONTROL_WORK_LIMIT && !report.consumed
+                && !*done && !memcmp(&before, &after, sizeof(before)));
+            continue;
+        }
+        const unsigned steps = scalar_clear_steps();
+        const size_t chunk = WL_COLUMNAR_RELATION_SCALAR_CLEAR_CHUNK;
+        const size_t size = sizeof(before.scalar_receipt);
+        const size_t end = size - (size_t)index * chunk;
+        const size_t begin = end > chunk ? end - chunk : 0;
+        CHECK(!rc && report.consumed == 256u);
+        if (index + 1u < steps) {
+            CHECK(!*done && after.scalar_clear_chunk == index + 1u
+                && after.scalar_cancel_clear == before.scalar_cancel_clear
+                && after.scalar_drained == before.scalar_drained
+                && !memcmp(after.scalar_receipt, before.scalar_receipt, begin));
+        } else {
+            CHECK(!after.scalar_clear_chunk && !after.scalar_cancel_clear
+                && !after.scalar_drained);
+        }
+        for (size_t i = begin; i != size; ++i)
+            CHECK(!after.scalar_receipt[i]);
+    }
+}
+
+/* The shared step zeroes the receipt from its end toward its start, so its
+ * storage identity is the last thing cleared, and it refuses an index past
+ * the final step without touching a byte. */
+static void
+test_scalar_retirement_clear_chunk_exact(void)
+{
+    const unsigned steps = scalar_clear_steps();
+    const size_t chunk = WL_COLUMNAR_RELATION_SCALAR_CLEAR_CHUNK;
+    wl_columnar_relation_scalar_retirement_t r;
+    printf("scalar retirement receipt %u B (%u clear steps)\n",
+        (unsigned)sizeof(r), steps);
+    CHECK(chunk == 64u && steps >= 2u);
+    memset(&r, 0xA5, sizeof(r));
+    unsigned char image[sizeof(r)];
+    uint8_t index = (uint8_t)steps;
+    bool done = true;
+    memcpy(image, &r, sizeof(r));
+    CHECK(wl_columnar_relation_scalar_retirement_clear_chunk(&r, &index,
+        &done) == EINVAL && index == steps && done
+        && !memcmp(image, &r, sizeof(r)));
+    CHECK(wl_columnar_relation_scalar_retirement_clear_chunk(NULL, &index,
+        &done) == EINVAL);
+    index = 0;
+    for (unsigned k = 0; k != steps; ++k) {
+        const size_t end = sizeof(r) - (size_t)k * chunk;
+        const size_t begin = end > chunk ? end - chunk : 0;
+        done = k == 0u;
+        CHECK(!wl_columnar_relation_scalar_retirement_clear_chunk(&r, &index,
+            &done));
+        const unsigned char *bytes = (const unsigned char *)&r;
+        for (size_t i = 0; i != begin; ++i) CHECK(bytes[i] == 0xA5);
+        for (size_t i = begin; i != sizeof(r); ++i) CHECK(!bytes[i]);
+        CHECK(done == (k + 1u == steps)
+            && index == (done ? 0u : k + 1u));
+    }
+}
+
 static void
 test_numeric_funded_scalar_finish(void)
 {
     const uint32_t widths[] = {1, 65, 257};
+    bool cleared_cancel = false, cleared_drained = false;
     for (unsigned w = 0; w < 3; ++w)
         for (unsigned owned = 0; owned < 2; ++owned)
             for (unsigned commit = 0; commit < 2; ++commit) {
@@ -8317,8 +8425,23 @@ test_numeric_funded_scalar_finish(void)
                     &f.record) == EBUSY);
                 CHECK(wl_columnar_eval_stack_cleanup_finish(&f.frame) == EBUSY);
                 done = false;
+                unsigned clear_turns = 0;
                 for (unsigned turn = 0; !done; ++turn) {
                     CHECK(turn < 100000);
+                    wl_columnar_eval_stack_test_unary_observation_t o;
+                    CHECK(!wl_columnar_eval_stack_test_unary_observe(f.frame,
+                        &f.record, &o));
+                    if (o.scalar_cancel_clear || o.scalar_drained) {
+                        CHECK(o.scalar_clear_chunk
+                            == clear_turns % scalar_clear_steps());
+                        cleared_cancel |= o.scalar_cancel_clear;
+                        cleared_drained |= o.scalar_drained;
+                        scalar_clear_turn(&f,
+                            clear_turns % scalar_clear_steps(), turn ? EIO
+                            : initiating, &semantic, &done);
+                        ++clear_turns;
+                        continue;
+                    }
                     int funding_owner;
                     wl_evaluation_control_t *funding = control_new(384,
                             &funding_owner);
@@ -8339,6 +8462,9 @@ test_numeric_funded_scalar_finish(void)
                         &funding_owner));
                     wl_evaluation_control_release(funding);
                 }
+                /* Each begun receipt is cleared in exactly STEPS turns; a
+                 * finish without one clears nothing. */
+                CHECK(clear_turns % scalar_clear_steps() == 0u);
                 CHECK(!wl_evaluation_control_report(f.operation, &after)
                     && after.attempt_id == original.attempt_id
                     && after.consumed == original.consumed
@@ -8357,6 +8483,7 @@ test_numeric_funded_scalar_finish(void)
                 wl_columnar_memory_governor_ref_release(governor);
                 free(codes); free(values);
             }
+    CHECK(cleared_cancel && cleared_drained);
 }
 
 static void
@@ -14154,7 +14281,7 @@ test_prepared_join_finish_boundaries(void)
         wl_columnar_eval_plan_numeric_attempt_t parent;
         memcpy(&parent, &f->record, sizeof(parent));
         bool saw_payload = false, saw_ledger = false, saw_credit = false;
-        unsigned initializer_phases = 0;
+        unsigned initializer_phases = 0, clear_turns = 0;
         for (unsigned turn = 0;
             p.phase != WL_COLUMNAR_EVAL_STACK_PREPARED_ACK_READY; ++turn){
             CHECK(turn < 100000);
@@ -14167,6 +14294,8 @@ test_prepared_join_finish_boundaries(void)
                 prepared_finish_schedule(phase, &before);
             if (phase == WL_COLUMNAR_EVAL_STACK_PREPARED_FINISH_INIT)
                 initializer_phases |= 1u << before.scalar_init_phase;
+            if (phase == WL_COLUMNAR_EVAL_STACK_PREPARED_FINISH_CLEAR_SCALAR)
+                CHECK(before.scalar_clear_chunk == clear_turns++);
             saw_payload |= phase ==
                 WL_COLUMNAR_EVAL_STACK_PREPARED_FINISH_PREPARE
                 && before.scalar_phase ==
@@ -14218,6 +14347,14 @@ test_prepared_join_finish_boundaries(void)
                 initializer_phases, saw_payload, saw_ledger, saw_credit);
         CHECK(initializer_phases == 31 && saw_payload && saw_ledger &&
             saw_credit);
+        {
+            wl_columnar_eval_stack_test_unary_observation_t o;
+            CHECK(!wl_columnar_eval_stack_test_unary_observe(f->frame,
+                &f->record, &o));
+            CHECK(clear_turns == scalar_clear_steps() && !o.scalar_clear_chunk);
+            for (size_t i = 0; i != sizeof(o.scalar_receipt); ++i)
+                CHECK(!o.scalar_receipt[i]);
+        }
         CHECK(prepared_finish_grant(&p, f, 191, false, true, &spent)
             == WL_EVALUATION_CONTROL_WORK_LIMIT && !spent);
         CHECK(!prepared_finish_grant(&p, f, 192, false, true,
@@ -14691,6 +14828,7 @@ test_prepared_join_finish_partial_decline(void)
         {WL_COLUMNAR_EVAL_STACK_PREPARED_FINISH_PREPARE, -1, 16, 0, 0},
         {WL_COLUMNAR_EVAL_STACK_PREPARED_FINISH_COMMIT, -1, -1, 0, 0}
     };
+    bool decline_cleared = false;
     for (unsigned pending = 0; pending < 2; ++pending)
         for (unsigned target = 0; target < sizeof(targets) / sizeof(targets[0]);
             ++target){
@@ -14738,6 +14876,7 @@ test_prepared_join_finish_partial_decline(void)
                 && !spent && !memcmp(image, &p, sizeof(p)));
             CHECK(!prepared_finish_decline_grant(&p, 128,
                 &spent) && spent == 128);
+            unsigned decline_clears = 0;
             for (unsigned turn = 0;
                 p.phase != WL_COLUMNAR_EVAL_STACK_PREPARED_ACK_READY; ++turn){
                 CHECK(turn < 100000);
@@ -14755,6 +14894,7 @@ test_prepared_join_finish_partial_decline(void)
                 case WL_COLUMNAR_EVAL_STACK_PREPARED_FINISH_DECLINE_CLAIMS:
                     schedule = (prepared_finish_schedule_t){0, 256, 0}; break;
                 case WL_COLUMNAR_EVAL_STACK_PREPARED_FINISH_DECLINE_CLEAR:
+                    CHECK(observed.scalar_clear_chunk == decline_clears++);
                     schedule = (prepared_finish_schedule_t){256, 256, 0}; break;
                 case WL_COLUMNAR_EVAL_STACK_PREPARED_FINISH_DECLINE_RESTORE:
                 case WL_COLUMNAR_EVAL_STACK_PREPARED_FINISH_CLEAR_WORK:
@@ -14776,6 +14916,10 @@ test_prepared_join_finish_partial_decline(void)
                     && spent == schedule.total
                     && !memcmp(&parent, &m.f.record, sizeof(parent)));
             }
+            /* A decline that skips DECLINE_CLEAR clears nothing; one that
+             * runs it clears every chunk, even of a never-begun receipt. */
+            CHECK(!decline_clears || decline_clears == scalar_clear_steps());
+            decline_cleared |= decline_clears != 0;
             CHECK(m.context->stage == WL_COLUMNAR_FILTER_STAGE_FINISH
                 && m.context->private_output && !m.context->semantic_result
                 && !m.context->execution_result
@@ -14803,6 +14947,7 @@ test_prepared_join_finish_partial_decline(void)
                 history.cleanup_result == WL_EVALUATION_CONTROL_WORK_LIMIT
                 && history.result_saved == (target != 0));
         }
+    CHECK(decline_cleared);
 }
 
 static void
@@ -17391,6 +17536,7 @@ main(void)
     test_prepared_join_finish_wide();
     test_prepared_initializer_external_journal();
     test_prepared_init_chunk_exact();
+    test_scalar_retirement_clear_chunk_exact();
     test_prepared_unary_actual_lifecycle();
     test_prepared_unary_original_boundaries();
     test_prepared_unary_cancelled_parent_cleanup();

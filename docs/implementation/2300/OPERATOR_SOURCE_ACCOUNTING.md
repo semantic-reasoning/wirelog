@@ -335,7 +335,7 @@ and containing serial/native caller bounds must be qualified at integration.
 | HEAD completed-resource or scratch / disposition / fixed handoff | 112 / 112 / 96 |
 | generic non-HEAD delegation prefix / decline prefix | 144 / 144 |
 | segments / selection / commit / ordinary dispose | 82 / 95 / 190 / 161 |
-| ledger wrapper / scalar clear / claim release / decline restore | 121 / 211 / 189 / 71 |
+| ledger wrapper / scalar clear chunk / claim release / decline restore | 121 / 96 / 189 / 71 |
 | work clear / ACK / error or footer | 99 / 125 / 48 |
 | scalar INIT BOOT first prefix / post128 / ZERO / BIND / RESET | 176 / 144 / 208 / 224 / 192 |
 | finite timestamp payload including the generic return | 192 |
@@ -359,9 +359,9 @@ old helpers respectively: their uppers become89 and72.
 | COMMIT | 192 |
 | ordinary DISPOSE / native credit | 256+1 / 256+64 |
 | ledger DISPOSE12 with actual debt | 128+109+166+28 |
-| scalar clear / work clear / ACK | 256 / 128 / 192 |
+| each scalar clear chunk / work clear / ACK | 256 / 128 / 192 |
 | decline / partial initializer reset if needed | 128 / 128 |
-| decline claims / clear / restore / work clear | 256 / 256 / 128 / 128 |
+| decline claims / each clear chunk / restore / work clear | 256 / 256 / 128 / 128 |
 
 The inherited native charge/lower identities remain distinct; in particular
 BOOT's real overlap lower64 precedes its128. No earlier setup intent pays for
