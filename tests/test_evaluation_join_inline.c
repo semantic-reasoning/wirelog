@@ -30,7 +30,8 @@ typedef struct {
     capture_t events;
 } fixture_t;
 static fixture_t *active;
-static bool configured, streamed, stream_strict, pressure;
+static bool configured, streamed, stream_strict, pressure, cap_policy;
+static unsigned cap_limit;
 enum {
     PRESSURE_PREPARE_DENIED = 10,
     PRESSURE_SINK_DENIED,
@@ -551,8 +552,14 @@ run(unsigned kind, unsigned route, unsigned fault)
                 else right_change(&f, sessions[i], 4, false);
             } else right_change(&f, sessions[i], 0, true);
         }
+        if (stage == 1 && cap_policy) {
+            /* Equal internal policy pressure on the same pending successor. */
+            COL_SESSION(f.s)->join_output_limit = cap_limit;
+            COL_SESSION(f.raw)->join_output_limit = cap_limit;
+        }
         capture_t snap = {0}, raw_snap = {0};
-        if (stage == 1 && fault) {
+        if (stage == 1 && (fault || cap_policy) &&
+            (!cap_policy || cap_limit < 4)) {
             mode = fault; pairs = 0; stopped = false;
             if (pressure) {
                 pressure_denials_before = wl_columnar_memory_denials(
@@ -572,7 +579,8 @@ run(unsigned kind, unsigned route, unsigned fault)
             if (rn) memcpy(rm, right->compound_arity_map, rn * sizeof(*rm));
             if (streamed && fault == 9) COL_SESSION(f.s)->join_output_limit = 3;
             int rc = evaluate(&f, f.s, &snap);
-            int wanted = pressure ? (fault <= PRESSURE_ACK_DENIED
+            int wanted = cap_policy ? EOVERFLOW : pressure ? (fault <=
+                PRESSURE_ACK_DENIED
                 ? ENOSPC : ENOMEM) : streamed && fault == 9 ? EOVERFLOW
                 : (fault %
                 2 ? WL_EVALUATION_CONTROL_CANCELLED :
@@ -581,7 +589,8 @@ run(unsigned kind, unsigned route, unsigned fault)
                     "pressure kind=%u route=%u fault=%u strict=%u rc=%d expected=%d triggered=%u first_error=%u\n",
                     kind, route, fault, stream_strict, rc, wanted,
                     pressure_triggered, pressure_error_seen);
-            CHECK((pressure || (streamed && fault == 9) ? !stopped : stopped) &&
+            CHECK((cap_policy || pressure ||
+                (streamed && fault == 9) ? !stopped : stopped) &&
                 rc == wanted
                 && !snap.count && !f.events.count &&
                 COL_SESSION(f.s)->pending_input_change
@@ -611,15 +620,38 @@ run(unsigned kind, unsigned route, unsigned fault)
                 CHECK(!wl_columnar_join_batch_test_prepare_fail_allocation
                     && !wl_columnar_relation_test_constructor_fail_allocation);
             }
+            if (cap_policy) {
+                capture_t failed_raw = {0};
+                CHECK(COL_SESSION(f.s)->join_output_limit == cap_limit &&
+                    COL_SESSION(f.raw)->join_output_limit == cap_limit);
+                int raw_failure = evaluate(&f, f.raw, &failed_raw);
+                if (raw_failure != EOVERFLOW) fprintf(stderr,
+                        "cap kind=%u route=%u strict=%u limit=%u raw=%d\n",
+                        kind, route, stream_strict, cap_limit, raw_failure);
+                CHECK(raw_failure == EOVERFLOW && !failed_raw.count);
+                /* Raw status is qualified under equal pressure; controlled
+                 * old-head rollback is the distinct transaction assertion. */
+                sources_writable(left, right);
+            }
             CHECK(!wl_evaluation_control_reset(f.control)); mode = 0;
+            if (cap_policy) {
+                COL_SESSION(f.s)->join_output_limit = 4;
+                COL_SESSION(f.raw)->join_output_limit = 4;
+            }
             if (streamed && fault == 9) COL_SESSION(f.s)->join_output_limit = 4;
         }
+        unsigned produced_before = stream_produced, acked_before = stream_acked,
+            rejected_before = stream_rejected, kept_before = stream_kept;
         int controlled_rc = evaluate(&f, f.s, &snap);
         int raw_rc = evaluate(&f, f.raw, &raw_snap);
         if (controlled_rc || raw_rc) fprintf(stderr,
                 "kind=%u route=%u fault=%u stage=%u controlled=%d raw=%d\n",
                 kind, route, fault, stage, controlled_rc, raw_rc);
         CHECK(!controlled_rc && !raw_rc);
+        if (cap_policy && stage == 1) CHECK(stream_produced > produced_before
+                && stream_acked > acked_before &&
+                stream_rejected > rejected_before
+                && stream_kept > kept_before);
         capture_t want = expected(&f, stage > 0, stage == 2);
         image(f.s, &want, kind >= 2); image(f.raw, &want, kind >= 2);
         if (route == 2) {
@@ -658,11 +690,14 @@ run(unsigned kind, unsigned route, unsigned fault)
 }
 int main(int argc, char **argv)
 {
+    cap_policy = argc >= 2 && !strncmp(argv[1], "cap-", 4);
     pressure = argc >= 2 && !strncmp(argv[1], "pressure-", 9);
-    streamed = pressure || (argc >= 2 && !strncmp(argv[1], "streamed-", 9));
+    streamed = cap_policy || pressure ||
+        (argc >= 2 && !strncmp(argv[1], "streamed-", 9));
     CHECK(argc == (streamed ? 4 : 2));
     configured = streamed || !strncmp(argv[1], "configured-", 11);
-    const char *name = streamed ? argv[1] + 9 : configured ? argv[1] +
+    const char *name = cap_policy ? argv[1] + 4 : streamed ? argv[1] +
+        9 : configured ? argv[1] +
         11 : argv[1];
     unsigned route = !strcmp(name, "observed") ? 0 : !strcmp(name,
             "plain") ? 1 : 2;
@@ -671,10 +706,16 @@ int main(int argc, char **argv)
         unsigned kind = (unsigned)strtoul(argv[2], NULL, 10);
         stream_strict = !strcmp(argv[3], "1");
         CHECK(kind < 3 && (!strcmp(argv[3], "0") || stream_strict));
-        for (unsigned fault = pressure ? PRESSURE_PREPARE_DENIED : 0;
-            fault < (pressure ? PRESSURE_SINK_ALLOC + 1 : 10); ++fault) {
-            if (!pressure && kind != 2 && (fault == 1 || fault == 2)) continue;
-            run(kind, route, fault);
+        if (cap_policy) {
+            for (cap_limit = 2; cap_limit <= 4;
+                ++cap_limit) run(kind, route, 0);
+        } else {
+            for (unsigned fault = pressure ? PRESSURE_PREPARE_DENIED : 0;
+                fault < (pressure ? PRESSURE_SINK_ALLOC + 1 : 10); ++fault) {
+                if (!pressure && kind != 2 &&
+                    (fault == 1 || fault == 2)) continue;
+                run(kind, route, fault);
+            }
         }
     } else for (unsigned kind = 0; kind < (configured ? 3u : 4u); ++kind)
             for (unsigned fault = 0; fault < 3;
