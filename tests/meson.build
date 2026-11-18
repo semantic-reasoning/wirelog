@@ -3517,7 +3517,7 @@ endforeach
 
 foreach body_inline_side : ['left', 'middle', 'right']
   foreach body_inline_route : ['observed', 'plain', 'snapshot']
-    foreach body_inline_mode : ['plain', 'batch']
+    foreach body_inline_mode : ['plain', 'batch', 'strict', 'limit-denied', 'batch-cancel', 'batch-work']
       test('evaluation_materialized_body_inline_' + body_inline_side + '_' +
            body_inline_route + '_' + body_inline_mode,
            test_evaluation_materialized_body_exe,
@@ -3526,6 +3526,18 @@ foreach body_inline_side : ['left', 'middle', 'right']
                  'WIRELOG_JOIN_OUTPUT_LIMIT='],
            suite: ['unit', 'tsan', 'evaluation_join_hosts'], timeout: 120)
     endforeach
+  endforeach
+endforeach
+
+foreach body_inline_route : ['observed', 'plain', 'snapshot']
+  foreach body_inline_failure : ['batch-memory-first', 'batch-memory-successor',
+                                 'batch-alloc-first', 'batch-alloc-successor']
+    test('evaluation_materialized_body_inline_right_' + body_inline_route + '_' + body_inline_failure,
+         test_evaluation_materialized_body_exe,
+         args: [body_inline_failure, 'right', body_inline_route],
+         env: ['WIRELOG_JOIN_BATCH_BYTES=', 'WIRELOG_JOIN_BATCH_STRICT=',
+               'WIRELOG_JOIN_OUTPUT_LIMIT='],
+         suite: ['unit', 'tsan', 'evaluation_join_hosts'], timeout: 120)
   endforeach
 endforeach
 
