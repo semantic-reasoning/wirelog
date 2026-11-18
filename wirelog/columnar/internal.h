@@ -1185,9 +1185,13 @@ int wl_columnar_relation_mutable_image_prepare_empty(col_rel_t *source,
 int wl_columnar_merge_incremental_delta_attempt_begin(col_rel_t *source,
     uint32_t old_nrows, wl_columnar_merge_incremental_delta_attempt_t *attempt,
     wl_evaluation_control_t *control);
-/* Merge separately staged positive-arity INT64 tuples without modifying
- * candidate. The source must be a canonical sorted relation; candidate may
- * be unsorted. Zero-column, timestamped, and compound relations are unsupported.
+/* Merge separately staged positive-arity tuples with exactly matching
+ * INT64/STRING/FLOAT lane types and metadata, without modifying candidate.
+ * STRING lanes compare stored signed IDs; caller retains their intern lifetime.
+ * The source must contain valid canonical sorted values; candidate may
+ * be unsorted. Nonempty candidates validate FLOAT cells and canonicalize zero
+ * in private COPY; empty candidates are no-ops without source revalidation.
+ * Zero-column, timestamped, and compound relations are unsupported.
  * On commit, source becomes set(source U candidate) and delta is
  * set(candidate) - set(source). Inputs are held stable through commit/abort.
  * EAGAIN from advance is a same-control-attempt slice; terminal stops discard
