@@ -156,8 +156,21 @@ streamed ENOMEM versus controlled strict EBUSY is an explicit diagnostic gap.
 The [local interval derivation](OPERATOR_SOURCE_ACCOUNTING.md#streamed-inline-join-local-intervals)
 keeps logical tariffs, prepare action counts and scalar SOURCE distance distinct.
 It does not supply whole-caller, four-platform or inherited financial-carry
-certification. Complete cache reuse/selector intersections, new INLINE governor
-pressure, materialized/recursive representation, INLINE probe RHS, required
+certification.
+
+The subsequent [INLINE pressure and matching-cap increment](JOIN_DOMAIN_QUALIFICATION.md#inline-pressure-and-matching-cap-increment)
+adds90 real memory/allocation-failure histories and54 equal-cap histories,
+bringing the shared history file to363 histories. The61 INLINE test selections
+also include the unchanged141-scenario policy executable. The five pressure sites include a
+later genuine denial after positive private-output ACK; checked peer rollback
+returns capacity only after error selection. Controlled old-head/input/source
+retention and same-input retry remain distinct from raw cap-status/eventual-result
+evidence. Internal memory pressure is controlled-only; caps2/3/4 are applied to
+both sessions. These finite cases do not certify permanently exhausted cleanup
+or every intermediate live-session resource baseline.
+
+Complete cache reuse/selector intersections, remaining INLINE memory/type
+products, materialized/recursive representation, INLINE probe RHS, required
 signed timestamps/weights, containing Source/carry and current MSVC/platform
 qualification remain outstanding. All corresponding rows and #2371/#2300 remain
 OPEN.

@@ -80,7 +80,7 @@ MSVC and LLVM22-specific tidy evidence remain outstanding locally.
 
 ## Streamed INLINE producer and consuming increment
 
-This increment starts from merged #2380, main `675d8441`. Before the repair,
+This historical #2384 increment starts from merged #2380, main `675d8441`. Before the repair,
 six fitting strict-off/on left/right/both INLINE cases returned controlled
 ENOTSUP while raw produced literal `(7,8),(9,10)`. There are three matching
 JOIN candidates, including rejected `(7,6)`, but only two post-FILTER survivors;
@@ -172,10 +172,86 @@ producer/source components. These results do not replace MSVC CI or LLVM22 tidy.
 Local poll/interval derivations are recorded in
 [OPERATOR_SOURCE_ACCOUNTING.md](OPERATOR_SOURCE_ACCOUNTING.md#streamed-inline-join-local-intervals).
 They distinguish tariffs from SOURCE distance and do not certify containing
-caller/return or inherited correlated carry. Full cache/selector intersections,
-materialized INLINE, INLINE probe RHS, timestamp/weight propagation, new INLINE
-ENOSPC pressure, full platform and Native/Source/carry obligations remain OPEN.
-No row or issue is closed by this finite increment.
+caller/return or inherited correlated carry. At that checkpoint, full cache/
+selector intersections, materialized INLINE, INLINE probe RHS, timestamp/weight
+propagation, new INLINE ENOSPC pressure, full platform and Native/Source/carry
+obligations remained OPEN. The next increment supplies finite memory-pressure
+and matching-cap evidence. No row or issue is closed by either increment.
+
+## INLINE pressure and matching-cap increment
+
+This increment starts from merged #2384, main `37928b5f`. It changes the
+existing generated history fixture and its registrations, with no production
+algorithm, admission, ownership, quantum or tariff change. The five actual
+failure sites and matching-cap partition below add144 finite histories to the
+previous219, for363 in `test_evaluation_join_inline.c`. The policy executable
+retains its141 scenarios. There are61 registered INLINE test selections.
+
+The18 `evaluation_join_inline_pressure_*` selections run90 histories: three
+INLINE source sides, observed STEP/plain STEP/evaluating SNAPSHOT, strict0/1,
+and five successor failure sites. Initial empty and the old two-row public
+image are verified before adding the pending input that produces three surviving
+rows. Both-INLINE retains FLOAT keys, STRING/FLOAT prefix lanes and STRING
+output; the right-INLINE numeric control retains its generated x+1 MAP.
+
+| Site | Actual reached failure witness |
+|---|---|
+| Prepare SCRATCH ENOSPC | Phase11 after committed arrays credit, owned keys/hash-head/types/key-row and completed RHS indexing; a later real governed scratch admission refuses |
+| Sink ENOSPC | One-shot SINK_SCHEMA pressure before actual row-buffer/output admission, after scalar consumer work |
+| Positive-output ACK then ENOSPC | A current-successor ACK has positive output extent and genuine generation/work; a later real admission refuses with private output already acknowledged |
+| Owned-prefix prepare ENOMEM | Phase8/cursor2 after committed arrays credit and allocated keys/hash-head; the next prepare allocation consumes the existing failure hook |
+| Sink ENOMEM | One-shot constructor failure survives the first SINK_SCHEMA row-buffer turn and is consumed by the actual output constructor |
+
+The budget competitor is a genuine same-address RESERVED token on the enforcing
+controlled governor. It reserves actual available capacity minus one byte;
+there is no budget mutation or fabricated ENOSPC. First-error observation
+requires a real increase in the isolated governor's denial counter, then checks
+rollback success, RELEASED state and the exact reserved-byte decrement for that
+peer. Capacity returns only after the host selects the actual denial and before
+mandatory cleanup. This qualifies cleanup with restored capacity, not permanently
+exhausted-memory cleanup. Allocation failures instead require ENOMEM, consumed
+one-shot hooks and unchanged denial count. Session denial metadata distinguishes
+the two causes. Memory pressure is an internal controlled-only fixture; raw is
+an unpressured semantic reference.
+
+Every failure retains the exact controlled old head and literal image, pending
+input and original source snapshots/maps, with no premature callbacks/SNAPSHOT
+tuples. Reports preserve the initiating result with positive work and cleanup0.
+Actual writer acquisition/release on both public input sources succeeds after
+cleanup. Genuine reset retries the same pending input without reinsertion, then
+independent literal images/signed differences, deletion and unchanged repeats
+verify future behavior. Per-attempt ACK generations remain consecutive.
+The exact peer-refund delta is a local resource assertion; no unexplained
+pre-call/live-session reservation equality is claimed. Final zero is checked
+after all sessions/source-owned state are destroyed.
+
+The18 `evaluation_join_inline_cap_*` selections run54 histories under equal
+internal cap pressure on controlled and raw: the same three source sides,
+three output routes, strict0/1 and successor caps2/3/4 against three survivors.
+Limits2 and3 return EOVERFLOW in both sessions; cap4 succeeds despite four/five
+intermediate JOIN candidates. The latter witnesses actual producer/consumer/ACK
+and discriminates post-consumer extent from ordinary intermediate materialization.
+The FLOAT-key/STRING-output case supplies the typed boundary alongside numeric
+and MAP controls. These are finite partitions, not every type-by-side product.
+
+After controlled refusal the exact old head, input/source retention and report
+assertions remain active. Both caps are raised to4. The genuine controlled
+control is reset and retries its same pending input before the subsequent
+removal/unchanged history; raw is called again and matches eventual literal
+content. Raw status under the same cap and eventual content are qualified;
+controlled transactional head rollback is a separate assertion and is not
+inferred for raw. Direct live field changes qualify an internal policy boundary,
+not a public setter API.
+
+Clang23 JOIN hosts162/162, affected prepare/materialized-memory/threading
+components6/6, GCC16 INLINE61/61 and ASan/UBSan INLINE61/61 passed on the
+integrated code/test tree. The threading audit still covers621 exact source
+sites with its unchanged negative selftests. These functional/resource results
+add no new four-platform, whole-caller or Native/Source/carry certificate.
+Remaining tight-memory/type/selector/cache intersections, INLINE probe RHS,
+materialized/recursive representation, signed timestamps/weights, overflow and
+containing lifecycle/accounting/platform obligations remain OPEN. No issue or
+matrix row is closed by this increment.
 
 ## Finite scenario inventory
 
@@ -314,7 +390,7 @@ complete selectors, timestamp propagation, cache pins/reuse or full Source/carry
 | Pins and deferred rebuild/eviction | `join_right_filter_cleanup` managed cache/pinned fallback/admission tests; existing strict internal-cache fixtures | Missing authentic consuming intersections, with internal pin setup labelled as such; no new public primary-cache producer is invented |
 | Materialized policy/memory and future calls | All12 `evaluation_materialized_body_*` modes, host strict/policy/lifecycle suites | Remaining empty/wide/metadata/selector/cache-equivalence and containing bounds, not a primitive controlled-cache-hit claim |
 | Batch/pipeline, recursive/frontier and representations | Existing JOIN host suites and natural recursive materialized histories | Each accepted operator-by-representation and RUNNING/FINISH intersection, including required signed timestamps/weights; new callback sign checks are not full timestamp qualification |
-| Ordinary INLINE representation | Direct public fused-projection regression;36 generated histories with real held-reader retry;8 constructed admission boundaries | Remaining policy/selector/cache/materialized/metadata and other operator representation intersections |
+| Ordinary INLINE representation | Direct public fused-projection regression;363 generated histories including streamed producer/consumer/ACK,90 controlled memory failures and54 matching-cap histories;141 finite policy cases and constructed admission controls | Remaining memory/type/policy/selector/cache/materialized/metadata and other operator representation intersections |
 | Reached prepared ownership and disposal | Merged #2364, existing recovery/lifecycle fixtures | Remaining #2367/#2368 local funding/caller/ACK and MSVC-C11 layout qualification on the actual routes |
 | RUNNING/FINISH and containing accounting | Existing components and local interval notes | Reached #2369 adapters and #2370 full entry/return, Original/SOURCE identity and correlated Native/Source carry certificates |
 
@@ -361,8 +437,9 @@ run; do not infer a final-SHA full-suite result from an earlier in-flight run.
 MSVC and its conditional C11 actor profile have not been run in this Linux
 workspace. Passing Linux tests do not close those acceptance items or #2371.
 
-For the configured and streamed increments, after the same uv activation and
-Meson availability, the sanitizer setup above can be followed by:
+For the configured, streamed, memory-pressure and matching-cap increments,
+after the same uv activation and Meson availability, the sanitizer setup above
+can be followed by:
 
 ```sh
 python -m mesonbuild.mesonmain compile -C build-asan \
@@ -377,6 +454,7 @@ python -m mesonbuild.mesonmain test -C build-gcc --no-rebuild --print-errorlogs 
   'evaluation_join_inline_*'
 ```
 
-The wildcard now selects25 tests, including the policy executable and18
-streamed registrations (it selected seven at the historical #2380 checkpoint).
+The wildcard now selects61 tests: the policy executable, six ordinary/configured
+registrations, and18 each for streamed, pressure and matching-cap histories.
+It selected seven at the historical #2380 checkpoint and25 after #2384.
 Both executables must be compiled before using `--no-rebuild`.
