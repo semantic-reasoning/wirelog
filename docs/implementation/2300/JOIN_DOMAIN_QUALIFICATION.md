@@ -298,7 +298,7 @@ after both sessions, control, plan and program-owned intern bindings are freed.
 
 ## Actual materialized selection and memory pressure
 
-`evaluation_materialized_body` retains the natural compiler K-fusion lineage,
+The original twelve scalar `evaluation_materialized_body` modes retain the natural compiler K-fusion lineage,
 whole-SCC selection and authorized preserved-body identity. Its owned child
 JOINs have no primitive materialized flags. This accepted equivalent route is
 not a controlled materialization-cache hit.
@@ -324,6 +324,99 @@ the same injected pressure. These modes prove controlled admission/recovery;
 they do not claim equal-pressure raw denial or an allocator ENOMEM result.
 Existing `batch-error-ended` separately qualifies the injected allocation error
 and first-error-versus-ended-Original behavior.
+
+## Preserved K3 bodies consuming INLINE EDBs
+
+This increment starts from merged #2387, main `6b95b661`. It adds66 finite
+INLINE-EDB histories to the twelve original scalar materialized-body modes,
+for78 `evaluation_materialized_body_*` selections. The separate ordinary INLINE
+history file remains363 histories with its141-scenario policy executable in61
+selections. No runtime algorithm, policy, ownership protocol, tariff or quantum
+changes in this increment.
+
+The natural programs declare `edge(p:pair(symbol,float) inline,x:int64,y:int64)`
+and scalar INT64 `path`/`plain`. Three recursive path occurrences and one static
+INLINE edge occur in left, middle or right body position. Compiler-generated
+K3 lineage and the exact plan-owned opaque identity are required; expanded K
+sequences contain real materialized JOIN hints. The actual controlled private
+preserved body instead has three ordinary, opaque-free, materialized=false
+JOINs. This qualifies materialized-equivalent preserved-body consumption of
+INLINE EDBs, not a controlled literal-materialized/cache-hit primitive or an
+INLINE recursive head.
+
+Independent literal chain references give `path`7->9->5 and `plain`5->6->5:
+five initial edges plus `(1,5),(2,6)`, then appended6->7 and `(3,7)`, then
+removing3->4 leaves five base edges with no four-edge-derived path. These sets
+are independent of raw and the evaluator. Observed STEP checks exact signed
+relation-qualified differences; plain STEP installs no observer; evaluating
+SNAPSHOT omits delta observers and checks full path/plain tuple images after
+actual mutations. Unchanged repeats are separate checks. Heads remain scalar
+width2 INT64; STRING/FLOAT values belong to the EDB prefix, with physical x/y
+lanes2/3. No FLOAT recursive key or signed timestamp/weight product is implied.
+
+The18 healthy histories cover three placements, three public routes and
+plain/configured batch execution. Actual selected-body bindings and whole-SCC
+witnesses exclude scalar companion work from the INLINE counters. Ordinary
+consumption observes actual HELD sources, descriptor/storage readers, map and
+typed prefix, displaced keys and matching gathers. Configured late-INLINE
+consumption observes the real selected op's INLINE RHS, dual readers, owned
+arrays and complete nonempty RHS index, then that op's producer/ACK/completion.
+Stages0/1 require positive gathered rows or positive-output ACK. Deletion may
+have no derived output: actual INLINE RHS hash work or nonempty-left/RHS
+preparation and positive producer completion qualify that reached no-output
+work. Legal empty SCC visits cannot alone satisfy the separate positive stage
+witnesses.
+
+The48 additional policy/recovery histories are finite partitions:
+
+| Partition | Cases | Actual boundary |
+|---|---:|---|
+| Strict or cap1, all placements/routes | 18 | Both sessions independently return ENOTSUP or EOVERFLOW; clear strict/raise cap128 and retry the same facts. A scalar companion may refuse before INLINE consumption, so this is mixed-body policy evidence rather than an INLINE-specific refusal or cap equality with the final recursive head |
+| Successor CANCEL/WORK, all placements/routes | 18 | After publishing path7/plain5, append6->7. Stop actual HELD INLINE matching gather for left/middle or completed owned/indexed INLINE preparation for configured right; no INT-key private-cell stop is invented |
+| Right INLINE prepare ENOSPC/ENOMEM, initial/successor and all routes | 12 | Match the actual selected-body op and nonempty INLINE RHS/left. Deny governed SCRATCH after owned arrays/index, or consume a one-shot allocation failure after keys/hash-head prefix and committed arrays credit |
+
+Controlled failures preserve exact old path/plain heads and literal images (or
+the genuine initial-empty state), pending input and original edge snapshot/map,
+with zero early signed/tuple delivery. Reports retain the selected cause with
+positive work and cleanup0. Raw policy refusal status and eventual literal/signed
+history are checked, without imposing controlled pre-cutoff rollback guarantees
+on raw. Policy fields are internal; raising them is not public setter coverage.
+Faults are disarmed before genuine control reset and same-pending-input retry;
+subsequent removal and unchanged calls still match the independent references.
+
+The six observed/plain STEP WORK cases deliberately retain the genuine parent
+Origin/transaction and admitted metadata while child/receipt/native cleanup is
+drained. Read-only retained-owner observations require the actual binding,
+positive metadata bytes, EVALUATE/PENDING and closed generation, without a
+platform-size constant or assumed active private financier. The real source
+writer and valid public insert/remove, Snapshot and try_destroy remain EBUSY;
+the latter retains its caller pointer and emits no tuples. Every public report
+field and source/head snapshot stays unchanged across these protected probes.
+Plain STEP has no observer and supplies the unambiguous pending-parent Snapshot
+exclusion case. After real reset/retry, a freshly looked-up live input accepts
+a writer. Snapshot WORK, CANCEL and the tested positive-error dispositions
+instead permit immediate writer acquisition. Cleanup0 is therefore not a claim
+that every parent lease/metadata owner disappeared at every stopped return.
+
+Both sessions share the enforcing governor, but only controlled preparation
+receives injected memory pressure; raw runs before that injection. A real
+same-address RESERVED competitor consumes actual available capacity minus one.
+A genuine selected ENOSPC/denial-count increase precedes checked rollback,
+RELEASED state and exact peer-byte decrement, restoring capacity before mandatory
+cleanup. ENOMEM instead requires the intended consumed allocator knob and no
+denial-counter increase. This qualifies restored-capacity cleanup, not permanent
+exhaustion; final governor zero follows destruction of both sessions and all
+governed source-owned state. No unexplained live-source total-zero or complete
+intermediate financial-baseline equality is asserted.
+
+Clang23 JOIN hosts228/228, affected prepare/source-shape/threading checks5/5,
+GCC16 materialized-body78/78 and ASan/UBSan materialized-body78/78 passed on the
+integrated code/test tree. Exact621-site threading audit and its negative
+selftests remain unchanged. These results supply no new MSVC/TSan runtime,
+complete platform or Native/Source/carry certificate. Controlled literal-
+materialized cache hit/pin/reuse, full/delta/empty selector products, cold/wide/
+nullary and other compound products, recursive metadata and containing lifecycle/
+accounting obligations remain OPEN. No matrix row or issue is closed.
 
 ## Ordinary JOIN consuming INLINE sources
 
@@ -388,7 +481,7 @@ complete selectors, timestamp propagation, cache pins/reuse or full Source/carry
 | Full/delta/empty selectors and signed future changes | Existing direct selector fixtures, serial append dispatches and the new literal public histories | Bind each newly enabled route to actual source identity and all required selector partitions; phase7 alone is insufficient |
 | Persistent full unfiltered index and filtered/private fallback | `test_controlled_persistent_join`, persistent stop/refusal matrices in `test_evaluation_serial.c`; new literal public build/private witnesses | Complete consuming predicate/representation/policy and same-input cache equivalence; new tests do not claim reuse from output equality |
 | Pins and deferred rebuild/eviction | `join_right_filter_cleanup` managed cache/pinned fallback/admission tests; existing strict internal-cache fixtures | Missing authentic consuming intersections, with internal pin setup labelled as such; no new public primary-cache producer is invented |
-| Materialized policy/memory and future calls | All12 `evaluation_materialized_body_*` modes, host strict/policy/lifecycle suites | Remaining empty/wide/metadata/selector/cache-equivalence and containing bounds, not a primitive controlled-cache-hit claim |
+| Materialized policy/memory and future calls | All78 `evaluation_materialized_body_*` selections:12 original scalar and66 typed INLINE-EDB preserved-body histories; host strict/policy/lifecycle suites | Remaining empty/wide/metadata/selector/cache-equivalence and containing bounds, not a primitive controlled-cache-hit claim |
 | Batch/pipeline, recursive/frontier and representations | Existing JOIN host suites and natural recursive materialized histories | Each accepted operator-by-representation and RUNNING/FINISH intersection, including required signed timestamps/weights; new callback sign checks are not full timestamp qualification |
 | Ordinary INLINE representation | Direct public fused-projection regression;363 generated histories including streamed producer/consumer/ACK,90 controlled memory failures and54 matching-cap histories;141 finite policy cases and constructed admission controls | Remaining memory/type/policy/selector/cache/materialized/metadata and other operator representation intersections |
 | Reached prepared ownership and disposal | Merged #2364, existing recovery/lifecycle fixtures | Remaining #2367/#2368 local funding/caller/ACK and MSVC-C11 layout qualification on the actual routes |
@@ -458,3 +551,20 @@ The wildcard now selects61 tests: the policy executable, six ordinary/configured
 registrations, and18 each for streamed, pressure and matching-cap histories.
 It selected seven at the historical #2380 checkpoint and25 after #2384.
 Both executables must be compiled before using `--no-rebuild`.
+
+For the preserved K3 INLINE-EDB increment, after the same setup and activation:
+
+```sh
+python -m mesonbuild.mesonmain compile -C build-asan test_evaluation_materialized_body
+python -m mesonbuild.mesonmain test -C build-asan --no-rebuild --print-errorlogs \
+  'evaluation_materialized_body_*'
+python -m mesonbuild.mesonmain compile -C build-gcc test_evaluation_materialized_body
+python -m mesonbuild.mesonmain test -C build-gcc --no-rebuild --print-errorlogs \
+  'evaluation_materialized_body_*'
+```
+
+This wildcard selects78 tests:12 original scalar modes and66 INLINE-EDB
+histories (18 healthy,18 policy,18 successor stops and12 memory failures).
+The integrated Clang23 JOIN-host result is228/228, related components5/5,
+GCC16 focused78/78 and ASan/UBSan78/78. These code/test results precede the
+documentation-only ledger commit; no additional platform certificate is implied.
