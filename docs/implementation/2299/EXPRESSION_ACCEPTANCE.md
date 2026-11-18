@@ -2736,3 +2736,77 @@ Source distance. Existing staged builder/source/reader children keep their own
 actual admissions. No new data-sized loop, synchronous typed constructor or
 Source/Native permission is introduced. Complete containing observer/Source
 and carry proofs outside this ordinary intersection are not certified here.
+
+### Matching typed staged delta prerequisite and retained sort tails (2026-11-18)
+
+The internal retained `begin_candidate` delta component now admits exactly
+matching positive-arity INT64, STRING and FLOAT lanes, including mixtures.
+Existing exact declaration, column-name, Arrow-schema and lane metadata equality
+remains authoritative. STRING compares stored signed IDs; the caller retains the
+intern lifetime. This adds no decoded-string lookup or lexical-order contract.
+Nonempty candidate COPY validates finite FLOAT cells in both inputs and
+normalizes signed zero only in the private image/delta. NaN and infinities are
+rejected. The canonical, valid, sorted source remains a caller precondition.
+Empty candidates preserve the existing no-op behavior without revalidating or
+repairing source values. Nullary candidate, timestamp, compound, pool/arena,
+alias/shared-storage and unsupported lane restrictions remain in place.
+
+Qualification exposed an existing retained merge-sort defect, also reproducible
+with an empty source and four sorted distinct INT64 candidate rows. After the
+left run was exhausted, `sort_i == sort_j == sort_mid` could hold. Comparing the
+selected row with the current left cursor then advanced the wrong cursor and
+repeated a right row. Both copy-completion arms now identify a left selection by
+`sort_copy_row < sort_mid`: the selected run ranges are disjoint and the midpoint
+is fixed while a row copy is active. No attempt field, allocation, charge,
+publication order or retry protocol was added. The large finite FLOAT fixture
+that previously produced only 64 novel rows from 300 distinct candidates now
+requires all 300 literal novel rows before exercising actual late delta growth.
+This is a local code/test finding; it does not identify a cause of prior hosted CI
+failures.
+
+`test_consolidate_incremental_delta` contains the following direct component
+qualification, in addition to its existing tests:
+
+- 60 scalar/mixed-width (1/3/17), shape and quantum combinations compare full
+  literal union/difference rows, typed metadata and an independent ordinary
+  consolidation oracle. Empty inputs, overlapping/duplicate tuples, sorted
+  candidates and signed stored STRING IDs are included.
+- 192 generated sorted/reversed/interleaved input cases cover INT64, STRING,
+  finite FLOAT and width-17 shared prefixes, with total sizes 1/3/5/17/257/301
+  and quantum 1/default. Literal rows and independent raw consolidation must
+  agree; candidate physical order remains unchanged.
+- Actual one-unit advance censuses are 58/58/170/954 calls and work units for
+  STRING/FLOAT scalar and width-3/17 mixed fixtures. The tests witness every
+  retained COPY/SORT/DEDUP/COUNT_NOVEL/EMIT_DELTA phase, every copy/compare lane,
+  and DONE. They replay 1,244 cancellation cuts (including commit), 1,240 real
+  accounting-overflow cuts, all 1,236 positive insufficient work limits and four
+  exact completed limits. Every terminal replay closes actual retained owners
+  and retries from original inputs with fresh control. Overflow uses the
+  existing test-only accounting-history seed, followed by a real refused charge.
+- 17 terminal fixtures cover advance/commit cancellation, work exhaustion,
+  invalid FLOAT cells in either input, real metadata-allocation failure,
+  enforcing-governor refusal, mismatched types and every other declared lane
+  type plus an unknown tag. Two additional fixtures check private signed-zero
+  normalization and the unchanged no-op boundary.
+- Four actual ownership histories exercise both pointer lock orders, source and
+  candidate writer contention, wrong-thread advance/commit/abort and competing
+  begin, or an actual completed/restarted control generation. The owning thread
+  aborts and reacquires the original inputs before successful publication.
+- The 300-row late-growth fixture requires an actual governor denial counter
+  increment after image/sort storage was admitted, exact reservation rollback,
+  unchanged input snapshots/cells and successful fresh retry with all delta
+  rows. Metadata allocation and late reserve are actual tested failure fronts;
+  this is not an exhaustive census of every physical allocator call.
+
+These tests check real source writer/candidate reader ownership, delta transfer,
+refund/reference closure, first-result/report behavior and literal run geometry.
+They do not create Native/Source authority. ALLOC_DELTA remains synchronous
+inside advance and is not counted as an externally retained phase. Begin still
+performs its existing synchronous schema/name/type traversal and allocation;
+abort retains its existing cleanup interior. No whole-call 256 bound is claimed.
+
+This closes a matching typed staged-delta transport prerequisite, not #2299.
+Raw recursive ROUND pool clones, prepared sort/delta integration, timestamp and
+compound transport, typed SCC/K execution, Snapshot/C1 intersections and the
+remaining containing Source/observer/carry proofs remain separate work. No
+Session routing or recursive/Source activation changes in this increment.

@@ -3379,7 +3379,7 @@ wl_columnar_merge_incremental_delta_attempt_advance(col_rel_t *source,
                     if (rc != 0)
                         goto sliced_or_terminal;
                     attempt->sort_copy_active = false;
-                    if (attempt->sort_copy_row == attempt->sort_i)
+                    if (attempt->sort_copy_row < attempt->sort_mid)
                         attempt->sort_i++;
                     else
                         attempt->sort_j++;
@@ -3401,7 +3401,7 @@ wl_columnar_merge_incremental_delta_attempt_advance(col_rel_t *source,
                 if (attempt->sort_copy_column == image->ncols) {
                     attempt->sort_copy_column = 0;
                     attempt->sort_copy_active = false;
-                    if (attempt->sort_copy_row == attempt->sort_i)
+                    if (attempt->sort_copy_row < attempt->sort_mid)
                         attempt->sort_i++;
                     else
                         attempt->sort_j++;
