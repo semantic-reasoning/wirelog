@@ -3470,7 +3470,7 @@ foreach join_inline_mode : ['observed', 'plain', 'snapshot',
        suite: ['unit', 'tsan', 'evaluation_join_hosts'], timeout: 120)
 endforeach
 
-foreach join_stream_family : ['streamed', 'pressure']
+foreach join_stream_family : ['streamed', 'pressure', 'cap']
   foreach join_stream_route : ['observed', 'plain', 'snapshot']
     foreach join_stream_kind : ['0', '1', '2']
       foreach join_stream_strict : ['0', '1']
