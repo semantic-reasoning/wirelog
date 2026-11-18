@@ -3470,16 +3470,18 @@ foreach join_inline_mode : ['observed', 'plain', 'snapshot',
        suite: ['unit', 'tsan', 'evaluation_join_hosts'], timeout: 120)
 endforeach
 
-foreach join_stream_route : ['observed', 'plain', 'snapshot']
-  foreach join_stream_kind : ['0', '1', '2']
-    foreach join_stream_strict : ['0', '1']
-      test('evaluation_join_inline_streamed_' + join_stream_route + '_kind' +
-           join_stream_kind + '_strict' + join_stream_strict,
-           test_evaluation_join_inline_exe,
-           args: ['streamed-' + join_stream_route, join_stream_kind, join_stream_strict],
-           env: ['WIRELOG_JOIN_BATCH_BYTES=', 'WIRELOG_JOIN_BATCH_STRICT=',
-                 'WIRELOG_JOIN_OUTPUT_LIMIT='],
-           suite: ['unit', 'tsan', 'evaluation_join_hosts'], timeout: 120)
+foreach join_stream_family : ['streamed', 'pressure']
+  foreach join_stream_route : ['observed', 'plain', 'snapshot']
+    foreach join_stream_kind : ['0', '1', '2']
+      foreach join_stream_strict : ['0', '1']
+        test('evaluation_join_inline_' + join_stream_family + '_' + join_stream_route + '_kind' +
+             join_stream_kind + '_strict' + join_stream_strict,
+             test_evaluation_join_inline_exe,
+             args: [join_stream_family + '-' + join_stream_route, join_stream_kind, join_stream_strict],
+             env: ['WIRELOG_JOIN_BATCH_BYTES=', 'WIRELOG_JOIN_BATCH_STRICT=',
+                   'WIRELOG_JOIN_OUTPUT_LIMIT='],
+             suite: ['unit', 'tsan', 'evaluation_join_hosts'], timeout: 120)
+      endforeach
     endforeach
   endforeach
 endforeach

@@ -30,7 +30,18 @@ typedef struct {
     capture_t events;
 } fixture_t;
 static fixture_t *active;
-static bool configured, streamed, stream_strict;
+static bool configured, streamed, stream_strict, pressure;
+enum {
+    PRESSURE_PREPARE_DENIED = 10,
+    PRESSURE_SINK_DENIED,
+    PRESSURE_ACK_DENIED,
+    PRESSURE_PREPARE_ALLOC,
+    PRESSURE_SINK_ALLOC
+};
+static wl_columnar_memory_reservation_t pressure_peer;
+static bool pressure_triggered, pressure_error_seen;
+static uint64_t pressure_denials_before, pressure_ack_generation;
+static unsigned pressure_acks_before;
 static unsigned stream_produced, stream_acked, stream_rejected, stream_kept,
     stream_cells;
 static uint64_t stream_attempt, stream_generation;
@@ -244,6 +255,60 @@ stream_stop_now(wl_evaluation_control_t *control)
             == WL_EVALUATION_CONTROL_WORK_LIMIT);
 }
 static void
+pressure_reserve(void)
+{
+    wl_columnar_memory_governor_t *gov =
+        wl_columnar_memory_governor_ref_get(active->governor);
+    uint64_t usable = atomic_load_explicit(&gov->usable_bytes,
+            memory_order_acquire), used = wl_columnar_memory_reserved(gov);
+    CHECK(!pressure_triggered && usable > used && usable - used > 1);
+    CHECK(wl_columnar_memory_reserve(gov, usable - used - 1, &pressure_peer));
+    CHECK(wl_columnar_memory_reserved(gov) == usable - 1);
+    CHECK(pressure_peer.identity == &pressure_peer && pressure_peer.bytes
+        && atomic_load_explicit(&pressure_peer.state, memory_order_acquire)
+        == WL_COLUMNAR_MEMORY_RESERVATION_RESERVED);
+    pressure_denials_before = wl_columnar_memory_denials(gov);
+    pressure_triggered = true;
+}
+static void
+pressure_first_error(wl_evaluation_control_t *control, int result)
+{
+    if (!pressure || mode < PRESSURE_PREPARE_DENIED) return;
+    CHECK(control == active->control && pressure_triggered
+        && !pressure_error_seen);
+    pressure_error_seen = true;
+    wl_columnar_memory_governor_t *gov =
+        wl_columnar_memory_governor_ref_get(active->governor);
+    if (mode <= PRESSURE_ACK_DENIED) {
+        CHECK(result == ENOSPC && wl_columnar_memory_denials(gov)
+            > pressure_denials_before);
+        /* Only the actual selected denial returns the competitor's capacity.
+         * Mandatory cleanup then runs with that capacity available. */
+        uint64_t before = wl_columnar_memory_reserved(gov),
+            bytes = pressure_peer.bytes;
+        CHECK(before >= bytes && wl_columnar_memory_rollback(&pressure_peer));
+        CHECK(wl_columnar_memory_reserved(gov) == before - bytes);
+        CHECK(atomic_load_explicit(&pressure_peer.state, memory_order_acquire)
+            == WL_COLUMNAR_MEMORY_RESERVATION_RELEASED);
+    } else {
+        CHECK(result == ENOMEM && wl_columnar_memory_denials(gov)
+            == pressure_denials_before);
+        CHECK(mode == PRESSURE_PREPARE_ALLOC
+            ? !wl_columnar_join_batch_test_prepare_fail_allocation
+            : !wl_columnar_relation_test_constructor_fail_allocation);
+    }
+}
+static void
+sources_writable(const col_rel_t *left, const col_rel_t *right)
+{
+    const col_rel_t *sources[] = {left, right};
+    for (unsigned i = 0; i < 2; ++i) {
+        wl_columnar_source_access_writer_t writer = {0};
+        CHECK(!col_rel_source_writer_acquire(sources[i], &writer));
+        CHECK(!wl_columnar_source_access_writer_release(&writer));
+    }
+}
+static void
 stream_prepare(const wl_columnar_join_batch_prepare_t *a)
 {
     if (a->phase < 4) return;
@@ -256,6 +321,19 @@ stream_prepare(const wl_columnar_join_batch_prepare_t *a)
             && readers[i]->owner == &rel[i]->storage_owner->source_access);
         if (rel[i]->compound_kind ==
             WIRELOG_COMPOUND_KIND_INLINE) inline_seen |= 1u << i;
+    }
+    if (pressure && !pressure_triggered &&
+        ((mode == PRESSURE_PREPARE_DENIED && a->phase == 11) ||
+        (mode == PRESSURE_PREPARE_ALLOC && a->phase == 8 && a->cursor == 2))) {
+        CHECK(a->arrays_committed && a->keys && a->arrangement.ht_head);
+        if (mode == PRESSURE_PREPARE_DENIED) {
+            CHECK(a->types && a->key_row
+                && a->arrangement.indexed_rows == a->right->nrows);
+            pressure_reserve();
+        } else {
+            wl_columnar_join_batch_test_prepare_fail_allocation = 1;
+            pressure_triggered = true;
+        }
     }
     if (active->kind == 2) CHECK(a->left->column_types[0] == WIRELOG_TYPE_STRING
             && a->left->column_types[1] == WIRELOG_TYPE_FLOAT
@@ -277,6 +355,21 @@ stream_event(wl_evaluation_control_t *control, unsigned event,
     if (event == WL_COLUMNAR_JOIN_PIPELINE_TEST_PRODUCE) ++stream_produced;
     if (event == WL_COLUMNAR_JOIN_PIPELINE_TEST_AFTER_ACK) {
         CHECK(generation == ++stream_generation); ++stream_acked;
+    }
+    if (pressure && !pressure_triggered) {
+        if (event == WL_COLUMNAR_JOIN_PIPELINE_TEST_SINK_SCHEMA &&
+            (mode == PRESSURE_SINK_DENIED || mode == PRESSURE_SINK_ALLOC)) {
+            if (mode == PRESSURE_SINK_DENIED) pressure_reserve();
+            else {
+                wl_columnar_relation_test_constructor_fail_allocation = 1;
+                pressure_triggered = true;
+            }
+        } else if (mode == PRESSURE_ACK_DENIED &&
+            event == WL_COLUMNAR_JOIN_PIPELINE_TEST_AFTER_ACK && extent > 0) {
+            CHECK(generation && work && stream_acked > pressure_acks_before);
+            pressure_ack_generation = generation;
+            pressure_reserve();
+        }
     }
     bool before = event == WL_COLUMNAR_JOIN_PIPELINE_TEST_BEFORE_ACK;
     bool after = event == WL_COLUMNAR_JOIN_PIPELINE_TEST_AFTER_ACK;
@@ -422,6 +515,11 @@ run(unsigned kind, unsigned route, unsigned fault)
     stream_produced = stream_acked = stream_rejected = stream_kept =
         stream_cells = 0;
     stream_attempt = stream_generation = 0;
+    pressure_triggered = pressure_error_seen = false;
+    pressure_ack_generation = 0;
+    wl_columnar_memory_reservation_init(&pressure_peer);
+    wl_columnar_join_pipeline_test_first_error = pressure
+        ? pressure_first_error : NULL;
     wl_columnar_join_test_attempt_checkpoint = streamed ? NULL : checkpoint;
     if (streamed) {
         uint32_t ji = (uint32_t)(join - p->ops), tail = UINT32_MAX;
@@ -456,6 +554,11 @@ run(unsigned kind, unsigned route, unsigned fault)
         capture_t snap = {0}, raw_snap = {0};
         if (stage == 1 && fault) {
             mode = fault; pairs = 0; stopped = false;
+            if (pressure) {
+                pressure_denials_before = wl_columnar_memory_denials(
+                    wl_columnar_memory_governor_ref_get(f.governor));
+                pressure_acks_before = stream_acked;
+            }
             col_rel_t *head = session_find_rel(COL_SESSION(f.s), "out");
             col_rel_t *left = session_find_rel(COL_SESSION(f.s), "a"),
                 *right = session_find_rel(COL_SESSION(f.s), "b");
@@ -469,11 +572,16 @@ run(unsigned kind, unsigned route, unsigned fault)
             if (rn) memcpy(rm, right->compound_arity_map, rn * sizeof(*rm));
             if (streamed && fault == 9) COL_SESSION(f.s)->join_output_limit = 3;
             int rc = evaluate(&f, f.s, &snap);
-            int wanted = streamed && fault == 9 ? EOVERFLOW
+            int wanted = pressure ? (fault <= PRESSURE_ACK_DENIED
+                ? ENOSPC : ENOMEM) : streamed && fault == 9 ? EOVERFLOW
                 : (fault %
                 2 ? WL_EVALUATION_CONTROL_CANCELLED :
                 WL_EVALUATION_CONTROL_WORK_LIMIT);
-            CHECK((streamed && fault == 9 ? !stopped : stopped) &&
+            if (pressure && rc != wanted) fprintf(stderr,
+                    "pressure kind=%u route=%u fault=%u strict=%u rc=%d expected=%d triggered=%u first_error=%u\n",
+                    kind, route, fault, stream_strict, rc, wanted,
+                    pressure_triggered, pressure_error_seen);
+            CHECK((pressure || (streamed && fault == 9) ? !stopped : stopped) &&
                 rc == wanted
                 && !snap.count && !f.events.count &&
                 COL_SESSION(f.s)->pending_input_change
@@ -493,6 +601,16 @@ run(unsigned kind, unsigned route, unsigned fault)
             CHECK(!wl_evaluation_control_report(f.control,
                 &report) && report.result == rc
                 && report.consumed && !report.cleanup_status);
+            if (pressure) {
+                CHECK(pressure_triggered && pressure_error_seen);
+                CHECK(COL_SESSION(f.s)->memory_budget_denied ==
+                    (fault <= PRESSURE_ACK_DENIED));
+                if (fault ==
+                    PRESSURE_ACK_DENIED) CHECK(pressure_ack_generation);
+                sources_writable(left, right);
+                CHECK(!wl_columnar_join_batch_test_prepare_fail_allocation
+                    && !wl_columnar_relation_test_constructor_fail_allocation);
+            }
             CHECK(!wl_evaluation_control_reset(f.control)); mode = 0;
             if (streamed && fault == 9) COL_SESSION(f.s)->join_output_limit = 4;
         }
@@ -526,6 +644,7 @@ run(unsigned kind, unsigned route, unsigned fault)
     else CHECK(pairs &&
             (configured ? !filter_rows : filter_rows && joined_rejected));
     wl_columnar_join_batch_test_prepare_checkpoint = NULL;
+    wl_columnar_join_pipeline_test_first_error = NULL;
     wl_columnar_join_pipeline_test_numeric_checkpoint = NULL;
     wl_columnar_join_batch_test_control_checkpoint = NULL;
     wl_columnar_filter_test_attempt_checkpoint = NULL;
@@ -539,7 +658,8 @@ run(unsigned kind, unsigned route, unsigned fault)
 }
 int main(int argc, char **argv)
 {
-    streamed = argc >= 2 && !strncmp(argv[1], "streamed-", 9);
+    pressure = argc >= 2 && !strncmp(argv[1], "pressure-", 9);
+    streamed = pressure || (argc >= 2 && !strncmp(argv[1], "streamed-", 9));
     CHECK(argc == (streamed ? 4 : 2));
     configured = streamed || !strncmp(argv[1], "configured-", 11);
     const char *name = streamed ? argv[1] + 9 : configured ? argv[1] +
@@ -551,8 +671,9 @@ int main(int argc, char **argv)
         unsigned kind = (unsigned)strtoul(argv[2], NULL, 10);
         stream_strict = !strcmp(argv[3], "1");
         CHECK(kind < 3 && (!strcmp(argv[3], "0") || stream_strict));
-        for (unsigned fault = 0; fault < 10; ++fault) {
-            if (kind != 2 && (fault == 1 || fault == 2)) continue;
+        for (unsigned fault = pressure ? PRESSURE_PREPARE_DENIED : 0;
+            fault < (pressure ? PRESSURE_SINK_ALLOC + 1 : 10); ++fault) {
+            if (!pressure && kind != 2 && (fault == 1 || fault == 2)) continue;
             run(kind, route, fault);
         }
     } else for (unsigned kind = 0; kind < (configured ? 3u : 4u); ++kind)
