@@ -53,6 +53,7 @@ static wl_evaluation_control_report_t frozen_report;
 static wl_session_t *controlled_session;
 static bool producer_error_armed;
 static bool memory_mode, memory_armed, memory_denied;
+static bool allocation_mode, allocation_armed, allocation_failed, stop_armed;
 static wl_columnar_memory_reservation_t memory_peer;
 static uint64_t memory_denials_before;
 
@@ -81,8 +82,23 @@ first_producer_error(wl_evaluation_control_t *control, int result)
         memory_denied = true;
         /* Actual admission has refused. Return peer capacity before mandatory
          * cleanup, while preserving the selected error and pending input. */
-        wl_columnar_memory_release(&memory_peer);
+        uint64_t before = wl_columnar_memory_reserved(memory_peer.governor),
+            bytes = memory_peer.bytes;
+        CHECK(before >= bytes && wl_columnar_memory_rollback(&memory_peer));
+        CHECK(wl_columnar_memory_reserved(memory_peer.governor) ==
+            before - bytes
+            && atomic_load_explicit(&memory_peer.state, memory_order_acquire)
+            == WL_COLUMNAR_MEMORY_RESERVATION_RELEASED);
         return;
+    }
+    if (allocation_armed) {
+        CHECK(!allocation_failed && producer_error_armed && result == ENOMEM
+            && control == controlled_session->evaluation_control
+            && !wl_columnar_join_batch_test_prepare_fail_allocation
+            && wl_columnar_memory_denials(wl_columnar_memory_governor_ref_get(
+                COL_SESSION(controlled_session)->memory_governor)) ==
+            memory_denials_before);
+        allocation_failed = true; return;
     }
     if (interrupt_kind != 5 || canceled_body) return;
     CHECK(producer_error_armed && result == ENOMEM
@@ -216,6 +232,17 @@ batch_event(wl_evaluation_control_t *control, unsigned event,
         ++inline_done;
 }
 static void
+stop_inline(wl_evaluation_control_t *control)
+{
+    CHECK(stop_armed && !canceled_body &&
+        (interrupt_kind == 1 || interrupt_kind == 2));
+    canceled_body = true; stop_armed = false;
+    if (interrupt_kind == 1) wl_evaluation_control_request_cancel(control);
+    else CHECK(wl_evaluation_control_charge_attempt(control,
+            wl_evaluation_control_active_attempt_id(control), UINT64_MAX)
+            == WL_EVALUATION_CONTROL_WORK_LIMIT);
+}
+static void
 batch_prepare(const wl_columnar_join_batch_prepare_t *attempt)
 {
     if (!path_child || !selected_plan) return;
@@ -247,7 +274,35 @@ batch_prepare(const wl_columnar_join_batch_prepare_t *attempt)
             inline_seen |= 2; ++inline_prepared; inline_batch_op = attempt->op;
             if (attempt->left->nrows) ++inline_live_prepared;
         }
-        if (interrupt_kind == 5 && !producer_error_armed) {
+        bool inline_target = inline_position &&
+            (attempt->phase == 8 || attempt->phase == 11) &&
+            inline_relation(attempt->right) && attempt->left->nrows;
+        bool indexed_target = inline_target && attempt->phase == 11 &&
+            attempt->arrays_committed && attempt->keys && attempt->types &&
+            attempt->arrangement.indexed_rows == attempt->right->nrows;
+        if (allocation_armed && !producer_error_armed && inline_target &&
+            attempt->phase == 8 && attempt->cursor == 2) {
+            CHECK(attempt->arrays_committed && attempt->keys &&
+                attempt->arrangement.ht_head
+                && attempt->right_reader.identity ==
+                (uintptr_t)&attempt->right_reader
+                && attempt->right_reader.secondary_owner ==
+                &attempt->right->descriptor_access
+                && attempt->right_reader.owner ==
+                &attempt->right->storage_owner->source_access
+                && attempt->left_reader.identity ==
+                (uintptr_t)&attempt->left_reader
+                && attempt->left_reader.secondary_owner ==
+                &attempt->left->descriptor_access
+                && attempt->left_reader.owner ==
+                &attempt->left->storage_owner->source_access);
+            CHECK(!wl_columnar_join_batch_test_prepare_fail_allocation);
+            producer_error_armed = true;
+            wl_columnar_join_batch_test_prepare_fail_allocation = 1;
+        }
+        if (stop_armed && indexed_target &&
+            !canceled_body) stop_inline(attempt->control);
+        if (!inline_position && interrupt_kind == 5 && !producer_error_armed) {
             CHECK(!wl_columnar_join_batch_test_prepare_fail_allocation);
             producer_error_armed = true;
             wl_columnar_join_batch_test_prepare_fail_allocation = 1;
@@ -256,7 +311,8 @@ batch_prepare(const wl_columnar_join_batch_prepare_t *attempt)
          * rather than merely reaching the pre-admission checkpoint. */
         if (attempt->arrays_committed) {
             ++owned_joins;
-            if (memory_armed && !memory_peer.governor && !memory_denied) {
+            if (memory_armed && !memory_peer.governor && !memory_denied
+                && (!inline_position || indexed_target)) {
                 wl_columnar_memory_governor_t *governor =
                     wl_columnar_memory_governor_ref_get(attempt->governor);
                 uint64_t available =
@@ -287,7 +343,8 @@ batch_prepare(const wl_columnar_join_batch_prepare_t *attempt)
             CHECK(!wl_columnar_session_controlled_batch_authorized(session,
                 attempt->control, attempt->attempt_id, identity + 1,
                 selected_plan, selected_bindings));
-            if (cancel_body && interrupt_kind != 5 && !canceled_body) {
+            if (!inline_position && cancel_body && interrupt_kind != 5 &&
+                !canceled_body){
                 canceled_body = true;
                 if (interrupt_kind == 1) {
                     wl_evaluation_control_request_cancel(attempt->control);
@@ -320,10 +377,36 @@ join_checkpoint(wl_evaluation_control_t *control, unsigned phase,
     unsigned mask = (inline_source(&ctx->source) ? 1u : 0u)
         | (inline_source(&ctx->join_right) ? 2u : 0u);
     inline_seen |= mask;
-    if (mask && phase == 18 && progress == 1) ++inline_gathers;
+    if (mask && phase == 18 && progress == 1) {
+        ++inline_gathers;
+        if (inline_position != 3 && stop_armed &&
+            !canceled_body) stop_inline(control);
+    }
     if ((mask & 2u) && phase == 27) ++inline_hashes;
 }
 
+static void
+reset_witnesses(void)
+{
+    inline_seen = inline_gathers = inline_hashes = inline_prepared =
+        inline_produced = inline_acks = inline_positive_acks = inline_done = 0;
+    inline_batch_op = NULL; inline_live_prepared = 0;
+    owned_joins = 0; path_child = selected_body = whole_scc = false;
+    selected_plan = NULL; selected_bindings = NULL;
+}
+static void
+watch(bool enabled)
+{
+    wl_columnar_session_test_observed_transaction_checkpoint =
+        enabled ? observed : NULL;
+    wl_columnar_join_test_attempt_checkpoint = enabled ? join_checkpoint : NULL;
+    wl_columnar_join_batch_test_prepare_checkpoint =
+        enabled ? batch_prepare : NULL;
+    wl_columnar_join_pipeline_test_first_error =
+        enabled ? first_producer_error : NULL;
+    wl_columnar_join_pipeline_test_numeric_checkpoint = enabled &&
+        inline_position ? batch_event : NULL;
+}
 static void
 tuple(const char *name, const int64_t *row, uint32_t width, void *payload)
 {
@@ -399,12 +482,24 @@ main(int argc, char **argv)
         output_route = !strcmp(argv[3], "observed") ? 0 : !strcmp(argv[3],
                 "plain") ? 1 : 2;
         CHECK(output_route != 2 || !strcmp(argv[3], "snapshot"));
-        CHECK(!strcmp(argv[1], "plain") || !strcmp(argv[1], "batch"));
+        CHECK(!strcmp(argv[1], "plain") || !strcmp(argv[1], "batch")
+            || !strcmp(argv[1], "strict") || !strcmp(argv[1], "limit-denied")
+            || !strcmp(argv[1], "batch-cancel") || !strcmp(argv[1],
+            "batch-work")
+            || !strcmp(argv[1], "batch-memory-first") || !strcmp(argv[1],
+            "batch-memory-successor")
+            || !strcmp(argv[1], "batch-alloc-first") || !strcmp(argv[1],
+            "batch-alloc-successor"));
     }
     wl_columnar_memory_reservation_init(&memory_peer);
     memory_mode = !strcmp(argv[1], "batch-memory-first")
         || !strcmp(argv[1], "batch-memory-successor");
-    unsigned memory_stage = !strcmp(argv[1], "batch-memory-successor") ? 1 : 0;
+    allocation_mode = !strcmp(argv[1], "batch-alloc-first")
+        || !strcmp(argv[1], "batch-alloc-successor");
+    CHECK(!allocation_mode || inline_position == 3);
+    CHECK(!inline_position || !memory_mode || inline_position == 3);
+    unsigned memory_stage = !strcmp(argv[1], "batch-memory-successor")
+        || !strcmp(argv[1], "batch-alloc-successor") ? 1 : 0;
     bool strict = !strcmp(argv[1], "strict");
     bool limited = !strcmp(argv[1], "limit");
     bool denied = !strcmp(argv[1], "limit-denied");
@@ -416,8 +511,8 @@ main(int argc, char **argv)
     cancel_body = interrupt_kind != 0;
     bool batch = strcmp(argv[1], "plain") != 0;
     CHECK(!batch || !strcmp(argv[1], "batch") || strict || limited || denied
-        || cancel_body || memory_mode);
-    const int expected = strict ? ENOTSUP : denied ? EOVERFLOW : 0;
+        || cancel_body || memory_mode || allocation_mode);
+    int expected = strict ? ENOTSUP : denied ? EOVERFLOW : 0;
     environment("WIRELOG_JOIN_BATCH_BYTES", batch ? "256" : NULL);
     environment("WIRELOG_JOIN_BATCH_STRICT", strict ? "1" : NULL);
     environment("WIRELOG_JOIN_OUTPUT_LIMIT", denied ? "1" : limited ? "128"
@@ -509,26 +604,127 @@ main(int argc, char **argv)
     const pair_t *edge[] = {edges0, edges1, edges2};
     const size_t edge_count[] = {5, 6, 5};
     for (unsigned stage = 0; stage != 3; ++stage) {
+        col_rel_t *old_path = session_find_rel(COL_SESSION(sessions[0]),
+                "path"),
+            *old_plain = session_find_rel(COL_SESSION(sessions[0]), "plain"),
+            *input = session_find_rel(COL_SESSION(sessions[0]), "edge");
+        col_relation_snapshot_t input_snapshot =
+            wl_columnar_relation_snapshot(input);
+        uint32_t input_map[3] = {0};
+        if (inline_position) {
+            CHECK(input->compound_arity_len == 3);
+            memcpy(input_map, input->compound_arity_map, sizeof(input_map));
+        }
         int raw_rc = finish(sessions[1]);
         if (raw_rc != expected) fprintf(stderr, "raw stage=%u batch=%u rc=%d\n",
                 stage, batch, raw_rc);
         CHECK(raw_rc == expected);
         history_stage = stage;
-        inline_seen = inline_gathers = inline_hashes = inline_prepared =
-            inline_produced = inline_acks = inline_positive_acks = inline_done =
-            0;
-        inline_batch_op = NULL; inline_live_prepared = 0;
-        owned_joins = 0; path_child = selected_body = whole_scc = false;
-        selected_plan = NULL;
-        selected_bindings = NULL;
-        wl_columnar_session_test_observed_transaction_checkpoint = observed;
-        wl_columnar_join_test_attempt_checkpoint = join_checkpoint;
-        wl_columnar_join_batch_test_prepare_checkpoint = batch_prepare;
-        wl_columnar_join_pipeline_test_first_error = first_producer_error;
-        wl_columnar_join_pipeline_test_numeric_checkpoint =
-            inline_position ? batch_event : NULL;
+        reset_witnesses(); watch(true);
         memory_armed = memory_mode && stage == memory_stage;
+        allocation_armed = allocation_mode && stage == memory_stage;
+        stop_armed = inline_position && cancel_body && stage == 1;
+        if (allocation_armed) memory_denials_before =
+                wl_columnar_memory_denials(
+                wl_columnar_memory_governor_ref_get(governor));
         int rc = finish(sessions[0]);
+        if (inline_position && rc) {
+            CHECK(session_find_rel(COL_SESSION(sessions[0]), "path") == old_path
+                && session_find_rel(COL_SESSION(sessions[0]),
+                "plain") == old_plain
+                && COL_SESSION(sessions[0])->pending_input_change
+                && wl_columnar_relation_snapshot_equal(input_snapshot,
+                wl_columnar_relation_snapshot(input))
+                && input->compound_arity_len == 3
+                && !memcmp(input_map, input->compound_arity_map,
+                sizeof(input_map)));
+            if (stage) {
+                content(sessions[0], "path", path[stage-1],
+                    path_count[stage-1]);
+                content(sessions[0], "plain", edge[stage-1],
+                    edge_count[stage-1]);
+            } else CHECK((!old_path || !old_path->nrows) &&
+                    (!old_plain || !old_plain->nrows));
+            const events_t empty = {0};
+            CHECK(!memcmp(&events[0], &empty, sizeof(empty)));
+            wl_evaluation_control_report_t report;
+            CHECK(!wl_evaluation_control_report(control,
+                &report) && report.result == rc
+                && report.consumed && !report.cleanup_status);
+            wl_columnar_source_access_writer_t writer = {0};
+            int writer_result = col_rel_source_writer_acquire(input, &writer);
+            if (rc == WL_EVALUATION_CONTROL_WORK_LIMIT && output_route != 2) {
+                /* STEP WORK retains the genuine parent/input lease after the
+                 * child drains. Protected entries cannot spend that report. */
+                uint64_t view[8];
+                CHECK(writer_result == EBUSY
+                    && !wl_columnar_session_test_retained_work_owner(
+                        COL_SESSION(sessions[0]), view)
+                    && view[0] && view[1] && view[2] && view[3] == 8 && view[7]
+                    && view[4] && view[4] == view[5]
+                    && !wl_evaluation_control_active_attempt_id(control)
+                    && sessions[0]->backend->session_controlled_step_state(
+                        sessions[0])
+                    == WL_CONTROLLED_STEP_PENDING);
+                const int64_t added[] = {input_tag, input_float, 6, 7},
+                    removed_row[] = {input_tag, input_float, 1, 2};
+                CHECK(wl_session_insert(sessions[0], "edge", added, 1,
+                    4) == EBUSY
+                    && wl_session_remove(sessions[0], "edge", removed_row, 1,
+                    4) == EBUSY);
+                events_t unexpected = {0};
+                CHECK(wl_session_snapshot(sessions[0], tuple,
+                    &unexpected) == EBUSY
+                    && !memcmp(&unexpected, &empty, sizeof(empty)));
+                wl_session_t *same = sessions[0];
+                CHECK(wl_session_try_destroy(&same) == EBUSY &&
+                    same == sessions[0]);
+                wl_evaluation_control_report_t after;
+                CHECK(!wl_evaluation_control_report(control, &after)
+                    && after.attempt_id == report.attempt_id &&
+                    after.limit == report.limit
+                    && after.consumed == report.consumed &&
+                    after.stop_reason == report.stop_reason
+                    && after.execution_status == report.execution_status
+                    && after.cleanup_status == report.cleanup_status &&
+                    after.result == report.result
+                    && !wl_evaluation_control_active_attempt_id(control));
+                CHECK(session_find_rel(COL_SESSION(sessions[0]),
+                    "path") == old_path
+                    && session_find_rel(COL_SESSION(sessions[0]),
+                    "plain") == old_plain
+                    && wl_columnar_relation_snapshot_equal(input_snapshot,
+                    wl_columnar_relation_snapshot(input))
+                    && input->compound_arity_len == 3
+                    && !memcmp(input_map, input->compound_arity_map,
+                    sizeof(input_map)));
+                content(sessions[0], "path", path[stage-1],
+                    path_count[stage-1]);
+                content(sessions[0], "plain", edge[stage-1],
+                    edge_count[stage-1]);
+            } else CHECK(!writer_result &&
+                    !wl_columnar_source_access_writer_release(&writer));
+        }
+        if (inline_position && expected) {
+            CHECK(rc == expected && raw_rc == expected && selected_body &&
+                whole_scc);
+            for (unsigned i = 0; i < 2; ++i) {
+                COL_SESSION(sessions[i])->join_batch_strict = false;
+                COL_SESSION(sessions[i])->join_output_limit = 128;
+            }
+            expected = 0;
+            watch(false); CHECK(!finish(sessions[1]));
+            CHECK(!wl_evaluation_control_reset(control));
+            reset_witnesses(); watch(true); rc = finish(sessions[0]);
+        }
+        if (allocation_armed) {
+            CHECK(allocation_failed && producer_error_armed && rc == ENOMEM
+                && !wl_columnar_join_batch_test_prepare_fail_allocation
+                && !COL_SESSION(sessions[0])->memory_budget_denied);
+            allocation_armed = false;
+            CHECK(!wl_evaluation_control_reset(control));
+            reset_witnesses(); rc = finish(sessions[0]);
+        }
         if (memory_armed) {
             CHECK(memory_denied && rc == ENOSPC && selected_body && whole_scc
                 && owned_joins && atomic_load_explicit(&memory_peer.state,
@@ -555,9 +751,10 @@ main(int argc, char **argv)
                 && !report.cleanup_status);
             memory_armed = false;
             CHECK(!wl_evaluation_control_reset(control));
+            if (inline_position) reset_witnesses();
             rc = finish(sessions[0]);
         }
-        if (cancel_body && !stage) {
+        if (cancel_body && stage == (inline_position ? 1u : 0u)) {
             int stopped = interrupt_kind == 1 ? WL_EVALUATION_CONTROL_CANCELLED
                 : interrupt_kind == 2 ? WL_EVALUATION_CONTROL_WORK_LIMIT
                 : interrupt_kind == 5 ? ENOMEM : 7;
@@ -570,11 +767,13 @@ main(int argc, char **argv)
                 && (interrupt_kind == 5 ? producer_error_armed : owned_joins));
             const events_t empty = {0};
             CHECK(!memcmp(&events[0], &empty, sizeof(empty)));
-            const col_rel_t *failed = session_find_rel(COL_SESSION(sessions[0]),
-                    "path");
-            CHECK(!failed || !failed->nrows);
-            failed = session_find_rel(COL_SESSION(sessions[0]), "plain");
-            CHECK(!failed || !failed->nrows);
+            if (!inline_position) {
+                const col_rel_t *failed =
+                    session_find_rel(COL_SESSION(sessions[0]), "path");
+                CHECK(!failed || !failed->nrows);
+                failed = session_find_rel(COL_SESSION(sessions[0]), "plain");
+                CHECK(!failed || !failed->nrows);
+            }
             if (interrupt_kind >= 3) {
                 wl_evaluation_control_report_t report;
                 CHECK(!wl_evaluation_control_report(control, &report));
@@ -593,7 +792,8 @@ main(int argc, char **argv)
                         sessions[0]->operation_admission, 0, 0));
                 }
             }
-            CHECK(!wl_evaluation_control_reset(control));
+            CHECK(!wl_evaluation_control_reset(control)); stop_armed = false;
+            if (inline_position) reset_witnesses();
             rc = finish(sessions[0]);
         }
         if (rc != expected || !selected_body || !whole_scc
@@ -604,11 +804,15 @@ main(int argc, char **argv)
                 sessions[0]->source_c1_admission);
         CHECK(rc == expected && selected_body && whole_scc
             && (expected || owned_joins));
-        wl_columnar_session_test_observed_transaction_checkpoint = NULL;
-        wl_columnar_join_test_attempt_checkpoint = NULL;
-        wl_columnar_join_batch_test_prepare_checkpoint = NULL;
-        wl_columnar_join_pipeline_test_first_error = NULL;
-        wl_columnar_join_pipeline_test_numeric_checkpoint = NULL;
+        if (inline_position && interrupt_kind == 2 && output_route != 2 &&
+            stage == 1) {
+            col_rel_t *live_input = session_find_rel(COL_SESSION(sessions[0]),
+                    "edge");
+            wl_columnar_source_access_writer_t writer = {0};
+            CHECK(!col_rel_source_writer_acquire(live_input, &writer)
+                && !wl_columnar_source_access_writer_release(&writer));
+        }
+        watch(false);
         if (inline_position && !expected) {
             CHECK(inline_seen == (inline_position == 1 ? 1u : 2u));
             if (inline_position == 3 && batch) {
@@ -673,6 +877,7 @@ main(int argc, char **argv)
         }
     }
     CHECK(!memory_mode || memory_denied);
+    CHECK(!allocation_mode || allocation_failed);
     CHECK(atomic_load_explicit(&memory_peer.state, memory_order_relaxed)
         == (memory_mode ? WL_COLUMNAR_MEMORY_RESERVATION_RELEASED
             : WL_COLUMNAR_MEMORY_RESERVATION_EMPTY));
