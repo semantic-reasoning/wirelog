@@ -3904,17 +3904,18 @@ staged_typed_case(uint32_t width, unsigned kind, unsigned shape,
     static const uint32_t candidate_ranks[] = { 3, 1, 2, 1 };
     static const uint32_t union_ranks[] = { 0, 1, 2, 3 };
     static const uint32_t novel_ranks[] = { 1, 3 };
-    uint32_t source_count = shape == 1 || shape == 4 ? 0 : 2;
+    uint32_t source_count = shape == 1 || shape == 4 || shape == 5 ? 0 : 2;
     uint32_t candidate_count = shape == 2 ||
         shape == 4 ? 0 : shape == 3 ? 2 : 4;
     const uint32_t *candidate_input = shape == 3
-        ? source_ranks : candidate_ranks;
+        ? source_ranks : shape == 5 ? union_ranks : candidate_ranks;
     const uint32_t *expected_union = shape == 2 || shape == 3
         ? source_ranks : shape == 1 ? union_ranks + 1 : union_ranks;
     uint32_t union_count = shape == 4 ? 0
         : shape == 2 || shape == 3 ? 2 : shape == 1 ? 3 : 4;
-    const uint32_t *expected_delta = shape == 1 ? union_ranks + 1 : novel_ranks;
-    uint32_t delta_count = shape >= 2 ? 0 : shape == 1 ? 3 : 2;
+    const uint32_t *expected_delta = shape == 5 ? union_ranks
+        : shape == 1 ? union_ranks + 1 : novel_ranks;
+    uint32_t delta_count = shape == 5 ? 4 : shape >= 2 ? 0 : shape == 1 ? 3 : 2;
     int owner = 0, fast_path = -1;
     bool ok = false;
     col_rel_t *source = staged_typed_relation(source_ranks, source_count,
@@ -3978,7 +3979,8 @@ staged_typed_case(uint32_t width, unsigned kind, unsigned shape,
         width, kind)
         || candidate->view_generation != candidate_view
         || source->sorted_nrows != source->nrows
-        || (shape == 2 && source->view_generation != source_view))
+        || ((shape == 2 || shape == 4) &&
+        source->view_generation != source_view))
         goto done;
     ok = wl_evaluation_control_finish(control, &owner, 0, 0) == 0;
 done:
@@ -4010,7 +4012,7 @@ test_controlled_staged_typed_rows_and_metadata(void)
     static const uint32_t widths[] = { 1, 3, 17 };
     for (unsigned w = 0; w < 3; w++)
         for (unsigned kind = 0; kind < (w == 0 ? 3u : 1u); kind++)
-            for (unsigned shape = 0; shape < 5; shape++)
+            for (unsigned shape = 0; shape < 6; shape++)
                 for (unsigned q = 0; q < 2; q++)
                     ASSERT(staged_typed_case(widths[w], kind, shape,
                         q ? WL_EVALUATION_CONTROL_QUANTUM : 1),
@@ -4065,9 +4067,14 @@ staged_typed_terminal_case(unsigned fault)
     } else if (fault == 11) {
         candidate->column_types[0] = WIRELOG_TYPE_INT64;
         expected = ENOTSUP;
-    } else if (fault == 12) {
+    } else if (fault >= 12) {
+        const wirelog_column_type_t unsupported[] = { WIRELOG_TYPE_BOOL,
+                                                      WIRELOG_TYPE_INT32,
+                                                      WIRELOG_TYPE_UINT32,
+                                                      WIRELOG_TYPE_UINT64,
+                                                      (wirelog_column_type_t)99 };
         source->column_types[0] = candidate->column_types[0] =
-            WIRELOG_TYPE_BOOL;
+            unsupported[fault - 12];
         expected = ENOTSUP;
     } else if (fault == 2) {
         expected = WL_EVALUATION_CONTROL_WORK_LIMIT;
@@ -4164,7 +4171,7 @@ test_controlled_staged_typed_terminal_retry(void)
 {
     TEST(
         "typed staged terminal faults close owners before fresh retry (#2299)");
-    for (unsigned fault = 0; fault < 13; fault++)
+    for (unsigned fault = 0; fault < 17; fault++)
         ASSERT(staged_typed_terminal_case(fault),
             "terminal first error, unchanged inputs, gates, refunds and retry");
     PASS();
@@ -4237,6 +4244,627 @@ test_controlled_staged_typed_zero_and_noop(void)
     ASSERT(staged_typed_zero_case(false), "private signed-zero normalization");
     ASSERT(staged_typed_zero_case(true),
         "empty candidate preserves no-op contract");
+    PASS();
+}
+
+typedef struct staged_typed_census {
+    uint32_t calls;
+    uint32_t phases;
+    uint32_t copy_columns;
+    uint32_t compare_columns;
+    uint64_t work;
+    uint64_t before_call[4096];
+} staged_typed_census_t;
+
+/* Census genuine outward advance cuts. ALLOC_DELTA is synchronous inside
+* advance and is qualified separately, not invented as a retained cut. */
+static bool
+staged_typed_frontier(uint32_t width, unsigned kind, unsigned mode,
+    uint32_t cut, uint64_t limit, staged_typed_census_t *census)
+{
+    static const uint32_t old[] = { 0, 2 }, incoming[] = { 3, 1, 2, 1 };
+    static const uint32_t united[] = { 0, 1, 2, 3 }, novel[] = { 1, 3 };
+    int owner = 0, fast = -1, rc = 0;
+    bool ok = false;
+    col_rel_t *source = staged_typed_relation(old, 2, width, kind);
+    col_rel_t *candidate = staged_typed_relation(incoming, 4, width, kind);
+    col_rel_t *delta = NULL;
+    wl_evaluation_control_t *control = attempt_test_control_create(limit,
+            &owner);
+    wl_columnar_memory_governor_ref_t *ref = test_ts_governor_create(16u << 20);
+    wl_columnar_merge_incremental_delta_attempt_t attempt = { 0 };
+    if (!source || !candidate || !control || !ref
+        || col_op_consolidate_incremental_delta(source, 0, NULL, &fast)
+        || col_rel_attach_memory_governor(source, ref))
+        goto done;
+    uint64_t reserved = wl_columnar_memory_reserved(
+        wl_columnar_memory_governor_ref_get(ref));
+    col_relation_snapshot_t source_before =
+        wl_columnar_relation_snapshot(source);
+    col_relation_snapshot_t candidate_before =
+        wl_columnar_relation_snapshot(candidate);
+    uint64_t id = wl_evaluation_control_active_attempt_id(control);
+    if (wl_columnar_merge_incremental_delta_attempt_begin_candidate(source,
+        candidate, &attempt, control))
+        goto done;
+    for (uint32_t calls = 0; calls < 4096; calls++) {
+        uint64_t before = 0, after = 0;
+        if (census) {
+            census->phases |= 1u << attempt.phase;
+            if (attempt.phase == WL_COLUMNAR_MERGE_INCREMENTAL_DELTA_COPY)
+                census->copy_columns |= 1u << attempt.copy_column;
+            if (attempt.compare_active && attempt.compare_column < width)
+                census->compare_columns |= 1u << attempt.compare_column;
+        }
+        if (calls == cut) {
+            if (mode == 1)
+                wl_evaluation_control_request_cancel(control);
+            if (mode == 2
+                && wl_evaluation_control_test_seed_active_consumed(control,
+                &owner, id, UINT64_MAX))
+                goto done;
+        }
+        if (wl_evaluation_control_test_active_consumed(control, id, &before))
+            goto done;
+        rc = wl_columnar_merge_incremental_delta_attempt_advance(source,
+                &attempt, control, 1);
+        if (wl_evaluation_control_test_active_consumed(control, id, &after)
+            || after < before || after - before > 1
+            || !staged_typed_rows(source, old, 2, width, kind)
+            || !staged_typed_rows(candidate, incoming, 4, width, kind)
+            || !wl_columnar_relation_snapshot_equal(source_before,
+            wl_columnar_relation_snapshot(source))
+            || !wl_columnar_relation_snapshot_equal(candidate_before,
+            wl_columnar_relation_snapshot(candidate)) || delta)
+            goto done;
+        if (census) {
+            census->before_call[calls] = before;
+            census->calls = calls + 1;
+            census->work = after;
+        }
+        if (rc == EAGAIN)
+            continue;
+        if (rc == 0) {
+            if (mode == 1 && cut == calls + 1)
+                wl_evaluation_control_request_cancel(control);
+            if (census)
+                census->phases |= 1u << attempt.phase;
+            rc = wl_columnar_merge_incremental_delta_attempt_commit(source,
+                    &attempt, &delta, &fast, control);
+        }
+        break;
+    }
+    int expected = mode == 1 ? WL_EVALUATION_CONTROL_CANCELLED
+        : mode == 2 ? EOVERFLOW : limit &&
+        mode != 4 ? WL_EVALUATION_CONTROL_WORK_LIMIT : 0;
+    if (rc != expected || attempt.identity)
+        goto done;
+    if (rc) {
+        if (delta || wl_columnar_memory_reserved(
+                wl_columnar_memory_governor_ref_get(ref)) != reserved
+            || !staged_typed_rows(source, old, 2, width, kind)
+            || !staged_typed_rows(candidate, incoming, 4, width, kind))
+            goto done;
+        if (wl_evaluation_control_finish(control, &owner, rc, 0) != expected)
+            goto done;
+        wl_evaluation_control_report_t report;
+        if (wl_evaluation_control_report(control, &report)
+            || report.result != expected
+            || (mode == 2 && report.consumed != UINT64_MAX)
+            || (limit && report.consumed != limit))
+            goto done;
+        attempt_test_control_destroy(control, &owner, rc);
+        control = attempt_test_control_create(0, &owner);
+        if (!control ||
+            wl_columnar_merge_incremental_delta_attempt_begin_candidate(
+                source, candidate, &attempt, control)
+            || staged_typed_drain(source, &attempt, control,
+            WL_EVALUATION_CONTROL_QUANTUM)
+            || wl_columnar_merge_incremental_delta_attempt_commit(source,
+            &attempt, &delta, &fast, control))
+            goto done;
+    }
+    ok = staged_typed_rows(source, united, 4, width, kind)
+        && staged_typed_rows(delta, novel, 2, width, kind)
+        && delta->sorted_nrows == 2 && delta->run_count == 1
+        && delta->run_ends[0] == 2 && source->sorted_nrows == 4
+        && source->run_count == 1 && source->run_ends[0] == 4
+        && wl_evaluation_control_finish(control, &owner, 0, 0) == 0;
+done:
+    if (attempt.identity)
+        (void)wl_columnar_merge_incremental_delta_attempt_abort(source,
+            &attempt);
+    test_rel_free(delta);
+    test_rel_free(candidate);
+    test_rel_free(source);
+    attempt_test_control_destroy(control, &owner, rc);
+    if (ref) {
+        ok &=
+            wl_columnar_memory_reserved(wl_columnar_memory_governor_ref_get(
+                    ref)) == 0
+            && wl_columnar_memory_governor_ref_is_sole(ref);
+        wl_columnar_memory_governor_ref_release(ref);
+    }
+    if (!ok)
+        fprintf(stderr,
+            "typed frontier width=%u kind=%u mode=%u cut=%u limit=%llu rc=%d\n",
+            width, kind, mode, cut, (unsigned long long)limit, rc);
+    return ok;
+}
+
+static void
+test_controlled_staged_typed_frontiers(void)
+{
+    TEST(
+        "typed staged actual cut census, per-lane debits and reset retries (#2299)");
+    static const uint32_t widths[] = { 1, 1, 3, 17 };
+    uint32_t total_cuts = 0;
+    uint64_t total_limits = 0;
+    for (unsigned fixture = 0; fixture < 4; fixture++) {
+        uint32_t width = widths[fixture];
+        unsigned kind = fixture == 0 ? 1 : 2;
+        staged_typed_census_t census = { 0 };
+        ASSERT(staged_typed_frontier(width, kind, 0, UINT32_MAX, 0, &census),
+            "baseline actual typed frontier census");
+        uint32_t expected_phases = (1u <<
+            WL_COLUMNAR_MERGE_INCREMENTAL_DELTA_COPY)
+            | (1u << WL_COLUMNAR_MERGE_INCREMENTAL_DELTA_SORT)
+            | (1u << WL_COLUMNAR_MERGE_INCREMENTAL_DELTA_DEDUP)
+            | (1u << WL_COLUMNAR_MERGE_INCREMENTAL_DELTA_COUNT_NOVEL)
+            | (1u << WL_COLUMNAR_MERGE_INCREMENTAL_DELTA_EMIT_DELTA)
+            | (1u << WL_COLUMNAR_MERGE_INCREMENTAL_DELTA_DONE);
+        ASSERT((census.phases & expected_phases) == expected_phases
+            && census.copy_columns == (1u << width) - 1
+            && census.compare_columns == (1u << width) - 1,
+            "every retained row phase and copy/compare lane was witnessed");
+        for (uint32_t cut = 0; cut <= census.calls; cut++) {
+            ASSERT(staged_typed_frontier(width, kind, 1, cut, 0, NULL),
+                "cancel at every actual outward cut including commit");
+            if (cut < census.calls && census.before_call[cut] < census.work)
+                ASSERT(staged_typed_frontier(width, kind, 2, cut, 0, NULL),
+                    "real accounting overflow before remaining paid work");
+        }
+        for (uint64_t limit = 1; limit < census.work; limit++)
+            ASSERT(staged_typed_frontier(width, kind, 3, UINT32_MAX, limit,
+                NULL),
+                "every positive insufficient work limit preserves input and retries");
+        ASSERT(staged_typed_frontier(width, kind, 4, UINT32_MAX, census.work,
+            NULL),
+            "the exact completed work limit succeeds");
+        total_cuts += census.calls + 1;
+        total_limits += census.work - 1;
+        printf("[typed width=%u kind=%u calls=%u work=%llu] ", width, kind,
+            census.calls, (unsigned long long)census.work);
+    }
+    printf("[cancel-cuts=%u limits=%llu] ", total_cuts,
+        (unsigned long long)total_limits);
+    PASS();
+}
+
+static bool
+staged_typed_late_delta_denial(void)
+{
+    static const uint32_t old[] = { 0, 2 };
+    int owner = 0, fast = -1, rc = 0;
+    bool ok = false;
+    unsigned stage = 0;
+    col_rel_t *source = staged_typed_relation(old, 2, 3, 0);
+    col_rel_t *candidate = staged_typed_relation(NULL, 0, 3, 0);
+    col_rel_t *delta = NULL;
+    wl_evaluation_control_t *control = attempt_test_control_create(0, &owner);
+    wl_columnar_memory_governor_ref_t *ref = test_ts_governor_create(16u << 20);
+    wl_columnar_merge_incremental_delta_attempt_t attempt = { 0 };
+    if (!source || !candidate || !control || !ref
+        || col_op_consolidate_incremental_delta(source, 0, NULL, &fast)
+        || col_rel_attach_memory_governor(source, ref))
+        goto done;
+    for (unsigned r = 0; r < 300; r++) {
+        int64_t row[] = { 7, 7, wl_columnar_float_to_bits(1000.0 + r) };
+        if (col_rel_append_row(candidate, row))
+            goto done;
+    }
+    for (unsigned r = 0; r < 300; r++)
+        if (candidate->columns[2][r] != wl_columnar_float_to_bits(1000.0 + r))
+            goto done;
+    wl_columnar_memory_governor_t *governor =
+        wl_columnar_memory_governor_ref_get(ref);
+    uint64_t original_reserved = wl_columnar_memory_reserved(governor);
+    uint64_t denials = wl_columnar_memory_denials(governor);
+    col_relation_snapshot_t source_before =
+        wl_columnar_relation_snapshot(source);
+    col_relation_snapshot_t candidate_before =
+        wl_columnar_relation_snapshot(candidate);
+    if (wl_columnar_merge_incremental_delta_attempt_begin_candidate(source,
+        candidate, &attempt, control) || attempt.delta->capacity >= 300)
+        goto done;
+    /* Image/sort storage is already admitted; only the actual late delta
+     * growth exceeds its initial capacity. Deny that new real reservation. */
+    atomic_store_explicit(&governor->usable_bytes,
+        wl_columnar_memory_reserved(governor), memory_order_release);
+    stage = 1;
+    rc = staged_typed_drain(source, &attempt, control, 1);
+    if (rc != ENOSPC || attempt.identity || delta
+        || wl_columnar_memory_denials(governor) != denials + 1
+        || wl_columnar_memory_reserved(governor) != original_reserved
+        || !wl_columnar_relation_snapshot_equal(source_before,
+        wl_columnar_relation_snapshot(source))
+        || !wl_columnar_relation_snapshot_equal(candidate_before,
+        wl_columnar_relation_snapshot(candidate))
+        || !staged_typed_rows(source, old, 2, 3, 0))
+        goto done;
+    stage = 2;
+    for (unsigned r = 0; r < 300; r++)
+        if (candidate->columns[0][r] != 7 || candidate->columns[1][r] != 7
+            || candidate->columns[2][r] !=
+            wl_columnar_float_to_bits(1000.0 + r))
+            goto done;
+    if (wl_evaluation_control_finish(control, &owner, rc, EIO) != ENOSPC)
+        goto done;
+    attempt_test_control_destroy(control, &owner, rc);
+    control = attempt_test_control_create(0, &owner);
+    atomic_store_explicit(&governor->usable_bytes, 16u << 20,
+        memory_order_release);
+    stage = 3;
+    if (!control || wl_columnar_merge_incremental_delta_attempt_begin_candidate(
+            source, candidate, &attempt, control)
+        || staged_typed_drain(source, &attempt, control, 17)
+        || wl_columnar_merge_incremental_delta_attempt_commit(source, &attempt,
+        &delta, &fast, control) || source->nrows != 302 || !delta
+        || delta->nrows != 300 || delta->sorted_nrows != 300
+        || delta->run_count != 1 || delta->run_ends[0] != 300)
+        goto done;
+    stage = 4;
+    for (unsigned r = 0; r < 300; r++)
+        if (delta->columns[0][r] != 7 || delta->columns[1][r] != 7
+            || delta->columns[2][r] != wl_columnar_float_to_bits(1000.0 + r)
+            || source->columns[2][r + 2] != delta->columns[2][r])
+            goto done;
+    ok = wl_evaluation_control_finish(control, &owner, 0, 0) == 0;
+done:
+    if (!ok)
+        fprintf(stderr,
+            "late delta stage=%u rc=%d source_rows=%u delta_rows=%u\n", stage,
+            rc, source ? source->nrows : 0, delta ? delta->nrows : 0);
+    if (attempt.identity)
+        (void)wl_columnar_merge_incremental_delta_attempt_abort(source,
+            &attempt);
+    test_rel_free(delta);
+    test_rel_free(candidate);
+    test_rel_free(source);
+    attempt_test_control_destroy(control, &owner, rc);
+    if (ref) {
+        ok &=
+            wl_columnar_memory_reserved(wl_columnar_memory_governor_ref_get(
+                    ref)) == 0
+            && wl_columnar_memory_governor_ref_is_sole(ref);
+        wl_columnar_memory_governor_ref_release(ref);
+    }
+    return ok;
+}
+
+static void
+test_controlled_staged_typed_late_allocation(void)
+{
+    TEST(
+        "typed staged late delta reservation refusal closes original owners (#2299)");
+    ASSERT(staged_typed_late_delta_denial(),
+        "late allocation denial and literal retry");
+    PASS();
+}
+
+static int64_t
+staged_typed_generated_cell(uint32_t rank, uint32_t column, uint32_t width,
+    unsigned kind)
+{
+    if (column + 1 < width)
+        return 7;
+    return staged_typed_type(column, width, kind) == WIRELOG_TYPE_FLOAT
+        ? wl_columnar_float_to_bits(((double)rank - 20.0) * 0.25)
+        : (int64_t)rank - 20;
+}
+
+static col_rel_t *
+staged_typed_generated_relation(uint32_t width, unsigned kind,
+    uint32_t start, uint32_t count, int step)
+{
+    col_rel_t *rel = staged_typed_relation(NULL, 0, width, kind);
+    if (!rel)
+        return NULL;
+    for (uint32_t r = 0; r < count; r++) {
+        int64_t row[17];
+        uint32_t rank = (uint32_t)((int64_t)start + (int64_t)r * step);
+        for (uint32_t c = 0; c < width; c++)
+            row[c] = staged_typed_generated_cell(rank, c, width, kind);
+        if (col_rel_append_row(rel, row)) {
+            test_rel_free(rel);
+            return NULL;
+        }
+    }
+    return rel;
+}
+
+static bool
+staged_typed_generated_rows(const col_rel_t *rel, uint32_t width, unsigned kind,
+    uint32_t start, uint32_t count, uint32_t step)
+{
+    if (!rel || rel->nrows != count || rel->ncols != width
+        || rel->declared_ncols != width || !rel->schema_ok || rel->timestamps)
+        return false;
+    for (uint32_t c = 0; c < width; c++) {
+        if (!rel->column_types || rel->column_types[c] != staged_typed_type(c,
+            width, kind)
+            || !rel->col_names || strcmp(rel->col_names[c], "lane"))
+            return false;
+        for (uint32_t r = 0; r < count; r++)
+            if (rel->columns[c][r]
+                != staged_typed_generated_cell(start + r * step, c, width,
+                kind))
+                return false;
+    }
+    return true;
+}
+
+static bool
+staged_typed_sort_origin_case(uint32_t width, unsigned kind, uint32_t n,
+    unsigned shape, uint64_t quantum)
+{
+    int owner = 0, fast = -1;
+    bool ok = false;
+    /* Shape0: left exhausted first. Shape1: same, reversed candidate.
+     * Shape2: right exhausted first. Shape3: interleaved odd/even values. */
+    uint32_t source_start = shape == 2 ? n + 1 : 0;
+    uint32_t candidate_start = shape == 1 ? 2 * n
+        : shape == 2 ? 0 : shape == 3 ? 1 : n;
+    int step = shape == 1 ? -1 : shape == 3 ? 2 : 1;
+    col_rel_t *source = staged_typed_generated_relation(width, kind,
+            source_start, n, shape == 3 ? 2 : 1);
+    col_rel_t *candidate = staged_typed_generated_relation(width, kind,
+            candidate_start, n + 1, step);
+    col_rel_t *raw = staged_typed_generated_relation(width, kind,
+            source_start, n, shape == 3 ? 2 : 1);
+    col_rel_t *delta = NULL;
+    wl_evaluation_control_t *control = attempt_test_control_create(0, &owner);
+    wl_columnar_memory_governor_ref_t *ref = test_ts_governor_create(16u << 20);
+    wl_columnar_merge_incremental_delta_attempt_t attempt = { 0 };
+    if (!source || !candidate || !raw || !control || !ref
+        || col_op_consolidate_incremental_delta(source, 0, NULL, &fast)
+        || col_rel_attach_memory_governor(source, ref))
+        goto done;
+    for (uint32_t r = 0; r <= n; r++) {
+        int64_t row[17];
+        col_rel_row_copy_out(candidate, r, row);
+        if (col_rel_append_row(raw, row))
+            goto done;
+    }
+    if (col_op_consolidate_incremental_delta(raw, 0, NULL, &fast))
+        goto done;
+    col_relation_snapshot_t before_source =
+        wl_columnar_relation_snapshot(source);
+    col_relation_snapshot_t before_candidate =
+        wl_columnar_relation_snapshot(candidate);
+    if (wl_columnar_merge_incremental_delta_attempt_begin_candidate(source,
+        candidate, &attempt, control))
+        goto done;
+    int rc = EAGAIN;
+    for (uint32_t calls = 0; rc == EAGAIN && calls < 1000000; calls++) {
+        rc = wl_columnar_merge_incremental_delta_attempt_advance(source,
+                &attempt, control, quantum);
+        if (!wl_columnar_relation_snapshot_equal(before_source,
+            wl_columnar_relation_snapshot(source))
+            || !wl_columnar_relation_snapshot_equal(before_candidate,
+            wl_columnar_relation_snapshot(candidate)) || delta)
+            goto done;
+    }
+    if (rc || wl_columnar_merge_incremental_delta_attempt_commit(source,
+        &attempt, &delta, &fast, control))
+        goto done;
+    uint32_t total = 2 * n + 1;
+    /* Interleaved input omits the final even rank2n and includes odd2n+1. */
+    if (shape == 3) {
+        if (source->nrows != total || !delta || delta->nrows != n + 1)
+            goto done;
+        for (uint32_t c = 0; c < width; c++)
+            if (source->columns[c][total - 1]
+                != staged_typed_generated_cell(2 * n + 1, c, width, kind))
+                goto done;
+        for (uint32_t r = 0; r + 1 < total; r++)
+            for (uint32_t c = 0; c < width; c++)
+                if (source->columns[c][r] != staged_typed_generated_cell(r, c,
+                    width, kind))
+                    goto done;
+    } else if (!staged_typed_generated_rows(source, width, kind, 0, total, 1)) {
+        goto done;
+    }
+    uint32_t delta_start = shape == 2 ? 0 : shape == 3 ? 1 : n;
+    if (!staged_typed_generated_rows(delta, width, kind, delta_start, n + 1,
+        shape == 3 ? 2 : 1) || raw->nrows != source->nrows
+        || delta->sorted_nrows != n + 1 || delta->run_count != 1
+        || delta->run_ends[0] != n + 1)
+        goto done;
+    for (uint32_t r = 0; r < total; r++)
+        for (uint32_t c = 0; c < width; c++)
+            if (raw->columns[c][r] != source->columns[c][r])
+                goto done;
+    /* Candidate exact physical input order is unchanged, including reverse. */
+    for (uint32_t r = 0; r <= n; r++)
+        for (uint32_t c = 0; c < width; c++)
+            if (candidate->columns[c][r] != staged_typed_generated_cell(
+                    (uint32_t)((int64_t)candidate_start + (int64_t)r * step), c,
+                    width, kind))
+                goto done;
+    ok = wl_evaluation_control_finish(control, &owner, 0, 0) == 0;
+done:
+    if (attempt.identity)
+        (void)wl_columnar_merge_incremental_delta_attempt_abort(source,
+            &attempt);
+    test_rel_free(delta);
+    test_rel_free(raw);
+    test_rel_free(candidate);
+    test_rel_free(source);
+    attempt_test_control_destroy(control, &owner, 0);
+    if (ref) {
+        ok &=
+            wl_columnar_memory_reserved(wl_columnar_memory_governor_ref_get(
+                    ref)) == 0
+            && wl_columnar_memory_governor_ref_is_sole(ref);
+        wl_columnar_memory_governor_ref_release(ref);
+    }
+    if (!ok)
+        fprintf(stderr, "typed origin width=%u kind=%u n=%u shape=%u q=%llu\n",
+            width, kind, n, shape, (unsigned long long)quantum);
+    return ok;
+}
+
+static void
+test_controlled_staged_typed_sort_origin(void)
+{
+    TEST(
+        "retained sort preserves both run tails for actual typed rows (#2299)");
+    static const uint32_t counts[] = { 0, 1, 2, 8, 128, 150 };
+    for (unsigned type = 0; type < 4; type++)
+        for (unsigned n = 0; n < 6; n++)
+            for (unsigned shape = 0; shape < 4; shape++)
+                for (unsigned q = 0; q < 2; q++)
+                    ASSERT(staged_typed_sort_origin_case(type == 3 ? 17 : 1,
+                        type == 3 ? 2 : type, counts[n], shape,
+                        q ? WL_EVALUATION_CONTROL_QUANTUM : 1),
+                        "literal and raw sorted union/delta, preserved inputs and resources");
+    PASS();
+}
+
+typedef struct staged_typed_thread_probe {
+    col_rel_t *source;
+    col_rel_t *candidate;
+    wl_columnar_merge_incremental_delta_attempt_t *attempt;
+    wl_evaluation_control_t *control;
+    int advance_rc, commit_rc, abort_rc, competing_rc;
+    bool unexpected_delta;
+} staged_typed_thread_probe_t;
+
+static void *
+staged_typed_wrong_thread(void *opaque)
+{
+    staged_typed_thread_probe_t *probe = opaque;
+    wl_columnar_merge_incremental_delta_attempt_t competing = { 0 };
+    col_rel_t *delta = NULL;
+    probe->advance_rc = wl_columnar_merge_incremental_delta_attempt_advance(
+        probe->source, probe->attempt, probe->control, 1);
+    probe->commit_rc = wl_columnar_merge_incremental_delta_attempt_commit(
+        probe->source, probe->attempt, &delta, NULL, probe->control);
+    probe->abort_rc = wl_columnar_merge_incremental_delta_attempt_abort(
+        probe->source, probe->attempt);
+    probe->competing_rc =
+        wl_columnar_merge_incremental_delta_attempt_begin_candidate(
+        probe->source, probe->candidate, &competing, probe->control);
+    if (competing.identity)
+        (void)wl_columnar_merge_incremental_delta_attempt_abort(probe->source,
+            &competing);
+    probe->unexpected_delta = delta != NULL;
+    test_rel_free(delta);
+    return NULL;
+}
+
+static bool
+staged_typed_owner_case(bool source_first, bool stale_control)
+{
+    static const uint32_t old[] = { 0, 2 };
+    int owner = 0, fast = -1;
+    bool ok = false;
+    col_rel_t *a = staged_typed_relation(old, 2, 17, 0);
+    col_rel_t *b = staged_typed_relation(old, 2, 17, 0);
+    col_rel_t *delta = NULL;
+    wl_evaluation_control_t *control = attempt_test_control_create(0, &owner);
+    wl_columnar_memory_governor_ref_t *ref = test_ts_governor_create(16u << 20);
+    wl_columnar_merge_incremental_delta_attempt_t attempt = { 0 };
+    wl_columnar_source_access_writer_t writer = { 0 };
+    col_rel_t *source = (uintptr_t)a < (uintptr_t)b ? a : b;
+    col_rel_t *candidate = source == a ? b : a;
+    if (!source_first) {
+        col_rel_t *swap = source;
+        source = candidate;
+        candidate = swap;
+    }
+    if (!a || !b || !control || !ref
+        || col_op_consolidate_incremental_delta(a, 0, NULL, &fast)
+        || col_op_consolidate_incremental_delta(b, 0, NULL, &fast)
+        || col_rel_attach_memory_governor(source, ref))
+        goto done;
+    for (unsigned side = 0; side < 2; side++) {
+        col_rel_t *blocked = side ? source : candidate;
+        if (col_rel_source_writer_acquire(blocked, &writer))
+            goto done;
+        int rc = wl_columnar_merge_incremental_delta_attempt_begin_candidate(
+            source, candidate, &attempt, control);
+        if (wl_columnar_source_access_writer_release(&writer)
+            || rc != EBUSY || attempt.identity)
+            goto done;
+    }
+    if (wl_columnar_merge_incremental_delta_attempt_begin_candidate(source,
+        candidate, &attempt,
+        control) || attempt.candidate_first == source_first)
+        goto done;
+    if (stale_control) {
+        uint64_t old_id = attempt.control_attempt_id;
+        if (wl_evaluation_control_finish(control, &owner, 0, 0)
+            || wl_evaluation_control_begin(control, &owner)
+            || wl_evaluation_control_active_attempt_id(control) == old_id
+            || wl_columnar_merge_incremental_delta_attempt_advance(source,
+            &attempt, control, 1) != EINVAL || !attempt.identity)
+            goto done;
+    } else {
+        staged_typed_thread_probe_t probe = {
+            .source = source, .candidate = candidate,
+            .attempt = &attempt, .control = control,
+        };
+        wl_thread_t thread;
+        if (wl_thread_create(&thread, staged_typed_wrong_thread, &probe)
+            || wl_thread_join(&thread))
+            goto done;
+        if (probe.advance_rc != EINVAL || probe.commit_rc != EINVAL
+            || probe.abort_rc != EINVAL || probe.competing_rc != EBUSY
+            || probe.unexpected_delta || !attempt.identity)
+            goto done;
+    }
+    if (!staged_typed_rows(source, old, 2, 17, 0)
+        || !staged_typed_rows(candidate, old, 2, 17, 0)
+        || wl_columnar_merge_incremental_delta_attempt_abort(source, &attempt)
+        || wl_columnar_merge_incremental_delta_attempt_begin_candidate(source,
+        candidate, &attempt, control)
+        || staged_typed_drain(source, &attempt, control, 1)
+        || wl_columnar_merge_incremental_delta_attempt_commit(source, &attempt,
+        &delta, &fast, control)
+        || !staged_typed_rows(delta, old, 0, 17, 0))
+        goto done;
+    ok = wl_evaluation_control_finish(control, &owner, 0, 0) == 0;
+done:
+    if (writer.identity)
+        (void)wl_columnar_source_access_writer_release(&writer);
+    if (attempt.identity)
+        (void)wl_columnar_merge_incremental_delta_attempt_abort(source,
+            &attempt);
+    test_rel_free(delta);
+    test_rel_free(a);
+    test_rel_free(b);
+    attempt_test_control_destroy(control, &owner, 0);
+    if (ref) {
+        ok &=
+            wl_columnar_memory_reserved(wl_columnar_memory_governor_ref_get(
+                    ref)) == 0
+            && wl_columnar_memory_governor_ref_is_sole(ref);
+        wl_columnar_memory_governor_ref_release(ref);
+    }
+    return ok;
+}
+
+static void
+test_controlled_staged_typed_owners(void)
+{
+    TEST(
+        "typed staged actual threads, stale control and both lock orders (#2299)");
+    for (unsigned order = 0; order < 2; order++)
+        for (unsigned stale = 0; stale < 2; stale++)
+            ASSERT(staged_typed_owner_case(order != 0, stale != 0),
+                "owner affinity, real writer contention and actual reset history");
     PASS();
 }
 
@@ -6083,6 +6711,10 @@ main(void)
     test_controlled_staged_typed_rows_and_metadata();
     test_controlled_staged_typed_terminal_retry();
     test_controlled_staged_typed_zero_and_noop();
+    test_controlled_staged_typed_frontiers();
+    test_controlled_staged_typed_late_allocation();
+    test_controlled_staged_typed_sort_origin();
+    test_controlled_staged_typed_owners();
     test_controlled_staged_delta_merges_and_resumes();
     test_controlled_staged_delta_multi_column();
     test_controlled_staged_delta_terminal_retry_and_rejects();
