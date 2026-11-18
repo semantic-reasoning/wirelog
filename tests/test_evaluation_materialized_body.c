@@ -29,6 +29,19 @@ static const pair_t deleted[] = {{1, 2}, {2, 3}, {4, 5}, {5, 6}, {6, 7},
 static const pair_t edges0[] = {{1, 2}, {2, 3}, {3, 4}, {4, 5}, {5, 6}};
 static const pair_t edges1[] = {{1, 2}, {2, 3}, {3, 4}, {4, 5}, {5, 6}, {6, 7}};
 static const pair_t edges2[] = {{1, 2}, {2, 3}, {4, 5}, {5, 6}, {6, 7}};
+static const pair_t inline_initial[] = {
+    {1, 2}, {2, 3}, {3, 4}, {4, 5}, {5, 6}, {1, 5}, {2, 6}
+};
+static const pair_t inline_inserted[] = {
+    {1, 2}, {2, 3}, {3, 4}, {4, 5}, {5, 6}, {6, 7}, {1, 5}, {2, 6}, {3, 7}
+};
+static unsigned inline_position, output_route, history_stage;
+static int64_t input_tag, input_float;
+static events_t snapshot_images[2];
+static unsigned inline_seen, inline_gathers, inline_hashes, inline_prepared,
+    inline_produced, inline_acks, inline_positive_acks, inline_done,
+    inline_live_prepared;
+static const wl_plan_op_t *inline_batch_op;
 static bool path_child, selected_body, whole_scc;
 static unsigned owned_joins;
 static const wl_plan_relation_t *selected_plan;
@@ -124,10 +137,84 @@ observed(wl_evaluation_control_t *control, unsigned phase, uint32_t index,
             && op->op != WL_PLAN_OP_K_FUSION && op->op != WL_PLAN_OP_LFTJ);
         joins += op->op == WL_PLAN_OP_JOIN;
     }
-    CHECK(joins == 2);
+    CHECK(joins == (inline_position ? 3u : 2u));
+    if (inline_position) {
+        const wl_plan_op_t *edge_join = NULL, *first_join = NULL;
+        for (uint32_t i = 0; i < bindings->plan->op_count; ++i) {
+            const wl_plan_op_t *op = &bindings->plan->ops[i];
+            if (op->op != WL_PLAN_OP_JOIN) continue;
+            if (!first_join) first_join = op;
+            if (op->right_relation && !strcmp(op->right_relation, "edge"))
+                edge_join = op;
+        }
+        CHECK(inline_position == 1 ? first_join && first_join->key_count == 1
+            && !strcmp(first_join->left_keys[0], "col3")
+            : edge_join && edge_join->key_count == 1
+            && !strcmp(edge_join->right_keys[0], "col2"));
+    }
     selected_body = true;
 }
 
+/* Read-only observation inside genuine private-body callbacks. */
+static bool
+inline_relation(const col_rel_t *rel)
+{
+    if (!rel || rel->compound_kind != WIRELOG_COMPOUND_KIND_INLINE
+        || !rel->nrows) return false;
+    CHECK(rel->schema_ok && rel->ncols == 4 && rel->compound_count == 1
+        && rel->compound_arity_len == 3 && !rel->inline_physical_offset
+        && rel->compound_arity_map && rel->compound_arity_map[0] == 2
+        && rel->compound_arity_map[1] == 1 && rel->compound_arity_map[2] == 1
+        && rel->column_types && rel->column_types[0] == WIRELOG_TYPE_STRING
+        && rel->column_types[1] == WIRELOG_TYPE_FLOAT
+        && rel->column_types[2] == WIRELOG_TYPE_INT64
+        && rel->column_types[3] == WIRELOG_TYPE_INT64
+        && rel->columns[0][0] == input_tag
+        && rel->columns[1][0] == input_float);
+    return true;
+}
+static bool
+inline_source(const wl_columnar_relation_scalar_source_t *source)
+{
+    if (source->phase != WL_COLUMNAR_RELATION_SCALAR_SOURCE_HELD
+        || !inline_relation(source->descriptor)) return false;
+    const col_rel_t *r = source->descriptor;
+    CHECK(source->identity == source && source->width == 4
+        && source->columns == (const int64_t *const *)r->columns
+        && source->descriptor_reader.identity ==
+        (uintptr_t)&source->descriptor_reader
+        && source->descriptor_reader.owner == &r->descriptor_access
+        && source->owner_reader.identity == (uintptr_t)&source->owner_reader
+        && source->owner_reader.owner == &r->storage_owner->source_access);
+    return true;
+}
+static wl_columnar_eval_serial_framed_attempt_t *
+actual_body(void)
+{
+    wl_col_session_t *s = COL_SESSION(controlled_session);
+    wl_columnar_eval_serial_framed_attempt_t *r = NULL;
+    CHECK(!wl_columnar_eval_stack_framed_context(s->cleanup_active, s, &r)
+        && r->capture_only && r->private_bindings == selected_bindings
+        && r->child_bound && r->child.plan == selected_plan);
+    return r;
+}
+static void
+batch_event(wl_evaluation_control_t *control, unsigned event,
+    uint64_t generation, uint32_t extent, uint64_t work)
+{
+    if (!inline_position || !path_child || !inline_batch_op) return;
+    CHECK(control == controlled_session->evaluation_control);
+    wl_columnar_eval_serial_framed_attempt_t *r = actual_body();
+    if (r->child.cursor >= selected_plan->op_count ||
+        &selected_plan->ops[r->child.cursor] != inline_batch_op) return;
+    if (event == WL_COLUMNAR_JOIN_PIPELINE_TEST_PRODUCE) ++inline_produced;
+    if (event == WL_COLUMNAR_JOIN_PIPELINE_TEST_AFTER_ACK && generation) {
+        CHECK(work); ++inline_acks;
+        if (extent) ++inline_positive_acks;
+    }
+    if (event == WL_COLUMNAR_JOIN_PIPELINE_TEST_PRODUCER_DONE && work)
+        ++inline_done;
+}
 static void
 batch_prepare(const wl_columnar_join_batch_prepare_t *attempt)
 {
@@ -137,6 +224,29 @@ batch_prepare(const wl_columnar_join_batch_prepare_t *attempt)
         CHECK(attempt->identity == attempt
             && attempt->op->op == WL_PLAN_OP_JOIN
             && !attempt->op->materialized && !attempt->op->opaque_data);
+        if (inline_position && attempt->phase >= 11 && attempt->phase <= 13
+            && (inline_relation(attempt->left) ||
+            inline_relation(attempt->right))){
+            CHECK(attempt->arrays_committed && attempt->keys && attempt->types
+                && attempt->arrangement.ht_head && attempt->key_row
+                && attempt->arrangement.indexed_rows == attempt->right->nrows
+                && attempt->right->nrows
+                && attempt->left_reader.identity ==
+                (uintptr_t)&attempt->left_reader
+                && attempt->right_reader.identity ==
+                (uintptr_t)&attempt->right_reader
+                && attempt->left_reader.secondary_owner ==
+                &attempt->left->descriptor_access
+                && attempt->right_reader.secondary_owner ==
+                &attempt->right->descriptor_access
+                && attempt->left_reader.owner ==
+                &attempt->left->storage_owner->source_access
+                && attempt->right_reader.owner ==
+                &attempt->right->storage_owner->source_access);
+            CHECK(inline_relation(attempt->right) && attempt->keys[1] == 2);
+            inline_seen |= 2; ++inline_prepared; inline_batch_op = attempt->op;
+            if (attempt->left->nrows) ++inline_live_prepared;
+        }
         if (interrupt_kind == 5 && !producer_error_armed) {
             CHECK(!wl_columnar_join_batch_test_prepare_fail_allocation);
             producer_error_armed = true;
@@ -199,15 +309,38 @@ static void
 join_checkpoint(wl_evaluation_control_t *control, unsigned phase,
     uint64_t progress)
 {
-    (void)control; (void)progress;
+    (void)control;
     if ((phase == 1 || phase == 50) && path_child) ++owned_joins;
+    if (!inline_position || !path_child || (phase != 18 && phase != 27)) return;
+    wl_columnar_eval_serial_framed_attempt_t *r = actual_body();
+    wl_columnar_filter_context_t *ctx = NULL;
+    CHECK(!wl_columnar_eval_stack_filter_context_owned(r->frame, &ctx,
+        &r->child)
+        && ctx->join_operation == &selected_plan->ops[r->child.cursor]);
+    unsigned mask = (inline_source(&ctx->source) ? 1u : 0u)
+        | (inline_source(&ctx->join_right) ? 2u : 0u);
+    inline_seen |= mask;
+    if (mask && phase == 18 && progress == 1) ++inline_gathers;
+    if ((mask & 2u) && phase == 27) ++inline_hashes;
 }
 
+static void
+tuple(const char *name, const int64_t *row, uint32_t width, void *payload)
+{
+    capture(name, row, width, 1, payload);
+}
 static int
 finish(wl_session_t *session)
 {
+    events_t *image = &snapshot_images[session == controlled_session ? 0 : 1];
+    memset(image, 0, sizeof(*image));
     for (unsigned call = 0; call < 1000000; ++call) {
-        int rc = wl_session_step(session);
+        int rc = output_route == 2 ? wl_session_snapshot(session, tuple, image)
+            : wl_session_step(session);
+        if (output_route == 2 && rc) {
+            const events_t empty = {0};
+            CHECK(!memcmp(image, &empty, sizeof(empty)));
+        }
         if (rc != EAGAIN) return rc;
     }
     CHECK(false); return EIO;
@@ -227,6 +360,11 @@ content(wl_session_t *session, const char *name, const pair_t *set,
 {
     const col_rel_t *relation = session_find_rel(COL_SESSION(session), name);
     CHECK(relation && relation->ncols == 2 && relation->nrows == count);
+    if (inline_position) CHECK(relation->compound_kind ==
+            WIRELOG_COMPOUND_KIND_NONE
+            && relation->column_types &&
+            relation->column_types[0] == WIRELOG_TYPE_INT64
+            && relation->column_types[1] == WIRELOG_TYPE_INT64);
     bool seen[8][8] = {{false}};
     for (uint32_t r = 0; r < relation->nrows; ++r) {
         int64_t x = col_rel_get(relation, r, 0),
@@ -253,7 +391,16 @@ events_match(const events_t *events, const pair_t *old, size_t old_count,
 int
 main(int argc, char **argv)
 {
-    CHECK(argc == 2);
+    CHECK(argc == 2 || argc == 4);
+    if (argc == 4) {
+        inline_position = !strcmp(argv[2], "left") ? 1 : !strcmp(argv[2],
+                "middle") ? 2 : 3;
+        CHECK(inline_position != 3 || !strcmp(argv[2], "right"));
+        output_route = !strcmp(argv[3], "observed") ? 0 : !strcmp(argv[3],
+                "plain") ? 1 : 2;
+        CHECK(output_route != 2 || !strcmp(argv[3], "snapshot"));
+        CHECK(!strcmp(argv[1], "plain") || !strcmp(argv[1], "batch"));
+    }
     wl_columnar_memory_reservation_init(&memory_peer);
     memory_mode = !strcmp(argv[1], "batch-memory-first")
         || !strcmp(argv[1], "batch-memory-successor");
@@ -276,11 +423,22 @@ main(int argc, char **argv)
     environment("WIRELOG_JOIN_OUTPUT_LIMIT", denied ? "1" : limited ? "128"
         : NULL);
     wirelog_error_t error;
-    wirelog_program_t *program = wirelog_parse_string(
-        ".decl edge(x:int64,y:int64)\n.decl path(x:int64,y:int64)\n"
-        ".decl plain(x:int64,y:int64)\nplain(x,y):-edge(x,y).\n"
-        "path(x,y):-edge(x,y).\npath(x,z):-path(x,y),path(y,w),path(w,z).\n",
-        &error);
+    const char *rules[] = {
+        "path(x,z):-edge(pair(t,v),x,y),path(y,u),path(u,w),path(w,z).\n",
+        "path(x,z):-path(x,y),edge(pair(t,v),y,u),path(u,w),path(w,z).\n",
+        "path(x,z):-path(x,y),path(y,u),path(u,w),edge(pair(t,v),w,z).\n"
+    };
+    char text[1024];
+    if (inline_position) snprintf(text, sizeof(text),
+            ".decl edge(p:pair(symbol,float) inline,x:int64,y:int64)\n"
+            ".decl path(x:int64,y:int64)\n.decl plain(x:int64,y:int64)\n"
+            "plain(x,y):-edge(pair(t,v),x,y).\npath(x,y):-edge(pair(t,v),x,y).\n%s",
+            rules[inline_position - 1]);
+    else snprintf(text, sizeof(text),
+            ".decl edge(x:int64,y:int64)\n.decl path(x:int64,y:int64)\n"
+            ".decl plain(x:int64,y:int64)\nplain(x,y):-edge(x,y).\n"
+            "path(x,y):-edge(x,y).\npath(x,z):-path(x,y),path(y,w),path(w,z).\n");
+    wirelog_program_t *program = wirelog_parse_string(text, &error);
     CHECK(program);
     wl_plan_t *plan = NULL;
     CHECK(!wl_plan_from_program(program, &plan));
@@ -292,6 +450,20 @@ main(int argc, char **argv)
     CHECK(body && body->lineage == WL_PLAN_BODY_LINEAGE_K_FUSION_EQUIVALENT
         && body->equivalent_k == 3 && body->equivalent_k_fusion_opaque);
     const void *identity = body->equivalent_k_fusion_opaque;
+    if (inline_position) {
+        const wl_plan_op_k_fusion_t *expanded = identity;
+        unsigned hints = 0;
+        CHECK(expanded->k == 3 && expanded->k_ops && expanded->k_op_counts);
+        for (uint32_t k = 0; k < expanded->k; ++k)
+            for (uint32_t op = 0; op < expanded->k_op_counts[k]; ++op)
+                if (expanded->k_ops[k][op].materialized) {
+                    CHECK(expanded->k_ops[k][op].op == WL_PLAN_OP_JOIN);
+                    ++hints;
+                }
+        CHECK(hints);
+        input_tag = wl_intern_put(plan->intern, "materialized-inline");
+        input_float = wl_columnar_float_to_bits(1.5);
+    }
     wl_evaluation_control_t *control = NULL;
     CHECK(!wl_evaluation_control_create(UINT64_C(100000000), &control));
     wl_columnar_memory_resolution_t resolution = {
@@ -316,12 +488,24 @@ main(int argc, char **argv)
     environment("WIRELOG_JOIN_OUTPUT_LIMIT", NULL);
     events_t events[2] = {0};
     const int64_t rows[] = {1, 2, 2, 3, 3, 4, 4, 5, 5, 6};
-    for (unsigned i = 0; i != 2; ++i) {
-        wl_session_set_delta_cb(sessions[i], capture, &events[i]);
-        CHECK(!wl_session_insert(sessions[i], "edge", rows, 5, 2));
+    int64_t physical[20];
+    for (unsigned i = 0; i < 5; ++i) {
+        physical[4*i] = input_tag; physical[4*i+1] = input_float;
+        physical[4*i+2] = edges0[i].x; physical[4*i+3] = edges0[i].y;
     }
-    const pair_t *path[] = {initial, inserted, deleted};
-    const size_t path_count[] = {9, 12, 6};
+    for (unsigned i = 0; i != 2; ++i) {
+        if (!output_route) wl_session_set_delta_cb(sessions[i], capture,
+                &events[i]);
+        CHECK(!wl_session_insert(sessions[i], "edge",
+            inline_position ? physical : rows,
+            5, inline_position ? 4 : 2));
+    }
+    const pair_t *path[] = {inline_position ? inline_initial : initial,
+                            inline_position ? inline_inserted : inserted,
+                            inline_position ? edges2 : deleted};
+    const size_t path_count[] = {inline_position ? 7u : 9u,
+                                 inline_position ? 9u : 12u,
+                                 inline_position ? 5u : 6u};
     const pair_t *edge[] = {edges0, edges1, edges2};
     const size_t edge_count[] = {5, 6, 5};
     for (unsigned stage = 0; stage != 3; ++stage) {
@@ -329,6 +513,11 @@ main(int argc, char **argv)
         if (raw_rc != expected) fprintf(stderr, "raw stage=%u batch=%u rc=%d\n",
                 stage, batch, raw_rc);
         CHECK(raw_rc == expected);
+        history_stage = stage;
+        inline_seen = inline_gathers = inline_hashes = inline_prepared =
+            inline_produced = inline_acks = inline_positive_acks = inline_done =
+            0;
+        inline_batch_op = NULL; inline_live_prepared = 0;
         owned_joins = 0; path_child = selected_body = whole_scc = false;
         selected_plan = NULL;
         selected_bindings = NULL;
@@ -336,6 +525,8 @@ main(int argc, char **argv)
         wl_columnar_join_test_attempt_checkpoint = join_checkpoint;
         wl_columnar_join_batch_test_prepare_checkpoint = batch_prepare;
         wl_columnar_join_pipeline_test_first_error = first_producer_error;
+        wl_columnar_join_pipeline_test_numeric_checkpoint =
+            inline_position ? batch_event : NULL;
         memory_armed = memory_mode && stage == memory_stage;
         int rc = finish(sessions[0]);
         if (memory_armed) {
@@ -417,6 +608,17 @@ main(int argc, char **argv)
         wl_columnar_join_test_attempt_checkpoint = NULL;
         wl_columnar_join_batch_test_prepare_checkpoint = NULL;
         wl_columnar_join_pipeline_test_first_error = NULL;
+        wl_columnar_join_pipeline_test_numeric_checkpoint = NULL;
+        if (inline_position && !expected) {
+            CHECK(inline_seen == (inline_position == 1 ? 1u : 2u));
+            if (inline_position == 3 && batch) {
+                CHECK(inline_prepared && inline_live_prepared &&
+                    inline_produced && inline_done);
+                if (history_stage < 2) CHECK(inline_acks &&
+                        inline_positive_acks);
+            } else CHECK(history_stage < 2 ? inline_gathers : inline_gathers ||
+                    inline_hashes);
+        }
         CHECK(body->equivalent_k_fusion_opaque == identity);
         if (expected) {
             const events_t empty = {0};
@@ -431,12 +633,19 @@ main(int argc, char **argv)
         for (unsigned i = 0; i != 2; ++i) {
             content(sessions[i], "path", path[stage], path_count[stage]);
             content(sessions[i], "plain", edge[stage], edge_count[stage]);
-            events_match(&events[i], stage ? path[stage-1] : NULL,
-                stage ? path_count[stage-1] : 0, path[stage], path_count[stage],
-                0);
-            events_match(&events[i], stage ? edge[stage-1] : NULL,
-                stage ? edge_count[stage-1] : 0, edge[stage], edge_count[stage],
-                1);
+            if (!output_route) {
+                events_match(&events[i], stage ? path[stage-1] : NULL,
+                    stage ? path_count[stage-1] : 0, path[stage],
+                    path_count[stage], 0);
+                events_match(&events[i], stage ? edge[stage-1] : NULL,
+                    stage ? edge_count[stage-1] : 0, edge[stage],
+                    edge_count[stage], 1);
+            } else if (output_route == 2) {
+                events_match(&snapshot_images[i], NULL, 0, path[stage],
+                    path_count[stage], 0);
+                events_match(&snapshot_images[i], NULL, 0, edge[stage],
+                    edge_count[stage], 1);
+            }
             memset(&events[i], 0, sizeof(events[i]));
         }
         /* A real unchanged public call after publication must retain the
@@ -447,10 +656,20 @@ main(int argc, char **argv)
             content(sessions[i], "plain", edge[stage], edge_count[stage]);
             const events_t empty = {0};
             CHECK(!memcmp(&events[i], &empty, sizeof(empty)));
+            if (output_route == 2) {
+                events_match(&snapshot_images[i], NULL, 0, path[stage],
+                    path_count[stage], 0);
+                events_match(&snapshot_images[i], NULL, 0, edge[stage],
+                    edge_count[stage], 1);
+            }
+            int64_t next[] = {input_tag, input_float, 6, 7},
+                removed[] = {input_tag, input_float, 3, 4};
             if (!stage) CHECK(!wl_session_insert(sessions[i], "edge",
-                    (int64_t[]){6, 7}, 1, 2));
+                    inline_position ? next : &next[2], 1,
+                    inline_position ? 4 : 2));
             if (stage == 1) CHECK(!wl_session_remove(sessions[i], "edge",
-                    (int64_t[]){3, 4}, 1, 2));
+                    inline_position ? removed : &removed[2], 1,
+                    inline_position ? 4 : 2));
         }
     }
     CHECK(!memory_mode || memory_denied);
@@ -465,6 +684,8 @@ main(int argc, char **argv)
             governor)));
     wl_columnar_memory_governor_ref_release(governor);
     puts(expected ? "materialized preserved body: exact policy refusal passed"
+        : inline_position ?
+        "preserved K3 INLINE body: literal 7/9/5 history passed"
         : "materialized preserved body: literal 9/12/6 signed history passed");
     return 0;
 }

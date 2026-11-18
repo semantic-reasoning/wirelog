@@ -3515,6 +3515,20 @@ foreach materialized_body_mode : ['plain', 'batch', 'strict', 'limit', 'limit-de
        suite: ['unit', 'tsan', 'evaluation_join_hosts'], timeout: 60)
 endforeach
 
+foreach body_inline_side : ['left', 'middle', 'right']
+  foreach body_inline_route : ['observed', 'plain', 'snapshot']
+    foreach body_inline_mode : ['plain', 'batch']
+      test('evaluation_materialized_body_inline_' + body_inline_side + '_' +
+           body_inline_route + '_' + body_inline_mode,
+           test_evaluation_materialized_body_exe,
+           args: [body_inline_mode, body_inline_side, body_inline_route],
+           env: ['WIRELOG_JOIN_BATCH_BYTES=', 'WIRELOG_JOIN_BATCH_STRICT=',
+                 'WIRELOG_JOIN_OUTPUT_LIMIT='],
+           suite: ['unit', 'tsan', 'evaluation_join_hosts'], timeout: 120)
+    endforeach
+  endforeach
+endforeach
+
 test_tdd_insert_manifest_exe = executable(
   'test_tdd_insert_manifest',
   files('test_tdd_insert_manifest.c'),
