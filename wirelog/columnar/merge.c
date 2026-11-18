@@ -3051,14 +3051,17 @@ wl_columnar_merge_incremental_delta_attempt_begin_internal(col_rel_t *source,
             goto fail;
         attempt->candidate_reader_held = true;
     }
-    bool all_int64 = source->ncols > 0;
-    for (uint32_t c = 0; candidate && c < source->ncols; c++)
-        if (source->column_types
-            && source->column_types[c] != WIRELOG_TYPE_INT64)
-            all_int64 = false;
+    bool supported_types = source->ncols > 0;
+    for (uint32_t c = 0; candidate && c < source->ncols; c++) {
+        wirelog_column_type_t type = source->column_types
+            ? source->column_types[c] : WIRELOG_TYPE_INT64;
+        if (type != WIRELOG_TYPE_INT64 && type != WIRELOG_TYPE_STRING
+            && type != WIRELOG_TYPE_FLOAT)
+            supported_types = false;
+    }
     if (candidate && (source->storage_owner != source
         || candidate->storage_owner != candidate
-        || !all_int64
+        || !supported_types
         || source->compound_kind != WIRELOG_COMPOUND_KIND_NONE
         || source->compound_arity_len != 0 || source->has_graph_column
         || !wl_columnar_merge_staged_metadata_equal(source, candidate)
