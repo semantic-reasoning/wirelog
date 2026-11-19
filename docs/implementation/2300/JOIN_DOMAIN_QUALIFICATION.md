@@ -473,17 +473,108 @@ The existing SIDE refusals remain. This increment does not qualify configured
 strict/batch or output/memory-policy INLINE products, materialized INLINE,
 complete selectors, timestamp propagation, cache pins/reuse or full Source/carry.
 
+## Persistent JOIN indexes and selected-source histories
+
+This increment starts from merged #2389 on main `51216670`. The focused
+`evaluation_join_cache_*` fixture adds six healthy histories and36 selected
+CANCEL/WORK histories. Every history uses the same logical input script in
+three sessions: the actual default controlled profile, deliberately
+`diff_enabled=false` controlled comparison, and a diff-disabled raw reference.
+The default is asserted as returned by Session creation and left unchanged.
+The disabled comparison also disables append optimization, so this is a
+whole-evaluation/private-index semantic comparison, not an isolated cache-only
+work or resource comparison. Each session has its own enforcing governor and
+each controlled session its own control.
+
+Natural programs use five scalar INT64 output heads. `first` and `mirror`
+share canonical scalar RHS key0; `reverse` uses key1; `exact` uses key0+1;
+`filtered` has a genuine RHS flag1 expression and private selected-row index.
+The left input is either scalar or has a real STRING/FLOAT INLINE prefix,
+with physical join keys displaced to lanes2/3. The RHS remains canonical
+scalar INT64. Persistent INLINE/non-INT64 RHS and literal-materialized result
+cache execution are not activated by this increment.
+
+An independent logical fact-set enumerator specifies each head without using
+raw output, production hashing or expression evaluation. Initial left facts
+are(1,1),(2,2). Flag1 RHS endpoint facts are(1,1),(2,2),(1,2),(4,4);
+a rejected duplicate-valued(1,2,0) and a
+unique rejected(2,7,0) distinguish predicate work from observable rejection.
+The latter is present in unfiltered output and absent from `filtered`.
+Duplicate left insertion requires real input/index work but no new set output
+or signed events; it is not FORCE_EMPTY selector evidence.
+
+An empty public bootstrap establishes the session before BOTH sides are
+populated. This reaches the general public transaction for the first nonempty
+call without forcing an internal route; it does not claim that the first-ever
+dense plain STEP selects this cache path. The mutation script then appends
+left(4,4), appends/removes RHS(4,2,1), repeats left(4,4), changes both sides with
+left(9,9)/RHS(9,9,1), and removes that RHS row. All five images and exact
+relation-qualified signed differences on observed STEP are independent of
+another execution. Plain STEP has no observer; evaluating Snapshot collects
+full tuple images after mutations. Unchanged calls are separate checks.
+
+Actual authorized dynamic bindings, capture-only framed child/current JOIN
+and HELD source reader/gate identities bind observations. Typed INLINE prefix
+map/types/values and the physical displaced keys are checked. Full RHS is the
+actual canonical public EDB binding with its current snapshot. Default scalar
+observed STEP selects the exact one-row appended RHS descriptor/content on the
+RHS-only append, and the exact VARIABLE frontier on qualified left-only
+appends. Plain STEP, Snapshot and typed INLINE-left histories select FULL RHS
+in these cases. The read-only selected-source observation neither creates a
+source nor forces selection. Phase7's used_delta flag alone is not the oracle.
+
+The default full path builds three key-signature indexes and shares a sibling
+request; warm left-only calls reuse the actual index objects and initialized
+bucket/link contents. Successful flat registry relocation is permitted.
+RHS mutation may already invalidate published index generations/extents before
+evaluation, so comparisons capture the post-mutation/pre-call image. The
+scalar observed RHS-delta call leaves that image untouched and uses an ephemeral
+private index; it does not key the full-source registry with a delta descriptor.
+Removal and both-input changes rebuild against current canonical snapshots and
+indexed extents. Real build phase47 is restricted to the actual nonempty
+unfiltered current build op, excluding its overloaded empty-filter recipe
+meaning. Phase48 proves persistent candidate/probe work, not necessarily a
+matching gathered result. The filtered private sibling separately reaches the
+unique false RHS fact and its required literal output.
+
+The36 recovery histories cover scalar/INLINE left, three routes, CANCEL/WORK
+and three distinct actual sites: warm validation/reuse, insertion of two real
+RHS rows into a new private index, and a warm persistent candidate probe. Every
+fault preserves the exact published registry container/count/signatures/index
+payload and old five-head pointers/images, pending input and both input
+snapshots/maps/types/cells, with zero early events/tuples. Capture occurs after
+public mutation; an invalidated prior index is not called usable for new facts.
+Genuine control reset retries the same facts without reinsertion. Fresh retry
+work witnesses and future updates/removals/unchanged calls remain mandatory.
+
+At these sites private differential transactions/readers are disposed for
+WORK as well as CANCEL, unlike the prior preserved-recursive WORK case. Both
+actual input writers reacquire immediately. STEP retains a logical PENDING
+retry state and a fixed descriptive RESERVED completion slot; it is not an
+active WAIT_SOURCE owner or retained transaction/metadata credit. The public
+Original report remains separate from that slot's inert report. Snapshot
+instead has SNAPSHOT_RETRYABLE and an INERT completion slot. Reached STEP
+insert/remove/Snapshot protection and frozen report/input/index observations
+are finite assertions; no universal destruction refusal is implied. Final
+governor zero follows complete teardown, not a claim of an intermediate
+financial baseline or containing Source/carry certificate.
+
+Validation and reproduction for the final code/test tree are recorded below.
+Other selector/empty/pin/materialization/type/representation and signed metadata
+products, current platform validation and containing Native/Source/carry remain
+OPEN. No issue or matrix row is closed.
+
 ## Reused evidence and remaining acceptance
 
 | Obligation | Existing evidence reused | Still outstanding for complete #2371 acceptance |
 |---|---|---|
 | Ordinary key/product/projection/collision and accepted RHS expressions | `evaluation_join`, generated large/filter/collision cases in `evaluation_serial`, scalar recovery and the new public histories | Complete accepted expression/type/error/representation crossproducts beyond the specified scalar and INLINE predicates |
-| Full/delta/empty selectors and signed future changes | Existing direct selector fixtures, serial append dispatches and the new literal public histories | Bind each newly enabled route to actual source identity and all required selector partitions; phase7 alone is insufficient |
-| Persistent full unfiltered index and filtered/private fallback | `test_controlled_persistent_join`, persistent stop/refusal matrices in `test_evaluation_serial.c`; new literal public build/private witnesses | Complete consuming predicate/representation/policy and same-input cache equivalence; new tests do not claim reuse from output equality |
+| Full/delta/empty selectors and signed future changes | Existing direct selector fixtures, serial append dispatches and literal public histories;42 cache histories bind actual canonical RHS and default scalar-observed append descriptors | Complete remaining selector partitions; historical phase7-only counters remain insufficient |
+| Persistent full unfiltered index and filtered/private fallback | `test_controlled_persistent_join`, persistent stop/refusal matrices in `test_evaluation_serial.c`;42 natural cache/source histories across scalar/INLINE LEFT and three public routes, actual key0/key1/composite reuse/rebuild, private filtered/delta work and exact rollback/retry | Remaining predicate/representation/policy/pin/selector intersections; same-input default/private whole-evaluation comparison is not an isolated cache-only or resource certificate |
 | Pins and deferred rebuild/eviction | `join_right_filter_cleanup` managed cache/pinned fallback/admission tests; existing strict internal-cache fixtures | Missing authentic consuming intersections, with internal pin setup labelled as such; no new public primary-cache producer is invented |
 | Materialized policy/memory and future calls | All78 `evaluation_materialized_body_*` selections:12 original scalar and66 typed INLINE-EDB preserved-body histories; host strict/policy/lifecycle suites | Remaining empty/wide/metadata/selector/cache-equivalence and containing bounds, not a primitive controlled-cache-hit claim |
 | Batch/pipeline, recursive/frontier and representations | Existing JOIN host suites and natural recursive materialized histories | Each accepted operator-by-representation and RUNNING/FINISH intersection, including required signed timestamps/weights; new callback sign checks are not full timestamp qualification |
-| Ordinary INLINE representation | Direct public fused-projection regression;363 generated histories including streamed producer/consumer/ACK,90 controlled memory failures and54 matching-cap histories;141 finite policy cases and constructed admission controls | Remaining memory/type/policy/selector/cache/materialized/metadata and other operator representation intersections |
+| Ordinary INLINE representation | Direct public fused-projection regression;363 generated histories including streamed producer/consumer/ACK,90 controlled memory failures and54 matching-cap histories;141 finite policy cases and constructed admission controls; new persistent-index histories consume typed INLINE LEFT with canonical scalar INT64 RHS | Remaining memory/type/policy/selector/cache/materialized/metadata and other operator representation intersections |
 | Reached prepared ownership and disposal | Merged #2364, existing recovery/lifecycle fixtures | Remaining #2367/#2368 local funding/caller/ACK and MSVC-C11 layout qualification on the actual routes |
 | RUNNING/FINISH and containing accounting | Existing components and local interval notes | Reached #2369 adapters and #2370 full entry/return, Original/SOURCE identity and correlated Native/Source carry certificates |
 
@@ -568,3 +659,27 @@ histories (18 healthy,18 policy,18 successor stops and12 memory failures).
 The integrated Clang23 JOIN-host result is228/228, related components5/5,
 GCC16 focused78/78 and ASan/UBSan78/78. These code/test results precede the
 documentation-only ledger commit; no additional platform certificate is implied.
+
+For the persistent-index/source histories, use the same uv activation and
+native/GCC/ASan setups above, then compile the focused executable before each
+`--no-rebuild` selection:
+
+```sh
+python -m mesonbuild.mesonmain compile -C build test_evaluation_join_cache
+python -m mesonbuild.mesonmain test -C build --no-rebuild --print-errorlogs \
+  'evaluation_join_cache_*'
+python -m mesonbuild.mesonmain compile -C build-gcc test_evaluation_join_cache
+python -m mesonbuild.mesonmain test -C build-gcc --no-rebuild --print-errorlogs \
+  'evaluation_join_cache_*'
+python -m mesonbuild.mesonmain compile -C build-asan test_evaluation_join_cache
+python -m mesonbuild.mesonmain test -C build-asan --no-rebuild --print-errorlogs \
+  'evaluation_join_cache_*'
+```
+
+The wildcard selects42 cases: six healthy and36 recovery histories. On the
+integrated code/test tree, Clang23 JOIN hosts270/270, six related checks
+(including serial persistent/refusal/recovery and the threading audit/selftest),
+GCC16 cache cases42/42 and ASan/UBSan42/42 passed. Formatting/whitespace/diff
+checks passed. Ordinary INLINE61 and materialized-body78 selections remain
+unchanged. These runtime results precede the documentation-only ledger commit;
+no additional MSVC/TSan runtime, platform or Source/carry certificate follows.
