@@ -1872,6 +1872,9 @@ void (*wl_columnar_session_test_iteration_checkpoint)(
     wl_evaluation_control_t *, uint32_t, bool);
 void (*wl_columnar_session_test_frontier_build_checkpoint)(
     wl_col_session_t *, bool, int);
+void (*wl_columnar_session_test_string_bottom_checkpoint)(
+    const wl_col_session_t *, wl_evaluation_control_t *, uint64_t,
+    uint32_t, uint32_t, bool, int, const col_rel_t *);
 void (*wl_columnar_session_test_observed_transaction_checkpoint)(
     wl_evaluation_control_t *, unsigned, uint32_t,
     const wl_columnar_eval_private_bindings_t *);
@@ -19268,11 +19271,23 @@ wl_columnar_session_observed_action(wl_col_session_t *sess,
         } else {
             if (tx->string_projection) {
                 const wirelog_column_type_t type = WIRELOG_TYPE_STRING;
+#ifdef WL_SESSION_TEST_HOOKS
+                if (wl_columnar_session_test_string_bottom_checkpoint)
+                    wl_columnar_session_test_string_bottom_checkpoint(sess,
+                        control, step->operation_id, tx->round, i, true, 0,
+                        head->previous);
+#endif
                 rc =
                     wl_columnar_relation_new_typed_one_operator_attempt_controlled
                     (
                     head->plan.name, 1, &type, sess->memory_governor,
                     &head->previous, control, step->operation_id);
+#ifdef WL_SESSION_TEST_HOOKS
+                if (wl_columnar_session_test_string_bottom_checkpoint)
+                    wl_columnar_session_test_string_bottom_checkpoint(sess,
+                        control, step->operation_id, tx->round, i, false, rc,
+                        head->previous);
+#endif
             } else {
                 rc = wl_columnar_relation_new_auto_operator_attempt_controlled(
                     head->plan.name, head->width, 1, sess->memory_governor,

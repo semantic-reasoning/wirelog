@@ -2866,3 +2866,83 @@ Core integration is qualified here; complete new-route lifecycle/cut census
 remains follow-up work. FLOAT, wider/mixed typed SCCs, additional topology,
 expression/K bodies, evaluating Snapshot/C1/batch, seeded heads, pool/prepared
 sort transport and the remaining containing Source/carry proofs stay open.
+
+### Unary STRING metadata and typed-bottom checkpoint qualification (2026-11-19)
+
+This increment qualifies the new metadata actions and round-zero typed-bottom
+constructor fronts for the existing one/two-head, observer off/on successor
+fixtures. Each fixture first establishes healthy public heads, then inserts the
+same new interned input into controlled and independent uncontrolled sessions.
+It does not expand the admitted STRING domain or close the complete public
+ownership-signature/lifecycle or containing Source/carry census.
+
+A healthy run records every actual common checkpoint occurrence in phases
+128/129/130, including repeated equal phase/index values within a public STEP.
+Both actual outgoing boundaries are separate keys: schema/body to NAMES (4),
+and later source audit to EVALUATE (8). Replays require the entire reached prefix
+of these selected observations to match before injecting at its exact ordinal.
+A divergence is diagnosed and fails; it is not redirected to another action.
+
+A `WL_SESSION_TEST_HOOKS` bracket surrounds only the actual round-zero
+`new_typed_one` invocation. It exposes the real session, Original/saved attempt,
+round, head and entry/exit result, plus a const private output. The existing
+relation work callback is enabled only within that authenticated scope. ENTRY
+precedes constructor admission. Each work callback follows its paid body and
+precedes the actual zero poll, including zero-work reservation tails. Healthy
+EXIT owns an empty, self-owned, schemaful unary STRING result of capacity one
+before entry binding; a stop there must retire that private result later, not
+pretend that it never existed. The bracket adds no poll, result change, runtime
+state or authority and compiles out of normal builds.
+
+For the current Linux fixtures, both observer settings discover these counts;
+each invocation rediscovers them instead of treating them as API constants:
+
+| Heads | Metadata 128/129/130 | Actual outgoing boundaries | Constructor work tails | ENTRY/EXIT | Allocation calls |
+| --- | --- | --- | --- | --- | --- |
+| 1 | 5 / 27 / 18 | 2 | 197 | 2 | 13 |
+| 2 | 6 / 36 / 24 | 2 | 195 per head | 2 per head | 13 per head |
+
+All 240 metadata/boundary keys and 1,186 constructor keys across the four
+fixtures receive cancellation, a genuinely refused work charge, actual Original
+END, and END followed by a genuinely begun successor: 960 + 4,744 = 5,704 stop
+histories. Work values and observed totals are not prices. Work tails retain
+actual token-commit prefixes 0/1/3/7 through the existing commit callback. The
+constructor trace is the finite reached schedule; it does not certify all
+identity-CAS retry schedules or opaque governor/allocator-library interiors.
+Repeated work values remain distinct occurrences, and no unreachable healthy
+suffix is required after an intentional stop.
+
+Allocation qualification uses the existing one-based constructor allocation
+seam, separately from work-tail ordinals. A scoped healthy UINT32_MAX countdown
+counts actual constructor heap/Arrow allocation calls. Ordinals 1..N must consume
+the seam and return ENOMEM; N+1 must succeed with one remaining count. Every
+EXIT clears the countdown before unrelated work. The four fixture cells cover
+78 genuine allocation failures and six N+1 controls. Failed-constructor error
+and actual private-output ownership are checked before ordinary cleanup/retry.
+
+Every failed public drain preserves old head pointers, generation snapshots,
+STRING type/literal rows and zero emitted events. END cases preserve every
+frozen Original report field, and successors consume zero work. Actual cleanup
+is followed by reset and same-input retry, with literal IDs/schema/sorted rows
+and signed events compared with uncontrolled execution. Session teardown must
+return all governor reservations and leave its sole reference. This final zero
+is not presented as a complete intermediate financial/owner certificate.
+
+`evaluation_recursive_string_cuts` assigns each metadata and constructor key
+exactly once across 16 modulo shards per fixture, plus separate allocation
+families, retaining normal 120-second watchdogs. Each shard checks its exact
+selected outcome count. Pilot ASan timings for the two-head observed fixture
+were 3.072 seconds (metadata shard), 16.707 seconds (constructor shard), and
+4.175 seconds (allocation family); timings are watchdog evidence only. The
+separate `evaluation_recursive_string_focused` families select actual ENTRY/EXIT
+and both handoffs plus first/last metadata, commit-prefix and zero-tail
+occurrences for focused TSan/optional-library execution; these representatives
+are not relabeled exhaustive. The original seven core families and their 96
+histories remain registered independently.
+
+Native and ASan run all discovered new metadata/work/allocation cuts. Focused
+GCC/Clang TSan and enabled optional-library runs cover every head/observer cell,
+all allocation ordinals and both END outcomes at their selected fronts. Full
+public child/MAIN/observer/retirement/publication products, arbitrary names and
+graph sizes, broader types/topology/modes/transport and remaining Source/carry
+proofs remain follow-up work. No whole-call 256 or whole-#2299 closure follows.

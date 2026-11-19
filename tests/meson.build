@@ -8078,3 +8078,27 @@ test('evaluation_recursive_string_refusals', evaluation_recursive_string_exe,
   args: ['refusals'], suite: ['unit', 'tsan'], timeout: 120)
 test('evaluation_recursive_string_failures', evaluation_recursive_string_exe,
   args: ['failures'], suite: ['unit', 'tsan'], timeout: 120)
+
+# Every reached metadata/bottom cut is assigned to exactly one modulo16 shard.
+# Existing normal watchdogs remain; focused representatives are separate tests.
+foreach heads : [1, 2]
+  foreach observed : [0, 1]
+    foreach shard : range(16)
+      foreach family : ['metadata_cuts', 'bottom_cuts']
+        family_id = family == 'metadata_cuts' ? '0' : '1'
+        test('evaluation_recursive_string_@0@_@1@_@2@_@3@'.format(family, heads, observed, shard),
+          evaluation_recursive_string_exe,
+          args: ['lifecycle', family_id, heads.to_string(), observed.to_string(), shard.to_string(), '16'],
+          suite: ['unit', 'tsan', 'evaluation_recursive_string_cuts'], timeout: 120)
+      endforeach
+    endforeach
+    test('evaluation_recursive_string_bottom_alloc_@0@_@1@'.format(heads, observed),
+      evaluation_recursive_string_exe,
+      args: ['lifecycle', '2', heads.to_string(), observed.to_string(), '0', '1'],
+      suite: ['unit', 'tsan', 'evaluation_recursive_string_cuts'], timeout: 120)
+    test('evaluation_recursive_string_focused_@0@_@1@'.format(heads, observed),
+      evaluation_recursive_string_exe,
+      args: ['lifecycle', '4', heads.to_string(), observed.to_string(), '0', '1'],
+      suite: ['unit', 'tsan', 'evaluation_recursive_string_focused'], timeout: 120)
+  endforeach
+endforeach
