@@ -4880,8 +4880,9 @@ program intern storage is released by program destruction.
 
 Internal `wl_session_options_t` version 5 adds `spill_join_batch_bytes` and
 `spill_join_index_bytes`. Both zero keeps existing behavior. Both positive
-requires the existing spill directory/quota/row-width configuration; combining
-this route with evaluation control is rejected with `EINVAL` before attachment.
+requires the existing spill directory/quota/row-width configuration. A session
+with an evaluation control may carry the caps: its JOINs never take this route,
+and it reads a cold input only through the controlled cold scan (#2301).
 Version 2, 3 and 4 option prefixes retain disabled routing, including when their
 buffers contain unknown trailing bytes. This is not an installed public API.
 
