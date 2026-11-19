@@ -286,6 +286,9 @@ typedef enum {
     WL_SESSION_SEED_PUBLIC_YIELD,
     WL_SESSION_SEED_CHILD_RESULT,
     WL_SESSION_SEED_CLOSE,
+    WL_SESSION_STRING_SCHEMA = 128,
+    WL_SESSION_STRING_BODY,
+    WL_SESSION_STRING_SOURCES,
 } wl_columnar_session_observed_phase_t;
 
 typedef enum {
@@ -432,6 +435,7 @@ typedef struct wl_columnar_session_observed_transaction {
     col_relation_snapshot_t append_snapshot;
     bool append_active;
     bool round_frontiers, frontier_started;
+    bool string_projection;
     wl_columnar_session_frontier_t frontier_source;
     uint32_t old_row, new_row, degree_depth;
     uint8_t degrees[COL_STACK_MAX];
@@ -9741,6 +9745,81 @@ wl_columnar_session_preflight_recursive_special(void *payload)
     return 0;
 }
 
+/* Fixed routing hint only. Names, bodies and actual reader-held sources are
+ * audited separately before a typed child can run. No Source/C1 admission. */
+static bool
+wl_columnar_session_string_projection_shape(const wl_col_session_t *sess)
+{
+    if (sess->base.source_c1_admission || sess->join_batch_bytes
+        || sess->num_workers != 1 || sess->coordinator) return false;
+    const wl_columnar_controlled_step_t *step = sess->controlled_step;
+    if (step &&
+        (step->snapshot || step->snapshot_owned || step->snapshot_retry))
+        return false;
+    const wl_plan_t *plan = sess->plan;
+    if (!plan || plan->edb_count != 1 || plan->stratum_count != 1
+        || !plan->strata || !plan->idb_schemas
+        || !plan->edb_declared_width || plan->edb_declared_width[0] != 1
+        || !plan->edb_column_type_counts || plan->edb_column_type_counts[0] != 1
+        || !plan->edb_column_types || !plan->edb_column_types[0]
+        || plan->edb_column_types[0][0] != WIRELOG_TYPE_STRING) return false;
+    const wl_plan_stratum_t *st = &plan->strata[0];
+    if (!st->is_recursive || !st->is_monotone || st->has_aggregate
+        || !st->relations || !st->bodies || !st->relation_count
+        || st->relation_count > 2 ||
+        plan->idb_schema_count != st->relation_count)
+        return false;
+    const wl_plan_idb_schema_t *a = &plan->idb_schemas[0];
+    if (!a->declared || a->width != 1 || !a->column_types
+        || a->column_types[0] != WIRELOG_TYPE_STRING
+        || st->bodies[0].declared_width != 1 || st->bodies[0].declared_int64)
+        return false;
+    if (st->relation_count == 2) {
+        const wl_plan_idb_schema_t *b = &plan->idb_schemas[1];
+        if (!b->declared || b->width != 1 || !b->column_types
+            || b->column_types[0] != WIRELOG_TYPE_STRING
+            || st->bodies[1].declared_width != 1 ||
+            st->bodies[1].declared_int64)
+            return false;
+    }
+    return true;
+}
+
+/* One fixed-width projection operator, never a data-sized expression scan. */
+static bool
+wl_columnar_session_string_projection_op(const wl_plan_op_t *op,
+    uint32_t index, uint32_t count)
+{
+    if (!op || (count != 3 && count != 6) || index >= count) return false;
+    if (index == count - 1) return op->op == WL_PLAN_OP_CONSOLIDATE;
+    if (index == 0 || index == 2)
+        return op->op == WL_PLAN_OP_VARIABLE && op->relation_name;
+    if (index == 4) return op->op == WL_PLAN_OP_CONCAT;
+    if (op->op != WL_PLAN_OP_MAP || op->project_count != 1
+        || !op->project_indices || op->project_indices[0] != 0
+        || op->map_expr_count != 1 || !op->map_exprs) return false;
+    const wl_plan_expr_buffer_t *expr = &op->map_exprs[0];
+    uint16_t length = 0;
+    if (!expr->data || expr->size != 7 || expr->data[0] != WL_PLAN_EXPR_VAR)
+        return false;
+    memcpy(&length, expr->data + 1, sizeof(length));
+    return length == 4 && memcmp(expr->data + 3, "col0", 4) == 0;
+}
+
+/* Caller owns the private descriptor or holds its original reader. */
+static bool
+wl_columnar_session_string_projection_relation(const col_rel_t *r)
+{
+    return r && r->storage_owner == r && !r->col_shared && !r->pool_owned
+           && !r->arena_owned && !col_rel_storage_alias_borrow_count(r)
+           && r->ncols == 1 && r->schema_ok && r->column_types
+           && r->column_types[0] == WIRELOG_TYPE_STRING && !r->timestamps
+           && !r->has_graph_column
+           && r->compound_kind == WIRELOG_COMPOUND_KIND_NONE
+           && !r->compound_arity_len
+           && (!r->nrows || (r->columns && r->columns[0]));
+}
+
 static int
 wl_columnar_session_preflight_recursive_one(void *payload)
 {
@@ -9749,7 +9828,8 @@ wl_columnar_session_preflight_recursive_one(void *payload)
     if (!stratum->is_recursive) return 0;
     p->done = true;
     if (p->plan->stratum_count == 1 && stratum->relation_count == 1
-        && (!stratum->bodies || !stratum->bodies[0].declared_int64)) return 0;
+        && (!stratum->bodies || !stratum->bodies[0].declared_int64)
+        && !wl_columnar_session_string_projection_shape(p->session)) return 0;
     p->shape = true;
     return 0;
 }
@@ -18349,9 +18429,12 @@ wl_columnar_session_observed_action(wl_col_session_t *sess,
             uint32_t count = body ? body->op_count : r->op_count;
             if (!r->name || !ops || !count
                 || ops[count - 1].op != WL_PLAN_OP_CONSOLIDATE
-                || (body &&
-                (!body->declared_int64 || !body->declared_width)))
-                return ENOTSUP;
+                || (body && !body->declared_width)) return ENOTSUP;
+            if (body && !body->declared_int64) {
+                if (!wl_columnar_session_string_projection_shape(sess))
+                    return ENOTSUP;
+                tx->string_projection = true;
+            }
             if (tx->head_count == UINT32_MAX ||
                 count > UINT32_MAX - 2
                 || count + 2 > UINT32_MAX - tx->op_count)
@@ -18495,8 +18578,10 @@ wl_columnar_session_observed_action(wl_col_session_t *sess,
             tx->index++; return 0;
         }
         if (tx->si == plan->stratum_count) {
-            tx->index = tx->other = 0;
-            tx->phase = WL_SESSION_OBSERVED_NAMES;
+            tx->index = tx->other = tx->op = 0;
+            tx->byte = 0;
+            tx->phase = tx->string_projection ? WL_SESSION_STRING_SCHEMA
+                : WL_SESSION_OBSERVED_NAMES;
             return 0;
         }
         if (tx->ri == plan->strata[tx->si].relation_count) {
@@ -18579,6 +18664,104 @@ wl_columnar_session_observed_action(wl_col_session_t *sess,
             }
             return 0;
         }
+    case WL_SESSION_STRING_SCHEMA: {
+        if (tx->index == tx->head_count) {
+            tx->index = tx->other = tx->op = 0; tx->byte = 0;
+            tx->phase = WL_SESSION_OBSERVED_NAMES; return 0;
+        }
+        if (tx->other == plan->idb_schema_count) return ENOTSUP;
+        const wl_plan_idb_schema_t *schema = &plan->idb_schemas[tx->other];
+        const wl_columnar_session_observed_head_t *head = &tx->heads[tx->index];
+        if (!schema->name) return ENOTSUP;
+        char a = head->plan.name[tx->byte], b = schema->name[tx->byte];
+        if (a != b) {
+            tx->other++; tx->byte = 0; return 0;
+        }
+        if (a) {
+            if (tx->byte == SIZE_MAX) return EOVERFLOW;
+            tx->byte++; return 0;
+        }
+        const wl_plan_body_t *body = head->preserved_body;
+        const wl_plan_relation_t *original =
+            &plan->strata[0].relations[tx->index];
+        if (!schema->declared || schema->width != 1 || !schema->column_types
+            || schema->column_types[0] != WIRELOG_TYPE_STRING || !body
+            || body->declared_width != 1 || body->declared_int64
+            || body->lineage != WL_PLAN_BODY_LINEAGE_LOWERED
+            || (body->op_count != 3 && body->op_count != 6)
+            || original->op_count != body->op_count || !original->ops)
+            return ENOTSUP;
+        tx->op = tx->column = 0; tx->byte = 0;
+        tx->phase = WL_SESSION_STRING_BODY; return 0;
+    }
+    case WL_SESSION_STRING_BODY: {
+        const wl_columnar_session_observed_head_t *head = &tx->heads[tx->index];
+        const wl_plan_body_t *body = head->preserved_body;
+        const wl_plan_relation_t *original =
+            &plan->strata[0].relations[tx->index];
+        if (tx->op == body->op_count) {
+            tx->index++; tx->other = tx->op = 0; tx->byte = 0;
+            tx->phase = WL_SESSION_STRING_SCHEMA; return 0;
+        }
+        if (tx->column < 2) {
+            const wl_plan_op_t *op = tx->column ? &original->ops[tx->op]
+                : &body->ops[tx->op];
+            if (!wl_columnar_session_string_projection_op(op, tx->op,
+                body->op_count))
+                return ENOTSUP;
+            tx->column++; return 0;
+        }
+        if (body->ops[tx->op].op == WL_PLAN_OP_VARIABLE) {
+            char a = body->ops[tx->op].relation_name[tx->byte];
+            char b = original->ops[tx->op].relation_name[tx->byte];
+            if (a != b) return ENOTSUP;
+            if (a) {
+                if (tx->byte == SIZE_MAX) return EOVERFLOW;
+                tx->byte++; return 0;
+            }
+        }
+        tx->op++; tx->column = 0; tx->byte = 0; return 0;
+    }
+    case WL_SESSION_STRING_SOURCES: {
+        if (tx->index == tx->head_count) {
+            tx->index = tx->op = tx->other = tx->column = 0; tx->byte = 0;
+            tx->phase = WL_SESSION_OBSERVED_EVALUATE; return 0;
+        }
+        const wl_columnar_session_observed_head_t *head = &tx->heads[tx->index];
+        if (!tx->column) {
+            const col_rel_t *public_head = tx->entries[plan->edb_count +
+                    tx->index].public_relation;
+            if (public_head &&
+                !wl_columnar_session_string_projection_relation(public_head))
+                return ENOTSUP;
+            tx->column = 1; return 0;
+        }
+        if (tx->op == head->plan.op_count) {
+            tx->index++; tx->op = tx->other = tx->column = 0; tx->byte = 0;
+            return 0;
+        }
+        const wl_plan_op_t *op = &head->plan.ops[tx->op];
+        if (op->op != WL_PLAN_OP_VARIABLE) {
+            tx->op++; return 0;
+        }
+        if (tx->other == tx->count) return ENOTSUP;
+        const wl_columnar_eval_private_dynamic_binding_t *entry =
+            &tx->entries[tx->other];
+        char a = op->relation_name[tx->byte], b = entry->name[tx->byte];
+        if (a != b) {
+            tx->other++; tx->byte = 0; return 0;
+        }
+        if (a) {
+            if (tx->byte == SIZE_MAX) return EOVERFLOW;
+            tx->byte++; return 0;
+        }
+        const col_rel_t *r = tx->other < plan->edb_count
+            ? entry->relation : entry->public_relation;
+        if ((tx->other < plan->edb_count || r)
+            && !wl_columnar_session_string_projection_relation(
+                r)) return ENOTSUP;
+        tx->op++; tx->other = 0; tx->byte = 0; return 0;
+    }
     case WL_SESSION_OBSERVED_NAMES:     /* Validate names and detect collisions, byte by byte. */
         if (tx->index == tx->count) {
             tx->index = tx->other = 0;
@@ -18658,6 +18841,10 @@ wl_columnar_session_observed_action(wl_col_session_t *sess,
             if (tx->seed_selected) {
                 tx->phase = WL_SESSION_SEED_LOOKUP_ASSIGN; return 0;
             }
+            /* Host head inserts create this real seed shadow. Whole-round
+             * pure-IDB execution must refuse it, not retire or ignore it. */
+            if (tx->string_projection && tx->op == 3
+                && tx->other >= plan->edb_count) return ENOTSUP;
             if (!tx->op && tx->other < plan->edb_count) {
                 if (tx->entries[tx->other].relation) return EINVAL;
                 tx->entries[tx->other].relation = r;
@@ -18703,7 +18890,8 @@ wl_columnar_session_observed_action(wl_col_session_t *sess,
             }
             tx->index = tx->op = tx->other = 0; tx->byte = 0;
             col_rel_t *input = step->append_source;
-            tx->append_active = step->append_proven && sess->diff_enabled
+            tx->append_active = !tx->string_projection && step->append_proven &&
+                sess->diff_enabled
                 && sess->has_evaluated && sess->pending_input_change
                 && !sess->pending_full_input_eval &&
                 !sess->last_removed_relation
@@ -18711,7 +18899,8 @@ wl_columnar_session_observed_action(wl_col_session_t *sess,
                 && input->relation_identity == step->append_identity
                 && input->base_nrows == step->append_begin
                 && input->base_nrows <= input->nrows;
-            tx->phase = tx->append_active ? WL_SESSION_APPEND_AUDIT
+            tx->phase = tx->string_projection ? WL_SESSION_STRING_SOURCES
+                : tx->append_active ? WL_SESSION_APPEND_AUDIT
                 : WL_SESSION_OBSERVED_EVALUATE;
             return 0;
         }
@@ -18933,7 +19122,7 @@ wl_columnar_session_observed_action(wl_col_session_t *sess,
             tx->round_begin = tx->head; tx->round_end = tx->head;
             tx->round_index = tx->head; tx->round = 0;
             tx->round_active = true;
-            tx->round_frontiers = sess->diff_enabled;
+            tx->round_frontiers = sess->diff_enabled && !tx->string_projection;
             tx->phase = WL_SESSION_RECURSIVE_RANGE;
             return 0;
         }
@@ -19077,9 +19266,18 @@ wl_columnar_session_observed_action(wl_col_session_t *sess,
         if (tx->round) {
             head->previous = head->candidate; head->candidate = NULL;
         } else {
-            rc = wl_columnar_relation_new_auto_operator_attempt_controlled(
-                head->plan.name, head->width, 1, sess->memory_governor,
-                &head->previous, control, step->operation_id);
+            if (tx->string_projection) {
+                const wirelog_column_type_t type = WIRELOG_TYPE_STRING;
+                rc =
+                    wl_columnar_relation_new_typed_one_operator_attempt_controlled
+                    (
+                    head->plan.name, 1, &type, sess->memory_governor,
+                    &head->previous, control, step->operation_id);
+            } else {
+                rc = wl_columnar_relation_new_auto_operator_attempt_controlled(
+                    head->plan.name, head->width, 1, sess->memory_governor,
+                    &head->previous, control, step->operation_id);
+            }
             if (rc) return rc;
         }
         uint32_t slot = plan->edb_count + i;
@@ -19101,7 +19299,11 @@ wl_columnar_session_observed_action(wl_col_session_t *sess,
         if (!a || !b || a->ncols != head->width || b->ncols != head->width)
             return EINVAL;
         if (tx->column < head->width && tx->row == 0) {
-            if ((b->column_types &&
+            if (tx->string_projection) {
+                if (!wl_columnar_session_string_projection_relation(a)
+                    || !wl_columnar_session_string_projection_relation(b))
+                    return ENOTSUP;
+            } else if ((b->column_types &&
                 b->column_types[tx->column] != WIRELOG_TYPE_INT64)
                 || b->timestamps ||
                 b->compound_kind != WIRELOG_COMPOUND_KIND_NONE)

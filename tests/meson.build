@@ -8056,3 +8056,25 @@ foreach observed : range(2)
       suite: ['unit', 'tsan', 'evaluation_seed_hosts', 'evaluation_unloaded_seed'], timeout: 120)
   endforeach
 endforeach
+
+# Declared unary STRING SCCs through the actual retained Session transaction.
+evaluation_recursive_string_exe = executable('test_evaluation_recursive_string',
+  files('test_evaluation_recursive_string.c'),
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  c_args: ['-DWL_SESSION_TEST_HOOKS=1'],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
+  link_with: [testlib_prod])
+test('evaluation_recursive_string_rows', evaluation_recursive_string_exe,
+  args: ['rows'], suite: ['unit', 'tsan'], timeout: 120)
+foreach heads : [1, 2]
+  foreach observed : [0, 1]
+    test('evaluation_recursive_string_stops_@0@_@1@'.format(heads, observed),
+      evaluation_recursive_string_exe,
+      args: ['stops', heads.to_string(), observed.to_string()],
+      suite: ['unit', 'tsan'], timeout: 120)
+  endforeach
+endforeach
+test('evaluation_recursive_string_refusals', evaluation_recursive_string_exe,
+  args: ['refusals'], suite: ['unit', 'tsan'], timeout: 120)
+test('evaluation_recursive_string_failures', evaluation_recursive_string_exe,
+  args: ['failures'], suite: ['unit', 'tsan'], timeout: 120)

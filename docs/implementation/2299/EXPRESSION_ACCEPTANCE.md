@@ -2810,3 +2810,59 @@ Raw recursive ROUND pool clones, prepared sort/delta integration, timestamp and
 compound transport, typed SCC/K execution, Snapshot/C1 intersections and the
 remaining containing Source/observer/carry proofs remain separate work. No
 Session routing or recursive/Source activation changes in this increment.
+
+### Declared unary STRING projection SCC integration (2026-11-19, core)
+
+The existing retained general Session transaction now admits an ordinary
+single-worker STEP with one declared STRING EDB and one monotone, nonaggregate
+recursive stratum containing one or two declared unary STRING pure-IDB heads.
+The preserved lowered bodies must be exact VARIABLE/identity-MAP/CONSOLIDATE
+projections, optionally two such branches joined by CONCAT. Both original and
+preserved body operators and variable names are audited. Actual idb-schema names
+and VARIABLE binding names are matched byte by byte before child execution;
+real reader-held EDB/public-head descriptors must have matching self-owned,
+schemaful STRING storage. The route rejects actual `$in$<head>` seed shadows, including empty
+historical ones, instead of dropping host head seeds. Declared inline head facts
+also remain outside this scope.
+
+Initial private bottoms use the existing capacity-one typed constructor on the
+actual Original attempt. Its fixed local STRING enum lives through the
+synchronous call; the returned relation owns independent metadata. The route
+uses full previous-round bindings: existing PLAN copies already force FULL,
+EDB append rewriting is disabled before audit, and recursive frontier rewriting
+is disabled before RANGE. Previous and candidate types are validated before
+stored-ID equality decides convergence. Child receipts/ACK, previous retirement,
+atomic publication and report/first-error protocols retain their existing
+owners. No raw recursive cursor, pool delta or typed frontier implementation is
+substituted for these owners.
+
+The dedicated `evaluation_recursive_string_*` core tests compare literal IDs
+and independent uncontrolled execution for one-/two-head cycles, observer off/on,
+a cold empty EDB, duplicate facts, insert/remove/no-op and typed empty results.
+Ninety-six first/later-round histories stop at comparison, an actual VARIABLE
+source END or a real child receipt ACK with cancellation, work exhaustion,
+Original END and END-with-successor. Every public drain turn preserves the old
+head pointers/snapshots/rows and no events; successor work stays zero. Real typed
+constructor allocation failure, enforcing-governor denial and iteration-cap
+failure preserve their first result and retry from unchanged public heads.
+Actual declaration/type/width, nonidentity expression, JOIN, seed, alias, name,
+evaluating Snapshot, batch and worker exclusions have separate negative checks.
+Recursive session creation already disables C1; this route does not create C1
+permission or manufacture an unsupported C1 session for testing.
+
+Added actions keep bounded metadata work separate: routing examines at most two
+fixed schema/body records; schema/source names consume one byte per action;
+body validation examines one operator’s fixed metadata (seven bytecode bytes
+for MAP) per action, then compares VARIABLE names separately. Conservative local added C-front
+bounds (member/address/predicate/store and call/return fronts included) are
+routing192, schema128, body192, source224, compare192 and typed-bottom caller32;
+append/frontier dispatch add at most3 each. The caller bound excludes the typed
+constructor's independently admitted interior. These are local work bounds, not
+new fees, successful-work-derived prices or complete Source ancestor/whole-call
+256 certificates. New phases pass the actual common Original admission and
+preserve existing phase numbers.
+
+Core integration is qualified here; complete new-route lifecycle/cut census
+remains follow-up work. FLOAT, wider/mixed typed SCCs, additional topology,
+expression/K bodies, evaluating Snapshot/C1/batch, seeded heads, pool/prepared
+sort transport and the remaining containing Source/carry proofs stay open.
