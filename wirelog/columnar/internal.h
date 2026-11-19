@@ -8300,6 +8300,9 @@ typedef enum {
     WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_SOURCE_END,
     WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_SOURCE_INSTALL,
     WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_SOURCE_ABORT,
+    WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_COLD_SLOT,
+    WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_COLD_CHILD,
+    WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_COLD_INSTALL,
     WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_PENDING,
     WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_JOIN_BATCH,
     WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_RELEASE,
@@ -8429,6 +8432,98 @@ typedef struct wl_columnar_lftj_attempt {
     wl_columnar_relation_private_batch_drain_t writer_drain;
 } wl_columnar_lftj_attempt_t;
 
+/* Controlled scan of a cold (spill-backed) source through a direct MAP/FILTER
+ * prefix (#2301). The owner composed attempt lends one frame result slot; the
+ * scan creates its typed private output there, appends the projected rows and
+ * leaves the slot for the owner to install or dispose. Each action charges at
+ * most WL_COLUMNAR_COLD_SCAN_ACTION_CELLS cells and polls the control before
+ * every cell; a spill read polls it through the reader's cancel callback.
+ * RELEASE drains the writer, releases the reader and scratch under separate
+ * funding and never touches the slot. Serialize calls on the owner thread. */
+#define WL_COLUMNAR_COLD_SCAN_ACTION_CELLS 64u
+typedef enum {
+    WL_COLUMNAR_COLD_SCAN_ATTEMPT_INERT = 0,
+    WL_COLUMNAR_COLD_SCAN_ATTEMPT_RESOLVE,
+    WL_COLUMNAR_COLD_SCAN_ATTEMPT_SCRATCH,
+    WL_COLUMNAR_COLD_SCAN_ATTEMPT_ALLOC,
+    WL_COLUMNAR_COLD_SCAN_ATTEMPT_DECODE,
+    WL_COLUMNAR_COLD_SCAN_ATTEMPT_TYPES,
+    WL_COLUMNAR_COLD_SCAN_ATTEMPT_OUTPUT_CREATE,
+    WL_COLUMNAR_COLD_SCAN_ATTEMPT_READER,
+    WL_COLUMNAR_COLD_SCAN_ATTEMPT_WRITER_BEGIN,
+    WL_COLUMNAR_COLD_SCAN_ATTEMPT_ROWS,
+    WL_COLUMNAR_COLD_SCAN_ATTEMPT_WRITER_END,
+    WL_COLUMNAR_COLD_SCAN_ATTEMPT_RELEASE,
+    WL_COLUMNAR_COLD_SCAN_ATTEMPT_DONE
+} wl_columnar_cold_scan_attempt_phase_t;
+
+typedef struct wl_columnar_cold_scan_attempt {
+    struct wl_columnar_cold_scan_attempt *identity;
+    const void *numeric_owner;
+    wl_col_session_t *session;
+    const wl_plan_relation_t *plan;
+    uint32_t end; /* First plan op after the MAP/FILTER prefix. */
+    col_rel_t **output;
+    wl_evaluation_control_t *control;
+    uint64_t attempt_id;
+    wl_columnar_cold_scan_attempt_phase_t phase;
+    int semantic_result;
+    const wl_columnar_session_cold_relation_t *cold;
+    wl_columnar_eval_plan_cold_projection_t decoded;
+    uint32_t width, stage_width, decode_op, next_predicate, type_lane;
+    uint32_t name_byte;
+    uint64_t decode_work, decode_charged; /* Resolution prepayment. */
+    const wl_columnar_session_cold_relation_t *resolve_cursor;
+    uint64_t scratch_bytes;
+    wl_columnar_memory_reservation_t scratch_reservation;
+    bool scratch_reserved, scratch_committed;
+    int64_t *row;
+    int64_t *type_codes;
+    uint32_t *indices;
+    wl_columnar_eval_plan_cold_predicate_t *predicates;
+    struct wl_columnar_batch_payload_reader *reader;
+    struct wl_columnar_trace_store_cursor *cursor;
+    wl_columnar_relation_append_batch_t writer;
+    wl_columnar_relation_private_batch_drain_t writer_drain;
+    bool writer_active;
+    const uint64_t *lanes; /* Valid only until the next read or release. */
+    uint32_t ordinal, cell;
+    bool row_open;
+    uint64_t rows_written;
+#if defined(WL_HAVE_C11_THREADS)
+    thrd_t owner_thread;
+#elif defined(_WIN32) || defined(_WIN64)
+    DWORD owner_thread;
+#else
+    pthread_t owner_thread;
+#endif
+    bool thread_valid, busy;
+} wl_columnar_cold_scan_attempt_t;
+
+/* Begin binds the attempt to its owner, frame result slot and original
+ * attempt; it performs no source access. Step runs one bounded action and
+ * reports DONE once RELEASE completed, with semantic_result holding any stop
+ * or error. Abort moves a live attempt to RELEASE under separate funding. */
+int wl_columnar_ops_cold_scan_attempt_begin(
+    wl_columnar_cold_scan_attempt_t *attempt, const void *numeric_owner,
+    wl_col_session_t *session, const wl_plan_relation_t *plan, uint32_t begin,
+    uint32_t end, col_rel_t **output, wl_evaluation_control_t *control,
+    uint64_t attempt_id);
+int wl_columnar_ops_cold_scan_attempt_step(
+    wl_columnar_cold_scan_attempt_t *attempt, bool *done,
+    wl_evaluation_control_t *funding, uint64_t funding_id);
+int wl_columnar_ops_cold_scan_attempt_abort(
+    wl_columnar_cold_scan_attempt_t *attempt, bool *done,
+    wl_evaluation_control_t *funding, uint64_t funding_id);
+/* First op index after VARIABLE(name) and its direct MAP/FILTER prefix. */
+uint32_t wl_columnar_ops_cold_scan_end(const wl_plan_relation_t *plan,
+    uint32_t begin);
+#ifdef WL_SESSION_TEST_HOOKS
+extern void (*wl_columnar_ops_test_cold_scan_checkpoint)(
+    wl_evaluation_control_t *, const wl_columnar_cold_scan_attempt_t *);
+extern uint64_t wl_columnar_ops_test_raw_cold_scans;
+#endif
+
 /* Actual owned LFTJ row and protected exact-capacity output; no generic
  * alias capture, growth or renewal is selected by this internal producer. */
 int wl_columnar_relation_append_lftj_owned_row_operator_controlled(
@@ -8515,6 +8610,9 @@ typedef struct wl_columnar_eval_plan_numeric_attempt {
     wl_columnar_lftj_metadata_proof_t lftj_metadata;
     wl_columnar_lftj_attempt_t lftj;
     bool composed_busy, lftj_cleanup_authorized;
+    /* Controlled cold scan child (#2301); identity NULL when inert. */
+    wl_columnar_cold_scan_attempt_t cold;
+    uint32_t cold_end;
     void *join_host;
     uint64_t join_host_initialized_bytes;
     uint32_t join_host_tail_count;
@@ -9095,6 +9193,12 @@ int wl_columnar_eval_stack_composed_source_claim(
     wl_columnar_eval_stack_cleanup_frame_t *, wl_col_session_t *,
     wl_columnar_eval_plan_numeric_attempt_t *);
 int wl_columnar_eval_stack_composed_source_output(
+    wl_columnar_eval_stack_cleanup_frame_t *, wl_col_session_t *,
+    wl_columnar_eval_plan_numeric_attempt_t *);
+int wl_columnar_eval_stack_composed_cold_output(
+    wl_columnar_eval_stack_cleanup_frame_t *, wl_col_session_t *,
+    wl_columnar_eval_plan_numeric_attempt_t *);
+int wl_columnar_eval_stack_composed_cold_install(
     wl_columnar_eval_stack_cleanup_frame_t *, wl_col_session_t *,
     wl_columnar_eval_plan_numeric_attempt_t *);
 int wl_columnar_eval_stack_composed_source_install(

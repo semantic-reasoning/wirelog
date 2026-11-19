@@ -485,6 +485,7 @@ wl_columnar_eval_serial_framed_attempt_step(
                 : wl_columnar_eval_plan_numeric_join_cleanup_step(ctx,
                        funding, funding_id);
         if (ctx->private_bindings && !ctx->child.lftj.identity
+            && !ctx->child.cold.identity
             && ctx->child.lftj_metadata.phase == WL_COLUMNAR_LFTJ_METADATA_INERT
             && wl_columnar_eval_stack_auto_error_drain(ctx))
             return ctx->pending_inner_consume
@@ -704,6 +705,7 @@ wl_columnar_eval_serial_framed_attempt_step(
             return wl_columnar_eval_plan_numeric_join_cleanup_ack(ctx, funding,
                        funding_id);
         rc = ctx->private_bindings && !ctx->child.lftj.identity
+            && !ctx->child.cold.identity
             && ctx->child.lftj_metadata.phase == WL_COLUMNAR_LFTJ_METADATA_INERT
             && wl_columnar_eval_stack_auto_error_drain(ctx)
             ? wl_columnar_eval_plan_numeric_native_cleanup_ack(ctx, funding,

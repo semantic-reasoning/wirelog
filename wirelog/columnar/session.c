@@ -2288,6 +2288,75 @@ wl_columnar_session_cold_scan_rule(const wl_col_session_t *s,
            wl_columnar_eval_plan_cold_projection(rp, name, width, types);
 }
 
+static bool
+wl_columnar_session_seed_shape_metadata(const wl_plan_t *plan);
+
+static bool
+wl_columnar_session_registered(const wl_col_session_t *sess, const char *name)
+{
+    for (uint32_t i = 0; i < sess->nrels; i++) {
+        if (sess->rels[i] && !strcmp(sess->rels[i]->name, name))
+            return true;
+    }
+    return false;
+}
+
+/* A controlled session reads a cold binding only through the composed cold
+* scan attempt: VARIABLE(name), a direct MAP/FILTER prefix holding at least
+* one MAP, then the rule's final CONSOLIDATE (#2301). A JOIN after the prefix
+* is refused: a FILTER-only prefix keeps the source's column names, which the
+* JOIN's keys resolve against, and the attempt's output has none.
+* Programs that a controlled STEP routes to the general observed transaction
+* are refused here, while the source is still resident: a head that is also
+* an EDB, the two-EDB single-rule seed shape, and a registry that a successor
+* STEP would find larger than three relations. The registry never shrinks
+* after a seal, so its size plus the heads not yet registered bounds it. */
+static bool
+wl_columnar_session_cold_controlled_plan(const wl_col_session_t *sess,
+    const char *name)
+{
+    const wl_plan_t *plan = sess->plan;
+    if (!sess->base.evaluation_control) return true;
+    if (wl_columnar_session_seed_shape_metadata(plan)) return false;
+    uint64_t heads = 0;
+    for (uint32_t si = 0; si < plan->stratum_count; si++) {
+        const wl_plan_stratum_t *sp = &plan->strata[si];
+        for (uint32_t ri = 0; ri < sp->relation_count; ri++) {
+            const wl_plan_relation_t *rp = &sp->relations[ri];
+            for (uint32_t i = 0; i < plan->edb_count; i++)
+                if (plan->edb_relations && plan->edb_relations[i] &&
+                    !strcmp(plan->edb_relations[i], rp->name)) return false;
+            bool first = !wl_columnar_session_registered(sess, rp->name);
+            for (uint32_t sj = 0; first && sj <= si; sj++)
+                for (uint32_t rj = 0; first && rj < plan->strata[sj].
+                    relation_count && (sj < si || rj < ri); rj++)
+                    first = strcmp(plan->strata[sj].relations[rj].name,
+                            rp->name) != 0;
+            if (first) heads++;
+            bool uses = false;
+            for (uint32_t oi = 0; oi < rp->op_count; oi++) {
+                const wl_plan_op_t *op = &rp->ops[oi];
+                bool here = (op->relation_name &&
+                    !strcmp(op->relation_name, name)) ||
+                    (op->right_relation && !strcmp(op->right_relation, name));
+                if (here && oi) return false;
+                uses |= here;
+                if (op->op == WL_PLAN_OP_REDUCE && uses) return false;
+            }
+            if (!uses) continue;
+            if (rp->ops[0].op != WL_PLAN_OP_VARIABLE) return false;
+            uint32_t end = wl_columnar_ops_cold_scan_end(rp, 0);
+            bool mapped = false;
+            for (uint32_t oi = 1; oi < end; oi++)
+                mapped |= rp->ops[oi].op == WL_PLAN_OP_MAP;
+            if (!mapped || end >= rp->op_count) return false;
+            if (rp->ops[end].op != WL_PLAN_OP_CONSOLIDATE ||
+                end != rp->op_count - 1) return false;
+        }
+    }
+    return (uint64_t)sess->nrels + heads <= 3;
+}
+
 /* Cold bindings never enter the raw relation registry. Only an audited,
  * immutable plan may access them through bounded JOIN/projection readers. */
 static bool
@@ -2296,6 +2365,7 @@ wl_columnar_session_cold_plan(const wl_col_session_t *sess, const char *name,
 {
     const wl_plan_t *plan = sess->plan;
     if (!plan || !name || !ncols || !plan->strata) return false;
+    if (!wl_columnar_session_cold_controlled_plan(sess, name)) return false;
     bool references = false;
     for (uint32_t i = 0; types && i < ncols; i++)
         references |= types[i] == WIRELOG_TYPE_STRING;
@@ -2398,7 +2468,7 @@ wl_columnar_session_cold_mode(const wl_col_session_t *s)
     return s->spill_store && s->owns_spill_store &&
            s->spill_join_batch_bytes && s->spill_join_index_bytes &&
            !s->coordinator && s->num_workers == 1 &&
-           !s->base.evaluation_control && !s->join_batch_bytes &&
+           !s->join_batch_bytes &&
            !s->delta_cb && !s->diff_operators_active && !s->tdd_input_run &&
            !s->delta_seeded && !s->retraction_seeded &&
            !s->retraction_right_pass && !s->delta_observer &&
@@ -28676,6 +28746,13 @@ col_controlled_step_drive(wl_col_session_t *sess,
 
     if (teardown) wl_evaluation_control_request_cancel(control);
 
+    /* No observed route reads a cold binding (#2301). Refuse before any
+     * transaction exists; seal and begin refuse the programs that would
+     * route there, so this covers a delta callback set after them. */
+    if (sess->cold_relation && (step->general_observed || step->observed)
+        && !step->transaction && !step->complete)
+        return col_controlled_step_finish(sess, step, ENOTSUP);
+
     if (step->general_observed)
         return wl_columnar_session_observed_drive(sess, step);
 
@@ -32616,6 +32693,9 @@ col_session_snapshot(wl_session_t *session, wirelog_on_tuple_fn callback,
     sess->cold_seal_closed = true;
     int cold_rc = wl_columnar_session_cold_execution_check(sess);
     if (cold_rc != 0) return cold_rc;
+    /* A controlled SNAPSHOT takes the general observed transaction, which
+     * has no cold binding (#2301). */
+    if (session->evaluation_control && sess->cold_relation) return ENOTSUP;
     if (session->evaluation_control)
         return col_session_snapshot_controlled(session, callback, user_data);
     const uint64_t denials = col_session_governor_denials(sess);

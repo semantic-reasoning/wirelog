@@ -7550,6 +7550,18 @@ test_evaluation_side_compounds_exe = executable(
 test('evaluation_side_compounds', test_evaluation_side_compounds_exe,
      suite: ['unit', 'tsan'], timeout: 60)
 
+# #2301: cold (spill-backed) sources in controlled single-worker sessions.
+test_evaluation_cold_sources_exe = executable(
+  'test_evaluation_cold_sources',
+  files('test_evaluation_cold_sources.c', '../wirelog/columnar/spill.c'),
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
+  c_args: ['-DWL_TEST_SPILL=1', '-DWL_SESSION_TEST_HOOKS=1'],
+  link_with: [testlib_prod],
+)
+test('evaluation_cold_sources', test_evaluation_cold_sources_exe,
+     suite: ['unit', 'tsan'], timeout: 300)
+
 test_evaluation_empty_edb_sources_exe = executable(
   'test_evaluation_empty_edb_sources', files('test_evaluation_empty_edb_sources.c'),
   include_directories: [wirelog_inc, wirelog_src_inc],

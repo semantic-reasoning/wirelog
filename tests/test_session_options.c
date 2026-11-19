@@ -300,11 +300,18 @@ spill_join_options(void)
     wl_evaluation_control_t *control = NULL;
     CHECK(wl_evaluation_control_create(0, &control) == 0);
     options.evaluation_control = control;
+    /* A controlled session accepts the caps (#2301). */
+    CHECK(wl_session_create_with_options(&options_backend, NULL, 1, &options,
+        &session) == 0);
+    CHECK(observed.spill_join_batch_bytes == 64 &&
+        observed.spill_join_index_bytes == 128);
+    wl_session_destroy(session);
+    session = NULL;
+    options.spill_join_index_bytes = 0;
     CHECK(wl_session_create_with_options(&options_backend, NULL, 1, &options,
         &session) == EINVAL && !session);
     /* Rejection did not attach or claim the control. */
     options.spill_join_batch_bytes = 0;
-    options.spill_join_index_bytes = 0;
     CHECK(wl_session_create_with_options(&options_backend, NULL, 1, &options,
         &session) == 0);
     wl_session_destroy(session);
