@@ -640,11 +640,412 @@ run_failures(void)
         "STRING typed-bottom allocation, governor and round-limit failures preserve error/retry passed");
 }
 
+/* Finite ordered checkpoint census. Equal phase/index/work values remain
+ * separate occurrences; this is not a tariff or a concurrency-schedule map. */
+enum { LIFE_METADATA, LIFE_HANDOFF, LIFE_ENTER, LIFE_WORK, LIFE_EXIT };
+enum { LIFE_TRACE_CAPACITY = 2048 };
+typedef struct {
+    unsigned kind, phase, index, head, commits;
+    uint64_t value;
+} life_key_t;
+typedef struct {
+    life_key_t keys[LIFE_TRACE_CAPACITY];
+    unsigned count, metadata[3], handoffs[2], works[2], allocations[2];
+} life_trace_t;
+typedef struct {
+    stop_t stop;
+    const life_trace_t *expected;
+    life_trace_t *record;
+    unsigned position, target, metadata[3], handoffs[2], works[2];
+    unsigned entered[2], exited[2], allocations[2];
+    unsigned scope_head, commits, allocation_head, allocation_ordinal;
+    uint32_t allocation_initial;
+    uint64_t original;
+    bool metadata_active, constructor_active, allocation_failure,
+        allocation_seen;
+} life_state_t;
+static life_state_t *lifecycle;
+
+static void
+life_original(life_state_t *s, wl_evaluation_control_t *control)
+{
+    CHECK(control == s->stop.fixture->control);
+    if (s->stop.hit) return;
+    uint64_t active = wl_evaluation_control_active_attempt_id(control);
+    CHECK(active);
+    if (!s->original) s->original = active;
+    CHECK(active == s->original);
+}
+
+static void
+life_emit(life_state_t *s, life_key_t key)
+{
+    if (s->stop.hit || s->allocation_failure) return;
+    unsigned at = s->position++;
+    CHECK(at < LIFE_TRACE_CAPACITY);
+    if (s->record) s->record->keys[at] = key;
+    if (s->expected) {
+        CHECK(at < s->expected->count);
+        const life_key_t *want = &s->expected->keys[at];
+        bool same = key.kind == want->kind && key.phase == want->phase
+            && key.index == want->index && key.head == want->head
+            && key.commits == want->commits && key.value == want->value;
+        if (!same) fprintf(stderr,
+                "lifecycle prefix differs at%u: kind%u/%u phase%u/%u index%u/%u head%u/%u value%llu/%llu commits%u/%u\n",
+                at, key.kind, want->kind, key.phase, want->phase, key.index,
+                want->index, key.head, want->head,
+                (unsigned long long)key.value, (unsigned long long)want->value,
+                key.commits, want->commits);
+        CHECK(same);
+    }
+    if (at == s->target) inject(&s->stop);
+}
+
+static void
+life_metadata(wl_evaluation_control_t *control, unsigned phase,
+    uint32_t progress, const wl_columnar_eval_private_bindings_t *bindings)
+{
+    (void)bindings;
+    life_state_t *s = lifecycle;
+    if (!s || s->stop.hit || control != s->stop.fixture->control) return;
+    if (phase >= 128 && phase <= 130) {
+        life_original(s, control);
+        unsigned occurrence = s->metadata[phase - 128]++;
+        s->metadata_active = true;
+        life_emit(s, (life_key_t){.kind = LIFE_METADATA, .phase = phase,
+                                  .index = progress, .head = UINT32_MAX,
+                                  .value = occurrence});
+    } else if (s->metadata_active) {
+        life_original(s, control);
+        CHECK(phase == 4 || phase == 8); /* Actual NAMES / EVALUATE. */
+        s->handoffs[phase == 8]++;
+        s->metadata_active = false;
+        life_emit(s, (life_key_t){.kind = LIFE_HANDOFF, .phase = phase,
+                                  .index = progress, .head = UINT32_MAX});
+    }
+}
+
+static void
+life_constructor_work(wl_evaluation_control_t *control, uint64_t work)
+{
+    life_state_t *s = lifecycle;
+    CHECK(s && s->constructor_active);
+    life_original(s, control);
+    if (s->stop.hit) return;
+    unsigned occurrence = s->works[s->scope_head]++;
+    life_emit(s, (life_key_t){.kind = LIFE_WORK, .phase = 21,
+                              .index = occurrence, .head = s->scope_head,
+                              .value = work, .commits = s->commits});
+}
+
+static void
+life_constructor_commit(wl_evaluation_control_t *control, unsigned token)
+{
+    life_state_t *s = lifecycle;
+    CHECK(s && s->constructor_active && !s->stop.hit && token < 3);
+    life_original(s, control);
+    CHECK(!(s->commits & (1u << token)));
+    s->commits |= 1u << token;
+}
+
+static void
+life_constructor(const wl_col_session_t *session,
+    wl_evaluation_control_t *control, uint64_t attempt, uint32_t round,
+    uint32_t head, bool entering, int result, const col_rel_t *output)
+{
+    life_state_t *s = lifecycle;
+    CHECK(s && session == (wl_col_session_t *)s->stop.fixture->session
+        && control == s->stop.fixture->control && round == 0
+        && head < s->stop.fixture->heads);
+    life_original(s, control);
+    CHECK(attempt == s->original);
+    if (entering) {
+        CHECK(!s->constructor_active && !output && !result
+            && !wl_columnar_relation_test_work_checkpoint
+            && !wl_columnar_relation_test_constructor_committed
+            && !wl_columnar_relation_test_constructor_fail_allocation);
+        CHECK(++s->entered[head] == 1);
+        s->constructor_active = true; s->scope_head = head; s->commits = 0;
+        bool allocation_target = head == s->allocation_head;
+        s->allocation_initial = allocation_target
+            ? s->allocation_ordinal : UINT32_MAX;
+        CHECK(s->allocation_initial);
+        wl_columnar_relation_test_constructor_fail_allocation =
+            s->allocation_initial;
+        wl_columnar_relation_test_work_checkpoint = life_constructor_work;
+        wl_columnar_relation_test_constructor_committed =
+            life_constructor_commit;
+        life_emit(s,
+            (life_key_t){.kind = LIFE_ENTER, .phase = 21, .head = head});
+        if (allocation_target) {
+            CHECK(s->expected &&
+                s->allocation_ordinal <= s->expected->allocations[head] + 1);
+            s->allocation_failure = s->allocation_ordinal <=
+                s->expected->allocations[head];
+        }
+    } else {
+        CHECK(s->constructor_active && s->scope_head == head);
+        CHECK(++s->exited[head] == 1);
+        uint32_t remaining =
+            wl_columnar_relation_test_constructor_fail_allocation;
+        s->allocations[head] = s->allocation_initial - remaining;
+        wl_columnar_relation_test_constructor_fail_allocation = 0;
+        wl_columnar_relation_test_work_checkpoint = NULL;
+        wl_columnar_relation_test_constructor_committed = NULL;
+        s->constructor_active = false;
+        if (!result) {
+            CHECK(output && output->ncols == 1 && !output->nrows
+                && output->capacity == 1 && output->schema_ok
+                && output->column_types &&
+                output->column_types[0] == WIRELOG_TYPE_STRING
+                && output->storage_owner == output && !output->col_shared
+                && !output->pool_owned && !output->arena_owned &&
+                !output->timestamps
+                && output->name && !strcmp(output->name,
+                head_name(s->stop.fixture, head))
+                && s->commits == 7);
+        } else CHECK(!output);
+        if (head == s->allocation_head) {
+            s->allocation_seen = true;
+            if (s->allocation_failure) {
+                CHECK(result == ENOMEM && !remaining && !s->stop.hit);
+                s->stop.hit = true; return;
+            }
+            CHECK(!result && remaining == 1);
+        }
+        if (!s->stop.hit) {
+            CHECK(!result && s->allocations[head]);
+            if (s->expected) CHECK(s->allocations[head] ==
+                    s->expected->allocations[head]);
+        }
+        life_emit(s, (life_key_t){.kind = LIFE_EXIT, .phase = 21, .head = head,
+                                  .commits = s->commits});
+    }
+}
+
+static void
+life_public(fixture_t *f, col_rel_t *const old[2],
+    const col_relation_snapshot_t snapshots[2], uint64_t successor)
+{
+    CHECK(!f->actual.count);
+    for (unsigned h = 0; h < f->heads; h++) {
+        CHECK(session_find_rel((wl_col_session_t *)f->session,
+            head_name(f, h)) == old[h]
+            && wl_columnar_relation_snapshot_equal(snapshots[h],
+            wl_columnar_relation_snapshot(old[h]))
+            && old[h]->ncols == 1 && old[h]->column_types
+            && old[h]->column_types[0] == WIRELOG_TYPE_STRING
+            && old[h]->nrows == 2 && old[h]->columns[0][0] == 0
+            && old[h]->columns[0][1] == 1);
+    }
+    if (successor) {
+        uint64_t used = UINT64_MAX;
+        CHECK(!wl_evaluation_control_test_active_consumed(f->control, successor,
+            &used) && !used);
+    }
+}
+
+static void
+life_case(unsigned heads, bool observed, const life_trace_t *expected,
+    life_trace_t *record, unsigned target, unsigned outcome,
+    unsigned allocation_head, unsigned allocation_ordinal)
+{
+    fixture_t f; fixture_init(&f, heads, observed);
+    CHECK(!step(&f) && !wl_session_step(f.reference));
+    f.actual.count = f.expected.count = 0;
+    int64_t fresh = wl_intern_put(f.plan->intern, "fresh"); CHECK(fresh == 2);
+    CHECK(!wl_session_insert(f.session, "input", &fresh, 1, 1)
+        && !wl_session_insert(f.reference, "input", &fresh, 1, 1));
+    col_rel_t *old[2]; col_relation_snapshot_t snapshots[2];
+    for (unsigned h = 0; h < heads; h++) {
+        old[h] = session_find_rel((wl_col_session_t *)f.session,
+                head_name(&f, h));
+        snapshots[h] = wl_columnar_relation_snapshot(old[h]);
+    }
+    CHECK(!wl_evaluation_control_configure(f.control, UINT64_C(1000000000)));
+    life_state_t state = {.stop = {.fixture = &f, .outcome = outcome},
+                          .expected = expected, .record = record,
+                          .target = target,
+                          .allocation_head = allocation_head,
+                          .allocation_ordinal = allocation_ordinal};
+    CHECK(!lifecycle &&
+        !wl_columnar_session_test_observed_transaction_checkpoint
+        && !wl_columnar_session_test_string_bottom_checkpoint);
+    lifecycle = &state;
+    wl_columnar_session_test_observed_transaction_checkpoint = life_metadata;
+    wl_columnar_session_test_string_bottom_checkpoint = life_constructor;
+    bool failed_allocation = allocation_head < heads && expected
+        && allocation_ordinal <= expected->allocations[allocation_head];
+    bool stopping_case = target != UINT32_MAX || failed_allocation;
+    int rc = EAGAIN;
+    for (unsigned turn = 0; rc == EAGAIN && turn < 1000000; turn++) {
+        rc = wl_session_step(f.session);
+        if (stopping_case) life_public(&f, old, snapshots,
+                state.stop.successor);
+    }
+    CHECK(!state.constructor_active &&
+        !wl_columnar_relation_test_work_checkpoint
+        && !wl_columnar_relation_test_constructor_committed
+        && !wl_columnar_relation_test_constructor_fail_allocation);
+    wl_columnar_session_test_observed_transaction_checkpoint = NULL;
+    wl_columnar_session_test_string_bottom_checkpoint = NULL;
+    lifecycle = NULL;
+    int wanted = failed_allocation ? ENOMEM : target == UINT32_MAX ? 0
+        : outcome == 0 ? WL_EVALUATION_CONTROL_CANCELLED
+        : outcome == 1 ? WL_EVALUATION_CONTROL_WORK_LIMIT : EINVAL;
+    if (rc != wanted) fprintf(stderr,
+            "lifecycle heads%u observer%d target%u outcome%u allochead%u ordinal%u hit%d rc%d wanted%d\n",
+            heads, observed, target, outcome, allocation_head,
+            allocation_ordinal,
+            state.stop.hit, rc, wanted);
+    CHECK(rc == wanted);
+    if (stopping_case) {
+        CHECK(state.stop.hit);
+        if (!failed_allocation) CHECK(state.position == target + 1);
+        wl_col_session_t *col = (wl_col_session_t *)f.session;
+        CHECK(!col->cleanup_active && !col->cleanup_pending &&
+            !col->cleanup_reserved_bytes);
+        wl_evaluation_control_report_t report;
+        CHECK(!wl_evaluation_control_report(f.control, &report));
+        if (!failed_allocation && outcome >= 2)
+            CHECK(wl_test_completed_step_report_equal(&report,
+                &state.stop.frozen));
+        else CHECK(report.result == wanted);
+        if (state.stop.successor) {
+            wl_evaluation_control_attempt_finish_result_t ended =
+                wl_evaluation_control_finish_attempt(f.control,
+                    f.session->operation_admission, state.stop.successor, 0, 0);
+            CHECK(!ended.protocol && ended.report_valid &&
+                !ended.report.consumed);
+        }
+        CHECK(!wl_evaluation_control_reset(f.control)
+            && !wl_evaluation_control_configure(f.control, 0) && !step(&f));
+    } else {
+        if (expected) CHECK(state.position == expected->count);
+        if (record) {
+            record->count = state.position;
+            memcpy(record->metadata, state.metadata, sizeof(record->metadata));
+            memcpy(record->handoffs, state.handoffs, sizeof(record->handoffs));
+            memcpy(record->works, state.works, sizeof(record->works));
+            memcpy(record->allocations, state.allocations,
+                sizeof(record->allocations));
+        }
+        for (unsigned h = 0; h < heads;
+            h++) CHECK(state.entered[h] == 1 && state.exited[h] == 1);
+    }
+    if (allocation_head < heads) CHECK(state.allocation_seen);
+    CHECK(!wl_session_step(f.reference));
+    const int64_t all[] = {0, 1, 2}; check_rows(&f, all, 3);
+    check_events(&f, 2, 1);
+    fixture_close(&f);
+}
+
+static life_trace_t *
+life_census(unsigned heads, bool observed)
+{
+    life_trace_t *trace = calloc(1, sizeof(*trace)); CHECK(trace);
+    life_case(heads, observed, NULL, trace, UINT32_MAX, 0, UINT32_MAX, 0);
+    CHECK(trace->count && trace->metadata[0] && trace->metadata[1] &&
+        trace->metadata[2]
+        && trace->handoffs[0] == 1 && trace->handoffs[1] == 1);
+    for (unsigned h = 0; h < heads; h++) {
+        unsigned masks = 0, zero = 0;
+        for (unsigned i = 0; i < trace->count; i++) {
+            const life_key_t *key = &trace->keys[i];
+            if (key->kind != LIFE_WORK || key->head != h) continue;
+            CHECK(key->commits <= 7);
+            masks |= 1u << key->commits; zero += key->value == 0;
+        }
+        CHECK(trace->works[h] && trace->allocations[h] && zero
+            && (masks & 139u) == 139u); /* Actual prefixes0/1/3/7. */
+    }
+    return trace;
+}
+
+/* Focused sanitizer/library profile: real ENTER/EXIT and both handoffs,
+ * first/last metadata phase, commit-prefix and zero-tail occurrences only. */
+static bool
+life_focused(const life_trace_t *trace, unsigned at)
+{
+    const life_key_t *key = &trace->keys[at];
+    if (key->kind == LIFE_HANDOFF || key->kind == LIFE_ENTER ||
+        key->kind == LIFE_EXIT)
+        return true;
+    for (unsigned group = 0;
+        group < (key->kind == LIFE_WORK && !key->value ? 2u : 1u); group++) {
+        bool before = false, after = false;
+        for (unsigned i = 0; i < trace->count; i++) {
+            const life_key_t *other = &trace->keys[i];
+            bool same = key->kind == other->kind
+                && (key->kind == LIFE_METADATA ? key->phase == other->phase
+                    : key->head == other->head
+                && (group ? !other->value : key->commits == other->commits));
+            if (!same) continue;
+            before |= i < at; after |= i > at;
+        }
+        if (!before || !after) return true;
+    }
+    return false;
+}
+
+static void
+run_lifecycle(unsigned family, unsigned heads, bool observed,
+    unsigned shard, unsigned shards)
+{
+    CHECK(shards && shard < shards);
+    life_trace_t *trace = life_census(heads, observed);
+    unsigned selected = 0, ordinal = 0;
+    if (family < 2 || family == 4) {
+        for (unsigned i = 0; i < trace->count; i++) {
+            bool metadata = trace->keys[i].kind == LIFE_METADATA ||
+                trace->keys[i].kind == LIFE_HANDOFF;
+            if (family == 4 ? !life_focused(trace,
+                i) : metadata != (family == 0)) continue;
+            unsigned own = ordinal++ % shards;
+            if (own != shard) continue;
+            for (unsigned outcome = 0; outcome < 4; outcome++) {
+                life_case(heads, observed, trace, NULL, i, outcome, UINT32_MAX,
+                    0);
+                selected++;
+            }
+        }
+    } else if (family == 2) {
+        for (unsigned head = 0; head < heads; head++)
+            for (unsigned allocation = 1;
+                allocation <= trace->allocations[head] + 1; allocation++) {
+                unsigned own = ordinal++ % shards;
+                if (own != shard) continue;
+                life_case(heads, observed, trace, NULL, UINT32_MAX, 0, head,
+                    allocation);
+                selected++;
+            }
+    }
+    unsigned owned = ordinal / shards + (shard < ordinal % shards);
+    CHECK(selected == owned * ((family < 2 || family == 4) ? 4u : 1u));
+    printf(
+        "lifecycle family%u heads%u observer%d shard%u/%u trace%u metadata%u/%u/%u handoffs%u/%u work%u/%u allocations%u/%u selected%u cuts%u\n",
+        family, heads, observed, shard, shards, trace->count,
+        trace->metadata[0], trace->metadata[1], trace->metadata[2],
+        trace->handoffs[0], trace->handoffs[1], trace->works[0],
+        trace->works[1],
+        trace->allocations[0], trace->allocations[1], selected, ordinal);
+    free(trace);
+}
+
 int
 main(int argc, char **argv)
 {
     CHECK(!environment("WIRELOG_JOIN_BATCH_BYTES", "")
         && !environment("WIRELOG_JOIN_BATCH_STRICT", ""));
+    if (argc == 7 && !strcmp(argv[1], "lifecycle")) {
+        unsigned family = (unsigned)strtoul(argv[2], NULL, 10);
+        unsigned heads = (unsigned)strtoul(argv[3], NULL, 10);
+        unsigned observed = (unsigned)strtoul(argv[4], NULL, 10);
+        unsigned shard = (unsigned)strtoul(argv[5], NULL, 10);
+        unsigned shards = (unsigned)strtoul(argv[6], NULL, 10);
+        CHECK(family <= 4 && heads >= 1 && heads <= 2 && observed <= 1);
+        run_lifecycle(family, heads, observed != 0, shard, shards); return 0;
+    }
     if (argc == 2 && !strcmp(argv[1], "refusals")) {
         run_refusals(); return 0;
     }

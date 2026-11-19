@@ -10007,6 +10007,12 @@ typedef struct {
     bool entry_charged;
 } wl_columnar_session_test_preflight_state_t;
 extern unsigned wl_columnar_session_test_preflight_quantum;
+/* Observation only around the actual round-zero STRING bottom constructor.
+ * EXIT can expose an owned private result before entry binding. No poll,
+ * authority, state transition or result normalization is added by this seam. */
+extern void (*wl_columnar_session_test_string_bottom_checkpoint)(
+    const wl_col_session_t *, wl_evaluation_control_t *, uint64_t,
+    uint32_t, uint32_t, bool, int, const col_rel_t *);
 extern void (*wl_columnar_session_test_recursive_step_checkpoint)(
     wl_evaluation_control_t *, unsigned, uint32_t);
 int wl_columnar_session_test_preflight_snapshot(wl_session_t *,
