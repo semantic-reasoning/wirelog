@@ -59,7 +59,8 @@ typedef struct {
     wl_plan_t *plan;
     profile_t profiles[3]; /* default controlled, private controlled, raw */
     bool compound, left[VALUES][VALUES], right[VALUES][VALUES][2];
-    unsigned route, stage;
+    unsigned route, stage, stop_site;
+    bool work_stop, armed, stopped;
     int64_t tag, floating;
     profile_t *active;
     unsigned profile, head, occurrence;
@@ -353,6 +354,20 @@ static void observed(wl_evaluation_control_t *control, unsigned phase,
         ++f->seen.append_reads[f->head];
     }
 }
+static void
+stop_at(fixture_t *f, wl_evaluation_control_t *control, unsigned site)
+{
+    if (f->profile || !f->armed || f->stopped || f->stop_site != site) return;
+    if (site == 1) CHECK(f->seen.reuses && !f->seen.builds && !f->seen.indexed);
+    if (site == 2) CHECK(f->seen.builds && f->seen.indexed >= 2);
+    if (site == 3) CHECK(f->seen.persistent && !f->seen.builds &&
+            !f->seen.indexed);
+    f->stopped = true;
+    if (f->work_stop) CHECK(wl_evaluation_control_charge_attempt(control,
+            wl_evaluation_control_active_attempt_id(control), UINT64_MAX)
+            == WL_EVALUATION_CONTROL_WORK_LIMIT);
+    else wl_evaluation_control_request_cancel(control);
+}
 static void arrangement(wl_evaluation_control_t *control, unsigned phase,
     uint64_t progress) {
     (void)progress;
@@ -370,6 +385,7 @@ static void arrangement(wl_evaluation_control_t *control, unsigned phase,
     } else {
         ++f->seen.reuses;
         f->building = NULL;
+        stop_at(f, control, 1);
     }
 }
 static void join(wl_evaluation_control_t *control, unsigned phase,
@@ -395,11 +411,13 @@ static void join(wl_evaluation_control_t *control, unsigned phase,
             ctx->join_right.nrows && f->building == ctx->join_operation &&
             !rhs_delta(f));
         ++f->seen.indexed;
+        if (progress == 1) stop_at(f, control, 2);
     }
     if (phase == 48) {
         CHECK(!f->profile && !ctx->join_operation->right_filter_expr.size &&
             !rhs_delta(f) && progress < ctx->join_right.nrows);
         ++f->seen.persistent;
+        stop_at(f, control, 3);
     }
     if (phase == 44 && ctx->join_right.columns[0][progress] == 2 &&
         ctx->join_right.columns[1][progress] == 7 &&
@@ -545,8 +563,187 @@ static void check_work(fixture_t *f, const registry_t *before) {
                 !f->seen.persistent);
     }
 }
+typedef struct {
+    const col_rel_t *relation, *owner;
+    col_relation_snapshot_t snapshot;
+    unsigned width, rows, kind, arity_len, offset;
+    bool explicit_types;
+    uint32_t arity[3];
+    wirelog_column_type_t types[4];
+    int64_t cells[INDEX_ROWS][4];
+} input_image_t;
+static input_image_t
+input_image(profile_t *p, const char *name)
+{
+    input_image_t image = {0};
+    const col_rel_t *r = session_find_rel(COL_SESSION(p->session), name);
+    CHECK(r && r->ncols <= 4 && r->nrows <= INDEX_ROWS &&
+        r->compound_arity_len <= 3);
+    image.relation = r; image.owner = r->storage_owner;
+    image.snapshot = wl_columnar_relation_snapshot(r);
+    image.width = r->ncols; image.rows = r->nrows;
+    image.kind = r->compound_kind; image.arity_len = r->compound_arity_len;
+    image.offset = r->inline_physical_offset;
+    image.explicit_types = r->column_types != NULL;
+    for (unsigned c = 0; c < image.arity_len;
+        ++c) image.arity[c] = r->compound_arity_map[c];
+    for (unsigned c = 0; c < image.width; ++c) {
+        image.types[c] =
+            r->column_types ? r->column_types[c] : WIRELOG_TYPE_INT64;
+        for (unsigned row = 0; row < image.rows;
+            ++row) image.cells[row][c] = col_rel_get(r, row, c);
+    }
+    return image;
+}
+static void
+same_input(const input_image_t *a, const input_image_t *b)
+{
+    CHECK(a->relation == b->relation && a->owner == b->owner
+        && wl_columnar_relation_snapshot_equal(a->snapshot, b->snapshot)
+        && a->width == b->width && a->rows == b->rows && a->kind == b->kind
+        && a->arity_len == b->arity_len && a->offset == b->offset
+        && a->explicit_types == b->explicit_types);
+    for (unsigned c = 0; c < a->arity_len;
+        ++c) CHECK(a->arity[c] == b->arity[c]);
+    for (unsigned c = 0; c < a->width; ++c) {
+        CHECK(a->types[c] == b->types[c]);
+        for (unsigned row = 0; row < a->rows;
+            ++row) CHECK(a->cells[row][c] == b->cells[row][c]);
+    }
+}
+static void
+same_report(const wl_evaluation_control_report_t *a,
+    const wl_evaluation_control_report_t *b)
+{
+    CHECK(a->attempt_id == b->attempt_id && a->limit == b->limit
+        && a->consumed == b->consumed && a->stop_reason == b->stop_reason
+        && a->execution_status == b->execution_status
+        && a->cleanup_status == b->cleanup_status && a->result == b->result);
+}
+static void
+writers(profile_t *p)
+{
+    const char *const inputs[] = {"left", "right"};
+    for (unsigned i = 0; i < 2; ++i) {
+        col_rel_t *live = session_find_rel(COL_SESSION(p->session), inputs[i]);
+        wl_columnar_source_access_writer_t writer = {0};
+        CHECK(live && !col_rel_source_writer_acquire(live, &writer)
+            && !wl_columnar_source_access_writer_release(&writer));
+    }
+}
+static wl_columnar_session_test_completed_view_t
+completion(profile_t *p, unsigned route,
+    const wl_evaluation_control_report_t *report)
+{
+    wl_columnar_session_test_completed_view_t v;
+    CHECK(!wl_columnar_session_test_completed_view(COL_SESSION(p->session),
+        &v));
+    CHECK(!v.transaction_present && !v.main_pending && !v.parent_pending
+        && !v.actor_current && !v.invocation_accepted && !v.backend_active
+        && !v.endpoint_busy && !v.source_ready && !v.ack_paid && !v.ack_prepared
+        && !v.finance_kind && !v.finance_consumed && !v.local_reset_completed
+        && !v.report.attempt_id);
+    if (route == 2) {
+        /* INERT: Snapshot has its distinct retryable public boundary. */
+        CHECK(p->session->backend->session_controlled_step_state(p->session)
+            == WL_CONTROLLED_STEP_SNAPSHOT_RETRYABLE && v.phase == 0
+            && !v.ticket && !v.operation_identity && !v.original_attempt_id);
+    } else {
+        /* RESERVED(1), not WAIT_SOURCE(2): fixed descriptive metadata owns
+         * no resource/reference and does not make completed_live true. */
+        CHECK(p->session->backend->session_controlled_step_state(p->session)
+            == WL_CONTROLLED_STEP_PENDING && v.phase == 1
+            && v.ticket && v.operation_identity && v.original_attempt_id
+            && v.original_attempt_id == report->attempt_id);
+    }
+    return v;
+}
+static void
+protected_step(fixture_t *f)
+{
+    profile_t *p = f->active;
+    const int64_t left[] = {f->tag, f->floating, 1, 1}, right[] = {1, 1, 1};
+    CHECK(wl_session_insert(p->session, "left", left + (f->compound ? 0 : 2),
+        1, f->compound ? 4 : 2) == EBUSY);
+    CHECK(wl_session_remove(p->session, "right", right, 1, 3) == EBUSY);
+    image_t unexpected = {0};
+    CHECK(wl_session_snapshot(p->session, snapshot_tuple,
+        &unexpected) == EBUSY);
+    for (unsigned h = 0; h < HEADS; ++h)
+        for (unsigned x = 0; x < VALUES; ++x)
+            for (unsigned y = 0; y < VALUES;
+                ++y) CHECK(!unexpected.rows[h][x][y]);
+    /* CLOSE may legitimately consume this bookkeeping. Do not probe it by
+     * destroying the session needed for the same-input recovery history. */
+}
+static void
+failure(fixture_t *f, const registry_t *before, const image_t *old)
+{
+    profile_t *p = f->active;
+    wl_col_session_t *s = COL_SESSION(p->session);
+    const col_rel_t *heads[HEADS];
+    for (unsigned h = 0; h < HEADS;
+        ++h) heads[h] = session_find_rel(s, names[h]);
+    input_image_t left = input_image(p, "left"),
+        right = input_image(p, "right");
+    f->armed = true;
+    int expected =
+        f->work_stop ? WL_EVALUATION_CONTROL_WORK_LIMIT :
+        WL_EVALUATION_CONTROL_CANCELLED;
+    int rc = finish(f, p);
+    CHECK(f->stopped && rc == expected && s->pending_input_change);
+    f->armed = false;
+    registry_t after = registry(p);
+    same_registry(before, &after, true);
+    content(p, old);
+    for (unsigned h = 0; h < HEADS; ++h) {
+        CHECK(session_find_rel(s, names[h]) == heads[h]);
+        for (unsigned x = 0; x < VALUES; ++x)
+            for (unsigned y = 0; y < VALUES; ++y)
+                CHECK(!p->events.calls[h][x][y] && !p->events.diff[h][x][y]
+                    && !p->tuples.rows[h][x][y]);
+    }
+    wl_evaluation_control_report_t report, frozen;
+    CHECK(!wl_evaluation_control_report(p->control, &report)
+        && report.result == expected && report.stop_reason == expected
+        && report.consumed && !report.cleanup_status
+        && !wl_evaluation_control_active_attempt_id(p->control)
+        && !s->cleanup_active && !s->cleanup_pending &&
+        !s->cleanup_reserved_bytes);
+    /* Actual persistent image construction has started at every selected
+     * site. Its rollback disposes WORK too, unlike retained recursive WORK. */
+    uint64_t owner[8];
+    CHECK(!wl_columnar_session_test_retained_work_owner(s, owner)
+        && !owner[0] && !owner[1] && !owner[2]);
+    wl_columnar_session_test_completed_view_t slot = completion(p, f->route,
+            &report);
+    if (f->route != 2) protected_step(f);
+    writers(p);
+    content(p, old);
+    CHECK(s->pending_input_change);
+    for (unsigned h = 0; h < HEADS;
+        ++h) CHECK(session_find_rel(s, names[h]) == heads[h]);
+    input_image_t current = input_image(p, "left"); same_input(&left, &current);
+    current = input_image(p, "right"); same_input(&right, &current);
+    after = registry(p); same_registry(before, &after, true);
+    CHECK(!wl_evaluation_control_report(p->control, &frozen));
+    same_report(&report, &frozen);
+    CHECK(!wl_evaluation_control_active_attempt_id(p->control));
+    wl_columnar_session_test_completed_view_t unchanged = completion(p,
+            f->route, &report);
+    CHECK(slot.phase == unchanged.phase && slot.ticket == unchanged.ticket
+        && slot.operation_identity == unchanged.operation_identity
+        && slot.original_attempt_id == unchanged.original_attempt_id);
+    same_report(&slot.report, &unchanged.report);
+    /* completion() separately reasserts every inactive flag on both reads. */
+    fprintf(stdout,
+        "site=%u work=%u route=%u state=%u disposed private index and readers\n",
+        f->stop_site, f->work_stop, f->route,
+        p->session->backend->session_controlled_step_state(p->session));
+    CHECK(!wl_evaluation_control_reset(p->control));
+}
 int main(int argc, char **argv) {
-    CHECK(argc == 3);
+    CHECK(argc == 3 || argc == 4);
     fixture_t f = {0};
     f.compound = !strcmp(argv[1], "inline");
     CHECK(f.compound || !strcmp(argv[1], "scalar"));
@@ -554,6 +751,16 @@ int main(int argc, char **argv) {
             : !strcmp(argv[2], "plain")  ? 1
                                          : 2;
     CHECK(f.route != 2 || !strcmp(argv[2], "snapshot"));
+    if (argc == 4) {
+        const char *const modes[] = {"reuse-cancel", "reuse-work",
+                                     "rebuild-cancel",
+                                     "rebuild-work", "probe-cancel",
+                                     "probe-work"};
+        for (unsigned i = 0; i < 6; ++i) if (!strcmp(argv[3], modes[i])) {
+                f.stop_site = i / 2 + 1; f.work_stop = (i % 2) != 0;
+            }
+        CHECK(f.stop_site);
+    }
     const char *env[] = {"WIRELOG_DIFF_ENABLED", "WIRELOG_JOIN_BATCH_BYTES",
                          "WIRELOG_JOIN_BATCH_STRICT",
                          "WIRELOG_JOIN_OUTPUT_LIMIT",
@@ -622,16 +829,23 @@ int main(int argc, char **argv) {
         for (unsigned p = 0; p < 3; ++p) {
             registry_t before = registry(&f.profiles[p]);
             watch(&f, p, p < 2);
+            if (!p && f.stop_site && !f.stopped
+                && f.stage == (f.stop_site == 2 ? 5u : 1u)) {
+                failure(&f, &before, &old);
+                watch(&f, p, true);
+            }
             CHECK(!finish(&f, &f.profiles[p]));
             if (p < 2)
                 check_work(&f, &before);
             watch(&f, p, false);
+            if (!p && f.stopped) writers(&f.profiles[p]);
             check_delivery(&f, &f.profiles[p], &old, &now);
             CHECK(!finish(&f, &f.profiles[p]));
             check_delivery(&f, &f.profiles[p], &now, &now);
         }
         old = now;
     }
+    CHECK(!f.stop_site || f.stopped);
     for (unsigned p = 0; p < 3; ++p) {
         CHECK(!wl_session_try_destroy(&f.profiles[p].session));
         if (f.profiles[p].control)
