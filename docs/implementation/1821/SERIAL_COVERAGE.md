@@ -125,7 +125,7 @@ references, not interruption evidence.
 | F05a | Ordinary keyed persistent arrangement/probe bundle versus ephemeral hash; cached right filter versus operation-owned filtered relation | General serial STEP owns a private native index registry for full-right public EDB INT64 JOIN, with bounded creation/reuse/probes and a common head/index cutoff. Existing pins/pending/deferred entries refuse replacement. Filtered/private-head/batch representations retain their previous controlled disposition; this does not qualify raw cache alternatives, G5/G6 |
 | F06a | LFTJ cache/probe versus owned source rebuild and raw output callback versus private owned-row append | Controlled session uses per-attempt bounded rebuild, no unlimited raw fallback; actual writer/ROW/ACK/drain ownership and precommit/postcutoff delivery qualified | Host failure/native/microsteps/policy and `test_lftj_postcut_delivery`; current-generation raw probe/pin checks; [source map](../2298/LFTJ_SOURCE_ACCOUNTING.md) |
 | F07a | Scalar-source compound kind NONE versus INLINE/SIDE, declared schema/type validity, timestamps and row weights | Admission predicates differ by child; no cross-operator representation support inferred. Managed copies/readers can be bounded while a surrounding child refuses the representation; G5. #2301: VARIABLE, MAP and FILTER admit compound_kind INLINE after a metered arity-map check; ordinary JOIN also admits INLINE through the existing bounded reader (#2371); SEMIJOIN/ANTIJOIN remain scalar-only; compound_kind SIDE stays ENOTSUP at the scalar source reader, and an EDB declared with a side compound column has compound_kind NONE in sessions, with controlled make_compound after a completed evaluation admitted on the ordinary and general observed hosts, `evaluation_side_compounds` (#2301), see "SIDE compound EDBs in controlled single-worker sessions (#2301)"; no timestamped/weighted source found in controlled single-worker sessions, `evaluation_source_shapes` (#2301), see "Source shapes in controlled single-worker sessions (#2301)" |
-| F07b | Retained/borrowed/owned, contiguous/segmented/spill-backed storage and empty/nullary/wide rows | Source reader/descriptor and copy helpers must preserve representation and governor state; capacity/overflow errors remain errors. Enumerated qualification combinations, not an invitation to raw fallback; G5/G6. #2301: borrowed public INLINE descriptors, empty, wide and arity-1 INLINE layouts; controlled sessions refuse cold (spill-backed) sources at seal; a never-inserted EDB through MAP, FILTER and REDUCE on the unobserved STEP; no lazy-owner, aliased or segmented source found in controlled single-worker sessions, `evaluation_source_shapes`, see "Source shapes in controlled single-worker sessions (#2301)" |
+| F07b | Retained/borrowed/owned, contiguous/segmented/spill-backed storage and empty/nullary/wide rows | Source reader/descriptor and copy helpers must preserve representation and governor state; capacity/overflow errors remain errors. Enumerated qualification combinations, not an invitation to raw fallback; G5/G6. #2301: borrowed public INLINE descriptors, empty, wide and arity-1 INLINE layouts; a controlled single-worker STEP reads a cold (spill-backed) source through a direct MAP/FILTER projection, and seal and begin refuse the other cold consumers under control, `evaluation_cold_sources`, see "Cold sources in controlled single-worker sessions (#2301)"; a never-inserted EDB through MAP, FILTER and REDUCE on the unobserved STEP; no lazy-owner, aliased or segmented source found in controlled single-worker sessions, `evaluation_source_shapes`, see "Source shapes in controlled single-worker sessions (#2301)" |
 
 ## Configuration predicates
 
@@ -2745,15 +2745,14 @@ signed timestamp intersections.
 Open after this increment: SEMIJOIN/ANTIJOIN, REDUCE and LFTJ reading an
 INLINE input directly, and remaining ordinary JOIN intersections above; direct compound, segmented, timestamped/weighted and
 spill inputs to CONCAT and CONSOLIDATE; cold sources in controlled sessions,
-which `wl_columnar_session_cold_mode` excludes when an evaluation control is
-attached: begin and seal return `WL_COLUMNAR_SPILL_UNSUPPORTED` once their
-argument and busy checks pass, append and finish find no cold loader and return
-`WL_COLUMNAR_SPILL_INVALID`, and such a session never holds a cold source; and
-lazy-owner descriptors, which the reader refuses with ENOTSUP and whose session
-reachability was not traced. #2301 is not closed by this bundle. A later unit
-records the search for the segmented, timestamped/weighted and lazy-owner
-items, and for the timestamps and owners also a test; see "Source shapes in
-controlled single-worker sessions (#2301)".
+which `wl_columnar_session_cold_mode` then excluded when an evaluation control
+was attached; and lazy-owner descriptors, which the reader refuses with ENOTSUP
+and whose session reachability was not traced. #2301 is not closed by this
+bundle. A later unit records the search for the segmented, timestamped/weighted
+and lazy-owner items, and for the timestamps and owners also a test; see
+"Source shapes in controlled single-worker sessions (#2301)". Another admits a
+cold source on one route of a controlled STEP; see "Cold sources in controlled
+single-worker sessions (#2301)".
 
 ### Never-inserted EDB sources through MAP, FILTER and REDUCE (#2301)
 
@@ -3175,3 +3174,113 @@ Limits: more than one worker, cold and spill sources, memory-budget denials,
 plans that the controlled preflight refuses, make_compound inside a delta
 callback, failed-retry custody, and side compounds of other functors and
 arities were not run; the handle values of the two sessions are not compared.
+
+### Cold sources in controlled single-worker sessions (#2301)
+
+Before this unit a controlled session could not hold a cold (spill-backed)
+input. Session creation returned EINVAL for an evaluation control with spill
+JOIN caps, and `wl_columnar_session_cold_mode`, which seal and begin require,
+excluded an evaluation control. The exclusion was a guard, not only a refusal:
+a controlled STEP runs the composed numeric attempt, whose VARIABLE looks the
+source up in the resident registry, and a seal clears that registry slot.
+
+A controlled STEP now reads a cold input through a composed cold scan attempt
+(`wl_columnar_cold_scan_attempt_t`), on one route: VARIABLE over the cold input,
+a direct MAP/FILTER prefix with at least one MAP, then the rule's final
+CONSOLIDATE. The attempt borrows the frame's result slot. It resolves the
+binding one charged name byte at a time, sizes the prefix decode one operator
+per action, prepays that cost in actions of at most one quantum and only then
+decodes, so a wide input or a long prefix costs more actions, not a refusal. It
+admits its scratch through the controlled source reservation, records each
+prefix operator one per action and creates a typed private output with the
+source's full row count as capacity, as the uncontrolled scan admits. It then
+reads rows through the payload reader or the trace cursor and appends them
+through the controlled batch writer. Each action evaluates at most 64 cells of
+one row, its predicates and then its projected lanes, prepays them and polls
+the control before each one. A spill read polls the control through the reader's
+cancel callback; within the attempt, the segment load inside one read is not
+metered in units, and its buffer is admitted by the reader's own governed path.
+RELEASE drains the writer and releases the reader and the scratch under host
+funding; the composed attempt then installs the output as an owned stack entry
+or disposes it from the slot. A retry starts the scan again at the first row.
+The attempt is embedded in the composed numeric attempt, as the LFTJ attempt
+is, so every controlled frame, with or without a cold input, is larger and its
+zeroing charges more work.
+
+Seal and begin keep their uncontrolled eligibility and, under control, refuse
+with `WL_COLUMNAR_SPILL_UNSUPPORTED` every other use of the input: a JOIN after
+the prefix, which the attempt cannot serve because a FILTER-only prefix keeps
+the source's column names and the JOIN resolves its keys against them; a JOIN
+right input or a self-JOIN; a VARIABLE/JOIN pair; a COUNT or other aggregate.
+They also refuse the programs that a controlled STEP routes to the general
+observed transaction, which has no cold binding: a head that is also an EDB,
+the two-EDB single-rule seed shape, which covers every such projection whether
+or not the second EDB is read, and a registry that a successor STEP would find
+larger than three relations, counted as the registry's slots, which a seal does
+not free, plus the heads not yet registered. The raw cold scan, aggregate and
+JOIN entry points and the raw evaluator's cold branches return ENOTSUP under
+control, and the controlled JOIN lookup returns ENOTSUP for a cold name. A
+controlled SNAPSHOT with a cold input returns ENOTSUP, and so does a STEP with a
+delta callback set; the session ignores a callback set while an attempt is
+parked, as it does in a resident controlled session. A STEP that would begin an
+observed or general attempt over a cold input finishes with ENOTSUP before any
+transaction exists. The loading calls are neither metered nor cancelled by the
+control, and the step-time eligibility check is not charged; its cost is
+bounded by the plan and the number of cold bindings.
+
+`evaluation_cold_sources` runs a controlled session and an uncontrolled one
+with the same program, spill store and JOIN caps, the cold input sealed or
+loaded in chunks of three rows. Each case asserts its rule's op order. The
+planner puts every FILTER before the MAP, so the parsed corpus has one and two
+FILTERs before the MAP, an empty input, an input that the FILTER removes
+entirely, 70-column rows with one FILTER and with two, whose decode costs more
+than one quantum, STRING lanes from program facts and a second stratum that
+reads the head. A FILTER after a permuting MAP comes from a plan the test
+edits, and its image is also compared with an uncontrolled session that keeps
+the input resident. For each case the attempt's checkpoint fires, the raw cold
+scan does not run, and both sessions hold the same head image after a first and
+a second STEP. For each checkpoint of a calibrated run on the seal route, the
+loading route and the 70-column case, a cancellation and a work-limit stop land
+at that checkpoint, return the stop code and a report naming it, publish no
+head, leave the governor at its value before the STEP and are followed after a
+reset by the uncontrolled image; some of the cancelled sessions are destroyed
+without a reset. The scan runs its rows within one public call, and parked at
+its first EAGAIN return after the last row a session refuses
+`wl_session_try_destroy`; after a cancellation its STEP ends and it is
+destroyed with no reservation left. A cancellation that the control first sees
+inside a spill read and an injected read fault (EIO) are checked as the stops
+are. A blocker reservation that leaves more room each time denies the attempt's
+scratch, its output, its reader and the drain of its writer, and on the loading
+route also a row read that loads a segment, until the STEP succeeds; each
+denial returns ENOSPC with `wl_session_budget_denied`, and the retry after the
+blocker is released returns the image. A full STEP over one input consumes the
+same work on both routes, and a limit one unit lower stops it; the total is not
+pinned because it differs between toolchains. Within the rows no action
+evaluates more than 64 cells, and no resolution action charges more than 257
+units. Each refusal above returns `WL_COLUMNAR_SPILL_UNSUPPORTED` at seal and
+at begin under control and `WL_COLUMNAR_SPILL_OK` uncontrolled, and the STEP
+that follows returns what it returns in a session that never tried the seal.
+The registry case is also run without the side compound that makes it exceed
+three relations, and is then admitted. A callback set at an EAGAIN return of an
+attempt is not installed, in the cold and in a resident controlled session, and
+neither delivers an event; the attempt then stops at a later cancellation or
+completes.
+
+Session creation now accepts an evaluation control with spill JOIN caps; a
+JOIN in such a session still never takes the spill route, whose selection
+excludes an evaluation control. With the caps set, the general observed
+transaction also keeps no persistent index image and uses its bounded local
+index, now in controlled sessions too; no resident controlled program was run
+with the caps. `session_options` checks the creation and a refusal of unpaired
+caps beside a control.
+
+Open after this unit, as refusals of routes the uncontrolled session supports:
+a cold input read by a JOIN, by a JOIN after the prefix or by an aggregate; a
+SNAPSHOT or an observed STEP over a cold input; and, under control, a head that
+is also an EDB, every two-EDB single-rule projection and a registry larger than
+three relations. Limits: more than one worker, the loading calls under the
+control and a successor STEP that evaluates, which a frozen input does not
+start, were not run, and neither the drive-time refusal nor the JOIN lookup
+refusal was reached. A stop after a work limit keeps `wl_session_try_destroy`
+busy in this session as in a resident controlled one, so only cancelled
+sessions are destroyed without a reset.

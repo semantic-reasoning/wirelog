@@ -623,3 +623,15 @@ reader's ENOTSUP for compound_kind SIDE was not met in the test. The recursive
 edge host, the observed single-rule host and failed-retry custody still refuse
 make_compound with EBUSY; more than one worker, cold sources and memory-budget
 denials are outside its evidence.
+
+A sixth bundle lets a controlled single-worker STEP read a cold (spill-backed)
+input through a composed cold scan attempt, on one route: a direct MAP/FILTER
+prefix with at least one MAP before the rule's final CONSOLIDATE. Seal and begin
+refuse every other use of a cold input under control, and the programs that a
+controlled STEP routes to the general observed transaction; a controlled
+SNAPSHOT and an observed STEP over a cold input return ENOTSUP. The bundle adds
+`evaluation_cold_sources`; see "Cold sources in controlled single-worker
+sessions (#2301)". A cold input read by a JOIN or an aggregate, a SNAPSHOT or
+an observed STEP over one, and, under control, a head that is also an EDB,
+every two-EDB single-rule projection and a registry larger than three
+relations stay open, with more than one worker.
