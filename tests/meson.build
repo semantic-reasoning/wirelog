@@ -3501,6 +3501,22 @@ foreach join_domain_mode : ['plain', 'batch']
        suite: ['unit', 'tsan', 'evaluation_join_hosts'], timeout: 120)
 endforeach
 
+test_evaluation_join_cache_exe = executable(
+  'test_evaluation_join_cache', files('test_evaluation_join_cache.c'),
+  c_args: ['-DWL_SESSION_TEST_HOOKS=1'],
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
+  link_with: [testlib_prod],
+  install: false,
+)
+foreach cache_representation : ['scalar', 'inline']
+  foreach cache_route : ['observed', 'plain', 'snapshot']
+    test('evaluation_join_cache_' + cache_representation + '_' + cache_route,
+         test_evaluation_join_cache_exe, args: [cache_representation, cache_route],
+         suite: ['unit', 'tsan', 'evaluation_join_hosts'], timeout: 120)
+  endforeach
+endforeach
+
 test_evaluation_materialized_body_exe = executable(
   'test_evaluation_materialized_body', files('test_evaluation_materialized_body.c'),
   c_args: ['-DWL_SESSION_TEST_HOOKS=1'],
