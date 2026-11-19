@@ -47,7 +47,9 @@ typedef struct wl_evaluation_control wl_evaluation_control_t;
  *
  * Version 5 enables eligible serial ordinary numeric JOINs over spilled
  * snapshots when both spill_join limits are positive. Both zero disables
- * routing. A configured store is required; evaluation control is incompatible.
+ * routing. A configured store is required. An evaluation control may carry the
+ * caps: its JOINs never take this route, and a cold input is read only through
+ * the controlled cold scan (#2301).
  * batch_bytes bounds output lanes, index_bytes bounds the window index;
  * resident inputs, final output and reader/producer metadata are additional.
  * Unsupported shapes retain their existing paths. Version 2/3/4 prefixes

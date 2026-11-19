@@ -3373,8 +3373,10 @@ wl_session_create_with_snapshot_options(const wl_compute_backend_t *backend,
     if ((normalized.spill_join_batch_bytes != 0)
         != (normalized.spill_join_index_bytes != 0))
         return EINVAL;
-    if (normalized.spill_join_batch_bytes
-        && (!normalized.spill_directory || control))
+    /* An evaluation control may hold spill JOIN caps: such a session reads
+     * a cold source only through the controlled cold scan (#2301), and its
+     * JOINs never take the unmetered spill route. */
+    if (normalized.spill_join_batch_bytes && !normalized.spill_directory)
         return EINVAL;
     if ((control || normalized.spill_directory)
         && !backend->session_create_with_options)

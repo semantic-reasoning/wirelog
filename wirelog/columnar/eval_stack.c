@@ -4244,6 +4244,73 @@ wl_columnar_eval_stack_composed_source_install(
     return 0;
 }
 
+/* Lend the frame result slot to a controlled cold scan (#2301). The slot
+ * is charged as a source output; SOURCE_ABORT disposes whatever the scan left
+ * in it, and the cold install pushes it as an owned entry. */
+int
+wl_columnar_eval_stack_composed_cold_output(
+    wl_columnar_eval_stack_cleanup_frame_t *frame, wl_col_session_t *sess,
+    wl_columnar_eval_plan_numeric_attempt_t *owner)
+{
+    int rc = wl_columnar_eval_stack_composed_source_frame(frame, sess, owner,
+            false, true);
+    if (rc) return rc;
+    if (owner->phase != WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_COLD_SLOT
+        || owner->source_slot_borrowed || owner->source_installed
+        || owner->source_initialized || owner->source_bare
+        || owner->source_is_delta)
+        return EBUSY;
+    for (unsigned i = 0; i < 4; ++i) {
+        rc = wl_columnar_eval_stack_attempt_charge(owner->control,
+                owner->attempt_id, 192);
+        if (rc) return rc;
+        rc = wl_columnar_eval_stack_attempt_charge(owner->control,
+                owner->attempt_id, 0);
+        if (rc) return rc;
+    }
+    frame->result.rel = NULL; frame->result.owned = true;
+    frame->result.is_delta = false;
+    frame->result.seg_boundaries = NULL; frame->result.seg_count = 0;
+    frame->result.kind = WL_COLUMNAR_EVAL_ENTRY_RELATION;
+    frame->result.continuation = NULL;
+    owner->source_output = &frame->result.rel;
+    owner->source_slot_borrowed = true;
+    return 0;
+}
+
+int
+wl_columnar_eval_stack_composed_cold_install(
+    wl_columnar_eval_stack_cleanup_frame_t *frame, wl_col_session_t *sess,
+    wl_columnar_eval_plan_numeric_attempt_t *owner)
+{
+    int rc = wl_columnar_eval_stack_composed_source_frame(frame, sess, owner,
+            owner && owner->source_slot_borrowed, true);
+    if (rc) return rc;
+    if (owner->phase != WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_COLD_INSTALL
+        || owner->cold.identity || !owner->source_slot_borrowed
+        || owner->source_installed || owner->source_initialized)
+        return EBUSY;
+    col_rel_t *rel = frame->result.rel;
+    if (!rel) return EINVAL;
+    rc = wl_columnar_eval_stack_attempt_charge(owner->control,
+            owner->attempt_id, 192);
+    if (rc) return rc;
+    rc = wl_columnar_eval_stack_attempt_charge(owner->control,
+            owner->attempt_id, 0);
+    if (rc) return rc;
+    eval_entry_t *entry = &frame->stack.items[frame->stack.top];
+    entry->rel = rel; entry->owned = true;
+    entry->is_delta = false;
+    entry->seg_boundaries = NULL; entry->seg_count = 0;
+    entry->kind = WL_COLUMNAR_EVAL_ENTRY_RELATION;
+    entry->continuation = NULL;
+    wl_columnar_eval_stack_unary_entry_clear(&frame->result);
+    ++frame->stack.top;
+    owner->source_slot_borrowed = false; owner->source_output = NULL;
+    owner->source_installed = true;
+    return 0;
+}
+
 int
 wl_columnar_eval_stack_composed_source_abort_validate(
     wl_columnar_eval_stack_cleanup_frame_t *frame, wl_col_session_t *sess,
@@ -7417,6 +7484,7 @@ wl_columnar_eval_stack_auto_cleanup_shape(const wl_col_session_t *session,
         || !n->plan || n->end > n->plan->op_count
         || n->source_initialized || n->source_bare || n->join_host
         || n->join_host_admitted || n->join_host_governor || n->lftj.identity
+        || n->cold.identity
         || n->lftj_metadata.phase != WL_COLUMNAR_LFTJ_METADATA_INERT)
         return EINVAL;
     wl_columnar_eval_plan_numeric_phase_t phase = n->phase ==
@@ -7468,6 +7536,7 @@ wl_columnar_eval_stack_auto_cleanup_ready(const wl_col_session_t *session)
         || !n->plan || n->end > n->plan->op_count
         || n->source_initialized || n->source_bare || n->join_host
         || n->join_host_admitted || n->join_host_governor || n->lftj.identity
+        || n->cold.identity
         || n->lftj_metadata.phase != WL_COLUMNAR_LFTJ_METADATA_INERT)
         return EINVAL;
     wl_columnar_eval_plan_numeric_phase_t phase = n->phase ==
@@ -7518,7 +7587,7 @@ wl_columnar_eval_stack_auto_cleanup_admit(
         || n->cursor < n->begin || n->cursor >= n->end
         || n->end > n->plan->op_count || n->source_initialized || n->source_bare
         || n->join_host || n->join_host_admitted || n->join_host_governor
-        || n->lftj.identity
+        || n->lftj.identity || n->cold.identity
         || n->lftj_metadata.phase != WL_COLUMNAR_LFTJ_METADATA_INERT)
         return EINVAL;
     const wl_columnar_eval_private_bindings_t *bindings = a->saved_binding;

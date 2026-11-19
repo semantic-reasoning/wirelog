@@ -389,6 +389,11 @@ wl_columnar_ops_cold_scan(const wl_plan_relation_t *plan,
         !wl_columnar_eval_plan_cold_scan_decode(plan,
         cold->name, cold->ncols, wl_columnar_session_cold_types(cold),
         end, &decoded)) return ENOTSUP;
+    /* Unmetered: a controlled session uses the cold scan attempt. */
+    if (sess->base.evaluation_control) return ENOTSUP;
+#ifdef WL_SESSION_TEST_HOOKS
+    ++wl_columnar_ops_test_raw_cold_scans;
+#endif
     uint32_t width = decoded.map ? decoded.map->project_count : cold->ncols;
     uint32_t logical_count = 0;
     const wirelog_column_t *logical = decoded.map ? NULL :
@@ -543,6 +548,575 @@ done:
     return rc;
 }
 
+/* ---- controlled cold scan attempt (#2301) -------------------------------- */
+
+#ifdef WL_SESSION_TEST_HOOKS
+void (*wl_columnar_ops_test_cold_scan_checkpoint)(wl_evaluation_control_t *,
+    const wl_columnar_cold_scan_attempt_t *);
+uint64_t wl_columnar_ops_test_raw_cold_scans;
+#endif
+
+uint32_t
+wl_columnar_ops_cold_scan_end(const wl_plan_relation_t *plan, uint32_t begin)
+{
+    if (!plan || !plan->ops || begin >= plan->op_count) return begin;
+    uint32_t end = begin + 1;
+    while (end < plan->op_count && (plan->ops[end].op == WL_PLAN_OP_MAP ||
+        plan->ops[end].op == WL_PLAN_OP_FILTER)) end++;
+    return end;
+}
+
+static bool
+wl_columnar_cold_scan_thread(const wl_columnar_cold_scan_attempt_t *a)
+{
+    if (!a->thread_valid) return false;
+#if defined(WL_HAVE_C11_THREADS)
+    return thrd_equal(a->owner_thread, thrd_current()) != 0;
+#elif defined(_WIN32) || defined(_WIN64)
+    return a->owner_thread == GetCurrentThreadId();
+#else
+    return pthread_equal(a->owner_thread, pthread_self()) != 0;
+#endif
+}
+
+static int
+wl_columnar_cold_scan_charge(wl_columnar_cold_scan_attempt_t *a, uint64_t work)
+{
+    if (!a->control || !a->attempt_id ||
+        wl_evaluation_control_active_attempt_id(a->control) != a->attempt_id)
+        return EINVAL;
+    return wl_evaluation_control_charge(a->control, work);
+}
+
+static int
+wl_columnar_cold_scan_fail(wl_columnar_cold_scan_attempt_t *a, int rc)
+{
+    if (!a->semantic_result) a->semantic_result = rc ? rc : EINVAL;
+    a->phase = WL_COLUMNAR_COLD_SCAN_ATTEMPT_RELEASE;
+    return 0;
+}
+
+/* The spill reader polls this between segment I/O steps. */
+static bool
+wl_columnar_cold_scan_cancel(void *context)
+{
+    wl_columnar_cold_scan_attempt_t *a = context;
+    return wl_evaluation_control_charge(a->control, 0) != 0;
+}
+
+static int
+wl_columnar_cold_scan_spill_fail(wl_columnar_cold_scan_attempt_t *a,
+    wl_columnar_spill_status_t status)
+{
+    int rc = ENOTSUP;
+    if (status == WL_COLUMNAR_SPILL_CANCELLED) {
+        /* Only this attempt's control cancels its reads. */
+        rc = wl_columnar_cold_scan_charge(a, 0);
+        if (!rc) rc = EINVAL;
+    } else {
+        rc = wl_columnar_ops_cold_spill_error(status);
+    }
+    if (rc == ENOSPC) a->session->memory_budget_denied = true;
+    return wl_columnar_cold_scan_fail(a, rc);
+}
+
+int
+wl_columnar_ops_cold_scan_attempt_begin(wl_columnar_cold_scan_attempt_t *a,
+    const void *numeric_owner, wl_col_session_t *session,
+    const wl_plan_relation_t *plan, uint32_t begin, uint32_t end,
+    col_rel_t **output, wl_evaluation_control_t *control, uint64_t attempt_id)
+{
+    if (!a || a->identity || !numeric_owner || !session || !plan ||
+        !plan->ops || begin || end <= begin + 1 || end >= plan->op_count ||
+        !output || *output || !control || !attempt_id ||
+        !session->base.evaluation_control) return EINVAL;
+    memset(a, 0, sizeof(*a));
+    a->identity = a;
+    a->numeric_owner = numeric_owner;
+    a->session = session;
+    a->plan = plan;
+    a->end = end;
+    a->output = output;
+    a->control = control;
+    a->attempt_id = attempt_id;
+    a->phase = WL_COLUMNAR_COLD_SCAN_ATTEMPT_RESOLVE;
+    a->resolve_cursor = session->cold_relation;
+    wl_columnar_memory_reservation_init(&a->scratch_reservation);
+#if defined(WL_HAVE_C11_THREADS)
+    a->owner_thread = thrd_current();
+#elif defined(_WIN32) || defined(_WIN64)
+    a->owner_thread = GetCurrentThreadId();
+#else
+    a->owner_thread = pthread_self();
+#endif
+    a->thread_valid = true;
+    return 0;
+}
+
+/* Resolution: one charged byte at a time for the binding names, then a
+ * sizing pass, one prefix op per action charged by its lanes, and prepayment
+ * of the summed decode cost in quantum-sized actions before the one decode.
+ * A MAP lane traces back through every earlier MAP and checks its expression
+ * bytes; a FILTER traces its column. */
+static int
+wl_columnar_cold_scan_resolve_name(wl_columnar_cold_scan_attempt_t *a,
+    const char *name)
+{
+    const wl_columnar_session_cold_relation_t *c = a->resolve_cursor;
+    if (!c) return wl_columnar_cold_scan_fail(a, ENOENT);
+    for (unsigned i = 0; i < WL_EVALUATION_CONTROL_QUANTUM; i++) {
+        int rc = wl_columnar_cold_scan_charge(a, 1);
+        if (rc) return wl_columnar_cold_scan_fail(a, rc);
+        char want = name[a->name_byte], have = c->name[a->name_byte];
+        if (want != have) {
+            a->resolve_cursor = c->next;
+            a->name_byte = 0;
+            return 0;
+        }
+        if (!want) {
+            a->cold = c;
+            a->name_byte = 0;
+            a->decode_op = 1;
+            return 0;
+        }
+        ++a->name_byte;
+    }
+    return 0;
+}
+
+static int
+wl_columnar_cold_scan_resolve(wl_columnar_cold_scan_attempt_t *a)
+{
+    const char *name = a->plan->ops[0].relation_name;
+    if (!name) return wl_columnar_cold_scan_fail(a, ENOENT);
+    if (!a->cold) return wl_columnar_cold_scan_resolve_name(a, name);
+    if (a->decode_op < a->end) {
+        const wl_plan_op_t *op = &a->plan->ops[a->decode_op];
+        uint64_t lanes = op->op == WL_PLAN_OP_MAP ? op->project_count : 1u;
+        int rc = wl_columnar_cold_scan_charge(a, 1u + (lanes <
+                WL_EVALUATION_CONTROL_QUANTUM ? lanes :
+                WL_EVALUATION_CONTROL_QUANTUM));
+        if (rc) return wl_columnar_cold_scan_fail(a, rc);
+        /* Larger lane counts are charged through the prepayment below. */
+        uint64_t cost = 1u + a->end, lane_cost = 1u + a->end;
+        for (uint64_t i = 0; op->op == WL_PLAN_OP_MAP && i < lanes; i++) {
+            uint64_t bytes = op->map_expr_count && i < op->map_expr_count
+                ? op->map_exprs[i].size : 0u;
+            if (!wl_columnar_memory_size_add(cost, lane_cost, &cost) ||
+                !wl_columnar_memory_size_add(cost, bytes, &cost))
+                return wl_columnar_cold_scan_fail(a, EOVERFLOW);
+        }
+        if (lanes > WL_EVALUATION_CONTROL_QUANTUM &&
+            !wl_columnar_memory_size_add(cost, lanes, &cost))
+            return wl_columnar_cold_scan_fail(a, EOVERFLOW);
+        if (!wl_columnar_memory_size_add(a->decode_work, cost,
+            &a->decode_work))
+            return wl_columnar_cold_scan_fail(a, EOVERFLOW);
+        ++a->decode_op;
+        return 0;
+    }
+    if (a->decode_charged < a->decode_work) {
+        uint64_t left = a->decode_work - a->decode_charged;
+        uint64_t charge = left < WL_EVALUATION_CONTROL_QUANTUM ? left
+            : WL_EVALUATION_CONTROL_QUANTUM;
+        int rc = wl_columnar_cold_scan_charge(a, charge);
+        if (rc) return wl_columnar_cold_scan_fail(a, rc);
+        a->decode_charged += charge;
+        return 0;
+    }
+    a->decode_op = 0;
+    if (a->cold->state == WL_COLUMNAR_COLD_LOADING ||
+        !wl_columnar_eval_plan_cold_scan_decode(a->plan, a->cold->name,
+        a->cold->ncols, wl_columnar_session_cold_types(a->cold), a->end,
+        &a->decoded) || !a->decoded.map)
+        return wl_columnar_cold_scan_fail(a, ENOTSUP);
+    a->width = a->decoded.map->project_count;
+    uint64_t bytes, predicate_bytes;
+    if (!a->width ||
+        !wl_columnar_memory_size_mul(a->width,
+        2u * sizeof(int64_t) + sizeof(uint32_t), &bytes) ||
+        !wl_columnar_memory_size_mul(a->decoded.filter_count,
+        sizeof(wl_columnar_eval_plan_cold_predicate_t), &predicate_bytes) ||
+        !wl_columnar_memory_size_add(bytes, predicate_bytes, &bytes) ||
+        bytes > SIZE_MAX) return wl_columnar_cold_scan_fail(a, EOVERFLOW);
+    a->scratch_bytes = bytes;
+    a->phase = WL_COLUMNAR_COLD_SCAN_ATTEMPT_SCRATCH;
+    return 0;
+}
+
+static int
+wl_columnar_cold_scan_reserve(wl_columnar_cold_scan_attempt_t *a)
+{
+    if (a->session->memory_governor) {
+        wl_columnar_memory_governor_t *g =
+            wl_columnar_memory_governor_ref_get(a->session->memory_governor);
+        wl_columnar_memory_admission_status_t status;
+        int rc = wl_columnar_memory_governor_reserve_source_attempt_controlled(
+            g, a->scratch_bytes, &a->scratch_reservation, &status, a->control,
+            a->attempt_id);
+        if (rc) return wl_columnar_cold_scan_fail(a, rc);
+        if (status != WL_COLUMNAR_MEMORY_ADMISSION_OK &&
+            status != WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY) {
+            if (status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED)
+                a->session->memory_budget_denied = true;
+            return wl_columnar_cold_scan_fail(a,
+                       status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED ? ENOSPC
+                : status == WL_COLUMNAR_MEMORY_ADMISSION_OVERFLOW ? EOVERFLOW
+                : EINVAL);
+        }
+        a->scratch_reserved = true;
+    }
+    a->phase = WL_COLUMNAR_COLD_SCAN_ATTEMPT_ALLOC;
+    return 0;
+}
+
+static int
+wl_columnar_cold_scan_alloc(wl_columnar_cold_scan_attempt_t *a)
+{
+    int rc = wl_columnar_cold_scan_charge(a, 4);
+    if (rc) return wl_columnar_cold_scan_fail(a, rc);
+    a->row = malloc((size_t)a->width * 2u * sizeof(*a->row));
+    a->indices = malloc((size_t)a->width * sizeof(*a->indices));
+    a->predicates = a->decoded.filter_count ? malloc(
+        (size_t)a->decoded.filter_count * sizeof(*a->predicates)) : NULL;
+    if (!a->row || !a->indices || (a->decoded.filter_count && !a->predicates))
+        return wl_columnar_cold_scan_fail(a, ENOMEM);
+    a->type_codes = a->row + a->width;
+    if (a->scratch_reserved) {
+        bool committed = false;
+        rc = wl_columnar_memory_governor_commit_source_attempt_controlled(
+            &a->scratch_reservation, a, &committed, a->control, a->attempt_id);
+        if (rc) return wl_columnar_cold_scan_fail(a, rc);
+        if (!committed) return wl_columnar_cold_scan_fail(a, EINVAL);
+        a->scratch_committed = true;
+    }
+    a->stage_width = a->cold->ncols;
+    a->decode_op = 1;
+    a->phase = WL_COLUMNAR_COLD_SCAN_ATTEMPT_DECODE;
+    return 0;
+}
+
+/* One prefix op per action, traced back through every earlier MAP. */
+static int
+wl_columnar_cold_scan_decode_op(wl_columnar_cold_scan_attempt_t *a)
+{
+    if (a->decode_op == a->end) {
+        if (a->next_predicate != a->decoded.filter_count)
+            return wl_columnar_cold_scan_fail(a, ENOTSUP);
+        a->phase = WL_COLUMNAR_COLD_SCAN_ATTEMPT_TYPES;
+        return 0;
+    }
+    int rc = wl_columnar_cold_scan_charge(a, 1u + a->end);
+    if (rc) return wl_columnar_cold_scan_fail(a, rc);
+    const wl_plan_op_t *op = &a->plan->ops[a->decode_op];
+    if (op->op == WL_PLAN_OP_MAP) {
+        a->stage_width = op->project_count;
+    } else {
+        if (a->next_predicate >= a->decoded.filter_count)
+            return wl_columnar_cold_scan_fail(a, ENOTSUP);
+        wl_columnar_eval_plan_cold_predicate_t *p =
+            &a->predicates[a->next_predicate++];
+        if (!wl_columnar_eval_plan_cold_predicate_decode(op, a->stage_width,
+            NULL, p) || !wl_columnar_eval_plan_cold_column(a->plan,
+            a->decode_op, p->column, a->cold->ncols, &p->column))
+            return wl_columnar_cold_scan_fail(a, ENOTSUP);
+    }
+    ++a->decode_op;
+    return 0;
+}
+
+static int
+wl_columnar_cold_scan_types(wl_columnar_cold_scan_attempt_t *a)
+{
+    if (a->type_lane == a->width) {
+        a->phase = WL_COLUMNAR_COLD_SCAN_ATTEMPT_OUTPUT_CREATE;
+        return 0;
+    }
+    int rc = wl_columnar_cold_scan_charge(a, 1u + a->end);
+    if (rc) return wl_columnar_cold_scan_fail(a, rc);
+    uint32_t lane = a->type_lane;
+    if (!wl_columnar_eval_plan_cold_column(a->plan, a->end, lane,
+        a->cold->ncols, &a->indices[lane]))
+        return wl_columnar_cold_scan_fail(a, ENOTSUP);
+    a->type_codes[lane] =
+        (int64_t)wl_columnar_session_cold_types(a->cold)[a->indices[lane]];
+    ++a->type_lane;
+    return 0;
+}
+
+static int
+wl_columnar_cold_scan_reader(wl_columnar_cold_scan_attempt_t *a)
+{
+    int rc = wl_columnar_cold_scan_charge(a, 1);
+    if (rc) return wl_columnar_cold_scan_fail(a, rc);
+    /* Cast away const only for the payload's own reader pin. */
+    wl_columnar_session_cold_relation_t *c =
+        (wl_columnar_session_cold_relation_t *)a->cold;
+    wl_columnar_spill_status_t status = c->state == WL_COLUMNAR_COLD_FINISHED
+        ? wl_columnar_trace_store_cursor_acquire(c->trace_snapshot, &a->cursor)
+        : wl_columnar_batch_payload_acquire(c->payload, &a->reader);
+    if (status != WL_COLUMNAR_SPILL_OK)
+        return wl_columnar_cold_scan_spill_fail(a, status);
+    a->phase = WL_COLUMNAR_COLD_SCAN_ATTEMPT_WRITER_BEGIN;
+    return 0;
+}
+
+static int
+wl_columnar_cold_scan_open_row(wl_columnar_cold_scan_attempt_t *a)
+{
+    int rc = wl_columnar_cold_scan_charge(a, 1);
+    if (rc) return wl_columnar_cold_scan_fail(a, rc);
+    wl_columnar_spill_metadata_t metadata;
+    a->lanes = NULL;
+    wl_columnar_spill_status_t status = a->cursor
+        ? wl_columnar_trace_store_cursor_read(a->cursor, a->ordinal,
+            wl_columnar_cold_scan_cancel, a, &a->lanes, &metadata)
+        : wl_columnar_batch_payload_read(a->reader, a->ordinal,
+            wl_columnar_cold_scan_cancel, a, &a->lanes, &metadata);
+    if (status != WL_COLUMNAR_SPILL_OK)
+        return wl_columnar_cold_scan_spill_fail(a, status);
+    if (metadata.multiplicity != 1 || metadata.iteration || metadata.stratum ||
+        metadata.worker) return wl_columnar_cold_scan_fail(a, ENOTSUP);
+    a->row_open = true;
+    a->cell = 0;
+    return 0;
+}
+
+static bool
+wl_columnar_cold_scan_keep(const wl_columnar_eval_plan_cold_predicate_t *p,
+    int64_t value, int *rc)
+{
+    int64_t literal = p->literal;
+    switch (p->comparison) {
+    case WL_PLAN_EXPR_CMP_EQ: return value == literal;
+    case WL_PLAN_EXPR_CMP_NEQ: return value != literal;
+    case WL_PLAN_EXPR_CMP_LT: return value < literal;
+    case WL_PLAN_EXPR_CMP_GT: return value > literal;
+    case WL_PLAN_EXPR_CMP_LTE: return value <= literal;
+    case WL_PLAN_EXPR_CMP_GTE: return value >= literal;
+    default: *rc = ENOTSUP; return false;
+    }
+}
+
+/* A row's cells are its predicates, then its projected lanes. One action
+ * evaluates at most ACTION_CELLS of them; a rejected row ends early. */
+static int
+wl_columnar_cold_scan_rows(wl_columnar_cold_scan_attempt_t *a)
+{
+    if (!a->row_open) {
+        if (a->ordinal == a->cold->nrows) {
+            a->phase = WL_COLUMNAR_COLD_SCAN_ATTEMPT_WRITER_END;
+            return 0;
+        }
+        return wl_columnar_cold_scan_open_row(a);
+    }
+    uint32_t cells = a->decoded.filter_count + a->width;
+    if (a->cell == cells) {
+        int rc = wl_columnar_relation_append_batch_row_controlled(&a->writer,
+                a->row);
+        if (rc) return wl_columnar_cold_scan_fail(a, rc);
+        ++a->rows_written;
+        a->row_open = false;
+        a->lanes = NULL;
+        ++a->ordinal;
+        return 0;
+    }
+    uint32_t count = cells - a->cell;
+    if (count > WL_COLUMNAR_COLD_SCAN_ACTION_CELLS)
+        count = WL_COLUMNAR_COLD_SCAN_ACTION_CELLS;
+    int rc = wl_columnar_cold_scan_charge(a, count);
+    if (rc) return wl_columnar_cold_scan_fail(a, rc);
+    for (uint32_t i = 0; i < count; i++, a->cell++) {
+#ifdef WL_SESSION_TEST_HOOKS
+        if (wl_columnar_ops_test_cold_scan_checkpoint)
+            wl_columnar_ops_test_cold_scan_checkpoint(a->control, a);
+#endif
+        rc = wl_columnar_cold_scan_charge(a, 0);
+        if (rc) return wl_columnar_cold_scan_fail(a, rc);
+        if (a->cell < a->decoded.filter_count) {
+            const wl_columnar_eval_plan_cold_predicate_t *p =
+                &a->predicates[a->cell];
+            int64_t value;
+            memcpy(&value, &a->lanes[p->column], sizeof(value));
+            int bad = 0;
+            bool keep = wl_columnar_cold_scan_keep(p, value, &bad);
+            if (bad) return wl_columnar_cold_scan_fail(a, bad);
+            if (!keep) {
+                a->row_open = false;
+                a->lanes = NULL;
+                ++a->ordinal;
+                return 0;
+            }
+        } else {
+            uint32_t lane = a->cell - a->decoded.filter_count;
+            memcpy(&a->row[lane], &a->lanes[a->indices[lane]],
+                sizeof(a->row[lane]));
+        }
+    }
+    return 0;
+}
+
+static int
+wl_columnar_cold_scan_release(wl_columnar_cold_scan_attempt_t *a, bool *done,
+    wl_evaluation_control_t *funding, uint64_t funding_id)
+{
+    if (!funding || funding == a->control || !funding_id ||
+        wl_evaluation_control_active_attempt_id(funding) != funding_id)
+        return EINVAL;
+    int rc = wl_evaluation_control_charge_attempt(funding, funding_id, 1);
+    if (rc) return rc;
+    if (a->writer_active) {
+        if (!a->writer_drain.identity) {
+            wl_columnar_relation_private_batch_drain_init(&a->writer_drain);
+            return 0;
+        }
+        bool drained = false;
+        rc = wl_columnar_relation_private_batch_drain_step_funded(
+            &a->writer_drain, &a->writer, a->semantic_result, &drained,
+            funding, funding_id);
+        if (rc) return rc;
+        if (drained) {
+            a->writer_active = false;
+            if (!a->semantic_result)
+                a->semantic_result = a->writer.saved_result;
+        }
+        return 0;
+    }
+    if (a->writer_drain.identity) {
+        if (a->writer_drain.identity != &a->writer_drain ||
+            a->writer_drain.batch != &a->writer ||
+            a->writer_drain.phase != WL_COLUMNAR_RELATION_PRIVATE_BATCH_DONE)
+            return EINVAL;
+        memset(&a->writer_drain, 0, sizeof(a->writer_drain));
+        return 0;
+    }
+    a->lanes = NULL;
+    if (a->cursor) {
+        wl_columnar_trace_store_cursor_release(a->cursor);
+        a->cursor = NULL;
+        return 0;
+    }
+    if (a->reader) {
+        wl_columnar_batch_payload_reader_release(a->reader);
+        a->reader = NULL;
+        return 0;
+    }
+    if (a->row || a->indices || a->predicates) {
+        free(a->row); free(a->indices); free(a->predicates);
+        a->row = a->type_codes = NULL;
+        a->indices = NULL; a->predicates = NULL;
+        return 0;
+    }
+    if (a->scratch_reserved) {
+        bool released = false;
+        rc = wl_columnar_memory_reservation_finish_step(
+            &a->scratch_reservation, !a->scratch_committed, &released);
+        if (rc) return rc;
+        if (!released) return 0;
+        a->scratch_reserved = a->scratch_committed = false;
+        return 0;
+    }
+    a->phase = WL_COLUMNAR_COLD_SCAN_ATTEMPT_DONE;
+    *done = true;
+    return 0;
+}
+
+static int
+wl_columnar_cold_scan_step_body(wl_columnar_cold_scan_attempt_t *a,
+    bool *done, wl_evaluation_control_t *funding, uint64_t funding_id)
+{
+    if (a->phase == WL_COLUMNAR_COLD_SCAN_ATTEMPT_DONE) {
+        *done = true;
+        return 0;
+    }
+    if (a->phase == WL_COLUMNAR_COLD_SCAN_ATTEMPT_RELEASE)
+        return wl_columnar_cold_scan_release(a, done, funding, funding_id);
+#ifdef WL_SESSION_TEST_HOOKS
+    if (wl_columnar_ops_test_cold_scan_checkpoint)
+        wl_columnar_ops_test_cold_scan_checkpoint(a->control, a);
+#endif
+    int rc = wl_columnar_cold_scan_charge(a, 0);
+    if (rc) return wl_columnar_cold_scan_fail(a, rc);
+    switch (a->phase) {
+    case WL_COLUMNAR_COLD_SCAN_ATTEMPT_RESOLVE:
+        return wl_columnar_cold_scan_resolve(a);
+    case WL_COLUMNAR_COLD_SCAN_ATTEMPT_SCRATCH:
+        return wl_columnar_cold_scan_reserve(a);
+    case WL_COLUMNAR_COLD_SCAN_ATTEMPT_ALLOC:
+        return wl_columnar_cold_scan_alloc(a);
+    case WL_COLUMNAR_COLD_SCAN_ATTEMPT_DECODE:
+        return wl_columnar_cold_scan_decode_op(a);
+    case WL_COLUMNAR_COLD_SCAN_ATTEMPT_TYPES:
+        return wl_columnar_cold_scan_types(a);
+    case WL_COLUMNAR_COLD_SCAN_ATTEMPT_OUTPUT_CREATE:
+        /* Full source-row capacity, as the uncontrolled scan admits. */
+        rc = wl_columnar_relation_new_typed_codes_operator_attempt_controlled(
+            "$map", a->width, a->cold->nrows, a->type_codes,
+            a->session->memory_governor, a->output, a->control,
+            a->attempt_id);
+        if (rc == ENOSPC) a->session->memory_budget_denied = true;
+        if (rc) return wl_columnar_cold_scan_fail(a, rc);
+        a->phase = WL_COLUMNAR_COLD_SCAN_ATTEMPT_READER;
+        return 0;
+    case WL_COLUMNAR_COLD_SCAN_ATTEMPT_READER:
+        return wl_columnar_cold_scan_reader(a);
+    case WL_COLUMNAR_COLD_SCAN_ATTEMPT_WRITER_BEGIN:
+        rc = wl_columnar_relation_append_batch_begin_controlled(&a->writer,
+                *a->output, a->control);
+        a->writer_active = a->writer.identity == &a->writer;
+        if (rc) return wl_columnar_cold_scan_fail(a, rc);
+        a->phase = WL_COLUMNAR_COLD_SCAN_ATTEMPT_ROWS;
+        return 0;
+    case WL_COLUMNAR_COLD_SCAN_ATTEMPT_ROWS:
+        return wl_columnar_cold_scan_rows(a);
+    case WL_COLUMNAR_COLD_SCAN_ATTEMPT_WRITER_END:
+        a->phase = WL_COLUMNAR_COLD_SCAN_ATTEMPT_RELEASE;
+        return 0;
+    default:
+        return wl_columnar_cold_scan_fail(a, EINVAL);
+    }
+}
+
+int
+wl_columnar_ops_cold_scan_attempt_step(wl_columnar_cold_scan_attempt_t *a,
+    bool *done, wl_evaluation_control_t *funding, uint64_t funding_id)
+{
+    if (!done) return EINVAL;
+    *done = false;
+    if (!a || a->identity != a || !wl_columnar_cold_scan_thread(a))
+        return EINVAL;
+    if (a->busy) return EBUSY;
+    a->busy = true;
+    int rc = wl_columnar_cold_scan_step_body(a, done, funding, funding_id);
+    a->busy = false;
+    return rc;
+}
+
+int
+wl_columnar_ops_cold_scan_attempt_abort(wl_columnar_cold_scan_attempt_t *a,
+    bool *done, wl_evaluation_control_t *funding, uint64_t funding_id)
+{
+    if (!done) return EINVAL;
+    *done = false;
+    if (!a || !a->identity) {
+        *done = true;
+        return 0;
+    }
+    if (a->identity != a || !wl_columnar_cold_scan_thread(a)) return EINVAL;
+    if (a->busy) return EBUSY;
+    if (a->phase == WL_COLUMNAR_COLD_SCAN_ATTEMPT_DONE) {
+        *done = true;
+        return 0;
+    }
+    a->busy = true;
+    if (!a->semantic_result)
+        a->semantic_result = WL_EVALUATION_CONTROL_CANCELLED;
+    a->phase = WL_COLUMNAR_COLD_SCAN_ATTEMPT_RELEASE;
+    int rc = wl_columnar_cold_scan_release(a, done, funding, funding_id);
+    a->busy = false;
+    return rc;
+}
+
 int
 wl_columnar_ops_cold_projection(const wl_plan_relation_t *plan,
     eval_stack_t *stack, wl_col_session_t *sess)
@@ -617,6 +1191,8 @@ wl_columnar_ops_cold_aggregate(const wl_plan_relation_t *plan,
     if (!cold || !wl_columnar_eval_plan_cold_aggregate_decode(plan, cold->name,
         cold->ncols, wl_columnar_session_cold_types(cold),
         &decoded)) return ENOTSUP;
+    /* No controlled route runs a cold aggregate (#2301). */
+    if (sess->base.evaluation_control) return ENOTSUP;
     const wl_plan_op_t *reduce = &plan->ops[decoded.reduce_index];
     uint32_t group_count = reduce->group_by_count,
         output_cols = group_count + 1;

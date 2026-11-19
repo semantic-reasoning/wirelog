@@ -730,6 +730,14 @@ int
 col_eval_relation_plan(const wl_plan_relation_t *rplan, eval_stack_t *stack,
     wl_col_session_t *sess)
 {
+    /* The raw cold routes are unmetered; a controlled session reads a cold
+     * binding only through the composed cold scan attempt (#2301). */
+    if (sess->cold_relation && sess->base.evaluation_control && rplan->ops)
+        for (uint32_t i = 0; i < rplan->op_count; i++)
+            if (wl_columnar_session_cold_find(sess,
+                rplan->ops[i].relation_name) ||
+                wl_columnar_session_cold_find(sess,
+                rplan->ops[i].right_relation)) return ENOTSUP;
     uint32_t aggregate_join;
     if (sess->cold_relation &&
         wl_columnar_join_aggregate_decode(sess, rplan, &aggregate_join) &&
@@ -3516,6 +3524,24 @@ wl_columnar_eval_plan_numeric_composed_attempt_step_validated_body(
             record->source_initialized = false;
             record->source_slot_borrowed = false;
             record->source_installed = false;
+            /* A cold binding has no registry slot; only the controlled
+             * cold scan reads it, from the start of its rule (#2301). */
+            if (record->session->cold_relation
+                && wl_columnar_session_cold_find(record->session,
+                record->plan->ops[record->cursor].relation_name)) {
+                record->cold_end = wl_columnar_ops_cold_scan_end(
+                    record->plan, record->cursor);
+                if (record->cursor || record->begin
+                    || record->cold_end >= record->end) {
+                    record->semantic_result = ENOTSUP;
+                    record->phase =
+                        WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_RELEASE;
+                } else {
+                    record->phase =
+                        WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_COLD_SLOT;
+                }
+                return 0;
+            }
             record->phase = WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_SOURCE_FULL;
             return 0;
         }
@@ -3621,6 +3647,56 @@ wl_columnar_eval_plan_numeric_composed_attempt_step_validated_body(
             record->phase = WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_RELEASE;
             return 0;
         }
+    case WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_COLD_SLOT:
+        rc = wl_columnar_eval_stack_composed_cold_output(record->frame,
+                record->session, record);
+        if (!rc) rc = wl_columnar_ops_cold_scan_attempt_begin(&record->cold,
+                    record, record->session, record->plan, record->cursor,
+                    record->cold_end, record->source_output, record->control,
+                    record->attempt_id);
+        if (rc) {
+            record->semantic_result = rc;
+            record->phase = record->source_slot_borrowed
+                ? WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_SOURCE_ABORT
+                : WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_RELEASE;
+        } else record->phase = WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_COLD_CHILD;
+        return 0;
+    case WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_COLD_CHILD: {
+        bool done = false;
+        rc = wl_columnar_ops_cold_scan_attempt_step(&record->cold, &done,
+                funding, funding_id);
+        if (rc) {
+            record->pending_action = record->phase;
+            record->phase = WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_PENDING;
+            return rc;
+        }
+        if (!done) return 0;
+        int result = record->cold.semantic_result;
+        memset(&record->cold, 0, sizeof(record->cold));
+        if (result) {
+            record->semantic_result = result;
+            record->phase = WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_SOURCE_ABORT;
+        } else record->phase =
+                WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_COLD_INSTALL;
+        return 0;
+    }
+    case WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_COLD_INSTALL:
+        rc = wl_columnar_eval_stack_composed_cold_install(record->frame,
+                record->session, record);
+        if (rc) {
+            record->semantic_result = rc;
+            record->phase = record->source_slot_borrowed
+                ? WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_SOURCE_ABORT
+                : WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_RELEASE;
+            return 0;
+        }
+        ++record->runtime_depth;
+        record->completed += record->cold_end - record->cursor;
+        record->cursor = record->cold_end;
+        record->phase = record->cursor == record->end
+            ? WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_RELEASE
+            : WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_READY;
+        return 0;
     case WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_UNARY_CHILD:
         record->pending_action = record->phase;
         record->phase = WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_PENDING;
@@ -3693,6 +3769,24 @@ wl_columnar_eval_plan_numeric_composed_attempt_step_validated_body(
         return wl_columnar_eval_plan_composed_source_step(record, funding,
                    funding_id);
     case WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_RELEASE:
+        if (record->cold.identity) {
+            bool done = false;
+            rc = wl_columnar_ops_cold_scan_attempt_abort(&record->cold, &done,
+                    funding, funding_id);
+            if (rc) {
+                record->pending_action = record->phase;
+                record->phase = WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_PENDING;
+                return rc;
+            }
+            if (!done) return 0;
+            if (!record->semantic_result)
+                record->semantic_result = record->cold.semantic_result;
+            memset(&record->cold, 0, sizeof(record->cold));
+            if (record->source_slot_borrowed)
+                record->phase =
+                    WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_SOURCE_ABORT;
+            return 0;
+        }
         if (record->lftj.identity
             && record->lftj.phase != WL_COLUMNAR_LFTJ_ATTEMPT_DONE) {
             bool done = false;
@@ -4085,6 +4179,7 @@ wl_columnar_eval_plan_composed_ack_body(
         rc = record->lftj.phase == WL_COLUMNAR_LFTJ_ATTEMPT_DONE
             ? wl_columnar_eval_plan_native_lftj_owner(record) : EBUSY;
     }
+    if (!rc && record->cold.identity) rc = EBUSY;
     /* NULL identity is a neverborn or already terminal partial-clear lineage.
      * Do not read its potentially uninitialized historic storage. Retain the
      * canonical numeric/frame owner until ALL refusing checks have passed. */
@@ -4339,6 +4434,8 @@ wl_columnar_eval_plan_registered_cleanup_admit(
     }
     if (native_lftj && !n->lftj.semantic_result)
         n->lftj.semantic_result = cause;
+    if (n->cold.identity && !n->cold.semantic_result)
+        n->cold.semantic_result = cause;
     /* Error intent is now a native cleanup obligation, not permission to
      * request cancellation on whatever generation the controller holds. */
     n->abort_requested = false;
@@ -4364,6 +4461,8 @@ wl_columnar_eval_plan_join_cleanup_redirect(
     case WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_SOURCE_NEW:
     case WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_SOURCE_INSTALL:
     case WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_CONCAT_START:
+    case WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_COLD_SLOT:
+    case WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_COLD_INSTALL:
         n->phase = n->source_initialized
             ? WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_SOURCE_END
             : n->source_slot_borrowed
@@ -4399,6 +4498,22 @@ wl_columnar_eval_plan_registered_cleanup_step(
     }
     n->composed_busy = true;
     switch (n->phase) {
+    case WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_COLD_CHILD: {
+        rc = wl_evaluation_control_charge_attempt(funding, id, 0);
+        if (rc) break;
+        bool done = false;
+        rc = wl_columnar_ops_cold_scan_attempt_abort(&n->cold, &done, funding,
+                id);
+        if (!rc && done) {
+            if (!n->semantic_result) n->semantic_result =
+                    n->cold.semantic_result;
+            memset(&n->cold, 0, sizeof(n->cold));
+            n->phase = n->source_slot_borrowed
+                ? WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_SOURCE_ABORT
+                : WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_RELEASE;
+        }
+        break;
+    }
     case WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_LFTJ_CHILD: {
         rc = wl_evaluation_control_charge_attempt(funding, id, 0);
         if (rc) break;

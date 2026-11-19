@@ -2289,6 +2289,8 @@ wl_columnar_join_cold_run(wl_col_session_t *sess, const wl_plan_op_t *op,
     eval_stack_t *stack, eval_entry_t *left, const char *cold_left,
     const wl_plan_relation_t *aggregate, uint32_t join_index)
 {
+    /* Unmetered spill continuation; no controlled route reaches it. */
+    if (sess->base.evaluation_control) return ENOTSUP;
 #ifdef WL_PROFILE
     uint64_t started = now_ns();
     sess->profile.join_calls++;
@@ -5635,6 +5637,14 @@ wl_columnar_join_attempt_lookup(wl_col_session_t *session, const char *name,
                 return private_entry && !candidate ? ENOENT : 0;
             }
         }
+    }
+    /* A cold binding is never a resident registry relation (#2301). */
+    for (const wl_columnar_session_cold_relation_t *c = delta ? NULL
+        : session->cold_relation; c; c = c->next) {
+        int rc = wl_columnar_join_attempt_charge(control, id,
+                WL_COLUMNAR_JOIN_ATTEMPT_CELL_WORK);
+        if (rc) return rc;
+        if (!strcmp(c->name, name)) return ENOTSUP;
     }
     return 0;
 }
