@@ -357,6 +357,22 @@ col_op_map_output_types(const wl_plan_op_t *op, const col_rel_t *input,
     return rc;
 }
 
+/* Spill status of a cold source read, as an operator error code. */
+static int
+wl_columnar_ops_cold_spill_error(wl_columnar_spill_status_t status)
+{
+    switch (status) {
+    case WL_COLUMNAR_SPILL_MEMORY: return ENOSPC;
+    case WL_COLUMNAR_SPILL_ALLOCATION: return ENOMEM;
+    case WL_COLUMNAR_SPILL_IO:
+    case WL_COLUMNAR_SPILL_QUOTA:
+    case WL_COLUMNAR_SPILL_CAPACITY: return EIO;
+    case WL_COLUMNAR_SPILL_OVERFLOW: return EOVERFLOW;
+    case WL_COLUMNAR_SPILL_BUSY: return EBUSY;
+    default: return ENOTSUP;
+    }
+}
+
 /* Read scratch is one pinned payload row plus one projected row/schema. The
  * complete projected output remains resident and independently admitted. */
 int
@@ -508,16 +524,7 @@ wl_columnar_ops_cold_scan(const wl_plan_relation_t *plan,
     appending = false;
     goto done;
 spill_error:
-    switch (status) {
-    case WL_COLUMNAR_SPILL_MEMORY: rc = ENOSPC; break;
-    case WL_COLUMNAR_SPILL_ALLOCATION: rc = ENOMEM; break;
-    case WL_COLUMNAR_SPILL_IO:
-    case WL_COLUMNAR_SPILL_QUOTA:
-    case WL_COLUMNAR_SPILL_CAPACITY: rc = EIO; break;
-    case WL_COLUMNAR_SPILL_OVERFLOW: rc = EOVERFLOW; break;
-    case WL_COLUMNAR_SPILL_BUSY: rc = EBUSY; break;
-    default: rc = ENOTSUP; break;
-    }
+    rc = wl_columnar_ops_cold_spill_error(status);
 done:
     if (appending) {
         int ended = col_rel_append_batch_end(&batch, false);
@@ -796,16 +803,7 @@ wl_columnar_ops_cold_aggregate(const wl_plan_relation_t *plan,
     }
     goto done;
 spill_error:
-    switch (status) {
-    case WL_COLUMNAR_SPILL_MEMORY: rc = ENOSPC; break;
-    case WL_COLUMNAR_SPILL_ALLOCATION: rc = ENOMEM; break;
-    case WL_COLUMNAR_SPILL_IO:
-    case WL_COLUMNAR_SPILL_QUOTA:
-    case WL_COLUMNAR_SPILL_CAPACITY: rc = EIO; break;
-    case WL_COLUMNAR_SPILL_OVERFLOW: rc = EOVERFLOW; break;
-    case WL_COLUMNAR_SPILL_BUSY: rc = EBUSY; break;
-    default: rc = ENOTSUP; break;
-    }
+    rc = wl_columnar_ops_cold_spill_error(status);
 done:
     if (rc == ENOMEM && out && out->memory_budget_denial_pending) rc = ENOSPC;
     if (appending) {
