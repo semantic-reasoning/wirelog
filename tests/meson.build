@@ -7718,7 +7718,12 @@ recursive_random_model_exe = executable(
   dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
   link_with: [testlib_prod],
 )
-test('recursive_random_model', recursive_random_model_exe, timeout: 180)
+# Bound each process's campaign without dropping original indices or profiles.
+foreach recursive_model_shard : ['0', '1', '2']
+  test('recursive_random_model_' + recursive_model_shard,
+       recursive_random_model_exe, args: [recursive_model_shard],
+       suite: ['recursive_models'], timeout: 180)
+endforeach
 
 # #2297: configured controlled JOIN sink policy and recovery.
 test_evaluation_join_host_policies_exe = executable(

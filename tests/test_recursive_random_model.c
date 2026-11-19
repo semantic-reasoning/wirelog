@@ -311,7 +311,7 @@ static void generate(program_t *p, unsigned index) {
 }
 static unsigned constant_programs, repeat_programs, keyed_programs,
     filtered_programs;
-static unsigned parallel_runs;
+static unsigned parallel_runs, engine_sessions, model_comparisons;
 static bool coverage(const program_t *p, const wl_plan_t *plan) {
     bool constants = false, repeats = false, keyed = false, filtered = false;
     for (unsigned i = 0; i < p->count; i++)
@@ -468,6 +468,7 @@ static bool run(const program_t *p, const char *src, unsigned index,
         coverage(p, plan);
     if (!rc)
         rc = wl_session_create(wl_backend_columnar(), plan, workers, &session);
+    if (!rc) ++engine_sessions;
     bool ok = true;
     for (unsigned b = 0; b < 2 && !rc; b++) {
         for (unsigned r = 0; r < 4 && !rc; r++)
@@ -506,6 +507,7 @@ static bool run(const program_t *p, const char *src, unsigned index,
             ok = false;
             break;
         }
+        if (!rc) ++model_comparisons;
     }
 done:
     if (!ok || rc)
@@ -529,7 +531,20 @@ done:
     wl_plan_free(plan);
     return ok && !rc;
 }
-int main(void) {
+int main(int argc, char **argv) {
+    const unsigned corpus = 150, shards = 3;
+    bool sharded = argc == 2;
+    unsigned shard = 0, processed = 0;
+    if (argc != 1) {
+        if (argc != 2 || argv[1][0] < '0' || argv[1][0] > '2'
+            || argv[1][1] != '\0') {
+            fprintf(stderr, "usage: %s [0|1|2]\n", argv[0]);
+            return 2;
+        }
+        shard = (unsigned)(argv[1][0] - '0');
+    }
+    unsigned programs = sharded ? corpus / shards : corpus;
+
     if (!oracle_selftest()) {
         fprintf(stderr, "oracle self-test failed\n");
         return 1;
@@ -539,9 +554,12 @@ int main(void) {
 #else
     setenv("WIRELOG_TDD_MIN_ROWS_PER_WORKER", "1", 1);
 #endif
-    for (unsigned i = 0; i < 150; i++) {
+    for (unsigned i = 0; i < corpus; i++) {
         program_t p;
         generate(&p, i);
+        /* Every process advances the original RNG for all original indices.
+         * Only execution is partitioned; parity and diagnostics stay global. */
+        if (sharded && i % shards != shard) continue;
         char *src = render(&p);
         if (!src)
             return 1;
@@ -552,15 +570,23 @@ int main(void) {
                     return 1;
                 }
         free(src);
+        ++processed;
     }
+    if (sharded) printf("shard=%u/%u ", shard, shards);
     printf("coverage constants=%u repeats=%u keyed-pairs=%u "
         "filtered-recursive=%u parallel-steps=%u\n",
         constant_programs, repeat_programs, keyed_programs, filtered_programs,
         parallel_runs);
-    if (constant_programs < 75 || repeat_programs < 75 || keyed_programs < 75 ||
-        filtered_programs < 75 || parallel_runs != 450)
+    unsigned minimum = programs / 2;
+    if (processed != programs || engine_sessions != programs * 6
+        || model_comparisons != programs * 12
+        || constant_programs < minimum || repeat_programs < minimum
+        || keyed_programs < minimum || filtered_programs < minimum
+        || parallel_runs != programs * 3)
         return 1;
     printf(
-        "150 programs x 3 optimizer modes x 2 worker widths x 2 rounds passed\n");
+        "%u programs x 3 optimizer modes x 2 worker widths x 2 rounds passed "
+        "(sessions=%u comparisons=%u)\n", processed, engine_sessions,
+        model_comparisons);
     return 0;
 }
