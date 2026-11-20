@@ -2284,11 +2284,19 @@ wl_columnar_join_cold_prefix(const wl_col_session_t *s,
     return true;
 }
 
+#ifdef WL_SESSION_TEST_HOOKS
+/* Calls of the raw cold-left JOIN; tests check a controlled STEP adds none. */
+uint64_t wl_columnar_join_test_raw_cold_joins;
+#endif
+
 static int
 wl_columnar_join_cold_run(wl_col_session_t *sess, const wl_plan_op_t *op,
     eval_stack_t *stack, eval_entry_t *left, const char *cold_left,
     const wl_plan_relation_t *aggregate, uint32_t join_index)
 {
+#ifdef WL_SESSION_TEST_HOOKS
+    if (cold_left) ++wl_columnar_join_test_raw_cold_joins;
+#endif
     /* Unmetered spill continuation; no controlled route reaches it. */
     if (sess->base.evaluation_control) return ENOTSUP;
 #ifdef WL_PROFILE

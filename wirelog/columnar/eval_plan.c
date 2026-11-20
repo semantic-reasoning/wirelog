@@ -559,15 +559,16 @@ wl_columnar_eval_plan_cold_map(const wl_plan_relation_t *rp, uint32_t stage,
  * terminal CONSOLIDATE, or a REDUCE before the terminal CONSOLIDATE that the
  * cold aggregate decode admits. A scan ending at the CONSOLIDATE requires a
  * MAP; FILTER-only JOIN prefixes preserve the source layout, and a prefix
- * before a REDUCE may be empty or hold no MAP. Arbitrary expressions remain
- * unsupported. */
+ * before a JOIN or a REDUCE may be empty or hold no MAP. Arbitrary
+ * expressions remain unsupported. */
 bool
 wl_columnar_eval_plan_cold_scan_decode(const wl_plan_relation_t *rp,
     const char *name, uint32_t ncols, const wirelog_column_type_t *types,
     uint32_t end, wl_columnar_eval_plan_cold_projection_t *out)
 {
     if (!rp || !name || !rp->ops || !end || end >= rp->op_count ||
-        (end < 2 && rp->ops[end].op != WL_PLAN_OP_REDUCE)) return false;
+        (end < 2 && rp->ops[end].op != WL_PLAN_OP_REDUCE &&
+        rp->ops[end].op != WL_PLAN_OP_JOIN)) return false;
     const wl_plan_op_t *v = &rp->ops[0];
     if (v->op != WL_PLAN_OP_VARIABLE || !v->relation_name ||
         strcmp(v->relation_name, name) ||

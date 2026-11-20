@@ -2304,19 +2304,65 @@ wl_columnar_session_registered(const wl_col_session_t *sess, const char *name)
     return false;
 }
 
+/* Generated and declared EDB column names are positional, col<N>. */
+static bool
+wl_columnar_session_cold_positional(char *const *names, uint32_t ncols)
+{
+    char want[16];
+    for (uint32_t i = 0; names && i < ncols; i++) {
+        snprintf(want, sizeof(want), "col%u", i);
+        if (names[i] && strcmp(names[i], want) != 0) return false;
+    }
+    return true;
+}
+
+/* A controlled JOIN after the cold scan prefix (#2301). The uncontrolled
+ * cold JOIN audits bound the rule. The scan's output holds the source's
+ * columns under generated positional names; the JOIN resolves its keys
+ * against them as the uncontrolled route resolves them against the source,
+ * whose names must then be positional too. Each JOIN has one key, no REDUCE
+ * follows, and an INLINE compound source, whose layout the scan's output
+ * does not carry, stays refused. */
+static bool
+wl_columnar_session_cold_join_rule(const wl_col_session_t *sess,
+    const wl_plan_relation_t *rp, uint32_t end, const char *name)
+{
+    for (uint32_t i = end; i < rp->op_count; i++)
+        if (rp->ops[i].op == WL_PLAN_OP_REDUCE ||
+            (rp->ops[i].op == WL_PLAN_OP_JOIN && rp->ops[i].key_count != 1))
+            return false;
+    if (!(end >= 2 ? wl_columnar_join_cold_scan_prefix(sess, rp, NULL) :
+        wl_columnar_join_cold_prefix(sess, rp))) return false;
+    const wl_plan_t *plan = sess->plan;
+    for (uint32_t i = 0; plan->edb_schemas && i < plan->edb_count; i++) {
+        const wl_plan_edb_schema_t *schema = &plan->edb_schemas[i];
+        if (!plan->edb_relations || !plan->edb_relations[i] ||
+            strcmp(plan->edb_relations[i], name) != 0) continue;
+        for (uint32_t c = 0; schema->columns && c < schema->column_count; c++)
+            if (schema->columns[c].compound_kind ==
+                WIRELOG_COMPOUND_KIND_INLINE) return false;
+    }
+    for (uint32_t i = 0; i < sess->nrels; i++)
+        if (sess->rels[i] && !strcmp(sess->rels[i]->name, name) &&
+            !wl_columnar_session_cold_positional(sess->rels[i]->col_names,
+            sess->rels[i]->ncols)) return false;
+    const wl_columnar_session_cold_relation_t *c =
+        wl_columnar_session_cold_find(sess, name);
+    return !c || wl_columnar_session_cold_positional(c->col_names, c->ncols);
+}
+
 /* A controlled session reads a cold binding only through the composed cold
-* scan attempt: VARIABLE(name), a direct MAP/FILTER prefix holding at least
-* one MAP, then the rule's final CONSOLIDATE (#2301). The prefix may instead
-* end at a REDUCE that the uncontrolled cold aggregate admits, followed by the
-* final CONSOLIDATE, and then needs no MAP; the composed attempt runs its
-* controlled REDUCE over the scan's output. A JOIN after the prefix
-* is refused: a FILTER-only prefix keeps the source's column names, which the
-* JOIN's keys resolve against, and the attempt's output has none.
-* Programs that a controlled STEP routes to the general observed transaction
-* are refused here, while the source is still resident: a head that is also
-* an EDB, the two-EDB single-rule seed shape, and a registry that a successor
-* STEP would find larger than three relations. The registry never shrinks
-* after a seal, so its size plus the heads not yet registered bounds it. */
+ * scan attempt: VARIABLE(name), a direct MAP/FILTER prefix holding at least
+ * one MAP, then the rule's final CONSOLIDATE (#2301). The prefix may instead
+ * end at a REDUCE that the uncontrolled cold aggregate admits, followed by
+ * the final CONSOLIDATE, or at a JOIN that the cold JOIN rule above admits,
+ * and then needs no MAP; the composed attempt runs its controlled REDUCE or
+ * JOIN over the scan's output. Programs that a controlled STEP routes to the
+ * general observed transaction are refused here, while the source is still
+ * resident: a head that is also an EDB, the two-EDB single-rule seed shape,
+ * and a registry that a successor STEP would find larger than three
+ * relations. The registry never shrinks after a seal, so its size plus the
+ * heads not yet registered bounds it. */
 static bool
 wl_columnar_session_cold_controlled_plan(const wl_col_session_t *sess,
     const char *name)
@@ -2354,6 +2400,11 @@ wl_columnar_session_cold_controlled_plan(const wl_col_session_t *sess,
             if (end < rp->op_count && rp->ops[end].op == WL_PLAN_OP_REDUCE) {
                 if (end + 2 != rp->op_count ||
                     !wl_columnar_session_cold_scan_rule(sess, rp, true))
+                    return false;
+                continue;
+            }
+            if (end < rp->op_count && rp->ops[end].op == WL_PLAN_OP_JOIN) {
+                if (!wl_columnar_session_cold_join_rule(sess, rp, end, name))
                     return false;
                 continue;
             }
