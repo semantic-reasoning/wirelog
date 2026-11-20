@@ -7493,7 +7493,10 @@ test_evaluation_lftj_hosts_exe = executable(
   c_args: ['-DWL_SESSION_TEST_HOOKS=1'],
   link_with: [testlib_prod],
 )
-foreach lftj_host_case : ['domains', 'recovery', 'failures', 'admission', 'native', 'metadata-native', 'microsteps', 'policy', 'qualification']
+# Keep the policy campaigns and disjoint batch0/1 error-order partitions
+# under separate 60s watchdogs; no policy cases are omitted or duplicated.
+# the executable's manual `policy` alias still runs their complete union.
+foreach lftj_host_case : ['domains', 'recovery', 'failures', 'admission', 'native', 'metadata-native', 'microsteps', 'policy-two', 'policy-errors-unbatched', 'policy-errors-batched', 'policy-metadata', 'policy-suffix', 'qualification']
   test('evaluation_lftj_hosts_' + lftj_host_case,
        test_evaluation_lftj_hosts_exe, args: [lftj_host_case],
        suite: ['unit', 'tsan', 'evaluation_lftj_hosts'], timeout: 60)
