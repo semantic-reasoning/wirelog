@@ -629,7 +629,8 @@ wl_columnar_ops_cold_scan_attempt_begin(wl_columnar_cold_scan_attempt_t *a,
 {
     if (!a || a->identity || !numeric_owner || !session || !plan ||
         !plan->ops || begin || !end || end >= plan->op_count ||
-        (end < 2 && plan->ops[end].op != WL_PLAN_OP_REDUCE) ||
+        (end < 2 && plan->ops[end].op != WL_PLAN_OP_REDUCE &&
+        plan->ops[end].op != WL_PLAN_OP_JOIN) ||
         !output || *output || !control || !attempt_id ||
         !session->base.evaluation_control) return EINVAL;
     memset(a, 0, sizeof(*a));
@@ -739,13 +740,20 @@ wl_columnar_cold_scan_resolve(wl_columnar_cold_scan_attempt_t *a)
         return 0;
     }
     a->decode_op = 0;
+    bool join_end = a->plan->ops[a->end].op == WL_PLAN_OP_JOIN;
+    uint32_t logical = 0;
     if (a->cold->state == WL_COLUMNAR_COLD_LOADING ||
         !wl_columnar_eval_plan_cold_scan_decode(a->plan, a->cold->name,
         a->cold->ncols, wl_columnar_session_cold_types(a->cold), a->end,
-        &a->decoded) || (!a->decoded.map && !reduce_end))
+        &a->decoded) || (!a->decoded.map && !reduce_end && !join_end))
         return wl_columnar_cold_scan_fail(a, ENOTSUP);
-    /* Without a MAP, which only a REDUCE admits, the output is the source
-     * row. */
+    /* The output carries no compound layout; seal and load refuse an INLINE
+     * source before a JOIN, and this keeps that refusal at the read. */
+    if (join_end && !a->decoded.map &&
+        wl_columnar_session_cold_inline_schema(a->cold, &logical) && logical)
+        return wl_columnar_cold_scan_fail(a, ENOTSUP);
+    /* Without a MAP, which only a REDUCE or a JOIN admits, the output holds
+     * the source's columns. */
     a->width = a->decoded.map ? a->decoded.map->project_count : a->cold->ncols;
     uint64_t bytes, predicate_bytes;
     if (!a->width ||
