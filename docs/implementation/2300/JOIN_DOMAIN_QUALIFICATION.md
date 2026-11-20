@@ -564,14 +564,91 @@ Other selector/empty/pin/materialization/type/representation and signed metadata
 products, current platform validation and containing Native/Source/carry remain
 OPEN. No issue or matrix row is closed.
 
+## Persistent cache policy, admission and pin increment
+
+This bundle starts from merged #2391, main `719db75f`. It adds32 selected
+histories to the earlier42 cache selections, for74 registered
+`evaluation_join_cache_*` histories. The executable commits are `a13cc9c2`
+(caps), `1a09dd1f` (resources) and `a63e469e` (pins). Production algorithms,
+supported domains, quantum, tariffs, public ABI and memory prices are unchanged.
+Every new history retains the independent five-head fact-set reference and
+future append/removal/rebuild/unchanged-call checks of the preceding increment.
+
+| New modes | Selected histories | Actual predicate |
+|---|---:|---|
+| `cap4`, `cap5`, `cap6` | 12 | Scalar observed/plain/Snapshot and INLINE-left observed, three initial caps each |
+| `image-denied`, `build-denied`, `key-nomem` | 15 | Scalar observed/plain/Snapshot and INLINE-left observed/Snapshot, three distinct resource sites each |
+| `pin-held` | 5 | The same five resource representation/route pairs, genuine canonical RHS/key0 pin |
+
+The cold cap partition sets the same internal numeric policy in default
+controlled, diff-disabled controlled and raw sessions after empty bootstrap.
+Independent logical facts yield five first/mirror JOIN pairs before DISTINCT,
+including the two flag-distinct RHS facts projecting to `(1,2)`, and four set
+rows. Actual authorized first/mirror phase20 output extent proves caps4/5
+refuse with EOVERFLOW; cap6 succeeds at extent5. Both controlled refusals retain
+empty old heads, exact published registry and inputs, pending facts and no early
+delivery. Raw supplies equal-cap status only, without a transactional rollback
+claim. Caps are cleared and genuine controls reset for same-pending-input retry;
+cap6 is also cleared after the first stage before future calls. This is an
+internal cold numeric cap certificate, not a public setter or warm/complete
+policy cross-product.
+
+Resource faults target only the default controlled profile. Warm stage1 image
+admission is denied before the image/slot reserve; stage5 replacement-build
+admission is denied after actual image/slot initialization and all three prior
+entries copied, before build credit. Both bind the current authorized first/
+mirror JOIN, canonical RHS and actual transaction progress. A same-address
+RESERVED peer consumes current available governor capacity minus one byte;
+real denial-counter increase, ENOSPC and session denial metadata are required.
+The peer stays RESERVED through completed public failure, preserved initiating
+report and cleanup0, then checked rollback returns exactly its bytes and reaches
+RELEASED. Other cleanup refunds may increase available capacity before that
+rollback; no fixed global intermediate balance is asserted. This qualifies
+cleanup with the competitor still held, unlike earlier restored-capacity cases.
+
+`key-nomem` instead binds the actual admitted key scratch0 before index selection,
+with scratch1 still uninitialized, exact key-byte extent and a witnessed failed
+physical allocation. ENOMEM preserves the existing published warm registry and
+does not increase governor denials. The countdown hook stays at0 until explicitly
+reset to-1 before retry; teardown also requires it cleared. This is pre-index
+JOIN-buffer failure, not persistent-image/index malloc coverage. Those malloc
+sites remain unqualified by an allocation hook. Both resource and pin histories
+retain exact old heads/content, pending facts, input snapshots/maps/types/cells,
+published index payload and zero early delivery, then reset and retry without
+reinsertion. The other controlled profile and raw are unpressured whole-history
+semantic comparisons, not equal-pressure resource/error certificates.
+
+`pin-held` acquires a genuine differential pin on the published canonical RHS/
+key0 index after stage0. Exact entry/index/generation/snapshots, the authentic
+source reader and one-pin count are asserted. Stage1 mutates LEFT only; RHS
+writer acquisition returns EBUSY. The actual controlled image-entry check rejects
+that held pin with its existing ENOTSUP policy, without injected errno. Public
+failure preserves the pin, registry location/payload, heads and inputs. Registry
+snapshots compare pins, pending and deferred flags; the sole one-pin exception
+requires the actual live pin's exact session/entry, and all older modes retain
+zero-flag invariants. Release restores the exact pre-pin registry image and
+permits writers before same-input retry, warm reuse and later RHS rebuilds.
+This is internal authentic-pin setup consumed by public evaluation, not a new
+public primary-cache producer, deferred invalidation or eviction certificate.
+
+The integrated executable tree passed Clang23 JOIN hosts302/302 and five related
+serial/arrangement/cleanup checks. All74 cache selections passed GCC16 and
+ASan/UBSan. Formatting and diff checks passed. These are local code/test-tree
+results; the following ledger commit changes documentation only. MSVC/hosted CI
+on the published HEAD remains separate evidence. Final governor zero follows
+complete teardown, not an intermediate financial certificate. Persistent typed/
+compound RHS, materialization-result cache, remaining expression/selector/
+metadata/policy products, deferred/eviction behavior, reached lifecycle and
+containing Native/Source/carry obligations remain OPEN. No row or issue closes.
+
 ## Reused evidence and remaining acceptance
 
 | Obligation | Existing evidence reused | Still outstanding for complete #2371 acceptance |
 |---|---|---|
 | Ordinary key/product/projection/collision and accepted RHS expressions | `evaluation_join`, generated large/filter/collision cases in `evaluation_serial`, scalar recovery and the new public histories | Complete accepted expression/type/error/representation crossproducts beyond the specified scalar and INLINE predicates |
 | Full/delta/empty selectors and signed future changes | Existing direct selector fixtures, serial append dispatches and literal public histories;42 cache histories bind actual canonical RHS and default scalar-observed append descriptors | Complete remaining selector partitions; historical phase7-only counters remain insufficient |
-| Persistent full unfiltered index and filtered/private fallback | `test_controlled_persistent_join`, persistent stop/refusal matrices in `test_evaluation_serial.c`;42 natural cache/source histories across scalar/INLINE LEFT and three public routes, actual key0/key1/composite reuse/rebuild, private filtered/delta work and exact rollback/retry | Remaining predicate/representation/policy/pin/selector intersections; same-input default/private whole-evaluation comparison is not an isolated cache-only or resource certificate |
-| Pins and deferred rebuild/eviction | `join_right_filter_cleanup` managed cache/pinned fallback/admission tests; existing strict internal-cache fixtures | Missing authentic consuming intersections, with internal pin setup labelled as such; no new public primary-cache producer is invented |
+| Persistent full unfiltered index and filtered/private fallback | `test_controlled_persistent_join`, persistent stop/refusal matrices in `test_evaluation_serial.c`;42 natural cache/source histories across scalar/INLINE LEFT and three public routes, actual key0/key1/composite reuse/rebuild, private filtered/delta work and exact rollback/retry;32 further cap/resource/pin histories described above | Remaining predicate/representation/policy/pin/selector intersections; same-input default/private whole-evaluation comparison is not an isolated cache-only or resource certificate |
+| Pins and deferred rebuild/eviction | `join_right_filter_cleanup` managed cache/pinned fallback/admission tests; existing strict internal-cache fixtures; five genuine differential pin public-refusal/release/future-reuse histories | Remaining stale/deferred/eviction and other consuming intersections; new pin setup is internal, not a public primary-cache producer |
 | Materialized policy/memory and future calls | All78 `evaluation_materialized_body_*` selections:12 original scalar and66 typed INLINE-EDB preserved-body histories; host strict/policy/lifecycle suites | Remaining empty/wide/metadata/selector/cache-equivalence and containing bounds, not a primitive controlled-cache-hit claim |
 | Batch/pipeline, recursive/frontier and representations | Existing JOIN host suites and natural recursive materialized histories | Each accepted operator-by-representation and RUNNING/FINISH intersection, including required signed timestamps/weights; new callback sign checks are not full timestamp qualification |
 | Ordinary INLINE representation | Direct public fused-projection regression;363 generated histories including streamed producer/consumer/ACK,90 controlled memory failures and54 matching-cap histories;141 finite policy cases and constructed admission controls; new persistent-index histories consume typed INLINE LEFT with canonical scalar INT64 RHS | Remaining memory/type/policy/selector/cache/materialized/metadata and other operator representation intersections |
@@ -676,10 +753,15 @@ python -m mesonbuild.mesonmain test -C build-asan --no-rebuild --print-errorlogs
   'evaluation_join_cache_*'
 ```
 
-The wildcard selects42 cases: six healthy and36 recovery histories. On the
-integrated code/test tree, Clang23 JOIN hosts270/270, six related checks
+The wildcard selected42 cases at the previous checkpoint: six healthy and36
+recovery histories. On that integrated code/test tree, Clang23 JOIN hosts270/270, six related checks
 (including serial persistent/refusal/recovery and the threading audit/selftest),
 GCC16 cache cases42/42 and ASan/UBSan42/42 passed. Formatting/whitespace/diff
 checks passed. Ordinary INLINE61 and materialized-body78 selections remain
 unchanged. These runtime results precede the documentation-only ledger commit;
 no additional MSVC/TSan runtime, platform or Source/carry certificate follows.
+
+The wildcard now selects74 cases: those42 plus12 cold-cap,15 resource and five
+pin histories. The current executable tree passed Clang JOIN hosts302/302,
+related serial/arrangement/cleanup checks5/5, and GCC/ASan-UBSan cache cases74/74
+each. The ordinary INLINE61 and materialized-body78 selections remain unchanged.
