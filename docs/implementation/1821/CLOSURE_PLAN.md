@@ -635,3 +635,13 @@ sessions (#2301)". A cold input read by a JOIN or an aggregate, a SNAPSHOT or
 an observed STEP over one, and, under control, a head that is also an EDB,
 every two-EDB single-rule projection and a registry larger than three
 relations stay open, with more than one worker.
+
+A seventh bundle admits, under control, a cold input read by an aggregate: a
+direct MAP/FILTER prefix, which may be empty, then a REDUCE that the
+uncontrolled cold aggregate admits, before the rule's final CONSOLIDATE. The
+cold scan attempt materializes the prefix's rows and the controlled REDUCE
+attempt consumes them, so the route holds the scan's output beside the
+REDUCE's state; see "Cold aggregates in controlled single-worker sessions
+(#2301)". A cold input read by a JOIN, alone or before an aggregate, a
+SNAPSHOT or an observed STEP over one, the program refusals of the sixth
+bundle and more than one worker stay open.
