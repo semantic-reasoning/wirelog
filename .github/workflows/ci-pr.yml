@@ -334,11 +334,10 @@ jobs:
     needs: [build-arm, build-mbedtls, build-scope]
     if: ${{ needs.build-scope.outputs.build-required == 'true' }}
     runs-on: ${{ matrix.os }}
-    # The Windows/MSVC full test build currently needs more than the shared
-    # Linux/macOS budget on a cold hosted runner. Recent successful Windows
-    # main builds took 10-34 minutes, while the failed PR cold build reached
-    # 83% of compilation at the 60-minute boundary. Keep the platform budgets
-    # explicit so a slow build cannot be mistaken for a compiler failure.
+    # Linux/Clang reached 1144/1182 tests before its 60-minute job deadline;
+    # allow 90 minutes for the full build and suite. Windows/MSVC retains its
+    # 120-minute cold-build allowance; macOS retains 60 minutes. Keep budgets
+    # platform-specific and preserve individual test watchdogs.
     timeout-minutes: ${{ matrix.timeout_minutes }}
     strategy:
       fail-fast: false
@@ -348,7 +347,7 @@ jobs:
           - os: ubuntu-26.04
             compiler: clang
             cc: clang
-            timeout_minutes: 60
+            timeout_minutes: 90
 
           # macOS - Clang
           - os: macos-latest

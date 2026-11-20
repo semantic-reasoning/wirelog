@@ -15,7 +15,7 @@ WORKFLOW = Path(__file__).resolve().parents[2] / ".github/workflows/ci-pr.yml"
 TEST_MESON = WORKFLOW.parents[2] / "tests/meson.build"
 PROJECT_MESON = WORKFLOW.parents[2] / "meson.build"
 EXPECTED_TIMEOUTS = {
-    "ubuntu-26.04": 60,
+    "ubuntu-26.04": 90,
     "macos-latest": 60,
     "windows-latest": 120,
 }
@@ -156,9 +156,28 @@ class CiPrBuildTimeoutTests(unittest.TestCase):
         with self.assertRaisesRegex(AssertionError, "duplicate"):
             validate(mutated)
 
-    def test_linux_budget_cannot_be_relaxed_accidentally(self):
-        mutated = self.text.replace("timeout_minutes: 60", "timeout_minutes: 90", 1)
+    def change_platform_budget(self, operating_system, old, new):
+        pattern = (r"(^          - os: " + re.escape(operating_system)
+                   + r"\n(?:            [^\n]*\n)*?"
+                   + r"            timeout_minutes: )" + str(old) + r"(?=\n)")
+        mutated, count = re.subn(pattern, lambda match: match[1] + str(new),
+                                 self.text, flags=re.MULTILINE)
+        self.assertEqual(count, 1)
         self.assertNotEqual(mutated, self.text)
+        return mutated
+
+    def test_linux_budget_cannot_revert_to_60(self):
+        mutated = self.change_platform_budget("ubuntu-26.04", 90, 60)
+        with self.assertRaisesRegex(AssertionError, "unexpected"):
+            validate(mutated)
+
+    def test_linux_budget_cannot_be_relaxed_accidentally(self):
+        mutated = self.change_platform_budget("ubuntu-26.04", 90, 120)
+        with self.assertRaisesRegex(AssertionError, "unexpected"):
+            validate(mutated)
+
+    def test_macos_budget_remains_60(self):
+        mutated = self.change_platform_budget("macos-latest", 60, 90)
         with self.assertRaisesRegex(AssertionError, "unexpected"):
             validate(mutated)
 
