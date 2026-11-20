@@ -645,3 +645,16 @@ REDUCE's state; see "Cold aggregates in controlled single-worker sessions
 (#2301)". A cold input read by a JOIN, alone or before an aggregate, a
 SNAPSHOT or an observed STEP over one, the program refusals of the sixth
 bundle and more than one worker stay open.
+
+An eighth bundle admits, under control, a cold input read by a JOIN: a direct
+MAP/FILTER prefix, which may be empty, then a one-key JOIN whose right input is
+not a cold binding and the operators after it that the uncontrolled cold JOIN
+admits, before the rule's final CONSOLIDATE. The cold scan attempt materializes
+the prefix's rows and the controlled JOIN attempt consumes them, so the route
+holds the scan's output beside the JOIN's state. The bundle also fixes a
+resident controlled STEP that a cancellation between public calls, with a JOIN
+or CONSOLIDATE in flight, left refusing checked destruction; see "Cold JOINs in
+controlled single-worker sessions (#2301)". A cold input read as a right input,
+by a self-JOIN, by a JOIN with more than one key or before an aggregate, a
+SNAPSHOT or an observed STEP over one, the program refusals of the sixth bundle
+and more than one worker stay open.
