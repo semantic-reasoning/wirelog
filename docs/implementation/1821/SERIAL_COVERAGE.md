@@ -125,7 +125,7 @@ references, not interruption evidence.
 | F05a | Ordinary keyed persistent arrangement/probe bundle versus ephemeral hash; cached right filter versus operation-owned filtered relation | General serial STEP owns a private native index registry for full-right public EDB INT64 JOIN, with bounded creation/reuse/probes and a common head/index cutoff. Existing pins/pending/deferred entries refuse replacement. Filtered/private-head/batch representations retain their previous controlled disposition; this does not qualify raw cache alternatives, G5/G6 |
 | F06a | LFTJ cache/probe versus owned source rebuild and raw output callback versus private owned-row append | Controlled session uses per-attempt bounded rebuild, no unlimited raw fallback; actual writer/ROW/ACK/drain ownership and precommit/postcutoff delivery qualified | Host failure/native/microsteps/policy and `test_lftj_postcut_delivery`; current-generation raw probe/pin checks; [source map](../2298/LFTJ_SOURCE_ACCOUNTING.md) |
 | F07a | Scalar-source compound kind NONE versus INLINE/SIDE, declared schema/type validity, timestamps and row weights | Admission predicates differ by child; no cross-operator representation support inferred. Managed copies/readers can be bounded while a surrounding child refuses the representation; G5. #2301: VARIABLE, MAP and FILTER admit compound_kind INLINE after a metered arity-map check; ordinary JOIN also admits INLINE through the existing bounded reader (#2371); SEMIJOIN/ANTIJOIN remain scalar-only; compound_kind SIDE stays ENOTSUP at the scalar source reader, and an EDB declared with a side compound column has compound_kind NONE in sessions, with controlled make_compound after a completed evaluation admitted on the ordinary and general observed hosts, `evaluation_side_compounds` (#2301), see "SIDE compound EDBs in controlled single-worker sessions (#2301)"; no timestamped/weighted source found in controlled single-worker sessions, `evaluation_source_shapes` (#2301), see "Source shapes in controlled single-worker sessions (#2301)" |
-| F07b | Retained/borrowed/owned, contiguous/segmented/spill-backed storage and empty/nullary/wide rows | Source reader/descriptor and copy helpers must preserve representation and governor state; capacity/overflow errors remain errors. Enumerated qualification combinations, not an invitation to raw fallback; G5/G6. #2301: borrowed public INLINE descriptors, empty, wide and arity-1 INLINE layouts; a controlled single-worker STEP reads a cold (spill-backed) source through a direct MAP/FILTER projection, and seal and begin refuse the other cold consumers under control, `evaluation_cold_sources`, see "Cold sources in controlled single-worker sessions (#2301)"; a never-inserted EDB through MAP, FILTER and REDUCE on the unobserved STEP; no lazy-owner, aliased or segmented source found in controlled single-worker sessions, `evaluation_source_shapes`, see "Source shapes in controlled single-worker sessions (#2301)" |
+| F07b | Retained/borrowed/owned, contiguous/segmented/spill-backed storage and empty/nullary/wide rows | Source reader/descriptor and copy helpers must preserve representation and governor state; capacity/overflow errors remain errors. Enumerated qualification combinations, not an invitation to raw fallback; G5/G6. #2301: borrowed public INLINE descriptors, empty, wide and arity-1 INLINE layouts; a controlled single-worker STEP reads a cold (spill-backed) source through a direct MAP/FILTER projection and through the aggregates the uncontrolled cold aggregate admits, and seal and begin refuse the other cold consumers under control, `evaluation_cold_sources`, see "Cold sources in controlled single-worker sessions (#2301)" and "Cold aggregates in controlled single-worker sessions (#2301)"; a never-inserted EDB through MAP, FILTER and REDUCE on the unobserved STEP; no lazy-owner, aliased or segmented source found in controlled single-worker sessions, `evaluation_source_shapes`, see "Source shapes in controlled single-worker sessions (#2301)" |
 
 ## Configuration predicates
 
@@ -3283,4 +3283,75 @@ control and a successor STEP that evaluates, which a frozen input does not
 start, were not run, and neither the drive-time refusal nor the JOIN lookup
 refusal was reached. A stop after a work limit keeps `wl_session_try_destroy`
 busy in this session as in a resident controlled one, so only cancelled
-sessions are destroyed without a reset.
+sessions are destroyed without a reset. A later unit admits the aggregates that
+the uncontrolled cold aggregate admits; see "Cold aggregates in controlled
+single-worker sessions (#2301)".
+
+### Cold aggregates in controlled single-worker sessions (#2301)
+
+A controlled STEP now also reads a cold input through an aggregate: VARIABLE
+over the cold input, a direct MAP/FILTER prefix, which may be empty, then a
+REDUCE that the uncontrolled cold aggregate admits, and the rule's final
+CONSOLIDATE. The REDUCE is SUM, MIN or MAX over a direct INT64 column, or
+COUNT, grouped by INT64 or STRING columns or by none, and each FILTER compares
+an INT64 column with a literal, as
+`wl_columnar_eval_plan_cold_aggregate_decode` checks. Seal and begin admit that
+shape under control, subject to the program refusals of the previous unit; the
+REDUCE need not follow a MAP.
+
+No new operator runs the aggregate. The cold scan attempt of the previous unit
+reads the input and leaves the prefix's rows in the frame's result slot;
+without a MAP they have the source's columns, for the rows the FILTERs keep.
+The composed numeric attempt installs them as an owned stack entry and
+continues, as for a resident input, with the controlled REDUCE attempt and the
+CONSOLIDATE child. Before a REDUCE the attempt's sizing pass also counts the
+REDUCE's group keys and operand, each traced back through the prefix, and
+counts the prefix twice, because the one decode checks it for the scan and
+again for the aggregate. The raw cold aggregate still returns ENOTSUP under
+control.
+
+The route holds more memory than the uncontrolled one. The scan's output is
+created with the source's row count as capacity and stays while the REDUCE
+runs, beside the REDUCE's own reservations; the uncontrolled cold aggregate
+streams the rows into its groups. A budget that admits the uncontrolled STEP
+can therefore deny the controlled one with ENOSPC. The route also reads every
+row before the REDUCE starts: a SUM that overflows returns ERANGE on both, but
+a read fault after the overflowing row stops the controlled STEP with that
+error, while the uncontrolled one, which stops at the overflowing row, returns
+ERANGE.
+
+`evaluation_cold_sources` adds these cases to the comparison with an
+uncontrolled session: a grouped COUNT and MIN, a MAX in the head's first
+column, a scalar COUNT over 6, 20 and 200 rows, a scalar SUM over an empty
+input, a scalar COUNT over an input that the FILTER removes entirely, a FILTER
+before a grouped SUM over 6 and 20 rows and before a grouped COUNT, and a
+STRING group key from program facts. The planner emitted no MAP before a REDUCE
+in this corpus, so a permuting MAP before a grouped SUM comes from a plan the
+test edits, compared also with the resident input. For each case the cold scan
+and the REDUCE checkpoints fire and neither raw cold entry point runs.
+Cancellation and work-limit stops at every cold scan checkpoint, for the
+filtered grouped SUM over 20 rows on the seal route, and at every checkpoint of
+the REDUCE that follows, for that SUM over 6 rows on the seal route and the
+scalar COUNT over 6 rows on the loading route, behave as the projection's stops
+do. The parked destroy, the cancellation inside a spill read, the read fault,
+the governor denials, some of them after the REDUCE started, and the equal work
+of both routes with a limit one unit lower are checked for the SUM over 20
+rows; there a denial after the scan's WRITER_END is not told apart from the
+later ones. For every admitted case the first STEP prepays exactly the
+resolution work that a closed form over the plan's prefix and REDUCE gives. A
+SUM overflow returns ERANGE on both sessions and routes with the governor back
+at its value before the STEP; a read fault injected after the uncontrolled
+route's reads returns EIO controlled and ERANGE uncontrolled; and the least
+free memory at which the 200-row COUNT succeeds is larger controlled than
+uncontrolled. Under control, seal and begin refuse a COUNT over a JOIN and a
+COUNT into a head that is also an EDB.
+
+Open after this unit: a cold input read by a JOIN, alone or before an
+aggregate; a SNAPSHOT or an observed STEP over a cold input; under control, a
+head that is also an EDB, every two-EDB single-rule projection and a registry
+larger than three relations; and more than one worker. Limits: a MAP whose
+lanes, or a REDUCE whose group keys and operand, exceed one quantum of
+resolution lanes was not run, and neither was a host ABORT of a parked
+aggregate attempt, which the composed attempt refuses for every REDUCE as it
+does for a resident one; in a probe of the grouped COUNT on the seal route, no
+EAGAIN return left a framed cleanup active, and that refusal was not reached.
