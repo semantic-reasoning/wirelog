@@ -42,6 +42,8 @@ typedef struct {
     uint64_t generation;
     col_relation_snapshot_t snapshot;
     uint32_t rows, current, buckets, capacity;
+    uint32_t pins;
+    bool pending, deferred;
     uint32_t heads[INDEX_ROWS], next[INDEX_ROWS];
 } index_image_t;
 typedef struct {
@@ -67,6 +69,9 @@ typedef struct {
     bool allocation_failed;
     uint64_t denials;
     wl_columnar_memory_reservation_t peer;
+    bool pin_mode;
+    col_diff_arrangement_pin_t pin;
+    registry_t unpinned;
     bool work_stop, armed, stopped;
     int64_t tag, floating;
     profile_t *active;
@@ -215,7 +220,10 @@ static registry_t registry(profile_t *p) {
     for (uint32_t i = 0; i < s->diff_arr_count; ++i) {
         const col_diff_arr_entry_t *e = &s->diff_arr_entries[i];
         unsigned key = signature(e);
-        CHECK(!(bits & (1u << key)) && e->diff_arr && !e->pin_count &&
+        bool pinned = active && active->pin.active
+            && active->pin.session == s && active->pin.entry == e;
+        CHECK(!(bits & (1u << key)) && e->diff_arr
+            && e->pin_count == (pinned ? 1u : 0u) &&
             !e->transaction_pending && !e->invalidation_deferred);
         bits |= 1u << key;
         const col_diff_arrangement_t *a = e->diff_arr;
@@ -232,6 +240,9 @@ static registry_t registry(profile_t *p) {
         v->current = a->current_nrows;
         v->buckets = a->nbuckets;
         v->capacity = a->ht_cap;
+        v->pins = e->pin_count;
+        v->pending = e->transaction_pending;
+        v->deferred = e->invalidation_deferred;
         memcpy(v->heads, a->ht_head, a->nbuckets * sizeof(uint32_t));
         memcpy(v->next, a->ht_next, a->ht_cap * sizeof(uint32_t));
     }
@@ -247,7 +258,9 @@ static void same_registry(const registry_t *a, const registry_t *b,
             x->snapshot.view_generation == y->snapshot.view_generation &&
             x->snapshot.storage_generation == y->snapshot.storage_generation &&
             x->rows == y->rows && x->current == y->current &&
-            x->buckets == y->buckets && x->capacity == y->capacity &&
+            x->buckets == y->buckets && x->capacity == y->capacity
+            && x->pins == y->pins && x->pending == y->pending
+            && x->deferred == y->deferred &&
             !memcmp(x->heads, y->heads, x->buckets * sizeof(uint32_t)) &&
             !memcmp(x->next, y->next, x->capacity * sizeof(uint32_t)));
     }
@@ -406,6 +419,17 @@ static void arrangement(wl_evaluation_control_t *control, unsigned phase,
     (void)progress;
     fixture_t *f = active;
     if (control != f->active->control) return;
+    if (!f->profile && f->armed && f->pin_mode && !f->stopped
+        && phase == 0 && COL_SESSION(f->active->session)->diff_txn_count == 1) {
+        wl_columnar_filter_context_t *ctx = context(f);
+        sources(f, ctx);
+        CHECK(f->stage == 1 && f->head < 2 && !progress
+            && f->pin.active && f->pin.entry ==
+            COL_SESSION(f->active->session)->diff_arr_entries
+            && f->pin.entry->pin_count == 1 && !f->seen.builds
+            && !f->seen.reuses);
+        f->stopped = true; /* Observe the genuine image pin refusal. */
+    }
     if (!f->profile && f->armed && f->resource && !f->stopped) {
         wl_columnar_filter_context_t *ctx = context(f);
         sources(f, ctx);
@@ -714,6 +738,24 @@ writers(profile_t *p)
             && !wl_columnar_source_access_writer_release(&writer));
     }
 }
+static void check_pin(fixture_t *f) {
+    profile_t *p = &f->profiles[0];
+    col_rel_t *r = session_find_rel(COL_SESSION(p->session), "right");
+    const col_diff_arrangement_pin_t *pin = &f->pin;
+    CHECK(pin->active && pin->session == COL_SESSION(p->session)
+        && pin->source == r && pin->entry->diff_arr == pin->arr
+        && pin->entry->pin_count == 1 &&
+        pin->generation == pin->entry->generation
+        && wl_columnar_relation_snapshot_equal(pin->source_snapshot,
+        wl_columnar_relation_snapshot(r))
+        && wl_columnar_relation_snapshot_equal(pin->arr->source_snapshot,
+        pin->source_snapshot)
+        && pin->source_reader.identity == (uintptr_t)&pin->source_reader
+        && pin->source_reader.owner == &r->storage_owner->source_access
+        && pin->source_reader.secondary_owner == &r->descriptor_access);
+    wl_columnar_source_access_writer_t writer = {0};
+    CHECK(col_rel_source_writer_acquire(r, &writer) == EBUSY);
+}
 static wl_columnar_session_test_completed_view_t
 completion(profile_t *p, unsigned route,
     const wl_evaluation_control_report_t *report)
@@ -822,6 +864,13 @@ failure(fixture_t *f, const registry_t *before, const image_t *old,
     wl_columnar_session_test_completed_view_t slot = completion(p, f->route,
             &report);
     if (f->route != 2) protected_step(f);
+    if (f->pin_mode) {
+        check_pin(f);
+        col_diff_arrangement_pin_release(&f->pin);
+        CHECK(!f->pin.active && !f->pin.entry && !f->pin.source_reader.owner);
+        registry_t released = registry(p);
+        same_registry(&f->unpinned, &released, true);
+    }
     writers(p);
     content(p, old);
     CHECK(s->pending_input_change);
@@ -829,7 +878,8 @@ failure(fixture_t *f, const registry_t *before, const image_t *old,
         ++h) CHECK(session_find_rel(s, names[h]) == heads[h]);
     input_image_t current = input_image(p, "left"); same_input(&left, &current);
     current = input_image(p, "right"); same_input(&right, &current);
-    after = registry(p); same_registry(before, &after, true);
+    after = registry(p);
+    same_registry(f->pin_mode ? &f->unpinned : before, &after, true);
     CHECK(!wl_evaluation_control_report(p->control, &frozen));
     same_report(&report, &frozen);
     CHECK(!wl_evaluation_control_active_attempt_id(p->control));
@@ -869,7 +919,8 @@ int main(int argc, char **argv) {
         if (!strcmp(argv[3], "image-denied")) f.resource = 1;
         if (!strcmp(argv[3], "build-denied")) f.resource = 2;
         if (!strcmp(argv[3], "key-nomem")) f.resource = 3;
-        CHECK(f.stop_site || f.cap || f.resource);
+        f.pin_mode = !strcmp(argv[3], "pin-held");
+        CHECK(f.stop_site || f.cap || f.resource || f.pin_mode);
     }
     const char *env[] = {"WIRELOG_DIFF_ENABLED", "WIRELOG_JOIN_BATCH_BYTES",
                          "WIRELOG_JOIN_BATCH_STRICT",
@@ -933,6 +984,17 @@ int main(int argc, char **argv) {
         CHECK(!registry(&f.profiles[p]).count);
     }
     for (f.stage = 0; f.stage < 7; ++f.stage) {
+        if (f.stage == 1 && f.pin_mode) {
+            profile_t *p = &f.profiles[0];
+            f.unpinned = registry(p);
+            uint32_t key = 0;
+            col_rel_t *r = session_find_rel(COL_SESSION(p->session), "right");
+            CHECK(f.unpinned.count == 3 && !col_session_pin_diff_arrangement(
+                    COL_SESSION(p->session), "right", r, &key, 1, &f.pin));
+            CHECK(f.pin.arr == (const col_diff_arrangement_t *)
+                f.unpinned.entries[0].address);
+            check_pin(&f);
+        }
         script(&f);
         image_t now = reference(&f);
         if (!f.stage && f.cap) {
@@ -949,6 +1011,12 @@ int main(int argc, char **argv) {
         for (unsigned p = 0; p < 3; ++p) {
             registry_t before = registry(&f.profiles[p]);
             watch(&f, p, p < 2);
+            if (!p && f.pin_mode && !f.stopped && f.stage == 1) {
+                check_pin(&f);
+                failure(&f, &before, &old, ENOTSUP);
+                before = registry(&f.profiles[p]);
+                watch(&f, p, true);
+            }
             if (!p && f.resource && !f.stopped
                 && f.stage == (f.resource == 2 ? 5u : 1u)) {
                 failure(&f, &before, &old, f.resource == 3 ? ENOMEM : ENOSPC);
@@ -990,7 +1058,8 @@ int main(int argc, char **argv) {
         }
         old = now;
     }
-    CHECK((!f.stop_site && !f.resource) || f.stopped);
+    CHECK((!f.stop_site && !f.resource && !f.pin_mode) || f.stopped);
+    CHECK(!f.pin.active);
     CHECK(wl_columnar_join_test_attempt_fail_allocation == -1);
     for (unsigned p = 0; p < 3; ++p) {
         CHECK(!wl_session_try_destroy(&f.profiles[p].session));
