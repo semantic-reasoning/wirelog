@@ -10184,6 +10184,23 @@ int wl_columnar_eval_serial_framed_attempt_close(
 extern void (*wl_columnar_eval_serial_test_framed_checkpoint)(
     wl_columnar_eval_serial_framed_attempt_t *);
 extern int wl_columnar_eval_serial_test_framed_fail_allocation;
+/* Quiescent copied custody roles only; no pointer, grant or resource loan.
+ * All words are initialized, making fieldwise trace comparison deterministic.
+ * owner bits: previous/candidate/frontier/next, entry==previous/candidate/public,
+ * round owner==previous/frontier/next, public still in frozen Original registry. */
+typedef struct {
+    uint64_t available, eligible, published, committed;
+    uint64_t phase, round, round_index, head, head_count;
+    uint64_t round_active, round_changed, append_active, round_frontiers;
+    uint64_t arrays_ready, originals_started, schema_started;
+    uint64_t metadata_admitted, image_admitted;
+    uint64_t child_active, child_thread_valid, receipt_pending, receipt_ack;
+    uint64_t receipt_acknowledged, receipt_index_valid, ack_committed;
+    uint64_t owners[2];
+    uint64_t retirement[8], child[16], main[16], observer[16], resource[12];
+} wl_columnar_session_test_string_custody_t;
+int wl_columnar_session_test_string_custody(const wl_col_session_t *,
+    wl_columnar_session_test_string_custody_t *);
 typedef struct {
     unsigned phase, finance_kind;
     uint64_t ticket, operation_identity, original_attempt_id;

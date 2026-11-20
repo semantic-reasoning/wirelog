@@ -2946,3 +2946,97 @@ all allocation ordinals and both END outcomes at their selected fronts. Full
 public child/MAIN/observer/retirement/publication products, arbitrary names and
 graph sizes, broader types/topology/modes/transport and remaining Source/carry
 proofs remain follow-up work. No whole-call 256 or whole-#2299 closure follows.
+
+### Unary STRING public child/receipt CANCEL and WORK representatives
+
+This increment qualifies a finite set of actual public-return child/receipt
+custody representatives for **CANCEL and genuinely refused WORK only**. Public
+Original END/END-with-successor, round-retirement/MAIN injection, public SEED,
+observer preparation, registry/claims/publication and postcommit delivery remain
+open. Existing internal metadata/bottom/core END tests are separate evidence;
+they do not qualify these public END products.
+
+The parsed one/two-head fixtures first establish their ordinary warm result,
+then append the same freshly interned STRING input to controlled and raw
+sessions. The real session must have no cold relation. Current main also changes
+cold-source execution/layout, so current cold-source and session-options tests
+are included in regression validation; their admission is not borrowed by this
+STRING route.
+
+A `WL_SESSION_TEST_HOOKS`-only copied view checks actual transaction initialization
+extent, array/schema/original construction markers and head/entry bounds before
+reading roles. It returns initialized scalar words, no mutable pointers,
+controller or grant. Normalized signatures retain actual phase, round, head and
+round index; previous/candidate/frontier presence, binding/Original equality and
+round-owner roles; admission and receipt/ACK flags; genuine retirement journal
+state; authenticated framed child phase, pin/gate/source/batch/candidate/capture
+custody and bound numeric operator/cursor; normalized MAIN and observer journals.
+Nested child/source reads require their own initialization markers. No retired
+relation payload or nested cold attempt is inspected. Historical IDs/addresses
+are reduced to role/presence predicates. Repeated name/row/copy/clear offsets are
+not distinct normalized classes, and observed work is not a price.
+
+After the actual round-zero typed-bottom callback, injection requires a real
+public `EAGAIN`, `round_active`, uncommitted/unpublished transaction, actual phase
+EVALUATE(8), COMPARE(19) or REBIND(20), and no MAIN identity, round owner or
+round-retirement progress identity. SEED(18), RETIRE(21) and all other phases are
+outside this injection partition. Filtering limits injection only: every
+prepublication return, including excluded gaps and the entire stopped drain,
+still checks old public pointers, complete generation snapshots, unary STRING
+rows/types and zero events. Cleanup and same-input retry follow the ordinary
+Session protocol even when they later enter excluded phases.
+
+Each process rediscovers its healthy trace with actual global public-call
+ordinals. Excluded gaps break segments; no synthetic REBIND-to-EVALUATE edge is
+invented across omitted retirement/seed work. Select first/last occurrence of
+each exact class, both endpoints of first/last occurrence of each distinct
+ordered within-segment class-pair transition, and every segment endpoint. The
+focused rule retains class/pair first occurrences and segment endpoints. Union
+selected ordinals before deterministic modulo16 sharding; every selected point
+receives both outcomes. Replays authenticate every reached eligible signature
+and its global ordinal before injection; divergence fails rather than retargets.
+These are representatives of observed classes/transition types, not every
+repeated transition, public offset or internal action.
+
+Current Linux discovery gives the same counts for observer off/on:
+
+| Heads | Eligible returns | Classes | Transition instances / types | Segments | Full / focused representatives | Excluded RETIRE returns |
+| --- | --- | --- | --- | --- | --- | --- |
+| 1 | 1,696 | 342 | 1,554 / 364 | 2 | 472 / 396 | 939 |
+| 2 | 4,065 | 830 | 3,651 / 883 | 3 | 1,136 / 960 | 2,807 |
+
+Private previous/candidate, child and receipt custody are actually witnessed.
+COMPARE/REBIND have no public `EAGAIN` observation in these fixtures; their
+internal actions are not newly qualified by a fabricated public witness.
+Native/ASan full families cover 6,432 selected CANCEL/WORK histories across four
+cells; focused first-occurrence families cover 5,424. Normal 120-second watchdogs
+remain. Counts are rediscovered, not API constants. Focused TSan and optional
+library runs exercise the separately labeled focused families, retaining every
+observed class/pair type and segment boundary.
+
+A terminal WORK result can retain a genuine metadata-origin/credit owner rather
+than dispose the transaction. That actual predicate selects checks for protected
+insert/remove/snapshot/destroy `EBUSY`, unchanged first report and public image,
+and actual reset/same-input retry. A disposed case instead checks actual
+transaction absence through the completed-owner view; generic backend PENDING
+alone is not proof of a live transaction. Retry must match literal IDs, STRING
+schema/sorted rows and signed events in raw execution. Actual teardown returns
+all governor reservations and its sole reference; this is not a complete
+intermediate financial certificate.
+
+Two broader experimental probes did **not** establish closure and are excluded
+from passing totals. On base `006d9793`, an experimental two-head observed public
+child cut with actual Original END first returned `EINVAL` with native cleanup
+pending; attempted ordinary drains reached the 1,000,000-iteration bound still
+at `EAGAIN`. A one-head retirement WORK probe also reached that bound instead
+of WORK, at actual RETIRE(21), round/index 0, head 1, child absent, MAIN identity
+present (phase 2, recipient 2), retirement identity present but not begun. These
+are observed probe facts, not a diagnosed cause, alternate closure protocol,
+universal failure or ordinary-user reachability claim. Their experimental
+ordinals are not stable identifiers. Public END/successor and retirement/MAIN
+qualification require follow-up; no normal-runtime fix is claimed here.
+
+FLOAT, wider/mixed SCCs, additional topology, expression/K bodies, evaluating
+Snapshot/C1/batch modes, seeded heads, pool/prepared-sort transport and remaining
+containing Source/carry proofs remain outside the qualified scope. This
+increment does not close the public lifecycle or #2299.

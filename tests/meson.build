@@ -8114,3 +8114,18 @@ foreach heads : [1, 2]
       suite: ['unit', 'tsan', 'evaluation_recursive_string_focused'], timeout: 120)
   endforeach
 endforeach
+
+# Public active-round CANCEL/WORK representatives; public END remains open.
+foreach heads : [1, 2]
+  foreach observed : [0, 1]
+    foreach shard : range(16)
+      foreach family : ['public_cuts', 'public_focused']
+        family_id = family == 'public_cuts' ? '0' : '1'
+        test('evaluation_recursive_string_@0@_@1@_@2@_@3@'.format(family, heads, observed, shard),
+          evaluation_recursive_string_exe,
+          args: ['public', family_id, heads.to_string(), observed.to_string(), shard.to_string(), '16'],
+          suite: ['unit', 'tsan', 'evaluation_recursive_string_@0@'.format(family)], timeout: 120)
+      endforeach
+    endforeach
+  endforeach
+endforeach

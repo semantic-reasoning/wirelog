@@ -25153,6 +25153,128 @@ wl_columnar_session_test_observer_resource_view(const wl_col_session_t *sess,
     return 0;
 }
 
+/* Only descriptive words escape; no borrowed payload is dereferenced. */
+int
+wl_columnar_session_test_string_custody(const wl_col_session_t *sess,
+    wl_columnar_session_test_string_custody_t *out)
+{
+    if (!sess || !out) return EINVAL;
+    memset(out, 0, sizeof(*out));
+    const wl_columnar_controlled_step_t *step = sess->controlled_step;
+    if (!step) return 0;
+    out->published = step->published;
+    if (!step->transaction_initialized || !step->transaction
+        || step->transaction_initialized_bytes != sizeof(*step->transaction))
+        return 0;
+    const wl_columnar_session_observed_transaction_t *tx = step->transaction;
+    out->committed = tx->committed;
+    if (!step->general_observed || !tx->string_projection
+        || !tx->arrays_ready || !tx->schema_started || !tx->originals_started
+        || !tx->heads || !tx->entries || !tx->originals
+        || tx->head_count < 1 || tx->head_count > 2
+        || sess->plan->edb_count > tx->count
+        || tx->head_count > tx->count - sess->plan->edb_count) return 0;
+    out->available = 1;
+    out->eligible = tx->round_active && !tx->committed && !step->published
+        && (tx->phase == WL_SESSION_OBSERVED_EVALUATE
+        || tx->phase == WL_SESSION_RECURSIVE_COMPARE
+        || tx->phase == WL_SESSION_RECURSIVE_REBIND)
+        && !step->main_action.identity && !tx->round_owner
+        && !tx->round_progress.identity;
+    out->phase = tx->phase; out->round = tx->round;
+    out->round_index = tx->round_index; out->head = tx->head;
+    out->head_count = tx->head_count;
+    out->round_active = tx->round_active;
+    out->round_changed = tx->round_changed;
+    out->append_active = tx->append_active;
+    out->round_frontiers = tx->round_frontiers;
+    out->arrays_ready = tx->arrays_ready;
+    out->originals_started = tx->originals_started;
+    out->schema_started = tx->schema_started;
+    out->metadata_admitted = tx->metadata_admitted;
+    out->image_admitted = tx->image_admitted;
+    out->child_active = tx->child_active;
+    out->child_thread_valid = tx->child_thread_valid;
+    out->receipt_pending = tx->receipt_pending;
+    out->receipt_ack = tx->receipt_ack;
+    out->receipt_acknowledged = tx->receipt_acknowledged;
+    out->receipt_index_valid = tx->receipt_index_valid;
+    out->ack_committed = tx->ack_committed;
+    for (uint32_t i = 0; i < tx->head_count; i++) {
+        const wl_columnar_session_observed_head_t *h = &tx->heads[i];
+        const wl_columnar_eval_private_dynamic_binding_t *e =
+            &tx->entries[sess->plan->edb_count + i];
+        uint64_t mask = (h->previous !=
+            NULL) | ((uint64_t)(h->candidate != NULL) << 1)
+            | ((uint64_t)(h->frontier !=
+            NULL) << 2) | ((uint64_t)(h->next_frontier != NULL) << 3)
+            | ((uint64_t)(h->previous && e->relation == h->previous) << 4)
+            | ((uint64_t)(h->candidate && e->relation == h->candidate) << 5)
+            | ((uint64_t)(e->public_relation &&
+            e->relation == e->public_relation) << 6)
+            | ((uint64_t)(tx->round_owner == &h->previous) << 7)
+            | ((uint64_t)(tx->round_owner == &h->frontier) << 8)
+            | ((uint64_t)(tx->round_owner == &h->next_frontier) << 9);
+        for (uint32_t j = 0; e->public_relation && j < tx->old_count; j++)
+            if (tx->originals[j].relation ==
+                e->public_relation) mask |= UINT64_C(1) << 10;
+        out->owners[i] = mask;
+    }
+    const wl_columnar_session_retirement_progress_t *p = &tx->round_progress;
+    out->retirement[0] = p->identity == p;
+    if (p->identity == p) {
+        out->retirement[1] = p->begun; out->retirement[2] = p->physical_done;
+        out->retirement[3] = p->cancel_clear; out->retirement[4] = p->role;
+        out->retirement[5] = p->index; out->retirement[6] = p->registered;
+        if (p->begun && !p->physical_done && !p->cancel_clear)
+            out->retirement[7] = tx->round_retirement.phase;
+    }
+    if (sess->cleanup_active) {
+        wl_columnar_eval_serial_framed_attempt_t *ctx = NULL;
+        int rc = wl_columnar_eval_stack_framed_context(sess->cleanup_active,
+                (wl_col_session_t *)sess, &ctx);
+        if (rc) return rc;
+        out->child[0] = 1;
+        if (ctx->identity == ctx) {
+            out->child[1] = 1; out->child[2] = ctx->phase;
+            out->child[3] = ctx->pending_action;
+            out->child[4] = ctx->pin_owned | ((uint64_t)ctx->gate_owned << 1)
+                | ((uint64_t)ctx->child_bound <<
+                2) | ((uint64_t)ctx->source_initialized << 3)
+                | ((uint64_t)ctx->batch_initialized <<
+                4) | ((uint64_t)ctx->candidate_owned << 5)
+                | ((uint64_t)ctx->capture_only <<
+                6) | ((uint64_t)ctx->capture_done << 7)
+                | ((uint64_t)ctx->committed <<
+                8) | ((uint64_t)ctx->close_proven << 9)
+                | ((uint64_t)ctx->pending_inner_consume << 10);
+            out->child[5] = ctx->child.identity == &ctx->child;
+            if (ctx->child_bound && ctx->child.identity == &ctx->child) {
+                out->child[6] = ctx->child.phase;
+                out->child[7] = ctx->child.pending_action;
+                out->child[8] = ctx->child.cursor;
+                if (ctx->child.plan &&
+                    ctx->child.cursor < ctx->child.plan->op_count)
+                    out->child[9] = 1 +
+                        ctx->child.plan->ops[ctx->child.cursor].op;
+            }
+            if (ctx->source_initialized) out->child[10] = 1 + ctx->source.phase;
+            out->child[11] = (uint64_t)(int64_t)ctx->primary_result;
+            out->child[12] = (uint64_t)(int64_t)ctx->cleanup_result;
+        }
+    }
+    int rc = wl_columnar_session_test_main_view(sess, out->main);
+    if (rc) return rc;
+    /* Raw IDs/addresses are historical numbers, not normalized owner classes. */
+    out->main[6] = out->main[6] != 0;
+    out->main[7] = out->main[7] != 0;
+    out->main[9] = out->main[9] != 0;
+    rc = wl_columnar_session_test_observer_main_view(sess, out->observer);
+    if (rc) return rc;
+    out->observer[14] = out->observer[14] != 0;
+    return wl_columnar_session_test_observer_resource_view(sess, out->resource);
+}
+
 bool
 wl_columnar_session_test_bootstrap_finance_pending(const wl_col_session_t *sess)
 {
