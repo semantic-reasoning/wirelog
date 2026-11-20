@@ -1032,11 +1032,311 @@ run_lifecycle(unsigned family, unsigned heads, bool observed,
     free(trace);
 }
 
+/* Finite public-return representatives; independent of internal lifecycle cuts. */
+typedef wl_columnar_session_test_string_custody_t public_key_t;
+typedef struct {
+    public_key_t *keys;
+    unsigned count, classes, transitions, pairs, selected, focused, segments;
+    unsigned excluded, excluded_seed, excluded_retire, excluded_owner;
+    unsigned *class_id, *public_ordinal;
+    bool *pick, *focus;
+} public_trace_t;
+static fixture_t *public_fixture;
+static bool public_bottom;
+
+static void
+public_constructor(const wl_col_session_t *col,
+    wl_evaluation_control_t *control,
+    uint64_t id, uint32_t round, uint32_t head, bool entering, int result,
+    const col_rel_t *output)
+{
+    (void)output;
+    CHECK(public_fixture && col == (wl_col_session_t *)public_fixture->session
+        && control == public_fixture->control && !round
+        && head < public_fixture->heads
+        && id == wl_evaluation_control_active_attempt_id(control));
+    if (!entering) {
+        CHECK(!result); public_bottom = true;
+    }
+}
+
+static bool
+public_equal(const public_key_t *a, const public_key_t *b)
+{
+    /* The view consists entirely of initialized uint64_t words. */
+    return !memcmp(a, b, sizeof(*a));
+}
+
+static void
+public_snapshot(const char *name, const int64_t *row, uint32_t width,
+    void *opaque)
+{
+    capture(name, row, width, 1, opaque);
+}
+
+static void
+public_replay(unsigned heads, bool observed, const public_trace_t *expected,
+    public_trace_t *record, unsigned target, unsigned outcome,
+    unsigned *retained)
+{
+    fixture_t f; fixture_init(&f, heads, observed);
+    wl_col_session_t *col = (wl_col_session_t *)f.session;
+    CHECK(!col->cold_relation && !step(&f) && !wl_session_step(f.reference));
+    f.actual.count = f.expected.count = 0;
+    const int64_t fresh = wl_intern_put(f.plan->intern, "fresh");
+    CHECK(fresh == 2);
+    CHECK(!wl_session_insert(f.session, "input", &fresh, 1, 1)
+        && !wl_session_insert(f.reference, "input", &fresh, 1, 1));
+    col_rel_t *old[2]; col_relation_snapshot_t snapshots[2];
+    for (unsigned h = 0; h < heads; h++) {
+        old[h] = session_find_rel(col, head_name(&f, h));
+        snapshots[h] = wl_columnar_relation_snapshot(old[h]);
+    }
+    CHECK(!wl_evaluation_control_configure(f.control, UINT64_C(1000000000)));
+    stop_t stop = {.fixture = &f, .outcome = outcome};
+    CHECK(!public_fixture &&
+        !wl_columnar_session_test_string_bottom_checkpoint);
+    public_fixture = &f; public_bottom = false;
+    wl_columnar_session_test_string_bottom_checkpoint = public_constructor;
+    unsigned position = 0;
+    uint64_t original = 0;
+    int rc = EAGAIN;
+    for (unsigned turn = 0; rc == EAGAIN && turn < 1000000; turn++) {
+        rc = wl_session_step(f.session);
+        public_key_t key;
+        CHECK(!col->cold_relation &&
+            !wl_columnar_session_test_string_custody(col, &key));
+        if (stop.hit || (rc == EAGAIN && !key.published && !key.committed))
+            life_public(&f, old, snapshots, stop.successor);
+        if (record && rc == EAGAIN && public_bottom && key.round_active
+            && !key.committed && !key.published && !key.eligible) {
+            record->excluded++;
+            record->excluded_seed += key.phase == 18;
+            record->excluded_retire += key.phase == 21;
+            record->excluded_owner += key.main[0] || key.retirement[0];
+        }
+        if (!stop.hit && rc == EAGAIN && public_bottom && key.eligible) {
+            CHECK(key.available && key.round_active && !key.append_active
+                && !key.round_frontiers && key.head_count == heads
+                && (key.phase == 8 || key.phase == 19 || key.phase == 20)
+                && !key.main[0] && !key.retirement[0]);
+            uint64_t active =
+                wl_evaluation_control_active_attempt_id(f.control);
+            if (!original) original = active;
+            CHECK(original && active == original);
+            if (expected) {
+                if (position >= expected->count ||
+                    !public_equal(&key, &expected->keys[position])
+                    || turn != expected->public_ordinal[position]) {
+                    fprintf(stderr,
+                        "public divergence heads%u observer%d ordinal%u target%u phase%llu round%llu head%llu\n",
+                        heads, observed, position, target,
+                        (unsigned long long)key.phase,
+                        (unsigned long long)key.round,
+                        (unsigned long long)key.head);
+                    CHECK(false);
+                }
+            }
+            if (record) {
+                CHECK(position < 16384); record->keys[position] = key;
+                record->public_ordinal[position] = turn;
+            }
+            if (position++ == target) {
+                CHECK(expected &&
+                    wl_evaluation_control_active_attempt_id(f.control));
+                inject(&stop);
+                life_public(&f, old, snapshots, stop.successor);
+            }
+        }
+    }
+    wl_columnar_session_test_string_bottom_checkpoint = NULL;
+    public_fixture = NULL;
+    CHECK(outcome < 2);
+    int wanted = target == UINT32_MAX ? 0 : outcome == 0
+        ? WL_EVALUATION_CONTROL_CANCELLED : WL_EVALUATION_CONTROL_WORK_LIMIT;
+    if (rc != wanted) fprintf(stderr,
+            "public heads%u observer%d target%u outcome%u hit%d rc%d wanted%d\n",
+            heads, observed, target, outcome, stop.hit, rc, wanted);
+    if (rc != wanted && expected) {
+        const public_key_t *k = &expected->keys[target];
+        fprintf(stderr,
+            "failed key phase%llu round%llu ri%llu head%llu child%llu/%llu/%llu flags%llu main%llu/%llu/%llu retire%llu/%llu/%llu\n",
+            (unsigned long long)k->phase, (unsigned long long)k->round,
+            (unsigned long long)k->round_index, (unsigned long long)k->head,
+            (unsigned long long)k->child[0], (unsigned long long)k->child[2],
+            (unsigned long long)k->child[3],
+            (unsigned long long)k->child[4], (unsigned long long)k->main[0],
+            (unsigned long long)k->main[1], (unsigned long long)k->main[2],
+            (unsigned long long)k->retirement[0],
+            (unsigned long long)k->retirement[1],
+            (unsigned long long)k->retirement[7]);
+    }
+    CHECK(rc == wanted && public_bottom);
+    if (target != UINT32_MAX) {
+        CHECK(stop.hit && position == target + 1 && !col->cleanup_active
+            && !col->cleanup_pending && !col->cleanup_reserved_bytes);
+        wl_evaluation_control_report_t report;
+        CHECK(!wl_evaluation_control_report(f.control, &report));
+        CHECK(report.attempt_id == original &&
+            report.limit == UINT64_C(1000000000)
+            && report.result == wanted && report.stop_reason == wanted &&
+            !report.cleanup_status);
+        uint64_t owner[8];
+        CHECK(!wl_columnar_session_test_retained_work_owner(col, owner));
+        if (outcome == 1 && owner[0]) {
+            (*retained)++;
+            CHECK(owner[1] && owner[2]
+                && f.session->backend->session_controlled_step_state(
+                    f.session) == WL_CONTROLLED_STEP_PENDING);
+            CHECK(wl_session_insert(f.session, "input", &fresh, 1, 1) == EBUSY
+                && wl_session_remove(f.session, "input", &fresh, 1,
+                1) == EBUSY);
+            events_t unexpected = {0};
+            CHECK(wl_session_snapshot(f.session, public_snapshot,
+                &unexpected) == EBUSY
+                && !unexpected.count);
+            wl_session_t *same = f.session;
+            CHECK(wl_session_try_destroy(&same) == EBUSY && same == f.session);
+            wl_evaluation_control_report_t after;
+            CHECK(!wl_evaluation_control_report(f.control, &after)
+                && wl_test_completed_step_report_equal(&report, &after));
+            life_public(&f, old, snapshots, stop.successor);
+        } else {
+            public_key_t closed;
+            CHECK(!owner[0] && !wl_columnar_session_test_string_custody(col,
+                &closed));
+            wl_columnar_session_test_completed_view_t completion;
+            CHECK(!closed.available &&
+                !wl_columnar_session_test_completed_view(col, &completion)
+                && !completion.transaction_present);
+        }
+        CHECK(!wl_evaluation_control_reset(f.control)
+            && !wl_evaluation_control_configure(f.control, 0) && !step(&f));
+    } else {
+        if (expected) CHECK(position == expected->count);
+        if (record) record->count = position;
+    }
+    CHECK(!wl_session_step(f.reference));
+    const int64_t all[] = {0, 1, 2}; check_rows(&f, all, 3);
+    check_events(&f, 2, 1);
+    fixture_close(&f);
+}
+
+static void
+run_public(unsigned family, unsigned heads, bool observed, unsigned shard,
+    unsigned shards)
+{
+    CHECK(shards && shard < shards);
+    public_trace_t t = {0};
+    t.keys = calloc(16384, sizeof(*t.keys));
+    t.class_id = calloc(16384, sizeof(*t.class_id));
+    t.public_ordinal = calloc(16384, sizeof(*t.public_ordinal));
+    t.pick = calloc(16384, sizeof(*t.pick));
+    t.focus = calloc(16384, sizeof(*t.focus));
+    CHECK(t.keys && t.class_id && t.public_ordinal && t.pick && t.focus);
+    unsigned retained = 0;
+    public_replay(heads, observed, NULL, &t, UINT32_MAX, 0, &retained);
+    CHECK(t.count);
+    unsigned first[2048], last[2048];
+    struct public_pair { unsigned from, to, first, last; };
+    struct public_pair *pairs = calloc(16384, sizeof(*pairs));
+    CHECK(pairs);
+    bool previous = false, candidate = false, child = false, receipt = false,
+        compare = false, rebind = false;
+    for (unsigned i = 0; i < t.count; i++) {
+        public_key_t *k = &t.keys[i];
+        unsigned c = 0;
+        for (; c < t.classes;
+            c++) if (public_equal(k, &t.keys[first[c]])) break;
+        if (c == t.classes) {
+            CHECK(c < 2048); first[c] = i; t.classes++;
+        }
+        t.class_id[i] = c; last[c] = i;
+        for (unsigned h = 0; h < heads; h++) {
+            previous |= (k->owners[h] & 1) != 0;
+            candidate |= (k->owners[h] & 2) != 0;
+        }
+        child |= k->child[0] != 0;
+        receipt |= k->receipt_pending || k->receipt_ack;
+        compare |= k->phase == 19; rebind |= k->phase == 20;
+        bool begin = !i || t.public_ordinal[i] != t.public_ordinal[i-1] + 1;
+        if (begin) {
+            t.segments++; t.pick[i] = t.focus[i] = true;
+            if (i) t.pick[i-1] = t.focus[i-1] = true;
+        }
+        if (i && !begin && !public_equal(k, &t.keys[i-1])) {
+            t.transitions++;
+            unsigned pair = 0;
+            for (; pair < t.pairs; pair++)
+                if (pairs[pair].from == t.class_id[i-1] &&
+                    pairs[pair].to == c) break;
+            if (pair == t.pairs) {
+                CHECK(pair < 16384); t.pairs++;
+                pairs[pair].from = t.class_id[i-1]; pairs[pair].to = c;
+                pairs[pair].first = i;
+            }
+            pairs[pair].last = i;
+        }
+    }
+    CHECK(previous && candidate && child && receipt);
+    /* Comparison/rebind may have no public yield; report rather than invent it. */
+    t.pick[t.count-1] = t.focus[t.count-1] = true;
+    for (unsigned c = 0; c < t.classes; c++) {
+        t.pick[first[c]] = t.pick[last[c]] = true;
+        t.focus[first[c]] = true;
+    }
+    for (unsigned p = 0; p < t.pairs; p++) {
+        unsigned a = pairs[p].first, b = pairs[p].last;
+        CHECK(a && b && a <= b);
+        CHECK(t.class_id[a-1] == pairs[p].from && t.class_id[a] == pairs[p].to
+            && t.class_id[b-1] == pairs[p].from &&
+            t.class_id[b] == pairs[p].to);
+        t.pick[a-1] = t.pick[a] = t.pick[b-1] = t.pick[b] = true;
+        t.focus[a-1] = t.focus[a] = true;
+    }
+    for (unsigned c = 0; c < t.classes;
+        c++) CHECK(t.pick[first[c]] && t.pick[last[c]] && t.focus[first[c]]);
+    unsigned ordinal = 0, selected = 0;
+    for (unsigned i = 0; i < t.count; i++) {
+        t.selected += t.pick[i]; t.focused += t.focus[i];
+        CHECK(!t.focus[i] || t.pick[i]);
+        if (family == 2 || !(family == 1 ? t.focus[i] : t.pick[i])) continue;
+        if (ordinal++ % shards != shard) continue;
+        for (unsigned outcome = 0; outcome < 2; outcome++) {
+            public_replay(heads, observed, &t, NULL, i, outcome, &retained);
+            selected++;
+        }
+    }
+    if (family != 2) {
+        CHECK(ordinal == (family == 1 ? t.focused : t.selected));
+        CHECK(selected == 2 * (ordinal / shards + (shard < ordinal % shards)));
+    }
+    printf(
+        "public family%u heads%u observer%d shard%u/%u observations%u classes%u transitions%u pairs%u representatives%u focused%u selected%u cuts%u retained_work%u segments%u excluded%u/seed%u/retire%u/owner%u witnesses%u%u%u%u%u%u\n",
+        family, heads, observed, shard, shards, t.count, t.classes,
+        t.transitions,
+        t.pairs, t.selected, t.focused, selected, ordinal, retained,
+        t.segments, t.excluded, t.excluded_seed, t.excluded_retire,
+        t.excluded_owner,
+        previous, candidate, child, receipt, compare, rebind);
+    free(t.public_ordinal); free(pairs); free(t.focus); free(t.pick);
+    free(t.class_id); free(t.keys);
+}
+
 int
 main(int argc, char **argv)
 {
     CHECK(!environment("WIRELOG_JOIN_BATCH_BYTES", "")
         && !environment("WIRELOG_JOIN_BATCH_STRICT", ""));
+    if (argc == 7 && !strcmp(argv[1], "public")) {
+        unsigned family = (unsigned)strtoul(argv[2], NULL, 10);
+        unsigned heads = (unsigned)strtoul(argv[3], NULL, 10);
+        unsigned observed = (unsigned)strtoul(argv[4], NULL, 10);
+        unsigned shard = (unsigned)strtoul(argv[5], NULL, 10);
+        unsigned shards = (unsigned)strtoul(argv[6], NULL, 10);
+        CHECK(family <= 2 && heads >= 1 && heads <= 2 && observed <= 1);
+        run_public(family, heads, observed != 0, shard, shards); return 0;
+    }
     if (argc == 7 && !strcmp(argv[1], "lifecycle")) {
         unsigned family = (unsigned)strtoul(argv[2], NULL, 10);
         unsigned heads = (unsigned)strtoul(argv[3], NULL, 10);
