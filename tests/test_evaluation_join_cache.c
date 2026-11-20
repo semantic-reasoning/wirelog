@@ -236,7 +236,8 @@ static void same_registry(const registry_t *a, const registry_t *b,
     }
 }
 static void
-bind(fixture_t *f, const wl_columnar_eval_private_bindings_t *bindings)
+wl_test_join_cache_bind(fixture_t *f,
+    const wl_columnar_eval_private_bindings_t *bindings)
 {
     CHECK(bindings && bindings->dynamic_entries
         && wl_columnar_session_observed_bindings_authorized(
@@ -254,7 +255,7 @@ context(fixture_t *f)
     wl_columnar_eval_serial_framed_attempt_t *r = NULL;
     CHECK(!wl_columnar_eval_stack_framed_context(s->cleanup_active, s, &r)
         && r->capture_only && r->child_bound && r->private_bindings);
-    bind(f, r->private_bindings);
+    wl_test_join_cache_bind(f, r->private_bindings);
     CHECK(r->child.plan == f->selected &&
         r->child.cursor < f->selected->op_count);
     wl_columnar_filter_context_t *ctx = NULL;
@@ -338,11 +339,11 @@ static void observed(wl_evaluation_control_t *control, unsigned phase,
     if (control != f->active->control) return;
     if (f->reading_selector)
         return;
-    if (phase == 8 && bindings) bind(f, bindings);
+    if (phase == 8 && bindings) wl_test_join_cache_bind(f, bindings);
     if (phase == 44)
         f->occurrence = progress;
     if (phase == 28) {
-        bind(f, bindings);
+        wl_test_join_cache_bind(f, bindings);
         CHECK(f->occurrence < f->selected->op_count);
         f->append_op = &f->selected->ops[f->occurrence];
         f->reading_selector = true;
