@@ -29051,11 +29051,16 @@ col_controlled_step_drive(wl_col_session_t *sess,
 
     for (;;) {
         /* Receipt-only debt belongs to the current relation. Drain it before
-         * consulting the stopped Original or advancing the schedule.  A
-         * refused acknowledgement leaves its debt across public calls, and
-         * this keeps the schedule from advancing until it is drained. */
+         * consulting the stopped Original or advancing the schedule. A refused
+         * acknowledgement leaves its debt across public calls, and this keeps
+         * the schedule from advancing until it is drained. A relation still in
+         * flight from an earlier public call resumes through its host action,
+         * which polls the control and aborts its own frame; the schedule's
+         * poll would end the STEP on a stop with that frame still active, and
+         * checked destruction would then report EBUSY. */
         int schedule_rc = (step->join_cleanup.kind ||
-            step->unary_cleanup.registered || step->terminal_receipt_ack)
+            step->unary_cleanup.registered || step->terminal_receipt_ack ||
+            step->relation_active)
             ? 0 : col_controlled_step_schedule(sess, step);
         if (schedule_rc == EAGAIN &&
             wl_evaluation_control_active_attempt_id(control)

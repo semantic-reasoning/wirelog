@@ -40,8 +40,13 @@
  * are destroyed without a reset. The scan runs its rows within one public
  * call; parked at its first EAGAIN return after the last row, a session
  * refuses wl_session_try_destroy, and after a cancellation its STEP ends and
- * it is destroyed with no reservation left. A cancellation requested from
- * inside a spill read, an injected read fault and governor denials at the
+ * it is destroyed with no reservation left. A resident controlled JOIN, which
+ * a cold one would reuse, and the CONSOLIDATE after it run across many public
+ * calls: a cancellation requested at every EAGAIN return of such a STEP ends
+ * it as cancelled with every reservation returned, or, once requested after
+ * its last poll, lets it complete; a cancelled session is destroyed at once
+ * or, after a reset, STEPs to the uncontrolled image. A cancellation requested
+ * from inside a spill read, an injected read fault and governor denials at the
  * admission points of the attempt are checked the same way, the denials with
  * wl_session_budget_denied, for the projection and the SUM; some SUM denials
  * come after the REDUCE started, and for the SUM a denial after WRITER_END is
@@ -313,7 +318,7 @@ static uint64_t stop_at; /* 1-based checkpoint ordinal; 0 disables. */
 static int stop_mode;    /* 1 cancel, 2 work limit. */
 static bool stop_reduce; /* Count the REDUCE child's checkpoints instead. */
 static bool stop_hit;
-static uint64_t reduce_checkpoints;
+static uint64_t reduce_checkpoints, join_checkpoints;
 static wl_columnar_cold_scan_attempt_phase_t last_phase;
 
 static uint64_t cell_consumed, cell_run;
@@ -394,11 +399,23 @@ reduce_checkpoint(wl_evaluation_control_t *control, unsigned phase,
             WL_EVALUATION_CONTROL_WORK_LIMIT);
 }
 
+/* The controlled JOIN's checkpoints, counted only. */
+static void
+join_checkpoint(wl_evaluation_control_t *control, unsigned phase,
+    uint64_t progress)
+{
+    (void)control;
+    (void)phase;
+    (void)progress;
+    ++join_checkpoints;
+}
+
 static void
 hooks_clear(void)
 {
     checkpoints = 0;
     reduce_checkpoints = 0;
+    join_checkpoints = 0;
     decode_work = 0;
     stop_at = 0;
     stop_mode = 0;
@@ -435,6 +452,8 @@ typedef struct {
                            * MAP before the REDUCE. */
     const char *head;
     const char *head2; /* A second head to compare, or NULL. */
+    const char *right; /* A resident input filled in both sessions. */
+    uint32_t right_width, right_rows;
 } qcase_t;
 
 static int64_t
@@ -1117,6 +1136,75 @@ divergence_case(void)
     CHECK(controlled > raw);
 }
 
+/* ---- parked stops -------------------------------------------------------- */
+
+/* A resident controlled JOIN and the CONSOLIDATE after it run across many
+ * public calls; a cold JOIN would reuse both. A cancellation requested
+ * between two calls, with the relation in flight, ends the STEP as cancelled
+ * and returns every reservation, unless it comes after the STEP's last poll.
+ * The session is then destroyed at once on odd parks; on even ones a reset
+ * and a new STEP match the uncontrolled session. A work limit is reached only
+ * inside a charge, which the stop sweeps cover. */
+#define PARKED_JOIN ".decl c(x:int64,y:int64)\n.decl r(y:int64,z:int64)\n" \
+        ".decl out(x:int64,y:int64,z:int64)\n" \
+        "out(x,y,z) :- c(x,y), r(y,z).\n"
+
+static void
+parked_cancel_case(void)
+{
+    const qcase_t c = {"parked", PARKED_JOIN, "c", 2, 20, "VJC", 0, "out",
+                       NULL, "r", 2, 20};
+    where = "parked_cancel";
+    unsigned stopped = 0, completed = 0;
+    for (unsigned park = 1;; park++) {
+        CHECK(park < 100000);
+        fixture_t f;
+        fixture(&f, PARKED_JOIN);
+        fill(&f, "r", 2, 20, true);
+        fill(&f, "c", 2, 20, true);
+        CHECK(!until_done(f.raw));
+        uint64_t before = reserved(&f);
+        hooks_clear();
+        int rc = EAGAIN;
+        for (unsigned i = 0; i < park && rc == EAGAIN; i++)
+            rc = wl_session_step(f.s);
+        if (rc != EAGAIN) {
+            /* The STEP completed before this park: every park was tried. */
+            CHECK(!rc);
+            expect_heads(&f, &c);
+            fixture_destroy(&f);
+            break;
+        }
+        const int code = WL_EVALUATION_CONTROL_CANCELLED;
+        wl_evaluation_control_request_cancel(f.control);
+        rc = until_done(f.s);
+        if (rc && rc != code)
+            fprintf(stderr, "%s: park %u rc %d\n", where, park, rc);
+        /* A cancellation requested after the STEP's last poll lets it
+         * complete, and so does every later one. */
+        CHECK(!rc || rc == code);
+        if (!rc) {
+            completed++;
+            expect_heads(&f, &c);
+            fixture_destroy(&f);
+            continue;
+        }
+        CHECK(!completed);
+        stopped += join_checkpoints > 0;
+        CHECK(head_rows(f.s, c.head) == 0 && reserved(&f) == before);
+        if (park % 2) {
+            fixture_destroy(&f);
+            continue;
+        }
+        CHECK(!wl_evaluation_control_reset(f.control));
+        CHECK(!until_done(f.s));
+        expect_heads(&f, &c);
+        fixture_destroy(&f);
+    }
+    /* Some stops came after the JOIN had started. */
+    CHECK(stopped > 0);
+}
+
 /* ---- refusals ------------------------------------------------------------ */
 
 typedef struct {
@@ -1351,6 +1439,7 @@ main(void)
 {
     wl_columnar_ops_test_cold_scan_checkpoint = cold_checkpoint;
     wl_columnar_ops_test_reduce_attempt_checkpoint = reduce_checkpoint;
+    wl_columnar_join_test_attempt_checkpoint = join_checkpoint;
     for (size_t i = 0; i < NQCASES; i++) {
         run_qcase(&qcases[i], VIA_SEAL);
         run_qcase(&qcases[i], VIA_LOAD);
@@ -1396,6 +1485,8 @@ main(void)
     }
     mode_refusals();
     parked_callback();
+    parked_cancel_case();
+    wl_columnar_join_test_attempt_checkpoint = NULL;
     printf("evaluation_cold_sources: ok\n");
     return 0;
 }
