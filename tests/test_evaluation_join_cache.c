@@ -53,6 +53,7 @@ typedef struct {
     unsigned builds, reuses, indexed, persistent, private_rows;
     unsigned sources[HEADS], probes[HEADS], gathers[HEADS], rejected;
     unsigned append_reads[HEADS];
+    unsigned output_extent[HEADS];
 } witnesses_t;
 typedef struct {
     wirelog_program_t *program;
@@ -60,6 +61,7 @@ typedef struct {
     profile_t profiles[3]; /* default controlled, private controlled, raw */
     bool compound, left[VALUES][VALUES], right[VALUES][VALUES][2];
     unsigned route, stage, stop_site;
+    unsigned cap;
     bool work_stop, armed, stopped;
     int64_t tag, floating;
     profile_t *active;
@@ -125,6 +127,16 @@ static image_t reference(const fixture_t *f) {
             image.rows[4][x][y] = left_x && f->right[x][y][1];
         }
     return image;
+}
+/* Count the logical first/mirror JOIN pairs before projection DISTINCT. */
+static unsigned first_pairs(const fixture_t *f) {
+    unsigned pairs = 0;
+    for (unsigned x = 1; x < VALUES; ++x)
+        for (unsigned z = 1; z < VALUES; ++z)
+            for (unsigned y = 1; y < VALUES; ++y)
+                for (unsigned flag = 0; flag < 2; ++flag)
+                    pairs += f->left[x][z] && f->right[x][y][flag];
+    return pairs;
 }
 static void content(profile_t *p, const image_t *expected) {
     for (unsigned h = 0; h < HEADS; ++h) {
@@ -394,11 +406,20 @@ static void join(wl_evaluation_control_t *control, unsigned phase,
     fixture_t *f = active;
     if (control != f->active->control) return;
     if (phase != 15 && phase != 28 && phase != 47 && phase != 48 &&
-        phase != 29 &&
+        phase != 29 && phase != 20 &&
         phase != 18 && phase != 44)
         return;
     wl_columnar_filter_context_t *ctx = context(f);
     sources(f, ctx);
+    if (phase == 20) {
+        CHECK(ctx->output && progress == ctx->output->nrows);
+        if (progress > f->seen.output_extent[f->head])
+            f->seen.output_extent[f->head] = (unsigned)progress;
+        if (f->armed && f->cap && progress == f->cap) {
+            CHECK(!f->stage && f->head < 2 && first_pairs(f) == 5);
+            f->stopped = true; /* Observe the real cap; do not inject it. */
+        }
+    }
     if (phase == 15)
         ++f->seen.sources[f->head];
     if (phase == 29)
@@ -678,7 +699,8 @@ protected_step(fixture_t *f)
      * destroying the session needed for the same-input recovery history. */
 }
 static void
-failure(fixture_t *f, const registry_t *before, const image_t *old)
+failure(fixture_t *f, const registry_t *before, const image_t *old,
+    int expected)
 {
     profile_t *p = f->active;
     wl_col_session_t *s = COL_SESSION(p->session);
@@ -688,9 +710,6 @@ failure(fixture_t *f, const registry_t *before, const image_t *old)
     input_image_t left = input_image(p, "left"),
         right = input_image(p, "right");
     f->armed = true;
-    int expected =
-        f->work_stop ? WL_EVALUATION_CONTROL_WORK_LIMIT :
-        WL_EVALUATION_CONTROL_CANCELLED;
     int rc = finish(f, p);
     CHECK(f->stopped && rc == expected && s->pending_input_change);
     f->armed = false;
@@ -706,13 +725,14 @@ failure(fixture_t *f, const registry_t *before, const image_t *old)
     }
     wl_evaluation_control_report_t report, frozen;
     CHECK(!wl_evaluation_control_report(p->control, &report)
-        && report.result == expected && report.stop_reason == expected
+        && report.result == expected
+        && (expected > 0 ? !report.stop_reason : report.stop_reason == expected)
         && report.consumed && !report.cleanup_status
         && !wl_evaluation_control_active_attempt_id(p->control)
         && !s->cleanup_active && !s->cleanup_pending &&
         !s->cleanup_reserved_bytes);
-    /* Actual persistent image construction has started at every selected
-     * site. Its rollback disposes WORK too, unlike retained recursive WORK. */
+    /* These ordinary failures dispose private transactions/readers, including
+     * WORK, unlike the retained recursive WORK case. */
     uint64_t owner[8];
     CHECK(!wl_columnar_session_test_retained_work_owner(s, owner)
         && !owner[0] && !owner[1] && !owner[2]);
@@ -760,7 +780,10 @@ int main(int argc, char **argv) {
         for (unsigned i = 0; i < 6; ++i) if (!strcmp(argv[3], modes[i])) {
                 f.stop_site = i / 2 + 1; f.work_stop = (i % 2) != 0;
             }
-        CHECK(f.stop_site);
+        if (!strncmp(argv[3], "cap", 3) && strlen(argv[3]) == 4
+            && argv[3][3] >= '4' && argv[3][3] <= '6')
+            f.cap = (unsigned)(argv[3][3] - '0');
+        CHECK(f.stop_site || f.cap);
     }
     const char *env[] = {"WIRELOG_DIFF_ENABLED", "WIRELOG_JOIN_BATCH_BYTES",
                          "WIRELOG_JOIN_BATCH_STRICT",
@@ -826,23 +849,53 @@ int main(int argc, char **argv) {
     for (f.stage = 0; f.stage < 7; ++f.stage) {
         script(&f);
         image_t now = reference(&f);
+        if (!f.stage && f.cap) {
+            CHECK(first_pairs(&f) == 5);
+            unsigned distinct = 0;
+            for (unsigned x = 1; x < VALUES; ++x)
+                for (unsigned y = 1; y < VALUES; ++y)
+                    distinct += now.rows[0][x][y];
+            CHECK(distinct == 4);
+            for (unsigned p = 0; p < 3; ++p)
+                COL_SESSION(f.profiles[p].session)->join_output_limit = f.cap;
+        }
         CHECK(now.rows[0][2][7] && !now.rows[4][2][7]);
         for (unsigned p = 0; p < 3; ++p) {
             registry_t before = registry(&f.profiles[p]);
             watch(&f, p, p < 2);
+            if (!f.stage && f.cap && f.cap < 6) {
+                if (p < 2) {
+                    failure(&f, &before, &old, EOVERFLOW);
+                    CHECK(f.seen.output_extent[f.head] == f.cap);
+                } else {
+                    /* Equal raw policy/status, without a raw rollback claim. */
+                    CHECK(finish(&f, &f.profiles[p]) == EOVERFLOW);
+                    memset(&f.profiles[p].events, 0,
+                        sizeof(f.profiles[p].events));
+                }
+                COL_SESSION(f.profiles[p].session)->join_output_limit = 0;
+                watch(&f, p, p < 2);
+            }
             if (!p && f.stop_site && !f.stopped
                 && f.stage == (f.stop_site == 2 ? 5u : 1u)) {
-                failure(&f, &before, &old);
+                failure(&f, &before, &old, f.work_stop
+                    ? WL_EVALUATION_CONTROL_WORK_LIMIT
+                    : WL_EVALUATION_CONTROL_CANCELLED);
                 watch(&f, p, true);
             }
             CHECK(!finish(&f, &f.profiles[p]));
             if (p < 2)
                 check_work(&f, &before);
+            if (!f.stage && f.cap && p < 2)
+                CHECK(f.seen.output_extent[0] == 5
+                    && f.seen.output_extent[1] == 5);
             watch(&f, p, false);
             if (!p && f.stopped) writers(&f.profiles[p]);
             check_delivery(&f, &f.profiles[p], &old, &now);
             CHECK(!finish(&f, &f.profiles[p]));
             check_delivery(&f, &f.profiles[p], &now, &now);
+            if (!f.stage && f.cap)
+                COL_SESSION(f.profiles[p].session)->join_output_limit = 0;
         }
         old = now;
     }

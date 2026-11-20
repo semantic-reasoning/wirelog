@@ -3524,6 +3524,15 @@ foreach cache_representation : ['scalar', 'inline']
   endforeach
 endforeach
 
+foreach cache_pair : [['scalar', 'observed'], ['scalar', 'plain'],
+                       ['scalar', 'snapshot'], ['inline', 'observed']]
+  foreach cache_cap : ['cap4', 'cap5', 'cap6']
+    test('evaluation_join_cache_' + cache_pair[0] + '_' + cache_pair[1] + '_' + cache_cap,
+         test_evaluation_join_cache_exe, args: cache_pair + [cache_cap],
+         suite: ['unit', 'tsan', 'evaluation_join_hosts'], timeout: 120)
+  endforeach
+endforeach
+
 test_evaluation_materialized_body_exe = executable(
   'test_evaluation_materialized_body', files('test_evaluation_materialized_body.c'),
   c_args: ['-DWL_SESSION_TEST_HOOKS=1'],
