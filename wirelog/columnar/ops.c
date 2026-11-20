@@ -554,6 +554,7 @@ done:
 void (*wl_columnar_ops_test_cold_scan_checkpoint)(wl_evaluation_control_t *,
     const wl_columnar_cold_scan_attempt_t *);
 uint64_t wl_columnar_ops_test_raw_cold_scans;
+uint64_t wl_columnar_ops_test_raw_cold_aggregates;
 #endif
 
 uint32_t
@@ -627,7 +628,8 @@ wl_columnar_ops_cold_scan_attempt_begin(wl_columnar_cold_scan_attempt_t *a,
     col_rel_t **output, wl_evaluation_control_t *control, uint64_t attempt_id)
 {
     if (!a || a->identity || !numeric_owner || !session || !plan ||
-        !plan->ops || begin || end <= begin + 1 || end >= plan->op_count ||
+        !plan->ops || begin || !end || end >= plan->op_count ||
+        (end < 2 && plan->ops[end].op != WL_PLAN_OP_REDUCE) ||
         !output || *output || !control || !attempt_id ||
         !session->base.evaluation_control) return EINVAL;
     memset(a, 0, sizeof(*a));
@@ -690,17 +692,26 @@ wl_columnar_cold_scan_resolve(wl_columnar_cold_scan_attempt_t *a)
     const char *name = a->plan->ops[0].relation_name;
     if (!name) return wl_columnar_cold_scan_fail(a, ENOENT);
     if (!a->cold) return wl_columnar_cold_scan_resolve_name(a, name);
-    if (a->decode_op < a->end) {
+    /* Before a REDUCE the decode runs the prefix twice, once for the scan
+     * and once for the aggregate, and traces each group key and the
+     * operand back through the prefix; the sizing pass counts all three. */
+    bool reduce_end = a->plan->ops[a->end].op == WL_PLAN_OP_REDUCE;
+    uint32_t sized = a->end + (reduce_end ? 1u : 0u);
+    if (a->decode_op < sized) {
         const wl_plan_op_t *op = &a->plan->ops[a->decode_op];
-        uint64_t lanes = op->op == WL_PLAN_OP_MAP ? op->project_count : 1u;
+        bool reduce = op->op == WL_PLAN_OP_REDUCE;
+        uint64_t lanes = op->op == WL_PLAN_OP_MAP ? op->project_count
+            : reduce ? (uint64_t)op->group_by_count + 1u : 1u;
         int rc = wl_columnar_cold_scan_charge(a, 1u + (lanes <
                 WL_EVALUATION_CONTROL_QUANTUM ? lanes :
                 WL_EVALUATION_CONTROL_QUANTUM));
         if (rc) return wl_columnar_cold_scan_fail(a, rc);
         /* Larger lane counts are charged through the prepayment below. */
         uint64_t cost = 1u + a->end, lane_cost = 1u + a->end;
-        for (uint64_t i = 0; op->op == WL_PLAN_OP_MAP && i < lanes; i++) {
-            uint64_t bytes = op->map_expr_count && i < op->map_expr_count
+        for (uint64_t i = 0; (op->op == WL_PLAN_OP_MAP || reduce) &&
+            i < lanes; i++) {
+            uint64_t bytes = reduce ? (i ? 0u : op->agg_expr.size)
+                : op->map_expr_count && i < op->map_expr_count
                 ? op->map_exprs[i].size : 0u;
             if (!wl_columnar_memory_size_add(cost, lane_cost, &cost) ||
                 !wl_columnar_memory_size_add(cost, bytes, &cost))
@@ -708,6 +719,9 @@ wl_columnar_cold_scan_resolve(wl_columnar_cold_scan_attempt_t *a)
         }
         if (lanes > WL_EVALUATION_CONTROL_QUANTUM &&
             !wl_columnar_memory_size_add(cost, lanes, &cost))
+            return wl_columnar_cold_scan_fail(a, EOVERFLOW);
+        if (reduce_end && !reduce &&
+            !wl_columnar_memory_size_add(cost, cost, &cost))
             return wl_columnar_cold_scan_fail(a, EOVERFLOW);
         if (!wl_columnar_memory_size_add(a->decode_work, cost,
             &a->decode_work))
@@ -728,9 +742,11 @@ wl_columnar_cold_scan_resolve(wl_columnar_cold_scan_attempt_t *a)
     if (a->cold->state == WL_COLUMNAR_COLD_LOADING ||
         !wl_columnar_eval_plan_cold_scan_decode(a->plan, a->cold->name,
         a->cold->ncols, wl_columnar_session_cold_types(a->cold), a->end,
-        &a->decoded) || !a->decoded.map)
+        &a->decoded) || (!a->decoded.map && !reduce_end))
         return wl_columnar_cold_scan_fail(a, ENOTSUP);
-    a->width = a->decoded.map->project_count;
+    /* Without a MAP, which only a REDUCE admits, the output is the source
+     * row. */
+    a->width = a->decoded.map ? a->decoded.map->project_count : a->cold->ncols;
     uint64_t bytes, predicate_bytes;
     if (!a->width ||
         !wl_columnar_memory_size_mul(a->width,
@@ -1191,8 +1207,12 @@ wl_columnar_ops_cold_aggregate(const wl_plan_relation_t *plan,
     if (!cold || !wl_columnar_eval_plan_cold_aggregate_decode(plan, cold->name,
         cold->ncols, wl_columnar_session_cold_types(cold),
         &decoded)) return ENOTSUP;
-    /* No controlled route runs a cold aggregate (#2301). */
+    /* Unmetered: a controlled session scans the cold input with the cold
+     * scan attempt and runs the controlled REDUCE over its output (#2301). */
     if (sess->base.evaluation_control) return ENOTSUP;
+#ifdef WL_SESSION_TEST_HOOKS
+    ++wl_columnar_ops_test_raw_cold_aggregates;
+#endif
     const wl_plan_op_t *reduce = &plan->ops[decoded.reduce_index];
     uint32_t group_count = reduce->group_by_count,
         output_cols = group_count + 1;

@@ -5,52 +5,79 @@
  * store and JOIN caps, get the same rows, and seal the same input or load it
  * through begin/append/finish. The controlled STEP reads the cold binding
  * through the composed cold scan attempt; the test checks for every admitted
- * case that the attempt's checkpoint fired, that the unmetered raw cold scan
- * did not run, and that both sessions hold the same head image after a first
- * and a second STEP.
+ * case that the attempt's checkpoint fired, that neither the unmetered raw
+ * cold scan nor the raw cold aggregate ran, and that both sessions hold the
+ * same head image after a first and a second STEP.
  *
- * The one admitted shape is VARIABLE over the cold input, a direct MAP/FILTER
- * prefix with at least one MAP, then the rule's final CONSOLIDATE; each case
- * asserts its plan's op order. The parsed corpus has one and two FILTERs
- * before the MAP, an empty input, an input every row of which is filtered
- * out, 70-column rows, with one and with two FILTERs, STRING lanes from
- * program facts, and a second stratum that reads the head. The planner puts
- * every FILTER before the MAP, so a FILTER after a permuting MAP comes from a
- * plan the test edits; its image is also compared with an uncontrolled
- * session that keeps the input resident.
+ * Two shapes are admitted, each case asserting its plan's op order. VARIABLE
+ * over the cold input, a direct MAP/FILTER prefix with at least one MAP, then
+ * the rule's final CONSOLIDATE: the corpus has one and two FILTERs before the
+ * MAP, an empty input, an input every row of which is filtered out, 70-column
+ * rows, with one and with two FILTERs, STRING lanes from program facts, and a
+ * second stratum that reads the head. The planner puts every FILTER before the
+ * MAP, so a FILTER after a permuting MAP comes from a plan the test edits; its
+ * image is also compared with an uncontrolled session that keeps the input
+ * resident. And VARIABLE, a direct MAP/FILTER prefix, possibly empty, then a
+ * REDUCE that the uncontrolled cold aggregate admits and the final
+ * CONSOLIDATE; the scan's output then feeds the controlled REDUCE, whose
+ * checkpoint the test also requires. The corpus has a grouped COUNT and MIN, a
+ * MAX in the head's first column, a scalar COUNT over 6, 20 and 200 rows, a
+ * scalar SUM over an empty input, a scalar COUNT over an input every row of
+ * which is filtered out, a FILTER before a grouped SUM over 6 and 20 rows and
+ * before a grouped COUNT, a STRING group key from program facts, and, from an
+ * edited plan, a permuting MAP before a grouped SUM, compared also with the
+ * resident input.
  *
- * Stops: for every cold scan checkpoint k of a calibrated run, a
- * cancellation and a work-limit stop at k on a first STEP, on the seal and
- * on the loading route and for 70-column rows. Each lands at k, returns the
- * stop code with a report naming it, publishes no head, returns the governor
- * to its value before the STEP, and after a reset STEP returns 0 with the
- * uncontrolled image. Some of the cancelled sessions are destroyed without a
- * reset. The scan runs its rows within one public call; parked at its first
- * EAGAIN return after the last row, a session refuses wl_session_try_destroy,
- * and after a cancellation its STEP ends and it is destroyed with no
- * reservation left. A cancellation requested from inside a spill read, an
- * injected read fault and governor denials at the admission points of the
- * attempt are checked the same way, the denials with wl_session_budget_denied.
- * The consumed work of a full STEP is pinned for a fixed input on both routes,
- * and a limit one unit below it stops the STEP. Within the rows no action
- * evaluates more than 64 cells, and no resolution action charges more than
- * 257 units.
+ * Stops: for every cold scan checkpoint k of a calibrated run, a cancellation
+ * and a work-limit stop at k on a first STEP: for the projection on the seal
+ * and on the loading route and for 70-column rows, and for a filtered grouped
+ * SUM on the seal route. For every checkpoint of the controlled REDUCE that
+ * follows the scan, the same stops for a filtered grouped SUM over six rows on
+ * the seal route and a scalar COUNT over six rows on the loading route. Each
+ * lands at k, returns the stop code with a report naming it, publishes no
+ * head, returns the governor to its value before the STEP, and after a reset
+ * STEP returns 0 with the uncontrolled image. Some of the cancelled sessions
+ * are destroyed without a reset. The scan runs its rows within one public
+ * call; parked at its first EAGAIN return after the last row, a session
+ * refuses wl_session_try_destroy, and after a cancellation its STEP ends and
+ * it is destroyed with no reservation left. A cancellation requested from
+ * inside a spill read, an injected read fault and governor denials at the
+ * admission points of the attempt are checked the same way, the denials with
+ * wl_session_budget_denied, for the projection and the SUM; some SUM denials
+ * come after the REDUCE started, and for the SUM a denial after WRITER_END is
+ * not told apart from those. For every admitted case the first STEP prepays
+ * exactly the resolution work that a closed form over the plan's prefix and
+ * REDUCE gives. A full STEP of either case consumes the same work on the seal
+ * and the loading route, and a limit one unit below it stops the STEP. Within
+ * the rows no action evaluates more than 64 cells, and no resolution action
+ * charges more than 257 units.
+ *
+ * Aggregates also: a SUM that overflows returns ERANGE on both sessions on
+ * both routes, publishes nothing and returns the governor to its value
+ * before the STEP. The controlled route reads every row before its REDUCE
+ * starts, so a read fault injected after the reads of the uncontrolled
+ * route, which stops at the overflowing row, returns EIO controlled while
+ * the uncontrolled STEP returns ERANGE. And the least free memory at which a
+ * scalar COUNT over 200 rows succeeds is larger controlled than
+ * uncontrolled: the scan's output is held beside the REDUCE's state.
  *
  * Refusals: seal and begin return WL_COLUMNAR_SPILL_UNSUPPORTED under
  * control, and WL_COLUMNAR_SPILL_OK uncontrolled, for a cold input read as a
  * JOIN right input or by a self-JOIN, a VARIABLE/JOIN pair without a MAP, a
- * FILTER prefix before a JOIN, a COUNT, a two-EDB single-rule projection, a
- * head that is also an EDB, and a registry that a successor STEP would find
- * larger than three relations. A controlled SNAPSHOT returns ENOTSUP and a
- * STEP with a delta callback set returns ENOTSUP. A STEP after a callback was
- * set and cleared following a completed STEP completes without an attempt,
- * the inputs being frozen; a callback set while an attempt is parked is
- * ignored, as in a resident controlled session.
+ * FILTER prefix before a JOIN, a COUNT over a JOIN, a two-EDB single-rule
+ * projection, a head that is also an EDB, with a projection and with a
+ * COUNT, and a registry that a successor STEP would find larger than three
+ * relations. A controlled SNAPSHOT returns ENOTSUP and a STEP with a delta
+ * callback set returns ENOTSUP. A STEP after a callback was set and cleared
+ * following a completed STEP completes without an attempt, the inputs being
+ * frozen; a callback set while an attempt is parked is ignored, as in a
+ * resident controlled session.
  *
  * Not checked here: more than one worker; an observed STEP or an observed
- * SNAPSHOT over a cold source, both refused; a JOIN or an aggregate over a
- * cold input, refused; the loading calls under the control, which neither
- * meters nor cancels them. */
+ * SNAPSHOT over a cold source, both refused; a JOIN over a cold input,
+ * refused; a MAP whose lanes, or a REDUCE whose group keys and operand, exceed
+ * one quantum of resolution lanes; the loading calls under the control, which
+ * neither meters nor cancels them. */
 #include "../wirelog/columnar/internal.h"
 #include "../wirelog/exec_plan_gen.h"
 #include "../wirelog/session.h"
@@ -72,6 +99,7 @@ static const char *where = "";
 /* ---- spill fault hooks --------------------------------------------------- */
 
 static unsigned read_fault;
+static uint64_t read_ios; /* Spill reads seen, faulted or not. */
 static bool read_cancel;
 static wl_evaluation_control_t *read_cancel_control;
 
@@ -90,6 +118,7 @@ wl_columnar_spill_test_io(bool writing, uint64_t offset, size_t *length)
         read_cancel = false;
         wl_evaluation_control_request_cancel(read_cancel_control);
     }
+    ++read_ios;
     if (read_fault && --read_fault == 0) return EIO;
     return 0;
 }
@@ -110,9 +139,11 @@ typedef struct {
 /* Set before fixture(): edit the first rule from VARIABLE, FILTER,
  * MAP[2,0], CONSOLIDATE to VARIABLE, MAP[1,2,0], FILTER, MAP[1,2],
  * CONSOLIDATE. The FILTER's column col2 then names the source's col0. */
-static bool plan_edit;
+static int plan_edit; /* 1 FILTER after MAP, 2 MAP before REDUCE. */
 static wl_plan_op_t edited_ops[5];
 static uint32_t edit_permute[3] = {1, 2, 0}, edit_project[2] = {1, 2};
+static uint32_t edit_swap[2] = {1, 0}, edit_group[1] = {1};
+static uint8_t reduce_expr[7]; /* VAR, length 4, "col0". */
 
 #define BUDGET (UINT64_C(4) * 1024 * 1024)
 
@@ -159,6 +190,32 @@ fixture(fixture_t *f, const char *text)
     f->governor = wl_columnar_memory_governor_ref_create(&resolution);
     CHECK(f->governor);
     CHECK(!wl_evaluation_control_create(UINT64_C(1000000000), &f->control));
+    if (plan_edit == 2) {
+        /* VARIABLE, REDUCE(group col0, sum col1), CONSOLIDATE becomes
+         * VARIABLE, MAP[1,0], REDUCE(group col1, sum col0), CONSOLIDATE. */
+        wl_plan_relation_t *rp =
+            (wl_plan_relation_t *)&f->plan->strata[0].relations[0];
+        CHECK(rp->op_count == 3 && rp->ops[1].op == WL_PLAN_OP_REDUCE &&
+            rp->ops[1].group_by_count == 1 &&
+            rp->ops[1].group_by_indices[0] == 0 &&
+            rp->ops[1].agg_expr.size == sizeof(reduce_expr) &&
+            !memcmp(rp->ops[1].agg_expr.data + 3, "col1", 4));
+        f->saved_ops = rp->ops;
+        f->saved_count = rp->op_count;
+        memcpy(reduce_expr, rp->ops[1].agg_expr.data, sizeof(reduce_expr));
+        reduce_expr[6] = '0';
+        edited_ops[0] = rp->ops[0];
+        edited_ops[1] = (wl_plan_op_t){.op = WL_PLAN_OP_MAP,
+                                       .project_count = 2,
+                                       .project_indices = edit_swap};
+        edited_ops[2] = rp->ops[1];
+        edited_ops[2].group_by_indices = edit_group;
+        edited_ops[2].agg_expr.data = reduce_expr;
+        edited_ops[3] = rp->ops[2];
+        rp->ops = edited_ops;
+        rp->op_count = 4;
+        plan_edit = 0;
+    }
     if (plan_edit) {
         /* The plan is the test's own: edit it before any session reads it. */
         wl_plan_relation_t *rp =
@@ -179,7 +236,7 @@ fixture(fixture_t *f, const char *text)
         edited_ops[4] = rp->ops[3];
         rp->ops = edited_ops;
         rp->op_count = 5;
-        plan_edit = false;
+        plan_edit = 0;
     }
     f->s = spill_session(f, f->control);
     f->raw = spill_session(f, NULL);
@@ -254,7 +311,9 @@ image_equal(const image_t *a, const image_t *b)
 static uint64_t checkpoints;
 static uint64_t stop_at; /* 1-based checkpoint ordinal; 0 disables. */
 static int stop_mode;    /* 1 cancel, 2 work limit. */
+static bool stop_reduce; /* Count the REDUCE child's checkpoints instead. */
 static bool stop_hit;
+static uint64_t reduce_checkpoints;
 static wl_columnar_cold_scan_attempt_phase_t last_phase;
 
 static uint64_t cell_consumed, cell_run;
@@ -281,6 +340,7 @@ cell_bound(wl_evaluation_control_t *control,
 
 static uint64_t resolve_consumed;
 static bool resolve_seen;
+static uint64_t decode_work; /* Prepaid resolution work, seen at SCRATCH. */
 
 /* Each resolution action, a name byte run, a sizing step or a prepayment,
  * charges at most one quantum plus the sizing step's own unit: consecutive
@@ -310,7 +370,24 @@ cold_checkpoint(wl_evaluation_control_t *control,
         cell_bound(control, a);
         resolve_bound(control, a);
     }
-    if (++checkpoints != stop_at || !stop_mode) return;
+    if (a->phase == WL_COLUMNAR_COLD_SCAN_ATTEMPT_SCRATCH)
+        decode_work = a->decode_work;
+    if (++checkpoints != stop_at || !stop_mode || stop_reduce) return;
+    stop_hit = true;
+    if (stop_mode == 1) wl_evaluation_control_request_cancel(control);
+    else CHECK(wl_evaluation_control_charge(control, UINT64_MAX) ==
+            WL_EVALUATION_CONTROL_WORK_LIMIT);
+}
+
+/* The controlled REDUCE that consumes the scan's output (#2301). */
+static void
+reduce_checkpoint(wl_evaluation_control_t *control, unsigned phase,
+    uint64_t progress)
+{
+    (void)phase;
+    (void)progress;
+    if (++reduce_checkpoints != stop_at || !stop_mode || !stop_reduce)
+        return;
     stop_hit = true;
     if (stop_mode == 1) wl_evaluation_control_request_cancel(control);
     else CHECK(wl_evaluation_control_charge(control, UINT64_MAX) ==
@@ -321,6 +398,8 @@ static void
 hooks_clear(void)
 {
     checkpoints = 0;
+    reduce_checkpoints = 0;
+    decode_work = 0;
     stop_at = 0;
     stop_mode = 0;
     stop_hit = false;
@@ -352,7 +431,8 @@ typedef struct {
     uint32_t width;       /* Its declared width; 0 seals program facts. */
     uint32_t rows;        /* Generated rows. */
     const char *ops;      /* Op order of the cold rule: VFMC... */
-    bool edit;            /* Move the FILTER after a permuting MAP. */
+    int edit;             /* 1 FILTER after a permuting MAP, 2 a permuting
+                           * MAP before the REDUCE. */
     const char *head;
     const char *head2; /* A second head to compare, or NULL. */
 } qcase_t;
@@ -492,23 +572,52 @@ wide_program(int filters)
 #define THREE ".decl c(x:int64,y:int64,z:int64)\n.decl out(z:int64,x:int64)\n"
 
 static qcase_t qcases[] = {
-    {"projection", PROJECTION, "c", 2, 20, "VFMC", false, "out", NULL},
+    {"projection", PROJECTION, "c", 2, 20, "VFMC", 0, "out", NULL},
     {"two_filters", THREE "out(z,x) :- c(x,y,z), z < 9, x != 4.\n", "c", 3,
-     20, "VFFMC", false, "out", NULL},
+     20, "VFFMC", 0, "out", NULL},
     {"filter_after_map", THREE "out(z,x) :- c(x,y,z), z < 9.\n", "c", 3, 20,
-     "VMFMC", true, "out", NULL},
-    {"empty", PROJECTION, "c", 2, 0, "VFMC", false, "out", NULL},
+     "VMFMC", 1, "out", NULL},
+    {"empty", PROJECTION, "c", 2, 0, "VFMC", 0, "out", NULL},
     {"all_filtered", ".decl c(x:int64,y:int64)\n.decl out(y:int64)\n"
-     "out(y) :- c(x,y), x > 100.\n", "c", 2, 20, "VFMC", false, "out", NULL},
-    {"wide", NULL, "c", 70, 4, "VFMC", false, "out", NULL},
-    {"wide_two_filters", NULL, "c", 70, 4, "VFFMC", false, "out", NULL},
+     "out(y) :- c(x,y), x > 100.\n", "c", 2, 20, "VFMC", 0, "out", NULL},
+    {"wide", NULL, "c", 70, 4, "VFMC", 0, "out", NULL},
+    {"wide_two_filters", NULL, "c", 70, 4, "VFFMC", 0, "out", NULL},
     {"strings", ".decl c(x:int64,s:symbol)\n.decl out(s:symbol,x:int64)\n"
      "c(1,\"a\"). c(2,\"b\"). c(3,\"c\").\n"
-     "out(s,x) :- c(x,s), x > 1.\n", "c", 0, 0, "VFMC", false, "out", NULL},
+     "out(s,x) :- c(x,s), x > 1.\n", "c", 0, 0, "VFMC", 0, "out", NULL},
     {"second_stratum", ".decl c(x:int64,y:int64)\n"
      ".decl out(y:int64,x:int64)\n.decl top(x:int64)\n"
      "out(y,x) :- c(x,y), x > 1.\ntop(x) :- out(y,x).\n", "c", 2,
-     20, "VFMC", false, "out", "top"},
+     20, "VFMC", 0, "out", "top"},
+#define AGG ".decl c(x:int64,y:int64)\n"
+    {"count_grouped", AGG ".decl out(x:int64,n:int64)\n"
+     "out(x,count(y)) :- c(x,y).\n", "c", 2, 20, "VRC", 0, "out", NULL},
+    {"sum_filtered", AGG ".decl out(x:int64,n:int64)\n"
+     "out(x,sum(y)) :- c(x,y), x > 1.\n", "c", 2, 20, "VFRC", 0, "out", NULL},
+    {"min_grouped", AGG ".decl out(x:int64,n:int64)\n"
+     "out(x,min(y)) :- c(x,y).\n", "c", 2, 20, "VRC", 0, "out", NULL},
+    {"max_swapped", AGG ".decl out(n:int64,y:int64)\n"
+     "out(max(x),y) :- c(x,y).\n", "c", 2, 20, "VRC", 0, "out", NULL},
+    {"count_scalar", AGG ".decl out(n:int64)\n"
+     "out(count(y)) :- c(x,y).\n", "c", 2, 20, "VRC", 0, "out", NULL},
+    {"sum_scalar_empty", AGG ".decl out(n:int64)\n"
+     "out(sum(y)) :- c(x,y).\n", "c", 2, 0, "VRC", 0, "out", NULL},
+    {"sum_few", AGG ".decl out(x:int64,n:int64)\n"
+     "out(x,sum(y)) :- c(x,y), x > 1.\n", "c", 2, 6, "VFRC", 0, "out", NULL},
+    {"count_few", AGG ".decl out(n:int64)\n"
+     "out(count(y)) :- c(x,y).\n", "c", 2, 6, "VRC", 0, "out", NULL},
+    {"count_many", AGG ".decl out(n:int64)\n"
+     "out(count(y)) :- c(x,y).\n", "c", 2, 200, "VRC", 0, "out", NULL},
+    {"string_key", ".decl c(s:symbol,y:int64)\n.decl out(s:symbol,n:int64)\n"
+     "c(\"a\",1). c(\"b\",2). c(\"a\",3).\n"
+     "out(s,sum(y)) :- c(s,y).\n", "c", 0, 0, "VRC", 0, "out", NULL},
+    {"filter_reduce", THREE "out(z,count(x)) :- c(x,y,z), y > 2.\n",
+     "c", 3, 20, "VFRC", 0, "out", NULL},
+    {"map_before_reduce", AGG ".decl out(x:int64,n:int64)\n"
+     "out(x,sum(y)) :- c(x,y).\n", "c", 2, 20, "VMRC", 2, "out", NULL},
+    {"count_all_filtered", AGG ".decl out(n:int64)\n"
+     "out(count(y)) :- c(x,y), x > 100.\n", "c", 2, 20, "VFRC", 0, "out",
+     NULL},
 };
 
 #define NQCASES (sizeof(qcases) / sizeof(qcases[0]))
@@ -542,6 +651,7 @@ expect_ops(const fixture_t *f, const qcase_t *c)
         case WL_PLAN_OP_MAP: got[i] = 'M'; break;
         case WL_PLAN_OP_FILTER: got[i] = 'F'; break;
         case WL_PLAN_OP_CONSOLIDATE: got[i] = 'C'; break;
+        case WL_PLAN_OP_REDUCE: got[i] = 'R'; break;
         default: got[i] = '?'; break;
         }
     }
@@ -558,6 +668,35 @@ set_where(const qcase_t *c, via_t via, const char *what)
     snprintf(where_buf, sizeof(where_buf), "%s/%s/%s", c->name,
         via == VIA_SEAL ? "seal" : "load", what);
     where = where_buf;
+}
+
+/* The resolution prepayment, from the plan, with u = end + 1: each prefix
+ * op costs u plus, for a MAP, u and its expression bytes per lane; before a
+ * REDUCE every prefix op is counted twice, and the REDUCE costs u, u per
+ * group key, u for the operand, and its expression bytes. */
+static uint64_t
+expected_decode_work(const fixture_t *f)
+{
+    const wl_plan_relation_t *rp = &f->plan->strata[0].relations[0];
+    uint32_t end = 1;
+    while (end < rp->op_count && (rp->ops[end].op == WL_PLAN_OP_MAP ||
+        rp->ops[end].op == WL_PLAN_OP_FILTER)) end++;
+    bool reduce = rp->ops[end].op == WL_PLAN_OP_REDUCE;
+    uint64_t unit = 1u + end, total = 0;
+    for (uint32_t i = 1; i <= end; i++) {
+        const wl_plan_op_t *op = &rp->ops[i];
+        if (i == end && !reduce) break;
+        uint64_t cost = unit;
+        if (op->op == WL_PLAN_OP_MAP) {
+            for (uint32_t l = 0; l < op->project_count; l++)
+                cost += unit + (l < op->map_expr_count ?
+                    op->map_exprs[l].size : 0u);
+        } else if (op->op == WL_PLAN_OP_REDUCE) {
+            cost += unit * (op->group_by_count + 1u) + op->agg_expr.size;
+        }
+        total += i == end ? cost : reduce ? 2u * cost : cost;
+    }
+    return total;
 }
 
 /* Admitted case: a first and a second STEP, both sessions equal. */
@@ -581,10 +720,18 @@ run_qcase(const qcase_t *c, via_t via)
     CHECK(!until_done(f.raw));
     for (int round = 0; round < 2; round++) {
         uint64_t raw = wl_columnar_ops_test_raw_cold_scans;
+        uint64_t raw_aggregates = wl_columnar_ops_test_raw_cold_aggregates;
         hooks_clear();
         CHECK(!until_done(f.s));
         CHECK(round || checkpoints > 0);
+        CHECK(round || !strchr(c->ops, 'R') || reduce_checkpoints > 0);
+        if (!round && decode_work != expected_decode_work(&f))
+            fprintf(stderr, "%s: decode work %llu, want %llu\n", where,
+                (unsigned long long)decode_work,
+                (unsigned long long)expected_decode_work(&f));
+        CHECK(round || decode_work == expected_decode_work(&f));
         CHECK(wl_columnar_ops_test_raw_cold_scans == raw);
+        CHECK(wl_columnar_ops_test_raw_cold_aggregates == raw_aggregates);
         if (round) CHECK(!until_done(f.raw));
         expect_heads(&f, c);
     }
@@ -609,23 +756,24 @@ run_qcase(const qcase_t *c, via_t via)
 /* ---- stops --------------------------------------------------------------- */
 
 static uint64_t
-calibrate(const qcase_t *c, via_t via)
+calibrate(const qcase_t *c, via_t via, bool reduce)
 {
     fixture_t f;
     fixture(&f, case_text(c));
     prepare(&f, c, via);
     hooks_clear();
     CHECK(!until_done(f.s));
-    uint64_t n = checkpoints;
+    uint64_t n = reduce ? reduce_checkpoints : checkpoints;
     fixture_destroy(&f);
     return n;
 }
 
 static void
-stop_case(const qcase_t *c, via_t via, int mode)
+stop_case(const qcase_t *c, via_t via, int mode, bool reduce)
 {
-    set_where(c, via, mode == 1 ? "cancel" : "work");
-    uint64_t n = calibrate(c, via);
+    set_where(c, via, mode == 1 ? reduce ? "reduce_cancel" : "cancel"
+        : reduce ? "reduce_work" : "work");
+    uint64_t n = calibrate(c, via, reduce);
     CHECK(n > 0);
     for (uint64_t k = 1; k <= n; k++) {
         fixture_t f;
@@ -636,10 +784,12 @@ stop_case(const qcase_t *c, via_t via, int mode)
         hooks_clear();
         stop_at = k;
         stop_mode = mode;
+        stop_reduce = reduce;
         int rc = until_done(f.s);
+        stop_reduce = false;
         CHECK(stop_hit);
         /* The control is polled at the checkpoint itself: none follows. */
-        CHECK(checkpoints == k);
+        CHECK((reduce ? reduce_checkpoints : checkpoints) == k);
         int code = mode == 1 ? WL_EVALUATION_CONTROL_CANCELLED
             : WL_EVALUATION_CONTROL_WORK_LIMIT;
         if (rc != code)
@@ -675,9 +825,8 @@ stop_case(const qcase_t *c, via_t via, int mode)
  * refuses checked destruction; after a cancellation the STEP ends and the
  * session is destroyed with every reservation returned. */
 static void
-parked_destroy_case(void)
+parked_destroy_case(const qcase_t *c)
 {
-    const qcase_t *c = find_qcase("wide");
     set_where(c, VIA_LOAD, "parked_destroy");
     fixture_t f;
     fixture(&f, case_text(c));
@@ -700,9 +849,8 @@ parked_destroy_case(void)
 
 /* A cancellation the control first sees inside a spill read. */
 static void
-read_cancel_case(void)
+read_cancel_case(const qcase_t *c)
 {
-    const qcase_t *c = find_qcase("projection");
     set_where(c, VIA_LOAD, "read_cancel");
     fixture_t f;
     fixture(&f, case_text(c));
@@ -724,9 +872,8 @@ read_cancel_case(void)
 }
 
 static void
-read_fault_case(void)
+read_fault_case(const qcase_t *c)
 {
-    const qcase_t *c = find_qcase("projection");
     set_where(c, VIA_LOAD, "read_fault");
     fixture_t f;
     fixture(&f, case_text(c));
@@ -749,7 +896,7 @@ static void
 denial_case(const qcase_t *c, via_t via)
 {
     set_where(c, via, "denial");
-    unsigned phases = 0, denials = 0, passes = 0;
+    unsigned phases = 0, denials = 0, passes = 0, reduce_denials = 0;
     for (uint64_t room = 0; room <= UINT64_C(256) * 1024 && !passes;
         room += 64) {
         fixture_t f;
@@ -779,10 +926,17 @@ denial_case(const qcase_t *c, via_t via)
         CHECK(wl_session_budget_denied(f.s));
         CHECK(head_rows(f.s, c->head) == 0);
         CHECK(reserved(&f) == BUDGET - room);
-        if (checkpoints) {
+        /* A denial after the scan, at its output's install, in the REDUCE
+         * or in the CONSOLIDATE, leaves the scan's last checkpoint behind. */
+        if (checkpoints && !strchr(c->ops, 'R')) {
+            denials++;
+            phases |= 1u << (unsigned)last_phase;
+        } else if (checkpoints && !reduce_checkpoints &&
+            last_phase != WL_COLUMNAR_COLD_SCAN_ATTEMPT_WRITER_END) {
             denials++;
             phases |= 1u << (unsigned)last_phase;
         }
+        if (reduce_checkpoints) reduce_denials++;
         CHECK(wl_columnar_memory_release(&blocker));
         CHECK(!wl_evaluation_control_reset(f.control));
         CHECK(!until_done(f.s));
@@ -792,25 +946,29 @@ denial_case(const qcase_t *c, via_t via)
     CHECK(passes == 1);
     /* The last checkpoint before each denial names the action it stopped:
      * scratch, output, reader, the writer's drain after WRITER_END, and on
-     * the loading route a row read that loads a segment. */
+     * the loading route a row read that loads a segment. Before a REDUCE a
+     * denial after WRITER_END is not told apart from the later ones, so
+     * WRITER_END is not required there. */
+    bool reduce = strchr(c->ops, 'R') != NULL;
     unsigned want = 1u << WL_COLUMNAR_COLD_SCAN_ATTEMPT_SCRATCH |
         1u << WL_COLUMNAR_COLD_SCAN_ATTEMPT_OUTPUT_CREATE |
         1u << WL_COLUMNAR_COLD_SCAN_ATTEMPT_READER |
-        1u << WL_COLUMNAR_COLD_SCAN_ATTEMPT_WRITER_END |
+        (reduce ? 0u : 1u << WL_COLUMNAR_COLD_SCAN_ATTEMPT_WRITER_END) |
         (via == VIA_LOAD ? 1u << WL_COLUMNAR_COLD_SCAN_ATTEMPT_ROWS : 0u);
     if ((phases & want) != want)
         fprintf(stderr, "%s: denials %u phases %#x\n", where, denials,
             phases);
     CHECK(denials && (phases & want) == want);
+    /* Before a REDUCE some denials come after the REDUCE started. */
+    CHECK(!reduce || reduce_denials);
 }
 
 /* A full STEP consumes the same work on both routes, and one unit less
  * stops it.  The total itself differs between toolchains (582040 with gcc
  * and clang on Linux, 568600 with MSVC), so it is not pinned. */
 static uint64_t
-exact_case(via_t via)
+exact_case(const qcase_t *c, via_t via)
 {
-    const qcase_t *c = find_qcase("projection");
     set_where(c, via, "exact");
     fixture_t f;
     fixture(&f, case_text(c));
@@ -831,6 +989,132 @@ exact_case(via_t via)
     CHECK(!until_done(f.s));
     fixture_destroy(&f);
     return expected;
+}
+
+/* ---- aggregates ---------------------------------------------------------- */
+
+/* Rows of the overflow case: a group whose SUM overflows at its second row,
+ * then rows of another group. */
+#define OVERFLOW_ROWS 12u
+
+static void
+overflow_row(uint32_t i, int64_t row[2])
+{
+    row[0] = i < 2 ? 1 : 2;
+    row[1] = i == 0 ? INT64_MAX : i == 1 ? 1 : (int64_t)i;
+}
+
+static wl_columnar_spill_status_t
+overflow_load(wl_session_t *s)
+{
+    wl_columnar_spill_status_t st = wl_columnar_session_begin_cold_input(s,
+            "c");
+    for (uint32_t i = 0; st == WL_COLUMNAR_SPILL_OK && i < OVERFLOW_ROWS;
+        i += 3) {
+        int64_t chunk[6];
+        for (uint32_t r = 0; r < 3; r++)
+            overflow_row(i + r, &chunk[2 * r]);
+        st = wl_columnar_session_append_cold_input(s, "c", chunk, 3, 2);
+    }
+    return st == WL_COLUMNAR_SPILL_OK ?
+           wl_columnar_session_finish_cold_input(s, "c") : st;
+}
+
+/* SUM overflow returns ERANGE on both sessions and publishes nothing. The
+ * controlled route reads every row before its REDUCE starts, the
+ * uncontrolled one stops at the overflowing row: a read fault after that
+ * row returns EIO only on the controlled route. */
+static void
+overflow_case(via_t via, bool fault)
+{
+    snprintf(where_buf, sizeof(where_buf), "overflow/%s%s",
+        via == VIA_SEAL ? "seal" : "load", fault ? "/fault" : "");
+    where = where_buf;
+    fixture_t f;
+    fixture(&f, AGG ".decl out(x:int64,n:int64)\n"
+        "out(x,sum(y)) :- c(x,y).\n");
+    if (via == VIA_SEAL) {
+        for (uint32_t i = 0; i < OVERFLOW_ROWS; i++) {
+            int64_t row[2];
+            overflow_row(i, row);
+            CHECK(!wl_session_insert(f.s, "c", row, 1, 2));
+            CHECK(!wl_session_insert(f.raw, "c", row, 1, 2));
+        }
+        CHECK(wl_columnar_session_seal_join_input(f.raw, "c", NULL, NULL) ==
+            WL_COLUMNAR_SPILL_OK);
+        CHECK(wl_columnar_session_seal_join_input(f.s, "c", NULL, NULL) ==
+            WL_COLUMNAR_SPILL_OK);
+    } else {
+        CHECK(overflow_load(f.raw) == WL_COLUMNAR_SPILL_OK);
+        CHECK(overflow_load(f.s) == WL_COLUMNAR_SPILL_OK);
+    }
+    registry_hash(&f);
+    uint64_t before = reserved(&f);
+    read_ios = 0;
+    CHECK(until_done(f.raw) == ERANGE);
+    uint64_t raw_reads = read_ios;
+    CHECK(head_rows(f.raw, "out") == 0);
+    if (fault) read_fault = (unsigned)raw_reads + 1;
+    hooks_clear();
+    int rc = until_done(f.s);
+    if (fault) {
+        CHECK(!read_fault);
+        CHECK(rc == EIO);
+    } else {
+        CHECK(rc == ERANGE && reduce_checkpoints > 0);
+    }
+    CHECK(head_rows(f.s, "out") == 0 && reserved(&f) == before);
+    CHECK(!wl_evaluation_control_reset(f.control));
+    CHECK(until_done(f.s) == ERANGE);
+    fixture_destroy(&f);
+}
+
+/* The minimum free bytes at which a STEP of one session succeeds. */
+static uint64_t
+least_room(const qcase_t *c, bool controlled, uint64_t step)
+{
+    for (uint64_t room = 0; room <= UINT64_C(256) * 1024; room += step) {
+        fixture_t f;
+        fixture(&f, case_text(c));
+        prepare(&f, c, VIA_SEAL);
+        uint64_t before = reserved(&f);
+        wl_columnar_memory_reservation_t blocker;
+        wl_columnar_memory_reservation_init(&blocker);
+        CHECK(wl_columnar_memory_reserve(wl_columnar_memory_governor_ref_get(
+                f.governor), BUDGET - before - room, &blocker));
+        wl_session_t *s = controlled ? f.s : f.raw;
+        int rc = until_done(s);
+        CHECK(!rc || rc == ENOSPC);
+        CHECK(rc ? wl_session_budget_denied(s) && head_rows(s, c->head) == 0
+            : !wl_session_budget_denied(s));
+        CHECK(wl_columnar_memory_release(&blocker));
+        if (rc && controlled) {
+            /* As after a work-limit stop, destruction needs a reset. */
+            CHECK(!wl_evaluation_control_reset(f.control));
+            CHECK(!until_done(f.s));
+        }
+        fixture_destroy(&f);
+        if (!rc) return room;
+    }
+    CHECK(false);
+    return 0;
+}
+
+/* The controlled route holds the scan's output, sized from the source rows,
+ * beside the REDUCE state; the uncontrolled cold aggregate streams the rows
+ * into its groups. A budget that admits the uncontrolled STEP can deny the
+ * controlled one. */
+static void
+divergence_case(void)
+{
+    const qcase_t *c = find_qcase("count_many");
+    set_where(c, VIA_SEAL, "divergence");
+    uint64_t raw = least_room(c, false, 256);
+    uint64_t controlled = least_room(c, true, 256);
+    if (controlled <= raw)
+        fprintf(stderr, "%s: raw %llu controlled %llu\n", where,
+            (unsigned long long)raw, (unsigned long long)controlled);
+    CHECK(controlled > raw);
 }
 
 /* ---- refusals ------------------------------------------------------------ */
@@ -855,8 +1139,12 @@ static const refusal_t refusals[] = {
     {"filter_prefix_join", ".decl c(x:int64,y:int64,w:int64)\n"
      ".decl r(y:int64,z:int64)\n.decl out(x:int64,z:int64)\n"
      "out(x,z) :- c(x,y,w), w = 7, r(y,z).\n", "c", 3, false},
-    {"count", ".decl c(x:int64,y:int64)\n.decl out(x:int64,n:int64)\n"
-     "out(x,count(y)) :- c(x,y).\n", "c", 2, false},
+    {"join_count", ".decl c(x:int64,y:int64)\n.decl r(y:int64,z:int64)\n"
+     ".decl out(x:int64,n:int64)\nout(x,count(z)) :- c(x,y), r(y,z).\n",
+     "c", 2, false},
+    {"head_is_edb_count", ".decl c(x:int64,y:int64)\n"
+     ".decl d(x:int64,n:int64)\nd(9,9).\nd(x,count(y)) :- c(x,y).\n", "c",
+     2, false},
     {"seed_shape", ".decl c(x:int64,y:int64)\n.decl d(x:int64)\n"
      ".decl out(y:int64,x:int64)\nout(y,x) :- c(x,y), x > 1.\n", "c", 2,
      false},
@@ -1062,26 +1350,42 @@ int
 main(void)
 {
     wl_columnar_ops_test_cold_scan_checkpoint = cold_checkpoint;
+    wl_columnar_ops_test_reduce_attempt_checkpoint = reduce_checkpoint;
     for (size_t i = 0; i < NQCASES; i++) {
         run_qcase(&qcases[i], VIA_SEAL);
         run_qcase(&qcases[i], VIA_LOAD);
     }
     for (int mode = 1; mode <= 2; mode++) {
-        stop_case(find_qcase("projection"), VIA_SEAL, mode);
-        stop_case(find_qcase("projection"), VIA_LOAD, mode);
-        stop_case(find_qcase("wide"), VIA_SEAL, mode);
+        stop_case(find_qcase("projection"), VIA_SEAL, mode, false);
+        stop_case(find_qcase("projection"), VIA_LOAD, mode, false);
+        stop_case(find_qcase("wide"), VIA_SEAL, mode, false);
+        stop_case(find_qcase("sum_filtered"), VIA_SEAL, mode, false);
+        stop_case(find_qcase("sum_few"), VIA_SEAL, mode, true);
+        stop_case(find_qcase("count_few"), VIA_LOAD, mode, true);
     }
-    parked_destroy_case();
-    read_cancel_case();
-    read_fault_case();
+    parked_destroy_case(find_qcase("wide"));
+    parked_destroy_case(find_qcase("sum_filtered"));
+    overflow_case(VIA_SEAL, false);
+    overflow_case(VIA_LOAD, false);
+    overflow_case(VIA_LOAD, true);
+    divergence_case();
+    read_cancel_case(find_qcase("projection"));
+    read_cancel_case(find_qcase("sum_filtered"));
+    read_fault_case(find_qcase("projection"));
+    read_fault_case(find_qcase("sum_filtered"));
     denial_case(find_qcase("projection"), VIA_SEAL);
     denial_case(find_qcase("projection"), VIA_LOAD);
-    uint64_t sealed = exact_case(VIA_SEAL);
-    uint64_t loaded = exact_case(VIA_LOAD);
-    if (sealed != loaded)
-        fprintf(stderr, "exact: sealed %llu loaded %llu\n",
-            (unsigned long long)sealed, (unsigned long long)loaded);
-    CHECK(sealed == loaded);
+    denial_case(find_qcase("sum_filtered"), VIA_SEAL);
+    denial_case(find_qcase("sum_filtered"), VIA_LOAD);
+    const char *exact[] = {"projection", "sum_filtered"};
+    for (int i = 0; i < 2; i++) {
+        uint64_t sealed = exact_case(find_qcase(exact[i]), VIA_SEAL);
+        uint64_t loaded = exact_case(find_qcase(exact[i]), VIA_LOAD);
+        if (sealed != loaded)
+            fprintf(stderr, "exact %s: sealed %llu loaded %llu\n", exact[i],
+                (unsigned long long)sealed, (unsigned long long)loaded);
+        CHECK(sealed == loaded);
+    }
     for (size_t i = 0; i < NREFUSALS; i++) {
         refusal_case(&refusals[i], VIA_SEAL, refusals[i].side_compound);
         refusal_case(&refusals[i], VIA_LOAD, refusals[i].side_compound);

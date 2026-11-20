@@ -555,27 +555,33 @@ wl_columnar_eval_plan_cold_map(const wl_plan_relation_t *rp, uint32_t stage,
     return true;
 }
 
-/* Audit stage-local FILTER/MAP operations ending before JOIN or terminal
- * CONSOLIDATE. Standalone scans require a MAP; FILTER-only JOIN prefixes
- * preserve the source layout. Arbitrary expressions remain unsupported. */
+/* Audit stage-local FILTER/MAP operations ending before a JOIN, the
+ * terminal CONSOLIDATE, or a REDUCE before the terminal CONSOLIDATE that the
+ * cold aggregate decode admits. A scan ending at the CONSOLIDATE requires a
+ * MAP; FILTER-only JOIN prefixes preserve the source layout, and a prefix
+ * before a REDUCE may be empty or hold no MAP. Arbitrary expressions remain
+ * unsupported. */
 bool
 wl_columnar_eval_plan_cold_scan_decode(const wl_plan_relation_t *rp,
     const char *name, uint32_t ncols, const wirelog_column_type_t *types,
     uint32_t end, wl_columnar_eval_plan_cold_projection_t *out)
 {
-    if (!rp || !name || !rp->ops || end < 2 ||
-        end >= rp->op_count) return false;
+    if (!rp || !name || !rp->ops || !end || end >= rp->op_count ||
+        (end < 2 && rp->ops[end].op != WL_PLAN_OP_REDUCE)) return false;
     const wl_plan_op_t *v = &rp->ops[0];
     if (v->op != WL_PLAN_OP_VARIABLE || !v->relation_name ||
         strcmp(v->relation_name, name) ||
         (rp->ops[end].op != WL_PLAN_OP_JOIN &&
         (rp->ops[end].op != WL_PLAN_OP_CONSOLIDATE ||
-        end != rp->op_count - 1))) return false;
+        end != rp->op_count - 1) &&
+        (rp->ops[end].op != WL_PLAN_OP_REDUCE || end + 2 != rp->op_count ||
+        !wl_columnar_eval_plan_cold_aggregate_decode(rp, name, ncols, types,
+        NULL)))) return false;
     wl_columnar_eval_plan_cold_projection_t decoded = {0};
     uint32_t width = ncols;
     for (uint32_t i = 0; i <= end; i++) {
         const wl_plan_op_t *op = &rp->ops[i];
-        if (i == end && op->op == WL_PLAN_OP_JOIN) break;
+        if (i == end && op->op != WL_PLAN_OP_CONSOLIDATE) break;
         if (op->opaque_data || op->materialized || op->right_relation ||
             (i && op->relation_name) || op->right_filter_expr.size ||
             op->right_filter_expr.data ||
@@ -645,7 +651,9 @@ wl_columnar_eval_plan_aggregate_column(const wl_plan_expr_buffer_t *expr,
     return true;
 }
 
-/* Separate from scan decoding: a reduction needs no materialized prefix. */
+/* The uncontrolled cold aggregate streams its prefix and materializes no
+ * scan output; the scan decode also calls this for a prefix ending at a
+ * REDUCE, which the controlled route materializes (#2301). */
 bool
 wl_columnar_eval_plan_cold_aggregate_decode(const wl_plan_relation_t *rp,
     const char *name, uint32_t ncols, const wirelog_column_type_t *types,
