@@ -8182,3 +8182,15 @@ foreach heads : [1, 2]
     endforeach
   endforeach
 endforeach
+
+# Existing scalar MAIN continuation, sticky WORK and genuine fresh-action guard.
+foreach mode : range(5)
+  foreach heads : [1, 2]
+    foreach observed : [0, 1]
+      test('evaluation_recursive_string_retirement_@0@_@1@_@2@'.format(mode, heads, observed),
+        evaluation_recursive_string_exe,
+        args: ['retirement', mode.to_string(), heads.to_string(), observed.to_string()],
+        suite: ['unit', 'tsan', 'evaluation_recursive_string_retirement'], timeout: 120)
+    endforeach
+  endforeach
+endforeach

@@ -1323,11 +1323,152 @@ run_public(unsigned family, unsigned heads, bool observed, unsigned shard,
     free(t.class_id); free(t.keys);
 }
 
+/* Selected MAIN packets must settle before sticky Original WORK is returned. */
+typedef struct {
+    fixture_t *fixture;
+    bool selected;
+    unsigned mode, advances, reports;
+} retirement_case_t;
+static retirement_case_t *retirement_case;
+
+static void
+retirement_advanced(wl_col_session_t *col, wl_evaluation_control_t *control,
+    uint64_t id, unsigned recipient, unsigned before, unsigned after,
+    int result)
+{
+    (void)before; (void)after; (void)result;
+    retirement_case_t *s = retirement_case;
+    if (!s || !s->selected || col != (wl_col_session_t *)s->fixture->session
+        || recipient != 2) return;
+    CHECK(control != s->fixture->control && id
+        && wl_evaluation_control_active_attempt_id(control) == id);
+    s->advances++;
+}
+
+static void
+retirement_report(const wl_col_session_t *col, unsigned recipient,
+    unsigned action, wl_evaluation_control_report_t report, int result)
+{
+    (void)result;
+    retirement_case_t *s = retirement_case;
+    if (!s || !s->selected || col != (wl_col_session_t *)s->fixture->session
+        || recipient != 2) return;
+    CHECK((s->mode ? action == 1 : action <= 2)
+        && report.attempt_id && report.limit == 256);
+    s->reports++;
+}
+
+static void
+run_retirement(unsigned mode, unsigned heads, bool observed)
+{
+    fixture_t f; fixture_init(&f, heads, observed);
+    CHECK(!step(&f) && !wl_session_step(f.reference));
+    f.actual.count = f.expected.count = 0;
+    const int64_t fresh = wl_intern_put(f.plan->intern, "fresh");
+    CHECK(fresh == 2 && !wl_session_insert(f.session, "input", &fresh, 1, 1)
+        && !wl_session_insert(f.reference, "input", &fresh, 1, 1));
+    wl_col_session_t *col = (wl_col_session_t *)f.session;
+    col_rel_t *old[2]; col_relation_snapshot_t snapshots[2];
+    for (unsigned h = 0; h < heads; h++) {
+        old[h] = session_find_rel(col, head_name(&f, h));
+        snapshots[h] = wl_columnar_relation_snapshot(old[h]);
+    }
+    CHECK(!col->cold_relation && !wl_evaluation_control_configure(f.control,
+        UINT64_C(1000000000)));
+    retirement_case_t state = {.fixture = &f, .mode = mode};
+    CHECK(!retirement_case && !wl_columnar_session_test_main_action_advanced
+        && !wl_columnar_session_test_main_action_report);
+    retirement_case = &state;
+    wl_columnar_session_test_main_action_advanced = retirement_advanced;
+    wl_columnar_session_test_main_action_report = retirement_report;
+    unsigned selected_turn = 0;
+    uint64_t original = 0;
+    int rc = EAGAIN;
+    for (unsigned turn = 0; rc == EAGAIN && turn < 10000; turn++) {
+        rc = wl_session_step(f.session);
+        public_key_t key;
+        CHECK(!wl_columnar_session_test_string_custody(col, &key));
+        if (mode || (rc == EAGAIN && !key.published && !key.committed))
+            life_public(&f, old, snapshots, 0);
+        if (state.selected || rc != EAGAIN || !key.available || key.phase != 21
+            || key.round || key.round_index || key.committed || key.published)
+            continue;
+        bool available = key.retirement[0] && !key.retirement[1]
+            && (key.owners[0] & (UINT64_C(1) << 7)) && key.main[0]
+            && key.main[1] == 2 && key.main[2] == 2 && !key.main[3];
+        bool fresh_action = key.retirement[0] && !key.main[0];
+        bool ready = key.retirement[0] && key.main[0]
+            && key.main[1] == 4 && key.main[2] == 2;
+        bool cleared_ready = !key.retirement[0] && key.main[0]
+            && key.main[1] == 4 && key.main[2] == 2;
+        bool selected = mode <= 1 ? available : mode == 2 ? fresh_action
+            : mode == 3 ? ready : cleared_ready;
+        if (!selected) continue;
+        state.selected = true; selected_turn = turn;
+        original = wl_evaluation_control_active_attempt_id(f.control);
+        CHECK(original);
+        if (mode) CHECK(wl_evaluation_control_charge(f.control, UINT64_MAX)
+                == WL_EVALUATION_CONTROL_WORK_LIMIT);
+    }
+    wl_columnar_session_test_main_action_advanced = NULL;
+    wl_columnar_session_test_main_action_report = NULL;
+    retirement_case = NULL;
+    int wanted = mode ? WL_EVALUATION_CONTROL_WORK_LIMIT : 0;
+    if (!state.selected || rc != wanted)
+        fprintf(stderr,
+            "retirement mode%u heads%u observer%d selected%d turn%u rc%d wanted%d advances%u reports%u\n",
+            mode, heads, observed, state.selected, selected_turn, rc, wanted,
+            state.advances, state.reports);
+    CHECK(state.selected && rc == wanted);
+    if (mode) {
+        CHECK(state.advances == (mode == 1 ? 1u : 0u)
+            && state.reports == state.advances);
+        uint64_t main_view[16], owner[8];
+        CHECK(!wl_columnar_session_test_main_view(col, main_view)
+            && !main_view[0] && !col->cleanup_active && !col->cleanup_pending
+            && !wl_columnar_session_test_retained_work_owner(col, owner)
+            && owner[0] && owner[1] && owner[2]);
+        wl_evaluation_control_report_t report, after;
+        CHECK(!wl_evaluation_control_report(f.control, &report)
+            && report.attempt_id == original
+            && report.stop_reason == WL_EVALUATION_CONTROL_WORK_LIMIT
+            && report.result == wanted && !report.cleanup_status);
+        CHECK(wl_session_insert(f.session, "input", &fresh, 1, 1) == EBUSY
+            && wl_session_remove(f.session, "input", &fresh, 1, 1) == EBUSY);
+        events_t unexpected = {0};
+        CHECK(wl_session_snapshot(f.session, public_snapshot,
+            &unexpected) == EBUSY
+            && !unexpected.count);
+        wl_session_t *same = f.session;
+        CHECK(wl_session_try_destroy(&same) == EBUSY && same == f.session);
+        CHECK(!wl_evaluation_control_report(f.control, &after)
+            && wl_test_completed_step_report_equal(&report, &after));
+        life_public(&f, old, snapshots, 0);
+        CHECK(!wl_evaluation_control_reset(f.control)
+            && !wl_evaluation_control_configure(f.control, 0) && !step(&f));
+    } else CHECK(state.advances && state.advances == state.reports);
+    CHECK(!wl_session_step(f.reference));
+    const int64_t all[] = {0, 1, 2}; check_rows(&f, all, 3);
+    check_events(&f, 2, 1);
+    printf(
+        "retirement mode%u heads%u observer%d witness_turn%u advances%u reports%u result%d retry_rows3 passed\n",
+        mode, heads, observed, selected_turn, state.advances, state.reports,
+        rc);
+    fixture_close(&f);
+}
+
 int
 main(int argc, char **argv)
 {
     CHECK(!environment("WIRELOG_JOIN_BATCH_BYTES", "")
         && !environment("WIRELOG_JOIN_BATCH_STRICT", ""));
+    if (argc == 5 && !strcmp(argv[1], "retirement")) {
+        unsigned mode = (unsigned)strtoul(argv[2], NULL, 10);
+        unsigned heads = (unsigned)strtoul(argv[3], NULL, 10);
+        unsigned observed = (unsigned)strtoul(argv[4], NULL, 10);
+        CHECK(mode <= 4 && heads >= 1 && heads <= 2 && observed <= 1);
+        run_retirement(mode, heads, observed != 0); return 0;
+    }
     if (argc == 7 && !strcmp(argv[1], "public")) {
         unsigned family = (unsigned)strtoul(argv[2], NULL, 10);
         unsigned heads = (unsigned)strtoul(argv[3], NULL, 10);

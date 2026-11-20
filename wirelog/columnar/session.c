@@ -14097,6 +14097,34 @@ wl_columnar_session_retirement_drive_owned(wl_columnar_controlled_step_t *step,
     return rc;
 }
 
+/* Continue only an existing packet, never select another action after WORK.
+ * A cleared READY progress is only a receipt; main_action consumes it without
+ * invoking Native again, using the same completed-progress rule as before. */
+static bool
+wl_columnar_session_retirement_packet(const wl_columnar_controlled_step_t *step,
+    const wl_columnar_session_retirement_progress_t *p,
+    wl_evaluation_control_t *control, uint64_t id, unsigned action)
+{
+    const wl_columnar_session_main_action_t *j = &step->main_action;
+    if (j->identity != j || j->session != step->metadata_bind_session
+        || j->step != step || j->transaction != step->transaction
+        || j->original != control
+        || j->original_identity != wl_evaluation_control_identity(control)
+        || j->operation_identity != step->operation_identity
+        || j->operation_id != id || !wl_columnar_session_main_actor(j)
+        || j->recipient != WL_COLUMNAR_SESSION_MAIN_SCALAR
+        || j->target != p || j->slot || j->action != action || j->executing
+        || !((j->phase == WL_COLUMNAR_SESSION_MAIN_AVAILABLE && !j->called)
+        || (j->phase == WL_COLUMNAR_SESSION_MAIN_READY && j->called)))
+        return false;
+    if (!p->identity) return j->phase == WL_COLUMNAR_SESSION_MAIN_READY;
+    return p->identity == p && p->step == step && p->registered
+           && wl_columnar_session_retirement_thread(p)
+           && j->resource_parent == p->parent && j->resource_target == p->target
+           && j->resource_slot == p->slot && j->role == p->role
+           && j->index == p->index;
+}
+
 static int
 wl_columnar_session_retirement_drive(wl_columnar_controlled_step_t *step,
     wl_columnar_session_retirement_progress_t *p,
@@ -14141,7 +14169,9 @@ wl_columnar_session_retirement_drive(wl_columnar_controlled_step_t *step,
             return EAGAIN;
         }
         int rc = wl_evaluation_control_charge_attempt(control, id, 0);
-        if (rc) return rc;
+        if (rc && (rc != WL_EVALUATION_CONTROL_WORK_LIMIT
+            || !wl_columnar_session_retirement_packet(step, p, control, id,
+            action))) return rc;
     }
     return wl_columnar_session_main_action(step->metadata_bind_session, step,
                WL_COLUMNAR_SESSION_MAIN_SCALAR, p, NULL, action);
