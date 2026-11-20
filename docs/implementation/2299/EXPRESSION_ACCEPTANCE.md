@@ -3040,3 +3040,47 @@ FLOAT, wider/mixed SCCs, additional topology, expression/K bodies, evaluating
 Snapshot/C1/batch modes, seeded heads, pool/prepared-sort transport and remaining
 containing Source/carry proofs remain outside the qualified scope. This
 increment does not close the public lifecycle or #2299.
+
+### Selected retirement MAIN packet after Original WORK
+
+The previously unclosed retirement-WORK probe has a bounded follow-up fix. On
+base `a8617bea`, a current-fixture reproduction reached round-zero RETIRE with
+an uncalled SCALAR MAIN packet already AVAILABLE and a registered retirement
+progress not yet begun. Genuine refused Original work then produced 19,040
+ordinary `EAGAIN` returns with the same packet. The regression selects this
+actual owner state; historical public ordinals are not its authority.
+
+The source cycle is specific: retirement admission returns the sticky Original
+WORK before calling the selected recipient; MAIN dispatch leaves AVAILABLE to
+that recipient; operation finish refuses while that MAIN packet is selected.
+The fix retains the Original zero-work poll and permits only its WORK result
+for an exact existing AVAILABLE/READY SCALAR packet to reach ordinary
+`main_action`. The match includes session, Step, transaction, Original identity
+and attempt, actor, action/target/NULL slot and the live progress resource tuple.
+A cleared READY progress is an existing receipt only. Native proof, private
+financier, execution, report and receipt consumption remain the existing owners.
+Fresh retirement still returns the Original stop before selecting work. Other
+errors, cancellation and the earlier ended-Original branch keep their paths.
+
+Five deterministic modes run for one/two heads and observer off/on: no-stop
+control, refused WORK on the selected AVAILABLE packet, fresh-action refusal,
+matching READY consumption and cleared-progress READY consumption. The
+unchanged production code fails the AVAILABLE regression at its finite bound,
+with zero performed actions/reports instead of terminal WORK. After the fix,
+that selected packet performs exactly one Native action and settles exactly one
+report before terminal WORK. Fresh/READY modes perform no new Native action
+after refusal, and READY no longer owns a pending packet at the terminal return.
+Every fixture must witness its actual state; none silently succeeds without it.
+
+Each stopped public return preserves old head pointers, generation snapshots,
+STRING schema/literal rows and no events. The terminal report belongs to the
+actual Original attempt and retains WORK; genuine retained metadata/credit
+ownership still protects input mutations. Reset and same-input retry must match
+raw sorted rows and signed events. Actual teardown returns all reservations and
+the governor's sole reference. This is a regression for an existing packet,
+not a complete intermediate financial or retirement/MAIN lifecycle certificate.
+
+The independent public-END child probe remains open. This fix does not qualify
+new types/topology/modes/seeds/transport, every retirement offset/packet kind,
+observer/publication products or remaining containing Source/carry proofs.
+Existing internal and public child/receipt suites remain separate evidence.
