@@ -3533,6 +3533,16 @@ foreach cache_pair : [['scalar', 'observed'], ['scalar', 'plain'],
   endforeach
 endforeach
 
+foreach cache_pair : [['scalar', 'observed'], ['scalar', 'plain'],
+                       ['scalar', 'snapshot'], ['inline', 'observed'],
+                       ['inline', 'snapshot']]
+  foreach cache_resource : ['image-denied', 'build-denied', 'key-nomem']
+    test('evaluation_join_cache_' + cache_pair[0] + '_' + cache_pair[1] + '_' + cache_resource,
+         test_evaluation_join_cache_exe, args: cache_pair + [cache_resource],
+         suite: ['unit', 'tsan', 'evaluation_join_hosts'], timeout: 120)
+  endforeach
+endforeach
+
 test_evaluation_materialized_body_exe = executable(
   'test_evaluation_materialized_body', files('test_evaluation_materialized_body.c'),
   c_args: ['-DWL_SESSION_TEST_HOOKS=1'],

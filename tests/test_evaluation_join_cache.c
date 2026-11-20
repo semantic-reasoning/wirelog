@@ -54,6 +54,7 @@ typedef struct {
     unsigned sources[HEADS], probes[HEADS], gathers[HEADS], rejected;
     unsigned append_reads[HEADS];
     unsigned output_extent[HEADS];
+    unsigned image_cells, copied_entries;
 } witnesses_t;
 typedef struct {
     wirelog_program_t *program;
@@ -62,6 +63,10 @@ typedef struct {
     bool compound, left[VALUES][VALUES], right[VALUES][VALUES][2];
     unsigned route, stage, stop_site;
     unsigned cap;
+    unsigned resource;
+    bool allocation_failed;
+    uint64_t denials;
+    wl_columnar_memory_reservation_t peer;
     bool work_stop, armed, stopped;
     int64_t tag, floating;
     profile_t *active;
@@ -381,11 +386,46 @@ stop_at(fixture_t *f, wl_evaluation_control_t *control, unsigned site)
             == WL_EVALUATION_CONTROL_WORK_LIMIT);
     else wl_evaluation_control_request_cancel(control);
 }
+static void reserve_peer(fixture_t *f) {
+    wl_columnar_memory_governor_t *g =
+        wl_columnar_memory_governor_ref_get(f->active->governor);
+    uint64_t usable = atomic_load_explicit(&g->usable_bytes,
+            memory_order_acquire), used = wl_columnar_memory_reserved(g);
+    CHECK(!f->stopped && usable > used && usable - used > 1);
+    wl_columnar_memory_reservation_init(&f->peer);
+    CHECK(wl_columnar_memory_reserve(g, usable - used - 1, &f->peer)
+        && f->peer.identity == &f->peer
+        && atomic_load_explicit(&f->peer.state, memory_order_acquire)
+        == WL_COLUMNAR_MEMORY_RESERVATION_RESERVED
+        && wl_columnar_memory_reserved(g) == usable - 1);
+    f->denials = wl_columnar_memory_denials(g);
+    f->stopped = true;
+}
 static void arrangement(wl_evaluation_control_t *control, unsigned phase,
     uint64_t progress) {
     (void)progress;
     fixture_t *f = active;
     if (control != f->active->control) return;
+    if (!f->profile && f->armed && f->resource && !f->stopped) {
+        wl_columnar_filter_context_t *ctx = context(f);
+        sources(f, ctx);
+        wl_col_session_t *s = COL_SESSION(f->active->session);
+        CHECK(f->head < 2 && !ctx->join_operation->right_filter_expr.size
+            && !rhs_delta(f) && s->diff_arr_count == 3);
+        if (phase == 5) ++f->seen.image_cells;
+        if (phase == 6) ++f->seen.copied_entries;
+        if (f->resource == 1 && phase == 0 && !s->diff_txn_count) {
+            CHECK(f->stage == 1 && !f->seen.image_cells
+                && !f->seen.builds && !f->seen.reuses);
+            reserve_peer(f); /* Before image/slot admission. */
+        }
+        if (f->resource == 2 && phase == 7) {
+            CHECK(f->stage == 5 && s->diff_txn_count == 1
+                && f->seen.image_cells && f->seen.copied_entries == 3
+                && !f->seen.builds && !f->seen.indexed && progress == 1);
+            reserve_peer(f); /* Admitted/copied image, before build credit. */
+        }
+    }
     if (phase != 13 && phase != 14)
         return;
     wl_columnar_filter_context_t *ctx = context(f);
@@ -406,11 +446,32 @@ static void join(wl_evaluation_control_t *control, unsigned phase,
     fixture_t *f = active;
     if (control != f->active->control) return;
     if (phase != 15 && phase != 28 && phase != 47 && phase != 48 &&
-        phase != 29 && phase != 20 &&
+        phase != 29 && phase != 20 && phase != 9 && phase != 11 &&
         phase != 18 && phase != 44)
         return;
     wl_columnar_filter_context_t *ctx = context(f);
     sources(f, ctx);
+    if (!f->profile && f->armed && f->resource == 3) {
+        wl_columnar_join_scratch_t *keys = &ctx->join_scratch[0];
+        uint64_t bytes = 2u * sizeof(uint32_t)
+            * ctx->join_operation->key_count;
+        if (phase == 9 && !f->stopped && keys->initialized
+            && !ctx->join_scratch[1].initialized) {
+            CHECK(f->stage == 1 && f->head < 2 && progress == bytes
+                && !keys->allocated && !keys->physical
+                && !f->seen.builds && !f->seen.reuses);
+            f->denials = wl_columnar_memory_denials(
+                wl_columnar_memory_governor_ref_get(f->active->governor));
+            wl_columnar_join_test_attempt_fail_allocation = 0;
+            f->stopped = true;
+        }
+        if (phase == 11 && f->stopped && !f->allocation_failed) {
+            CHECK(progress == bytes && keys->initialized && keys->admitted
+                && !keys->allocated && !keys->physical
+                && !wl_columnar_join_test_attempt_fail_allocation);
+            f->allocation_failed = true;
+        }
+    }
     if (phase == 20) {
         CHECK(ctx->output && progress == ctx->output->nrows);
         if (progress > f->seen.output_extent[f->head])
@@ -731,6 +792,28 @@ failure(fixture_t *f, const registry_t *before, const image_t *old,
         && !wl_evaluation_control_active_attempt_id(p->control)
         && !s->cleanup_active && !s->cleanup_pending &&
         !s->cleanup_reserved_bytes);
+    if (f->resource) {
+        wl_columnar_memory_governor_t *g =
+            wl_columnar_memory_governor_ref_get(p->governor);
+        CHECK(s->memory_budget_denied == (f->resource != 3));
+        if (f->resource == 3) {
+            CHECK(f->allocation_failed &&
+                !wl_columnar_join_test_attempt_fail_allocation
+                && wl_columnar_memory_denials(g) == f->denials);
+            wl_columnar_join_test_attempt_fail_allocation = -1;
+        } else {
+            /* Capacity stays exhausted through completed failure/cleanup0. */
+            CHECK(wl_columnar_memory_denials(g) > f->denials
+                && atomic_load_explicit(&f->peer.state, memory_order_acquire)
+                == WL_COLUMNAR_MEMORY_RESERVATION_RESERVED);
+            uint64_t held = wl_columnar_memory_reserved(g),
+                bytes = f->peer.bytes;
+            CHECK(held >= bytes && wl_columnar_memory_rollback(&f->peer)
+                && wl_columnar_memory_reserved(g) == held - bytes
+                && atomic_load_explicit(&f->peer.state, memory_order_acquire)
+                == WL_COLUMNAR_MEMORY_RESERVATION_RELEASED);
+        }
+    }
     /* These ordinary failures dispose private transactions/readers, including
      * WORK, unlike the retained recursive WORK case. */
     uint64_t owner[8];
@@ -758,8 +841,8 @@ failure(fixture_t *f, const registry_t *before, const image_t *old,
     same_report(&slot.report, &unchanged.report);
     /* completion() separately reasserts every inactive flag on both reads. */
     fprintf(stdout,
-        "site=%u work=%u route=%u state=%u disposed private index and readers\n",
-        f->stop_site, f->work_stop, f->route,
+        "site=%u work=%u cap=%u resource=%u route=%u state=%u disposed private index and readers\n",
+        f->stop_site, f->work_stop, f->cap, f->resource, f->route,
         p->session->backend->session_controlled_step_state(p->session));
     CHECK(!wl_evaluation_control_reset(p->control));
 }
@@ -783,7 +866,10 @@ int main(int argc, char **argv) {
         if (!strncmp(argv[3], "cap", 3) && strlen(argv[3]) == 4
             && argv[3][3] >= '4' && argv[3][3] <= '6')
             f.cap = (unsigned)(argv[3][3] - '0');
-        CHECK(f.stop_site || f.cap);
+        if (!strcmp(argv[3], "image-denied")) f.resource = 1;
+        if (!strcmp(argv[3], "build-denied")) f.resource = 2;
+        if (!strcmp(argv[3], "key-nomem")) f.resource = 3;
+        CHECK(f.stop_site || f.cap || f.resource);
     }
     const char *env[] = {"WIRELOG_DIFF_ENABLED", "WIRELOG_JOIN_BATCH_BYTES",
                          "WIRELOG_JOIN_BATCH_STRICT",
@@ -863,6 +949,11 @@ int main(int argc, char **argv) {
         for (unsigned p = 0; p < 3; ++p) {
             registry_t before = registry(&f.profiles[p]);
             watch(&f, p, p < 2);
+            if (!p && f.resource && !f.stopped
+                && f.stage == (f.resource == 2 ? 5u : 1u)) {
+                failure(&f, &before, &old, f.resource == 3 ? ENOMEM : ENOSPC);
+                watch(&f, p, true);
+            }
             if (!f.stage && f.cap && f.cap < 6) {
                 if (p < 2) {
                     failure(&f, &before, &old, EOVERFLOW);
@@ -899,7 +990,8 @@ int main(int argc, char **argv) {
         }
         old = now;
     }
-    CHECK(!f.stop_site || f.stopped);
+    CHECK((!f.stop_site && !f.resource) || f.stopped);
+    CHECK(wl_columnar_join_test_attempt_fail_allocation == -1);
     for (unsigned p = 0; p < 3; ++p) {
         CHECK(!wl_session_try_destroy(&f.profiles[p].session));
         if (f.profiles[p].control)
