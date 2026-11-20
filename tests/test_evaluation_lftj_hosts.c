@@ -2426,9 +2426,10 @@ test_metadata_native_cleanup(void)
 }
 
 static void
-test_lftj_policy_error_order(void)
+test_lftj_policy_error_order(unsigned batch_begin, unsigned batch_end)
 {
-    for (unsigned batch = 0; batch < 2; ++batch)
+    CHECK(batch_begin < batch_end && batch_end <= 2);
+    for (unsigned batch = batch_begin; batch < batch_end; ++batch)
         for (unsigned strict = 0; strict < 2; ++strict)
             for (unsigned observed = 0; observed < 2; ++observed)
                 for (unsigned snapshot = 0; snapshot < 2; ++snapshot)
@@ -3358,11 +3359,18 @@ main(int argc, char **argv)
         && strcmp(argv[1], "native") && strcmp(argv[1], "admission")
         && strcmp(argv[1], "qualification")
         && strcmp(argv[1], "metadata-native") && strcmp(argv[1],
-        "policy") && strcmp(argv[1],
+        "policy") && strcmp(argv[1], "policy-two")
+        && strcmp(argv[1], "policy-errors")
+        && strcmp(argv[1], "policy-errors-unbatched")
+        && strcmp(argv[1], "policy-errors-batched")
+        && strcmp(argv[1], "policy-metadata")
+        && strcmp(argv[1], "policy-suffix") && strcmp(argv[1],
         "microsteps"))) {
         fprintf(stderr,
             "usage: %s [domains|recovery|failures|admission|native|"
-            "metadata-native|policy|qualification|microsteps]\n",
+            "metadata-native|policy|policy-two|policy-errors|"
+            "policy-errors-unbatched|policy-errors-batched|policy-metadata|"
+            "policy-suffix|qualification|microsteps]\n",
             argv[0]);
         return EXIT_FAILURE;
     }
@@ -3402,13 +3410,22 @@ main(int argc, char **argv)
             }
         reset_target = UINT32_MAX;
     }
-    if (argc == 1 || !strcmp(argv[1], "policy")) {
+    bool all_policy = argc == 1 || !strcmp(argv[1], "policy");
+    if (all_policy || !strncmp(argv[1], "policy-", 7)) {
         uint8_t threshold = wl_log_thresholds[WL_LOG_SEC_JOIN];
         wl_log_thresholds[WL_LOG_SEC_JOIN] = WL_LOG_WARN;
-        test_two_lftj_policy();
-        test_lftj_policy_error_order();
-        test_second_lftj_metadata_cleanup();
-        test_lftj_join_suffix_policy();
+        if (all_policy || !strcmp(argv[1], "policy-two"))
+            test_two_lftj_policy();
+        if (all_policy || !strcmp(argv[1], "policy-errors"))
+            test_lftj_policy_error_order(0, 2);
+        else if (!strcmp(argv[1], "policy-errors-unbatched"))
+            test_lftj_policy_error_order(0, 1);
+        else if (!strcmp(argv[1], "policy-errors-batched"))
+            test_lftj_policy_error_order(1, 2);
+        if (all_policy || !strcmp(argv[1], "policy-metadata"))
+            test_second_lftj_metadata_cleanup();
+        if (all_policy || !strcmp(argv[1], "policy-suffix"))
+            test_lftj_join_suffix_policy();
         wl_log_thresholds[WL_LOG_SEC_JOIN] = threshold;
     }
     if (argc == 1 || !strcmp(argv[1], "qualification")) {
