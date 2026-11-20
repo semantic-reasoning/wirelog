@@ -2306,7 +2306,10 @@ wl_columnar_session_registered(const wl_col_session_t *sess, const char *name)
 
 /* A controlled session reads a cold binding only through the composed cold
 * scan attempt: VARIABLE(name), a direct MAP/FILTER prefix holding at least
-* one MAP, then the rule's final CONSOLIDATE (#2301). A JOIN after the prefix
+* one MAP, then the rule's final CONSOLIDATE (#2301). The prefix may instead
+* end at a REDUCE that the uncontrolled cold aggregate admits, followed by the
+* final CONSOLIDATE, and then needs no MAP; the composed attempt runs its
+* controlled REDUCE over the scan's output. A JOIN after the prefix
 * is refused: a FILTER-only prefix keeps the source's column names, which the
 * JOIN's keys resolve against, and the attempt's output has none.
 * Programs that a controlled STEP routes to the general observed transaction
@@ -2344,11 +2347,16 @@ wl_columnar_session_cold_controlled_plan(const wl_col_session_t *sess,
                     (op->right_relation && !strcmp(op->right_relation, name));
                 if (here && oi) return false;
                 uses |= here;
-                if (op->op == WL_PLAN_OP_REDUCE && uses) return false;
             }
             if (!uses) continue;
             if (rp->ops[0].op != WL_PLAN_OP_VARIABLE) return false;
             uint32_t end = wl_columnar_ops_cold_scan_end(rp, 0);
+            if (end < rp->op_count && rp->ops[end].op == WL_PLAN_OP_REDUCE) {
+                if (end + 2 != rp->op_count ||
+                    !wl_columnar_session_cold_scan_rule(sess, rp, true))
+                    return false;
+                continue;
+            }
             bool mapped = false;
             for (uint32_t oi = 1; oi < end; oi++)
                 mapped |= rp->ops[oi].op == WL_PLAN_OP_MAP;

@@ -8435,11 +8435,14 @@ typedef struct wl_columnar_lftj_attempt {
 /* Controlled scan of a cold (spill-backed) source through a direct MAP/FILTER
  * prefix (#2301). The owner composed attempt lends one frame result slot; the
  * scan creates its typed private output there, appends the projected rows and
- * leaves the slot for the owner to install or dispose. Each action charges at
- * most WL_COLUMNAR_COLD_SCAN_ACTION_CELLS cells and polls the control before
- * every cell; a spill read polls it through the reader's cancel callback.
- * RELEASE drains the writer, releases the reader and scratch under separate
- * funding and never touches the slot. Serialize calls on the owner thread. */
+ * leaves the slot for the owner to install or dispose. Before a REDUCE the
+ * prefix may hold no MAP; the output then has the source's columns, for the
+ * rows the FILTERs keep, for the owner's controlled REDUCE. Each action
+ * charges at most WL_COLUMNAR_COLD_SCAN_ACTION_CELLS cells and polls the
+ * control before every cell; a spill read polls it through the reader's
+ * cancel callback. RELEASE drains the writer, releases the reader and scratch
+ * under separate funding and never touches the slot. Serialize calls on the
+ * owner thread. */
 #define WL_COLUMNAR_COLD_SCAN_ACTION_CELLS 64u
 typedef enum {
     WL_COLUMNAR_COLD_SCAN_ATTEMPT_INERT = 0,
@@ -8522,6 +8525,7 @@ uint32_t wl_columnar_ops_cold_scan_end(const wl_plan_relation_t *plan,
 extern void (*wl_columnar_ops_test_cold_scan_checkpoint)(
     wl_evaluation_control_t *, const wl_columnar_cold_scan_attempt_t *);
 extern uint64_t wl_columnar_ops_test_raw_cold_scans;
+extern uint64_t wl_columnar_ops_test_raw_cold_aggregates;
 #endif
 
 /* Actual owned LFTJ row and protected exact-capacity output; no generic
