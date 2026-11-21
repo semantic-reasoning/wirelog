@@ -3084,3 +3084,55 @@ The independent public-END child probe remains open. This fix does not qualify
 new types/topology/modes/seeds/transport, every retirement offset/packet kind,
 observer/publication products or remaining containing Source/carry proofs.
 Existing internal and public child/receipt suites remain separate evidence.
+
+### Observed CONCAT ownership after public Original END
+
+The public-END follow-up has a concrete current-base correction. On `79a5b502`,
+finite diagnostic sampling closed 1,700 of 1,760 owner histories, while 60 CONCAT
+histories remained pending for both END and END-with-successor. An early
+VARIABLE cut closed after 1,176 cleanup calls; a shorter bound would have
+misclassified it. These diagnostic counts are not exhaustive qualification.
+
+The failing path reaches `COMPOSE_CONCAT_CHILD` through registered observed
+cleanup. GDB showed an authenticated `observed_native_cleanup` parent and a real
+private funding attempt (limit 3,072, consumed 1,320), followed by `EINVAL` from
+the CONCAT latch's unconditional JOIN-owner proof. The frame remains owned and
+the same cleanup cannot advance. This establishes a wrong proof selection,
+not a refused grant or a general END failure.
+
+The CONCAT latch now selects the existing full observed cleanup proof only for
+that recorded observed-cleanup parent; otherwise it keeps the JOIN proof.
+Either proof failure returns directly, with no alternate-proof fallback. Numeric
+owner, parent/child, frame and CONCAT context/resource authentication, funding
+charges, running/committed checks and first nonzero execution result remain.
+Provisional observed cause follows the existing filter latch's semantic-result
+precedence. No new UNARY admission or manufactured Native authority is added.
+
+Four fixtures (one/two heads, observer off/on) discover actual first/last
+CONCAT_START-pending and CONCAT_CHILD witnesses for every reached recursive
+round, authenticate the complete copied signature at the real public-call
+ordinal, then separately perform actual Original END and END-with-successor.
+The one-head fixtures reach two rounds and 16 CONCAT histories each; two-head
+fixtures reach three rounds and 24 each, for 80 CONCAT histories total. Eight
+early VARIABLE END controls and four healthy CONCAT controls are separate.
+Absent witnesses fail; diagnostic or historical ordinals are not retargeted.
+The unchanged-production promoted regression remains pending at its 20,000-call
+bound, with first `EINVAL`, while the corrected cases genuinely finish cleanup.
+That bound exceeds the measured successful diagnostic cleanup maximum of 2,067
+calls and includes the healthy prefix; normal 120-second test watchdogs remain.
+
+Every cleanup return preserves old public head pointers, generation snapshots,
+unary STRING literal rows/types and zero events. Every visible error must remain
+`EINVAL`, and the already finished Original report stays fieldwise unchanged.
+A genuine successor remains the same active attempt and consumes zero work
+throughout old cleanup; after closure its own owner checks an uncancelled zero
+poll and finishes it with zero consumption/result. Pending protected APIs remain
+`EBUSY`. Final checks require no active/pending frame, transaction, MAIN/parent or
+retirement debt, then actual reset/same-input retry matches raw rows/events.
+Teardown returns all governor reservations and its sole reference.
+
+This qualifies the finite observed-CONCAT END/successor regression within the
+existing declared unary STRING projection route. It does not certify every
+public offset, all child/retirement/MAIN/observer/publication states, wider types
+or topology, additional evaluation modes/seeds/transport, or the remaining
+containing Source/carry proofs. It does not close #2299.
