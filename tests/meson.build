@@ -3549,6 +3549,16 @@ foreach cache_pair : [['scalar', 'observed'], ['scalar', 'plain'],
        suite: ['unit', 'tsan', 'evaluation_join_hosts'], timeout: 120)
 endforeach
 
+foreach cache_pair : [['scalar', 'observed'], ['scalar', 'plain'],
+                       ['scalar', 'snapshot'], ['inline', 'observed']]
+  foreach cache_cycle_fault : ['empty-right-cancel', 'empty-right-work',
+                               'rejected-cancel', 'rejected-work']
+    test('evaluation_join_cache_' + cache_pair[0] + '_' + cache_pair[1] + '_' + cache_cycle_fault,
+         test_evaluation_join_cache_exe, args: cache_pair + [cache_cycle_fault],
+         suite: ['unit', 'tsan', 'evaluation_join_hosts'], timeout: 120)
+  endforeach
+endforeach
+
 test_evaluation_materialized_body_exe = executable(
   'test_evaluation_materialized_body', files('test_evaluation_materialized_body.c'),
   c_args: ['-DWL_SESSION_TEST_HOOKS=1'],

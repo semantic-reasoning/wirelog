@@ -76,6 +76,7 @@ typedef struct {
     col_diff_arrangement_pin_t pin;
     registry_t unpinned;
     bool cycle;
+    unsigned cycle_fault;
     bool work_stop, armed, stopped;
     int64_t tag, floating;
     profile_t *active;
@@ -708,6 +709,27 @@ wl_test_join_cache_cycle_join(wl_evaluation_control_t *control,
         f->seen.empty_left[f->head] += !ctx->source.nrows;
         f->seen.empty_right[f->head] += !ctx->join_right.nrows;
         f->seen.overrides[f->head] += overridden;
+        if (!f->profile && f->armed && !f->stopped &&
+            ((f->cycle_fault == 1 && f->stage == 2 && f->head < 2)
+            || (f->cycle_fault == 2 && f->stage == 1 && f->head == 4))) {
+            CHECK(!ctx->output && ctx->source.nrows && !overridden);
+            if (f->cycle_fault == 1)
+                CHECK(!ctx->join_right.nrows
+                    && !ctx->join_operation->right_filter_expr.size);
+            else
+                CHECK(ctx->join_right.nrows == 1
+                    && ctx->join_operation->right_filter_expr.size
+                    && f->seen.selected[4] == 1 && f->seen.false_rows[4] == 1
+                    && !f->seen.private_head[4] && !f->seen.probes[4]
+                    && f->seen.builds && f->seen.indexed);
+            f->stopped = true;
+            if (f->work_stop)
+                CHECK(wl_evaluation_control_charge_attempt(control,
+                    wl_evaluation_control_active_attempt_id(control),
+                    UINT64_MAX)
+                    == WL_EVALUATION_CONTROL_WORK_LIMIT);
+            else wl_evaluation_control_request_cancel(control);
+        }
     }
     if (phase == 15) ++f->seen.sources[f->head];
     if (phase == 18) ++f->seen.gathers[f->head];
@@ -964,6 +986,10 @@ wl_test_join_cache_cycle_work(fixture_t *f, const registry_t *before)
         f->stage, f->profile, f->seen.builds, f->seen.reuses, override);
 }
 static void
+wl_test_join_cache_cycle_failure(fixture_t *, const registry_t *,
+    const image_t *);
+static void writers(profile_t *);
+static void
 wl_test_join_cache_cycle_run(fixture_t *f)
 {
     image_t old = {0};
@@ -974,7 +1000,13 @@ wl_test_join_cache_cycle_run(fixture_t *f)
         for (unsigned p = 0; p < 3; ++p) {
             registry_t before = registry(&f->profiles[p]);
             watch(f, p, p < 2);
+            if (!p && f->cycle_fault && !f->stopped
+                && f->stage == (f->cycle_fault == 1 ? 2u : 1u)) {
+                wl_test_join_cache_cycle_failure(f, &before, &old);
+                watch(f, p, true);
+            }
             CHECK(!finish(f, &f->profiles[p]));
+            if (!p && f->stopped) writers(&f->profiles[p]);
             if (p < 2) wl_test_join_cache_cycle_work(f, &before);
             watch(f, p, false);
             check_delivery(f, &f->profiles[p], &old, &now);
@@ -1210,6 +1242,83 @@ failure(fixture_t *f, const registry_t *before, const image_t *old,
         p->session->backend->session_controlled_step_state(p->session));
     CHECK(!wl_evaluation_control_reset(p->control));
 }
+static void
+wl_test_join_cache_cycle_failure(fixture_t *f, const registry_t *before,
+    const image_t *old)
+{
+    profile_t *p = f->active;
+    wl_col_session_t *s = COL_SESSION(p->session);
+    const col_rel_t *heads[HEADS];
+    for (unsigned h = 0; h < HEADS;
+        ++h) heads[h] = session_find_rel(s, names[h]);
+    input_image_t left = input_image(p, "left"),
+        right = input_image(p, "right");
+    f->armed = true;
+    int expected = f->work_stop ? WL_EVALUATION_CONTROL_WORK_LIMIT
+        : WL_EVALUATION_CONTROL_CANCELLED;
+    CHECK(finish(f, p) == expected && f->stopped && s->pending_input_change);
+    f->armed = false;
+    content(p, old);
+    for (unsigned h = 0; h < HEADS; ++h) {
+        CHECK(session_find_rel(s, names[h]) == heads[h]);
+        for (unsigned x = 0; x < VALUES; ++x)
+            for (unsigned y = 0; y < VALUES; ++y)
+                CHECK(!p->events.calls[h][x][y] && !p->events.diff[h][x][y]
+                    && !p->tuples.rows[h][x][y]);
+    }
+    registry_t after = registry(p); same_registry(before, &after, true);
+    wl_evaluation_control_report_t report, frozen;
+    CHECK(!wl_evaluation_control_report(p->control, &report)
+        && report.result == expected && report.stop_reason == expected
+        && report.consumed && !report.cleanup_status
+        && !wl_evaluation_control_active_attempt_id(p->control)
+        && !s->cleanup_active && !s->cleanup_pending &&
+        !s->cleanup_reserved_bytes);
+    uint64_t owner[8], again[8];
+    CHECK(!wl_columnar_session_test_retained_work_owner(s, owner));
+    fprintf(stdout,
+        "cycle fault=%u work=%u route=%u owner=%llu/%llu/%llu phase=%llu gen=%llu/%llu finance=%llu drained=%llu\n",
+        f->cycle_fault, f->work_stop, f->route,
+        (unsigned long long)owner[0], (unsigned long long)owner[1],
+        (unsigned long long)owner[2], (unsigned long long)owner[3],
+        (unsigned long long)owner[4], (unsigned long long)owner[5],
+        (unsigned long long)owner[6], (unsigned long long)owner[7]);
+    bool retained = f->cycle_fault == 1 && f->work_stop && f->route != 2;
+    if (retained) {
+        /* Actual acyclic EVALUATE(8) parent, without a started index image. */
+        CHECK(owner[0] && owner[1] && owner[2] && owner[3] == 8
+            && owner[4] && owner[4] == owner[5] && owner[7]
+            && p->session->backend->session_controlled_step_state(p->session)
+            == WL_CONTROLLED_STEP_PENDING);
+    } else {
+        CHECK(!owner[0] && !owner[1] && !owner[2]);
+        (void)completion(p, f->route, &report);
+    }
+    const char *const inputs[] = {"left", "right"};
+    for (unsigned i = 0; i < 2; ++i) {
+        col_rel_t *r = session_find_rel(s, inputs[i]);
+        wl_columnar_source_access_writer_t writer = {0};
+        int rc = col_rel_source_writer_acquire(r, &writer);
+        fprintf(stdout, "cycle writer=%s rc=%d retained=%u\n", inputs[i], rc,
+            retained);
+        CHECK(rc == (retained ? EBUSY : 0));
+        if (!retained) CHECK(!wl_columnar_source_access_writer_release(
+                    &writer));
+    }
+    if (f->route != 2) protected_step(f);
+    content(p, old);
+    CHECK(s->pending_input_change);
+    for (unsigned h = 0; h < HEADS;
+        ++h) CHECK(session_find_rel(s, names[h]) == heads[h]);
+    input_image_t current = input_image(p, "left"); same_input(&left, &current);
+    current = input_image(p, "right"); same_input(&right, &current);
+    after = registry(p); same_registry(before, &after, true);
+    CHECK(!wl_evaluation_control_report(p->control, &frozen));
+    same_report(&report, &frozen);
+    CHECK(!wl_columnar_session_test_retained_work_owner(s, again));
+    for (unsigned i = 0; i < 8; ++i) CHECK(owner[i] == again[i]);
+    CHECK(!wl_evaluation_control_reset(p->control));
+}
 int main(int argc, char **argv) {
     CHECK(argc == 3 || argc == 4);
     fixture_t f = {0};
@@ -1235,6 +1344,13 @@ int main(int argc, char **argv) {
         if (!strcmp(argv[3], "key-nomem")) f.resource = 3;
         f.pin_mode = !strcmp(argv[3], "pin-held");
         f.cycle = !strcmp(argv[3], "empty-cycle");
+        const char *const cycle_modes[] = {"empty-right-cancel",
+                                           "empty-right-work",
+                                           "rejected-cancel", "rejected-work"};
+        for (unsigned i = 0; i < 4; ++i) if (!strcmp(argv[3], cycle_modes[i])) {
+                f.cycle = true; f.cycle_fault = i / 2 + 1;
+                f.work_stop = (i % 2) != 0;
+            }
         CHECK(f.stop_site || f.cap || f.resource || f.pin_mode || f.cycle);
     }
     const char *env[] = {"WIRELOG_DIFF_ENABLED", "WIRELOG_JOIN_BATCH_BYTES",
@@ -1379,6 +1495,7 @@ int main(int argc, char **argv) {
         old = now;
     }
     CHECK((!f.stop_site && !f.resource && !f.pin_mode) || f.stopped);
+    CHECK(!f.cycle_fault || f.stopped);
     CHECK(!f.pin.active);
     CHECK(wl_columnar_join_test_attempt_fail_allocation == -1);
     for (unsigned p = 0; p < 3; ++p) {
