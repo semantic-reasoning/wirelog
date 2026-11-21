@@ -5516,8 +5516,15 @@ wl_columnar_merge_concat_native_cleanup_latch_owned(
     int rc = wl_columnar_eval_stack_framed_context(frame, r->session, &parent);
     if (rc) return rc;
     int cause = 0;
-    rc = wl_columnar_session_join_cleanup_prove(parent, funding, id, NULL,
-            &cause);
+    if (parent->observed_native_cleanup) {
+        wl_columnar_session_observed_cleanup_result_t proof =
+            wl_columnar_session_observed_cleanup_prove(parent, funding, id,
+                NULL);
+        rc = proof.protocol;
+        cause = proof.provisional && r->semantic_result
+            ? r->semantic_result : proof.cause;
+    } else rc = wl_columnar_session_join_cleanup_prove(parent, funding, id,
+                NULL, &cause);
     if (rc) return rc;
     if (&parent->child != r) return EINVAL;
     rc = wl_evaluation_control_charge_attempt(funding, id, 112);
