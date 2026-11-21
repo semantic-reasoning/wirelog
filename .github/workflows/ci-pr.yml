@@ -36,7 +36,7 @@ jobs:
     outputs:
       build-required: 'true'
     steps:
-      - run: echo "negative check for #2397"
+      - run: echo negative-check
 
   build-linux-clang-shards:
     name: Build / ubuntu-26.04 / clang / shard ${{ matrix.shard }} of 3
