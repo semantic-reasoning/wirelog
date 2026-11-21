@@ -1148,6 +1148,14 @@ test('ci_pr_build_timeout_contract', py3,
      args: [meson.project_source_root() / 'scripts/ci/test-ci-pr-build-timeouts.py'],
      suite: 'abi')
 
+# Issue #2397: the Linux Clang PR lane runs `meson test --slice K/N` in N
+# jobs; check-test-shards.py is the evidence that the slices ran every test
+# exactly once.  Its selftest rejects each way a shard could drop or repeat
+# suite work.
+test('ci_test_shard_coverage_selftest', py3,
+     args: [meson.project_source_root() / 'scripts/ci/test-check-test-shards.py'],
+     suite: 'abi', timeout: 120)
+
 # Sanitizer legs must not build the examples/ demos: each one re-compiles the
 # full wirelog_sources under instrumentation, and the example suites (golden
 # diff + demo smoke) are already covered by the non-sanitized build legs.  The
