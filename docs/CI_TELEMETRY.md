@@ -1021,11 +1021,11 @@ change, kept apart from what was inferred from it.
 ### Observed facts
 
 All figures come from GitHub job and step timestamps and the job logs.
-Configuration: hosted runner, image `ubuntu-26.04` versions 20261103.629 and
-20261111.635, `CC=clang`, distro Meson 1.10.1,
-`meson setup builddir -Dtests=true -DmbedTLS=disabled`, `meson test` at the
-default parallelism.  Setup and configure took about 0.3 min in every
-successful run.
+Configuration: hosted runner, runner image `ubuntu-26.04` versions
+20261111.82.6, 20261111.196.1 and 20261116.202.1, `CC=clang`, distro
+Meson 1.10.1, `meson setup builddir -Dtests=true -DmbedTLS=disabled`,
+`meson test` at the default parallelism.  Setup and configure took about
+0.3 min in every successful run.
 
 | run | build min | test min | job min | tests |
 | --- | --- | --- | --- | --- |
