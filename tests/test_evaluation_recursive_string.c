@@ -18,6 +18,9 @@ extern void (*wl_columnar_session_test_observed_transaction_checkpoint)(
     wl_evaluation_control_t *, unsigned, uint32_t,
     const wl_columnar_eval_private_bindings_t *);
 
+extern int wl_columnar_session_test_retirement_view(const wl_col_session_t *,
+    uint64_t[16]);
+
 static const char *const sources[] = {
     ".decl input(x:string)\n.decl out(x:string)\n"
     "input(\"z\").\ninput(\"a\").\ninput(\"z\").\n"
@@ -1457,11 +1460,202 @@ run_retirement(unsigned mode, unsigned heads, bool observed)
     fixture_close(&f);
 }
 
+/* Real public CONCAT owners, independent of historical diagnostic ordinals. */
+typedef struct {
+    public_key_t first_key, last_key;
+    unsigned first, last, category;
+    uint64_t round, head;
+} ended_cut_t;
+typedef struct { ended_cut_t cuts[16]; unsigned count; } ended_trace_t;
+
+static int
+ended_category(const public_key_t *key)
+{
+    if (!key->available || key->phase != 8 || !key->child[0]
+        || !key->child[1] || !(key->child[4] & 4)
+        || !(key->child[4] & 64) || !key->child[5]) return -1;
+    if (key->child[9] == 1 + WL_PLAN_OP_VARIABLE) return 2;
+    if (key->child[9] != 1 + WL_PLAN_OP_CONCAT) return -1;
+    if (key->child[6] == WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_PENDING
+        && key->child[7] == WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_CONCAT_START)
+        return 0;
+    return key->child[6] == WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_CONCAT_CHILD
+        ? 1 : -1;
+}
+
+static void
+ended_case(unsigned heads, bool observed, ended_trace_t *record,
+    const public_key_t *expected, unsigned target, unsigned outcome, bool early)
+{
+    fixture_t f; fixture_init(&f, heads, observed);
+    CHECK(!step(&f) && !wl_session_step(f.reference));
+    f.actual.count = f.expected.count = 0;
+    const int64_t fresh = wl_intern_put(f.plan->intern, "fresh");
+    CHECK(fresh == 2 && !wl_session_insert(f.session, "input", &fresh, 1, 1)
+        && !wl_session_insert(f.reference, "input", &fresh, 1, 1));
+    wl_col_session_t *col = (wl_col_session_t *)f.session;
+    CHECK(!col->cold_relation && !wl_evaluation_control_configure(f.control,
+        UINT64_C(1000000000)));
+    col_rel_t *old[2]; col_relation_snapshot_t snapshots[2];
+    for (unsigned h = 0; h < heads; h++) {
+        old[h] = session_find_rel(col, head_name(&f, h));
+        snapshots[h] = wl_columnar_relation_snapshot(old[h]);
+    }
+    stop_t stop = {.fixture = &f, .outcome = outcome};
+    bool stopping_case = expected || early;
+    unsigned calls = 0, after_end = 0;
+    int rc = EAGAIN, first_error = 0;
+    bool terminal = false;
+    for (; !terminal && calls < 20000; calls++) {
+        rc = wl_session_step(f.session);
+        public_key_t key;
+        CHECK(!col->cold_relation
+            && !wl_columnar_session_test_string_custody(col, &key));
+        if (stopping_case || (rc == EAGAIN && !key.published && !key.committed))
+            life_public(&f, old, snapshots, stop.successor);
+        int category = ended_category(&key);
+        if (record && rc == EAGAIN && category >= 0 && category < 2) {
+            unsigned i = 0;
+            for (; i < record->count; i++)
+                if (record->cuts[i].round == key.round
+                    && record->cuts[i].head == key.head
+                    && record->cuts[i].category == (unsigned)category) break;
+            if (i == record->count) {
+                CHECK(i < 16); record->count++;
+                record->cuts[i] = (ended_cut_t){.first_key = key,
+                                                .first = calls,
+                                                .category = (unsigned)category,
+                                                .round = key.round,
+                                                .head = key.head};
+            }
+            record->cuts[i].last = calls; record->cuts[i].last_key = key;
+        }
+        if (!stop.hit && stopping_case && rc == EAGAIN
+            && (early ? category == 2 : calls == target)) {
+            CHECK(category >= 0);
+            if (expected) CHECK(public_equal(&key, expected));
+            inject(&stop);
+            CHECK(wl_session_insert(f.session, "input", &fresh, 1, 1) == EBUSY
+                && wl_session_remove(f.session, "input", &fresh, 1,
+                1) == EBUSY);
+            events_t unexpected = {0};
+            CHECK(wl_session_snapshot(f.session, public_snapshot,
+                &unexpected) == EBUSY
+                && !unexpected.count);
+            wl_session_t *same = f.session;
+            CHECK(wl_session_try_destroy(&same) == EBUSY && same == f.session);
+        }
+        if (stop.hit) {
+            after_end++;
+            wl_evaluation_control_report_t report;
+            CHECK(!wl_evaluation_control_report(f.control, &report)
+                && wl_test_completed_step_report_equal(&report, &stop.frozen));
+            if (stop.successor) {
+                uint64_t used = UINT64_MAX;
+                CHECK(wl_evaluation_control_active_attempt_id(f.control) ==
+                    stop.successor
+                    && !wl_evaluation_control_test_active_consumed(f.control,
+                    stop.successor, &used) && !used);
+            }
+            if (rc != EAGAIN) {
+                CHECK(rc == EINVAL);
+                if (!first_error) first_error = rc;
+                CHECK(first_error == rc);
+                int state =
+                    f.session->backend->session_controlled_step_state(
+                    f.session);
+                terminal = state !=
+                    WL_CONTROLLED_STEP_NATIVE_ERROR_CLEANUP_PENDING;
+            }
+        } else if (rc != EAGAIN) terminal = true;
+    }
+    if (!terminal) fprintf(stderr,
+            "ended heads%u observer%d target%u outcome%u hit%d after%u first%d rc%d terminal%d\n",
+            heads, observed, target, outcome, stop.hit, after_end, first_error,
+            rc, terminal);
+    CHECK(terminal);
+    if (stopping_case) {
+        CHECK(stop.hit && rc == EINVAL && first_error == EINVAL
+            && !col->cleanup_active && !col->cleanup_pending
+            && !col->cleanup_reserved_bytes
+            && f.session->backend->session_controlled_step_state(f.session) ==
+            WL_CONTROLLED_STEP_IDLE);
+        wl_columnar_session_test_completed_view_t completed;
+        uint64_t main_view[16], retirement[16];
+        CHECK(!wl_columnar_session_test_completed_view(col, &completed)
+            && !completed.transaction_present && !completed.main_pending
+            && !completed.parent_pending
+            && !wl_columnar_session_test_main_view(col,
+            main_view) && !main_view[0]
+            && !wl_columnar_session_test_retirement_view(col, retirement)
+            && !retirement[0]);
+        if (stop.successor) {
+            /* Its genuine owner may poll only after old cleanup is closed. */
+            CHECK(!wl_evaluation_control_charge_attempt(f.control,
+                stop.successor, 0));
+            wl_evaluation_control_attempt_finish_result_t ended =
+                wl_evaluation_control_finish_attempt(f.control,
+                    f.session->operation_admission, stop.successor, 0, 0);
+            CHECK(!ended.protocol && ended.report_valid
+                && !ended.report.consumed && !ended.report.stop_reason
+                && !ended.report.execution_status &&
+                !ended.report.cleanup_status
+                && !ended.report.result);
+        } else CHECK(!wl_evaluation_control_active_attempt_id(f.control));
+        CHECK(!wl_evaluation_control_reset(f.control)
+            && !wl_evaluation_control_configure(f.control, 0) && !step(&f));
+    } else CHECK(!rc);
+    CHECK(!wl_session_step(f.reference));
+    const int64_t all[] = {0, 1, 2}; check_rows(&f, all, 3);
+    check_events(&f, 2, 1);
+    fixture_close(&f);
+}
+
+static void
+run_ended(unsigned heads, bool observed)
+{
+    ended_trace_t *trace = calloc(1, sizeof(*trace)); CHECK(trace);
+    ended_case(heads, observed, trace, NULL, UINT32_MAX, 2, false);
+    CHECK(trace->count);
+    unsigned histories = 0, rounds = 0;
+    bool category[2] = {false, false};
+    for (unsigned i = 0; i < trace->count; i++) {
+        const ended_cut_t *cut = &trace->cuts[i];
+        CHECK(cut->category < 2 && cut->head < heads &&
+            cut->first <= cut->last);
+        category[cut->category] = true;
+        if (cut->round + 1 > rounds) rounds = (unsigned)cut->round + 1;
+        for (unsigned end = 0; end < 2; end++) {
+            unsigned target = end ? cut->last : cut->first;
+            if (end && cut->last == cut->first) continue;
+            for (unsigned outcome = 2; outcome <= 3; outcome++) {
+                ended_case(heads, observed, NULL,
+                    end ? &cut->last_key : &cut->first_key, target, outcome,
+                    false);
+                histories++;
+            }
+        }
+    }
+    CHECK(category[0] && category[1] && trace->count == 2 * rounds);
+    for (unsigned outcome = 2; outcome <= 3; outcome++)
+        ended_case(heads, observed, NULL, NULL, UINT32_MAX, outcome, true);
+    printf(
+        "ended heads%u observer%d categories%u rounds%u concat_histories%u early_controls2 healthy_controls1 passed\n",
+        heads, observed, trace->count, rounds, histories);
+    free(trace);
+}
+
 int
 main(int argc, char **argv)
 {
     CHECK(!environment("WIRELOG_JOIN_BATCH_BYTES", "")
         && !environment("WIRELOG_JOIN_BATCH_STRICT", ""));
+    if (argc == 4 && !strcmp(argv[1], "ended")) {
+        unsigned heads = (unsigned)strtoul(argv[2], NULL, 10);
+        unsigned observed = (unsigned)strtoul(argv[3], NULL, 10);
+        CHECK(heads >= 1 && heads <= 2 && observed <= 1);
+        run_ended(heads, observed != 0); return 0;
+    }
     if (argc == 5 && !strcmp(argv[1], "retirement")) {
         unsigned mode = (unsigned)strtoul(argv[2], NULL, 10);
         unsigned heads = (unsigned)strtoul(argv[3], NULL, 10);

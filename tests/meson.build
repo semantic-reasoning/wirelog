@@ -8194,3 +8194,13 @@ foreach mode : range(5)
     endforeach
   endforeach
 endforeach
+
+# Actual observed CONCAT ownership after Original END; successor is separate.
+foreach heads : [1, 2]
+  foreach observed : [0, 1]
+    test('evaluation_recursive_string_ended_@0@_@1@'.format(heads, observed),
+      evaluation_recursive_string_exe,
+      args: ['ended', heads.to_string(), observed.to_string()],
+      suite: ['unit', 'tsan', 'evaluation_recursive_string_ended'], timeout: 120)
+  endforeach
+endforeach
