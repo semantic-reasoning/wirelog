@@ -3,7 +3,8 @@ set -euo pipefail
 
 image=semantic-reasoning:ubuntu26
 docker_bin=${DOCKER_BIN:-docker}
-repo_root=$(git rev-parse --show-toplevel)
+# Resolve the checkout from this script, not from the caller's directory.
+repo_root=$(git -C "$(dirname "${BASH_SOURCE[0]}")" rev-parse --show-toplevel)
 artifact_dir=${PERF_ARTIFACT_DIR:-"$repo_root/perf-artifacts/linux-suite"}
 mkdir -p "$artifact_dir"
 
@@ -181,8 +182,8 @@ image_id=$(jq -r '.[0].Id // empty' "$artifact_dir/image-inspect.json")
 printf 'tag=%s\nimage_id=%s\ndocker_network=host\n' "$image" "$image_id" \
     > "$artifact_dir/image-identity.txt"
 {
-    echo "commit=$(git rev-parse HEAD)"
-    echo "source_tree=$(git rev-parse HEAD^{tree})"
+    echo "commit=$(git -C "$repo_root" rev-parse HEAD)"
+    echo "source_tree=$(git -C "$repo_root" rev-parse HEAD^{tree})"
     echo "runner=${RUNNER_NAME:-unknown} os=${RUNNER_OS:-unknown} arch=${RUNNER_ARCH:-unknown}"
     echo 'runner_labels=self-hosted,Linux,X64,perf'
     echo "image_tag=$image image_id=$image_id pull=never"

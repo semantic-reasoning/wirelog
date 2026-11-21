@@ -79,9 +79,12 @@ printf '%s\n' "$*" >> "$DOCKER_CALL_LOG"
 exit 1
 EOF
 chmod +x "$tmp_dir/docker-missing"
-if HOME="$test_home" PERF_ARTIFACT_DIR="$tmp_dir/missing-image" \
+# Run from outside any git checkout: the runner must locate the repository
+# from its own path, not from the caller's working directory (meson runs this
+# test from the build directory, which need not be inside the source tree).
+if (cd "$tmp_dir" && HOME="$test_home" PERF_ARTIFACT_DIR="$tmp_dir/missing-image" \
     DOCKER_CALL_LOG="$tmp_dir/docker-calls" DOCKER_BIN="$tmp_dir/docker-missing" \
-    "$script_dir/run-perf-nightly-linux.sh"; then
+    "$script_dir/run-perf-nightly-linux.sh"); then
     echo 'missing-image fixture unexpectedly passed' >&2; exit 1
 fi
 grep -Fq 'image inspect semantic-reasoning:ubuntu26' "$tmp_dir/docker-calls"
