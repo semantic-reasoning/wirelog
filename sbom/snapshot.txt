@@ -64,6 +64,7 @@ actions/download-artifact@v5:NOASSERTION
 actions/download-artifact@v6:NOASSERTION
 actions/download-artifact@v7:NOASSERTION
 actions/download-artifact@v7:NOASSERTION
+actions/download-artifact@v7:NOASSERTION
 actions/download-artifact@v8:NOASSERTION
 actions/download-artifact@v8:NOASSERTION
 actions/setup-node@v7:NOASSERTION
@@ -83,6 +84,7 @@ actions/upload-artifact@main:NOASSERTION
 actions/upload-artifact@v4:NOASSERTION
 actions/upload-artifact@v4:NOASSERTION
 actions/upload-artifact@v7.0.1:NOASSERTION
+actions/upload-artifact@v7:NOASSERTION
 actions/upload-artifact@v7:NOASSERTION
 actions/upload-artifact@v7:NOASSERTION
 actions/upload-artifact@v7:NOASSERTION

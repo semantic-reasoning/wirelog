@@ -15,17 +15,110 @@ WORKFLOW = Path(__file__).resolve().parents[2] / ".github/workflows/ci-pr.yml"
 TEST_MESON = WORKFLOW.parents[2] / "tests/meson.build"
 PROJECT_MESON = WORKFLOW.parents[2] / "meson.build"
 EXPECTED_TIMEOUTS = {
-    "ubuntu-26.04": 90,
     "macos-latest": 60,
     "windows-latest": 120,
 }
+# Issue #2397: Linux Clang runs as SHARD_COUNT `meson test --slice K/N` jobs
+# with a per-shard job budget, a shorter test-step budget (so the evidence
+# steps still run after a test-step timeout) and a collecting job that keeps
+# the `Build / ubuntu-26.04 / clang` context.
+SHARD_COUNT = 3
+SHARD_JOB_TIMEOUT = 60
+SHARD_TEST_STEP_TIMEOUT = 40
+COLLECT_TIMEOUT = 10
+SHARD_JOB = "build-linux-clang-shards"
+COLLECT_JOB = "build-linux-clang"
+
+
+def job_block(text: str, name: str) -> str:
+    match = re.search(r"^  " + re.escape(name) + r":\n(.*?)(?=^  \S|\Z)",
+                      text, re.MULTILINE | re.DOTALL)
+    assert match, f"missing {name} job"
+    return match[1]
 
 
 def build_matrix(text: str) -> str:
-    match = re.search(r"^  build-matrix:\n(.*?)(?=^  \S|\Z)",
-                      text, re.MULTILINE | re.DOTALL)
-    assert match, "missing build-matrix job"
-    return match[1]
+    return job_block(text, "build-matrix")
+
+
+def step_block(job: str, name: str) -> str:
+    starts = [m.start() for m in re.finditer(
+        r"^      - name: " + re.escape(name) + r"\n", job, re.MULTILINE)]
+    assert len(starts) == 1, f"expected exactly one '{name}' step"
+    rest = job[starts[0]:]
+    end = re.search(r"^      - ", rest[1:], re.MULTILINE)
+    return rest if not end else rest[:end.start() + 1]
+
+
+def validate_linux_clang_shards(text: str) -> None:
+    n = SHARD_COUNT
+    assert "ubuntu" not in build_matrix(text), \
+        "Linux Clang must not also run unsharded in build-matrix"
+    shards = job_block(text, SHARD_JOB)
+    collect = job_block(text, COLLECT_JOB)
+    for name, block in ((SHARD_JOB, shards), (COLLECT_JOB, collect)):
+        assert "continue-on-error" not in block, \
+            f"{name} must not use continue-on-error"
+        assert "--repeat" not in block and "retry" not in block.lower(), \
+            f"{name} must not retry tests"
+    assert re.search(r"^    name: Build / ubuntu-26\.04 / clang / shard "
+                     r"\$\{\{ matrix\.shard \}\} of " + str(n) + r"$",
+                     shards, re.MULTILINE), "shard job name must state the shard count"
+    assert re.findall(r"^    timeout-minutes: (\d+)$", shards, re.MULTILINE) \
+        == [str(SHARD_JOB_TIMEOUT)], f"shard jobs must keep a {SHARD_JOB_TIMEOUT}-minute budget"
+    assert re.search(r"^      fail-fast: false$", shards, re.MULTILINE), \
+        "one failing shard must not cancel the others"
+    shard_list = re.findall(r"^        shard: \[([^]]*)\]$", shards, re.MULTILINE)
+    assert shard_list == [", ".join(str(k) for k in range(1, n + 1))], \
+        f"shard matrix must be exactly 1..{n}"
+    test = step_block(shards, "Test (Linux Clang shard)")
+    assert re.findall(r"^        run: (.*)$", test, re.MULTILINE) == [
+        "meson test -C builddir --print-errorlogs --slice ${{ matrix.shard }}/" + str(n)], \
+        "shard test step must run the whole default suite sliced, nothing else"
+    assert re.findall(r"^        timeout-minutes: (\d+)$", test, re.MULTILINE) \
+        == [str(SHARD_TEST_STEP_TIMEOUT)], "shard test step needs its own shorter budget"
+    assert SHARD_TEST_STEP_TIMEOUT < SHARD_JOB_TIMEOUT
+    for flag in ("--suite", "--no-suite", "--exclude", "--timeout-multiplier",
+                 "--setup"):
+        assert flag not in shards, f"shard job must not filter tests with {flag}"
+    plan = step_block(shards, "Plan Linux Clang shard")
+    assert re.findall(r"--count (\S+)", plan) == [str(n)] \
+        and "--shard ${{ matrix.shard }}" in plan, \
+        "plan step must record this shard of the same count"
+    verify = step_block(shards, "Verify shard coverage")
+    assert "check-test-shards.py verify" in verify, "verify step must run the checker"
+    assert "always()" in verify, "verify must also run after a test-step failure"
+    walltime = step_block(shards, "Shell gate walltime budget (Linux Clang shard)")
+    assert 'WIRELOG_WALLTIME_REQUIRED: "1"' in walltime \
+        and not re.search(r"^        if:", walltime, re.MULTILINE), \
+        "shard walltime gate must be required and unconditional"
+    upload = step_block(shards, "Upload shard evidence")
+    assert "if: ${{ always() }}" in upload and "upload-artifact" in upload \
+        and "linux-clang-shard-${{ matrix.shard }}" in upload, \
+        "shard evidence must upload under its shard name even on failure"
+
+    assert re.search(r"^    name: Build / ubuntu-26\.04 / clang$", collect,
+                     re.MULTILINE), "collecting job must keep the stable context name"
+    assert re.search(r"^    needs: \[" + SHARD_JOB + r", build-scope\]$", collect,
+                     re.MULTILINE), "collecting job must need every shard"
+    condition = re.findall(r"^    if: (.*)$", collect, re.MULTILINE)
+    assert len(condition) == 1 and "!cancelled()" in condition[0], \
+        "collecting job must run, not skip, when a shard fails"
+    assert re.findall(r"^    timeout-minutes: (\d+)$", collect, re.MULTILINE) \
+        == [str(COLLECT_TIMEOUT)], "collecting job needs its own budget"
+    gate = step_block(collect, "Require every shard to succeed")
+    assert "needs." + SHARD_JOB + ".result" in gate and "!= success" in gate, \
+        "collecting job must fail unless every shard succeeded"
+    aggregate = step_block(collect, "Aggregate shard coverage")
+    assert re.findall(r"--count (\S+)", aggregate) == [str(n)], \
+        "collecting job must prove the same shard count"
+    download = step_block(collect, "Download shard evidence")
+    assert re.findall(r"^          pattern: (.*)$", download, re.MULTILINE) \
+        == ["linux-clang-shard-*"] \
+        and re.findall(r"^          path: (.*)$", download, re.MULTILINE) \
+        == ["shard-evidence"] \
+        and aggregate.rstrip().endswith(" shard-evidence"), \
+        "collecting job must download every shard's upload into the folder it aggregates"
 
 
 def validate(text: str) -> None:
@@ -51,6 +144,7 @@ def validate(text: str) -> None:
         actual[operating_system] = int(timeout[1])
     assert actual == EXPECTED_TIMEOUTS, \
         f"unexpected build-matrix timeout mapping: {actual!r}"
+    validate_linux_clang_shards(text)
 
 
 def library(text: str, name: str) -> str:
@@ -166,20 +260,149 @@ class CiPrBuildTimeoutTests(unittest.TestCase):
         self.assertNotEqual(mutated, self.text)
         return mutated
 
-    def test_linux_budget_cannot_revert_to_60(self):
-        mutated = self.change_platform_budget("ubuntu-26.04", 90, 60)
-        with self.assertRaisesRegex(AssertionError, "unexpected"):
-            validate(mutated)
-
-    def test_linux_budget_cannot_be_relaxed_accidentally(self):
-        mutated = self.change_platform_budget("ubuntu-26.04", 90, 120)
-        with self.assertRaisesRegex(AssertionError, "unexpected"):
-            validate(mutated)
-
     def test_macos_budget_remains_60(self):
         mutated = self.change_platform_budget("macos-latest", 60, 90)
         with self.assertRaisesRegex(AssertionError, "unexpected"):
             validate(mutated)
+
+
+class LinuxClangShardTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.text = WORKFLOW.read_text(encoding="utf-8")
+
+    def mutate(self, old, new, count=1):
+        self.assertEqual(self.text.count(old), count, old)
+        mutated = self.text.replace(old, new)
+        self.assertNotEqual(mutated, self.text)
+        return mutated
+
+    def rejects(self, mutated, message):
+        with self.assertRaisesRegex(AssertionError, message):
+            validate(mutated)
+
+    def test_actual_workflow(self):
+        validate_linux_clang_shards(self.text)
+
+    def test_dropping_a_shard_is_rejected(self):
+        self.rejects(self.mutate("shard: [1, 2, 3]", "shard: [1, 2]"),
+                     "exactly 1..3")
+
+    def test_slice_count_must_agree(self):
+        self.rejects(self.mutate("--slice ${{ matrix.shard }}/3",
+                                 "--slice ${{ matrix.shard }}/2"),
+                     "sliced")
+
+    def test_plan_count_must_agree(self):
+        self.rejects(self.mutate("--shard ${{ matrix.shard }} --count 3",
+                                 "--shard ${{ matrix.shard }} --count 2"),
+                     "same count")
+
+    def test_aggregate_count_must_agree(self):
+        self.rejects(self.mutate("aggregate --count 3", "aggregate --count 2"),
+                     "same shard count")
+
+    def test_plan_count_must_match_exactly(self):
+        self.rejects(self.mutate("--shard ${{ matrix.shard }} --count 3",
+                                 "--shard ${{ matrix.shard }} --count 30"),
+                     "same count")
+
+    def test_aggregate_count_must_match_exactly(self):
+        self.rejects(self.mutate("aggregate --count 3", "aggregate --count 31"),
+                     "same shard count")
+
+    def test_download_must_match_upload_name(self):
+        self.rejects(self.mutate("pattern: linux-clang-shard-*",
+                                 "pattern: linux-clang-evidence-*"),
+                     "download every shard")
+
+    def test_download_path_must_match_aggregate_folder(self):
+        self.rejects(self.mutate("          path: shard-evidence\n\n",
+                                 "          path: evidence\n\n"),
+                     "download every shard")
+
+    def test_shard_walltime_gate_must_be_unconditional(self):
+        self.rejects(self.mutate(
+            "      - name: Shell gate walltime budget (Linux Clang shard)\n",
+            "      - name: Shell gate walltime budget (Linux Clang shard)\n"
+            "        if: false\n"),
+            "unconditional")
+
+    def test_test_filter_is_rejected(self):
+        self.rejects(self.mutate("--print-errorlogs --slice",
+                                 "--print-errorlogs --no-suite tidy --slice"),
+                     "sliced")
+
+    def test_collecting_context_name_is_pinned(self):
+        self.rejects(self.mutate("    name: Build / ubuntu-26.04 / clang\n",
+                                 "    name: Build / ubuntu-26.04 / clang / all\n"),
+                     "stable context")
+
+    def test_collecting_job_must_not_skip(self):
+        self.rejects(self.mutate("if: ${{ !cancelled() && needs.build-scope",
+                                 "if: ${{ needs.build-scope"),
+                     "run, not skip")
+
+    def test_collecting_job_must_check_shard_result(self):
+        self.rejects(self.mutate('if [ "$SHARDS_RESULT" != success ]; then',
+                                 'if [ "$SHARDS_RESULT" = cancelled ]; then'),
+                     "every shard succeeded")
+
+    def test_continue_on_error_is_rejected(self):
+        self.rejects(self.mutate(
+            "      - name: Test (Linux Clang shard)\n",
+            "      - name: Test (Linux Clang shard)\n        continue-on-error: true\n"),
+            "continue-on-error")
+
+    def test_shard_budget_is_pinned(self):
+        self.rejects(self.mutate("    timeout-minutes: 60\n    strategy:\n"
+                                 "      fail-fast: false\n      matrix:\n"
+                                 "        shard:",
+                                 "    timeout-minutes: 90\n    strategy:\n"
+                                 "      fail-fast: false\n      matrix:\n"
+                                 "        shard:"),
+                     "60-minute")
+
+    def test_test_step_budget_is_pinned(self):
+        self.rejects(self.mutate("        timeout-minutes: 40\n",
+                                 "        timeout-minutes: 60\n"),
+                     "shorter budget")
+
+    def test_fail_fast_is_rejected(self):
+        block = job_block(self.text, SHARD_JOB)
+        mutated = self.text.replace(block, block.replace("fail-fast: false",
+                                                         "fail-fast: true"))
+        self.assertNotEqual(mutated, self.text)
+        self.rejects(mutated, "cancel the others")
+
+    def test_walltime_gate_must_stay_required(self):
+        block = job_block(self.text, SHARD_JOB)
+        mutated = self.text.replace(block, block.replace(
+            'WIRELOG_WALLTIME_REQUIRED: "1"', 'WIRELOG_WALLTIME_REQUIRED: "0"'))
+        self.assertNotEqual(mutated, self.text)
+        self.rejects(mutated, "walltime gate must be required")
+
+    def test_evidence_upload_must_survive_failure(self):
+        block = job_block(self.text, SHARD_JOB)
+        mutated = self.text.replace(block, block.replace(
+            "        if: ${{ always() }}\n        uses: actions/upload-artifact",
+            "        uses: actions/upload-artifact"))
+        self.assertNotEqual(mutated, self.text)
+        self.rejects(mutated, "even on failure")
+
+    def test_linux_cannot_return_to_build_matrix(self):
+        block = build_matrix(self.text)
+        entry = "          # macOS - Clang\n"
+        self.assertEqual(block.count(entry), 1)
+        mutated = self.text.replace(block, block.replace(
+            entry, "          - os: ubuntu-26.04\n"
+            "            compiler: clang\n            cc: clang\n"
+            "            timeout_minutes: 90\n\n" + entry))
+        self.assertNotEqual(mutated, self.text)
+        with self.assertRaisesRegex(AssertionError, "one entry per platform"):
+            validate(mutated)
+        with self.assertRaisesRegex(AssertionError, "unsharded"):
+            validate_linux_clang_shards(mutated)
 
 
 class CiPrLtoCostTests(unittest.TestCase):
