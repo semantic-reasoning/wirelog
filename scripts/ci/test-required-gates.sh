@@ -196,10 +196,13 @@ assert 'release-tag.yml Tag/SBOM sets WIRELOG_SBOM_REQUIRED' \
     sets_in_step release-tag.yml 'Build and test SBOM suite' WIRELOG_SBOM_REQUIRED
 
 # #1487: the walltime budget is a post-suite step, so it has two OS-split steps
-# in the PR matrix and one in the release default job. Each must carry the
-# escalation, else the required contract above is unenforced in CI.
-assert 'ci-pr.yml walltime step (Linux/macOS) sets WIRELOG_WALLTIME_REQUIRED' \
-    sets_in_step ci-pr.yml 'Shell gate walltime budget (Linux / macOS)' WIRELOG_WALLTIME_REQUIRED
+# in the PR matrix, one in each Linux Clang shard (#2397) and one in the
+# release default job. Each must carry the escalation, else the required
+# contract above is unenforced in CI.
+assert 'ci-pr.yml walltime step (macOS) sets WIRELOG_WALLTIME_REQUIRED' \
+    sets_in_step ci-pr.yml 'Shell gate walltime budget (macOS)' WIRELOG_WALLTIME_REQUIRED
+assert 'ci-pr.yml walltime step (Linux Clang shard) sets WIRELOG_WALLTIME_REQUIRED' \
+    sets_in_step ci-pr.yml 'Shell gate walltime budget (Linux Clang shard)' WIRELOG_WALLTIME_REQUIRED
 assert 'ci-pr.yml walltime step (Windows) sets WIRELOG_WALLTIME_REQUIRED' \
     sets_in_step ci-pr.yml 'Shell gate walltime budget (Windows / MSVC)' WIRELOG_WALLTIME_REQUIRED
 assert 'release-tag.yml default job sets WIRELOG_WALLTIME_REQUIRED' \

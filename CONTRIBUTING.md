@@ -148,11 +148,12 @@ a real process call. The walltime budget below still measures only
 drift detector (#1797).
 
 Because the walltime gate's measurement input
-(`build/meson-logs/testlog.json`) exists only
-after `meson test`, it runs as a **post-suite CI step** in
-`ci-pr.yml` (`build-matrix`, all three OSes) and `release-tag.yml` (the
-`default` job), not as a suite member -- a suite-registered gate would always
-see an empty log and skip (the #1301 always-skip shape).
+(`build/meson-logs/testlog.json`) exists only after `meson test`, it runs as
+a **post-suite CI step** in `ci-pr.yml` (`build-matrix` on macOS and Windows,
+and each Linux Clang shard over the tests that shard ran) and
+`release-tag.yml` (the `default` job), not as a suite member -- a
+suite-registered gate would always see an empty log and skip (the #1301
+always-skip shape).
 
 * The step fails any shell-seeded test whose measured duration exceeds
   **50%** of its own `timeout`, by name, printing both numbers.

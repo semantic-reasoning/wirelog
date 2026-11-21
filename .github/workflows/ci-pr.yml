@@ -11,6 +11,8 @@ name: CI PR
 #         └─ build-primary (ubuntu-26.04 gcc, SBOM/size/path-a gates)
 #            ├─ build-arm (ubuntu-26.04-arm gcc, ABI #681) ──┐
 #            └─ build-mbedtls (ubuntu-26.04 gcc, crypto) ──┼─ build-matrix
+#                                                          └─ build-linux-clang-shards
+#                                                             └─ build-linux-clang
 #
 # CodeQL runs in its own workflow (GitHub default-setup); not invoked from here.
 
@@ -199,9 +201,10 @@ jobs:
       #
       # This is the only job that installs clang-tidy, so the ratchet's
       # guarantee is Linux/gcc-configured-build only.  The other jobs
-      # (build-arm, build-matrix macOS + MSVC, build-mbedtls,
-      # sanitizer-matrix, tsan) skip it at runtime rather than reporting a
-      # verdict from a configuration the allowlist was not calibrated for.
+      # (build-arm, build-matrix macOS + MSVC, build-linux-clang-shards,
+      # build-mbedtls, sanitizer-matrix, tsan) skip it at runtime rather than
+      # reporting a verdict from a configuration the allowlist was not
+      # calibrated for.
       # =======================================================================
       - name: Install clang-tidy (pinned major)
         run: |
@@ -326,7 +329,7 @@ jobs:
 
   # ==========================================================================
   # Phase: Build Matrix (gated by build-arm + build-mbedtls)
-  # Linux Clang + macOS Clang + Windows MSVC
+  # macOS Clang + Windows MSVC; Linux Clang runs sharded below (#2397).
   # Only proceeds after build-primary's dependencies (ARM ABI, mbedTLS) pass.
   # ==========================================================================
   build-matrix:
@@ -334,21 +337,14 @@ jobs:
     needs: [build-arm, build-mbedtls, build-scope]
     if: ${{ needs.build-scope.outputs.build-required == 'true' }}
     runs-on: ${{ matrix.os }}
-    # Linux/Clang reached 1144/1182 tests before its 60-minute job deadline;
-    # allow 90 minutes for the full build and suite. Windows/MSVC retains its
-    # 120-minute cold-build allowance; macOS retains 60 minutes. Keep budgets
-    # platform-specific and preserve individual test watchdogs.
+    # Windows/MSVC retains its 120-minute cold-build allowance; macOS retains
+    # 60 minutes. Keep budgets platform-specific and preserve individual test
+    # watchdogs.
     timeout-minutes: ${{ matrix.timeout_minutes }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          # Linux - Clang
-          - os: ubuntu-26.04
-            compiler: clang
-            cc: clang
-            timeout_minutes: 90
-
           # macOS - Clang
           - os: macos-latest
             compiler: clang
@@ -363,15 +359,6 @@ jobs:
 
     steps:
       - uses: actions/checkout@v5
-
-      - name: Install dependencies (Linux)
-        if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y meson ninja-build libmbedtls-dev uncrustify abigail-tools b3sum
-          if [ "${{ matrix.compiler }}" = "clang" ]; then
-            sudo apt-get install -y clang
-          fi
 
       - name: Install dependencies (macOS)
         if: runner.os == 'macOS'
@@ -388,8 +375,8 @@ jobs:
         if: runner.os == 'Windows'
         uses: ./.github/actions/setup-meson
 
-      - name: Configure (Linux / macOS)
-        if: runner.os != 'Windows'
+      - name: Configure (macOS)
+        if: runner.os == 'macOS'
         run: meson setup builddir -Dtests=true -DmbedTLS=disabled
         env:
           CC: ${{ matrix.cc }}
@@ -415,8 +402,8 @@ jobs:
           $env:CXX = 'cl'
           meson setup builddir -Dtests=true -DmbedTLS=disabled
 
-      - name: Build (Linux / macOS)
-        if: runner.os != 'Windows'
+      - name: Build (macOS)
+        if: runner.os == 'macOS'
         run: meson compile -C builddir
 
       - name: Build (Windows / MSVC)
@@ -447,11 +434,11 @@ jobs:
       # a Homebrew bash 5 ahead of it, that runtime coverage disappears silently
       # and nothing else would say so. One line, printed every run.
       - name: Record bash version
-        if: runner.os != 'Windows'
+        if: runner.os == 'macOS'
         run: bash --version | head -1
 
-      - name: Test (Linux / macOS)
-        if: runner.os != 'Windows'
+      - name: Test (macOS)
+        if: runner.os == 'macOS'
         run: meson test -C builddir --print-errorlogs
 
       - name: Test (Windows / MSVC)
@@ -481,10 +468,10 @@ jobs:
       # whose duration exceeded 50% of its own timeout, by name with both
       # numbers. WIRELOG_WALLTIME_REQUIRED=1 turns every would-be skip into a
       # failure so a gate that asserts nothing is loud, not green. Bash is
-      # present on all three runners, so shell gates register and run here; the
-      # gate measures exactly the ones that ran.
-      - name: Shell gate walltime budget (Linux / macOS)
-        if: runner.os != 'Windows'
+      # present on both runners here and on the Linux Clang shards, so shell
+      # gates register and run; the gate measures exactly the ones that ran.
+      - name: Shell gate walltime budget (macOS)
+        if: runner.os == 'macOS'
         run: python3 scripts/ci/check-shell-gate-walltime.py builddir --fraction 0.5
         env:
           WIRELOG_WALLTIME_REQUIRED: "1"
@@ -495,6 +482,120 @@ jobs:
         run: python scripts/ci/check-shell-gate-walltime.py builddir --fraction 0.5
         env:
           WIRELOG_WALLTIME_REQUIRED: "1"
+
+  # ==========================================================================
+  # Phase: Linux Clang, sharded (gated by build-arm + build-mbedtls)
+  # Issue #2397: the unsharded Linux Clang job outgrew its 60-minute budget as
+  # the suite grew (1035 -> 1454 tests in about two days) and on slower hosted
+  # runners (1.41x slower in aggregate). Each shard builds the same
+  # configuration and runs `meson test --slice K/3`, which takes every third
+  # test of the same list a plain `meson test` runs. check-test-shards.py
+  # records each slice before the run and proves after it that the shards
+  # executed every test exactly once; build-linux-clang below keeps the
+  # `Build / ubuntu-26.04 / clang` context and fails unless every shard
+  # succeeded and that proof holds. Measurements and the re-sharding rule:
+  # docs/CI_TELEMETRY.md, "Linux Clang PR lane (#2397)".
+  # The test step has its own budget below the job's so that, if it times
+  # out, the verify and upload steps still run and keep the partial results.
+  # ==========================================================================
+  build-linux-clang-shards:
+    name: Build / ubuntu-26.04 / clang / shard ${{ matrix.shard }} of 3
+    needs: [build-arm, build-mbedtls, build-scope]
+    if: ${{ needs.build-scope.outputs.build-required == 'true' }}
+    runs-on: ubuntu-26.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3]
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y meson ninja-build libmbedtls-dev uncrustify abigail-tools b3sum clang
+
+      - name: Configure
+        run: meson setup builddir -Dtests=true -DmbedTLS=disabled
+        env:
+          CC: clang
+
+      - name: Build
+        run: meson compile -C builddir
+
+      - name: Record bash version
+        run: bash --version | head -1
+
+      - name: Plan Linux Clang shard
+        id: plan
+        run: >-
+          python3 scripts/ci/check-test-shards.py plan --builddir builddir
+          --shard ${{ matrix.shard }} --count 3 --sha "${{ github.sha }}"
+          --run-attempt "${{ github.run_attempt }}" --out shard-evidence
+
+      - name: Test (Linux Clang shard)
+        timeout-minutes: 40
+        run: meson test -C builddir --print-errorlogs --slice ${{ matrix.shard }}/3
+
+      - name: Verify shard coverage
+        if: ${{ always() && steps.plan.outcome == 'success' }}
+        run: >-
+          python3 scripts/ci/check-test-shards.py verify --evidence shard-evidence
+          --testlog builddir/meson-logs/testlog.json
+
+      # #1487 walltime budget over the shell gates this shard ran. Each slice
+      # currently holds 18-20 shell-seeded tests; with
+      # WIRELOG_WALLTIME_REQUIRED=1 the gate fails loudly if one ever holds
+      # none.
+      - name: Shell gate walltime budget (Linux Clang shard)
+        run: python3 scripts/ci/check-shell-gate-walltime.py builddir --fraction 0.5
+        env:
+          WIRELOG_WALLTIME_REQUIRED: "1"
+
+      # Trimmed results only (name/result/start/duration/returncode): the raw
+      # testlog carries each test's environment and output.
+      - name: Upload shard evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: linux-clang-shard-${{ matrix.shard }}
+          path: shard-evidence
+          overwrite: true
+          retention-days: 7
+          if-no-files-found: warn
+
+  build-linux-clang:
+    name: Build / ubuntu-26.04 / clang
+    needs: [build-linux-clang-shards, build-scope]
+    # !cancelled(): without a status function this job would be skipped when
+    # a shard fails, and a skipped context is not a failed one.
+    if: ${{ !cancelled() && needs.build-scope.outputs.build-required == 'true' }}
+    runs-on: ubuntu-26.04
+    timeout-minutes: 10
+    steps:
+      - name: Require every shard to succeed
+        env:
+          SHARDS_RESULT: ${{ needs.build-linux-clang-shards.result }}
+        run: |
+          if [ "$SHARDS_RESULT" != success ]; then
+            echo "::error::Linux Clang shard jobs concluded '$SHARDS_RESULT'; every shard must succeed"
+            exit 1
+          fi
+
+      - uses: actions/checkout@v5
+
+      - name: Download shard evidence
+        uses: actions/download-artifact@v7
+        with:
+          pattern: linux-clang-shard-*
+          path: shard-evidence
+
+      - name: Aggregate shard coverage
+        run: >-
+          python3 scripts/ci/check-test-shards.py aggregate --count 3
+          --sha "${{ github.sha }}" --summary "$GITHUB_STEP_SUMMARY" shard-evidence
 
   # ==========================================================================
   # Phase: Build mbedTLS (gated by build-primary)

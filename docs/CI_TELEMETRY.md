@@ -1008,3 +1008,149 @@ The fixtures under `scripts/ci/ci-telemetry-fixtures/` are trimmed captures of
 real runs -- a success, a skip cascade, which is also the failed-run case, and
 a clock-skewed run -- plus hand-written queued, missing-data and re-run cases.
 The self-test uses no network, no `gh` and no build directory.
+
+## Linux Clang PR lane (#2397)
+
+The `Build / ubuntu-26.04 / clang` leg of `build-matrix` ran the whole suite
+in one hosted job and began hitting its 60-minute timeout.  It now runs as
+three `build-linux-clang-shards` jobs, each executing
+`meson test --slice K/3`, plus a `build-linux-clang` job that keeps the
+original context name.  This section records what was measured before the
+change, kept apart from what was inferred from it.
+
+### Observed facts
+
+All figures come from GitHub job and step timestamps and the job logs.
+Configuration: hosted runner, runner image `ubuntu-26.04` versions
+20261111.82.6, 20261111.196.1 and 20261116.202.1, `CC=clang`, distro
+Meson 1.10.1, `meson setup builddir -Dtests=true -DmbedTLS=disabled`,
+`meson test` at the default parallelism.  Setup and configure took about
+0.3 min in every successful run.
+
+| run | build min | test min | job min | tests |
+| --- | --- | --- | --- | --- |
+| 44267216163 | 13.0 | 44.5 | 58.1 | 1035 |
+| 44310167205 | 8.7 | 31.1 | 40.2 | 1138 |
+| 44449305995 | 9.2 | 32.7 | 43.3 | 1145 |
+| 44483642375 | 11.2 | 42.3 | 54.4 | 1281 |
+| 44503772372 | 9.2 | 32.7 | 42.6 | 1146 |
+| 44657253886 | 9.6 | 36.6 | 46.7 | 1326 |
+| 44670249612 | 8.7 | 34.5 | 43.5 | 1282 |
+
+Run 44664182053 (PR #2394, 1410 tests) was cancelled at the limit on both
+attempts.  Attempt 1 had reached test 1227 of 1410 at 60 minutes.  Attempt 2
+spent 16.5 min on setup and build, then reached test 1105 of 1410 after
+43.3 min of test step.
+
+- Summed per-test durations were 108-127 CPU-min per run.
+- Effective parallelism (summed test time over test-step wall time) was 2.93
+  on the cancelled attempt 2 (job 136192547575: 126.8 CPU-min in 43.3 min)
+  and 3.16 on a normal run (job 136102787105: 115.6 CPU-min in 36.6 min).
+- Over the 1104 tests both of those jobs ran, the cancelled attempt was 1.41x
+  slower in aggregate.  Per-test ratios varied widely: among the 259 shared
+  tests that took at least 5 s on the normal run, they ran from 1.01x to
+  2.56x, and 230 were below 1.5x.  Two long examples: `clang_tidy_ratchet`
+  353 s against 196 s (1.8x), `candidate_consumer_contract` 251 s against
+  168 s (1.5x).
+- Heaviest families by summed duration:
+  `evaluation_seed_hosts_unloaded_frontier` 17-23 min,
+  `evaluation_seed_hosts_frontier` 11-17 min,
+  `evaluation_seed_hosts_declared_frontier` 7-11 min,
+  `evaluation_recursive_string_bottom_cuts_{1,2}` about 11 min,
+  `clang_tidy_ratchet` 3-6 min and `candidate_consumer_contract` 3-4 min.
+  The longest single test took 353 s.
+- The suite grew from 1035 tests (Nov 18) to 1410 (Nov 20, PR #2394) and 1454
+  on `main` when this change was made.
+
+### Hypotheses
+
+These were not established and the change does not depend on them.
+
+- The cancellations come from runner speed variance on top of test growth,
+  not from a hang.
+- The suite will keep growing at a similar rate, so a larger single-job
+  budget would only postpone the next timeout.
+
+### Decision and headroom
+
+Three shards, each a separate job with its own 60-minute limit.  The test
+step inside each shard has a 40-minute limit, so a timed-out suite still
+leaves the verify and upload steps time to keep the partial results; the
+collecting job has 10 minutes.  The worst observed setup plus build was 16.5
+minutes, so 40 minutes of test step leaves about 3.5 minutes for verify and
+upload; a build that grows past about 19 minutes would let the job limit
+pre-empt the upload again.  The re-sharding rule below is on total job time
+for that reason.
+
+The worst case was projected by applying Meson's `tests[K-1::N]` assignment
+to the 1454-test list.  Each test took the cancelled attempt's duration where
+it had one, the normal run's duration times 1.41 otherwise, and the mean
+times 1.41 when neither run measured it.  That gives 178.4 CPU-min for the
+suite and [67.9, 56.6, 53.9] CPU-min per shard.  At the slow runner's
+parallelism of 2.93 the worst shard job is about 0.3 setup + 16.5 build +
+23.2 test + 5.9 allowance for the longest test + 1 for listing, checks and
+upload, about **46.9 min, or 78% of 60**.  The same projection for one
+unsharded job is about 0.3 + 16.5 + 60.9 + 5.9 + 1, about 84.6 min, or 94%
+of the 90-minute budget `main` had raised it to.
+
+Four shards were not chosen: the build runs in every shard, so the same
+projection only falls to about 41 min (49.4 CPU-min worst shard) while every
+PR pays another 9-16 runner-minutes.
+
+### Re-sharding rule
+
+Raise the shard count when any hosted shard job exceeds 45 minutes (75% of
+its limit).  The projected worst case above is over that trigger on purpose:
+a hosted run that comes close to it means the slow-runner case has arrived,
+and the count should rise while there are still about 13 minutes of
+headroom, not after a job hits 60.  The count is `SHARD_COUNT` in
+`scripts/ci/test-ci-pr-build-timeouts.py`, which requires the shard job
+name, its `shard:` list, `--slice K/N` and both `--count` arguments in the
+workflow to agree with it.
+
+### Hosted runs with the sharded lane
+
+Run 44882426643, attempt 1, head 65efd0ea: 1511 tests, runner image
+`ubuntu-26.04` 20261116.202.1, Meson 1.10.1.  Times are minutes from the
+job and step timestamps; queue is the gap between a job's creation and its
+start.  Parallelism is the aggregate table's summed test seconds over its
+elapsed seconds.
+
+| job | queue s | setup | build | test | job min | of limit | tests | parallelism |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| shard 1 (136861471833) | 2 | 0.4 | 9.2 | 17.4 | 27.1 | 45% | 504 | 2.86 |
+| shard 2 (136861471755) | 2 | 0.3 | 16.2 | 22.3 | 38.9 | 65% | 504 | 3.18 |
+| shard 3 (136861471844) | 2 | 0.4 | 16.1 | 18.6 | 35.3 | 59% | 503 | 3.43 |
+| collecting (136871269767) | 1 | | | | 0.1 | <1% | | |
+
+- The collecting job's aggregate step reported "1511 tests in 3 shards,
+  each executed exactly once"; no test failed (4, 5 and 8 runtime skips).
+- The lane took 39.1 min from the shards' creation to the collecting job's
+  end, and 101.4 runner-minutes in total.
+- The slowest shard job, 38.9 min, is under the 45-minute re-sharding
+  trigger.  Two of the three shards built in about 16 minutes, the slow
+  build the headroom projection assumed.
+
+For comparison, every successful unsharded `Build / ubuntu-26.04 / clang`
+job in the ci-pr runs created on 2026-11-20 and 2026-11-21 (UTC):
+
+| run | job | build | test | job min |
+| --- | --- | --- | --- | --- |
+| 44657253886 | 136102787105 | 9.6 | 36.6 | 46.7 |
+| 44670249612 | 136208072335 | 8.7 | 34.5 | 43.5 |
+| 44734020758 | 136421106736 | 14.3 | 63.8 | 79.1 |
+| 44734940574 | 136454245873 | 9.7 | 44.5 | 55.1 |
+| 44812128737 | 136674047989 | 9.2 | 42.9 | 53.2 |
+| 44881958767 | 136844043722 | 9.5 | 43.9 | 54.1 |
+| 44882505982 | 136853825568 | 16.6 | 64.9 | 82.1 |
+
+Two of those seven ran past the original 60-minute limit and passed only
+under the 90-minute budget.  The same window also holds four jobs cancelled
+at the 60-minute limit their PR heads still carried: 136153935963 and
+136179688707 (run 44670249612, attempts 1 and 2), 136157126966 and
+136192547575 (run 44664182053, attempts 1 and 2).
+
+The evidence artifacts are kept for 7 days.  Re-running only the
+collecting job after that cannot pass: either the download step fails or
+`check-test-shards.py aggregate` rejects a folder without every shard's
+evidence.  Re-run the shard jobs with it.
