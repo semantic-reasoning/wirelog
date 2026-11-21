@@ -60,7 +60,16 @@ typedef struct {
     unsigned schema[HEADS], empty_left[HEADS], empty_right[HEADS];
     unsigned overrides[HEADS], selected[HEADS], false_rows[HEADS];
     unsigned private_head[HEADS];
+    unsigned refill_builds;
 } witnesses_t;
+/* Descriptive build-occurrence tuple, never an authority or private pointer. */
+typedef struct {
+    uintptr_t session, control, plan, operation, source;
+    uint64_t attempt, control_identity, generation;
+    col_relation_snapshot_t snapshot;
+    unsigned occurrence, slot, key_count, key, rows, inserted, ordinal;
+    bool pending;
+} wl_test_join_cache_build_t;
 typedef struct {
     wirelog_program_t *program;
     wl_plan_t *plan;
@@ -77,6 +86,9 @@ typedef struct {
     registry_t unpinned;
     bool cycle;
     unsigned cycle_fault;
+    wl_test_join_cache_build_t cycle_build;
+    uint64_t failed_build_attempt;
+    unsigned build_ordinal;
     bool work_stop, armed, stopped;
     int64_t tag, floating;
     profile_t *active;
@@ -279,6 +291,7 @@ wl_test_join_cache_bind(fixture_t *f,
             COL_SESSION(f->active->session), bindings));
     if (f->selected != bindings->plan) {
         f->append = NULL; f->append_op = NULL; f->building = NULL;
+        f->cycle_build.pending = false;
     }
     f->bindings = bindings; f->selected = bindings->plan;
     f->head = head_number(bindings->plan->name);
@@ -677,6 +690,79 @@ wl_test_join_cache_cycle_sources(fixture_t *f,
     return override != NULL;
 }
 static void
+wl_test_join_cache_cycle_build_capture(fixture_t *f,
+    wl_columnar_filter_context_t *ctx, uint64_t slot)
+{
+    wl_col_session_t *s = COL_SESSION(f->active->session);
+    const wl_plan_op_t *op = ctx->join_operation;
+    const col_rel_t *source = ctx->join_right.descriptor;
+    CHECK(!f->cycle_build.pending && !f->build_ordinal && s->diff_enabled
+        && s->diff_txn_count == 1 && s->diff_arr_count == 3
+        && ctx->source.nrows && source->nrows == 2
+        && !op->right_filter_expr.size && op->key_count == 1
+        && !strcmp(op->right_keys[0], "col0") && slot == 0
+        && s->diff_arr_entries[slot].key_count == 1
+        && s->diff_arr_entries[slot].key_cols[0] == 0
+        && f->seen.schema[f->head] && f->seen.sources[f->head]);
+    wl_test_join_cache_build_t *b = &f->cycle_build;
+    b->session = (uintptr_t)s; b->control = (uintptr_t)f->active->control;
+    b->control_identity = wl_evaluation_control_identity(f->active->control);
+    b->attempt = wl_evaluation_control_active_attempt_id(f->active->control);
+    CHECK(b->attempt && b->attempt == f->bindings->attempt_id);
+    b->generation = f->bindings->generation;
+    b->plan = (uintptr_t)f->selected; b->operation = (uintptr_t)op;
+    b->occurrence = (unsigned)(op - f->selected->ops);
+    b->source = (uintptr_t)source;
+    b->snapshot = wl_columnar_relation_snapshot(source);
+    b->slot = (unsigned)slot; b->key_count = op->key_count; b->key = 0;
+    b->rows = source->nrows; b->inserted = 0;
+    b->ordinal = ++f->build_ordinal; b->pending = true;
+    if (f->failed_build_attempt) CHECK(b->attempt != f->failed_build_attempt);
+}
+static void
+wl_test_join_cache_cycle_build_row(fixture_t *f,
+    wl_columnar_filter_context_t *ctx, uint64_t row)
+{
+    wl_test_join_cache_build_t *b = &f->cycle_build;
+    const wl_plan_op_t *op = ctx->join_operation;
+    wl_col_session_t *s = COL_SESSION(f->active->session);
+    CHECK(b->pending && b->ordinal == 1 && b->session == (uintptr_t)s
+        && s->diff_txn_count == 1 && b->control == (uintptr_t)f->active->control
+        && b->control_identity ==
+        wl_evaluation_control_identity(f->active->control)
+        && b->attempt ==
+        wl_evaluation_control_active_attempt_id(f->active->control)
+        && b->attempt == f->bindings->attempt_id &&
+        b->generation == f->bindings->generation
+        && b->plan == (uintptr_t)f->selected && b->operation == (uintptr_t)op
+        && b->occurrence == (unsigned)(op - f->selected->ops)
+        && b->source == (uintptr_t)ctx->join_right.descriptor
+        && wl_columnar_relation_snapshot_equal(b->snapshot,
+        wl_columnar_relation_snapshot(ctx->join_right.descriptor))
+        && b->slot == 0 && b->key_count == op->key_count && b->key == 0
+        && !strcmp(op->right_keys[0],
+        "col0") && b->rows == ctx->join_right.nrows
+        && row == b->inserted && row < b->rows);
+    ++b->inserted;
+    if (b->inserted != b->rows) return;
+    CHECK(row == 1 && b->inserted == 2);
+    b->pending = false; ++f->seen.refill_builds;
+    if (f->failed_build_attempt)
+        fprintf(stdout, "refill retry old=%llu new=%llu rows=%u\n",
+            (unsigned long long)f->failed_build_attempt,
+            (unsigned long long)b->attempt, b->inserted);
+    if (f->cycle_fault != 3 || !f->armed || f->stopped) return;
+    f->stopped = true; f->failed_build_attempt = b->attempt;
+    fprintf(stdout,
+        "refill build attempt=%llu generation=%llu slot=%u rows=%u ordinal=%u\n",
+        (unsigned long long)b->attempt, (unsigned long long)b->generation,
+        b->slot, b->inserted, b->ordinal);
+    if (f->work_stop)
+        CHECK(wl_evaluation_control_charge_attempt(f->active->control,
+            b->attempt, UINT64_MAX) == WL_EVALUATION_CONTROL_WORK_LIMIT);
+    else wl_evaluation_control_request_cancel(f->active->control);
+}
+static void
 wl_test_join_cache_cycle_arrangement(wl_evaluation_control_t *control,
     unsigned phase, uint64_t progress)
 {
@@ -689,7 +775,10 @@ wl_test_join_cache_cycle_arrangement(wl_evaluation_control_t *control,
         && !ctx->join_operation->right_filter_expr.size);
     if (phase == 14) {
         ++f->seen.builds; f->building = ctx->join_operation;
+        if (!f->profile && f->stage == 6 && f->head < 2)
+            wl_test_join_cache_cycle_build_capture(f, ctx, progress);
     } else {
+        f->cycle_build.pending = false;
         ++f->seen.reuses; f->building = NULL;
     }
 }
@@ -754,6 +843,8 @@ wl_test_join_cache_cycle_join(wl_evaluation_control_t *control,
             CHECK(!overridden && f->building == ctx->join_operation
                 && ctx->join_right.nrows && progress < ctx->join_right.nrows);
             ++f->seen.indexed;
+            if (!f->profile && f->stage == 6 && f->head < 2)
+                wl_test_join_cache_cycle_build_row(f, ctx, progress);
         }
     }
     if (phase == 48) {
@@ -767,6 +858,8 @@ static void watch(fixture_t *f, unsigned profile, bool enabled) {
     f->profile = profile;
     f->active = &f->profiles[profile];
     memset(&f->seen, 0, sizeof(f->seen));
+    memset(&f->cycle_build, 0, sizeof(f->cycle_build));
+    f->build_ordinal = 0;
     f->bindings = NULL;
     f->selected = NULL;
     f->building = NULL;
@@ -981,6 +1074,7 @@ wl_test_join_cache_cycle_work(fixture_t *f, const registry_t *before)
         if (!f->profile) same_registry(before, &now, true);
         else CHECK(!now.count);
     }
+    if (!f->profile && f->stage == 6) CHECK(f->seen.refill_builds == 1);
     fprintf(stdout,
         "cycle stage=%u profile=%u builds=%u reuse=%u override=%u\n",
         f->stage, f->profile, f->seen.builds, f->seen.reuses, override);
@@ -1001,7 +1095,8 @@ wl_test_join_cache_cycle_run(fixture_t *f)
             registry_t before = registry(&f->profiles[p]);
             watch(f, p, p < 2);
             if (!p && f->cycle_fault && !f->stopped
-                && f->stage == (f->cycle_fault == 1 ? 2u : 1u)) {
+                && f->stage ==
+                (f->cycle_fault == 1 ? 2u : f->cycle_fault == 2 ? 1u : 6u)) {
                 wl_test_join_cache_cycle_failure(f, &before, &old);
                 watch(f, p, true);
             }
@@ -1346,8 +1441,9 @@ int main(int argc, char **argv) {
         f.cycle = !strcmp(argv[3], "empty-cycle");
         const char *const cycle_modes[] = {"empty-right-cancel",
                                            "empty-right-work",
-                                           "rejected-cancel", "rejected-work"};
-        for (unsigned i = 0; i < 4; ++i) if (!strcmp(argv[3], cycle_modes[i])) {
+                                           "rejected-cancel", "rejected-work",
+                                           "refill-cancel", "refill-work"};
+        for (unsigned i = 0; i < 6; ++i) if (!strcmp(argv[3], cycle_modes[i])) {
                 f.cycle = true; f.cycle_fault = i / 2 + 1;
                 f.work_stop = (i % 2) != 0;
             }
