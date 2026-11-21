@@ -8527,6 +8527,7 @@ extern void (*wl_columnar_ops_test_cold_scan_checkpoint)(
 extern uint64_t wl_columnar_ops_test_raw_cold_scans;
 extern uint64_t wl_columnar_ops_test_raw_cold_aggregates;
 extern uint64_t wl_columnar_join_test_raw_cold_joins;
+extern uint64_t wl_columnar_join_test_raw_cold_join_aggregates;
 #endif
 
 /* Actual owned LFTJ row and protected exact-capacity output; no generic
