@@ -434,6 +434,14 @@ the cutover commit sets `project_version` to `1.0.0-rc1`.
     `Sanitizers / ubuntu-26.04 / clang`,
     `Sanitizers / macos-latest / clang`,
     `TSan / ubuntu-26.04 / gcc`.
+  - `Build / ubuntu-26.04 / clang` is the collecting job of the sharded
+    Linux Clang lane (#2397).  Require it, not the
+    `Build / ubuntu-26.04 / clang / shard K of N` contexts: their names
+    change whenever the shard count does, and the collecting job, whenever
+    it runs, fails unless every shard succeeded and ran its whole slice.
+    It is skipped only when the run is cancelled or
+    `Detect build-triggering changes` does not succeed; that job reports
+    `build-required=true` on every PR, documentation-only ones included.
 
 #### Synthetic PR verification plan (Phase B)
 

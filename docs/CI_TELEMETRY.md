@@ -1110,4 +1110,47 @@ workflow to agree with it.
 
 ### Hosted runs with the sharded lane
 
-No hosted run recorded yet.
+Run 44882426643, attempt 1, head 65efd0ea: 1511 tests, runner image
+`ubuntu-26.04` 20261116.202.1, Meson 1.10.1.  Times are minutes from the
+job and step timestamps; queue is the gap between a job's creation and its
+start.  Parallelism is the aggregate table's summed test seconds over its
+elapsed seconds.
+
+| job | queue s | setup | build | test | job min | of limit | tests | parallelism |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| shard 1 (136861471833) | 2 | 0.4 | 9.2 | 17.4 | 27.1 | 45% | 504 | 2.86 |
+| shard 2 (136861471755) | 2 | 0.3 | 16.2 | 22.3 | 38.9 | 65% | 504 | 3.18 |
+| shard 3 (136861471844) | 2 | 0.4 | 16.1 | 18.6 | 35.3 | 59% | 503 | 3.43 |
+| collecting (136871269767) | 1 | | | | 0.1 | <1% | | |
+
+- The collecting job's aggregate step reported "1511 tests in 3 shards,
+  each executed exactly once"; no test failed (4, 5 and 8 runtime skips).
+- The lane took 39.1 min from the shards' creation to the collecting job's
+  end, and 101.4 runner-minutes in total.
+- The slowest shard job, 38.9 min, is under the 45-minute re-sharding
+  trigger.  Two of the three shards built in about 16 minutes, the slow
+  build the headroom projection assumed.
+
+For comparison, every successful unsharded `Build / ubuntu-26.04 / clang`
+job in the ci-pr runs created on 2026-11-20 and 2026-11-21 (UTC):
+
+| run | job | build | test | job min |
+| --- | --- | --- | --- | --- |
+| 44657253886 | 136102787105 | 9.6 | 36.6 | 46.7 |
+| 44670249612 | 136208072335 | 8.7 | 34.5 | 43.5 |
+| 44734020758 | 136421106736 | 14.3 | 63.8 | 79.1 |
+| 44734940574 | 136454245873 | 9.7 | 44.5 | 55.1 |
+| 44812128737 | 136674047989 | 9.2 | 42.9 | 53.2 |
+| 44881958767 | 136844043722 | 9.5 | 43.9 | 54.1 |
+| 44882505982 | 136853825568 | 16.6 | 64.9 | 82.1 |
+
+Two of those seven ran past the original 60-minute limit and passed only
+under the 90-minute budget.  The same window also holds four jobs cancelled
+at the 60-minute limit their PR heads still carried: 136153935963 and
+136179688707 (run 44670249612, attempts 1 and 2), 136157126966 and
+136192547575 (run 44664182053, attempts 1 and 2).
+
+The evidence artifacts are kept for 7 days.  Re-running only the
+collecting job after that cannot pass: either the download step fails or
+`check-test-shards.py aggregate` rejects a folder without every shard's
+evidence.  Re-run the shard jobs with it.
