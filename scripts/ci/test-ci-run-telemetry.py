@@ -1003,7 +1003,7 @@ class DependencyGraph(unittest.TestCase):
     def test_every_job_has_an_entry_and_roots_are_explicit(self):
         # A job missing from the graph must be a gap, never mistaken for a
         # root, which is why roots carry an explicit empty list.
-        self.assertEqual(len(self.graph), 12)
+        self.assertEqual(len(self.graph), 14)
         self.assertEqual(self.graph["Detect build-triggering changes"], [])
         self.assertEqual(self.graph["RC changelog freeze gate"], [])
 
@@ -1016,15 +1016,19 @@ class DependencyGraph(unittest.TestCase):
                         f"{tool.DEFAULT_WORKFLOW} does not exist")
         self.assertEqual(Path(tool.DEFAULT_WORKFLOW),
                          self.WORKFLOW.resolve())
-        self.assertEqual(len(tool.extract_graph(tool.DEFAULT_WORKFLOW)), 12)
+        self.assertEqual(len(tool.extract_graph(tool.DEFAULT_WORKFLOW)), 14)
 
     def test_the_on_section_is_not_read_as_jobs(self):
         for spurious in ("pull_request", "workflow_call", "lint / workflow_call"):
             self.assertNotIn(spurious, self.graph)
 
     def test_every_node_resolves_against_a_real_run(self):
+        # run-success was recorded before #2397 sharded Linux Clang, so the
+        # three shard job names GitHub reports are added here; the recorded
+        # fixture itself stays as captured.
         _, jobs = fixture("run-success")
-        names = [j["name"] for j in jobs["jobs"]]
+        names = [j["name"] for j in jobs["jobs"]] + [
+            f"Build / ubuntu-26.04 / clang / shard {k} of 3" for k in (1, 2, 3)]
         edges, drift = tool.match_graph_to_jobs(self.graph, names)
         self.assertEqual(drift["nodes_without_job"], [])
         self.assertEqual(drift["jobs_without_node"], [])
@@ -1138,7 +1142,27 @@ class CriticalPath(unittest.TestCase):
         # every edge on the reported chain is known: the number is final.
         # Flagging it because some unrelated edge elsewhere was unavailable
         # would attach a caveat that does not apply to the value shown.
-        paths = self._analyze("run-skip-cascade")["critical_path"]
+        # The fixture predates the #2397 Linux Clang shards; add the two rows
+        # GitHub reports for them in such a cascade (the skipped shard matrix
+        # under its unexpanded name, and the collecting job, which runs and
+        # fails under !cancelled()), so only the cascade is under test here.
+        run, jobs = fixture("run-skip-cascade")
+        jobs = copy.deepcopy(jobs)
+        jobs["jobs"] += [
+            {"name": "Build / ubuntu-26.04 / clang / shard ${{ matrix.shard }} of 3",
+             "conclusion": "skipped", "status": "completed", "steps": [],
+             "created_at": "2026-09-11T07:14:47Z",
+             "started_at": "2026-09-11T07:14:47Z",
+             "completed_at": "2026-09-11T07:14:46Z"},
+            {"name": "Build / ubuntu-26.04 / clang",
+             "conclusion": "failure", "status": "completed", "steps": [],
+             "created_at": "2026-09-11T07:14:47Z",
+             "started_at": "2026-09-11T07:14:53Z",
+             "completed_at": "2026-09-11T07:15:01Z"}]
+        graph = tool.extract_graph(self.WORKFLOW)
+        edges, drift = tool.match_graph_to_jobs(
+            graph, [j["name"] for j in jobs["jobs"]])
+        paths = tool.analyze(run, jobs, edges, drift)["critical_path"]
         self.assertEqual(paths["observed"]["status"], "measured")
         self.assertNotIn("Build / ubuntu-26.04-arm / gcc",
                          paths["observed"]["evidence"]["chain"])
@@ -1211,15 +1235,15 @@ class CriticalPath(unittest.TestCase):
         self.assertIn("TSan", drift["jobs_without_node"][0])
 
     def test_a_run_missing_declared_jobs_is_flagged_not_reported_flat(self):
-        # The one-job rerun fixture walks cleanly to its root, but eleven jobs
-        # the graph declares never appear; a bare number would read as a
+        # The one-job rerun fixture walks cleanly to its root, but thirteen
+        # jobs the graph declares never appear; a bare number would read as a
         # complete path over a complete run.
         report = self._analyze("run-rerun")
         observed = report["critical_path"]["observed"]
         self.assertEqual(observed["status"], "partial")
         self.assertIn("absent from this run", observed["reason"])
         self.assertEqual(len(report["critical_path"]["graph_drift"]
-                             ["nodes_without_job"]), 11)
+                             ["nodes_without_job"]), 13)
 
     def test_a_hop_the_run_did_not_time_is_not_summed_as_zero(self):
         run, jobs = fixture("run-success")

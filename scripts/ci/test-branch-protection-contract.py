@@ -176,6 +176,8 @@ CONCRETE_BUILD_JOBS = (
     "build-primary",
     "build-arm",
     "build-matrix",
+    "build-linux-clang-shards",
+    "build-linux-clang",
     "build-mbedtls",
     "sanitizer-matrix",
     "tsan",

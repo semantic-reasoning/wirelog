@@ -1142,8 +1142,9 @@ if host_machine.system() == 'linux'
        suite: 'abi', timeout: 120)
 endif
 
-# Keep the longer Windows/MSVC build budget platform-specific; a global
-# timeout increase would hide Linux/macOS regressions in the PR gate.
+# Keep the longer Windows/MSVC build budget platform-specific and the Linux
+# Clang lane sharded under its own budgets (#2397); a global timeout increase
+# would hide Linux/macOS regressions in the PR gate.
 test('ci_pr_build_timeout_contract', py3,
      args: [meson.project_source_root() / 'scripts/ci/test-ci-pr-build-timeouts.py'],
      suite: 'abi')
