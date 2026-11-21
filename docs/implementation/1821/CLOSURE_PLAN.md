@@ -658,3 +658,14 @@ controlled single-worker sessions (#2301)". A cold input read as a right input,
 by a self-JOIN, by a JOIN with more than one key or before an aggregate, a
 SNAPSHOT or an observed STEP over one, the program refusals of the sixth bundle
 and more than one worker stay open.
+
+A ninth bundle admits, under control, a cold input read by a JOIN and then by
+an aggregate: the eighth bundle's JOIN shape with a COUNT, MIN or MAX that the
+uncontrolled cold JOIN aggregate admits as the rule's next to last op. The cold
+scan, the controlled JOIN and the controlled REDUCE attempts run in turn, and
+in the tested cases, which set no JOIN batch size, each child's output is
+materialized before the next one reads it; see "Cold JOIN aggregates in
+controlled single-worker sessions (#2301)". A cold input read as a right input,
+by a self-JOIN or by a JOIN with more than one key, alone or before an
+aggregate, a SNAPSHOT or an observed STEP over one, the program refusals of the
+sixth bundle and more than one worker stay open.

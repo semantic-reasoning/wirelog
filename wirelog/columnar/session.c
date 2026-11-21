@@ -2320,18 +2320,28 @@ wl_columnar_session_cold_positional(char *const *names, uint32_t ncols)
  * cold JOIN audits bound the rule. The scan's output holds the source's
  * columns under generated positional names; the JOIN resolves its keys
  * against them as the uncontrolled route resolves them against the source,
- * whose names must then be positional too. Each JOIN has one key, no REDUCE
- * follows, and an INLINE compound source, whose layout the scan's output
- * does not carry, stays refused. */
+ * whose names must then be positional too. Each JOIN has one key, and an
+ * INLINE compound source, whose layout the scan's output does not carry,
+ * stays refused. A REDUCE may follow only as the rule's next to last op,
+ * where the uncontrolled cold JOIN aggregate admits it, with an operand
+ * type the controlled REDUCE accepts. */
 static bool
 wl_columnar_session_cold_join_rule(const wl_col_session_t *sess,
     const wl_plan_relation_t *rp, uint32_t end, const char *name)
 {
+    uint32_t last = rp->op_count - 2;
+    bool reduction = rp->op_count >= 4 &&
+        rp->ops[last].op == WL_PLAN_OP_REDUCE;
     for (uint32_t i = end; i < rp->op_count; i++)
-        if (rp->ops[i].op == WL_PLAN_OP_REDUCE ||
+        if ((rp->ops[i].op == WL_PLAN_OP_REDUCE &&
+            (!reduction || i != last)) ||
             (rp->ops[i].op == WL_PLAN_OP_JOIN && rp->ops[i].key_count != 1))
             return false;
-    if (!(end >= 2 ? wl_columnar_join_cold_scan_prefix(sess, rp, NULL) :
+    uint32_t join = 0;
+    if (reduction ? !wl_columnar_join_aggregate_decode(sess, rp, &join) ||
+        join != end ||
+        rp->ops[last].agg_operand_type > WL_PLAN_AGG_OPERAND_FLOAT :
+        !(end >= 2 ? wl_columnar_join_cold_scan_prefix(sess, rp, NULL) :
         wl_columnar_join_cold_prefix(sess, rp))) return false;
     const wl_plan_t *plan = sess->plan;
     for (uint32_t i = 0; plan->edb_schemas && i < plan->edb_count; i++) {
@@ -2357,7 +2367,8 @@ wl_columnar_session_cold_join_rule(const wl_col_session_t *sess,
  * end at a REDUCE that the uncontrolled cold aggregate admits, followed by
  * the final CONSOLIDATE, or at a JOIN that the cold JOIN rule above admits,
  * and then needs no MAP; the composed attempt runs its controlled REDUCE or
- * JOIN over the scan's output. Programs that a controlled STEP routes to the
+ * JOIN over the scan's output, and after the JOIN the operators and the
+ * REDUCE that follow it. Programs that a controlled STEP routes to the
  * general observed transaction are refused here, while the source is still
  * resident: a head that is also an EDB, the two-EDB single-rule seed shape,
  * and a registry that a successor STEP would find larger than three

@@ -2517,10 +2517,19 @@ wl_columnar_join_cold_left(wl_col_session_t *sess, const wl_plan_relation_t *rp,
                rp->ops[0].relation_name, NULL, 0);
 }
 
+#ifdef WL_SESSION_TEST_HOOKS
+/* Calls of the raw cold JOIN aggregate; tests check a controlled STEP adds
+ * none. */
+uint64_t wl_columnar_join_test_raw_cold_join_aggregates;
+#endif
+
 int
 wl_columnar_join_aggregate(wl_col_session_t *s, const wl_plan_relation_t *rp,
     eval_stack_t *stack, uint32_t join_index, const char *cold_left)
 {
+#ifdef WL_SESSION_TEST_HOOKS
+    ++wl_columnar_join_test_raw_cold_join_aggregates;
+#endif
     uint32_t decoded;
     if (!wl_columnar_join_aggregate_decode(s, rp, &decoded) ||
         decoded != join_index) return ENOTSUP;
