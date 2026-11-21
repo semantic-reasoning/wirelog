@@ -641,13 +641,98 @@ compound RHS, materialization-result cache, remaining expression/selector/
 metadata/policy products, deferred/eviction behavior, reached lifecycle and
 containing Native/Source/carry obligations remain OPEN. No row or issue closes.
 
+## Present-empty, rejected and refill cycles
+
+This bundle starts from merged #2396 on main `79a5b502`. Three executable
+commits (`31ba92dc`, `cfe1d82a`, `26746e8e`) add30 selected histories to74
+previous cache selections, for104 `evaluation_join_cache_*` registrations.
+No production algorithm, supported domain, quantum, tariff or public ABI changes.
+
+Six healthy cycles cover scalar and STRING/FLOAT INLINE LEFT over observed STEP,
+plain STEP and evaluating Snapshot. A separate duplicate-free public input script
+keeps the Boolean logical fact reference independent of evaluator output and
+avoids the earlier script's duplicated LEFT insertion. The natural five heads,
+default controlled profile, deliberately diff-disabled controlled comparison and
+raw reference are reused. At every stage all five literal images/types, exact
+relation-qualified signed observed differences or Snapshot tuples, once-only
+events and unchanged repeats are checked independently.
+
+The script populates LEFT(1,1),(2,2) and RHS(1,1,1),(2,2,1),(2,7,0), then removes
+the accepted RHS facts: `first` retains(2,7) while `filtered` is genuinely
+all-rejected. Removing the last RHS fact leaves an existing typed canonical
+zero-row descriptor, then RHS(1,1,1) refills it. Removing both LEFT facts leaves
+a scalar or mapped typed INLINE zero-row input. RHS(2,2,1) is appended while LEFT
+stays empty; LEFT is then refilled, followed by unmatched LEFT(4,4), matching
+RHS(4,4,1), its removal and separate unchanged repeats.
+
+Current authorized JOIN/occurrence observations bind HELD self/control/attempt,
+descriptor/owner readers, identity/generations/extents, physical types, INLINE
+maps and displaced keys. The reached typed zero-row descriptors use real scalar
+HELD readers; bare flags are excluded before those assertions. Actual
+`delta_source` output under the recursion guard distinguishes canonical FULL
+(including present-empty RHS) from exact nonempty append descriptors and LEFT
+frontiers. Default scalar observed RHS appends use the exact one-row override,
+including when LEFT is empty; LEFT refill/unmatched append binds its actual
+VARIABLE frontier. This does not certify a nonNULL empty override, missing
+relation or FORCE_EMPTY. Empty output alone supplies none of those predicates.
+
+Every head must reach the final schema field. Empty inputs bypass later
+probe/gather/private/persistent row work and preserve the post-mutation registry;
+all-rejected nonempty RHS instead requires real false-row predicate work for
+`filtered`, without that head's accepted/private rows. Refill rebuilds all three
+key signatures against canonical current RHS extents/snapshots; later warm work
+requires four actual reuses and unchanged index identity/payload. Input mutation
+may legitimately invalidate the previously published cache before evaluation.
+
+The24 interruption selections use scalar observed/plain/Snapshot and INLINE-left
+observed:16 no-output cases and eight refill cases, each with CANCEL/WORK.
+
+| Reached stop | Actual work witness | Fixed stopped-return disposition |
+|---|---|---|
+| Present-empty RHS | Unfiltered first/mirror final schema field, nonempty LEFT and canonical RHS0, before output construction | CANCEL drains; WORK on selected STEP routes retains the authentic phase8 Original/transaction, admitted metadata and both input leases; Snapshot WORK drains |
+| Nonempty all-rejected RHS | Actual filtered false row selection completed, final schema field, no accepted/private rows for this head; earlier siblings performed real index work | Both causes drain the private transaction/readers |
+| LEFT refill after RHS growth | Actual key0 phase14 build occurrence followed by consecutive phase47 rows0/1, after both hash-link writes | Both causes drain the private index image/readers |
+
+The refill identity is the authenticated session/control/attempt/generation,
+plan/op/occurrence, canonical source snapshot, key and private-image-slot tuple.
+Phase14 follows new arrangement installation; no claim inspects transaction
+source fields assigned after that hook. Filtered empty-recipe phase47 cannot
+satisfy this unfiltered nonempty build tuple. Pending observations are invalidated
+on watch/plan transition/reuse and sequence completion; retry must perform a new
+two-row build under a different active attempt. This is not opaque uncommitted
+allocation-address/payload qualification or every-signature interruption.
+
+All failures preserve exact public old heads/content, pending facts, input
+snapshots/maps/types/cells, post-mutation registry and no early delivery. Reports
+retain the initiating cause, positive performed work and cleanup0. Retained STEP
+WORK requires the authentic Original, real admitted metadata, closed generation,
+drained child state, PENDING and both writers EBUSY; disposed cases require
+completed-state invariants and writers that acquire. Reports and all returned
+owner observations stay frozen across protected probes. The financier active bit
+is observed/frozen, not an all-platform financial certificate. Genuine reset
+retries the same pending facts without reinsertion, verifies new successful
+site/build work and writer release, then completes future changes/repeats.
+WORK injection is an actual oversized charge refusal, not an independent
+primitive exact/one-short boundary. Final governor zero follows full teardown.
+
+The integrated executable tree passed Clang JOIN hosts332/332 and seven related
+serial/source/cleanup checks, with GCC and ASan/UBSan cache selections104/104 each.
+Formatting/diff checks passed. These local executable results precede the ledger
+commit and do not replace hosted/MSVC validation. The selected failure matrix
+is not the entire healthy representation/route product. Bare/missing/empty-
+override/forced selector, wider/nullary/typed RHS and expression/policy products,
+materialization-result cache, signed timestamps/weights, deferred/eviction and
+containing lifecycle/Native/Source/carry obligations remain OPEN. Main's cold
+LEFT JOIN support is reused context under #2301, not a new cold certificate here.
+No matrix row or issue closes.
+
 ## Reused evidence and remaining acceptance
 
 | Obligation | Existing evidence reused | Still outstanding for complete #2371 acceptance |
 |---|---|---|
 | Ordinary key/product/projection/collision and accepted RHS expressions | `evaluation_join`, generated large/filter/collision cases in `evaluation_serial`, scalar recovery and the new public histories | Complete accepted expression/type/error/representation crossproducts beyond the specified scalar and INLINE predicates |
-| Full/delta/empty selectors and signed future changes | Existing direct selector fixtures, serial append dispatches and literal public histories;42 cache histories bind actual canonical RHS and default scalar-observed append descriptors | Complete remaining selector partitions; historical phase7-only counters remain insufficient |
-| Persistent full unfiltered index and filtered/private fallback | `test_controlled_persistent_join`, persistent stop/refusal matrices in `test_evaluation_serial.c`;42 natural cache/source histories across scalar/INLINE LEFT and three public routes, actual key0/key1/composite reuse/rebuild, private filtered/delta work and exact rollback/retry;32 further cap/resource/pin histories described above | Remaining predicate/representation/policy/pin/selector intersections; same-input default/private whole-evaluation comparison is not an isolated cache-only or resource certificate |
+| Full/delta/empty selectors and signed future changes | Existing direct selector fixtures, serial append dispatches and literal public histories;42 cache histories bind actual canonical RHS and default scalar-observed append descriptors | Remaining selector products beyond the new canonical present-empty FULL/nonempty append cycle; historical phase7-only counters remain insufficient |
+| Persistent full unfiltered index and filtered/private fallback | `test_controlled_persistent_join`, persistent stop/refusal matrices in `test_evaluation_serial.c`;42 natural cache/source histories across scalar/INLINE LEFT and three public routes, actual key0/key1/composite reuse/rebuild, private filtered/delta work and exact rollback/retry;32 further cap/resource/pin histories and30 empty/rejected/refill histories described above | Remaining predicate/representation/policy/pin/selector intersections; same-input default/private whole-evaluation comparison is not an isolated cache-only or resource certificate |
 | Pins and deferred rebuild/eviction | `join_right_filter_cleanup` managed cache/pinned fallback/admission tests; existing strict internal-cache fixtures; five genuine differential pin public-refusal/release/future-reuse histories | Remaining stale/deferred/eviction and other consuming intersections; new pin setup is internal, not a public primary-cache producer |
 | Materialized policy/memory and future calls | All78 `evaluation_materialized_body_*` selections:12 original scalar and66 typed INLINE-EDB preserved-body histories; host strict/policy/lifecycle suites | Remaining empty/wide/metadata/selector/cache-equivalence and containing bounds, not a primitive controlled-cache-hit claim |
 | Batch/pipeline, recursive/frontier and representations | Existing JOIN host suites and natural recursive materialized histories | Each accepted operator-by-representation and RUNNING/FINISH intersection, including required signed timestamps/weights; new callback sign checks are not full timestamp qualification |
@@ -761,7 +846,13 @@ checks passed. Ordinary INLINE61 and materialized-body78 selections remain
 unchanged. These runtime results precede the documentation-only ledger commit;
 no additional MSVC/TSan runtime, platform or Source/carry certificate follows.
 
-The wildcard now selects74 cases: those42 plus12 cold-cap,15 resource and five
-pin histories. The current executable tree passed Clang JOIN hosts302/302,
+The previous wildcard checkpoint selected74 cases: those42 plus12 cold-cap,15
+resource and five pin histories. That executable tree passed Clang JOIN hosts302/302,
 related serial/arrangement/cleanup checks5/5, and GCC/ASan-UBSan cache cases74/74
 each. The ordinary INLINE61 and materialized-body78 selections remain unchanged.
+
+The wildcard now selects104 cases: the previous74 plus six healthy empty/refill
+cycles,16 no-output stops and eight actual key0 refill stops. Reuse the same
+compile-before-no-rebuild commands above. Clang JOIN hosts332/332 and related
+checks7/7, GCC104/104 and ASan/UBSan104/104 passed on the executable tree before
+the ledger-only commit; no hosted/final-platform or containing Source proof follows.
