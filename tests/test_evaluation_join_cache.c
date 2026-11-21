@@ -57,6 +57,9 @@ typedef struct {
     unsigned append_reads[HEADS];
     unsigned output_extent[HEADS];
     unsigned image_cells, copied_entries;
+    unsigned schema[HEADS], empty_left[HEADS], empty_right[HEADS];
+    unsigned overrides[HEADS], selected[HEADS], false_rows[HEADS];
+    unsigned private_head[HEADS];
 } witnesses_t;
 typedef struct {
     wirelog_program_t *program;
@@ -72,6 +75,7 @@ typedef struct {
     bool pin_mode;
     col_diff_arrangement_pin_t pin;
     registry_t unpinned;
+    bool cycle;
     bool work_stop, armed, stopped;
     int64_t tag, floating;
     profile_t *active;
@@ -533,6 +537,209 @@ static void join(wl_evaluation_control_t *control, unsigned phase,
         ++f->seen.rejected;
     }
 }
+/* Cycle assertions intentionally do not relax the legacy nonempty contract. */
+static void
+wl_test_join_cache_cycle_held(fixture_t *f,
+    const wl_columnar_relation_scalar_source_t *source)
+{
+    held(source);
+    const col_rel_t *r = source->descriptor;
+    CHECK(source->control == f->active->control
+        && source->attempt_id == f->bindings->attempt_id
+        && source->owner == r->storage_owner && source->thread_valid
+        && source->descriptor_identity == r->relation_identity
+        && source->descriptor_view_generation == r->view_generation
+        && source->descriptor_storage_generation == r->storage_generation
+        && source->owner_identity == r->storage_owner->relation_identity
+        && source->owner_storage_generation ==
+        r->storage_owner->storage_generation
+        && source->nrows == r->nrows && source->width == r->ncols);
+}
+static bool
+wl_test_join_cache_cycle_sources(fixture_t *f,
+    wl_columnar_filter_context_t *ctx)
+{
+    CHECK(!ctx->source_bare && !ctx->join_right_bare);
+    wl_test_join_cache_cycle_held(f, &ctx->source);
+    wl_test_join_cache_cycle_held(f, &ctx->join_right);
+    CHECK(ctx->join_right.width == 3);
+    const wl_plan_op_t *op = ctx->join_operation;
+    unsigned offset = f->compound ? 2 : 0;
+    CHECK(op->key_count == (f->head == 3 ? 2u : 1u)
+        && op->project_count == 2 && op->project_indices);
+    for (unsigned k = 0; k < op->key_count; ++k) {
+        char left_key[16], right_key[16];
+        snprintf(left_key, sizeof(left_key), "col%u",
+            offset + (f->head == 2 ? 1 : k));
+        snprintf(right_key, sizeof(right_key), "col%u", f->head == 2 ? 1 : k);
+        CHECK(!strcmp(op->left_keys[k], left_key) && !strcmp(op->right_keys[k],
+            right_key));
+    }
+    CHECK(op->project_indices[0] == (f->head == 2 ? offset + 2 : offset)
+        && op->project_indices[1] == (f->head == 2 ||
+        f->head == 3 ? offset + 1 : offset + 3));
+    col_rel_t *right = session_find_rel(COL_SESSION(f->active->session),
+            "right");
+    CHECK(right && right->schema_ok && right->ncols == 3);
+    col_rel_t *override = NULL;
+    f->reading_selector = true;
+    CHECK(!wl_columnar_session_delta_source(COL_SESSION(f->active->session),
+        f->bindings, ctx->join_operation, &override));
+    f->reading_selector = false;
+    CHECK(ctx->join_right.descriptor == (override ? override : right));
+    bool eligible = !f->profile && !f->compound && !f->route;
+    bool appended = eligible &&
+        (f->stage == 3 || f->stage == 5 || f->stage == 8);
+    CHECK((override != NULL) == appended);
+    if (override) {
+        unsigned key = f->stage == 3 ? 1 : f->stage == 5 ? 2 : 4;
+        CHECK(f->append_op == ctx->join_operation && f->append == override
+            && override->nrows == 1 && col_rel_get(override, 0, 0) == key
+            && col_rel_get(override, 0, 1) == key
+            && col_rel_get(override, 0, 2) == 1
+            && wl_columnar_relation_snapshot_valid(
+                wl_columnar_relation_snapshot(override)));
+    } else {
+        bool found = false;
+        for (unsigned i = 0; i < f->bindings->count; ++i) {
+            const wl_columnar_eval_private_dynamic_binding_t *b =
+                &f->bindings->dynamic_entries[i];
+            if (strcmp(b->name, "right")) continue;
+            CHECK(b->relation == right && b->public_relation == right
+                && wl_columnar_relation_snapshot_equal(b->snapshot,
+                wl_columnar_relation_snapshot(right)));
+            found = true;
+        }
+        CHECK(found);
+    }
+    for (unsigned c = 0; c < 3; ++c)
+        CHECK(!ctx->join_right.types
+            || ctx->join_right.types[c] == WIRELOG_TYPE_INT64);
+    unsigned count = 0;
+    for (unsigned x = 1; x < VALUES; ++x)
+        for (unsigned y = 1; y < VALUES; ++y)
+            for (unsigned flag = 0; flag < 2; ++flag)
+                count += f->right[x][y][flag];
+    CHECK(right->nrows == count);
+    if (!override) CHECK(ctx->join_right.nrows == count);
+    bool right_seen[VALUES][VALUES][2] = {{{false}}};
+    for (unsigned row = 0; row < ctx->join_right.nrows; ++row) {
+        int64_t x = ctx->join_right.columns[0][row],
+            y = ctx->join_right.columns[1][row],
+            flag = ctx->join_right.columns[2][row];
+        CHECK(x > 0 && x < VALUES && y > 0 && y < VALUES
+            && (flag == 0 || flag == 1) && f->right[x][y][flag]
+            && !right_seen[x][y][flag]);
+        right_seen[x][y][flag] = true;
+    }
+    CHECK(ctx->source.width == offset + 2);
+    if (f->compound) {
+        const col_rel_t *l = ctx->source.descriptor;
+        CHECK(l->compound_kind == WIRELOG_COMPOUND_KIND_INLINE
+            && l->compound_count == 1 && l->compound_arity_len == 3
+            && l->compound_arity_map[0] == 2 && l->compound_arity_map[1] == 1
+            && l->compound_arity_map[2] == 1
+            && ctx->source.types[0] == WIRELOG_TYPE_STRING
+            && ctx->source.types[1] == WIRELOG_TYPE_FLOAT);
+        for (unsigned row = 0; row < ctx->source.nrows; ++row)
+            CHECK(ctx->source.columns[0][row] == f->tag
+                && ctx->source.columns[1][row] == f->floating);
+    }
+    CHECK(!ctx->source.types ||
+        (ctx->source.types[offset] == WIRELOG_TYPE_INT64
+        && ctx->source.types[offset + 1] == WIRELOG_TYPE_INT64));
+    if (eligible && (f->stage == 6 || f->stage == 7)) {
+        col_rel_t *frontier = NULL;
+        CHECK(f->append_op && f->append_op->op == WL_PLAN_OP_VARIABLE);
+        f->reading_selector = true;
+        CHECK(!wl_columnar_session_delta_source(COL_SESSION(f->active->session),
+            f->bindings, f->append_op, &frontier));
+        f->reading_selector = false;
+        CHECK(frontier && frontier == f->append &&
+            frontier == ctx->source.descriptor
+            && frontier->nrows == (f->stage == 6 ? 2u : 1u));
+    } else {
+        unsigned rows = 0;
+        for (unsigned x = 1; x < VALUES; ++x)
+            for (unsigned z = 1; z < VALUES; ++z) rows += f->left[x][z];
+        CHECK(ctx->source.nrows == rows);
+    }
+    bool left_seen[VALUES][VALUES] = {{false}};
+    for (unsigned row = 0; row < ctx->source.nrows; ++row) {
+        int64_t x = ctx->source.columns[offset][row],
+            z = ctx->source.columns[offset + 1][row];
+        CHECK(x > 0 && x < VALUES && z > 0 && z < VALUES && f->left[x][z]
+            && !left_seen[x][z]);
+        left_seen[x][z] = true;
+        if (eligible && f->stage == 7) CHECK(x == 4 && z == 4);
+    }
+    return override != NULL;
+}
+static void
+wl_test_join_cache_cycle_arrangement(wl_evaluation_control_t *control,
+    unsigned phase, uint64_t progress)
+{
+    (void)progress;
+    fixture_t *f = active;
+    if (control != f->active->control || (phase != 13 && phase != 14)) return;
+    wl_columnar_filter_context_t *ctx = context(f);
+    CHECK(!wl_test_join_cache_cycle_sources(f, ctx) && !f->profile
+        && ctx->source.nrows && ctx->join_right.nrows
+        && !ctx->join_operation->right_filter_expr.size);
+    if (phase == 14) {
+        ++f->seen.builds; f->building = ctx->join_operation;
+    } else {
+        ++f->seen.reuses; f->building = NULL;
+    }
+}
+static void
+wl_test_join_cache_cycle_join(wl_evaluation_control_t *control,
+    unsigned phase, uint64_t progress)
+{
+    fixture_t *f = active;
+    if (control != f->active->control) return;
+    if (phase != 13 && phase != 15 && phase != 18 && phase != 28
+        && phase != 29 && phase != 44 && phase != 47 && phase != 48) return;
+    wl_columnar_filter_context_t *ctx = context(f);
+    bool overridden = wl_test_join_cache_cycle_sources(f, ctx);
+    if (phase == 13) CHECK(ctx->width == 2);
+    if (phase == 13 && progress == ctx->width - 1u) {
+        ++f->seen.schema[f->head];
+        f->seen.empty_left[f->head] += !ctx->source.nrows;
+        f->seen.empty_right[f->head] += !ctx->join_right.nrows;
+        f->seen.overrides[f->head] += overridden;
+    }
+    if (phase == 15) ++f->seen.sources[f->head];
+    if (phase == 18) ++f->seen.gathers[f->head];
+    if (phase == 29) ++f->seen.probes[f->head];
+    if (phase == 28) {
+        ++f->seen.private_rows; ++f->seen.private_head[f->head];
+    }
+    if (phase == 44) {
+        CHECK(f->head == 4 && ctx->join_operation->right_filter_expr.size
+            && progress < ctx->join_right.nrows);
+        ++f->seen.selected[f->head];
+        if (!ctx->join_right.columns[2][progress]) {
+            CHECK(ctx->join_right.columns[0][progress] == 2
+                && ctx->join_right.columns[1][progress] == 7);
+            ++f->seen.false_rows[f->head];
+        }
+    }
+    if (phase == 47) {
+        if (ctx->join_operation->right_filter_expr.size) {
+            CHECK(!ctx->join_right.nrows); /* Empty-filter recipe, not index work. */
+        } else {
+            CHECK(!overridden && f->building == ctx->join_operation
+                && ctx->join_right.nrows && progress < ctx->join_right.nrows);
+            ++f->seen.indexed;
+        }
+    }
+    if (phase == 48) {
+        CHECK(!f->profile && !overridden
+            && !ctx->join_operation->right_filter_expr.size);
+        ++f->seen.persistent;
+    }
+}
 static void watch(fixture_t *f, unsigned profile, bool enabled) {
     active = f;
     f->profile = profile;
@@ -545,8 +752,11 @@ static void watch(fixture_t *f, unsigned profile, bool enabled) {
     f->append_op = NULL;
     wl_columnar_session_test_observed_transaction_checkpoint =
         enabled ? observed : NULL;
-    wl_columnar_arrangement_test_diff_checkpoint = enabled ? arrangement : NULL;
-    wl_columnar_join_test_attempt_checkpoint = enabled ? join : NULL;
+    wl_columnar_arrangement_test_diff_checkpoint =
+        enabled ?
+        (f->cycle ? wl_test_join_cache_cycle_arrangement : arrangement) : NULL;
+    wl_columnar_join_test_attempt_checkpoint =
+        enabled ? (f->cycle ? wl_test_join_cache_cycle_join : join) : NULL;
 }
 static void left_insert(fixture_t *f, unsigned x, unsigned z) {
     int64_t row[] = {f->tag, f->floating, x, z};
@@ -668,6 +878,110 @@ static void check_work(fixture_t *f, const registry_t *before) {
         } else
             CHECK(!now.count && !f->seen.builds && !f->seen.reuses &&
                 !f->seen.persistent);
+    }
+}
+static void
+wl_test_join_cache_cycle_script(fixture_t *f)
+{
+    switch (f->stage) {
+    case 0:
+        left_insert(f, 1, 1); left_insert(f, 2, 2);
+        right_change(f, 1, 1, 1, false);
+        right_change(f, 2, 2, 1, false);
+        right_change(f, 2, 7, 0, false);
+        break;
+    case 1:
+        right_change(f, 1, 1, 1, true);
+        right_change(f, 2, 2, 1, true);
+        break;
+    case 2: right_change(f, 2, 7, 0, true); break;
+    case 3: right_change(f, 1, 1, 1, false); break;
+    case 4:
+        /* This independent script inserts each fact once before removal. */
+        for (unsigned x = 1; x <= 2; ++x) {
+            int64_t row[] = {f->tag, f->floating, x, x};
+            CHECK(f->left[x][x]);
+            for (unsigned p = 0; p < 3; ++p)
+                CHECK(!wl_session_remove(f->profiles[p].session, "left",
+                    row + (f->compound ? 0 : 2), 1, f->compound ? 4 : 2));
+            f->left[x][x] = false;
+        }
+        break;
+    case 5: right_change(f, 2, 2, 1, false); break;
+    case 6: left_insert(f, 1, 1); left_insert(f, 2, 2); break;
+    case 7: left_insert(f, 4, 4); break;
+    case 8: right_change(f, 4, 4, 1, false); break;
+    case 9: right_change(f, 4, 4, 1, true); break;
+    default: CHECK(false);
+    }
+}
+static void
+wl_test_join_cache_cycle_work(fixture_t *f, const registry_t *before)
+{
+    bool empty = f->stage == 2 || f->stage == 4 || f->stage == 5;
+    bool override = !f->profile && !f->compound && !f->route
+        && (f->stage == 3 || f->stage == 5 || f->stage == 8);
+    registry_t now = registry(f->active);
+    for (unsigned h = 0; h < HEADS; ++h) {
+        CHECK(f->seen.schema[h] == 1
+            && f->seen.empty_right[h] == (f->stage == 2 ? 1u : 0u)
+            && f->seen.empty_left[h] == (f->stage == 4 ||
+            f->stage == 5 ? 1u : 0u)
+            && f->seen.overrides[h] == (override ? 1u : 0u));
+        if (empty || (h == 4 && f->stage == 1))
+            CHECK(!f->seen.sources[h] && !f->seen.probes[h]
+                && !f->seen.gathers[h] && !f->seen.private_head[h]);
+        else CHECK(f->seen.sources[h] && f->seen.probes[h]);
+    }
+    CHECK(f->seen.false_rows[4] == (f->stage <= 1 ? 1u : 0u));
+    if (f->stage == 1) CHECK(f->seen.selected[4] == 1);
+    if (empty) {
+        CHECK(!f->seen.builds && !f->seen.reuses && !f->seen.indexed
+            && !f->seen.persistent && !f->seen.private_rows);
+        same_registry(before, &now, true);
+    } else if (!f->profile && !override) {
+        bool warm = f->stage == 7;
+        CHECK(f->seen.builds == (warm ? 0u : 3u)
+            && f->seen.reuses == (warm ? 4u : 1u) && now.count == 3);
+        if (warm) {
+            CHECK(!f->seen.indexed); same_registry(before, &now, false);
+        } else CHECK(f->seen.indexed);
+        col_rel_t *r = session_find_rel(COL_SESSION(f->active->session),
+                "right");
+        for (unsigned k = 0; k < 3; ++k)
+            CHECK(now.entries[k].rows == r->nrows &&
+                now.entries[k].current == r->nrows
+                && wl_columnar_relation_snapshot_equal(now.entries[k].snapshot,
+                wl_columnar_relation_snapshot(r)));
+    } else {
+        CHECK(!f->seen.builds && !f->seen.reuses && !f->seen.indexed
+            && !f->seen.persistent);
+        if (!f->profile) same_registry(before, &now, true);
+        else CHECK(!now.count);
+    }
+    fprintf(stdout,
+        "cycle stage=%u profile=%u builds=%u reuse=%u override=%u\n",
+        f->stage, f->profile, f->seen.builds, f->seen.reuses, override);
+}
+static void
+wl_test_join_cache_cycle_run(fixture_t *f)
+{
+    image_t old = {0};
+    for (f->stage = 0; f->stage < 10; ++f->stage) {
+        wl_test_join_cache_cycle_script(f);
+        image_t now = reference(f);
+        if (f->stage == 1) CHECK(now.rows[0][2][7] && !now.rows[4][2][7]);
+        for (unsigned p = 0; p < 3; ++p) {
+            registry_t before = registry(&f->profiles[p]);
+            watch(f, p, p < 2);
+            CHECK(!finish(f, &f->profiles[p]));
+            if (p < 2) wl_test_join_cache_cycle_work(f, &before);
+            watch(f, p, false);
+            check_delivery(f, &f->profiles[p], &old, &now);
+            CHECK(!finish(f, &f->profiles[p]));
+            check_delivery(f, &f->profiles[p], &now, &now);
+        }
+        old = now;
     }
 }
 typedef struct {
@@ -920,7 +1234,8 @@ int main(int argc, char **argv) {
         if (!strcmp(argv[3], "build-denied")) f.resource = 2;
         if (!strcmp(argv[3], "key-nomem")) f.resource = 3;
         f.pin_mode = !strcmp(argv[3], "pin-held");
-        CHECK(f.stop_site || f.cap || f.resource || f.pin_mode);
+        f.cycle = !strcmp(argv[3], "empty-cycle");
+        CHECK(f.stop_site || f.cap || f.resource || f.pin_mode || f.cycle);
     }
     const char *env[] = {"WIRELOG_DIFF_ENABLED", "WIRELOG_JOIN_BATCH_BYTES",
                          "WIRELOG_JOIN_BATCH_STRICT",
@@ -983,13 +1298,16 @@ int main(int argc, char **argv) {
         CHECK(!finish(&f, &f.profiles[p]));
         CHECK(!registry(&f.profiles[p]).count);
     }
-    for (f.stage = 0; f.stage < 7; ++f.stage) {
+    if (f.cycle) wl_test_join_cache_cycle_run(&f);
+    for (f.stage = 0; !f.cycle && f.stage < 7; ++f.stage) {
         if (f.stage == 1 && f.pin_mode) {
             profile_t *p = &f.profiles[0];
             f.unpinned = registry(p);
             uint32_t key = 0;
-            col_rel_t *r = session_find_rel(COL_SESSION(p->session), "right");
-            CHECK(f.unpinned.count == 3 && !col_session_pin_diff_arrangement(
+            col_rel_t *r = session_find_rel(COL_SESSION(p->session),
+                    "right");
+            CHECK(f.unpinned.count == 3 &&
+                !col_session_pin_diff_arrangement(
                     COL_SESSION(p->session), "right", r, &key, 1, &f.pin));
             CHECK(f.pin.arr == (const col_diff_arrangement_t *)
                 f.unpinned.entries[0].address);
@@ -1005,7 +1323,8 @@ int main(int argc, char **argv) {
                     distinct += now.rows[0][x][y];
             CHECK(distinct == 4);
             for (unsigned p = 0; p < 3; ++p)
-                COL_SESSION(f.profiles[p].session)->join_output_limit = f.cap;
+                COL_SESSION(f.profiles[p].session)->join_output_limit =
+                    f.cap;
         }
         CHECK(now.rows[0][2][7] && !now.rows[4][2][7]);
         for (unsigned p = 0; p < 3; ++p) {
@@ -1019,7 +1338,8 @@ int main(int argc, char **argv) {
             }
             if (!p && f.resource && !f.stopped
                 && f.stage == (f.resource == 2 ? 5u : 1u)) {
-                failure(&f, &before, &old, f.resource == 3 ? ENOMEM : ENOSPC);
+                failure(&f, &before, &old,
+                    f.resource == 3 ? ENOMEM : ENOSPC);
                 watch(&f, p, true);
             }
             if (!f.stage && f.cap && f.cap < 6) {
