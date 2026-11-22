@@ -2316,6 +2316,30 @@ wl_columnar_session_cold_positional(char *const *names, uint32_t ncols)
     return true;
 }
 
+/* A cold input read by a controlled JOIN keeps no INLINE compound column,
+ * whose layout the scan's output does not carry, and positional names. */
+static bool
+wl_columnar_session_cold_layout(const wl_col_session_t *sess,
+    const char *name)
+{
+    const wl_plan_t *plan = sess->plan;
+    for (uint32_t i = 0; plan->edb_schemas && i < plan->edb_count; i++) {
+        const wl_plan_edb_schema_t *schema = &plan->edb_schemas[i];
+        if (!plan->edb_relations || !plan->edb_relations[i] ||
+            strcmp(plan->edb_relations[i], name) != 0) continue;
+        for (uint32_t c = 0; schema->columns && c < schema->column_count; c++)
+            if (schema->columns[c].compound_kind ==
+                WIRELOG_COMPOUND_KIND_INLINE) return false;
+    }
+    for (uint32_t i = 0; i < sess->nrels; i++)
+        if (sess->rels[i] && !strcmp(sess->rels[i]->name, name) &&
+            !wl_columnar_session_cold_positional(sess->rels[i]->col_names,
+            sess->rels[i]->ncols)) return false;
+    const wl_columnar_session_cold_relation_t *c =
+        wl_columnar_session_cold_find(sess, name);
+    return !c || wl_columnar_session_cold_positional(c->col_names, c->ncols);
+}
+
 /* A controlled JOIN after the cold scan prefix (#2301). The uncontrolled
  * cold JOIN audits bound the rule. The scan's output holds the source's
  * columns under generated positional names; the JOIN resolves its keys
@@ -2343,22 +2367,35 @@ wl_columnar_session_cold_join_rule(const wl_col_session_t *sess,
         rp->ops[last].agg_operand_type > WL_PLAN_AGG_OPERAND_FLOAT :
         !(end >= 2 ? wl_columnar_join_cold_scan_prefix(sess, rp, NULL) :
         wl_columnar_join_cold_prefix(sess, rp))) return false;
-    const wl_plan_t *plan = sess->plan;
-    for (uint32_t i = 0; plan->edb_schemas && i < plan->edb_count; i++) {
-        const wl_plan_edb_schema_t *schema = &plan->edb_schemas[i];
-        if (!plan->edb_relations || !plan->edb_relations[i] ||
-            strcmp(plan->edb_relations[i], name) != 0) continue;
-        for (uint32_t c = 0; schema->columns && c < schema->column_count; c++)
-            if (schema->columns[c].compound_kind ==
-                WIRELOG_COMPOUND_KIND_INLINE) return false;
-    }
-    for (uint32_t i = 0; i < sess->nrels; i++)
-        if (sess->rels[i] && !strcmp(sess->rels[i]->name, name) &&
-            !wl_columnar_session_cold_positional(sess->rels[i]->col_names,
-            sess->rels[i]->ncols)) return false;
-    const wl_columnar_session_cold_relation_t *c =
-        wl_columnar_session_cold_find(sess, name);
-    return !c || wl_columnar_session_cold_positional(c->col_names, c->ncols);
+    /* Two cold inputs in one rule stay refused, in either seal order. */
+    if (wl_columnar_session_cold_find(sess, rp->ops[end].right_relation))
+        return false;
+    return wl_columnar_session_cold_layout(sess, name);
+}
+
+/* A controlled JOIN of a cold right input (#2301): the JOIN at ops[1]
+ * after a VARIABLE over another input that is resident or declared, not
+ * this one (a self-JOIN) and not another cold one, every JOIN with one key,
+ * of a shape the uncontrolled cold JOIN prefix admits, and no REDUCE. The
+ * composed attempt copies the input whole into the frame's cold right slot
+ * and the controlled JOIN reads the copy. */
+static bool
+wl_columnar_session_cold_right_rule(const wl_col_session_t *sess,
+    const wl_plan_relation_t *rp, const char *name)
+{
+    if (rp->op_count < 3 || rp->ops[0].op != WL_PLAN_OP_VARIABLE ||
+        !rp->ops[0].relation_name || rp->ops[1].op != WL_PLAN_OP_JOIN ||
+        rp->ops[1].key_count != 1 || !rp->ops[1].right_relation ||
+        strcmp(rp->ops[1].right_relation, name) != 0 ||
+        !strcmp(rp->ops[0].relation_name, name) ||
+        wl_columnar_session_cold_find(sess, rp->ops[0].relation_name))
+        return false;
+    for (uint32_t i = 0; i < rp->op_count; i++)
+        if (rp->ops[i].op == WL_PLAN_OP_REDUCE ||
+            (rp->ops[i].op == WL_PLAN_OP_JOIN && rp->ops[i].key_count != 1))
+            return false;
+    return wl_columnar_join_cold_prefix(sess, rp) &&
+           wl_columnar_session_cold_layout(sess, name);
 }
 
 /* A controlled session reads a cold binding only through the composed cold
@@ -2368,12 +2405,13 @@ wl_columnar_session_cold_join_rule(const wl_col_session_t *sess,
  * the final CONSOLIDATE, or at a JOIN that the cold JOIN rule above admits,
  * and then needs no MAP; the composed attempt runs its controlled REDUCE or
  * JOIN over the scan's output, and after the JOIN the operators and the
- * REDUCE that follow it. Programs that a controlled STEP routes to the
- * general observed transaction are refused here, while the source is still
- * resident: a head that is also an EDB, the two-EDB single-rule seed shape,
- * and a registry that a successor STEP would find larger than three
- * relations. The registry never shrinks after a seal, so its size plus the
- * heads not yet registered bounds it. */
+ * REDUCE that follow it. The JOIN at ops[1] may instead read the binding as
+ * its right input, under the cold right rule above. Programs that a
+ * controlled STEP routes to the general observed transaction are refused
+ * here, while the source is still resident: a head that is also an EDB, the
+ * two-EDB single-rule seed shape, and a registry that a successor STEP would
+ * find larger than three relations. The registry never shrinks after a
+ * seal, so its size plus the heads not yet registered bounds it. */
 static bool
 wl_columnar_session_cold_controlled_plan(const wl_col_session_t *sess,
     const char *name)
@@ -2396,16 +2434,25 @@ wl_columnar_session_cold_controlled_plan(const wl_col_session_t *sess,
                     first = strcmp(plan->strata[sj].relations[rj].name,
                             rp->name) != 0;
             if (first) heads++;
-            bool uses = false;
+            bool uses = false, right = false;
             for (uint32_t oi = 0; oi < rp->op_count; oi++) {
                 const wl_plan_op_t *op = &rp->ops[oi];
-                bool here = (op->relation_name &&
-                    !strcmp(op->relation_name, name)) ||
-                    (op->right_relation && !strcmp(op->right_relation, name));
-                if (here && oi) return false;
-                uses |= here;
+                bool left_here = op->relation_name &&
+                    !strcmp(op->relation_name, name);
+                bool right_here = op->right_relation &&
+                    !strcmp(op->right_relation, name);
+                /* A JOIN at ops[1] may read the input as its right input. */
+                if (right_here && oi == 1 && !left_here &&
+                    op->op == WL_PLAN_OP_JOIN) right = true;
+                else if ((left_here || right_here) && oi) return false;
+                uses |= left_here || right_here;
             }
             if (!uses) continue;
+            if (right) {
+                if (!wl_columnar_session_cold_right_rule(sess, rp, name))
+                    return false;
+                continue;
+            }
             if (rp->ops[0].op != WL_PLAN_OP_VARIABLE) return false;
             uint32_t end = wl_columnar_ops_cold_scan_end(rp, 0);
             if (end < rp->op_count && rp->ops[end].op == WL_PLAN_OP_REDUCE) {

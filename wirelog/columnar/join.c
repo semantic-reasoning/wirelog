@@ -2287,6 +2287,8 @@ wl_columnar_join_cold_prefix(const wl_col_session_t *s,
 #ifdef WL_SESSION_TEST_HOOKS
 /* Calls of the raw cold-left JOIN; tests check a controlled STEP adds none. */
 uint64_t wl_columnar_join_test_raw_cold_joins;
+/* Calls of the raw JOIN of a cold right input; likewise. */
+uint64_t wl_columnar_join_test_raw_cold_right_joins;
 #endif
 
 static int
@@ -2296,6 +2298,7 @@ wl_columnar_join_cold_run(wl_col_session_t *sess, const wl_plan_op_t *op,
 {
 #ifdef WL_SESSION_TEST_HOOKS
     if (cold_left) ++wl_columnar_join_test_raw_cold_joins;
+    else if (!aggregate) ++wl_columnar_join_test_raw_cold_right_joins;
 #endif
     /* Unmetered spill continuation; no controlled route reaches it. */
     if (sess->base.evaluation_control) return ENOTSUP;
@@ -6336,15 +6339,32 @@ wl_columnar_join_op_attempt_start_owned_initialize(const wl_plan_op_t *op,
     rc = wl_columnar_join_attempt_return(control, id, rc);
     if (rc) goto done;
     col_rel_t *right = NULL, *delta = NULL;
+    /* A cold right input is the composed owner's scanned copy (#2301); it
+     * has no registry slot and no delta. */
+    bool cold_right = session->cold_relation
+        && wl_columnar_session_cold_find(session, op->right_relation);
+    if (cold_right) {
+        rc = wl_columnar_join_attempt_charge(control, id,
+                WL_COLUMNAR_JOIN_ATTEMPT_WORK);
+        if (rc) goto done;
+        rc = wl_columnar_eval_stack_composed_cold_right(frame, owner, op,
+                &right);
+        rc = wl_columnar_join_attempt_return(control, id, rc);
+        if (rc) goto done;
+        if (!right) {
+            rc = ENOTSUP; goto done;
+        }
+    }
     rc = wl_columnar_join_attempt_charge(control, id,
             WL_COLUMNAR_JOIN_ATTEMPT_WORK);
     if (rc) goto done;
-    rc = wl_columnar_join_attempt_lookup(session, op->right_relation, false,
-            &right, control, id, private_bindings);
+    if (!cold_right)
+        rc = wl_columnar_join_attempt_lookup(session, op->right_relation,
+                false, &right, control, id, private_bindings);
     rc = wl_columnar_join_attempt_return(control, id, rc);
     if (rc) goto done;
     bool left_delta = stack->items[stack->top - 1].is_delta;
-    if (right && op->delta_mode != WL_DELTA_FORCE_FULL
+    if (right && !cold_right && op->delta_mode != WL_DELTA_FORCE_FULL
         && (op->delta_mode == WL_DELTA_FORCE_DELTA || !left_delta)) {
         rc = wl_columnar_join_attempt_charge(control, id,
                 WL_COLUMNAR_JOIN_ATTEMPT_WORK);
@@ -6368,8 +6388,9 @@ wl_columnar_join_op_attempt_start_owned_initialize(const wl_plan_op_t *op,
         right = delta; used_delta = true;
     }
     col_rel_t *append_delta = NULL;
-    rc = wl_columnar_session_delta_source(session, private_bindings,
-            op, &append_delta);
+    if (!cold_right)
+        rc = wl_columnar_session_delta_source(session, private_bindings,
+                op, &append_delta);
     if (rc) goto done;
     if (append_delta) {
         right = append_delta; used_delta = true;
