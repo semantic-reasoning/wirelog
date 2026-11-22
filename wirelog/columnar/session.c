@@ -2376,9 +2376,11 @@ wl_columnar_session_cold_join_rule(const wl_col_session_t *sess,
 /* A controlled JOIN of a cold right input (#2301): the JOIN at ops[1]
  * after a VARIABLE over another input that is resident or declared, not
  * this one (a self-JOIN) and not another cold one, every JOIN with one key,
- * of a shape the uncontrolled cold JOIN prefix admits, and no REDUCE. The
- * composed attempt copies the input whole into the frame's cold right slot
- * and the controlled JOIN reads the copy. */
+ * of a shape the uncontrolled cold JOIN prefix admits. A REDUCE may follow
+ * only as the rule's next to last op, where the uncontrolled cold JOIN
+ * aggregate admits it with this JOIN, with an operand type the controlled
+ * REDUCE accepts. The composed attempt copies the input whole into the
+ * frame's cold right slot and the controlled JOIN reads the copy. */
 static bool
 wl_columnar_session_cold_right_rule(const wl_col_session_t *sess,
     const wl_plan_relation_t *rp, const char *name)
@@ -2390,12 +2392,19 @@ wl_columnar_session_cold_right_rule(const wl_col_session_t *sess,
         !strcmp(rp->ops[0].relation_name, name) ||
         wl_columnar_session_cold_find(sess, rp->ops[0].relation_name))
         return false;
+    uint32_t last = rp->op_count - 2, join = 0;
+    bool reduction = rp->op_count >= 4 &&
+        rp->ops[last].op == WL_PLAN_OP_REDUCE;
     for (uint32_t i = 0; i < rp->op_count; i++)
-        if (rp->ops[i].op == WL_PLAN_OP_REDUCE ||
+        if ((rp->ops[i].op == WL_PLAN_OP_REDUCE &&
+            (!reduction || i != last)) ||
             (rp->ops[i].op == WL_PLAN_OP_JOIN && rp->ops[i].key_count != 1))
             return false;
-    return wl_columnar_join_cold_prefix(sess, rp) &&
-           wl_columnar_session_cold_layout(sess, name);
+    if (reduction ? !wl_columnar_join_aggregate_decode(sess, rp, &join) ||
+        join != 1 ||
+        rp->ops[last].agg_operand_type > WL_PLAN_AGG_OPERAND_FLOAT :
+        !wl_columnar_join_cold_prefix(sess, rp)) return false;
+    return wl_columnar_session_cold_layout(sess, name);
 }
 
 /* A controlled session reads a cold binding only through the composed cold
@@ -2406,7 +2415,8 @@ wl_columnar_session_cold_right_rule(const wl_col_session_t *sess,
  * and then needs no MAP; the composed attempt runs its controlled REDUCE or
  * JOIN over the scan's output, and after the JOIN the operators and the
  * REDUCE that follow it. The JOIN at ops[1] may instead read the binding as
- * its right input, under the cold right rule above. Programs that a
+ * its right input, under the cold right rule above, and a REDUCE may then
+ * follow it. Programs that a
  * controlled STEP routes to the general observed transaction are refused
  * here, while the source is still resident: a head that is also an EDB, the
  * two-EDB single-rule seed shape, and a registry that a successor STEP would
