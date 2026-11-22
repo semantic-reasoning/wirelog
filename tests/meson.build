@@ -8274,3 +8274,13 @@ foreach pair : [['scalar', 'observed'], ['scalar', 'plain'], ['scalar', 'snapsho
       suite: ['unit', 'tsan', 'evaluation_join_hosts'], timeout: 120)
   endforeach
 endforeach
+
+# Complete frame-present child-unbound END representatives, all four fixtures.
+foreach heads : [1, 2]
+  foreach observed : [0, 1]
+    test('evaluation_recursive_string_unbound_@0@_@1@'.format(heads, observed),
+      evaluation_recursive_string_exe,
+      args: ['unbound', heads.to_string(), observed.to_string()],
+      suite: ['unit', 'tsan', 'evaluation_recursive_string_unbound'], timeout: 120)
+  endforeach
+endforeach

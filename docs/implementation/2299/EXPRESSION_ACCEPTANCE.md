@@ -3220,3 +3220,85 @@ remaining containing Source/carry proofs remain open. Existing unary STRING
 scope is unchanged; wider/mixed/FLOAT, extra topology/expression/K bodies,
 evaluating Snapshot/C1/batch, seeds and pool/prepared-sort transport remain
 outside qualified scope. This increment does not close #2299.
+
+### Frame-present child-unbound END representatives
+
+This test-only increment qualifies finite first/last END/successor representatives
+for the adjacent frame-present child-unbound slice. Production code, recovery,
+observation hooks and unary STRING admission do not change. Healthy discovery
+and stopped replays run on the current implementation; previous bound-child
+campaigns are separate evidence.
+
+Injection requires an actual eligible public `EAGAIN` after the real typed-bottom
+checkpoint, EVALUATE phase8 in an active uncommitted/unpublished round, no
+MAIN/round-owner/retirement identity, and an initialized authenticated frame
+with capture-only set and child-bound clear. Numeric identity absence is not a
+condition: the copied residual identity word actually takes both values0 and1.
+Nested numeric phase/cursor/op are not directly read when unbound. The existing
+copied view supplies initialized zeros under its nested guards; Source phase is
+still guarded by its own initialization marker.
+
+The exact class tuple reuses the preceding stage tuple: round/head and round
+custody flags, child-active/thread-valid, all five receipt flags, normalized
+relation owner masks and initialized child words2..12, including residual numeric
+identity. Complete copied signatures authenticate the actual discovered public
+ordinal independently. First/last endpoints are unioned before each cut runs
+real END and END-with-successor; no retargeting, synthetic grant or manufactured
+cleanup authority is used.
+
+Healthy discovery actually contains LOOKUP/CHILD_BEGIN and pending child-begin
+states, plus SPARE_PROOF/NORMALIZE/CLOSE_PROOF/DONE. LOOKUP must have capture-done
+clear and SPARE_PROOF must have it set at every reached round/head. Actual
+`CHILD_ACK` consumption clears child-bound and advances to SPARE_PROOF; that
+source path and observed capture state distinguish later unbound states from
+initial lookup. Unbound is therefore not a synonym for bootstrap. The observed
+pending actions are none, CHILD_BEGIN and CHILD_ACK. All five receipt flags stay
+zero; no receipt transition or frame-absent receipt qualification follows.
+
+Current discovery is identical with observer off/on:
+
+| Heads | Unbound observations | Classes | First/last cuts | END/successor histories per cell | Rounds |
+| --- | --- | --- | --- | --- | --- |
+| 1 | 88 | 14 | 18 | 36 | 2 |
+| 2 | 255 | 42 | 54 | 108 | 3 |
+
+All four cells total288 new histories. Per-cut records identify class, cut index,
+actual public ordinal, endpoint roles and outcome. Coverage validation requires
+every cut exactly once per outcome and both endpoints of every discovered class.
+The four complete selectors fit the existing120-second watchdog; TSan retains
+its existing hosted multiplier4/effective480seconds. No focused subset or new
+sharding is needed for the new unbound family: all288 run in every profile.
+
+Excluded eligible observations remain separate: one head has2 frame-absent,
+1,604 bound-numeric and2 bound-but-numeric-cleared returns; two heads have
+6/3,798/6 respectively. These are not injected by the unbound selector. Outside
+eligibility, retirement and selected-owner counters are939 each for one head
+and2,807 each for two; these overlap and must not be added. The later unbound
+stage does not qualify the preceding bound-but-numeric-cleared cut or following
+frame-absent receipt cut.
+
+The existing replay still requires first visible `EINVAL` and an unchanged
+completed Original report on every cleanup return, the old public head pointers,
+generation snapshots, STRING rows/schema and no events, pending protected API
+`EBUSY`, same active successor with zero consumption, its own uncancelled finish
+after old cleanup, genuine IDLE/no frame/transaction/MAIN/parent/retirement debt,
+ordinary reset/same-input raw retry and final governor reservations/reference.
+The20,000-call bound is unchanged. No new runtime defect or fix is claimed.
+
+Validation uses all new histories in native, ASan/UBSan, GCC/Clang TSan and
+enabled-crypto native/ASan. Sized existing regressions on native/ASan include
+all92 CONCAT/early/healthy cases,20 retirement modes, four bound-child focused
+shard0 cases, STRING core/stops/refusals/failures, focused metadata/constructor
+and public focused shard0 cases. Extra profiles use a smaller explicitly listed
+old healthy/CONCAT/bound-child/stops/retirement/controller selection. Current
+cold right-JOIN/source/resident integration and ABI/source/format/CI-shard guards
+are checked on the current baseline. The full previous bound-child, internal
+metadata and public CANCEL/WORK campaigns are not reported as rerun here.
+
+This is finite class-endpoint qualification, not all public offsets, transition
+pairs, concurrency schedules or financial products. Bound-but-numeric-cleared,
+frame-absent receipt-only, retirement/MAIN/observer/claims/publication END and
+remaining containing Source/carry proofs remain open. Existing unary STRING
+ordinary STEP scope is unchanged; wider/mixed/FLOAT, extra topology/expression/K,
+evaluating Snapshot/C1/batch, seeds and pool/prepared-sort remain outside scope.
+This increment does not close #2299.
