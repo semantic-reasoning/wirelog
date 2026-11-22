@@ -8247,3 +8247,12 @@ foreach heads : [1, 2]
       suite: ['unit', 'tsan', 'evaluation_recursive_string_endstage_focused'], timeout: 120)
   endforeach
 endforeach
+
+# Controlled persistent image/slot malloc failure, preserving natural retries.
+foreach pair : [['scalar', 'observed'], ['scalar', 'plain'], ['scalar', 'snapshot'], ['inline', 'observed']]
+  foreach mode : ['index-image-nomem', 'index-slots-nomem']
+    test('evaluation_join_cache_@0@_@1@_@2@'.format(pair[0], pair[1], mode),
+      test_evaluation_join_cache_exe, args: [pair[0], pair[1], mode],
+      suite: ['unit', 'tsan', 'evaluation_join_hosts'], timeout: 120)
+  endforeach
+endforeach

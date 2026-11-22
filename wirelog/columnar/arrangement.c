@@ -3576,6 +3576,24 @@ col_diff_arr_entries_clone(const col_diff_arr_entry_t *src, uint32_t count,
 #ifdef WL_SESSION_TEST_HOOKS
 void (*wl_columnar_arrangement_test_diff_checkpoint)(wl_evaluation_control_t *,
     unsigned, uint64_t);
+bool (*wl_columnar_arrangement_test_diff_fail_allocation)(
+    wl_evaluation_control_t *, uint64_t,
+    wl_columnar_arrangement_test_diff_alloc_site_t, size_t);
+
+static void *
+wl_columnar_arrangement_diff_allocate(size_t bytes,
+    wl_columnar_arrangement_test_diff_alloc_site_t site,
+    wl_evaluation_control_t *control, uint64_t id)
+{
+    if (wl_columnar_arrangement_test_diff_fail_allocation
+        && wl_columnar_arrangement_test_diff_fail_allocation(control, id,
+        site, bytes)) return NULL;
+    return malloc(bytes);
+}
+#else
+/* Drop test descriptors entirely from the ordinary production malloc path. */
+#define wl_columnar_arrangement_diff_allocate(bytes, site, control, \
+            id) malloc(bytes)
 #endif
 
 static int
@@ -3660,7 +3678,8 @@ wl_columnar_arrangement_diff_metadata(
     col_diff_arr_entry_t *entry = &tx->image[slot];
     rc = wl_columnar_arrangement_diff_pay(control, id, 2, slot);
     if (rc) return rc;
-    entry->rel_name = malloc((size_t)length);
+    entry->rel_name = wl_columnar_arrangement_diff_allocate((size_t)length,
+            WL_COLUMNAR_ARRANGEMENT_TEST_DIFF_ALLOC_NAME, control, id);
     if (!entry->rel_name) return ENOMEM;
     tx->metadata_bytes += length;
     wl_mem_ledger_alloc(&sess->mem_ledger, WL_MEM_SUBSYS_ARRANGEMENT, length);
@@ -3671,7 +3690,8 @@ wl_columnar_arrangement_diff_metadata(
     }
     rc = wl_columnar_arrangement_diff_pay(control, id, 2, slot);
     if (rc) return rc;
-    entry->key_cols = malloc((size_t)key_bytes);
+    entry->key_cols = wl_columnar_arrangement_diff_allocate((size_t)key_bytes,
+            WL_COLUMNAR_ARRANGEMENT_TEST_DIFF_ALLOC_METADATA_KEYS, control, id);
     if (!entry->key_cols) return ENOMEM;
     tx->metadata_bytes += key_bytes;
     wl_mem_ledger_alloc(&sess->mem_ledger, WL_MEM_SUBSYS_ARRANGEMENT,
@@ -3756,7 +3776,8 @@ wl_columnar_arrangement_diff_image(
     if (rc) return rc;
     rc = wl_columnar_arrangement_diff_pay(control, id, 2, tx->array_bytes);
     if (rc) return rc;
-    tx->image = malloc((size_t)tx->array_bytes);
+    tx->image = wl_columnar_arrangement_diff_allocate((size_t)tx->array_bytes,
+            WL_COLUMNAR_ARRANGEMENT_TEST_DIFF_ALLOC_IMAGE, control, id);
     if (!tx->image) return ENOMEM;
     tx->image_charged = true;
     wl_mem_ledger_alloc(&sess->mem_ledger, WL_MEM_SUBSYS_ARRANGEMENT,
@@ -3772,7 +3793,8 @@ wl_columnar_arrangement_diff_image(
     rc = wl_columnar_arrangement_diff_pay(control, id, 2, tx->slots_bytes);
     if (rc) return rc;
     const size_t allocated_slots = (size_t)tx->slots_bytes;
-    tx->slots = malloc(allocated_slots);
+    tx->slots = wl_columnar_arrangement_diff_allocate(allocated_slots,
+            WL_COLUMNAR_ARRANGEMENT_TEST_DIFF_ALLOC_SLOTS, control, id);
     if (!tx->slots) return ENOMEM;
     tx->slots_charged = true;
     wl_mem_ledger_alloc(&sess->mem_ledger, WL_MEM_SUBSYS_ARRANGEMENT,
@@ -3826,7 +3848,8 @@ wl_columnar_arrangement_diff_build(
     if (rc) return rc;
     rc = wl_columnar_arrangement_diff_pay(control, id, 2, total);
     if (rc) return rc;
-    tx->building = malloc(sizeof(*tx->building));
+    tx->building = wl_columnar_arrangement_diff_allocate(sizeof(*tx->building),
+            WL_COLUMNAR_ARRANGEMENT_TEST_DIFF_ALLOC_HEADER, control, id);
     if (!tx->building) return ENOMEM;
     tx->building_initialized = false;
     for (size_t i = 0; i < sizeof(*tx->building); ++i) {
@@ -3850,15 +3873,18 @@ wl_columnar_arrangement_diff_build(
     arr->key_count = key_count; arr->nbuckets = buckets; arr->ht_cap = rows;
     rc = wl_columnar_arrangement_diff_pay(control, id, 2, key_bytes);
     if (rc) return rc;
-    arr->key_cols = malloc((size_t)key_bytes);
+    arr->key_cols = wl_columnar_arrangement_diff_allocate((size_t)key_bytes,
+            WL_COLUMNAR_ARRANGEMENT_TEST_DIFF_ALLOC_KEYS, control, id);
     if (!arr->key_cols) return ENOMEM;
     rc = wl_columnar_arrangement_diff_pay(control, id, 2, head_bytes);
     if (rc) return rc;
-    arr->ht_head = malloc((size_t)head_bytes);
+    arr->ht_head = wl_columnar_arrangement_diff_allocate((size_t)head_bytes,
+            WL_COLUMNAR_ARRANGEMENT_TEST_DIFF_ALLOC_HEADS, control, id);
     if (!arr->ht_head) return ENOMEM;
     rc = wl_columnar_arrangement_diff_pay(control, id, 2, next_bytes);
     if (rc) return rc;
-    arr->ht_next = malloc((size_t)next_bytes);
+    arr->ht_next = wl_columnar_arrangement_diff_allocate((size_t)next_bytes,
+            WL_COLUMNAR_ARRANGEMENT_TEST_DIFF_ALLOC_NEXT, control, id);
     if (!arr->ht_next) return ENOMEM;
     for (uint32_t i = 0; i < key_count; ++i) {
         rc = wl_columnar_arrangement_diff_pay(control, id, 4, i);

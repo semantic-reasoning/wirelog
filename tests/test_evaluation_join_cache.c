@@ -79,6 +79,9 @@ typedef struct {
     unsigned cap;
     unsigned resource;
     bool allocation_failed;
+    unsigned index_allocation, allocation_calls[9], allocation_phase;
+    uint64_t allocation_progress, allocation_attempt, failed_allocation_attempt;
+    unsigned injected_allocations;
     uint64_t denials;
     wl_columnar_memory_reservation_t peer;
     bool pin_mode;
@@ -432,11 +435,78 @@ static void reserve_peer(fixture_t *f) {
     f->denials = wl_columnar_memory_denials(g);
     f->stopped = true;
 }
+/* Observe only the real controlled allocator boundary, never its private owner. */
+static bool
+wl_test_join_cache_index_allocation(wl_evaluation_control_t *control,
+    uint64_t id, wl_columnar_arrangement_test_diff_alloc_site_t site,
+    size_t bytes)
+{
+    fixture_t *f = active;
+    CHECK(f && !f->profile && f->index_allocation && bytes
+        && control == f->active->control && id
+        && id == wl_evaluation_control_active_attempt_id(control)
+        && site >= WL_COLUMNAR_ARRANGEMENT_TEST_DIFF_ALLOC_IMAGE
+        && site <= WL_COLUMNAR_ARRANGEMENT_TEST_DIFF_ALLOC_NEXT);
+    wl_columnar_filter_context_t *ctx = context(f);
+    sources(f, ctx);
+    wl_col_session_t *s = COL_SESSION(f->active->session);
+    CHECK(s->diff_txn_count == 1 && !rhs_delta(f)
+        && !ctx->join_operation->right_filter_expr.size);
+    if (!f->allocation_attempt) f->allocation_attempt = id;
+    CHECK(f->allocation_attempt == id && (!f->armed || !f->stopped));
+    ++f->allocation_calls[site];
+    if (!f->armed || site != f->index_allocation) return false;
+    CHECK(f->stage == 1 && f->head < 2 && s->diff_arr_count == 3
+        && !f->seen.builds && !f->seen.reuses && !f->seen.indexed
+        && f->allocation_calls[site] == 1 && f->allocation_phase == 2
+        && f->allocation_progress == bytes);
+    /* The real transaction image contains every head's operations plus its
+     * two reserved suffix slots, not only this current head's plan. */
+    uint64_t capacity = s->diff_arr_count;
+    unsigned heads = 0;
+    for (uint32_t st = 0; st < f->plan->stratum_count; ++st) {
+        const wl_plan_stratum_t *stratum = &f->plan->strata[st];
+        CHECK(!stratum->is_recursive);
+        for (uint32_t h = 0; h < stratum->relation_count; ++h) {
+            capacity += stratum->relations[h].op_count + 2u;
+            ++heads;
+        }
+    }
+    CHECK(heads == HEADS);
+    if (site == WL_COLUMNAR_ARRANGEMENT_TEST_DIFF_ALLOC_IMAGE) {
+        CHECK(bytes == capacity * sizeof(col_diff_arr_entry_t)
+            && !f->seen.image_cells && !f->seen.copied_entries
+            && !f->allocation_calls[
+                WL_COLUMNAR_ARRANGEMENT_TEST_DIFF_ALLOC_SLOTS]);
+    } else {
+        CHECK(site == WL_COLUMNAR_ARRANGEMENT_TEST_DIFF_ALLOC_SLOTS
+            && bytes == capacity * sizeof(wl_columnar_arrangement_diff_slot_t)
+            && f->allocation_calls[WL_COLUMNAR_ARRANGEMENT_TEST_DIFF_ALLOC_IMAGE]
+            == 1
+            && f->seen.image_cells == capacity * sizeof(col_diff_arr_entry_t)
+            && !f->seen.copied_entries);
+    }
+    f->denials = wl_columnar_memory_denials(
+        wl_columnar_memory_governor_ref_get(f->active->governor));
+    f->failed_allocation_attempt = id;
+    CHECK(!f->injected_allocations++);
+    f->stopped = true;
+    fprintf(stdout,
+        "index malloc NULL site=%u bytes=%zu attempt=%llu image=%u copied=%u\n",
+        (unsigned)site, bytes, (unsigned long long)id,
+        f->seen.image_cells, f->seen.copied_entries);
+    return true;
+}
 static void arrangement(wl_evaluation_control_t *control, unsigned phase,
     uint64_t progress) {
     (void)progress;
     fixture_t *f = active;
     if (control != f->active->control) return;
+    f->allocation_phase = phase; f->allocation_progress = progress;
+    if (f->index_allocation) {
+        if (phase == 5) ++f->seen.image_cells;
+        if (phase == 6) ++f->seen.copied_entries;
+    }
     if (!f->profile && f->armed && f->pin_mode && !f->stopped
         && phase == 0 && COL_SESSION(f->active->session)->diff_txn_count == 1) {
         wl_columnar_filter_context_t *ctx = context(f);
@@ -860,6 +930,12 @@ static void watch(fixture_t *f, unsigned profile, bool enabled) {
     memset(&f->seen, 0, sizeof(f->seen));
     memset(&f->cycle_build, 0, sizeof(f->cycle_build));
     f->build_ordinal = 0;
+    memset(f->allocation_calls, 0, sizeof(f->allocation_calls));
+    f->allocation_attempt = 0;
+    f->allocation_phase = 0; f->allocation_progress = 0;
+    wl_columnar_arrangement_test_diff_fail_allocation =
+        enabled && !profile && f->index_allocation
+        ? wl_test_join_cache_index_allocation : NULL;
     f->bindings = NULL;
     f->selected = NULL;
     f->building = NULL;
@@ -1275,6 +1351,15 @@ failure(fixture_t *f, const registry_t *before, const image_t *old,
         && !wl_evaluation_control_active_attempt_id(p->control)
         && !s->cleanup_active && !s->cleanup_pending &&
         !s->cleanup_reserved_bytes);
+    if (f->index_allocation) {
+        CHECK(expected == ENOMEM && f->injected_allocations == 1
+            && f->allocation_attempt == f->failed_allocation_attempt
+            && !s->memory_budget_denied && !s->diff_txn_count
+            && wl_columnar_memory_denials(
+                wl_columnar_memory_governor_ref_get(p->governor)) ==
+            f->denials);
+        wl_columnar_arrangement_test_diff_fail_allocation = NULL;
+    }
     if (f->resource) {
         wl_columnar_memory_governor_t *g =
             wl_columnar_memory_governor_ref_get(p->governor);
@@ -1437,6 +1522,10 @@ int main(int argc, char **argv) {
         if (!strcmp(argv[3], "image-denied")) f.resource = 1;
         if (!strcmp(argv[3], "build-denied")) f.resource = 2;
         if (!strcmp(argv[3], "key-nomem")) f.resource = 3;
+        if (!strcmp(argv[3], "index-image-nomem"))
+            f.index_allocation = WL_COLUMNAR_ARRANGEMENT_TEST_DIFF_ALLOC_IMAGE;
+        if (!strcmp(argv[3], "index-slots-nomem"))
+            f.index_allocation = WL_COLUMNAR_ARRANGEMENT_TEST_DIFF_ALLOC_SLOTS;
         f.pin_mode = !strcmp(argv[3], "pin-held");
         f.cycle = !strcmp(argv[3], "empty-cycle");
         const char *const cycle_modes[] = {"empty-right-cancel",
@@ -1447,7 +1536,8 @@ int main(int argc, char **argv) {
                 f.cycle = true; f.cycle_fault = i / 2 + 1;
                 f.work_stop = (i % 2) != 0;
             }
-        CHECK(f.stop_site || f.cap || f.resource || f.pin_mode || f.cycle);
+        CHECK(f.stop_site || f.cap || f.resource || f.pin_mode || f.cycle ||
+            f.index_allocation);
     }
     const char *env[] = {"WIRELOG_DIFF_ENABLED", "WIRELOG_JOIN_BATCH_BYTES",
                          "WIRELOG_JOIN_BATCH_STRICT",
@@ -1554,6 +1644,10 @@ int main(int argc, char **argv) {
                     f.resource == 3 ? ENOMEM : ENOSPC);
                 watch(&f, p, true);
             }
+            if (!p && f.index_allocation && !f.stopped && f.stage == 1) {
+                failure(&f, &before, &old, ENOMEM);
+                watch(&f, p, true);
+            }
             if (!f.stage && f.cap && f.cap < 6) {
                 if (p < 2) {
                     failure(&f, &before, &old, EOVERFLOW);
@@ -1575,6 +1669,17 @@ int main(int argc, char **argv) {
                 watch(&f, p, true);
             }
             CHECK(!finish(&f, &f.profiles[p]));
+            if (!p && f.index_allocation && f.stage == 1) {
+                CHECK(f.injected_allocations == 1 && f.allocation_attempt
+                    && f.allocation_attempt != f.failed_allocation_attempt
+                    && f.allocation_calls[f.index_allocation] == 1
+                    && f.seen.image_cells && f.seen.copied_entries == 3);
+                fprintf(stdout,
+                    "index malloc retry site=%u attempt=%llu reuses=%u\n",
+                    f.index_allocation,
+                    (unsigned long long)f.allocation_attempt,
+                    f.seen.reuses);
+            }
             if (p < 2)
                 check_work(&f, &before);
             if (!f.stage && f.cap && p < 2)
@@ -1592,6 +1697,8 @@ int main(int argc, char **argv) {
     }
     CHECK((!f.stop_site && !f.resource && !f.pin_mode) || f.stopped);
     CHECK(!f.cycle_fault || f.stopped);
+    CHECK(!f.index_allocation || (f.stopped && f.injected_allocations == 1));
+    CHECK(!wl_columnar_arrangement_test_diff_fail_allocation);
     CHECK(!f.pin.active);
     CHECK(wl_columnar_join_test_attempt_fail_allocation == -1);
     for (unsigned p = 0; p < 3; ++p) {
