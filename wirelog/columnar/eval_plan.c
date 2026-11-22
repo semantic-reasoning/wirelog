@@ -2501,6 +2501,7 @@ wl_columnar_eval_plan_numeric_composed_attempt_begin_internal(
     record->source_begin = begin;
     record->source_full = NULL; record->source_delta = NULL;
     record->source_selected = NULL; record->source_output = NULL;
+    record->cold_right_held = false; record->cold_right_output = NULL;
     record->composed_mode = true;
     record->controlled_materialized_batch_fallback =
         controlled_materialized_batch_fallback;
@@ -3150,6 +3151,7 @@ wl_columnar_eval_plan_metadata_stopped_parent(
         || !r->composed_mode || r->session->cleanup_active != r->frame
         || r->runtime_depth || r->source_installed || r->source_initialized
         || r->source_bare || r->source_slot_borrowed || r->source_output
+        || r->cold_right_held
         || r->join_host || r->join_host_admitted || r->join_host_governor
         || r->lftj.identity || r->lftj.inputs || r->lftj.output
         || r->lftj.row || r->lftj.output_types || r->lftj.scratch_reserved
@@ -3611,6 +3613,23 @@ wl_columnar_eval_plan_numeric_composed_attempt_step_validated_body(
                 WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_PREFLIGHT_LFTJ;
             return 0;
         }
+        /* A cold right input is first scanned into its frame slot (#2301). */
+        if (record->plan->ops[record->cursor].op == WL_PLAN_OP_JOIN
+            && !record->cold_right_held && record->session->cold_relation
+            && wl_columnar_session_cold_find(record->session,
+            record->plan->ops[record->cursor].right_relation)) {
+            if (record->cursor != 1 || record->begin
+                || record->cursor + 1 >= record->end
+                || wl_columnar_session_cold_find(record->session,
+                record->plan->ops[0].relation_name)) {
+                record->semantic_result = ENOTSUP;
+                record->phase = WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_RELEASE;
+            } else {
+                record->phase =
+                    WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_COLD_RIGHT_SLOT;
+            }
+            return 0;
+        }
         if (record->plan->ops[record->cursor].op == WL_PLAN_OP_JOIN
             && record->controlled_materialized_batch_fallback
             && !record->join_host_declined) {
@@ -3661,8 +3680,8 @@ wl_columnar_eval_plan_numeric_composed_attempt_step_validated_body(
                 record->session, record);
         if (!rc) rc = wl_columnar_ops_cold_scan_attempt_begin(&record->cold,
                     record, record->session, record->plan, record->cursor,
-                    record->cold_end, record->source_output, record->control,
-                    record->attempt_id);
+                    record->cold_end, false, record->source_output,
+                    record->control, record->attempt_id);
         if (rc) {
             record->semantic_result = rc;
             record->phase = record->source_slot_borrowed
@@ -3682,13 +3701,31 @@ wl_columnar_eval_plan_numeric_composed_attempt_step_validated_body(
         if (!done) return 0;
         int result = record->cold.semantic_result;
         memset(&record->cold, 0, sizeof(record->cold));
-        if (result) {
+        if (record->cold_right_held) {
+            /* The right copy stays in its slot for the JOIN at READY. */
+            if (result) record->semantic_result = result;
+            record->phase = result
+                ? WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_RELEASE
+                : WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_READY;
+        } else if (result) {
             record->semantic_result = result;
             record->phase = WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_SOURCE_ABORT;
         } else record->phase =
                 WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_COLD_INSTALL;
         return 0;
     }
+    case WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_COLD_RIGHT_SLOT:
+        rc = wl_columnar_eval_stack_composed_cold_right_output(record->frame,
+                record->session, record);
+        if (!rc) rc = wl_columnar_ops_cold_scan_attempt_begin(&record->cold,
+                    record, record->session, record->plan, 0, record->cursor,
+                    true, record->cold_right_output, record->control,
+                    record->attempt_id);
+        if (rc) {
+            record->semantic_result = rc;
+            record->phase = WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_RELEASE;
+        } else record->phase = WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_COLD_CHILD;
+        return 0;
     case WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_COLD_INSTALL:
         rc = wl_columnar_eval_stack_composed_cold_install(record->frame,
                 record->session, record);
@@ -3794,6 +3831,16 @@ wl_columnar_eval_plan_numeric_composed_attempt_step_validated_body(
             if (record->source_slot_borrowed)
                 record->phase =
                     WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_SOURCE_ABORT;
+            return 0;
+        }
+        if (record->cold_right_held) {
+            rc = wl_columnar_eval_stack_composed_cold_right_drop(
+                record->frame, record, funding, funding_id);
+            if (rc) {
+                record->pending_action = record->phase;
+                record->phase = WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_PENDING;
+                return rc;
+            }
             return 0;
         }
         if (record->lftj.identity
@@ -4141,6 +4188,7 @@ wl_columnar_eval_plan_composed_ack_clear(
     record->join_host_terminal = record->join_host_declined = false;
     record->join_host_busy = false;
     record->private_bindings = NULL;
+    record->cold_right_output = NULL;
     record->lftj_metadata_dispatch = false;
     record->abort_supported = false; record->abort_requested = false;
     record->composed_busy = record->lftj_cleanup_authorized = false;
@@ -4188,7 +4236,7 @@ wl_columnar_eval_plan_composed_ack_body(
         rc = record->lftj.phase == WL_COLUMNAR_LFTJ_ATTEMPT_DONE
             ? wl_columnar_eval_plan_native_lftj_owner(record) : EBUSY;
     }
-    if (!rc && record->cold.identity) rc = EBUSY;
+    if (!rc && (record->cold.identity || record->cold_right_held)) rc = EBUSY;
     /* NULL identity is a neverborn or already terminal partial-clear lineage.
      * Do not read its potentially uninitialized historic storage. Retain the
      * canonical numeric/frame owner until ALL refusing checks have passed. */
@@ -4223,6 +4271,7 @@ wl_columnar_eval_plan_numeric_composed_attempt_ack(
     if (rc) return rc;
     if (record->phase != WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_DONE
         || record->source_initialized || record->source_bare
+        || record->cold_right_held
         || !record->control || record->join_host || record->join_host_admitted
         || record->join_host_governor) return EBUSY;
     rc = wl_columnar_eval_plan_composed_fund(funding, funding_id,
@@ -4472,6 +4521,7 @@ wl_columnar_eval_plan_join_cleanup_redirect(
     case WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_CONCAT_START:
     case WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_COLD_SLOT:
     case WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_COLD_INSTALL:
+    case WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_COLD_RIGHT_SLOT:
         n->phase = n->source_initialized
             ? WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_SOURCE_END
             : n->source_slot_borrowed
@@ -4607,7 +4657,12 @@ wl_columnar_eval_plan_registered_cleanup_step(
         if (n->source_initialized || n->source_slot_borrowed
             || n->join_host || n->join_host_admitted ||
             n->join_host_governor) rc = EBUSY;
-        else if (n->lftj.identity
+        else if (n->cold_right_held) {
+            rc = wl_evaluation_control_charge_attempt(funding, id, 0);
+            if (rc) break;
+            rc = wl_columnar_eval_stack_composed_cold_right_drop(n->frame, n,
+                    funding, id);
+        } else if (n->lftj.identity
             && n->lftj.phase != WL_COLUMNAR_LFTJ_ATTEMPT_DONE) {
             rc = wl_evaluation_control_charge_attempt(funding, id, 0);
             if (rc) break;
@@ -4698,6 +4753,7 @@ wl_columnar_eval_plan_registered_cleanup_ack(
     wl_columnar_eval_plan_numeric_attempt_t *n = &ctx->child;
     if (n->phase != WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_DONE
         || n->source_initialized || n->source_slot_borrowed
+        || n->cold_right_held
         || n->join_host || n->join_host_admitted || n->join_host_governor)
         return EBUSY;
     rc = wl_columnar_eval_plan_composed_fund(funding, id, n->control);
@@ -4851,6 +4907,12 @@ wl_columnar_eval_plan_numeric_composed_attempt_step(
         || (record->plan->ops[record->cursor].op == WL_PLAN_OP_JOIN
         && (!record->controlled_materialized_batch_fallback
         || record->join_host_declined)));
+    /* A cold right input is scanned into its slot at READY first. */
+    if (setup && record->plan->ops[record->cursor].op == WL_PLAN_OP_JOIN
+        && !record->cold_right_held && record->session
+        && record->session->cold_relation
+        && wl_columnar_session_cold_find(record->session,
+        record->plan->ops[record->cursor].right_relation)) setup = false;
     if (setup) {
         if (!funding || funding == record->control || !funding_id)
             return EINVAL;

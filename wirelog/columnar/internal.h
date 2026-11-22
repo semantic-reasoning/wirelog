@@ -8303,6 +8303,7 @@ typedef enum {
     WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_COLD_SLOT,
     WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_COLD_CHILD,
     WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_COLD_INSTALL,
+    WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_COLD_RIGHT_SLOT,
     WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_PENDING,
     WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_JOIN_BATCH,
     WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_RELEASE,
@@ -8466,6 +8467,7 @@ typedef struct wl_columnar_cold_scan_attempt {
     wl_col_session_t *session;
     const wl_plan_relation_t *plan;
     uint32_t end; /* First plan op after the MAP/FILTER prefix. */
+    bool right; /* Reads ops[end].right_relation whole, with no prefix. */
     col_rel_t **output;
     wl_evaluation_control_t *control;
     uint64_t attempt_id;
@@ -8506,12 +8508,14 @@ typedef struct wl_columnar_cold_scan_attempt {
 /* Begin binds the attempt to its owner, frame result slot and original
  * attempt; it performs no source access. Step runs one bounded action and
  * reports DONE once RELEASE completed, with semantic_result holding any stop
- * or error. Abort moves a live attempt to RELEASE under separate funding. */
+ * or error. Abort moves a live attempt to RELEASE under separate funding.
+ * With right set, the attempt reads the cold right input of the JOIN at
+ * end == 1 whole, with no prefix, into the frame's cold right slot. */
 int wl_columnar_ops_cold_scan_attempt_begin(
     wl_columnar_cold_scan_attempt_t *attempt, const void *numeric_owner,
     wl_col_session_t *session, const wl_plan_relation_t *plan, uint32_t begin,
-    uint32_t end, col_rel_t **output, wl_evaluation_control_t *control,
-    uint64_t attempt_id);
+    uint32_t end, bool right, col_rel_t **output,
+    wl_evaluation_control_t *control, uint64_t attempt_id);
 int wl_columnar_ops_cold_scan_attempt_step(
     wl_columnar_cold_scan_attempt_t *attempt, bool *done,
     wl_evaluation_control_t *funding, uint64_t funding_id);
@@ -8528,6 +8532,7 @@ extern uint64_t wl_columnar_ops_test_raw_cold_scans;
 extern uint64_t wl_columnar_ops_test_raw_cold_aggregates;
 extern uint64_t wl_columnar_join_test_raw_cold_joins;
 extern uint64_t wl_columnar_join_test_raw_cold_join_aggregates;
+extern uint64_t wl_columnar_join_test_raw_cold_right_joins;
 #endif
 
 /* Actual owned LFTJ row and protected exact-capacity output; no generic
@@ -8619,6 +8624,10 @@ typedef struct wl_columnar_eval_plan_numeric_attempt {
     /* Controlled cold scan child (#2301); identity NULL when inert. */
     wl_columnar_cold_scan_attempt_t cold;
     uint32_t cold_end;
+    /* Set from the right scan's slot until RELEASE drops the frame's copy
+     * of a cold JOIN right input (#2301). */
+    bool cold_right_held;
+    col_rel_t **cold_right_output;
     void *join_host;
     uint64_t join_host_initialized_bytes;
     uint32_t join_host_tail_count;
@@ -9207,6 +9216,19 @@ int wl_columnar_eval_stack_composed_cold_output(
 int wl_columnar_eval_stack_composed_cold_install(
     wl_columnar_eval_stack_cleanup_frame_t *, wl_col_session_t *,
     wl_columnar_eval_plan_numeric_attempt_t *);
+/* The frame's cold right slot (#2301): lend it to the right scan, give the
+ * controlled JOIN at ops[1] the scanned copy (NULL when the owner holds no
+ * slot), and drop the copy under separate funding once no child holds it. */
+int wl_columnar_eval_stack_composed_cold_right_output(
+    wl_columnar_eval_stack_cleanup_frame_t *, wl_col_session_t *,
+    wl_columnar_eval_plan_numeric_attempt_t *);
+int wl_columnar_eval_stack_composed_cold_right(
+    const wl_columnar_eval_stack_cleanup_frame_t *, const void *owner,
+    const wl_plan_op_t *, col_rel_t **);
+int wl_columnar_eval_stack_composed_cold_right_drop(
+    wl_columnar_eval_stack_cleanup_frame_t *,
+    wl_columnar_eval_plan_numeric_attempt_t *, wl_evaluation_control_t *,
+    uint64_t);
 int wl_columnar_eval_stack_composed_source_install(
     wl_columnar_eval_stack_cleanup_frame_t *, wl_col_session_t *,
     wl_columnar_eval_plan_numeric_attempt_t *);

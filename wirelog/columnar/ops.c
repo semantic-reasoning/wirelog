@@ -624,13 +624,14 @@ wl_columnar_cold_scan_spill_fail(wl_columnar_cold_scan_attempt_t *a,
 int
 wl_columnar_ops_cold_scan_attempt_begin(wl_columnar_cold_scan_attempt_t *a,
     const void *numeric_owner, wl_col_session_t *session,
-    const wl_plan_relation_t *plan, uint32_t begin, uint32_t end,
+    const wl_plan_relation_t *plan, uint32_t begin, uint32_t end, bool right,
     col_rel_t **output, wl_evaluation_control_t *control, uint64_t attempt_id)
 {
     if (!a || a->identity || !numeric_owner || !session || !plan ||
         !plan->ops || begin || !end || end >= plan->op_count ||
         (end < 2 && plan->ops[end].op != WL_PLAN_OP_REDUCE &&
         plan->ops[end].op != WL_PLAN_OP_JOIN) ||
+        (right && (end != 1 || plan->ops[end].op != WL_PLAN_OP_JOIN)) ||
         !output || *output || !control || !attempt_id ||
         !session->base.evaluation_control) return EINVAL;
     memset(a, 0, sizeof(*a));
@@ -639,6 +640,7 @@ wl_columnar_ops_cold_scan_attempt_begin(wl_columnar_cold_scan_attempt_t *a,
     a->session = session;
     a->plan = plan;
     a->end = end;
+    a->right = right;
     a->output = output;
     a->control = control;
     a->attempt_id = attempt_id;
@@ -690,7 +692,8 @@ wl_columnar_cold_scan_resolve_name(wl_columnar_cold_scan_attempt_t *a,
 static int
 wl_columnar_cold_scan_resolve(wl_columnar_cold_scan_attempt_t *a)
 {
-    const char *name = a->plan->ops[0].relation_name;
+    const char *name = a->right ? a->plan->ops[a->end].right_relation
+        : a->plan->ops[0].relation_name;
     if (!name) return wl_columnar_cold_scan_fail(a, ENOENT);
     if (!a->cold) return wl_columnar_cold_scan_resolve_name(a, name);
     /* Before a REDUCE the decode runs the prefix twice, once for the scan
@@ -742,10 +745,13 @@ wl_columnar_cold_scan_resolve(wl_columnar_cold_scan_attempt_t *a)
     a->decode_op = 0;
     bool join_end = a->plan->ops[a->end].op == WL_PLAN_OP_JOIN;
     uint32_t logical = 0;
-    if (a->cold->state == WL_COLUMNAR_COLD_LOADING ||
+    /* A right input is read whole: no MAP, no FILTER, the source's columns
+     * in their order, which the TYPES lanes at end == 1 keep. */
+    if (a->right) memset(&a->decoded, 0, sizeof(a->decoded));
+    if (a->cold->state == WL_COLUMNAR_COLD_LOADING || (!a->right &&
         !wl_columnar_eval_plan_cold_scan_decode(a->plan, a->cold->name,
         a->cold->ncols, wl_columnar_session_cold_types(a->cold), a->end,
-        &a->decoded) || (!a->decoded.map && !reduce_end && !join_end))
+        &a->decoded)) || (!a->decoded.map && !reduce_end && !join_end))
         return wl_columnar_cold_scan_fail(a, ENOTSUP);
     /* The output carries no compound layout; seal and load refuse an INLINE
      * source before a JOIN, and this keeps that refusal at the read. */

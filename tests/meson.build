@@ -7623,6 +7623,8 @@ test_evaluation_cold_sources_exe = executable(
 )
 test('evaluation_cold_sources', test_evaluation_cold_sources_exe,
      suite: ['unit', 'tsan'], timeout: 300)
+test('evaluation_cold_right_sources', test_evaluation_cold_sources_exe,
+     args: ['right'], suite: ['unit', 'tsan'], timeout: 300)
 
 test_evaluation_empty_edb_sources_exe = executable(
   'test_evaluation_empty_edb_sources', files('test_evaluation_empty_edb_sources.c'),

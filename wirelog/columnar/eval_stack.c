@@ -327,6 +327,8 @@ struct wl_columnar_eval_stack_cleanup_frame {
     wl_columnar_eval_cleanup_receipt_key_t cleanup_receipt_index_key;
     eval_stack_t stack;
     eval_entry_t result;
+    /* A controlled cold scan's copy of a JOIN right input (#2301). */
+    eval_entry_t cold_right;
     wl_columnar_memory_reservation_t reservation;
     wl_columnar_memory_governor_ref_t *governor;
     const void *identity;
@@ -1094,6 +1096,7 @@ wl_columnar_eval_stack_numeric_metadata_empty(
         out)) return EINVAL;
     if (frame->stack.top ||
         !wl_columnar_eval_stack_unary_entry_inert(&frame->result)
+        || !wl_columnar_eval_stack_unary_entry_inert(&frame->cold_right)
         || frame->unary_phase != WL_COLUMNAR_EVAL_STACK_UNARY_IDLE
         || frame->filter.stage != WL_COLUMNAR_FILTER_STAGE_INERT
         || frame->binary.phase || frame->concat.identity || frame->stream_host)
@@ -1388,6 +1391,7 @@ wl_columnar_eval_stack_unary_output_sanitize(
         goto alias;
     if (candidate == frame->unary_snapshot.rel
         || candidate == frame->result.rel ||
+        candidate == frame->cold_right.rel ||
         candidate == frame->unary_retired.rel)
         goto alias;
     uint32_t limit = frame->stack.top - frame->stack.top % 4;
@@ -1677,6 +1681,7 @@ wl_columnar_eval_stack_unary_commit_attempt_body(
     col_rel_t *candidate = output->rel;
     bool alias = candidate == frame->unary_snapshot.rel
         || candidate == frame->result.rel ||
+        candidate == frame->cold_right.rel ||
         candidate == frame->unary_retired.rel;
     if (alias)
         wl_columnar_eval_stack_unary_alias_detach(frame);
@@ -2527,7 +2532,9 @@ wl_columnar_eval_stack_numeric_source_claim(
     int rc = wl_columnar_eval_stack_numeric_source_frame(frame, sess, owner,
             false);
     if (rc) return rc;
-    if (frame->numeric_plan_owner) return EBUSY;
+    if (frame->numeric_plan_owner
+        || !wl_columnar_eval_stack_unary_entry_inert(&frame->cold_right))
+        return EBUSY;
     frame->numeric_plan_owner = owner;
     return 0;
 }
@@ -2676,6 +2683,9 @@ wl_columnar_eval_stack_cleanup_dispose(
     int retired_rc = eval_entry_dispose(&frame->unary_retired);
     if (result == 0)
         result = retired_rc;
+    int cold_rc = eval_entry_dispose(&frame->cold_right);
+    if (result == 0)
+        result = cold_rc;
     /* Visit lower entries even if a higher one refuses. Their destruction
      * can release dependencies needed by other pending frames. */
     for (uint32_t i = frame->stack.top; i > 0; i--) {
@@ -4311,6 +4321,89 @@ wl_columnar_eval_stack_composed_cold_install(
     return 0;
 }
 
+/* Lend the frame's cold right slot to the controlled cold scan of the
+ * JOIN right input at ops[1] (#2301). The left input is already installed;
+ * the slot stays held until the RELEASE drop, after every child that read
+ * it has finished. */
+int
+wl_columnar_eval_stack_composed_cold_right_output(
+    wl_columnar_eval_stack_cleanup_frame_t *frame, wl_col_session_t *sess,
+    wl_columnar_eval_plan_numeric_attempt_t *owner)
+{
+    int rc = wl_columnar_eval_stack_composed_source_frame(frame, sess, owner,
+            false, false);
+    if (rc) return rc;
+    if (owner->phase != WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_COLD_RIGHT_SLOT
+        || owner->cold_right_held || owner->cold.identity
+        || owner->source_slot_borrowed || owner->source_initialized
+        || owner->source_bare || owner->cursor != 1 || frame->stack.top != 1
+        || !wl_columnar_eval_stack_unary_entry_inert(&frame->cold_right))
+        return EBUSY;
+    for (unsigned i = 0; i < 4; ++i) {
+        rc = wl_columnar_eval_stack_attempt_charge(owner->control,
+                owner->attempt_id, 192);
+        if (rc) return rc;
+        rc = wl_columnar_eval_stack_attempt_charge(owner->control,
+                owner->attempt_id, 0);
+        if (rc) return rc;
+    }
+    wl_columnar_eval_stack_unary_entry_clear(&frame->cold_right);
+    frame->cold_right.owned = true;
+    owner->cold_right_output = &frame->cold_right.rel;
+    owner->cold_right_held = true;
+    return 0;
+}
+
+int
+wl_columnar_eval_stack_composed_cold_right(
+    const wl_columnar_eval_stack_cleanup_frame_t *frame, const void *owner,
+    const wl_plan_op_t *op, col_rel_t **out)
+{
+    if (!out) return EINVAL;
+    *out = NULL;
+    if (!frame || frame->identity != frame || !owner || !op
+        || frame->numeric_plan_owner != owner
+        || !wl_columnar_eval_plan_numeric_owner_valid(owner, frame))
+        return EINVAL;
+    const wl_columnar_eval_plan_numeric_attempt_t *n = owner;
+    if (!n->composed_mode || !n->cold_right_held) return 0;
+    if (n->cold.identity || !n->plan || n->cursor != 1
+        || op != &n->plan->ops[1] || op->op != WL_PLAN_OP_JOIN
+        || !frame->cold_right.owned || !frame->cold_right.rel)
+        return EINVAL;
+    *out = frame->cold_right.rel;
+    return 0;
+}
+
+int
+wl_columnar_eval_stack_composed_cold_right_drop(
+    wl_columnar_eval_stack_cleanup_frame_t *frame,
+    wl_columnar_eval_plan_numeric_attempt_t *owner,
+    wl_evaluation_control_t *funding, uint64_t funding_id)
+{
+    if (!frame || frame->identity != frame || !owner
+        || frame->numeric_plan_owner != owner
+        || !wl_columnar_eval_plan_numeric_owner_valid(owner, frame))
+        return EINVAL;
+    if (!owner->cold_right_held || owner->cold.identity
+        || frame->filter.stage != WL_COLUMNAR_FILTER_STAGE_INERT
+        || frame->unary_phase != WL_COLUMNAR_EVAL_STACK_UNARY_IDLE
+        || !wl_columnar_eval_stack_unary_entry_inert(&frame->unary_output)
+        || !wl_columnar_eval_stack_unary_entry_inert(&frame->unary_retired))
+        return EBUSY;
+    if (!funding || funding == owner->control || !funding_id
+        || wl_evaluation_control_active_attempt_id(funding) != funding_id)
+        return EINVAL;
+    int rc = wl_evaluation_control_charge_attempt(funding, funding_id, 384);
+    if (rc) return rc;
+    rc = eval_entry_dispose(&frame->cold_right);
+    if (rc) return rc;
+    wl_columnar_eval_stack_unary_entry_clear(&frame->cold_right);
+    owner->cold_right_output = NULL;
+    owner->cold_right_held = false;
+    return 0;
+}
+
 int
 wl_columnar_eval_stack_composed_source_abort_validate(
     wl_columnar_eval_stack_cleanup_frame_t *frame, wl_col_session_t *sess,
@@ -4372,7 +4465,8 @@ wl_columnar_eval_stack_composed_source_release_validate(
     if (rc) return rc;
     if (owner->phase != WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_DONE
         || owner->source_initialized || owner->source_bare
-        || owner->source_slot_borrowed)
+        || owner->source_slot_borrowed || owner->cold_right_held
+        || !wl_columnar_eval_stack_unary_entry_inert(&frame->cold_right))
         return EBUSY;
     return 0;
 }
@@ -7745,6 +7839,7 @@ wl_columnar_eval_stack_framed_fresh(
         || frame->unary_result_saved || frame->unary_first_result
         || frame->unary_cleanup_result || frame->unary_alias_rejected
         || !wl_columnar_eval_stack_unary_entry_inert(&frame->result)
+        || !wl_columnar_eval_stack_unary_entry_inert(&frame->cold_right)
         || !wl_columnar_eval_stack_unary_entry_inert(&frame->unary_output)
         || !wl_columnar_eval_stack_unary_entry_inert(&frame->unary_retired)
         || !wl_columnar_eval_stack_unary_entry_inert(&frame->unary_snapshot))
@@ -7892,6 +7987,7 @@ wl_columnar_eval_stack_framed_close_proof(
     wl_columnar_eval_stack_cleanup_frame_t *frame = ctx->frame;
     if (frame->stack.top ||
         !wl_columnar_eval_stack_unary_entry_inert(&frame->result)
+        || !wl_columnar_eval_stack_unary_entry_inert(&frame->cold_right)
         || frame->unary_phase != WL_COLUMNAR_EVAL_STACK_UNARY_IDLE
         || ctx->child_bound || ctx->child.identity || ctx->gate_owned
         || ctx->source_initialized || ctx->batch_initialized
