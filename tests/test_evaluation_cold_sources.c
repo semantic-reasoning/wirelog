@@ -573,6 +573,8 @@ typedef struct {
     uint32_t right_fan; /* Nonzero: right row i is (i % fan, i). */
     bool cold_right; /* The JOIN at ops[1] reads the cold input as its right
                       * input; `right` is then the rule's resident left. */
+    uint32_t cold_fan; /* Nonzero: each JOIN key of the left input matches
+                        * this many cold rows, and the COUNT counts them. */
 } qcase_t;
 
 static int64_t
@@ -862,6 +864,33 @@ static qcase_t qcases[] = {
      "c(\"a\",10). c(\"b\",20). c(\"a\",30).\n"
      "out(x,z) :- a(x,s), c(s,z).\n", "c", 0, 0, "VJC", 0, "out", NULL,
      NULL, 0, 0, 0, true},
+#define RIGHT_AGG RIGHT2 ".decl out(x:int64,n:int64)\n"
+    {"right_count", RIGHT_AGG "out(x,count(z)) :- a(x,y), c(y,z).\n", "c",
+     2, 20, "VJRC", 0, "out", NULL, "a", 2, 20, 0, true},
+    {"right_count_few", RIGHT_AGG "out(x,count(z)) :- a(x,y), c(y,z).\n",
+     "c", 2, 6, "VJRC", 0, "out", NULL, "a", 2, 13, 0, true},
+    {"right_count_scalar", RIGHT2 ".decl out(n:int64)\n"
+     "out(count(z)) :- a(x,y), c(y,z).\n", "c", 2, 20, "VJRC", 0, "out",
+     NULL, "a", 2, 20, 0, true},
+    {"right_min", RIGHT_AGG "out(x,min(z)) :- a(x,y), c(y,z).\n", "c", 2,
+     20, "VJRC", 0, "out", NULL, "a", 2, 20, 0, true},
+    {"right_max_filter", RIGHT_AGG
+     "out(x,max(z)) :- a(x,y), c(y,z), z > 3.\n", "c", 2, 20, "VJFRC", 0,
+     "out", NULL, "a", 2, 20, 0, true},
+    {"right_fanout", RIGHT_AGG "out(x,count(z)) :- a(x,y), c(y,z).\n", "c",
+     2, 39, "VJRC", 0, "out", NULL, "a", 2, 20, 0, true, 3},
+    {"right_count_absent_left", RIGHT_AGG
+     "out(x,count(z)) :- a(x,y), c(y,z).\n", "c", 2, 20, "VJRC", 0, "out",
+     NULL, "a", 2, 0, 0, true},
+    {"right_max_absent_left", RIGHT_AGG
+     "out(x,max(z)) :- a(x,y), c(y,z).\n", "c", 2, 20, "VJRC", 0, "out",
+     NULL, "a", 2, 0, 0, true},
+    {"right_string_group", ".decl a(x:int64,k:int64)\n"
+     ".decl c(k:int64,s:symbol)\n.decl out(s:symbol,n:int64)\n"
+     "a(1,1). a(2,2). a(3,1). a(4,4).\n"
+     "c(1,\"p\"). c(2,\"q\"). c(1,\"r\"). c(5,\"p\").\n"
+     "out(s,count(x)) :- a(x,k), c(k,s).\n", "c", 0, 0, "VJRC", 0, "out",
+     NULL, NULL, 0, 0, 0, true},
 };
 
 #define NQCASES (sizeof(qcases) / sizeof(qcases[0]))
@@ -984,8 +1013,8 @@ run_qcase(const qcase_t *c, via_t via)
     CHECK(!strchr(c->ops, 'J') || c->cold_right ||
         wl_columnar_join_test_raw_cold_joins +
         wl_columnar_ops_test_raw_cold_scans > raw_joins + raw_scans);
-    CHECK(c->cold_right == (wl_columnar_join_test_raw_cold_right_joins >
-        raw_right_joins));
+    CHECK((c->cold_right && !join_reduce) ==
+        (wl_columnar_join_test_raw_cold_right_joins > raw_right_joins));
     CHECK(!join_reduce || wl_columnar_join_test_raw_cold_join_aggregates >
         raw_join_aggregates);
     for (int round = 0; round < 2; round++) {
@@ -1016,6 +1045,15 @@ run_qcase(const qcase_t *c, via_t via)
                 left * (int64_t)(c->right_rows / c->right_fan));
         }
         CHECK(!c->right_fan || (out && out->nrows > 0));
+        /* Each left row's key matches cold_fan cold rows, which repeat
+         * every 13 rows; the COUNT counts every pair. */
+        for (uint32_t i = 0; c->cold_fan && out && i < out->nrows; i++) {
+            int64_t left = 0;
+            for (uint32_t k = 0; k < c->right_rows; k++)
+                left += cell(k, 0) == col_rel_get(out, i, 0);
+            CHECK(col_rel_get(out, i, 1) == left * (int64_t)c->cold_fan);
+        }
+        CHECK(!c->cold_fan || (out && out->nrows > 0));
         /* An aggregate over an empty right input yields no row. */
         CHECK(!join_reduce || !c->right || c->right_rows ||
             head_rows(f.s, c->head) == 0);
@@ -1174,11 +1212,14 @@ parked_destroy_case(const qcase_t *c)
 /* Parked inside the controlled JOIN that reads the copy of a cold right
  * input (#2301): the session refuses checked destruction while the copy is
  * held; after a cancellation the STEP ends with every reservation
- * returned, and a later STEP gives the uncontrolled heads. */
+ * returned, and a later STEP gives the uncontrolled heads. With reduce, the
+ * park is the first return after the REDUCE after the JOIN started, before
+ * the RELEASE that drops the copy; as after a scan's last row, the
+ * cancellation may come too late to stop the STEP. */
 static void
-parked_join_case(const qcase_t *c)
+parked_join_case(const qcase_t *c, bool reduce)
 {
-    set_where(c, VIA_SEAL, "parked_join");
+    set_where(c, VIA_SEAL, reduce ? "parked_reduce" : "parked_join");
     fixture_t f;
     fixture(&f, case_text(c));
     prepare(&f, c, VIA_SEAL);
@@ -1186,17 +1227,22 @@ parked_join_case(const qcase_t *c)
     uint64_t before = reserved(&f);
     hooks_clear();
     int rc = EAGAIN;
-    for (unsigned i = 0; rc == EAGAIN && !join_checkpoints; i++) {
+    for (unsigned i = 0; rc == EAGAIN &&
+        !(reduce ? reduce_checkpoints : join_checkpoints); i++) {
         CHECK(i < 200000);
         rc = wl_session_step(f.s);
     }
     CHECK(rc == EAGAIN && join_checkpoints && right_scan_seen);
+    CHECK(!reduce || reduce_checkpoints);
     wl_session_t *s = f.s;
     CHECK(wl_session_try_destroy(&s) == EBUSY && s == f.s);
     wl_evaluation_control_request_cancel(f.control);
     rc = until_done(f.s);
-    CHECK(rc == WL_EVALUATION_CONTROL_CANCELLED);
-    CHECK(head_rows(f.s, c->head) == 0 && reserved(&f) == before);
+    if (rc != WL_EVALUATION_CONTROL_CANCELLED && (!reduce || rc))
+        fprintf(stderr, "%s: rc %d\n", where, rc);
+    CHECK(rc == WL_EVALUATION_CONTROL_CANCELLED || (reduce && !rc));
+    /* A STEP the cancellation missed holds its published heads. */
+    CHECK(!rc || (head_rows(f.s, c->head) == 0 && reserved(&f) == before));
     CHECK(!wl_evaluation_control_reset(f.control));
     CHECK(!until_done(f.s));
     expect_heads(&f, c);
@@ -1659,15 +1705,27 @@ typedef struct {
 } refusal_t;
 
 static const refusal_t refusals[] = {
-    {"right_count", ".decl a(x:int64,y:int64)\n.decl c(y:int64,z:int64)\n"
-     ".decl out(x:int64,n:int64)\nout(x,count(z)) :- a(x,y), c(y,z).\n",
-     "c", 2, false},
+    {"right_sum", ".decl a(x:int64,y:int64)\n.decl c(y:int64,z:int64)\n"
+     ".decl out(x:int64,n:int64)\nout(x,sum(z)) :- a(x,y), c(y,z).\n",
+     "c", 2, false, true},
+    {"right_count_composite", ".decl a(x:int64,y:int64)\n"
+     ".decl c(x:int64,y:int64,z:int64)\n.decl out(x:int64,n:int64)\n"
+     "out(x,count(z)) :- a(x,y), c(x,y,z).\n", "c", 3, false},
+    {"right_count_after_filter", ".decl a(x:int64,y:int64)\n"
+     ".decl c(y:int64,z:int64)\n.decl out(x:int64,n:int64)\n"
+     "out(x,count(z)) :- a(x,y), y = 3, c(y,z).\n", "c", 2, false, true},
     {"right_composite", ".decl a(x:int64,y:int64)\n"
      ".decl c(x:int64,y:int64,z:int64)\n.decl out(x:int64,z:int64)\n"
      "out(x,z) :- a(x,y), c(x,y,z).\n", "c", 3, false},
     {"right_after_filter", ".decl a(x:int64,y:int64)\n"
      ".decl c(y:int64,z:int64)\n.decl out(x:int64,z:int64)\n"
      "out(x,z) :- a(x,y), y = 3, c(y,z).\n", "c", 2, false, true},
+    {"right_inline", ".decl a(x:int64,y:int64)\n"
+     ".decl c(y:int64,p:pair/2 inline)\n.decl out(x:int64,u:int64)\n"
+     "out(x,u) :- a(x,y), c(y,pair(u,v)).\n", "c", 3, false},
+    {"right_inline_count", ".decl a(x:int64,y:int64)\n"
+     ".decl c(y:int64,p:pair/2 inline)\n.decl out(x:int64,n:int64)\n"
+     "out(x,count(u)) :- a(x,y), c(y,pair(u,v)).\n", "c", 3, false},
     {"right_second_join", ".decl a(x:int64,y:int64)\n"
      ".decl r(y:int64,w:int64)\n.decl c(w:int64,z:int64)\n"
      ".decl out(x:int64,z:int64)\n"
@@ -1913,8 +1971,13 @@ right_cases(void)
     }
     stop_case(find_qcase("right_few"), VIA_SEAL, 2, 2);
     stop_case(find_qcase("right_few"), VIA_LOAD, 1, 2);
+    /* After the JOIN, the REDUCE's checkpoints with each stop mode on one
+     * route. */
+    stop_case(find_qcase("right_count_few"), VIA_SEAL, 1, 1);
+    stop_case(find_qcase("right_count_few"), VIA_LOAD, 2, 1);
     parked_destroy_case(find_qcase("right_pair"));
-    parked_join_case(find_qcase("right_pair"));
+    parked_join_case(find_qcase("right_pair"), false);
+    parked_join_case(find_qcase("right_count"), true);
     join_fault_case(find_qcase("right_pair"));
     read_cancel_case(find_qcase("right_pair"));
     read_fault_case(find_qcase("right_pair"));
