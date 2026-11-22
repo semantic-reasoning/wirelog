@@ -8265,3 +8265,12 @@ foreach pair : [['scalar', 'observed'], ['scalar', 'plain'], ['scalar', 'snapsho
       suite: ['unit', 'tsan', 'evaluation_join_hosts'], timeout: 120)
   endforeach
 endforeach
+
+# Replacement index allocations: unallocated header through owned array prefix.
+foreach pair : [['scalar', 'observed'], ['scalar', 'plain'], ['scalar', 'snapshot'], ['inline', 'observed']]
+  foreach mode : ['index-header-nomem', 'index-keys-nomem', 'index-heads-nomem', 'index-next-nomem']
+    test('evaluation_join_cache_@0@_@1@_@2@'.format(pair[0], pair[1], mode),
+      test_evaluation_join_cache_exe, args: [pair[0], pair[1], mode],
+      suite: ['unit', 'tsan', 'evaluation_join_hosts'], timeout: 120)
+  endforeach
+endforeach

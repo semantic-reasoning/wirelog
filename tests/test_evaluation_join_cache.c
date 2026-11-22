@@ -61,6 +61,7 @@ typedef struct {
     unsigned overrides[HEADS], selected[HEADS], false_rows[HEADS];
     unsigned private_head[HEADS];
     unsigned refill_builds, metadata_name_bytes, metadata_key_cells;
+    unsigned header_cells, bucket_cells;
 } witnesses_t;
 /* Descriptive build-occurrence tuple, never an authority or private pointer. */
 typedef struct {
@@ -378,10 +379,12 @@ static void sources(fixture_t *f, wl_columnar_filter_context_t *ctx) {
         (ctx->source.types[offset] == WIRELOG_TYPE_INT64 &&
         ctx->source.types[offset + 1] == WIRELOG_TYPE_INT64));
     if (!f->profile && !f->compound && !f->route &&
-        (f->stage == 1 || f->stage == 4))
+        (f->stage == 1 || f->stage == 4 || (f->index_allocation >=
+        WL_COLUMNAR_ARRANGEMENT_TEST_DIFF_ALLOC_HEADER && f->stage == 7)))
         CHECK(f->append_op->op == WL_PLAN_OP_VARIABLE &&
             ctx->source.descriptor == f->append && ctx->source.nrows == 1 &&
-            ctx->source.columns[0][0] == 4 && ctx->source.columns[1][0] == 4);
+            ctx->source.columns[0][0] == (f->stage == 7 ? 8 : 4)
+            && ctx->source.columns[1][0] == (f->stage == 7 ? 8 : 4));
 }
 static void observed(wl_evaluation_control_t *control, unsigned phase,
     uint32_t progress,
@@ -458,7 +461,10 @@ wl_test_join_cache_index_allocation(wl_evaluation_control_t *control,
     if (!f->armed || site != f->index_allocation
         || (f->allocation_ordinal &&
         f->allocation_calls[site] < f->allocation_ordinal)) return false;
-    CHECK(f->stage == 1 && f->head < 2 && s->diff_arr_count == 3
+    CHECK(f->stage ==
+        (f->index_allocation >=
+        WL_COLUMNAR_ARRANGEMENT_TEST_DIFF_ALLOC_HEADER ? 5u : 1u)
+        && f->head < 2 && s->diff_arr_count == 3
         && !f->seen.builds && !f->seen.reuses && !f->seen.indexed
         && f->allocation_calls[site] ==
         (f->allocation_ordinal ? f->allocation_ordinal : 1u)
@@ -489,7 +495,7 @@ wl_test_join_cache_index_allocation(wl_evaluation_control_t *control,
             == 1
             && f->seen.image_cells == capacity * sizeof(col_diff_arr_entry_t)
             && !f->seen.copied_entries);
-    } else {
+    } else if (site <= WL_COLUMNAR_ARRANGEMENT_TEST_DIFF_ALLOC_METADATA_KEYS) {
         CHECK((site == WL_COLUMNAR_ARRANGEMENT_TEST_DIFF_ALLOC_NAME
             || site == WL_COLUMNAR_ARRANGEMENT_TEST_DIFF_ALLOC_METADATA_KEYS)
             && f->allocation_ordinal >= 1 && f->allocation_ordinal <= 2);
@@ -517,6 +523,42 @@ wl_test_join_cache_index_allocation(wl_evaluation_control_t *control,
             && f->seen.metadata_name_bytes == (slot + (keys ? 1u : 0u)) * length
             && f->seen.metadata_key_cells == prior_keys
             && bytes == (keys ? entry->key_count * sizeof(uint32_t) : length));
+    } else {
+        CHECK(site >= WL_COLUMNAR_ARRANGEMENT_TEST_DIFF_ALLOC_HEADER
+            && ctx->join_operation->key_count == 1
+            && !strcmp(ctx->join_operation->right_keys[0], "col0")
+            && ctx->join_right.nrows && f->seen.copied_entries == 3
+            && f->seen.image_cells == capacity * (sizeof(col_diff_arr_entry_t)
+            + sizeof(wl_columnar_arrangement_diff_slot_t))
+            && f->seen.metadata_name_bytes == 3u * sizeof("right")
+            && f->seen.metadata_key_cells == 4 && !f->seen.bucket_cells
+            && f->allocation_calls[WL_COLUMNAR_ARRANGEMENT_TEST_DIFF_ALLOC_IMAGE]
+            == 1
+            && f->allocation_calls[WL_COLUMNAR_ARRANGEMENT_TEST_DIFF_ALLOC_SLOTS]
+            == 1
+            && f->allocation_calls[WL_COLUMNAR_ARRANGEMENT_TEST_DIFF_ALLOC_NAME]
+            == 3
+            && f->allocation_calls[
+                WL_COLUMNAR_ARRANGEMENT_TEST_DIFF_ALLOC_METADATA_KEYS] == 3);
+        uint64_t buckets = 1;
+        while (buckets < 2u * ctx->join_right.nrows) buckets *= 2;
+        uint64_t sizes[] = {sizeof(col_diff_arrangement_t), sizeof(uint32_t),
+                            buckets * sizeof(uint32_t),
+                            ctx->join_right.nrows * sizeof(uint32_t)};
+        uint64_t total = sizes[0] + sizes[1] + sizes[2] + sizes[3];
+        unsigned ordinal = site -
+            WL_COLUMNAR_ARRANGEMENT_TEST_DIFF_ALLOC_HEADER;
+        CHECK(bytes == sizes[ordinal] &&
+            f->allocation_progress == (ordinal ? bytes : total)
+            && f->seen.header_cells ==
+            (ordinal ? sizeof(col_diff_arrangement_t) + 1u : 0u));
+        for (unsigned i = 0; i < 4; ++i)
+            CHECK(
+                f->allocation_calls[
+                    WL_COLUMNAR_ARRANGEMENT_TEST_DIFF_ALLOC_HEADER + i]
+                == (i <= ordinal ? 1u : 0u));
+        /* Reaching the next malloc proves earlier pointers succeeded. Keys
+         * and hash heads are allocated, not populated, until ALL succeed. */
     }
     f->denials = wl_columnar_memory_denials(
         wl_columnar_memory_governor_ref_get(f->active->governor));
@@ -540,6 +582,8 @@ static void arrangement(wl_evaluation_control_t *control, unsigned phase,
         if (phase == 6) ++f->seen.copied_entries;
         if (phase == 3) ++f->seen.metadata_name_bytes;
         if (phase == 4) ++f->seen.metadata_key_cells;
+        if (phase == 8) ++f->seen.header_cells;
+        if (phase == 9) ++f->seen.bucket_cells;
     }
     if (!f->profile && f->armed && f->pin_mode && !f->stopped
         && phase == 0 && COL_SESSION(f->active->session)->diff_txn_count == 1) {
@@ -1032,6 +1076,11 @@ static void script(fixture_t *f) {
     case 6:
         right_change(f, 9, 9, 1, true);
         break;
+    case 7:
+        CHECK(f->index_allocation >=
+            WL_COLUMNAR_ARRANGEMENT_TEST_DIFF_ALLOC_HEADER);
+        left_insert(f, 8, 8); /* Unmatched append must really reuse after recovery. */
+        break;
     default:
         CHECK(false);
     }
@@ -1083,7 +1132,7 @@ static void check_work(fixture_t *f, const registry_t *before) {
     } else {
         CHECK(f->seen.rejected);
         if (!f->profile) {
-            bool warm = f->stage == 1 || f->stage == 4;
+            bool warm = f->stage == 1 || f->stage == 4 || f->stage == 7;
             CHECK(f->seen.builds == (warm ? 0u : 3u) &&
                 f->seen.reuses == (warm ? 4u : 1u) && f->seen.persistent);
             if (warm) {
@@ -1571,6 +1620,13 @@ int main(int argc, char **argv) {
                 : WL_COLUMNAR_ARRANGEMENT_TEST_DIFF_ALLOC_NAME;
                 f.allocation_ordinal = i / 2 + 1;
             }
+        const char *const build_modes[] = {"index-header-nomem",
+                                           "index-keys-nomem",
+                                           "index-heads-nomem",
+                                           "index-next-nomem"};
+        for (unsigned i = 0; i < 4; ++i) if (!strcmp(argv[3], build_modes[i]))
+                f.index_allocation =
+                    WL_COLUMNAR_ARRANGEMENT_TEST_DIFF_ALLOC_HEADER + i;
         f.pin_mode = !strcmp(argv[3], "pin-held");
         f.cycle = !strcmp(argv[3], "empty-cycle");
         const char *const cycle_modes[] = {"empty-right-cancel",
@@ -1646,7 +1702,8 @@ int main(int argc, char **argv) {
         CHECK(!registry(&f.profiles[p]).count);
     }
     if (f.cycle) wl_test_join_cache_cycle_run(&f);
-    for (f.stage = 0; !f.cycle && f.stage < 7; ++f.stage) {
+    for (f.stage = 0; !f.cycle && f.stage < (f.index_allocation >=
+        WL_COLUMNAR_ARRANGEMENT_TEST_DIFF_ALLOC_HEADER ? 8u : 7u); ++f.stage) {
         if (f.stage == 1 && f.pin_mode) {
             profile_t *p = &f.profiles[0];
             f.unpinned = registry(p);
@@ -1689,7 +1746,9 @@ int main(int argc, char **argv) {
                     f.resource == 3 ? ENOMEM : ENOSPC);
                 watch(&f, p, true);
             }
-            if (!p && f.index_allocation && !f.stopped && f.stage == 1) {
+            if (!p && f.index_allocation && !f.stopped && f.stage ==
+                (f.index_allocation >=
+                WL_COLUMNAR_ARRANGEMENT_TEST_DIFF_ALLOC_HEADER ? 5u : 1u)) {
                 failure(&f, &before, &old, ENOMEM);
                 watch(&f, p, true);
             }
@@ -1714,11 +1773,15 @@ int main(int argc, char **argv) {
                 watch(&f, p, true);
             }
             CHECK(!finish(&f, &f.profiles[p]));
-            if (!p && f.index_allocation && f.stage == 1) {
+            if (!p && f.index_allocation && f.stage ==
+                (f.index_allocation >=
+                WL_COLUMNAR_ARRANGEMENT_TEST_DIFF_ALLOC_HEADER ? 5u : 1u)) {
                 CHECK(f.injected_allocations == 1 && f.allocation_attempt
                     && f.allocation_attempt != f.failed_allocation_attempt
                     && f.allocation_calls[f.index_allocation] ==
-                    (f.allocation_ordinal ? 3u : 1u)
+                    (f.allocation_ordinal ||
+                    f.index_allocation >=
+                    WL_COLUMNAR_ARRANGEMENT_TEST_DIFF_ALLOC_HEADER ? 3u : 1u)
                     && f.seen.image_cells && f.seen.copied_entries == 3);
                 fprintf(stdout,
                     "index malloc retry site=%u attempt=%llu reuses=%u\n",
