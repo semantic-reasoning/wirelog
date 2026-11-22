@@ -60,7 +60,7 @@ typedef struct {
     unsigned schema[HEADS], empty_left[HEADS], empty_right[HEADS];
     unsigned overrides[HEADS], selected[HEADS], false_rows[HEADS];
     unsigned private_head[HEADS];
-    unsigned refill_builds;
+    unsigned refill_builds, metadata_name_bytes, metadata_key_cells;
 } witnesses_t;
 /* Descriptive build-occurrence tuple, never an authority or private pointer. */
 typedef struct {
@@ -81,7 +81,7 @@ typedef struct {
     bool allocation_failed;
     unsigned index_allocation, allocation_calls[9], allocation_phase;
     uint64_t allocation_progress, allocation_attempt, failed_allocation_attempt;
-    unsigned injected_allocations;
+    unsigned injected_allocations, allocation_ordinal;
     uint64_t denials;
     wl_columnar_memory_reservation_t peer;
     bool pin_mode;
@@ -455,11 +455,14 @@ wl_test_join_cache_index_allocation(wl_evaluation_control_t *control,
     if (!f->allocation_attempt) f->allocation_attempt = id;
     CHECK(f->allocation_attempt == id && (!f->armed || !f->stopped));
     ++f->allocation_calls[site];
-    if (!f->armed || site != f->index_allocation) return false;
+    if (!f->armed || site != f->index_allocation
+        || (f->allocation_ordinal &&
+        f->allocation_calls[site] < f->allocation_ordinal)) return false;
     CHECK(f->stage == 1 && f->head < 2 && s->diff_arr_count == 3
         && !f->seen.builds && !f->seen.reuses && !f->seen.indexed
-        && f->allocation_calls[site] == 1 && f->allocation_phase == 2
-        && f->allocation_progress == bytes);
+        && f->allocation_calls[site] ==
+        (f->allocation_ordinal ? f->allocation_ordinal : 1u)
+        && f->allocation_phase == 2);
     /* The real transaction image contains every head's operations plus its
      * two reserved suffix slots, not only this current head's plan. */
     uint64_t capacity = s->diff_arr_count;
@@ -474,17 +477,46 @@ wl_test_join_cache_index_allocation(wl_evaluation_control_t *control,
     }
     CHECK(heads == HEADS);
     if (site == WL_COLUMNAR_ARRANGEMENT_TEST_DIFF_ALLOC_IMAGE) {
-        CHECK(bytes == capacity * sizeof(col_diff_arr_entry_t)
+        CHECK(f->allocation_progress == bytes &&
+            bytes == capacity * sizeof(col_diff_arr_entry_t)
             && !f->seen.image_cells && !f->seen.copied_entries
             && !f->allocation_calls[
                 WL_COLUMNAR_ARRANGEMENT_TEST_DIFF_ALLOC_SLOTS]);
-    } else {
-        CHECK(site == WL_COLUMNAR_ARRANGEMENT_TEST_DIFF_ALLOC_SLOTS
+    } else if (site == WL_COLUMNAR_ARRANGEMENT_TEST_DIFF_ALLOC_SLOTS) {
+        CHECK(f->allocation_progress == bytes
             && bytes == capacity * sizeof(wl_columnar_arrangement_diff_slot_t)
             && f->allocation_calls[WL_COLUMNAR_ARRANGEMENT_TEST_DIFF_ALLOC_IMAGE]
             == 1
             && f->seen.image_cells == capacity * sizeof(col_diff_arr_entry_t)
             && !f->seen.copied_entries);
+    } else {
+        CHECK((site == WL_COLUMNAR_ARRANGEMENT_TEST_DIFF_ALLOC_NAME
+            || site == WL_COLUMNAR_ARRANGEMENT_TEST_DIFF_ALLOC_METADATA_KEYS)
+            && f->allocation_ordinal >= 1 && f->allocation_ordinal <= 2);
+        unsigned slot = f->allocation_ordinal - 1;
+        const col_diff_arr_entry_t *entry = &s->diff_arr_entries[slot];
+        unsigned length = (unsigned)strlen("right") + 1, prior_keys = 0;
+        for (unsigned i = 0; i < slot; ++i)
+            prior_keys += s->diff_arr_entries[i].key_count;
+        bool keys = site ==
+            WL_COLUMNAR_ARRANGEMENT_TEST_DIFF_ALLOC_METADATA_KEYS;
+        CHECK(!strcmp(entry->rel_name, "right") && entry->key_count
+            && f->allocation_progress == slot
+            && f->seen.image_cells == capacity * (sizeof(col_diff_arr_entry_t)
+            + sizeof(wl_columnar_arrangement_diff_slot_t))
+            && f->seen.copied_entries == f->allocation_ordinal
+            && f->allocation_calls[WL_COLUMNAR_ARRANGEMENT_TEST_DIFF_ALLOC_IMAGE]
+            == 1
+            && f->allocation_calls[WL_COLUMNAR_ARRANGEMENT_TEST_DIFF_ALLOC_SLOTS]
+            == 1
+            && f->allocation_calls[WL_COLUMNAR_ARRANGEMENT_TEST_DIFF_ALLOC_NAME]
+            == slot + 1
+            && f->allocation_calls[
+                WL_COLUMNAR_ARRANGEMENT_TEST_DIFF_ALLOC_METADATA_KEYS] ==
+            slot + (keys ? 1u : 0u)
+            && f->seen.metadata_name_bytes == (slot + (keys ? 1u : 0u)) * length
+            && f->seen.metadata_key_cells == prior_keys
+            && bytes == (keys ? entry->key_count * sizeof(uint32_t) : length));
     }
     f->denials = wl_columnar_memory_denials(
         wl_columnar_memory_governor_ref_get(f->active->governor));
@@ -506,6 +538,8 @@ static void arrangement(wl_evaluation_control_t *control, unsigned phase,
     if (f->index_allocation) {
         if (phase == 5) ++f->seen.image_cells;
         if (phase == 6) ++f->seen.copied_entries;
+        if (phase == 3) ++f->seen.metadata_name_bytes;
+        if (phase == 4) ++f->seen.metadata_key_cells;
     }
     if (!f->profile && f->armed && f->pin_mode && !f->stopped
         && phase == 0 && COL_SESSION(f->active->session)->diff_txn_count == 1) {
@@ -1526,6 +1560,17 @@ int main(int argc, char **argv) {
             f.index_allocation = WL_COLUMNAR_ARRANGEMENT_TEST_DIFF_ALLOC_IMAGE;
         if (!strcmp(argv[3], "index-slots-nomem"))
             f.index_allocation = WL_COLUMNAR_ARRANGEMENT_TEST_DIFF_ALLOC_SLOTS;
+        const char *const metadata_modes[] = {"index-first-name-nomem",
+                                              "index-first-keys-nomem",
+                                              "index-second-name-nomem",
+                                              "index-second-keys-nomem"};
+        for (unsigned i = 0; i < 4;
+            ++i) if (!strcmp(argv[3], metadata_modes[i])) {
+                f.index_allocation = (i %
+                    2) ? WL_COLUMNAR_ARRANGEMENT_TEST_DIFF_ALLOC_METADATA_KEYS
+                : WL_COLUMNAR_ARRANGEMENT_TEST_DIFF_ALLOC_NAME;
+                f.allocation_ordinal = i / 2 + 1;
+            }
         f.pin_mode = !strcmp(argv[3], "pin-held");
         f.cycle = !strcmp(argv[3], "empty-cycle");
         const char *const cycle_modes[] = {"empty-right-cancel",
@@ -1672,7 +1717,8 @@ int main(int argc, char **argv) {
             if (!p && f.index_allocation && f.stage == 1) {
                 CHECK(f.injected_allocations == 1 && f.allocation_attempt
                     && f.allocation_attempt != f.failed_allocation_attempt
-                    && f.allocation_calls[f.index_allocation] == 1
+                    && f.allocation_calls[f.index_allocation] ==
+                    (f.allocation_ordinal ? 3u : 1u)
                     && f.seen.image_cells && f.seen.copied_entries == 3);
                 fprintf(stdout,
                     "index malloc retry site=%u attempt=%llu reuses=%u\n",

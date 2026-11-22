@@ -8256,3 +8256,12 @@ foreach pair : [['scalar', 'observed'], ['scalar', 'plain'], ['scalar', 'snapsho
       suite: ['unit', 'tsan', 'evaluation_join_hosts'], timeout: 120)
   endforeach
 endforeach
+
+# Existing-entry metadata malloc failures after distinct copied prefixes.
+foreach pair : [['scalar', 'observed'], ['scalar', 'plain'], ['scalar', 'snapshot'], ['inline', 'observed']]
+  foreach mode : ['index-first-name-nomem', 'index-first-keys-nomem', 'index-second-name-nomem', 'index-second-keys-nomem']
+    test('evaluation_join_cache_@0@_@1@_@2@'.format(pair[0], pair[1], mode),
+      test_evaluation_join_cache_exe, args: [pair[0], pair[1], mode],
+      suite: ['unit', 'tsan', 'evaluation_join_hosts'], timeout: 120)
+  endforeach
+endforeach
