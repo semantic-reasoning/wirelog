@@ -680,3 +680,14 @@ CONSOLIDATE; see "Cold JOIN right inputs in controlled single-worker sessions
 aggregate, a self-JOIN, two cold inputs of one rule, a JOIN with more than one
 key, a SNAPSHOT or an observed STEP over a cold input, the program refusals of
 the sixth bundle and more than one worker stay open.
+
+An eleventh bundle admits, under control, the tenth bundle's cold right input
+before an aggregate: a COUNT, MIN or MAX that the uncontrolled cold JOIN
+aggregate admits as the rule's next to last op. The composed attempt holds the
+copy of the right input through the controlled JOIN, the MAP and FILTER after
+it and the controlled REDUCE attempt, and drops it at its RELEASE; see "Cold
+JOIN right aggregates in controlled single-worker sessions (#2301)". A cold
+right input after a prefix or read by a later JOIN, a self-JOIN, two cold
+inputs of one rule, a JOIN with more than one key, a SNAPSHOT or an observed
+STEP over a cold input, the program refusals of the sixth bundle and more than
+one worker stay open.
