@@ -8731,6 +8731,21 @@ int wl_columnar_arrangement_diff_attempt_ledger_capture_owned(
 #ifdef WL_SESSION_TEST_HOOKS
 extern void (*wl_columnar_arrangement_test_diff_checkpoint)(
     wl_evaluation_control_t *, unsigned, uint64_t);
+/* Actual controlled diff-attempt malloc boundaries; callback true injects
+ * NULL once at the selected site. No ownership pointers or raw API hook. */
+typedef enum {
+    WL_COLUMNAR_ARRANGEMENT_TEST_DIFF_ALLOC_IMAGE = 1,
+    WL_COLUMNAR_ARRANGEMENT_TEST_DIFF_ALLOC_SLOTS,
+    WL_COLUMNAR_ARRANGEMENT_TEST_DIFF_ALLOC_NAME,
+    WL_COLUMNAR_ARRANGEMENT_TEST_DIFF_ALLOC_METADATA_KEYS,
+    WL_COLUMNAR_ARRANGEMENT_TEST_DIFF_ALLOC_HEADER,
+    WL_COLUMNAR_ARRANGEMENT_TEST_DIFF_ALLOC_KEYS,
+    WL_COLUMNAR_ARRANGEMENT_TEST_DIFF_ALLOC_HEADS,
+    WL_COLUMNAR_ARRANGEMENT_TEST_DIFF_ALLOC_NEXT
+} wl_columnar_arrangement_test_diff_alloc_site_t;
+extern bool (*wl_columnar_arrangement_test_diff_fail_allocation)(
+    wl_evaluation_control_t *, uint64_t,
+    wl_columnar_arrangement_test_diff_alloc_site_t, size_t);
 #endif
 int wl_columnar_eval_private_binding_get(
     const wl_columnar_eval_private_bindings_t *, uint32_t,
