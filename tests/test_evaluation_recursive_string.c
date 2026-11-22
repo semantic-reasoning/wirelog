@@ -1512,6 +1512,16 @@ endstage_equal(const public_key_t *a, const public_key_t *b)
            && !memcmp(a->child + 2, b->child + 2, 11 * sizeof(uint64_t));
 }
 
+/* Frame-present capture-only states with no bound child, before or after ACK. */
+static bool
+unbound_eligible(const public_key_t *k)
+{
+    return k->available && k->eligible && k->phase == 8 && k->round_active
+           && !k->published && !k->committed && !k->main[0] && !k->retirement[0]
+           && k->child[0] && k->child[1] && (k->child[4] & 64)
+           && !(k->child[4] & 4);
+}
+
 static void
 ended_case(unsigned heads, bool observed, ended_trace_t *record,
     const public_key_t *expected, unsigned target, unsigned outcome, bool early)
@@ -1561,7 +1571,8 @@ ended_case(unsigned heads, bool observed, ended_trace_t *record,
         }
         if (!stop.hit && stopping_case && rc == EAGAIN
             && (early ? category == 2 : calls == target)) {
-            CHECK(category >= 0 || endstage_eligible(&key));
+            CHECK(category >= 0 || endstage_eligible(&key)
+                || unbound_eligible(&key));
             if (expected) CHECK(public_equal(&key, expected));
             inject(&stop);
             CHECK(wl_session_insert(f.session, "input", &fresh, 1, 1) == EBUSY
@@ -1769,11 +1780,104 @@ run_endstage(unsigned heads, bool observed, unsigned shard, unsigned shards)
     free(t.class_id); free(t.pick); free(t.public_ordinal); free(t.keys);
 }
 
+/* Exact first/last unbound classes; numeric identity may still be present. */
+static void
+run_unbound(unsigned heads, bool observed)
+{
+    public_trace_t t = {0};
+    t.keys = calloc(16384, sizeof(*t.keys));
+    t.public_ordinal = calloc(16384, sizeof(*t.public_ordinal));
+    t.class_id = calloc(16384, sizeof(*t.class_id));
+    t.pick = calloc(16384, sizeof(*t.pick));
+    CHECK(t.keys && t.public_ordinal && t.class_id && t.pick);
+    unsigned retained = 0;
+    public_replay(heads, observed, NULL, &t, UINT32_MAX, 0, &retained);
+    unsigned first[2048], last[2048], classes = 0, observations = 0, rounds = 0;
+    unsigned absent = 0, bound = 0, cleared = 0, other = 0;
+    bool reached[16][2] = {{false}}, lookup[16][2] = {{false}},
+        spare[16][2] = {{false}};
+    uint64_t phases = 0, pending = 0, flags = 0, identities = 0, receipts = 0;
+    for (unsigned i = 0; i < t.count; i++) {
+        const public_key_t *k = &t.keys[i]; t.class_id[i] = UINT32_MAX;
+        if (!unbound_eligible(k)) {
+            if (!k->child[0]) absent++;
+            else if (k->child[4] & 4) {
+                if (k->child[5]) bound++;
+                else cleared++;
+            } else other++;
+            continue;
+        }
+        CHECK(k->round < 16 && k->head < heads && k->child[2] < 64
+            && k->child[3] < 64 && k->child[5] < 2);
+        observations++; reached[k->round][k->head] = true;
+        if (k->round + 1 > rounds) rounds = (unsigned)k->round + 1;
+        if (k->child[2] == WL_COLUMNAR_EVAL_SERIAL_FRAMED_LOOKUP)
+            CHECK(!(k->child[4] & 128));
+        if (k->child[2] == WL_COLUMNAR_EVAL_SERIAL_FRAMED_SPARE_PROOF)
+            CHECK(k->child[4] & 128);
+        lookup[k->round][k->head] |= k->child[2] ==
+            WL_COLUMNAR_EVAL_SERIAL_FRAMED_LOOKUP;
+        spare[k->round][k->head] |= k->child[2] ==
+            WL_COLUMNAR_EVAL_SERIAL_FRAMED_SPARE_PROOF;
+        phases |= UINT64_C(1) << k->child[2];
+        pending |= UINT64_C(1) << k->child[3]; flags |= k->child[4];
+        identities |= UINT64_C(1) << k->child[5];
+        receipts |= UINT64_C(1) << (k->receipt_pending | (k->receipt_ack << 1)
+            | (k->receipt_acknowledged << 2) | (k->receipt_index_valid << 3)
+            | (k->ack_committed << 4));
+        unsigned c = 0;
+        for (; c < classes; c++)
+            if (endstage_equal(k, &t.keys[first[c]])) break;
+        if (c == classes) {
+            CHECK(c < 2048); first[c] = i; classes++;
+        }
+        last[c] = i; t.class_id[i] = c;
+    }
+    CHECK(observations && classes && rounds);
+    for (unsigned r = 0; r < rounds; r++)
+        for (unsigned h = 0; h < heads; h++)
+            CHECK(reached[r][h] && lookup[r][h] && spare[r][h]);
+    for (unsigned c = 0; c < classes; c++) {
+        CHECK(first[c] <= last[c] && t.class_id[first[c]] == c
+            && t.class_id[last[c]] == c);
+        t.pick[first[c]] = t.pick[last[c]] = true;
+    }
+    unsigned cuts = 0, selected = 0;
+    for (unsigned i = 0; i < t.count; i++) {
+        if (!t.pick[i]) continue;
+        unsigned index = cuts++, c = t.class_id[i]; CHECK(c < classes);
+        for (unsigned outcome = 2; outcome <= 3; outcome++) {
+            ended_case(heads, observed, NULL, &t.keys[i],
+                t.public_ordinal[i], outcome, false);
+            selected++;
+            printf(
+                "unbound_cut heads%u observer%d index%u class%u public%u first%d last%d outcome%u passed\n",
+                heads, observed, index, c, t.public_ordinal[i],
+                i == first[c], i == last[c], outcome);
+        }
+    }
+    CHECK(selected == 2 * cuts);
+    printf(
+        "unbound heads%u observer%d observations%u classes%u cuts%u selected%u rounds%u phases%llu pending%llu flags%llu numeric_identities%llu receipts%llu excluded_frame_absent%u/bound_numeric%u/bound_cleared%u/other%u/retire%u/owner%u passed\n",
+        heads, observed, observations, classes, cuts, selected, rounds,
+        (unsigned long long)phases, (unsigned long long)pending,
+        (unsigned long long)flags, (unsigned long long)identities,
+        (unsigned long long)receipts, absent, bound, cleared, other,
+        t.excluded_retire, t.excluded_owner);
+    free(t.pick); free(t.class_id); free(t.public_ordinal); free(t.keys);
+}
+
 int
 main(int argc, char **argv)
 {
     CHECK(!environment("WIRELOG_JOIN_BATCH_BYTES", "")
         && !environment("WIRELOG_JOIN_BATCH_STRICT", ""));
+    if (argc == 4 && !strcmp(argv[1], "unbound")) {
+        unsigned heads = (unsigned)strtoul(argv[2], NULL, 10);
+        unsigned observed = (unsigned)strtoul(argv[3], NULL, 10);
+        CHECK(heads >= 1 && heads <= 2 && observed <= 1);
+        run_unbound(heads, observed != 0); return 0;
+    }
     if (argc == 6 && !strcmp(argv[1], "endstage")) {
         unsigned heads = (unsigned)strtoul(argv[2], NULL, 10);
         unsigned observed = (unsigned)strtoul(argv[3], NULL, 10);
