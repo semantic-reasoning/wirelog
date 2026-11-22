@@ -8227,3 +8227,21 @@ foreach heads : [1, 2]
       suite: ['unit', 'tsan', 'evaluation_recursive_string_ended'], timeout: 120)
   endforeach
 endforeach
+
+# All-tests TSan CI registers only focused shard0/16; native/ASan retain all16.
+foreach heads : [1, 2]
+  foreach observed : [0, 1]
+    if not get_option('b_sanitize').contains('thread')
+      foreach shard : range(16)
+        test('evaluation_recursive_string_endstage_@0@_@1@_@2@'.format(heads, observed, shard),
+          evaluation_recursive_string_exe,
+          args: ['endstage', heads.to_string(), observed.to_string(), shard.to_string(), '16'],
+          suite: ['unit', 'evaluation_recursive_string_endstage'], timeout: 120)
+      endforeach
+    endif
+    test('evaluation_recursive_string_endstage_focused_@0@_@1@'.format(heads, observed),
+      evaluation_recursive_string_exe,
+      args: ['endstage', heads.to_string(), observed.to_string(), '0', '16'],
+      suite: ['unit', 'tsan', 'evaluation_recursive_string_endstage_focused'], timeout: 120)
+  endforeach
+endforeach

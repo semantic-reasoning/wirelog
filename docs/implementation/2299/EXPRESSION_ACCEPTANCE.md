@@ -3136,3 +3136,87 @@ existing declared unary STRING projection route. It does not certify every
 public offset, all child/retirement/MAIN/observer/publication states, wider types
 or topology, additional evaluation modes/seeds/transport, or the remaining
 containing Source/carry proofs. It does not close #2299.
+
+### Public bound-child END stage representatives
+
+This test-only follow-up expands the finite public END/successor representatives
+beyond the two CONCAT numeric stages. It uses the merged observed-CONCAT proof
+selection without changing production code, admission, recovery or ownership.
+Current-base discovery and replay use the existing copied, initialization-guarded
+custody view; earlier diagnostic counts are not substituted for this campaign.
+
+Injection requires an actual public `EAGAIN`, the existing eligible predicate,
+EVALUATE phase8 and an active uncommitted/unpublished round, no MAIN or retirement
+identity, and an authenticated frame/context with capture-only, child-bound and
+numeric-identity flags. Round-owner absence is part of existing eligibility.
+Unbound/bootstrap, frame-absent receipt-only, retirement/MAIN, observer and
+publication states are outside this injection slice. The healthy discovery
+reuses the existing post-typed-bottom public trace. Excluded returns remain
+outside the representative set; replay cleanup may traverse them normally.
+
+The explicit initialized class tuple is round/head; active/changed/append/frontier
+round flags; child-active/thread-valid flags; receipt pending/ACK/acknowledged,
+index-valid and ACK-committed flags; both normalized relation-custody masks; and
+child words2..12 (outer phase/pending/custody, numeric identity/phase/pending,
+operation cursor/kind, initialized Source phase and primary/cleanup result).
+Numeric cursor identifies an operation stage, not per-row progress. There are
+no raw addresses, attempt IDs, public ordinals or repeated copy/row offsets in
+the class key. The entire copied public signature is stored separately and must
+match at the discovered actual public-call ordinal before real END injection;
+replay never retargets a nearby stage.
+
+Select first and last observation of every class, union identical endpoints,
+then shard selected cut indices modulo16. Each selected cut independently runs
+END and END-with-successor. Per-cut output records class, index, real public
+ordinal, endpoint roles and outcome; shard-union validation requires every
+selected index exactly once for each outcome and both endpoints of every class.
+These are finite class representatives, not every public offset or transition
+pair. Actual per-round/head presence and declared CONCAT-start/child witnesses
+are required; absent witnesses fail.
+
+Current discovery is identical with observer off/on:
+
+| Heads | Bound-child observations | Classes | Selected cuts | END/successor histories per cell | Reached rounds |
+| --- | --- | --- | --- | --- | --- |
+| 1 | 1,604 | 324 | 402 | 804 | 2 |
+| 2 | 3,798 | 776 | 958 | 1,916 | 3 |
+
+All four cells total5,440 histories. VARIABLE, identity MAP, CONCAT and
+CONSOLIDATE operation stages actually occur, as does a completed cursor with no
+current operation. All five receipt flags remain zero in this bound-child
+slice; no receipt-flag transition or frame-absent receipt qualification follows.
+The full copied signature still authenticates each injection.
+
+The eligible healthy trace also records excluded unbound/frame-absent/other
+returns:88/2/2 for one head and255/6/6 for two. Outside eligible trace, retirement
+and selected-owner counters are939 each for one head and2,807 each for two.
+Those counters overlap and must not be summed or counted as injected histories.
+They do not establish END behavior at retirement or MAIN.
+
+Every injected case reuses the existing first-`EINVAL` and completed-Original
+report preservation, unchanged public head pointers/generation snapshots/STRING
+rows/schema/no events, pending protected-API `EBUSY`, successor active identity
+and zero consumption, uncancelled successor finish after genuine closure,
+IDLE/no frame/transaction/MAIN/parent/retirement debt, same-input reset/retry to
+raw rows/events and final governor reservations/reference checks. The existing
+20,000-call drain bound and ordinary120-second watchdog remain. Healthy and
+early VARIABLE controls plus the92-case CONCAT regression remain separate.
+Thread-sanitizer CI applies its existing timeout multiplier4, making the
+effective watchdog480 seconds; no new timeout multiplier is introduced.
+
+Native and ASan/UBSan validate all16 shards and all5,440 new histories. GCC/Clang
+TSan and enabled-crypto native/ASan use the explicitly named focused shard0/16
+across all four cells:344 new histories, not all new classes/endpoints. The
+existing92 CONCAT/early/healthy cases remain in every profile. Full stage tests
+are not registered when `b_sanitize` contains `thread`, so all-tests hosted TSan
+CI also runs only the focused new family. Native/ASan register the full family
+and the separately named focused aliases. This split keeps
+full stage qualification distinct from focused sanitizer/library regression.
+
+No new runtime defect or production fix is claimed. Full public offsets,
+ordered transitions, concurrency/financial products, unbound/bootstrap and
+frame-absent receipt-only END, retirement/MAIN/observer/claims/publication and
+remaining containing Source/carry proofs remain open. Existing unary STRING
+scope is unchanged; wider/mixed/FLOAT, extra topology/expression/K bodies,
+evaluating Snapshot/C1/batch, seeds and pool/prepared-sort transport remain
+outside qualified scope. This increment does not close #2299.
