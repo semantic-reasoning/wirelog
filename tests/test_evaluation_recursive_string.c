@@ -1483,6 +1483,35 @@ ended_category(const public_key_t *key)
         ? 1 : -1;
 }
 
+/* Explicit initialized operation-stage tuple, not public row/copy offsets. */
+static bool
+endstage_eligible(const public_key_t *k)
+{
+    return k->available && k->eligible && k->phase == 8 && k->round_active
+           && !k->published && !k->committed && !k->main[0] && !k->retirement[0]
+           && k->child[0] && k->child[1] && (k->child[4] & 4)
+           && (k->child[4] & 64) && k->child[5];
+}
+
+static bool
+endstage_equal(const public_key_t *a, const public_key_t *b)
+{
+    return a->round == b->round && a->head == b->head
+           && a->round_active == b->round_active
+           && a->round_changed == b->round_changed
+           && a->append_active == b->append_active
+           && a->round_frontiers == b->round_frontiers
+           && a->child_active == b->child_active
+           && a->child_thread_valid == b->child_thread_valid
+           && a->receipt_pending == b->receipt_pending
+           && a->receipt_ack == b->receipt_ack
+           && a->receipt_acknowledged == b->receipt_acknowledged
+           && a->receipt_index_valid == b->receipt_index_valid
+           && a->ack_committed == b->ack_committed
+           && !memcmp(a->owners, b->owners, sizeof(a->owners))
+           && !memcmp(a->child + 2, b->child + 2, 11 * sizeof(uint64_t));
+}
+
 static void
 ended_case(unsigned heads, bool observed, ended_trace_t *record,
     const public_key_t *expected, unsigned target, unsigned outcome, bool early)
@@ -1532,7 +1561,7 @@ ended_case(unsigned heads, bool observed, ended_trace_t *record,
         }
         if (!stop.hit && stopping_case && rc == EAGAIN
             && (early ? category == 2 : calls == target)) {
-            CHECK(category >= 0);
+            CHECK(category >= 0 || endstage_eligible(&key));
             if (expected) CHECK(public_equal(&key, expected));
             inject(&stop);
             CHECK(wl_session_insert(f.session, "input", &fresh, 1, 1) == EBUSY
@@ -1645,11 +1674,114 @@ run_ended(unsigned heads, bool observed)
     free(trace);
 }
 
+/* First/last representatives of each discovered authenticated child stage. */
+static void
+run_endstage(unsigned heads, bool observed, unsigned shard, unsigned shards)
+{
+    CHECK(shards && shard < shards);
+    public_trace_t t = {0};
+    t.keys = calloc(16384, sizeof(*t.keys));
+    t.public_ordinal = calloc(16384, sizeof(*t.public_ordinal));
+    t.pick = calloc(16384, sizeof(*t.pick));
+    t.class_id = calloc(16384, sizeof(*t.class_id));
+    CHECK(t.keys && t.public_ordinal && t.pick && t.class_id);
+    unsigned retained = 0;
+    public_replay(heads, observed, NULL, &t, UINT32_MAX, 0, &retained);
+    unsigned first[2048], last[2048], classes = 0, observations = 0;
+    unsigned unbound = 0, absent = 0, other = 0, rounds = 0;
+    bool reached[16][2] = {{false}}, concat[16][2][2] = {{{false}}};
+    uint64_t ops = 0, outer = 0, numeric = 0, receipts = 0;
+    for (unsigned i = 0; i < t.count; i++) {
+        const public_key_t *k = &t.keys[i];
+        t.class_id[i] = UINT32_MAX;
+        if (!endstage_eligible(k)) {
+            if (k->phase != 8) other++;
+            else if (!k->child[0]) absent++;
+            else if (!(k->child[4] & 4)) unbound++;
+            else other++;
+            continue;
+        }
+        CHECK(k->round < 16 && k->head < heads
+            && k->child[9] < 64 && k->child[2] < 64 && k->child[6] < 64);
+        observations++;
+        reached[k->round][k->head] = true;
+        if (k->round + 1 > rounds) rounds = (unsigned)k->round + 1;
+        ops |= UINT64_C(1) << k->child[9];
+        outer |= UINT64_C(1) << k->child[2];
+        numeric |= UINT64_C(1) << k->child[6];
+        receipts |= UINT64_C(1) << (k->receipt_pending | (k->receipt_ack << 1)
+            | (k->receipt_acknowledged << 2) | (k->receipt_index_valid << 3)
+            | (k->ack_committed << 4));
+        int category = ended_category(k);
+        if (category >= 0 && category < 2)
+            concat[k->round][k->head][category] = true;
+        unsigned c = 0;
+        for (; c < classes; c++)
+            if (endstage_equal(k, &t.keys[first[c]])) break;
+        if (c == classes) {
+            CHECK(c < 2048); first[c] = i; classes++;
+        }
+        last[c] = i; t.class_id[i] = c;
+    }
+    CHECK(classes && observations && rounds && (ops &
+        (UINT64_C(1) << (1 + WL_PLAN_OP_VARIABLE)))
+        && (ops & (UINT64_C(1) << (1 + WL_PLAN_OP_CONCAT))));
+    bool declared_concat[2] = {false, false};
+    fixture_t declared; fixture_init(&declared, heads, observed);
+    for (unsigned h = 0; h < heads; h++) {
+        const wl_plan_body_t *body = &declared.plan->strata[0].bodies[h];
+        for (uint32_t op = 0; op < body->op_count; op++)
+            declared_concat[h] |= body->ops[op].op == WL_PLAN_OP_CONCAT;
+    }
+    fixture_close(&declared);
+    for (unsigned r = 0; r < rounds; r++)
+        for (unsigned h = 0; h < heads; h++)
+            CHECK(reached[r][h] && concat[r][h][0] == declared_concat[h]
+                && concat[r][h][1] == declared_concat[h]);
+    for (unsigned c = 0; c < classes; c++) {
+        CHECK(first[c] <= last[c] && t.class_id[first[c]] == c
+            && t.class_id[last[c]] == c);
+        t.pick[first[c]] = t.pick[last[c]] = true;
+    }
+    unsigned cuts = 0, selected = 0;
+    for (unsigned i = 0; i < t.count; i++) {
+        if (!t.pick[i]) continue;
+        unsigned ordinal = cuts++;
+        if (ordinal % shards != shard) continue;
+        unsigned c = t.class_id[i]; CHECK(c < classes);
+        for (unsigned outcome = 2; outcome <= 3; outcome++) {
+            ended_case(heads, observed, NULL, &t.keys[i],
+                t.public_ordinal[i], outcome, false);
+            selected++;
+            printf(
+                "endstage_cut heads%u observer%d shard%u/%u index%u class%u public%u first%d last%d outcome%u passed\n",
+                heads, observed, shard, shards, ordinal, c,
+                t.public_ordinal[i], i == first[c], i == last[c], outcome);
+        }
+    }
+    CHECK(selected == 2 * (cuts / shards + (shard < cuts % shards)));
+    printf(
+        "endstage heads%u observer%d shard%u/%u observations%u classes%u cuts%u selected%u rounds%u ops%llu outer%llu numeric%llu receipts%llu excluded_unbound%u/frame_absent%u/other%u/retire%u/owner%u passed\n",
+        heads, observed, shard, shards, observations, classes, cuts, selected,
+        rounds, (unsigned long long)ops, (unsigned long long)outer,
+        (unsigned long long)numeric, (unsigned long long)receipts, unbound,
+        absent, other, t.excluded_retire, t.excluded_owner);
+    free(t.class_id); free(t.pick); free(t.public_ordinal); free(t.keys);
+}
+
 int
 main(int argc, char **argv)
 {
     CHECK(!environment("WIRELOG_JOIN_BATCH_BYTES", "")
         && !environment("WIRELOG_JOIN_BATCH_STRICT", ""));
+    if (argc == 6 && !strcmp(argv[1], "endstage")) {
+        unsigned heads = (unsigned)strtoul(argv[2], NULL, 10);
+        unsigned observed = (unsigned)strtoul(argv[3], NULL, 10);
+        unsigned shard = (unsigned)strtoul(argv[4], NULL, 10);
+        unsigned shards = (unsigned)strtoul(argv[5], NULL, 10);
+        CHECK(heads >= 1 && heads <= 2 && observed <= 1);
+        run_endstage(heads, observed != 0, shard, shards); return 0;
+    }
     if (argc == 4 && !strcmp(argv[1], "ended")) {
         unsigned heads = (unsigned)strtoul(argv[2], NULL, 10);
         unsigned observed = (unsigned)strtoul(argv[3], NULL, 10);
