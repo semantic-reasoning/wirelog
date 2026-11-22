@@ -669,3 +669,14 @@ controlled single-worker sessions (#2301)". A cold input read as a right input,
 by a self-JOIN or by a JOIN with more than one key, alone or before an
 aggregate, a SNAPSHOT or an observed STEP over one, the program refusals of the
 sixth bundle and more than one worker stay open.
+
+A tenth bundle admits, under control, a cold input read as the right input of a
+one-key JOIN at a rule's second op, after a VARIABLE over a resident or
+declared input and with no REDUCE in the rule. The composed attempt runs the
+cold scan attempt over the right input into a slot of the frame, the controlled
+JOIN reads the copy, and the attempt drops it at its RELEASE, after the final
+CONSOLIDATE; see "Cold JOIN right inputs in controlled single-worker sessions
+(#2301)". A cold right input after a prefix, read by a later JOIN or before an
+aggregate, a self-JOIN, two cold inputs of one rule, a JOIN with more than one
+key, a SNAPSHOT or an observed STEP over a cold input, the program refusals of
+the sixth bundle and more than one worker stay open.
