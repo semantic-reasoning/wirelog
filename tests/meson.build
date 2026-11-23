@@ -8305,3 +8305,25 @@ foreach mode : ['pin-cancel', 'pin-work']
     args: ['scalar', 'observed', mode],
     suite: ['unit', 'tsan', 'evaluation_join_hosts'], timeout: 120)
 endforeach
+
+# Runtime typed-key/payload reuse; finite public history and raw DIFF compatibility.
+join_runtime_cache_exe = executable('test_evaluation_join_runtime_cache',
+  files('test_evaluation_join_runtime_cache.c'),
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  c_args: ['-DWL_SESSION_TEST_HOOKS=1'],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
+  link_with: [testlib_prod])
+foreach kind : range(3)
+  foreach route : range(3)
+    test('evaluation_join_runtime_cache_@0@_@1@'.format(kind, route),
+      join_runtime_cache_exe, args: [kind.to_string(), route.to_string(), 'healthy'],
+      suite: ['unit', 'tsan', 'evaluation_join_hosts'], timeout: 120)
+  endforeach
+  test('evaluation_join_runtime_cache_seed_@0@'.format(kind),
+    join_runtime_cache_exe, args: [kind.to_string(), '0', 'seed'],
+    suite: ['unit', 'tsan', 'evaluation_join_hosts'], timeout: 120)
+endforeach
+foreach mode : ['cancel', 'nomem', 'pin']
+  test('evaluation_join_runtime_cache_' + mode, join_runtime_cache_exe,
+    args: ['2', '0', mode], suite: ['unit', 'tsan', 'evaluation_join_hosts'], timeout: 120)
+endforeach

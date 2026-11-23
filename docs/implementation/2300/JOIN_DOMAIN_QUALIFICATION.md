@@ -837,6 +837,44 @@ earlier pin cannot mask later protocol errors. The public query changes from
 ENOTSUP to success; no public API, quantum or price constant changes. Wider
 policy/deferred/eviction and platform/Native/Source/carry obligations stay OPEN.
 
+## Typed canonical RHS index reuse
+
+Controlled ordinary JOIN now permits canonical scalar RHS INT64, FLOAT and
+STRING columns in its existing charged eligibility scan. A STRING/FLOAT payload
+lane no longer forces private indexing either. Other enum values and the
+existing noncanonical, compound, shared, timestamp, filtered, recursive,
+delta, batch and spill exclusions retain their prior destinations. The
+per-column charging and existing surrounding stop checks remain unchanged;
+no hash namespace or installed API changes.
+
+The natural two-head fixture in `test_evaluation_join_runtime_cache.c` uses
+real intern-backed strings and finite FLOAT keys, including public +0/-0
+canonicalization, negative and positive keys. Before the change the supported
+query produced correct results but indexed six private RHS rows per stable
+source call. It now builds one persistent index, reuses it for the second head,
+and reuses it for both heads after a LEFT-only append with zero RHS insertion.
+RHS append/removal rebuild against the current canonical snapshot; subsequent
+LEFT changes reuse the initialized index. The independent numeric-ID oracle
+checks signed callbacks, plain STEP, Snapshot, mutations and unchanged repeats
+in both default and deliberately diff-disabled whole-evaluation profiles.
+
+Nine healthy selections cover three key/payload domains and three public
+routes. Three internal interoperability selections seed an index through the
+actual raw differential JOIN (not the ordinary-arrangement hash namespace),
+then require the controlled public call to reuse that exact index without
+rebuilding. One FLOAT CANCEL at actual persistent insertion, one real NEXT
+allocation ENOMEM and one FLOAT live-pin history verify finite recovery and
+composition with bounded private fallback. Stops preserve pre-call public
+heads, inputs, registry object/payload/metadata and denial/report semantics,
+then reset and retry the same pending facts with a fresh attempt. Public NaN
+and infinity rejection is checked without changing an existing warm cache.
+
+These15 new selections accompany the two runtime changes, not a standalone
+qualification increment. The146 existing cache selections remain registered.
+Broader typed/predicate/representation/policy and interruption products,
+containing Native/Source/carry, deferred eviction and current MSVC/TSan runtime
+qualification remain open. This does not close F05a, #2371 or #2300.
+
 ## Reused evidence and remaining acceptance
 
 | Obligation | Existing evidence reused | Still outstanding for complete #2371 acceptance |
@@ -844,7 +882,7 @@ policy/deferred/eviction and platform/Native/Source/carry obligations stay OPEN.
 | Ordinary key/product/projection/collision and accepted RHS expressions | `evaluation_join`, generated large/filter/collision cases in `evaluation_serial`, scalar recovery and the new public histories | Complete accepted expression/type/error/representation crossproducts beyond the specified scalar and INLINE predicates |
 | Full/delta/empty selectors and signed future changes | Existing direct selector fixtures, serial append dispatches and literal public histories;42 cache histories bind actual canonical RHS and default scalar-observed append descriptors | Remaining selector products beyond the new canonical present-empty FULL/nonempty append cycle; historical phase7-only counters remain insufficient |
 | Persistent full unfiltered index and filtered/private fallback | `test_controlled_persistent_join`, persistent stop/refusal matrices in `test_evaluation_serial.c`;42 natural cache/source histories across scalar/INLINE LEFT and three public routes, actual key0/key1/composite reuse/rebuild, private filtered/delta work and exact rollback/retry;32 further cap/resource/pin histories and30 empty/rejected/refill histories described above;40 further allocator-boundary histories qualify image/slots, first/second copied metadata and key0 replacement prefixes with fixed disposed ENOMEM and fresh retry/future reuse | Remaining new-entry/all-width allocator, predicate/representation/policy/pin/selector intersections; same-input default/private whole-evaluation comparison is not an isolated cache-only or resource certificate |
-| Pins and deferred rebuild/eviction | `join_right_filter_cleanup` managed cache/pinned fallback/admission tests; existing strict internal-cache fixtures; five genuine differential pin public-refusal/release/future-reuse histories | Remaining stale/deferred/eviction and other consuming intersections; new pin setup is internal, not a public primary-cache producer |
+| Pins and deferred rebuild/eviction | `join_right_filter_cleanup` managed cache/pinned fallback/admission tests; existing strict internal-cache fixtures; five genuine differential live-pin private-success/release/future-reuse histories plus two stopped private-insertion retries | Remaining stale/deferred/eviction and other consuming intersections; new pin setup is internal, not a public primary-cache producer |
 | Materialized policy/memory and future calls | All78 `evaluation_materialized_body_*` selections:12 original scalar and66 typed INLINE-EDB preserved-body histories; host strict/policy/lifecycle suites | Remaining empty/wide/metadata/selector/cache-equivalence and containing bounds, not a primitive controlled-cache-hit claim |
 | Batch/pipeline, recursive/frontier and representations | Existing JOIN host suites and natural recursive materialized histories | Each accepted operator-by-representation and RUNNING/FINISH intersection, including required signed timestamps/weights; new callback sign checks are not full timestamp qualification |
 | Ordinary INLINE representation | Direct public fused-projection regression;363 generated histories including streamed producer/consumer/ACK,90 controlled memory failures and54 matching-cap histories;141 finite policy cases and constructed admission controls; new persistent-index histories consume typed INLINE LEFT with canonical scalar INT64 RHS | Remaining memory/type/policy/selector/cache/materialized/metadata and other operator representation intersections |

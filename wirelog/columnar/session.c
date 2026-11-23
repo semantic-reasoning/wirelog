@@ -1871,8 +1871,13 @@ wl_columnar_session_diff_index(wl_col_session_t *sess,
     for (uint32_t c = 0; c < source->ncols; ++c) {
         int rc = wl_evaluation_control_charge_attempt(control, id, 128);
         if (rc) return rc;
+        /* Differential JOIN producers and consumers share typed hashing.
+         * A STRING/FLOAT lane, including a payload lane, does not prevent
+         * reuse. Other scalar domains retain their existing private path. */
         if (source->column_types &&
-            source->column_types[c] != WIRELOG_TYPE_INT64)
+            source->column_types[c] != WIRELOG_TYPE_INT64
+            && source->column_types[c] != WIRELOG_TYPE_FLOAT
+            && source->column_types[c] != WIRELOG_TYPE_STRING)
             return 0;
     }
     if (!tx->differential.started && !sess->diff_txn_count) {
