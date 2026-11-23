@@ -807,12 +807,36 @@ keyed_cases(void)
     for (uint32_t r = 0; r < 65; ++r) duplicates.left->columns[0][r] = 1;
     for (uint32_t r = 0; r < 2; ++r) duplicates.registry[0]->columns[0][r] = 1;
     duplicates.op.key_count = 1;
-    compare_raw(&duplicates); fixture_close(&duplicates);
+    compare_raw(&duplicates);
+    const col_rel_t *pairs =
+        wl_columnar_eval_stack_cleanup_stack(duplicates.frame)->items[0].rel;
+    CHECK(pairs->nrows == 130 && pairs->ncols == 4);
+    bool emitted[65][2] = {{false}};
+    for (uint32_t r = 0; r < pairs->nrows; ++r) {
+        int64_t l = col_rel_get(pairs, r, 1), right = col_rel_get(pairs, r, 3);
+        CHECK(col_rel_get(pairs, r, 0) == 1 && col_rel_get(pairs, r, 2) == 1 &&
+            l >= 1 && l <= 65 && right >= 1 && right <= 2 &&
+            !emitted[l-1][right-1]);
+        emitted[l-1][right-1] = true;
+    }
+    fixture_close(&duplicates);
     fixture_t projection; fixture_init(&projection, 17, 3, 5, 0);
     uint32_t indices[] = {33, 0, UINT32_MAX};
     projection.op.key_count = 1;
     projection.op.project_count = 3; projection.op.project_indices = indices;
-    compare_raw(&projection); fixture_close(&projection);
+    compare_raw(&projection);
+    const col_rel_t *projected =
+        wl_columnar_eval_stack_cleanup_stack(projection.frame)->items[0].rel;
+    CHECK(projected->nrows == 3 && projected->ncols == 3);
+    unsigned projected_mask = 0;
+    for (uint32_t r = 0; r < projected->nrows; ++r) {
+        int64_t key = col_rel_get(projected, r, 1);
+        CHECK(key >= 0 && key < 3 && col_rel_get(projected, r, 0) == key+16 &&
+            !col_rel_get(projected, r,
+            2) && !(projected_mask&(1u<<(unsigned)key)));
+        projected_mask |= 1u<<(unsigned)key;
+    }
+    CHECK(projected_mask == 7); fixture_close(&projection);
 
     fixture_t no_match; fixture_init(&no_match, 2, 3, 5, 0);
     uint32_t bucket = wl_columnar_hash_value(2166136261u, no_match.left, 0,
@@ -2879,6 +2903,196 @@ static void right_string_comparator_compatibility(void) {
     }
 }
 
+static fixture_t *shared_fixture;
+static col_rel_t *shared_owner;
+static unsigned shared_reads;
+static bool shared_cancel;
+static void shared_checkpoint(wl_evaluation_control_t *control, unsigned phase,
+    uint64_t progress) {
+    if (phase != 44)return;
+    fixture_t *f = shared_fixture; wl_columnar_filter_context_t *ctx = NULL;
+    CHECK(f && control == f->operation && progress < 5 &&
+        !wl_columnar_eval_stack_filter_context(f->frame, &ctx));
+    const col_rel_t *alias = f->registry[0];
+    CHECK(alias != shared_owner && alias->storage_owner == shared_owner &&
+        ctx->join_operation == &f->op &&
+        ctx->join_right.identity == &ctx->join_right &&
+        ctx->join_right.phase == WL_COLUMNAR_RELATION_SCALAR_SOURCE_HELD &&
+        ctx->join_right.descriptor == alias &&
+        ctx->join_right.owner == shared_owner &&
+        ctx->join_right.owner_reader.owner == &shared_owner->source_access &&
+        ctx->join_right.descriptor_reader.owner == &alias->descriptor_access &&
+        ctx->join_right.timestamps == alias->timestamps &&
+        ctx->source.timestamps == f->left->timestamps &&
+        col_rel_get(alias, (uint32_t)progress, 0) == (int64_t)progress);
+    ++shared_reads;
+    if (shared_cancel) wl_evaluation_control_request_cancel(control);
+}
+static void ordinary_shared_stamped_source(void) {
+    fixture_t f; fixture_init(&f, 2, 3, 5, 0); f.op.key_count = 1;
+    uint8_t bytes[32]; f.op.right_filter_expr = right_filter(bytes, 0);
+    CHECK(!col_rel_enable_timestamps(f.left) &&
+        !col_rel_enable_timestamps(f.registry[0]));
+    const int64_t weights[] = {0, -1, 1, 3, -4};
+    for (uint32_t r = 0; r < 5;
+        ++r) f.registry[0]->timestamps[r] = (col_delta_timestamp_t){
+            .iteration = 10+r, .stratum = 20+r, .worker = 30+r,
+            .multiplicity = weights[r]
+        };
+    for (uint32_t r = 0; r < 3;
+        ++r) f.left->timestamps[r] = (col_delta_timestamp_t){
+            .iteration = 110+r, .stratum = 120+r, .worker = 130+r,
+            .multiplicity = weights[r]
+        };
+    col_rel_t *root = f.registry[0];
+    f.registry[0] = relation_new("right", 2, 0);
+    CHECK(!col_rel_install_shared_view(f.registry[0], root) &&
+        col_rel_storage_alias_borrow_count(root) == 1 &&
+        f.registry[0]->timestamps != root->timestamps);
+    for (uint32_t r = 0; r < 5;
+        ++r) f.registry[0]->timestamps[r].iteration += 1000;
+    col_delta_timestamp_t lhs[3], rhs[5], backing[5];
+    memcpy(lhs, f.left->timestamps, sizeof(lhs));
+    memcpy(rhs, f.registry[0]->timestamps, sizeof(rhs));
+    memcpy(backing, root->timestamps, sizeof(backing));
+    col_relation_snapshot_t left_snapshot =
+        wl_columnar_relation_snapshot(f.left),
+        right_snapshot = wl_columnar_relation_snapshot(f.registry[0]),
+        root_snapshot = wl_columnar_relation_snapshot(root);
+    shared_fixture = &f; shared_owner = root; shared_cancel = true;
+    shared_reads = 0;
+    wl_columnar_join_test_attempt_checkpoint = shared_checkpoint; run(&f);
+    CHECK(shared_reads == 1 &&
+        f.status.semantic_result == WL_EVALUATION_CONTROL_CANCELLED &&
+        !f.status.committed &&
+        wl_columnar_eval_stack_cleanup_stack(f.frame)->items[0].rel == f.left);
+    CHECK(!memcmp(lhs, f.left->timestamps, sizeof(lhs)) &&
+        !memcmp(rhs, f.registry[0]->timestamps, sizeof(rhs)) && !memcmp(backing,
+        root->timestamps, sizeof(backing)) &&
+        wl_columnar_relation_snapshot_equal(left_snapshot,
+        wl_columnar_relation_snapshot(f.left)) &&
+        wl_columnar_relation_snapshot_equal(right_snapshot,
+        wl_columnar_relation_snapshot(f.registry[0])) &&
+        wl_columnar_relation_snapshot_equal(root_snapshot,
+        wl_columnar_relation_snapshot(root)) &&
+        !atomic_load(&root->source_access.state) &&
+        !atomic_load(&f.registry[0]->descriptor_access.state));
+    CHECK(wl_evaluation_control_finish(f.operation, &f.operation_owner,
+        WL_EVALUATION_CONTROL_CANCELLED, 0) == WL_EVALUATION_CONTROL_CANCELLED);
+    wl_evaluation_control_report_t report;
+    CHECK(!wl_evaluation_control_report(f.operation, &report) &&
+        report.result == WL_EVALUATION_CONTROL_CANCELLED &&
+        !report.cleanup_status && report.consumed);
+    CHECK(!wl_evaluation_control_reset(f.operation) &&
+        !wl_evaluation_control_begin(f.operation, &f.operation_owner));
+    f.operation_id = wl_evaluation_control_active_attempt_id(f.operation);
+    f.phase = 0;
+    memset(&f.status, 0, sizeof(f.status)); shared_cancel = false;
+    shared_reads = 0; run(&f);
+    wl_columnar_join_test_attempt_checkpoint = NULL;
+    CHECK(shared_reads == 5 && f.status.committed && !f.status.semantic_result);
+    const col_rel_t *out =
+        wl_columnar_eval_stack_cleanup_stack(f.frame)->items[0].rel;
+    CHECK(out->nrows == 2 && out->ncols == 4 && !out->timestamps);
+    unsigned mask = 0;
+    for (uint32_t r = 0; r < out->nrows; ++r) {
+        int64_t key = col_rel_get(out, r, 0); CHECK((key == 0 || key == 2) &&
+            col_rel_get(out, r, 1) == key+1 && col_rel_get(out, r, 2) == key &&
+            col_rel_get(out, r, 3) == key+1 && !(mask&(1u<<(unsigned)key)));
+        mask |= 1u<<(unsigned)key;
+    }
+    CHECK(mask == 5 && !memcmp(lhs, f.left->timestamps, sizeof(lhs)) &&
+        !memcmp(rhs, f.registry[0]->timestamps, sizeof(rhs)) && !memcmp(backing,
+        root->timestamps, sizeof(backing)) &&
+        wl_columnar_relation_snapshot_equal(left_snapshot,
+        wl_columnar_relation_snapshot(f.left)) &&
+        wl_columnar_relation_snapshot_equal(right_snapshot,
+        wl_columnar_relation_snapshot(f.registry[0])) &&
+        wl_columnar_relation_snapshot_equal(root_snapshot,
+        wl_columnar_relation_snapshot(root)) &&
+        !atomic_load(&root->source_access.state) &&
+        !atomic_load(&f.registry[0]->descriptor_access.state));
+    fixture_close(&f); CHECK(!col_rel_storage_alias_borrow_count(root));
+    col_rel_destroy(root);
+    shared_fixture = NULL; shared_owner = NULL;
+}
+static unsigned integer_key_private_rows;
+static void integer_key_checkpoint(wl_evaluation_control_t *control,
+    unsigned phase, uint64_t progress) {
+    (void)control; if (phase == 28) {
+        CHECK(progress < 2); ++integer_key_private_rows;
+    }
+}
+static void ordinary_integer_enum_keys(void) {
+    const wirelog_column_type_t integers[] = {WIRELOG_TYPE_INT32,
+                                              WIRELOG_TYPE_UINT32,
+                                              WIRELOG_TYPE_INT64,
+                                              WIRELOG_TYPE_UINT64,
+                                              WIRELOG_TYPE_BOOL};
+    for (unsigned i = 0; i < sizeof(integers)/sizeof(*integers); ++i) {
+        fixture_t f; fixture_init(&f, 2, 2, 2, 0); f.op.key_count = 1;
+        wirelog_column_type_t types[] = {integers[i], WIRELOG_TYPE_INT64};
+        CHECK(!col_rel_set_column_types(f.left, types,
+            2) && !col_rel_set_column_types(f.registry[0], types, 2));
+        integer_key_private_rows = 0;
+        wl_columnar_join_test_attempt_checkpoint = integer_key_checkpoint;
+        run(&f); wl_columnar_join_test_attempt_checkpoint = NULL;
+        CHECK(!f.status.semantic_result && f.status.committed &&
+            integer_key_private_rows == 2);
+        const col_rel_t *out =
+            wl_columnar_eval_stack_cleanup_stack(f.frame)->items[0].rel;
+        CHECK(out->nrows == 2 && out->ncols == 4 &&
+            out->column_types[0] == integers[i] &&
+            out->column_types[2] == integers[i]);
+        unsigned mask = 0;
+        for (uint32_t r = 0; r < out->nrows; ++r) {
+            int64_t k = col_rel_get(out, r, 0);
+            CHECK(k >= 0 && k <= 1 && col_rel_get(out, r, 2) == k &&
+                col_rel_get(out, r, 1) == k+1 && col_rel_get(out, r,
+                3) == k+1 && !(mask&(1u<<(unsigned)k)));
+            mask |= 1u<<(unsigned)k;
+        }
+        CHECK(mask == 3); fixture_close(&f);
+    }
+}
+static void ordinary_cap_priorities(void) {
+    for (unsigned kind = 0; kind < 3; ++kind)
+        for (unsigned boundary = 0; boundary < 4; ++boundary) {
+            fixture_t f; fixture_init(&f, 2, 2, 2, 0);
+            unsigned pairs = kind?2u:4u;
+            if (kind) f.op.key_count = 1;
+            uint32_t projected[] = {0};
+            if (kind == 2) {
+                f.op.project_count = 1; f.op.project_indices = projected;
+            }
+            f.session.join_output_limit = !boundary?0u:pairs+boundary-2u;
+            run(&f); bool overflow = boundary == 1 || boundary == 2;
+            CHECK(f.status.semantic_result == (overflow?EOVERFLOW:0) &&
+                f.status.committed == !overflow);
+            if (!overflow) {
+                const col_rel_t *out =
+                    wl_columnar_eval_stack_cleanup_stack(f.frame)->items[0].rel;
+                CHECK(out->nrows == pairs && out->ncols == (kind == 2?1u:4u));
+            } else CHECK(wl_columnar_eval_stack_cleanup_stack(
+                        f.frame)->items[0].rel == f.left);
+            fixture_close(&f);
+        }
+    for (unsigned missing = 0; missing < 3; ++missing) {
+        fixture_t f; fixture_init(&f, 2, 2, missing == 2?0u:2u, 0);
+        f.op.key_count = 1; f.session.join_output_limit = 1;
+        f.op.right_filter_expr = (wl_plan_expr_buffer_t){NULL, 1};
+        if (missing == 1)f.op.right_relation = "absent";
+        run(&f); CHECK(f.status.semantic_result == (missing == 1?0:EINVAL));
+        if (missing == 1)CHECK(f.status.committed &&
+                !wl_columnar_eval_stack_cleanup_stack(
+                    f.frame)->items[0].rel->nrows);
+        else CHECK(!f.status.committed &&
+                wl_columnar_eval_stack_cleanup_stack(f.frame)->items[0].rel ==
+                f.left);
+        fixture_close(&f);
+    }
+}
+
 /* Constructed internal descriptors verify the admission/error boundary;
  * public compiler-selected representation histories live in join_inline. */
 static void
@@ -2933,6 +3147,9 @@ main(void)
     probe_right_filter_edges();
     right_scalar_function_cases();
     right_string_comparator_compatibility();
+    ordinary_shared_stamped_source();
+    ordinary_integer_enum_keys();
+    ordinary_cap_priorities();
     right_filter_cases();
     right_filter_owned_storage_case();
     right_filter_owned_refusal_retry_case();

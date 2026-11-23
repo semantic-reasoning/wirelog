@@ -8355,7 +8355,14 @@ join_acceptance_exe = executable('test_evaluation_join_acceptance',
   c_args: ['-DWL_SESSION_TEST_HOOKS=1'],
   dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
   link_with: [testlib_prod])
-foreach mode : ['chains', 'probe-chains', 'expressions', 'expression-faults', 'selectors']
+foreach mode : ['chains', 'probe-chains', 'expressions', 'expression-faults', 'selectors', 'fallbacks']
   test('evaluation_join_acceptance_' + mode, join_acceptance_exe, args: [mode],
+    suite: ['unit', 'tsan', 'evaluation_join_hosts'], timeout: 120)
+endforeach
+
+# Few missing distinct ownership prefixes; do not import the old56-case matrix.
+foreach mode : ['index-new-key0-name', 'index-new-key0-keys', 'index-new-key1-keys', 'index-key1-next', 'index-key1-denied']
+  test('evaluation_join_cache_scalar_observed_' + mode,
+    test_evaluation_join_cache_exe, args: ['scalar', 'observed', mode],
     suite: ['unit', 'tsan', 'evaluation_join_hosts'], timeout: 120)
 endforeach
