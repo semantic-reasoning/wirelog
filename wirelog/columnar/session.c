@@ -1704,6 +1704,136 @@ wl_columnar_session_observed_bindings_cleanup_authorized(
            && bindings->attempt_id == id && id == step->operation_id;
 }
 
+/* Only the unavailable-cache path needs this read-only metadata validation.
+ * One128 action per name byte (including NUL), then one for checked sizes. */
+static int
+wl_columnar_session_diff_index_metadata(const char *name, uint32_t keys,
+    uint64_t *metadata, wl_evaluation_control_t *control, uint64_t id)
+{
+    uint64_t length = 0;
+    for (size_t i = 0; ; ++i) {
+        int rc = wl_evaluation_control_charge_attempt(control, id, 128);
+        if (rc) return rc;
+        int error = !name ? EINVAL : i == SIZE_MAX ||
+            length == UINT64_MAX ? EOVERFLOW : 0;
+        bool end = !error && !name[i];
+        if (!error) ++length;
+        rc = wl_evaluation_control_charge_attempt(control, id, 0);
+        if (rc) return rc;
+        if (error) return error;
+        if (end) break;
+    }
+    int rc = wl_evaluation_control_charge_attempt(control, id, 128);
+    if (rc) return rc;
+    uint64_t bytes = 0, total = 0;
+    bool sized = wl_columnar_memory_size_mul(keys, sizeof(uint32_t), &bytes)
+        && wl_columnar_memory_size_add(*metadata, length, &total)
+        && wl_columnar_memory_size_add(total, bytes, &total)
+        && length <= SIZE_MAX && bytes <= SIZE_MAX;
+    rc = wl_evaluation_control_charge_attempt(control, id, 0);
+    if (rc) return rc;
+    if (!sized) return EOVERFLOW;
+    *metadata = total;
+    return 0;
+}
+
+/* A live pin forbids relocating the published registry. Before starting an
+ * image, use the existing bounded private JOIN instead. Never turn another
+ * protocol/metadata error into a cache miss. Normal image guards remain the
+ * authority when no pin is present or an image/transaction is already live.
+ * With N entries, M ops, J JOIN names and B metadata-name bytes, added
+ * actions are N+1 normally, or3N+M+J+B+N(N-1)/2+3 when pinned. Each is128
+ * work units at the existing price. Every action has a
+ * stop footer; none allocates, publishes or changes pin/transaction state. */
+static int
+wl_columnar_session_diff_index_pinned(wl_col_session_t *sess,
+    const wl_plan_op_t *ops, uint32_t op_count,
+    wl_evaluation_control_t *control, uint64_t id, bool *unavailable)
+{
+    *unavailable = false;
+    int entry_rc = wl_evaluation_control_charge_attempt(control, id, 128);
+    if (entry_rc) return entry_rc;
+    bool shape = sess->diff_arr_count <= sess->diff_arr_cap
+        && (!sess->diff_arr_count || sess->diff_arr_entries)
+        && (!op_count || ops);
+    entry_rc = wl_evaluation_control_charge_attempt(control, id, 0);
+    if (entry_rc) return entry_rc;
+    if (!shape) return EINVAL;
+    bool pinned = false;
+    for (uint32_t i = 0; i < sess->diff_arr_count; ++i) {
+        int rc = wl_evaluation_control_charge_attempt(control, id, 128);
+        if (rc) return rc;
+        const col_diff_arr_entry_t *entry = &sess->diff_arr_entries[i];
+        pinned |= entry->pin_count != 0;
+        rc = wl_evaluation_control_charge_attempt(control, id, 0);
+        if (rc) return rc;
+    }
+    if (!pinned) return 0;
+    int rc = wl_evaluation_control_charge_attempt(control, id, 128);
+    if (rc) return rc;
+    uint64_t old_bytes = 0, array_bytes = 0, slot_bytes = 0;
+    bool sized = op_count <= UINT32_MAX - sess->diff_arr_count
+        && wl_columnar_memory_size_add(sess->diff_arr_registry_reserved_bytes,
+            sess->diff_arr_registry_metadata_reserved_bytes, &old_bytes)
+        && wl_columnar_memory_size_mul((uint64_t)sess->diff_arr_count +
+            op_count,
+            sizeof(col_diff_arr_entry_t), &array_bytes)
+        && wl_columnar_memory_size_mul((uint64_t)sess->diff_arr_count +
+            op_count,
+            sizeof(wl_columnar_arrangement_diff_slot_t), &slot_bytes)
+        && array_bytes && array_bytes <= SIZE_MAX && slot_bytes <= SIZE_MAX;
+    rc = wl_evaluation_control_charge_attempt(control, id, 0);
+    if (rc) return rc;
+    if (!sized) return EOVERFLOW;
+    uint64_t metadata = 0;
+    for (uint32_t i = 0; i < sess->diff_arr_count; ++i) {
+        rc = wl_evaluation_control_charge_attempt(control, id, 128);
+        if (rc) return rc;
+        const col_diff_arr_entry_t *entry = &sess->diff_arr_entries[i];
+        int invalid = entry->transaction_pending || entry->invalidation_deferred
+            ? ENOTSUP : !entry->diff_arr || !entry->key_count ||
+            !entry->key_cols
+            || !entry->generation ||
+            entry->generation == UINT64_MAX ? EINVAL : 0;
+        rc = wl_evaluation_control_charge_attempt(control, id, 0);
+        if (rc) return rc;
+        if (invalid) return invalid;
+        for (uint32_t j = 0; j < i; ++j) {
+            rc = wl_evaluation_control_charge_attempt(control, id, 128);
+            if (rc) return rc;
+            bool duplicate = sess->diff_arr_entries[j].diff_arr ==
+                entry->diff_arr;
+            rc = wl_evaluation_control_charge_attempt(control, id, 0);
+            if (rc) return rc;
+            if (duplicate) return EINVAL;
+        }
+        rc = wl_columnar_session_diff_index_metadata(entry->rel_name,
+                entry->key_count, &metadata, control, id);
+        if (rc) return rc;
+    }
+    for (uint32_t i = 0; i < op_count; ++i) {
+        rc = wl_evaluation_control_charge_attempt(control, id, 128);
+        if (rc) return rc;
+        bool include = ops[i].op == WL_PLAN_OP_JOIN && ops[i].key_count &&
+            ops[i].right_relation;
+        rc = wl_evaluation_control_charge_attempt(control, id, 0);
+        if (rc) return rc;
+        if (!include) continue;
+        rc = wl_columnar_session_diff_index_metadata(ops[i].right_relation,
+                ops[i].key_count, &metadata, control, id);
+        if (rc) return rc;
+    }
+    rc = wl_evaluation_control_charge_attempt(control, id, 128);
+    if (rc) return rc;
+    uint64_t total = 0;
+    sized = wl_columnar_memory_size_add(array_bytes, metadata, &total);
+    rc = wl_evaluation_control_charge_attempt(control, id, 0);
+    if (rc) return rc;
+    if (!sized) return EOVERFLOW;
+    *unavailable = true;
+    return 0;
+}
+
 int
 wl_columnar_session_diff_index(wl_col_session_t *sess,
     const wl_columnar_eval_private_bindings_t *bindings,
@@ -1744,6 +1874,12 @@ wl_columnar_session_diff_index(wl_col_session_t *sess,
         if (source->column_types &&
             source->column_types[c] != WIRELOG_TYPE_INT64)
             return 0;
+    }
+    if (!tx->differential.started && !sess->diff_txn_count) {
+        bool unavailable = false;
+        int rc = wl_columnar_session_diff_index_pinned(sess, tx->ops,
+                tx->op_count, control, id, &unavailable);
+        if (rc || unavailable) return rc;
     }
     return wl_columnar_arrangement_diff_attempt_index(&tx->differential,
                sess, tx->ops, tx->op_count, source, name, keys, count, control,
