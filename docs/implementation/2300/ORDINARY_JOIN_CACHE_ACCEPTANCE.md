@@ -432,3 +432,25 @@ and hosted MSVC/TSan/platform certification remain separate containing work.
 Their current OPEN state does not hide an unfinished item in this17-row local
 inventory. Linux local acceptance is not a hosted CI success claim. #2371 and
 #2300 therefore remain OPEN after this ordinary/cache bundle.
+
+
+## Shared K-fusion worker registry initialization regression
+
+The first hosted full-suite run exposed a deterministic shared-producer
+regression that the earlier ordinary-focused local selection missed. K-fusion
+cleared its shallow-copied differential registry pointers/count/cap but retained
+the ancestor's reservation identity and byte counters. Current fatal error
+propagation correctly returned EINVAL when the empty worker tried to grow that
+registry; swallowing the error would conceal the ownership defect again.
+
+The worker now initializes its own empty reservation at its final address and
+zeros its local transaction and byte counters before allocation or cleanup. It
+never releases, rolls back or moves the ancestor's token. The real K4 inline
+submit observer in `k_fusion_e2e` checks EMPTY initialization, actual subsequent
+worker-owned registry allocation and exact parent token/registry/hash payload
+preservation; independent thirty-pair output and shared-governor teardown remain
+required. Existing threaded K-fusion/TDD/recursive consumers and all28 originally
+failed CI registrations are part of the expanded shared regression validation.
+The precise canonical producer ENOSPC/ENOMEM/overflow/protocol contracts are
+unchanged. No budget increase or errno fallback repairs this defect, and these
+regressions do not certify the whole recursive/accounting containing domain.

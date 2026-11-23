@@ -1086,6 +1086,14 @@ col_op_k_fusion_dispatch(const wl_plan_op_t *op, eval_stack_t *stack,
         worker_sess[d].diff_arr_entries = NULL;
         worker_sess[d].diff_arr_count = 0;
         worker_sess[d].diff_arr_cap = 0;
+        /* This empty registry owns none of the shallow-copied parent's
+         * transaction or credit. Bind its new token at the final address;
+         * never release or move the ancestor's reservation. */
+        worker_sess[d].diff_txn_count = 0;
+        worker_sess[d].diff_arr_registry_reserved_bytes = 0;
+        worker_sess[d].diff_arr_registry_metadata_reserved_bytes = 0;
+        wl_columnar_memory_reservation_init(
+            &worker_sess[d].diff_arr_registry_reservation);
         worker_sess[d].darr_entries = NULL;
         worker_sess[d].darr_count = 0;
         worker_sess[d].darr_cap = 0;

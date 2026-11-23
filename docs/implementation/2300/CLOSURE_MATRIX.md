@@ -325,3 +325,25 @@ last-release refill/warm relation+arrangement reuse/future mutation. Existing
 component cases stay intact. `ORDINARY_JOIN_CACHE_ACCEPTANCE.md` names exact
 consumers and independent literals; all17 local items are reconciled there,
 while no materialized/recursive/accounting/platform containing row closes here.
+
+
+## Shared K-fusion worker registry initialization regression
+
+The first hosted full-suite run exposed a deterministic shared-producer
+regression that the earlier ordinary-focused local selection missed. K-fusion
+cleared its shallow-copied differential registry pointers/count/cap but retained
+the ancestor's reservation identity and byte counters. Current fatal error
+propagation correctly returned EINVAL when the empty worker tried to grow that
+registry; swallowing the error would conceal the ownership defect again.
+
+The worker now initializes its own empty reservation at its final address and
+zeros its local transaction and byte counters before allocation or cleanup. It
+never releases, rolls back or moves the ancestor's token. The real K4 inline
+submit observer in `k_fusion_e2e` checks EMPTY initialization, actual subsequent
+worker-owned registry allocation and exact parent token/registry/hash payload
+preservation; independent thirty-pair output and shared-governor teardown remain
+required. Existing threaded K-fusion/TDD/recursive consumers and all28 originally
+failed CI registrations are part of the expanded shared regression validation.
+The precise canonical producer ENOSPC/ENOMEM/overflow/protocol contracts are
+unchanged. No budget increase or errno fallback repairs this defect, and these
+regressions do not certify the whole recursive/accounting containing domain.
