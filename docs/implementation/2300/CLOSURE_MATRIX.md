@@ -273,3 +273,11 @@ failures and subsequent public ordinary typed reuse are recorded in the
 selection is not relabelled ordinary dispatch. This closes that shared producer
 error distinction within C01/P03, not their remaining ordinary products or any
 global recursive/accounting row.
+
+The ordinary RHS compiler now preserves the full FILTER chain and fails
+atomically on expression/context allocation failure. Natural31/32/33/65
+predicate public sessions, shared raw ANTI/explicit SEMI, deep extension guards
+and calibrated real-NULL same-program retries are recorded in
+`ORDINARY_JOIN_CACHE_ACCEPTANCE.md`. This is a production correctness repair;
+remaining ordinary inventory items stay open until their consuming proof is
+reconciled, and no containing global row is closed by this subset.

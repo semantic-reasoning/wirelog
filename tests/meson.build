@@ -8347,3 +8347,15 @@ foreach mode : ['raw-clone-denied', 'raw-growth-denied', 'raw-clone-nomem',
   test('evaluation_join_runtime_cache_' + mode, join_runtime_cache_exe,
     args: ['2', '1', mode], suite: ['unit', 'tsan', 'evaluation_join_hosts'], timeout: 120)
 endforeach
+
+# Complete ordinary/compiler predicate-chain acceptance, with actual public histories.
+join_acceptance_exe = executable('test_evaluation_join_acceptance',
+  files('test_evaluation_join_acceptance.c'),
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  c_args: ['-DWL_SESSION_TEST_HOOKS=1'],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
+  link_with: [testlib_prod])
+foreach mode : ['chains', 'probe-chains']
+  test('evaluation_join_acceptance_' + mode, join_acceptance_exe, args: [mode],
+    suite: ['unit', 'tsan', 'evaluation_join_hosts'], timeout: 120)
+endforeach

@@ -76,3 +76,27 @@ capacity overflow without changing source arrays; its real governor growth test
 now requires ENOSPC and pending denial. `diff_join` retains the actual batch
 admission/growth and stale-state regressions with current session denial transfer.
 C01/P03 remain PENDING until their other ordinary products finish in this PR.
+
+## Wide RHS compilation and failure atomicity (J02/J05/P03 subset)
+
+The real natural compiler/session campaign `evaluation_join_acceptance_chains`
+checks31/32/33/65 constant predicates with independent all-match, first-column
+and last-column mismatch oracles, public signed insert/delete histories,
+unchanged repeats, actual source/selection checkpoints, unloaded private empty
+shadows, typed-empty RHS and refill. Default controlled STEP, explicitly
+differential-disabled controlled Snapshot and raw STEP are separate profiles.
+`evaluation_join_acceptance_probe-chains` retains shared ANTI and explicitly
+constructed SEMI IR/compiler/raw compatibility; it does not certify bounded
+probe-host ownership. The empty source assertions authenticate the observed
+private binding and exact snapshot rather than inferring canonical identity
+from an unloaded declaration.
+
+`plan_gen_oom` calibrates real malloc64, wide-column calloc and realloc sites in
+this build. Every selected real NULL must either return failure with no plan or
+a complete reference RHS expression; the same parsed program then retries and
+executes independent mismatch0/all-match1 output histories. `plan_gen` checks
+an extension below33 genuine predicates still fails compilation, while33 NULL
+predicate wrappers emit no RHS bytes. Existing ANTI/SEMI extension guards remain.
+The checked uint32 buffer addition/doubling is reviewed statically at extreme
+representability bounds; no giant-allocation runtime proof is claimed. Other
+ordinary expression/context/selector obligations remain PENDING here.

@@ -1092,3 +1092,11 @@ Native/Source/carry qualification remain outstanding.
 The current cache wildcard selects146 cases: the five pin-held cases now require
 success through bounded private indexing and two new pin-held insertion stops
 verify CANCEL/WORK recovery. Other139 original modes retain their assertions.
+
+The ordinary RHS compiler now preserves the full FILTER chain and fails
+atomically on expression/context allocation failure. Natural31/32/33/65
+predicate public sessions, shared raw ANTI/explicit SEMI, deep extension guards
+and calibrated real-NULL same-program retries are recorded in
+`ORDINARY_JOIN_CACHE_ACCEPTANCE.md`. This is a production correctness repair;
+remaining ordinary inventory items stay open until their consuming proof is
+reconciled, and no containing global row is closed by this subset.
