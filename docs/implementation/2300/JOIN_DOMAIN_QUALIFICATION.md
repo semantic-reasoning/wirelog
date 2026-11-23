@@ -801,13 +801,81 @@ registration checks passed. These results precede the ledger-only commit and
 supply no local MSVC/TSan-runtime or hosted published-HEAD certificate.
 
 These are finite one-worker serialized, controlled-only, current-width existing-
-entry/key0 fault partitions. New-signature metadata, wider counts/keys/types,
-concurrent fault injection, competing first-error histories, all selector/policy/
+entry/key0 fault partitions. At that checkpoint new-signature metadata and later
+key1/composite build failures remained open; the next increment adds finite
+evidence. Wider counts/keys/types, concurrent fault injection, competing first-error histories, all selector/policy/
 representation products, deferred invalidation/eviction, materialization-result
 cache, signed timestamp/weight and containing Native/Source/carry/platform
 obligations remain OPEN. No opaque private allocation-address/payload, full
 financial certificate or complete malloc-failure product is inferred. F05a,
 #2371 and #2300 remain OPEN.
+
+## New signatures and later owned-index prefixes
+
+This bundle starts from main `5f2ceffb`, after merged #2406 and cold-right
+JOIN-aggregate source support. It reuses the existing allocation hook without
+changing arrangement/header/engine code. It adds56 selected histories to144,
+for200 `evaluation_join_cache_*` selections:24 initial new-signature metadata,
+16 later key1 build prefixes and16 later two-key composite build prefixes.
+Four selected pairs remain scalar observed STEP/plain STEP/evaluating Snapshot
+and typed INLINE-left observed STEP. Only default controlled execution receives
+faults; disabled-controlled/raw profiles are unpressured semantic references.
+
+| New family | Natural entry and actual ownership distinction |
+|---|---|
+| New key0/key1/composite NAME/KEYS | Stage0 after empty bootstrap and public population of both inputs; published registry count0, no old-entry copying, actual new slot0/1/2 and current physical JOIN keys. Later targets follow one/two completed private image-owned indexes |
+| Later key1 HEADER/KEYS/HEADS/NEXT | Stage5 both-input mutation, three stale public signatures; reverse/key1 target follows a completed private key0 replacement and sibling reuse |
+| Later composite HEADER/KEYS/HEADS/NEXT | Same mutation; exact/key0+1 target follows completed private key0 and key1 replacements, with8-byte target keys rather than the one-key4-byte extent |
+
+Prior-owned records originate at actual phase14 installation and bind session,
+control identity, active attempt, plan/op/occurrence, source snapshot, signature
+and slot. Every consecutive real unfiltered phase47 insertion must occur before
+a matching phase48 probe marks completion after final indexed-row/source-snapshot
+assignment. Sibling reuse cannot fabricate an owned record. Cross-head records
+account for actual per-head binding-generation advancement; within an operation
+the saved generation remains exact. These are descriptive occurrence records,
+not private allocation-address or payload inspection.
+
+Initial metadata requires no copied-public-entry traversal and never reads a
+public slot as private authority while count0. Site/slot/name/key extent and
+preceding work distinguish name from keys failure. Cumulative phase4 includes
+both earlier metadata copying and earlier build-key initialization. Header and
+bucket/link work from preceding completed indexes remain in the observations.
+Later builds capture the actual current build-start context and cumulative
+counter/allocation baselines before target build admission, then require exact
+target-prefix
+deltas. Earlier initialized arrays cannot satisfy target initialization. Target
+keys/heads are allocated but unpopulated until all target mallocs succeed.
+
+Exactly one existing allocator-boundary NULL must yield initiating ENOMEM with
+positive work, cleanup0, stable governor denials and false budget-denied metadata.
+The fixed disposed/completed owner state, no live transaction/cleanup and real
+input writer release are checked alongside exact post-mutation public registry/
+head/input snapshots, pending facts, no premature callbacks/tuples and frozen
+reports. Zero published indexes alone supplies no private cleanup certificate.
+Clear the callback before genuine reset; a different-attempt retry must complete
+all three actual build/insertion/probe records on the same pending facts without
+reinsertion, then the independent five-head content/signed/Snapshot/repeat oracle.
+New metadata reaches later stage1 warm reuse; later build modes retain stage7
+unmatched LEFT(8,8), its actual scalar-observed VARIABLE frontier and four real
+reuses/no indexed writes/unchanged public index identity and payload. Final
+governor zero follows full teardown, not an intermediate financial equality.
+
+The final executable tree passed Clang JOIN hosts428/428 and20 related serial/
+source/arrangement/cache/pin/drain checks; GCC and ASan/UBSan each passed200/200
+cache selections. All144 earlier registrations/scripts and their mode-specific
+assertions remain, with unchanged suite labels and120-second watchdogs.
+Formatting, exact registrations and unchanged engine/header checks passed.
+Runtime evidence precedes the ledger-only commit. No new MSVC/TSan-runtime,
+hosted published-HEAD, cold-source or containing Source/carry certificate follows.
+
+These are finite current-program signatures, one/two-key widths, name "right"
+and one-worker controlled fault partitions. Other metadata names/counts/widths/
+types, competing-error and concurrent faults, complete selector/policy/cache/
+representation/materialized-result, pin/deferred/eviction, signed metadata and
+containing Native/Source/carry/platform obligations remain OPEN. No production
+cleanup defect or new public API/domain/quantum/tariff behavior is claimed.
+F05a, #2371 and #2300 remain OPEN.
 
 ## Reused evidence and remaining acceptance
 
@@ -815,7 +883,7 @@ financial certificate or complete malloc-failure product is inferred. F05a,
 |---|---|---|
 | Ordinary key/product/projection/collision and accepted RHS expressions | `evaluation_join`, generated large/filter/collision cases in `evaluation_serial`, scalar recovery and the new public histories | Complete accepted expression/type/error/representation crossproducts beyond the specified scalar and INLINE predicates |
 | Full/delta/empty selectors and signed future changes | Existing direct selector fixtures, serial append dispatches and literal public histories;42 cache histories bind actual canonical RHS and default scalar-observed append descriptors | Remaining selector products beyond the new canonical present-empty FULL/nonempty append cycle; historical phase7-only counters remain insufficient |
-| Persistent full unfiltered index and filtered/private fallback | `test_controlled_persistent_join`, persistent stop/refusal matrices in `test_evaluation_serial.c`;42 natural cache/source histories across scalar/INLINE LEFT and three public routes, actual key0/key1/composite reuse/rebuild, private filtered/delta work and exact rollback/retry;32 further cap/resource/pin histories and30 empty/rejected/refill histories described above;40 further allocator-boundary histories qualify image/slots, first/second copied metadata and key0 replacement prefixes with fixed disposed ENOMEM and fresh retry/future reuse | Remaining new-entry/all-width allocator, predicate/representation/policy/pin/selector intersections; same-input default/private whole-evaluation comparison is not an isolated cache-only or resource certificate |
+| Persistent full unfiltered index and filtered/private fallback | `test_controlled_persistent_join`, persistent stop/refusal matrices in `test_evaluation_serial.c`;42 natural cache/source histories across scalar/INLINE LEFT and three public routes, actual key0/key1/composite reuse/rebuild, private filtered/delta work and exact rollback/retry;32 further cap/resource/pin histories and30 empty/rejected/refill histories described above;40 further allocator-boundary histories qualify image/slots, first/second copied metadata and key0 replacement prefixes with fixed disposed ENOMEM and fresh retry/future reuse;56 new-signature/later-owned-index histories add actual prior installation/insertion/probe witnesses and target-prefix deltas | Remaining other-name/count/all-width allocator, predicate/representation/policy/pin/selector intersections; same-input default/private whole-evaluation comparison is not an isolated cache-only or resource certificate |
 | Pins and deferred rebuild/eviction | `join_right_filter_cleanup` managed cache/pinned fallback/admission tests; existing strict internal-cache fixtures; five genuine differential pin public-refusal/release/future-reuse histories | Remaining stale/deferred/eviction and other consuming intersections; new pin setup is internal, not a public primary-cache producer |
 | Materialized policy/memory and future calls | All78 `evaluation_materialized_body_*` selections:12 original scalar and66 typed INLINE-EDB preserved-body histories; host strict/policy/lifecycle suites | Remaining empty/wide/metadata/selector/cache-equivalence and containing bounds, not a primitive controlled-cache-hit claim |
 | Batch/pipeline, recursive/frontier and representations | Existing JOIN host suites and natural recursive materialized histories | Each accepted operator-by-representation and RUNNING/FINISH intersection, including required signed timestamps/weights; new callback sign checks are not full timestamp qualification |
@@ -940,11 +1008,18 @@ compile-before-no-rebuild commands above. Clang JOIN hosts332/332 and related
 checks7/7, GCC104/104 and ASan/UBSan104/104 passed on the executable tree before
 the ledger-only commit; no hosted/final-platform or containing Source proof follows.
 
-The wildcard now selects144 cases: those104 plus eight image/slot,16 copied-
-metadata and16 replacement-build allocation-failure histories. Reuse the same
+The preceding wildcard checkpoint selected144 cases: those104 plus eight
+image/slot,16 copied-metadata and16 replacement-build allocation-failure histories. Reuse the same
 compile-before-no-rebuild commands above. Clang JOIN hosts372/372, affected
 serial/source/arrangement/cache/pin/drain checks20/20 and ABI/header/threading
 contracts5/5, GCC144/144 and ASan/UBSan144/144 passed on the final executable
 tree before the ledger-only commit. The normal production library built without
 the new callback/helper symbols. Hosted published-HEAD/MSVC and containing
 Native/Source/carry qualification remain outstanding.
+
+The wildcard now selects200 cases: the previous144 plus24 initial new-signature
+metadata and32 later key1/composite build-prefix cases. Reuse the compile-before-
+no-rebuild commands above. Clang JOIN hosts428/428 and related checks20/20,
+GCC200/200 and ASan/UBSan200/200 passed on the final executable tree before the
+ledger-only commit. Hosted/MSVC/TSan-runtime and containing Native/Source/carry
+qualification remain outstanding.
