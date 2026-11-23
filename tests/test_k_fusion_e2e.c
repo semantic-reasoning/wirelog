@@ -731,6 +731,7 @@ struct branch_token_probe {
     unsigned inherited;
     unsigned grown_after_primed_parent;
     unsigned parent_changed;
+    unsigned diff_submitted, diff_built, diff_bad, diff_primed;
 };
 
 static struct branch_token_probe token_probe;
@@ -753,6 +754,41 @@ record_parent_token(wl_col_session_t *parent, wl_col_session_t *child,
     }
 }
 
+/* Exact parent registry/token/payload image, not a query-result oracle.
+ * The existing check_pair_cb independently checks all thirty output pairs. */
+static void *
+copy_diff_registry(const wl_col_session_t *parent, size_t *size)
+{
+    *size = sizeof(parent->diff_arr_registry_reservation)
+        + (size_t)parent->diff_arr_count * sizeof(*parent->diff_arr_entries);
+    for (uint32_t i = 0; i < parent->diff_arr_count; ++i) {
+        const col_diff_arrangement_t *a = parent->diff_arr_entries[i].diff_arr;
+        *size += sizeof(*a) + (size_t)(a->key_count + a->nbuckets
+            + a->indexed_rows) * sizeof(uint32_t);
+    }
+    unsigned char *image = malloc(*size), *cursor = image;
+    if (!image) return NULL;
+#define COPY_DIFF_IMAGE(pointer, bytes) do { \
+            size_t n = (bytes); \
+            if (n) memcpy(cursor, (pointer), n); \
+            cursor += n; \
+} while (0)
+    COPY_DIFF_IMAGE(&parent->diff_arr_registry_reservation,
+        sizeof(parent->diff_arr_registry_reservation));
+    COPY_DIFF_IMAGE(parent->diff_arr_entries,
+        (size_t)parent->diff_arr_count * sizeof(*parent->diff_arr_entries));
+    for (uint32_t i = 0; i < parent->diff_arr_count; ++i) {
+        const col_diff_arrangement_t *a = parent->diff_arr_entries[i].diff_arr;
+        COPY_DIFF_IMAGE(a, sizeof(*a));
+        COPY_DIFF_IMAGE(a->key_cols, (size_t)a->key_count * sizeof(uint32_t));
+        COPY_DIFF_IMAGE(a->ht_head, (size_t)a->nbuckets * sizeof(uint32_t));
+        /* Spare next slots are uninitialized capacity, not hash payload. */
+        COPY_DIFF_IMAGE(a->ht_next, (size_t)a->indexed_rows * sizeof(uint32_t));
+    }
+#undef COPY_DIFF_IMAGE
+    return image;
+}
+
 /* Runs branch d inline on the coordinator thread, after all of its resets.
  * Clearing an inherited token here keeps the unfixed code from releasing
  * the coordinator's token, so the token reads below and in the next
@@ -769,7 +805,54 @@ run_branch_inline(wl_work_queue_t *wq, void (*work_fn)(void *ctx), void *ctx)
         token_probe.inherited++;
         child->filt_cache_array_reservation = NULL;
     }
+    wl_col_session_t *parent = token_probe.parent;
+    col_diff_arr_entry_t *entries = parent->diff_arr_entries;
+    uint32_t count = parent->diff_arr_count, cap = parent->diff_arr_cap;
+    uint64_t array_bytes = parent->diff_arr_registry_reserved_bytes;
+    uint64_t metadata_bytes = parent->diff_arr_registry_metadata_reserved_bytes;
+    size_t before_size = 0, after_size = 0;
+    void *before = copy_diff_registry(parent, &before_size);
+    if (!before) return ENOMEM;
+    ++token_probe.diff_submitted;
+    if (count && array_bytes && metadata_bytes
+        && parent->diff_arr_registry_reservation.bytes ==
+        array_bytes + metadata_bytes
+        && parent->diff_arr_registry_reservation.owner_bits == (uintptr_t)parent
+        && atomic_load_explicit(&parent->diff_arr_registry_reservation.state,
+        memory_order_relaxed) == WL_COLUMNAR_MEMORY_RESERVATION_COMMITTED
+        && parent->diff_arr_registry_reservation.identity
+        == &parent->diff_arr_registry_reservation)
+        ++token_probe.diff_primed;
+    if (child->diff_arr_entries || child->diff_arr_count || child->diff_arr_cap
+        || child->diff_txn_count || child->diff_arr_registry_reserved_bytes
+        || child->diff_arr_registry_metadata_reserved_bytes
+        || child->diff_arr_registry_reservation.identity
+        != &child->diff_arr_registry_reservation
+        || atomic_load_explicit(&child->diff_arr_registry_reservation.state,
+        memory_order_relaxed) != WL_COLUMNAR_MEMORY_RESERVATION_EMPTY)
+        ++token_probe.diff_bad;
+    /* Observe only: never repair an inherited differential token here. */
     work_fn(ctx);
+    if (child->diff_arr_count && child->diff_arr_entries
+        && !child->diff_txn_count && child->diff_arr_registry_reserved_bytes
+        && child->diff_arr_registry_metadata_reserved_bytes
+        && child->diff_arr_registry_reservation.identity
+        == &child->diff_arr_registry_reservation
+        && child->diff_arr_registry_reservation.owner_bits == (uintptr_t)child
+        && atomic_load_explicit(&child->diff_arr_registry_reservation.state,
+        memory_order_relaxed) == WL_COLUMNAR_MEMORY_RESERVATION_COMMITTED)
+        ++token_probe.diff_built;
+    void *after_image = copy_diff_registry(parent, &after_size);
+    if (!after_image || before_size != after_size
+        || memcmp(before, after_image, before_size)
+        || parent->diff_arr_entries != entries ||
+        parent->diff_arr_count != count
+        || parent->diff_arr_cap != cap
+        || parent->diff_arr_registry_reserved_bytes != array_bytes
+        || parent->diff_arr_registry_metadata_reserved_bytes != metadata_bytes)
+        ++token_probe.diff_bad;
+    free(before);
+    free(after_image);
     if (child->filt_cache_cap > 0 && token != NULL)
         token_probe.grown_after_primed_parent++;
     if (token_probe.parent->filt_cache_array_reservation != token
@@ -778,6 +861,40 @@ run_branch_inline(wl_work_queue_t *wq, void (*work_fn)(void *ctx), void *ctx)
         != token_probe.token_state)))
         token_probe.parent_changed++;
     return 0;
+}
+
+/* Prime an actual canonical index through the shared producer, not by
+ * fabricating a reservation or an initialized hash payload. */
+static int
+prime_branch_diff_registry(wl_col_session_t *session)
+{
+    col_rel_t *edge = session_find_rel(session, "e");
+    if (!edge || edge->nrows != 12 || edge->ncols != 2) return EINVAL;
+    const char *keys[] = {"x"};
+    wl_plan_op_t op = {.op = WL_PLAN_OP_JOIN, .right_relation = "e",
+                       .left_keys = keys, .right_keys = keys, .key_count = 1};
+    eval_stack_t stack;
+    eval_stack_init(&stack);
+    int rc = eval_stack_push(&stack, edge, false);
+    if (!rc) rc = col_op_join_diff(&op, &stack, session);
+    if (!rc) {
+        const col_rel_t *out = stack.items[stack.top - 1].rel;
+        unsigned seen = 0;
+        if (!out || out->ncols != 4 || out->nrows != 12) rc = EINVAL;
+        for (uint32_t i = 0; !rc && i < out->nrows; ++i) {
+            int64_t key = out->columns[0][i];
+            if (key < 0 || key >= 12 || (seen & (1u << key))
+                || out->columns[1][i] != key + 1
+                || out->columns[2][i] != key || out->columns[3][i] != key + 1)
+                rc = EINVAL;
+            else seen |= 1u << key;
+        }
+        if (seen != 4095u || session->diff_arr_count != 1
+            || session->diff_arr_entries[0].diff_arr->indexed_rows != 12)
+            rc = EINVAL;
+    }
+    eval_stack_drain(&stack);
+    return rc;
 }
 
 static void
@@ -835,7 +952,8 @@ test_k4_branch_filter_cache_tokens_are_branch_owned(void)
         if (prog && wl_plan_from_program(prog, &plan) == 0
             && wl_session_create_with_options(wl_backend_columnar(), plan, w,
             &options, &sess) == 0
-            && wl_session_load_facts(sess, prog) == 0)
+            && wl_session_load_facts(sess, prog) == 0
+            && prime_branch_diff_registry(COL_SESSION(sess)) == 0)
             rc = wl_session_snapshot(sess, check_pair_cb, &pairs);
         if (sess)
             wl_session_destroy(sess);
@@ -853,6 +971,9 @@ test_k4_branch_filter_cache_tokens_are_branch_owned(void)
             token_probe.primed_clones, token_probe.inherited,
             token_probe.grown_after_primed_parent,
             token_probe.parent_changed, (int64_t)(after - baseline));
+        printf("diff submitted=%u primed=%u built=%u bad=%u ",
+            token_probe.diff_submitted, token_probe.diff_primed,
+            token_probe.diff_built, token_probe.diff_bad);
         if (rc != 0)
             snprintf(why, sizeof(why), "W=%u: snapshot failed (rc %d)", w,
                 rc);
@@ -862,6 +983,13 @@ test_k4_branch_filter_cache_tokens_are_branch_owned(void)
         else if (w > 1 && token_probe.grown_after_primed_parent < 2)
             snprintf(why, sizeof(why), "W=%u: fewer than two branches grew "
                 "a filter cache while the coordinator held a token", w);
+        else if (w > 1 && (!token_probe.diff_submitted
+            || !token_probe.diff_primed || !token_probe.diff_built))
+            snprintf(why, sizeof(why), "W=%u: no primed differential owner "
+                "or actual worker-local index", w);
+        else if (token_probe.diff_bad)
+            snprintf(why, sizeof(why), "W=%u: differential registry/token "
+                "ownership changed or was inherited", w);
         else if (token_probe.inherited != 0)
             snprintf(why, sizeof(why), "W=%u: a branch session inherited "
                 "the coordinator's filter-cache array token", w);
