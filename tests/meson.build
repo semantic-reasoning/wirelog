@@ -8302,3 +8302,12 @@ foreach pair : [['scalar', 'observed'], ['scalar', 'plain'], ['scalar', 'snapsho
       suite: ['unit', 'tsan', 'evaluation_join_hosts'], timeout: 120)
   endforeach
 endforeach
+
+# Two-key replacement faults follow complete owned key0 and key1 replacements.
+foreach pair : [['scalar', 'observed'], ['scalar', 'plain'], ['scalar', 'snapshot'], ['inline', 'observed']]
+  foreach mode : ['index-pair-header', 'index-pair-keys', 'index-pair-heads', 'index-pair-next']
+    test('evaluation_join_cache_@0@_@1@_@2@'.format(pair[0], pair[1], mode),
+      test_evaluation_join_cache_exe, args: [pair[0], pair[1], mode],
+      suite: ['unit', 'tsan', 'evaluation_join_hosts'], timeout: 120)
+  endforeach
+endforeach

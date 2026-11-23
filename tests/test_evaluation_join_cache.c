@@ -1934,6 +1934,14 @@ int main(int argc, char **argv) {
                 f.index_allocation =
                     WL_COLUMNAR_ARRANGEMENT_TEST_DIFF_ALLOC_HEADER + i;
             }
+        const char *const pair_modes[] = {"index-pair-header",
+                                          "index-pair-keys", "index-pair-heads",
+                                          "index-pair-next"};
+        for (unsigned i = 0; i < 4; ++i) if (!strcmp(argv[3], pair_modes[i])) {
+                f.later_signature = 3; f.allocation_ordinal = 3;
+                f.index_allocation =
+                    WL_COLUMNAR_ARRANGEMENT_TEST_DIFF_ALLOC_HEADER + i;
+            }
         f.pin_mode = !strcmp(argv[3], "pin-held");
         f.cycle = !strcmp(argv[3], "empty-cycle");
         const char *const cycle_modes[] = {"empty-right-cancel",
