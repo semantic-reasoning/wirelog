@@ -1995,9 +1995,15 @@ endif
 # turns those skips into failures; WIRELOG_TIDY_SKIP=1 forces a skip.
 #
 # Cost: ~12-16 s wall at 8 jobs, ~113 s summed CPU, on a suite whose
-# baseline is ~20 s wall.  priority: 100 starts it early so it overlaps the
-# rest rather than trailing them.  The 900 s timeout is generous against
-# the 12.7 s worst single file (exec_plan_gen.c) on a loaded runner.
+# baseline is ~20 s wall; the hosted Linux Clang ratchet durations recorded
+# in docs/CI_TELEMETRY.md ("Linux Clang PR lane (#2397)") include 196, 353
+# and 358 s.  priority: 100 starts it first, but it overlaps only the
+# parallel tests queued ahead of the next non-parallel one: Meson waits for
+# every running test before it starts a non-parallel test, so that test and
+# the rest of the queue wait for the ratchet.  In shard 1 of run 45104151262
+# the first non-parallel test was 20th, and about 10 s of other test time
+# overlapped the ratchet's 358 s.  The 900 s timeout is generous against the
+# 12.7 s worst single file (exec_plan_gen.c) on a loaded runner.
 if not is_windows
   test('clang_tidy_ratchet', py3,
        args: [meson.project_source_root() / 'scripts/ci/check-clang-tidy-ratchet.py',
