@@ -8,30 +8,31 @@ Native/Source/carry and final platform certification stay separate groups. An
 ordinary local omission cannot be reclassified into those groups to close this
 inventory. Global O04/F05a and #2371/#2300 remain OPEN for containing obligations.
 
-The table is an in-progress inventory until all items have current executable
-proof. COMPLETE-local means the named local contract only, with exact source,
-destination, independent oracle and guard boundaries. PENDING items are not
-claimed completed by the deferred-pin runtime change.
+All17 finite local obligations below are COMPLETE-local on the integrated code.
+Each entry names the actual consumer and independent oracle; the detailed sections
+preserve source, destination, protocol guards and supporting leaf boundaries.
+This is local acceptance of the stated contracts, not exhaustive arbitrary-value
+or Cartesian certification and not closure of the containing issue.
 
-| ID | Local contract | State | Current evidence / next integration |
+| ID | Local contract | State | Current executable evidence and oracle |
 |---|---|---|---|
-| J01 | key/product/collision/projection | PENDING | Reconcile existing evidence and fill missing consuming branches in the remaining units of this PR |
-| J02 | numeric/FLOAT predicates | PENDING | Reconcile existing evidence and fill missing consuming branches in the remaining units of this PR |
-| J03 | STRING functions/predicates | PENDING | Reconcile existing evidence and fill missing consuming branches in the remaining units of this PR |
-| J04 | hash/crypto/UUID/extensions | PENDING | Reconcile existing evidence and fill missing consuming branches in the remaining units of this PR |
-| J05 | missing/empty/rejected/refill | PENDING | Reconcile existing evidence and fill missing consuming branches in the remaining units of this PR |
-| J06 | actual selector/override contracts | PENDING | Reconcile existing evidence and fill missing consuming branches in the remaining units of this PR |
-| J07 | scalar/INLINE/width/ownership representations | PENDING | Reconcile existing evidence and fill missing consuming branches in the remaining units of this PR |
-| J08 | signed changes and physical metadata | PENDING | Reconcile existing evidence and fill missing consuming branches in the remaining units of this PR |
-| C01 | differential build/reuse/invalidation/source equivalence | PENDING | Reconcile existing evidence and fill missing consuming branches in the remaining units of this PR |
-| C02 | genuine pin/deferred/last-release and protocol errors | COMPLETE-local | `evaluation_join_runtime_cache_deferred_0/_1/_2`, `deferred-cancel`, `deferred-work`; prior `evaluation_join_cache_scalar_observed_pin-held` fourteen mixed protocol/metadata guards; private fallback under actual invalidation, two real pins and exact last-release reset/unchanged-RHS rebuild, literal signed/tuple/retry oracles |
-| C03 | primary cache LRU/pinned rebuild/eviction | PENDING | Reconcile existing evidence and fill missing consuming branches in the remaining units of this PR |
-| C04 | filtered cache lease/hide/disposal/owned alternative | PENDING | Reconcile existing evidence and fill missing consuming branches in the remaining units of this PR |
-| C05 | differential free/EBUSY/clear/rebuild | PENDING | Reconcile existing evidence and fill missing consuming branches in the remaining units of this PR |
-| P01 | configured ordinary strict/permissive policies | PENDING | Reconcile existing evidence and fill missing consuming branches in the remaining units of this PR |
-| P02 | output caps/duplicate extent/overflow | PENDING | Reconcile existing evidence and fill missing consuming branches in the remaining units of this PR |
-| P03 | current memory/allocation/error ownership prefixes | PENDING | Reconcile existing evidence and fill missing consuming branches in the remaining units of this PR |
-| L01 | actual interruptions/publication/ownership/retry | PENDING | Reconcile existing evidence and fill missing consuming branches in the remaining units of this PR |
+| J01 | key/product/collision/projection | COMPLETE-local | `evaluation_join`: `keyed_cases`, `generated_case`, `key_grammar_cases`, `key_literal_prefixes`; natural `evaluation_join_domains_*` and `evaluation_join_cache_*` bind compiler heads and public signed literals. Independent130 physical pairs, all schema lanes and padded wide projection supplement complete raw parity. |
+| J02 | numeric/FLOAT predicates | COMPLETE-local | `evaluation_join_acceptance_chains` and `expressions`: actual compiler/session/source/selection, numeric versus scalar FLOAT contexts, literal accepted/rejected masks, invalid arithmetic false;31/32/33/65 predicates and typed empty/refill. Numeric semantic leaves and shared probe controls support the same emitter. |
+| J03 | STRING functions/predicates | COMPLETE-local | `evaluation_join_acceptance_expressions` covers natural post-FILTER and explicit compiled RHS, UTF-8/created/borrowed STRING and all ordering classes; literal masks/signed removals/repeats. `expression-faults` fixes created CAT ownership/error/retry; STRING leaf and natural scalar-recovery MAP support their actual contexts. |
+| J04 | hash/crypto/UUID/extensions | COMPLETE-local | Finite84-tag map below links every enum to its semantic leaf and accepted/rejected context. `evaluation_join_acceptance_expressions` runs crypto enabled/disabled; extension natural JOIN hosts and deep compiler RHS rejection stay distinct. UUID4 uses its specified invariant, not a deterministic random literal. |
+| J05 | missing/empty/rejected/refill | COMPLETE-local | `evaluation_join` missing/typed-empty/key/type/right-filter controls; `evaluation_join_cache_*cycle*` actual public empty/rejected/refill/frontier/stop histories; `acceptance_chains` real compiled wide predicates and unloaded private empty bindings. Positive rejected-row work is separate from zero-work empty controls. |
+| J06 | actual selector/override contracts | COMPLETE-local | `evaluation_join_acceptance_selectors`:50 VARIABLE plus4 legacy controls and exact HELD descriptor/snapshot/leases; `evaluation_join:ordinary_selector_sources`:60 JOIN controls. Natural phase44 positive append API pointer matches consumed VARIABLE, while cache cycles bind JOIN-right overrides. Zero-row append unreachability and configured refusals are explicitly bounded below. |
+| J07 | scalar/INLINE/width/ownership representations | COMPLETE-local | `evaluation_join`: nullary/wide parity, `ordinary_integer_enum_keys`, `inline_admission_boundaries`, genuine `ordinary_shared_stamped_source`; natural `evaluation_join_inline_*` ordinary consumers authenticate physical maps/readers. Runtime-cache typed persistent/private paths and actual spill-backed `evaluation_cold_sources` plus `evaluation_cold_right_sources` supply real destination-specific coverage. |
+| J08 | signed changes and physical metadata | COMPLETE-local | Natural cache/domain/INLINE campaigns require independent signed callbacks and future-call uniqueness; `ordinary_shared_stamped_source` consumes actual alias/backing descriptors with distinct timestamp storage and weights0/-1/1/3/-4 through CANCEL/retry, preserving every input stamp while ordinary output remains value-only. `evaluation_physical` supports the shared transport contract. |
+| C01 | differential build/reuse/invalidation/source equivalence | COMPLETE-local | Natural `evaluation_join_cache_*`, typed `evaluation_join_runtime_cache_*` and `evaluation_join_acceptance_cache-clear-cycle` authenticate current canonical/append sources, same-count replacement, actual build/probe/warm reuse and independent literal signed results. Deliberately private whole-evaluation comparisons are semantic controls; raw DIFF seed/error cases are separately labelled producer interoperability. |
+| C02 | genuine pin/deferred/last-release and protocol errors | COMPLETE-local | `evaluation_join_runtime_cache_deferred_0/_1/_2`, `deferred-cancel`, `deferred-work`; `evaluation_join_cache_scalar_observed_pin-held` protocol/metadata guards. Two authentic pins preserve stale payload during private fallback; first/last release, unchanged-RHS rebuild, genuine retained WORK versus disposed CANCEL, literal retry and later reuse are distinct assertions. |
+| C03 | primary cache LRU/pinned rebuild/eviction | COMPLETE-local | `arrangement_lru_eviction:test_primary_consuming_deferred` and `test_primary_consuming_lru` execute real nonunary raw ordinary JOIN around two-pin stale EBUSY, lazy/deferred-eviction final release and measured-cap genuine LRU victim/survivor/reaccess, with complete literal lanes. Existing built-empty/tombstone/failure/byte-sum cases and `arrangement_cache_reuse` support the cache states; synthetic defensive controls stay labelled. |
+| C04 | filtered cache lease/hide/disposal/owned alternative | COMPLETE-local | `join_right_filter_cleanup:test_join_filter_cache_deferred_cycle` performs real backend same-count mutation, two-pin hide and owned raw JOIN alternative, first/last disposal, refill and exact warm filtered relation/arrangement reuse, then future mutation literals. Existing admission/capacity-growth/fallback cases plus `generation_cache` support availability and stale-token behavior. |
+| C05 | differential free/EBUSY/clear/rebuild | COMPLETE-local | `evaluation_join_acceptance_cache-clear-cycle` authenticates actual active transaction and pin free EBUSY, preserved owners/hash/source leases, exact abort/clear local refunds, registry reset, then real public ordinary absent-index rebuild and warm reuse. `diff_join:test_diff_arrangement_pin_lifetime` and `arrangement_diff_drain` support the protocol; no differential LRU is claimed. |
+| P01 | configured ordinary strict/permissive policies | COMPLETE-local | `evaluation_join_inline_policy`, `evaluation_join_host_strict`, `evaluation_join_domains_*`, `evaluation_serial` bind ordinary admission/fit/type/successor/error precedence and strict positives/refusals. `evaluation_join_acceptance_fallbacks` additionally records exact permissive raw DELTA_RIGHT/FILTERED_RIGHT reasons and literal selected-source results. Configured producers and primitive knob refusal retain their actual interface labels. |
+| P02 | output caps/duplicate extent/overflow | COMPLETE-local | `evaluation_join:ordinary_cap_priorities` covers product/keyed/projection disabled/below/equal/above and malformed-present/typed-empty versus missing precedence. Cache cap4/5/6 proves five pre-DISTINCT pairs versus four final values with same-input retry; INLINE caps and `join_limit`, `join_overflow`, `join_overflow_batched`, `arrangement_pow2_overflow` supply precise shared boundaries, not a huge-allocation claim. |
+| P03 | current memory/allocation/error ownership prefixes | COMPLETE-local | Cache image/slot/copied and five new-signature/later-owned-index failure representatives; `evaluation_join_acceptance_expression-faults`; runtime `raw-*`; compiler `plan_gen_oom`; governed source/key/MAP/output supporting functions below. Real NULL ENOMEM, peer-held ENOSPC, overflow and protocol causes remain distinct with exact owned-prefix preservation/refund, same-input retry and future reuse. |
+| L01 | actual interruptions/publication/ownership/retry | COMPLETE-local | Natural cache/domain/INLINE and scalar-recovery histories, genuine runtime deferred CANCEL/WORK and RHS created CAT faults authenticate actual live owner/attempt/source. They check fixed retained/disposed states, frozen reports/published heads, no early delivery, real reset/same-facts retry, later signed changes and eventual governor0. This is finite reached-owner proof; whole-path FINISH/Native/Source remains separately open. |
 
 ## Deferred-pin evidence boundary
 
@@ -75,7 +76,8 @@ while the deliberately private comparison checks the same content separately.
 capacity overflow without changing source arrays; its real governor growth test
 now requires ENOSPC and pending denial. `diff_join` retains the actual batch
 admission/growth and stale-state regressions with current session denial transfer.
-C01/P03 remain PENDING until their other ordinary products finish in this PR.
+The remaining C01/P03 products are now linked in the completed table and the
+consuming cache/prefix sections below.
 
 ## Wide RHS compilation and failure atomicity (J02/J05/P03 subset)
 
@@ -99,7 +101,8 @@ an extension below33 genuine predicates still fails compilation, while33 NULL
 predicate wrappers emit no RHS bytes. Existing ANTI/SEMI extension guards remain.
 The checked uint32 buffer addition/doubling is reviewed statically at extreme
 representability bounds; no giant-allocation runtime proof is claimed. Other
-ordinary expression/context/selector obligations remain PENDING here.
+ordinary expression/context/selector obligations are linked to the completed
+consumer campaigns below.
 
 ## Predicate and selected-source consumers
 
@@ -257,7 +260,7 @@ BOOL and STRING EQ/NEQ compatibility use explicit actual ordinary RHS controls.
 | `WL_PLAN_EXPR_ARITH_UUID5_SI` | unit7-uuid-numeric | RHS crypto typed variants; enabled/disabled feature and created/interned owner where applicable |
 | `WL_PLAN_EXPR_ARITH_UUID5_IS` | unit7-uuid-numeric | RHS crypto typed variants; enabled/disabled feature and created/interned owner where applicable |
 
-## Ordinary representation, policy and remaining owner prefixes
+## Ordinary representation, policy and owned prefixes
 
 `evaluation_join:ordinary_shared_stamped_source` consumes a genuine shared view,
 not a copy: the RHS descriptor differs from its canonical storage owner and both
@@ -317,9 +320,8 @@ history checks are retained. Denial pressure survives completed cleanup, physica
 NULL does not add a denial, published registry/head/input stay exact, reset retries
 the same pending facts under a new attempt, and later unmatched LEFT work proves
 warm reuse against unchanged RHS. The closed2410 full56-case matrix is excluded.
-These assertions close these local representation/policy/prefix products only;
-cache-family consuming invalidation/clear/LRU cycles and final reconciliation
-remain in progress in this PR.
+These assertions close the stated local representation/policy/prefix products.
+The following consuming cache cycles complete their distinct lifecycle gaps.
 
 ## Cache-family consuming lifecycle closure
 
@@ -377,6 +379,56 @@ Governor credit reaches zero after retirement. These raw primary/filtered consum
 are separate from default controlled differential/private routing.
 
 All existing cache tests remain. These finite consuming cycles finish the cache
-protocol gaps identified by the local inventory; final integrated reconciliation
-and the explicit containing-domain/platform boundaries are still recorded below
-and in the containing ledgers, without closing #2371/#2300.
+protocol gaps identified by the local inventory. The completed table above and
+the boundaries below reconcile this evidence without closing #2371/#2300.
+
+
+## Reused resource paths and guard boundaries
+
+`evaluation_join` runs actual ordinary governed `governor_cases`,
+`key_governor_cases`, `interrupt_cases`, `key_interrupt_cases`,
+`right_filter_owned_storage_case`, `right_filter_credit_retained_case` and
+`right_filter_owned_refusal_retry_case`. They distinguish governed output/key/
+filtered-source ownership, actual physical NULL and authentic retained-credit or
+fresh-attempt retry. These are exact primitive consumers supporting the natural
+public cache and created-expression histories, not an inference from raw parity.
+
+`memory_admission_join:test_variable_empty_admission` calibrates actual empty
+VARIABLE constructor credit, metadata NULL and invalid-schema precedence.
+`test_source_governed_join_key_scratch_denial` and
+`test_source_governed_join_key_scratch_alloc_failure` distinguish actual source-
+funded key ENOSPC from physical ENOMEM; `test_join_output_growth_denial_is_typed`
+sets `materialized=false` and proves ordinary product output growth ENOSPC with
+only registry credit retained. `test_source_governor_output_precedence` and
+`test_governed_join_consumers_release_exactly_once` support effective governor choice and
+single release. `test_map_admission` is explicitly a shared MAP adapter's
+pre-callback output admission/retry, linked to natural post-JOIN MAP consumption
+by `evaluation_join_scalar_recovery`, not a fabricated JOIN-local MAP producer.
+Materialized/projected and parallel tests in that executable remain regressions
+for their own routes, not ordinary completion evidence.
+
+Unsupported SIDE/unknown/malformed INLINE descriptors, invalid key/type/schema,
+compiler-forbidden RHS extensions/AVG, configured strict eligibility refusals,
+conflicting native transactions and unpinned deferred corruption retain their
+existing negative oracles. Other integer enums remain private-key destinations;
+scalar INT64/FLOAT/STRING persistent eligibility does not imply compound/shared/
+stamped/cold persistent eligibility. Missing, registered-empty and FORCE_EMPTY
+are distinct; the static zero-append producer boundary is not an executed case.
+These are genuine existing route/guard distinctions, not new domain refusals.
+
+## Integrated validation and containing work
+
+The integrated code passes Clang417 JOIN hosts,45 affected components,7 typed
+components and5 ABI/header/thread contracts, plus normal production compilation.
+GCC passes204 affected cache/acceptance/primitive/cache-family selections.
+Crypto-enabled compiler/consumer and expression leaves pass19 selections, with
+crypto-disabled leaves included in the native run. ASan/UBSan passes the same complete417/45/7/5 integrated selections; both real
+cold-source registrations are included. The PR records the publication HEAD. Existing watchdogs, quantum256, tariffs,
+output caps and installed API/layout remain unchanged.
+
+Materialized-result/cache equivalence, actual pipeline RUNNING/consume/ACK/FINISH,
+recursive/frontier/deletion scheduling, full caller/financial Native/Source/carry
+and hosted MSVC/TSan/platform certification remain separate containing work.
+Their current OPEN state does not hide an unfinished item in this17-row local
+inventory. Linux local acceptance is not a hosted CI success claim. #2371 and
+#2300 therefore remain OPEN after this ordinary/cache bundle.

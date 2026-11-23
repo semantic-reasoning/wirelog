@@ -16,6 +16,33 @@ consuming/retirement tests `f7e234dc`. Use the reviewed PR HEAD/configuration
 for subsequent certificates; earlier green runs and experimental Native/Source
 snapshots are not current route certificates.
 
+## Current ordinary/cache local completion in PR #2413
+
+The complete17-item [ordinary/cache inventory](ORDINARY_JOIN_CACHE_ACCEPTANCE.md)
+is COMPLETE-local. It is the current authority for ordinary nonmaterialized
+key/product/projection/predicate, source/representation/metadata, policy/cap,
+allocation/error and reached-owner contracts, including actual differential,
+private, primary and filtered cache consumers. Each item has named current
+executable evidence, independent literals and its real guards/destination.
+
+The runtime bundle repairs live/deferred differential pin availability, typed
+canonical RHS reuse, first clone/growth error propagation and full RHS predicate
+compilation with atomic failure. Natural31/32/33/65 predicate histories,84 exact
+tag/context mappings, real selectors/append provenance, genuine shared/stamped
+sources, independent physical pair/projection oracles, finite missing allocation
+prefixes and three cache-family consuming cycles finish the identified ordinary
+local gaps. No ordinary inventory item is deferred to a new PR.
+
+Materialized/cache equivalence, pipeline RUNNING/consume/ACK/FINISH, recursive
+scheduling, full caller/Native/Source/carry and hosted platform certification
+remain distinct containing work; #2371/#2300 remain OPEN. Local Linux checks do
+not certify hosted MSVC/TSan. The table under “Reused evidence and remaining
+acceptance” below records that current boundary. Earlier increment descriptions
+and numeric test counts are historical checkpoints: their “remaining ordinary”
+phrases are superseded by the completed17-row inventory, not new residual tasks.
+
+## Historical implementation increments
+
 ## Configured no-tail INLINE policy increment
 
 This historical #2380 increment starts from merged #2378, main `803381f1`. That merge contains
@@ -951,24 +978,23 @@ errno and caller denial transfer. Other ordinary inventory items remain pending.
 
 ## Reused evidence and remaining acceptance
 
-| Obligation | Existing evidence reused | Still outstanding for complete #2371 acceptance |
+| Obligation | Current evidence and local state | Still outstanding for complete #2371 acceptance |
 |---|---|---|
-| Ordinary key/product/projection/collision and accepted RHS expressions | `evaluation_join`, generated large/filter/collision cases in `evaluation_serial`, scalar recovery and the new public histories | Complete accepted expression/type/error/representation crossproducts beyond the specified scalar and INLINE predicates |
-| Full/delta/empty selectors and signed future changes | Existing direct selector fixtures, serial append dispatches and literal public histories;42 cache histories bind actual canonical RHS and default scalar-observed append descriptors | Remaining selector products beyond the new canonical present-empty FULL/nonempty append cycle; historical phase7-only counters remain insufficient |
-| Persistent full unfiltered index and filtered/private fallback | `test_controlled_persistent_join`, persistent stop/refusal matrices in `test_evaluation_serial.c`;42 natural cache/source histories across scalar/INLINE LEFT and three public routes, actual key0/key1/composite reuse/rebuild, private filtered/delta work and exact rollback/retry;32 further cap/resource/pin histories and30 empty/rejected/refill histories described above;40 further allocator-boundary histories qualify image/slots, first/second copied metadata and key0 replacement prefixes with fixed disposed ENOMEM and fresh retry/future reuse | Remaining new-entry/all-width allocator, predicate/representation/policy/pin/selector intersections; same-input default/private whole-evaluation comparison is not an isolated cache-only or resource certificate |
-| Pins and deferred rebuild/eviction | `join_right_filter_cleanup` managed cache/pinned fallback/admission tests; existing strict internal-cache fixtures; five genuine differential live-pin private-success/release/future-reuse histories plus two stopped private-insertion retries | Remaining stale/deferred/eviction and other consuming intersections; new pin setup is internal, not a public primary-cache producer |
-| Materialized policy/memory and future calls | All78 `evaluation_materialized_body_*` selections:12 original scalar and66 typed INLINE-EDB preserved-body histories; host strict/policy/lifecycle suites | Remaining empty/wide/metadata/selector/cache-equivalence and containing bounds, not a primitive controlled-cache-hit claim |
-| Batch/pipeline, recursive/frontier and representations | Existing JOIN host suites and natural recursive materialized histories | Each accepted operator-by-representation and RUNNING/FINISH intersection, including required signed timestamps/weights; new callback sign checks are not full timestamp qualification |
-| Ordinary INLINE representation | Direct public fused-projection regression;363 generated histories including streamed producer/consumer/ACK,90 controlled memory failures and54 matching-cap histories;141 finite policy cases and constructed admission controls; new persistent-index histories consume typed INLINE LEFT with canonical scalar INT64 RHS | Remaining memory/type/policy/selector/cache/materialized/metadata and other operator representation intersections |
-| Reached prepared ownership and disposal | Merged #2364, existing recovery/lifecycle fixtures | Remaining #2367/#2368 local funding/caller/ACK and MSVC-C11 layout qualification on the actual routes |
-| RUNNING/FINISH and containing accounting | Existing components and local interval notes | Reached #2369 adapters and #2370 full entry/return, Original/SOURCE identity and correlated Native/Source carry certificates |
+| Ordinary key/product/projection/collision and predicates | COMPLETE-local J01–J05; actual compiler/ordinary primitive/public sessions,84-tag/context map and numeric/scalar/STRING/hash/crypto/extension semantic leaves in the linked inventory | Containing caller/Native/Source and hosted platform certificate; no pending ordinary local semantic item |
+| Full/delta/empty/append and signed future changes | COMPLETE-local J06/J08; exact source descriptor/snapshot/leases, explicit supported/legacy selectors, natural positive override provenance and independent signed/literal histories | Recursive/frontier producers and pipeline consume/ACK remain separate; no fabricated ordinary zero-row append override |
+| Persistent differential/private and primary/filtered cache | COMPLETE-local C01–C05/P03; same-count mutation, real build/reuse, two-pin defer/hide/release, genuine primary LRU and real differential free/refund/rebuild, with actual consuming JOIN results | Materialized-result cache equivalence and containing financial/platform obligations; raw primary/filtered versus controlled differential/private labels retained |
+| Ordinary representations and strict/permissive/cap policy | COMPLETE-local J07/J08/P01/P02; scalar/INLINE/shared/stamped/cold/wide/nullary actual consumers, selected-source errors, caps/duplicates and genuine negative guards | Other operators, pipeline/recursive representation intersections and containing bounds; existing SIDE/unknown/invalid protocols remain errors |
+| Materialized policy/memory and future calls | Existing78 materialized-body selections and strict/policy/lifecycle evidence remain partial for that separate domain | Remaining materialized empty/wide/metadata/selector/cache-equivalence and containing bounds |
+| Batch/pipeline and recursive/frontier | Existing JOIN hosts and natural recursive materialized histories remain partial for those domains | Actual operator-by-representation RUNNING/FINISH, consume/ACK and recursive signed scheduling intersections |
+| Reached ordinary owner stops/retry | COMPLETE-local L01; exact disposed/retained states, reports, prepublication rollback, reset/same-facts retry and future signed changes | Remaining #2367/#2368 funding/caller/ACK and platform qualification; local governor0 does not certify full Native/Source/carry |
+| RUNNING/FINISH and containing accounting | Existing components and local interval notes | #2369 adapters, #2370 whole entry/return, Original/SOURCE identity and correlated carry certificates |
 
-#2299 expression machinery is reused. #2301 owns representation access, while
-this issue still owns the consuming JOIN intersections it enables. These are
-precise handoffs, not a requirement to wait for unrelated sibling domains.
-Required unavailable platform/Source evidence remains outstanding. There is no
-new raw fallback, supported-domain refusal, language/API semantics, quantum
-increase, cap increase or replacement index project in this bundle.
+#2299 semantic machinery and #2301 source adapters are reused through explicitly
+named consumers; their whole-issue certificates are not inferred. All ordinary
+local gaps identified for this PR are resolved by the inventory evidence. This
+bundle adds no supported-domain refusal, language/API/layout change, cap/quantum/
+tariff increase or unlimited raw fallback. Hosted unavailable platform evidence
+remains open, independently of completed local semantics.
 
 ## Reproduction and validation boundary
 
@@ -1098,8 +1124,8 @@ atomically on expression/context allocation failure. Natural31/32/33/65
 predicate public sessions, shared raw ANTI/explicit SEMI, deep extension guards
 and calibrated real-NULL same-program retries are recorded in
 `ORDINARY_JOIN_CACHE_ACCEPTANCE.md`. This is a production correctness repair;
-remaining ordinary inventory items stay open until their consuming proof is
-reconciled, and no containing global row is closed by this subset.
+the completed ordinary inventory now links their consuming proof, while no
+containing global row is closed by this local subset.
 
 The ordinary predicate/source integration now has a finite84-tag/context map in
 `ORDINARY_JOIN_CACHE_ACCEPTANCE.md`, real natural post-JOIN versus explicit RHS-IR
@@ -1108,8 +1134,8 @@ stop ownership and selected descriptor/snapshot proofs. Registered zero delta,
 forced empty, legacy initial selector compatibility, configured refusals and
 natural nonempty immutable append overrides are distinguished. No zero-row public
 append producer or universal selector refusal is invented. This discharges only
-these local contexts; remaining representations/cache/policy inventory remains
-in progress and containing global rows remain open.
+these local contexts; the completed inventory now links representation/cache/
+policy evidence, while containing global rows remain open.
 
 The ordinary representation/policy integration adds real shared-descriptor versus
 storage-owner JOIN and timestamp/weight preservation, independent130-pair/wide
@@ -1118,7 +1144,7 @@ priorities, actual raw permissive DELTA_RIGHT/FILTERED_RIGHT reasons and only fi
 missing new-metadata/later-owned-index failure representatives. Exact routes and
 same-input recovery are recorded in `ORDINARY_JOIN_CACHE_ACCEPTANCE.md`. No new
 engine domain/refusal or whole-path accounting claim follows; primary/filtered/
-differential consuming lifecycle completion and final local inventory remain.
+differential consuming lifecycle completion is linked in the inventory below.
 
 Ordinary cache-family consuming lifecycle evidence now includes public same-count
 differential rebuild/reuse and real active/pinned clear/refund/rebuild; raw primary
@@ -1126,5 +1152,5 @@ two-pin stale EBUSY/deferred eviction/lazy consuming rebuild and genuine measure
 LRU victim/reaccess; and raw filtered two-pin hide/same-count owned fallback/
 last-release refill/warm relation+arrangement reuse/future mutation. Existing
 component cases stay intact. `ORDINARY_JOIN_CACHE_ACCEPTANCE.md` names exact
-consumers and independent literals; final local reconciliation remains required,
-and no materialized/recursive/accounting/platform containing row closes here.
+consumers and independent literals; all17 local items are reconciled there,
+while no materialized/recursive/accounting/platform containing row closes here.
