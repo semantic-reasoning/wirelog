@@ -8284,3 +8284,12 @@ foreach heads : [1, 2]
       suite: ['unit', 'tsan', 'evaluation_recursive_string_unbound'], timeout: 120)
   endforeach
 endforeach
+
+# Initial new signatures, including retirement of preceding private indexes.
+foreach pair : [['scalar', 'observed'], ['scalar', 'plain'], ['scalar', 'snapshot'], ['inline', 'observed']]
+  foreach mode : ['index-new-key0-name', 'index-new-key0-keys', 'index-new-key1-name', 'index-new-key1-keys', 'index-new-pair-name', 'index-new-pair-keys']
+    test('evaluation_join_cache_@0@_@1@_@2@'.format(pair[0], pair[1], mode),
+      test_evaluation_join_cache_exe, args: [pair[0], pair[1], mode],
+      suite: ['unit', 'tsan', 'evaluation_join_hosts'], timeout: 120)
+  endforeach
+endforeach

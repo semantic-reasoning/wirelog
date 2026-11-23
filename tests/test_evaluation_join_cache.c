@@ -82,7 +82,8 @@ typedef struct {
     bool allocation_failed;
     unsigned index_allocation, allocation_calls[9], allocation_phase;
     uint64_t allocation_progress, allocation_attempt, failed_allocation_attempt;
-    unsigned injected_allocations, allocation_ordinal;
+    unsigned injected_allocations, allocation_ordinal, new_metadata;
+    wl_test_join_cache_build_t prefix[3];
     uint64_t denials;
     wl_columnar_memory_reservation_t peer;
     bool pin_mode;
@@ -438,6 +439,156 @@ static void reserve_peer(fixture_t *f) {
     f->denials = wl_columnar_memory_denials(g);
     f->stopped = true;
 }
+static unsigned
+wl_test_join_cache_allocation_stage(const fixture_t *f)
+{
+    return f->new_metadata ? 0u : f->index_allocation >=
+           WL_COLUMNAR_ARRANGEMENT_TEST_DIFF_ALLOC_HEADER ? 5u : 1u;
+}
+static void
+wl_test_join_cache_signature(fixture_t *f, wl_columnar_filter_context_t *ctx,
+    unsigned signature)
+{
+    const wl_plan_op_t *op = ctx->join_operation;
+    CHECK(signature >= 1 && signature <= 3 && !op->right_filter_expr.size
+        && (signature == 1 ? f->head < 2 : f->head == signature)
+        && op->key_count == (signature == 3 ? 2u : 1u));
+    for (unsigned k = 0; k < op->key_count; ++k) {
+        unsigned key = signature == 2 ? 1u : k;
+        char left[16], right[16];
+        snprintf(left, sizeof(left), "col%u", (f->compound ? 2u : 0u) + key);
+        snprintf(right, sizeof(right), "col%u", key);
+        CHECK(!strcmp(op->left_keys[k], left) && !strcmp(op->right_keys[k],
+            right));
+    }
+}
+/* Descriptive installed/insertion/probe records, not private index pointers. */
+static void
+wl_test_join_cache_prefix(fixture_t *f, wl_columnar_filter_context_t *ctx,
+    unsigned action, uint64_t progress)
+{
+    unsigned signature = f->head < 2 ? 1u : f->head;
+    wl_test_join_cache_signature(f, ctx, signature);
+    wl_test_join_cache_build_t *b = &f->prefix[signature - 1];
+    const wl_plan_op_t *op = ctx->join_operation;
+    const col_rel_t *source = ctx->join_right.descriptor;
+    if (!action) {
+        CHECK(!b->operation && progress == signature - 1u);
+        b->session = (uintptr_t)COL_SESSION(f->active->session);
+        b->control = (uintptr_t)f->active->control;
+        b->control_identity =
+            wl_evaluation_control_identity(f->active->control);
+        b->attempt =
+            wl_evaluation_control_active_attempt_id(f->active->control);
+        b->generation = f->bindings->generation;
+        b->plan = (uintptr_t)f->selected; b->operation = (uintptr_t)op;
+        b->occurrence = (unsigned)(op - f->selected->ops);
+        b->source = (uintptr_t)source;
+        b->snapshot = wl_columnar_relation_snapshot(source);
+        b->slot = (unsigned)progress; b->key_count = op->key_count;
+        b->key = signature == 2 ? 1u : 0u; b->rows = source->nrows;
+        b->pending = true;
+        return;
+    }
+    if (action == 2 && b->operation != (uintptr_t)op) return; /* sibling reuse */
+    /* Warm reuse has no new build record; it cannot supply an owned prefix. */
+    if (action == 2 && !b->operation) return;
+    CHECK(b->operation == (uintptr_t)op && b->plan == (uintptr_t)f->selected
+        && b->occurrence == (unsigned)(op - f->selected->ops)
+        && b->generation == f->bindings->generation &&
+        b->source == (uintptr_t)source
+        && b->attempt ==
+        wl_evaluation_control_active_attempt_id(f->active->control)
+        && b->control_identity ==
+        wl_evaluation_control_identity(f->active->control)
+        && wl_columnar_relation_snapshot_equal(b->snapshot,
+        wl_columnar_relation_snapshot(source)));
+    if (action == 1) {
+        CHECK(b->pending && progress == b->inserted && progress < b->rows);
+        ++b->inserted;
+    } else {
+        CHECK(action == 2 && b->inserted == b->rows && progress < b->rows);
+        /* Real probe follows final indexed_rows/source snapshot assignment. */
+        b->pending = false; b->ordinal = f->head + 1;
+    }
+}
+static void
+wl_test_join_cache_prior(fixture_t *f, wl_columnar_filter_context_t *ctx,
+    unsigned count)
+{
+    CHECK(f->seen.builds == count &&
+        f->seen.indexed == count * ctx->join_right.nrows
+        && f->seen.reuses == (count ? 1u : 0u));
+    for (unsigned i = 0; i < 3; ++i) {
+        const wl_test_join_cache_build_t *b = &f->prefix[i];
+        if (i >= count) {
+            CHECK(!b->operation); continue;
+        }
+        CHECK(b->operation && b->plan && b->ordinal && b->ordinal <= f->head &&
+            !b->pending
+            && b->session == (uintptr_t)COL_SESSION(f->active->session)
+            && b->control == (uintptr_t)f->active->control
+            && b->control_identity ==
+            wl_evaluation_control_identity(f->active->control)
+            && b->attempt ==
+            wl_evaluation_control_active_attempt_id(f->active->control)
+            && b->generation + (f->head + 1u - b->ordinal) ==
+            f->bindings->generation && b->slot == i
+            && b->key_count == (i == 2 ? 2u : 1u) &&
+            b->key == (i == 1 ? 1u : 0u)
+            && b->source == (uintptr_t)ctx->join_right.descriptor
+            && b->rows == ctx->join_right.nrows && b->inserted == b->rows
+            && wl_columnar_relation_snapshot_equal(b->snapshot,
+            wl_columnar_relation_snapshot(ctx->join_right.descriptor)));
+    }
+}
+static void
+wl_test_join_cache_new_metadata(fixture_t *f, wl_columnar_filter_context_t *ctx,
+    wl_columnar_arrangement_test_diff_alloc_site_t site, size_t bytes)
+{
+    wl_col_session_t *s = COL_SESSION(f->active->session);
+    unsigned slot = f->new_metadata - 1;
+    bool keys = site == WL_COLUMNAR_ARRANGEMENT_TEST_DIFF_ALLOC_METADATA_KEYS;
+    wl_test_join_cache_signature(f, ctx, slot + 1);
+    wl_test_join_cache_prior(f, ctx, slot);
+    uint64_t capacity = 0, buckets = 1;
+    for (uint32_t st = 0; st < f->plan->stratum_count; ++st)
+        for (uint32_t h = 0; h < f->plan->strata[st].relation_count; ++h)
+            capacity += f->plan->strata[st].relations[h].op_count + 2u;
+    while (buckets < 2u * ctx->join_right.nrows) buckets *= 2;
+    CHECK(f->stage == 0 && !s->diff_arr_count && !f->seen.copied_entries
+        && ctx->join_right.nrows && f->allocation_phase == 2
+        && f->allocation_progress == slot &&
+        f->allocation_calls[site] == slot + 1
+        && (keys || site == WL_COLUMNAR_ARRANGEMENT_TEST_DIFF_ALLOC_NAME)
+        && bytes ==
+        (keys ? ctx->join_operation->key_count *
+        sizeof(uint32_t) : sizeof("right"))
+        && f->seen.image_cells ==
+        capacity *
+        (sizeof(col_diff_arr_entry_t) +
+        sizeof(wl_columnar_arrangement_diff_slot_t))
+        && f->allocation_calls[WL_COLUMNAR_ARRANGEMENT_TEST_DIFF_ALLOC_IMAGE] ==
+        1
+        && f->allocation_calls[WL_COLUMNAR_ARRANGEMENT_TEST_DIFF_ALLOC_SLOTS] ==
+        1
+        && f->allocation_calls[WL_COLUMNAR_ARRANGEMENT_TEST_DIFF_ALLOC_NAME] ==
+        slot + 1
+        && f->allocation_calls[
+            WL_COLUMNAR_ARRANGEMENT_TEST_DIFF_ALLOC_METADATA_KEYS] ==
+        slot + (keys ? 1u : 0u)
+        && f->seen.metadata_name_bytes ==
+        (slot + (keys ? 1u : 0u)) * sizeof("right")
+        /* phase4 includes prior metadata AND prior initialized build keys. */
+        && f->seen.metadata_key_cells == 2u * slot
+        && f->seen.header_cells == slot * (sizeof(col_diff_arrangement_t) + 1u)
+        && f->seen.bucket_cells == slot * (buckets + ctx->join_right.nrows));
+    for (unsigned i = WL_COLUMNAR_ARRANGEMENT_TEST_DIFF_ALLOC_HEADER;
+        i <= WL_COLUMNAR_ARRANGEMENT_TEST_DIFF_ALLOC_NEXT; ++i)
+        CHECK(f->allocation_calls[i] == slot);
+    fprintf(stdout, "new signature=%u slot=%u keys=%u prior-owned=%u\n",
+        slot + 1, slot, ctx->join_operation->key_count, slot);
+}
 /* Observe only the real controlled allocator boundary, never its private owner. */
 static bool
 wl_test_join_cache_index_allocation(wl_evaluation_control_t *control,
@@ -461,104 +612,124 @@ wl_test_join_cache_index_allocation(wl_evaluation_control_t *control,
     if (!f->armed || site != f->index_allocation
         || (f->allocation_ordinal &&
         f->allocation_calls[site] < f->allocation_ordinal)) return false;
-    CHECK(f->stage ==
-        (f->index_allocation >=
-        WL_COLUMNAR_ARRANGEMENT_TEST_DIFF_ALLOC_HEADER ? 5u : 1u)
-        && f->head < 2 && s->diff_arr_count == 3
-        && !f->seen.builds && !f->seen.reuses && !f->seen.indexed
-        && f->allocation_calls[site] ==
-        (f->allocation_ordinal ? f->allocation_ordinal : 1u)
-        && f->allocation_phase == 2);
-    /* The real transaction image contains every head's operations plus its
-     * two reserved suffix slots, not only this current head's plan. */
-    uint64_t capacity = s->diff_arr_count;
-    unsigned heads = 0;
-    for (uint32_t st = 0; st < f->plan->stratum_count; ++st) {
-        const wl_plan_stratum_t *stratum = &f->plan->strata[st];
-        CHECK(!stratum->is_recursive);
-        for (uint32_t h = 0; h < stratum->relation_count; ++h) {
-            capacity += stratum->relations[h].op_count + 2u;
-            ++heads;
+    if (f->new_metadata) wl_test_join_cache_new_metadata(f, ctx, site, bytes);
+    else {
+        CHECK(f->stage ==
+            (f->index_allocation >=
+            WL_COLUMNAR_ARRANGEMENT_TEST_DIFF_ALLOC_HEADER ? 5u : 1u)
+            && f->head < 2 && s->diff_arr_count == 3
+            && !f->seen.builds && !f->seen.reuses && !f->seen.indexed
+            && f->allocation_calls[site] ==
+            (f->allocation_ordinal ? f->allocation_ordinal : 1u)
+            && f->allocation_phase == 2);
+        /* The real transaction image contains every head's operations plus its
+         * two reserved suffix slots, not only this current head's plan. */
+        uint64_t capacity = s->diff_arr_count;
+        unsigned heads = 0;
+        for (uint32_t st = 0; st < f->plan->stratum_count; ++st) {
+            const wl_plan_stratum_t *stratum = &f->plan->strata[st];
+            CHECK(!stratum->is_recursive);
+            for (uint32_t h = 0; h < stratum->relation_count; ++h) {
+                capacity += stratum->relations[h].op_count + 2u;
+                ++heads;
+            }
         }
-    }
-    CHECK(heads == HEADS);
-    if (site == WL_COLUMNAR_ARRANGEMENT_TEST_DIFF_ALLOC_IMAGE) {
-        CHECK(f->allocation_progress == bytes &&
-            bytes == capacity * sizeof(col_diff_arr_entry_t)
-            && !f->seen.image_cells && !f->seen.copied_entries
-            && !f->allocation_calls[
-                WL_COLUMNAR_ARRANGEMENT_TEST_DIFF_ALLOC_SLOTS]);
-    } else if (site == WL_COLUMNAR_ARRANGEMENT_TEST_DIFF_ALLOC_SLOTS) {
-        CHECK(f->allocation_progress == bytes
-            && bytes == capacity * sizeof(wl_columnar_arrangement_diff_slot_t)
-            && f->allocation_calls[WL_COLUMNAR_ARRANGEMENT_TEST_DIFF_ALLOC_IMAGE]
-            == 1
-            && f->seen.image_cells == capacity * sizeof(col_diff_arr_entry_t)
-            && !f->seen.copied_entries);
-    } else if (site <= WL_COLUMNAR_ARRANGEMENT_TEST_DIFF_ALLOC_METADATA_KEYS) {
-        CHECK((site == WL_COLUMNAR_ARRANGEMENT_TEST_DIFF_ALLOC_NAME
-            || site == WL_COLUMNAR_ARRANGEMENT_TEST_DIFF_ALLOC_METADATA_KEYS)
-            && f->allocation_ordinal >= 1 && f->allocation_ordinal <= 2);
-        unsigned slot = f->allocation_ordinal - 1;
-        const col_diff_arr_entry_t *entry = &s->diff_arr_entries[slot];
-        unsigned length = (unsigned)strlen("right") + 1, prior_keys = 0;
-        for (unsigned i = 0; i < slot; ++i)
-            prior_keys += s->diff_arr_entries[i].key_count;
-        bool keys = site ==
-            WL_COLUMNAR_ARRANGEMENT_TEST_DIFF_ALLOC_METADATA_KEYS;
-        CHECK(!strcmp(entry->rel_name, "right") && entry->key_count
-            && f->allocation_progress == slot
-            && f->seen.image_cells == capacity * (sizeof(col_diff_arr_entry_t)
-            + sizeof(wl_columnar_arrangement_diff_slot_t))
-            && f->seen.copied_entries == f->allocation_ordinal
-            && f->allocation_calls[WL_COLUMNAR_ARRANGEMENT_TEST_DIFF_ALLOC_IMAGE]
-            == 1
-            && f->allocation_calls[WL_COLUMNAR_ARRANGEMENT_TEST_DIFF_ALLOC_SLOTS]
-            == 1
-            && f->allocation_calls[WL_COLUMNAR_ARRANGEMENT_TEST_DIFF_ALLOC_NAME]
-            == slot + 1
-            && f->allocation_calls[
-                WL_COLUMNAR_ARRANGEMENT_TEST_DIFF_ALLOC_METADATA_KEYS] ==
-            slot + (keys ? 1u : 0u)
-            && f->seen.metadata_name_bytes == (slot + (keys ? 1u : 0u)) * length
-            && f->seen.metadata_key_cells == prior_keys
-            && bytes == (keys ? entry->key_count * sizeof(uint32_t) : length));
-    } else {
-        CHECK(site >= WL_COLUMNAR_ARRANGEMENT_TEST_DIFF_ALLOC_HEADER
-            && ctx->join_operation->key_count == 1
-            && !strcmp(ctx->join_operation->right_keys[0], "col0")
-            && ctx->join_right.nrows && f->seen.copied_entries == 3
-            && f->seen.image_cells == capacity * (sizeof(col_diff_arr_entry_t)
-            + sizeof(wl_columnar_arrangement_diff_slot_t))
-            && f->seen.metadata_name_bytes == 3u * sizeof("right")
-            && f->seen.metadata_key_cells == 4 && !f->seen.bucket_cells
-            && f->allocation_calls[WL_COLUMNAR_ARRANGEMENT_TEST_DIFF_ALLOC_IMAGE]
-            == 1
-            && f->allocation_calls[WL_COLUMNAR_ARRANGEMENT_TEST_DIFF_ALLOC_SLOTS]
-            == 1
-            && f->allocation_calls[WL_COLUMNAR_ARRANGEMENT_TEST_DIFF_ALLOC_NAME]
-            == 3
-            && f->allocation_calls[
-                WL_COLUMNAR_ARRANGEMENT_TEST_DIFF_ALLOC_METADATA_KEYS] == 3);
-        uint64_t buckets = 1;
-        while (buckets < 2u * ctx->join_right.nrows) buckets *= 2;
-        uint64_t sizes[] = {sizeof(col_diff_arrangement_t), sizeof(uint32_t),
-                            buckets * sizeof(uint32_t),
-                            ctx->join_right.nrows * sizeof(uint32_t)};
-        uint64_t total = sizes[0] + sizes[1] + sizes[2] + sizes[3];
-        unsigned ordinal = site -
-            WL_COLUMNAR_ARRANGEMENT_TEST_DIFF_ALLOC_HEADER;
-        CHECK(bytes == sizes[ordinal] &&
-            f->allocation_progress == (ordinal ? bytes : total)
-            && f->seen.header_cells ==
-            (ordinal ? sizeof(col_diff_arrangement_t) + 1u : 0u));
-        for (unsigned i = 0; i < 4; ++i)
-            CHECK(
-                f->allocation_calls[
-                    WL_COLUMNAR_ARRANGEMENT_TEST_DIFF_ALLOC_HEADER + i]
-                == (i <= ordinal ? 1u : 0u));
-        /* Reaching the next malloc proves earlier pointers succeeded. Keys
-         * and hash heads are allocated, not populated, until ALL succeed. */
+        CHECK(heads == HEADS);
+        if (site == WL_COLUMNAR_ARRANGEMENT_TEST_DIFF_ALLOC_IMAGE) {
+            CHECK(f->allocation_progress == bytes &&
+                bytes == capacity * sizeof(col_diff_arr_entry_t)
+                && !f->seen.image_cells && !f->seen.copied_entries
+                && !f->allocation_calls[
+                    WL_COLUMNAR_ARRANGEMENT_TEST_DIFF_ALLOC_SLOTS]);
+        } else if (site == WL_COLUMNAR_ARRANGEMENT_TEST_DIFF_ALLOC_SLOTS) {
+            CHECK(f->allocation_progress == bytes
+                && bytes ==
+                capacity * sizeof(wl_columnar_arrangement_diff_slot_t)
+                && f->allocation_calls[
+                    WL_COLUMNAR_ARRANGEMENT_TEST_DIFF_ALLOC_IMAGE]
+                == 1
+                && f->seen.image_cells ==
+                capacity * sizeof(col_diff_arr_entry_t)
+                && !f->seen.copied_entries);
+        } else if (site <=
+            WL_COLUMNAR_ARRANGEMENT_TEST_DIFF_ALLOC_METADATA_KEYS) {
+            CHECK((site == WL_COLUMNAR_ARRANGEMENT_TEST_DIFF_ALLOC_NAME
+                || site ==
+                WL_COLUMNAR_ARRANGEMENT_TEST_DIFF_ALLOC_METADATA_KEYS)
+                && f->allocation_ordinal >= 1 && f->allocation_ordinal <= 2);
+            unsigned slot = f->allocation_ordinal - 1;
+            const col_diff_arr_entry_t *entry = &s->diff_arr_entries[slot];
+            unsigned length = (unsigned)strlen("right") + 1, prior_keys = 0;
+            for (unsigned i = 0; i < slot; ++i)
+                prior_keys += s->diff_arr_entries[i].key_count;
+            bool keys = site ==
+                WL_COLUMNAR_ARRANGEMENT_TEST_DIFF_ALLOC_METADATA_KEYS;
+            CHECK(!strcmp(entry->rel_name, "right") && entry->key_count
+                && f->allocation_progress == slot
+                && f->seen.image_cells ==
+                capacity * (sizeof(col_diff_arr_entry_t)
+                + sizeof(wl_columnar_arrangement_diff_slot_t))
+                && f->seen.copied_entries == f->allocation_ordinal
+                && f->allocation_calls[
+                    WL_COLUMNAR_ARRANGEMENT_TEST_DIFF_ALLOC_IMAGE]
+                == 1
+                && f->allocation_calls[
+                    WL_COLUMNAR_ARRANGEMENT_TEST_DIFF_ALLOC_SLOTS]
+                == 1
+                && f->allocation_calls[
+                    WL_COLUMNAR_ARRANGEMENT_TEST_DIFF_ALLOC_NAME]
+                == slot + 1
+                && f->allocation_calls[
+                    WL_COLUMNAR_ARRANGEMENT_TEST_DIFF_ALLOC_METADATA_KEYS] ==
+                slot + (keys ? 1u : 0u)
+                && f->seen.metadata_name_bytes ==
+                (slot + (keys ? 1u : 0u)) * length
+                && f->seen.metadata_key_cells == prior_keys
+                && bytes ==
+                (keys ? entry->key_count * sizeof(uint32_t) : length));
+        } else {
+            CHECK(site >= WL_COLUMNAR_ARRANGEMENT_TEST_DIFF_ALLOC_HEADER
+                && ctx->join_operation->key_count == 1
+                && !strcmp(ctx->join_operation->right_keys[0], "col0")
+                && ctx->join_right.nrows && f->seen.copied_entries == 3
+                && f->seen.image_cells ==
+                capacity * (sizeof(col_diff_arr_entry_t)
+                + sizeof(wl_columnar_arrangement_diff_slot_t))
+                && f->seen.metadata_name_bytes == 3u * sizeof("right")
+                && f->seen.metadata_key_cells == 4 && !f->seen.bucket_cells
+                && f->allocation_calls[
+                    WL_COLUMNAR_ARRANGEMENT_TEST_DIFF_ALLOC_IMAGE]
+                == 1
+                && f->allocation_calls[
+                    WL_COLUMNAR_ARRANGEMENT_TEST_DIFF_ALLOC_SLOTS]
+                == 1
+                && f->allocation_calls[
+                    WL_COLUMNAR_ARRANGEMENT_TEST_DIFF_ALLOC_NAME]
+                == 3
+                && f->allocation_calls[
+                    WL_COLUMNAR_ARRANGEMENT_TEST_DIFF_ALLOC_METADATA_KEYS] ==
+                3);
+            uint64_t buckets = 1;
+            while (buckets < 2u * ctx->join_right.nrows) buckets *= 2;
+            uint64_t sizes[] = {sizeof(col_diff_arrangement_t),
+                                sizeof(uint32_t),
+                                buckets * sizeof(uint32_t),
+                                ctx->join_right.nrows * sizeof(uint32_t)};
+            uint64_t total = sizes[0] + sizes[1] + sizes[2] + sizes[3];
+            unsigned ordinal = site -
+                WL_COLUMNAR_ARRANGEMENT_TEST_DIFF_ALLOC_HEADER;
+            CHECK(bytes == sizes[ordinal] &&
+                f->allocation_progress == (ordinal ? bytes : total)
+                && f->seen.header_cells ==
+                (ordinal ? sizeof(col_diff_arrangement_t) + 1u : 0u));
+            for (unsigned i = 0; i < 4; ++i)
+                CHECK(
+                    f->allocation_calls[
+                        WL_COLUMNAR_ARRANGEMENT_TEST_DIFF_ALLOC_HEADER + i]
+                    == (i <= ordinal ? 1u : 0u));
+            /* Reaching the next malloc proves earlier pointers succeeded. Keys
+             * and hash heads are allocated, not populated, until ALL succeed. */
+        }
     }
     f->denials = wl_columnar_memory_denials(
         wl_columnar_memory_governor_ref_get(f->active->governor));
@@ -623,6 +794,7 @@ static void arrangement(wl_evaluation_control_t *control, unsigned phase,
     CHECK(!f->profile && !ctx->join_operation->right_filter_expr.size &&
         ctx->join_right.nrows && !rhs_delta(f));
     if (phase == 14) {
+        if (f->new_metadata) wl_test_join_cache_prefix(f, ctx, 0, progress);
         ++f->seen.builds;
         f->building = ctx->join_operation;
     } else {
@@ -683,12 +855,14 @@ static void join(wl_evaluation_control_t *control, unsigned phase,
         CHECK(!ctx->join_operation->right_filter_expr.size &&
             ctx->join_right.nrows && f->building == ctx->join_operation &&
             !rhs_delta(f));
+        if (f->new_metadata) wl_test_join_cache_prefix(f, ctx, 1, progress);
         ++f->seen.indexed;
         if (progress == 1) stop_at(f, control, 2);
     }
     if (phase == 48) {
         CHECK(!f->profile && !ctx->join_operation->right_filter_expr.size &&
             !rhs_delta(f) && progress < ctx->join_right.nrows);
+        if (f->new_metadata) wl_test_join_cache_prefix(f, ctx, 2, progress);
         ++f->seen.persistent;
         stop_at(f, control, 3);
     }
@@ -1008,6 +1182,7 @@ static void watch(fixture_t *f, unsigned profile, bool enabled) {
     memset(&f->seen, 0, sizeof(f->seen));
     memset(&f->cycle_build, 0, sizeof(f->cycle_build));
     f->build_ordinal = 0;
+    memset(f->prefix, 0, sizeof(f->prefix));
     memset(f->allocation_calls, 0, sizeof(f->allocation_calls));
     f->allocation_attempt = 0;
     f->allocation_phase = 0; f->allocation_progress = 0;
@@ -1627,6 +1802,19 @@ int main(int argc, char **argv) {
         for (unsigned i = 0; i < 4; ++i) if (!strcmp(argv[3], build_modes[i]))
                 f.index_allocation =
                     WL_COLUMNAR_ARRANGEMENT_TEST_DIFF_ALLOC_HEADER + i;
+        const char *const new_modes[] = {"index-new-key0-name",
+                                         "index-new-key0-keys",
+                                         "index-new-key1-name",
+                                         "index-new-key1-keys",
+                                         "index-new-pair-name",
+                                         "index-new-pair-keys"};
+        for (unsigned i = 0; i < 6; ++i) if (!strcmp(argv[3], new_modes[i])) {
+                f.new_metadata = i / 2 + 1;
+                f.allocation_ordinal = f.new_metadata;
+                f.index_allocation = (i %
+                    2) ? WL_COLUMNAR_ARRANGEMENT_TEST_DIFF_ALLOC_METADATA_KEYS
+                : WL_COLUMNAR_ARRANGEMENT_TEST_DIFF_ALLOC_NAME;
+            }
         f.pin_mode = !strcmp(argv[3], "pin-held");
         f.cycle = !strcmp(argv[3], "empty-cycle");
         const char *const cycle_modes[] = {"empty-right-cancel",
@@ -1747,8 +1935,7 @@ int main(int argc, char **argv) {
                 watch(&f, p, true);
             }
             if (!p && f.index_allocation && !f.stopped && f.stage ==
-                (f.index_allocation >=
-                WL_COLUMNAR_ARRANGEMENT_TEST_DIFF_ALLOC_HEADER ? 5u : 1u)) {
+                wl_test_join_cache_allocation_stage(&f)) {
                 failure(&f, &before, &old, ENOMEM);
                 watch(&f, p, true);
             }
@@ -1774,15 +1961,21 @@ int main(int argc, char **argv) {
             }
             CHECK(!finish(&f, &f.profiles[p]));
             if (!p && f.index_allocation && f.stage ==
-                (f.index_allocation >=
-                WL_COLUMNAR_ARRANGEMENT_TEST_DIFF_ALLOC_HEADER ? 5u : 1u)) {
+                wl_test_join_cache_allocation_stage(&f)) {
                 CHECK(f.injected_allocations == 1 && f.allocation_attempt
                     && f.allocation_attempt != f.failed_allocation_attempt
                     && f.allocation_calls[f.index_allocation] ==
                     (f.allocation_ordinal ||
                     f.index_allocation >=
                     WL_COLUMNAR_ARRANGEMENT_TEST_DIFF_ALLOC_HEADER ? 3u : 1u)
-                    && f.seen.image_cells && f.seen.copied_entries == 3);
+                    && f.seen.image_cells &&
+                    f.seen.copied_entries == (f.new_metadata ? 0u : 3u));
+                if (f.new_metadata) {
+                    CHECK(f.seen.builds == 3 && f.seen.reuses == 1);
+                    for (unsigned i = 0; i < 3;
+                        ++i) CHECK(f.prefix[i].ordinal && !f.prefix[i].pending
+                            && f.prefix[i].inserted == f.prefix[i].rows);
+                }
                 fprintf(stdout,
                     "index malloc retry site=%u attempt=%llu reuses=%u\n",
                     f.index_allocation,
