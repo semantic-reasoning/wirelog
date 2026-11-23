@@ -691,3 +691,14 @@ right input after a prefix or read by a later JOIN, a self-JOIN, two cold
 inputs of one rule, a JOIN with more than one key, a SNAPSHOT or an observed
 STEP over a cold input, the program refusals of the sixth bundle and more than
 one worker stay open.
+
+A twelfth bundle admits, under control, a JOIN with more than one key where it
+reads the cold input, as its left input after the cold scan prefix or as its
+right input at the rule's second op, alone or before the aggregates the earlier
+bundles admit, under the uncontrolled route's audits; every later JOIN keeps
+one key. No operator changes: the controlled JOIN already resolves, hashes and
+matches every key; see "Cold multi-key JOINs in controlled single-worker
+sessions (#2301)". A cold right input after a prefix or read by a later JOIN, a
+self-JOIN, two cold inputs of one rule, a later JOIN with more than one key, a
+SNAPSHOT or an observed STEP over a cold input, the program refusals of the
+sixth bundle and more than one worker stay open.
