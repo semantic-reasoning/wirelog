@@ -7,6 +7,22 @@ test does not close a containing production row. No row below authorizes
 unlimited raw fallback, a new refusal of an otherwise accepted domain, or a
 higher quantum. The current quantum is256.
 
+## Current ordinary/cache local boundary
+
+PR #2413 completes all17 finite ordinary nonmaterialized JOIN/cache obligations
+in [ORDINARY_JOIN_CACHE_ACCEPTANCE.md](ORDINARY_JOIN_CACHE_ACCEPTANCE.md).
+J01–J08, C01–C05, P01–P03 and L01 are COMPLETE-local with named consuming routes,
+independent oracles and real negative guards. This resolves the ordinary local
+predicate/selector/representation/policy/allocation/deferred/LRU/clear gaps;
+none is carried as unfinished ordinary work into another PR.
+
+O04/F05a remain OPEN solely as containing production rows: full caller/financial
+Native/Source/carry and hosted platform evidence remain outstanding, with
+materialized, pipeline and recursive intersections tracked in their own rows.
+This local completion does not close #2371/#2300. Historical delivery paragraphs
+below preserve their checkpoint counts and earlier gaps; the current matrix and
+17-row inventory supersede their statements of remaining ordinary local work.
+
 ## Scope and evaluating Roots
 
 The issue owns O04/O05/O06/O09 and F05/F05a. The X rows qualify accepted
@@ -35,18 +51,18 @@ a prerequisite for this operator issue.
 
 | Row | Accepted domain and actual destination | Existing evidence | Remaining closure evidence | State |
 |---|---|---|---|---|
-| O04.1 | Ordinary keyed/product JOIN, projection, collision and right predicate | `evaluation_join`, serial JOIN and host tests; physical-row filtered hash chains; new public numeric/STRING RHS keyed/product histories with literal signed results and positive-work CANCEL/WORK retry; ordinary INLINE source admission with displaced physical keys/projection and real held-reader retries; configured no-tail dispatch preserving strict policy, with27 additional public strict-off histories | Complete accepted expression/representation matrix, caller intervals and financial obligations | OPEN |
-| O04.2 | Numeric and scalar/string right predicates, missing/present-empty/all-rejected | Numeric public ANTI and component JOIN/probes; public numeric/STRING constant RHS all-rejected/mixed histories and present-empty state; positive scalar post-JOIN composition; numeric/STRING post-FILTER rejection after actual INLINE JOIN gather; six typed present-empty/all-rejected/refill cycles and16 actual no-output CANCEL/WORK histories | Full current expression context, accepted failure semantics, created-owner refusal/cleanup, actual generated destinations | OPEN |
-| O04.3 | Full/delta/empty right selection and future calls | Existing ordinary JOIN/host selectors; #2299 joined-string suffix full/deletion tests; new public RHS/left append and multiplicity-aware deletion histories (phase7 is only used_delta, not source identity);42 cache histories bind canonical FULL and scalar-observed append descriptors with retry; new cycles bind actual present-empty canonical FULL, nonempty RHS appends while LEFT is empty, and actual LEFT refill frontiers | Complete remaining actual selector/signed-metadata intersections | OPEN |
+| O04.1 | Ordinary keyed/product JOIN, projection, collision and right predicate | COMPLETE-local J01/J07: compiler/public literal histories, private/persistent consumers, independent130 physical pairs/schema and wide padded projection, scalar/INLINE/shared/stamped/cold source witnesses | Full actual caller intervals, financial Native/Source/carry and hosted platform qualification | OPEN |
+| O04.2 | Numeric/scalar/STRING right predicates, missing/empty/rejected/refill | COMPLETE-local J02–J05/P03/L01:84-tag/context map; real natural post-FILTER and explicitly compiled RHS,31/32/33/65 predicate atomic emitter/OOM repair; semantic-false/typed-empty/refill/created-owner failure and fixed stopped-return histories | Containing source/caller/carry bounds and hosted platform qualification | OPEN |
+| O04.3 | Full/delta/empty right selection and future calls | COMPLETE-local J06/J08: actual VARIABLE/JOIN descriptor/snapshot/lease selectors and legacy guards, positive immutable append provenance, independent signed future-call results and physical timestamp/weight preservation | Recursive/frontier and pipeline producers in X.R/X.P, containing caller/Source/carry and platform evidence | OPEN |
 | O05 | ANTI keyed/unkeyed, right filtering, absent/empty, keep-all | Numeric compiler-selected ANTI, literal/raw component cases | Remaining accepted predicates/types, resource/representation/caller/source profiles | OPEN |
 | O09 | SEMI keyed/unkeyed/projected and right filtering | Numeric explicit-IR probes and generated SIP components; 18 public-optimizer natural SEMI histories in plain/configured batch modes prove the actual owned probe, five RHS partitions, rejected/private-emit CANCEL/WORK, new-generation retry, literal signed future insert/delete, retained WORK ownership and final governor0 | Remaining accepted predicate/type/representation/policy/recursive products and containing Source/carry proof; generated final projection is separate from the SEMI leaf | OPEN |
 | O06.1 | Grouped/ungrouped COUNT and accepted numeric SUM/MIN/MAX/FLOAT AVG | `evaluation_numeric_operators`, generated serial/grouped tests | Computed operands, full type/group/result and empty/error/projection matrix | OPEN |
 | O06.2 | Accepted STRING SUM/MIN/MAX and computed operands | Generated STRING/computed literal/raw/public cases; bounded rank comparison; actual created-scalar-owner failure cleanup | Remaining type/group/result/error crossproducts and containing source/carry/representation profiles | OPEN |
 | F05 | Accepted materialized JOIN selection and its actual controlled destination | Compiler-bound K-fusion lineage selects the incrementally audited positive preserved body; natural plain/configured-batch histories verify actual whole-SCC/owned receivers, literal9→12→6, exact signed events and unchanged repeats; strict/output refusals match raw; genuine CANCEL/WORK, END7/live successor0 and earlier ENOMEM-before-END preserve cause and permit healthy retry; actual governor denial after committed selected-body preparation preserves ENOSPC, initial/prior public images and pending input, then retries the literal histories;66 typed INLINE-EDB K3 preserved-body histories add literal7→9→5, finite policy/recovery and explicit retained STEP WORK ownership | Complete policy/selector/representation and tight-memory/cache-equivalence partitions, remaining interruption boundaries, containing Source/carry and parent disposal | OPEN |
-| F05a | Persistent ordinary index/cache and filtered/private destination | Existing serial native-index owner/reuse/refusal cases; public literal unfiltered keyed/plain build and filtered/private hash histories; configured unfiltered scalar batch PRODUCE witness; no-tail INLINE canonical usable/stale pins, EBUSY-before-row-fit and same-name private-source isolation fixtures;42 natural scalar/INLINE-LEFT cache histories bind key0/key1/composite index reuse/rebuild and actual FULL/append sources, same-input default/private whole-evaluation results and36 exact rollback/retry boundaries;32 additional natural histories qualify cold cap4/5/6, actual image/build admission ENOSPC with peer held through cleanup, pre-index key-buffer ENOMEM, and historical held-pin refusal/release/future reuse; ordinary controlled JOIN now uses a bounded private index under a valid live pin, preserving its registry and releasing it only deliberately;30 empty/rejected/refill histories add current-source rebuild/reuse, exact rollback and new-attempt key0 insertion retry (104 at that checkpoint);40 controlled allocator-boundary histories add image/slot, first/second copied metadata and key0 replacement-build NULL prefixes, fixed disposed ENOMEM and fresh-attempt retry/future reuse (144 total) | Remaining predicate/representation/policy/selector products, new-entry metadata/all-width and other allocator-failure products, deferred invalidation/eviction, typed/compound RHS and containing obligations | OPEN |
+| F05a | Persistent ordinary index/cache and filtered/private destination | COMPLETE-local C01–C05/P01–P03/L01: canonical typed build/reuse/same-count invalidation, live/deferred-pin bounded private success, actual primary two-pin/LRU/reaccess and filtered hidden/owned-alternative/release/refill consumers; real differential active/pinned free/refund/rebuild; current ENOSPC versus ENOMEM and finite owned-prefix rollback/retry | Containing caller/Native/Source/carry and hosted platform certification; materialized cache equivalence remains F05 and pipeline/recursive composition remains X.P/X.R | OPEN |
 | X.P | Legal batch/pipeline operator intersections | Existing LFTJ, ordinary JOIN hosts, probes, aggregate batch owner, #2299 string suffix | Every newly enabled domain's producer/consumer/consume/ACK and policy/cutoff qualification | OPEN |
 | X.R | Legal recursive/frontier/deletion intersections | Existing narrow recursive routes and shared recovery contracts; typed INLINE-EDB input to K3 preserved recursive bodies with scalar INT64 heads | Actual selected operator/type/representation paths, signed changes, interruption and future-call uniqueness | OPEN |
-| X.V | Accepted empty/nullary/wide/typed/owned/borrowed/segmented and metadata representations | Existing scalar/source/row/copy components and direct cases; ordinary left/right/both INLINE public histories, typed physical lanes, signed changes and held-reader stops; configured no-tail INLINE numeric cap and malformed/SIDE/unknown descriptor controls; typed INLINE-EDB inputs to scalar recursive preserved bodies, without compound recursive-head qualification; typed INLINE LEFT consumption of actual persistent scalar-RHS indexes with private comparison and fault recovery; new cycles retain typed zero-row scalar/INLINE descriptors/maps and actual source readers | Explicit operator-by-representation assertions; source adapters cannot imply absent algorithm support | OPEN |
+| X.V | Accepted empty/nullary/wide/typed/owned/borrowed/segmented and metadata representations | Existing scalar/source/row/copy components and direct cases; ordinary left/right/both INLINE public histories, typed physical lanes, signed changes and held-reader stops; configured no-tail INLINE numeric cap and malformed/SIDE/unknown descriptor controls; typed INLINE-EDB inputs to scalar recursive preserved bodies, without compound recursive-head qualification; typed INLINE LEFT consumption of actual persistent scalar-RHS indexes with private comparison and fault recovery; new cycles retain typed zero-row scalar/INLINE descriptors/maps and actual source readers | Explicit remaining other-operator/pipeline/recursive representation intersections and containing bounds; ordinary local J07/J08 completed in the linked inventory | OPEN |
 | L.ROW | Actual RUNNING output append and displaced/partial storage | Merged quiet owned-row debt component | Authentic RUNNING adapter, real production consumers, footer refusal and exact retained debt | OPEN |
 | L.END | Batch/source/output/input FINISH and registered native cleanup | Merged finite components; canonical recovery; actual nonstream retained BEGIN/finite scalar END and33 new public recovery histories | Finish stream source adapters, RUNNING ROW/batch and generic FINISH; qualify containing source/carry and all accepted intersections | OPEN |
 | L.PARENT | Observer/transaction/frame/child acquisition and terminal or WORK handoff | Canonical owners and observed recovery; actual abort-observer BUILD/PREPARE/READY reader barrier, finite resource actions and durable ACK; phased private-financier FINISH/detach/release/consume; canonical terminal receipt retains array/header disposal, moved header credit and real controller close after header free; early producer disposition covers every header-zero packet and each allocation/initialization stage; 1,117 public histories cover Original turnover, live successor0, real peer CAS loss, refused close phases, WORK retention and future signed events; retained real Normal generations survive permanent global identity exhaustion; 74 constructor histories and two isolated exhaustion cases cover real creation failure, turnover and before/after BANK refusal; bootstrap receipts settle before header disposal; 20 Snapshot finish histories preserve actual BANK versus OUTER observation/ownership rejection, one reset, retained committed-DONE Tx and the sole Original FINISH; permanent bootstrap BANK stops settle through real MAIN and maintenance outer financial/observation owners, with report stability paired within each actual action; seven actual MAIN-only prior-Snapshot CLOSE histories preserve Original/report/id0 and private funding IDs across real parked before/after refusal and healthy retry, and explicitly reject an unproduced maintenance owner; isolated retained-generation overflow preserves its selected result; financial FINISH commit and matching report observation advance separately before a refusing footer; stable role recipes bind before private births; grouped preparation observes the actual saved BANK generation; 20 real initializer histories cover fresh/reset/Snapshot/CLOSE refusal and pending admission, plus five inactive/id0 failed-retry reset histories | Finish differential/round/private-object disposal and committed observer FINISH; qualify complete producer/registration/bootstrap/ACK/caller/native/source/carry intervals | OPEN |
@@ -262,7 +278,7 @@ unchanged-RHS rebuild and typed/public-route recovery are recorded in the
 [ordinary/cache local inventory](ORDINARY_JOIN_CACHE_ACCEPTANCE.md). Independent
 pending/unpinned-deferred/malformed errors stay authoritative. This discharges
 that local deferred-pin transition; other ordinary cache-family/selector/policy
-items are still pending in the inventory, and global rows remain OPEN.
+items are now COMPLETE-local in the inventory, while global rows remain OPEN.
 
 
 The shared differential index producer now propagates the first clone/growth
@@ -279,8 +295,8 @@ atomically on expression/context allocation failure. Natural31/32/33/65
 predicate public sessions, shared raw ANTI/explicit SEMI, deep extension guards
 and calibrated real-NULL same-program retries are recorded in
 `ORDINARY_JOIN_CACHE_ACCEPTANCE.md`. This is a production correctness repair;
-remaining ordinary inventory items stay open until their consuming proof is
-reconciled, and no containing global row is closed by this subset.
+the completed ordinary inventory now links their consuming proof, while no
+containing global row is closed by this local subset.
 
 The ordinary predicate/source integration now has a finite84-tag/context map in
 `ORDINARY_JOIN_CACHE_ACCEPTANCE.md`, real natural post-JOIN versus explicit RHS-IR
@@ -289,8 +305,8 @@ stop ownership and selected descriptor/snapshot proofs. Registered zero delta,
 forced empty, legacy initial selector compatibility, configured refusals and
 natural nonempty immutable append overrides are distinguished. No zero-row public
 append producer or universal selector refusal is invented. This discharges only
-these local contexts; remaining representations/cache/policy inventory remains
-in progress and containing global rows remain open.
+these local contexts; the completed inventory now links representation/cache/
+policy evidence, while containing global rows remain open.
 
 The ordinary representation/policy integration adds real shared-descriptor versus
 storage-owner JOIN and timestamp/weight preservation, independent130-pair/wide
@@ -299,7 +315,7 @@ priorities, actual raw permissive DELTA_RIGHT/FILTERED_RIGHT reasons and only fi
 missing new-metadata/later-owned-index failure representatives. Exact routes and
 same-input recovery are recorded in `ORDINARY_JOIN_CACHE_ACCEPTANCE.md`. No new
 engine domain/refusal or whole-path accounting claim follows; primary/filtered/
-differential consuming lifecycle completion and final local inventory remain.
+differential consuming lifecycle completion is linked in the inventory below.
 
 Ordinary cache-family consuming lifecycle evidence now includes public same-count
 differential rebuild/reuse and real active/pinned clear/refund/rebuild; raw primary
@@ -307,5 +323,5 @@ two-pin stale EBUSY/deferred eviction/lazy consuming rebuild and genuine measure
 LRU victim/reaccess; and raw filtered two-pin hide/same-count owned fallback/
 last-release refill/warm relation+arrangement reuse/future mutation. Existing
 component cases stay intact. `ORDINARY_JOIN_CACHE_ACCEPTANCE.md` names exact
-consumers and independent literals; final local reconciliation remains required,
-and no materialized/recursive/accounting/platform containing row closes here.
+consumers and independent literals; all17 local items are reconciled there,
+while no materialized/recursive/accounting/platform containing row closes here.
