@@ -291,3 +291,12 @@ natural nonempty immutable append overrides are distinguished. No zero-row publi
 append producer or universal selector refusal is invented. This discharges only
 these local contexts; remaining representations/cache/policy inventory remains
 in progress and containing global rows remain open.
+
+The ordinary representation/policy integration adds real shared-descriptor versus
+storage-owner JOIN and timestamp/weight preservation, independent130-pair/wide
+projection oracles, five integer-enum private-key consumers, unconfigured cap
+priorities, actual raw permissive DELTA_RIGHT/FILTERED_RIGHT reasons and only five
+missing new-metadata/later-owned-index failure representatives. Exact routes and
+same-input recovery are recorded in `ORDINARY_JOIN_CACHE_ACCEPTANCE.md`. No new
+engine domain/refusal or whole-path accounting claim follows; primary/filtered/
+differential consuming lifecycle completion and final local inventory remain.

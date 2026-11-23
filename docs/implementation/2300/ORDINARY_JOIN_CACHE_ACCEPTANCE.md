@@ -256,3 +256,67 @@ BOOL and STRING EQ/NEQ compatibility use explicit actual ordinary RHS controls.
 | `WL_PLAN_EXPR_ARITH_UUID5_SS` | unit7-uuid-numeric | RHS crypto typed variants; enabled/disabled feature and created/interned owner where applicable |
 | `WL_PLAN_EXPR_ARITH_UUID5_SI` | unit7-uuid-numeric | RHS crypto typed variants; enabled/disabled feature and created/interned owner where applicable |
 | `WL_PLAN_EXPR_ARITH_UUID5_IS` | unit7-uuid-numeric | RHS crypto typed variants; enabled/disabled feature and created/interned owner where applicable |
+
+## Ordinary representation, policy and remaining owner prefixes
+
+`evaluation_join:ordinary_shared_stamped_source` consumes a genuine shared view,
+not a copy: the RHS descriptor differs from its canonical storage owner and both
+real reader gates are authenticated during actual RHS predicate work. LEFT and
+RHS have nontrivial timestamp fields and weights0/-1/1/3/-4; alias timestamp
+storage is distinct and intentionally differs from the backing owner's stamps.
+CANCEL preserves the original stack/input snapshots/stamps and releases readers;
+the same frame and unchanged sources then execute under a fresh attempt. Literal
+matching keys0/2 include weight0 and prove ordinary value semantics. Output
+contains ordinary projected values without timestamp storage; both original
+and alias/backing stamps remain exact through success and retirement. Public
+signed delivery remains separately proven by the natural session campaigns.
+
+`ordinary_integer_enum_keys` consumes INT32/UINT32/INT64/UINT64/BOOL keys through
+the actual private index with literal pairs, typed output and positive private
+row work. Real governed FLOAT/STRING/INT64 persistent eligibility and private
+alternatives remain mapped to runtime-cache tests. The existing65x2 duplicate
+fixture now independently requires130 distinct physical pairs before DISTINCT,
+all four schema lanes and exact values; its wide fused projection separately
+requires the three literal rows and zero-padded invalid projection lane.
+
+`ordinary_cap_priorities` checks unconfigured product, keyed and fused projection
+below/equal/above actual pair extent and with the cap disabled. It requires the
+original LEFT on refusal, and checks malformed RHS-expression priority under
+cap1 for a present source and typed-empty source; a missing RHS bypasses that
+expression and yields empty output. Existing cache cap4/5/6 distinguishes five
+physical pairs from four logical values and tests pending-input recovery; INLINE
+and configured producers retain their exact separate cap/interface evidence.
+Checked row-width clamping and representability guards are supported by the
+existing join_limit/join_overflow/arrangement_pow2 tests, not a giant allocation.
+
+`evaluation_join_acceptance_fallbacks` runs natural compiler/public raw ordinary
+sessions in permissive configured mode. The actually selected disjoint RHS delta
+records exactly one DELTA_RIGHT reason and literal key2; a natural RHS constant
+filter records exactly one FILTERED_RIGHT reason and literal keys1/2. Source
+values/extent and reader release are checked. Raw public preparation may update
+source generation while consolidating, so this is not an invented unchanged-token
+promise across a whole raw STEP. Controlled strict/refusal/fit/type/precedence
+and actual ordinary source ownership remain separately mapped to existing
+host_strict/INLINE-policy, serial and selected-source campaigns; raw fallback
+counters are not attributed to those other interfaces.
+
+Only five registrations fill the remaining index owner-prefix distinctions:
+`evaluation_join_cache_scalar_observed_index-new-key0-name`,
+`index-new-key0-keys`, `index-new-key1-keys`, `index-key1-next` and
+`index-key1-denied`. Fresh NAME/KEY physical NULLs distinguish public entry count0
+from the actually owned private image, first-name ownership and earlier completed
+key0 index. Later key1 NEXT NULL owns earlier header/key/head allocations after
+an actual fully populated/probed key0 replacement. Its separate real denial is
+injected before later build admission while key0 is owned, not after all NEXT
+credit was already admitted. Captures bind real attempt/control/operation/source/
+snapshot/signature/slot and exact per-build counter baselines across per-head
+binding generations. Allocated target arrays are not labelled populated arrays.
+
+The existing full rollback/report/reader/governor and independent public signed
+history checks are retained. Denial pressure survives completed cleanup, physical
+NULL does not add a denial, published registry/head/input stay exact, reset retries
+the same pending facts under a new attempt, and later unmatched LEFT work proves
+warm reuse against unchanged RHS. The closed2410 full56-case matrix is excluded.
+These assertions close these local representation/policy/prefix products only;
+cache-family consuming invalidation/clear/LRU cycles and final reconciliation
+remain in progress in this PR.

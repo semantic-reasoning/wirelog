@@ -3,6 +3,7 @@
 #define _DEFAULT_SOURCE 1
 #endif
 #include "../wirelog/columnar/internal.h"
+#include "../wirelog/columnar/join_batch.h"
 #include "../wirelog/exec_plan_gen.h"
 #include "../wirelog/ir/program.h"
 #include "../wirelog/ir/ir.h"
@@ -824,6 +825,85 @@ static void variable_selectors(void) {
             }
 }
 
+/* Raw ordinary permissive policy records its real exclusion reason; controlled
+ * strict/owner/source interfaces are covered separately, without equating stats. */
+static void ordinary_fallback_reasons(void) {
+    for (unsigned filtered = 0; filtered < 2; ++filtered) {
+        char text[512]; snprintf(text, sizeof(text),
+            ".decl left(k:int64)\n.decl right(k:int64,f:int64)\n.decl out(k:int64)\n"
+            "out(k):-left(k),right(k,%s).\n", filtered?"1":"f");
+        wirelog_error_t error;
+        wirelog_program_t *program = wirelog_parse_string(text, &error);
+        CHECK(program); wl_plan_t *plan = NULL;
+        CHECK(!wl_plan_from_program(program, &plan));
+        unsigned joins = 0;
+        for (uint32_t st = 0; st < plan->stratum_count; ++st)
+            for (uint32_t r = 0; r < plan->strata[st].relation_count; ++r)
+                for (uint32_t o = 0; o < plan->strata[st].relations[r].op_count;
+                    ++o) {
+                    const wl_plan_op_t *op =
+                        &plan->strata[st].relations[r].ops[o];
+                    if (op->op == WL_PLAN_OP_JOIN) {
+                        joins++;
+                        CHECK((op->right_filter_expr.size != 0) ==
+                            (filtered != 0));
+                    }
+                }
+        CHECK(joins == 1); wl_session_t *base = NULL;
+        CHECK(!wl_session_create(wl_backend_columnar(), plan, 1, &base));
+        wl_col_session_t *session = COL_SESSION(base);
+        session->join_batch_bytes = 64; session->join_batch_strict = false;
+        const int64_t left[] = {1, 2, 3}, right[] = {1, 1, 2, 1, 3, 0},
+            delta[] = {2, 1};
+        CHECK(!wl_session_insert(base, "left", left, 3,
+            1) && !wl_session_insert(base, "right", right, 3, 2));
+        col_rel_t *canonical = session_find_rel(session, "right");
+        CHECK(canonical);
+
+        if (!filtered) {
+            col_rel_t *selected = col_rel_new_like("$d$right", canonical);
+            CHECK(selected);
+            selected->nrows = selected->base_nrows = selected->sorted_nrows =
+                selected->run_count = 0;
+            bool denied = false;
+            CHECK(!col_rel_append_rows_atomic(selected, delta, 1, 2, &denied) &&
+                !session_add_rel(session, selected));
+        }
+        CHECK(!wl_session_step(base));
+        unsigned expected = filtered?3u:2u, seen = 0;
+        const col_rel_t *out = session_find_rel(session, "out");
+        CHECK(out && out->ncols == 1);
+        for (uint32_t r = 0; r < out->nrows; ++r) {
+            int64_t key = col_rel_get(out, r, 0); CHECK(key >= 1 && key <= 3);
+            unsigned bit = 1u<<((unsigned)key-1); CHECK(!(seen&bit));
+            seen |= bit;
+        }
+        fprintf(stdout,
+            "raw ordinary fallback filtered=%u count=%u reason=%u mask=%u\n",
+            filtered,
+            session->join_batch_fallback_count, session->join_batch_last_reason,
+            seen);
+        CHECK(seen == expected && session->join_batch_fallback_count == 1 &&
+            session->join_batch_last_reason ==
+            (filtered?COL_JOIN_BATCH_EXCLUDED_FILTERED_RIGHT:
+            COL_JOIN_BATCH_EXCLUDED_DELTA_RIGHT) &&
+            canonical->nrows == 3 && canonical->ncols == 2 &&
+            !atomic_load(&canonical->source_access.state) &&
+            !atomic_load(&canonical->descriptor_access.state));
+        unsigned source_keys = 0;
+        for (uint32_t row = 0; row < canonical->nrows; ++row) {
+            int64_t key = col_rel_get(canonical, row, 0);
+            CHECK(key >= 1 && key <= 3 &&
+                col_rel_get(canonical, row, 1) == (key == 3?0:1));
+            unsigned bit = 1u<<((unsigned)key-1); CHECK(!(source_keys&bit));
+            source_keys |= bit;
+        }
+        CHECK(source_keys == 7);
+        CHECK(!wl_session_try_destroy(&base)); wl_plan_free(plan);
+        wirelog_program_free(program);
+    }
+}
+
 int main(int argc, char **argv) {
     CHECK(argc == 2);
     const char *vars[] = {"WIRELOG_DIFF_ENABLED", "WIRELOG_JOIN_BATCH_BYTES",
@@ -838,6 +918,8 @@ int main(int argc, char **argv) {
             chain_case(widths[i], -1, 0); chain_case(widths[i], 0, 0);
             chain_case(widths[i], (int)widths[i]-1, 0);
         }
+    } else if (!strcmp(argv[1], "fallbacks")) {
+        ordinary_fallback_reasons();
     } else if (!strcmp(argv[1], "selectors")) {
         variable_selectors();
     } else if (!strcmp(argv[1], "expression-faults")) {
