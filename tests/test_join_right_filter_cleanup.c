@@ -27,6 +27,7 @@
  */
 
 #include "../wirelog/columnar/internal.h"
+#include "../wirelog/columnar/columnar_nanoarrow.h"
 
 #include <assert.h>
 #include <stdint.h>
@@ -1336,6 +1337,148 @@ cleanup:
     if (ok) PASS(); else FAIL("filter cache fallback contract");
 }
 
+static bool consume_filtered_future(wl_col_session_t *session, unsigned mask,
+    bool changed_three) {
+    col_rel_t *left = make_left(false); eval_stack_t stack;
+    eval_stack_init(&stack);
+    bool transferred = false, ok = false;
+    if (!left || col_rel_append_row(left, (int64_t[]){4, 14}))goto done;
+    wl_plan_op_t op; init_op(&op, WL_PLAN_OP_JOIN);
+    op.delta_mode = WL_DELTA_FORCE_FULL; op.materialized = false;
+    if (eval_stack_push(&stack, left, true))goto done; transferred = true;
+    if (wl_columnar_join_op(&op, &stack,
+        session) || stack.top != 1 || !stack.items[0].owned) goto done;
+    const col_rel_t *out = stack.items[0].rel;
+    unsigned expected = 0;
+    for (unsigned i = 0; i < 5; ++i) expected += (mask>>i)&1u;
+    if (!out || out->nrows != expected || out->ncols != 4)goto done;
+    unsigned seen = 0;
+    for (uint32_t r = 0; r < out->nrows; ++r) {
+        int64_t key = col_rel_get(out, r, 0);
+        if (key < 0 || key > 4)goto done;
+        unsigned bit = 1u<<(unsigned)key;
+        if (!(mask&bit) || (seen&bit) || col_rel_get(out, r, 1) != 10+key ||
+            col_rel_get(out, r, 2) != key || col_rel_get(out, r,
+            3) != (key == 3 && changed_three?303:200+key)) goto done;
+        seen |= bit;
+    }
+    ok = seen == mask;
+done:
+    (void)eval_stack_drain(&stack);
+    if (!transferred) col_rel_destroy(left); return ok;
+}
+static void test_join_filter_cache_deferred_cycle(void) {
+    TEST(
+        "ordinary filtered two-pin hide, same-count fallback and future cache reuse");
+    wl_col_session_t *session = make_mock_session();
+    wl_columnar_memory_governor_ref_t *ref = right_filter_governor(1u<<20);
+    col_filt_cache_pin_t first = {0}, second = {0}, blocked = {0};
+    bool ok = session && ref && register_right(session) == 0;
+    if (!ok) goto cleanup;
+    session->memory_governor = ref;
+    session->base.backend = wl_backend_columnar();
+    col_rel_t *right = session_find_rel(session, "right");
+    wl_plan_expr_buffer_t expression = {filter_bytes, sizeof(filter_bytes)};
+    col_rel_t *cached =
+        wl_columnar_filter_apply_right_filter_cached_pin(session, &expression,
+            "right", right, &first);
+    col_rel_t *same = wl_columnar_filter_apply_right_filter_cached_pin(session,
+            &expression, "right", right, &second);
+    if (!(ok = cached && same == cached && first.active && second.active &&
+        first.entry == second.entry &&
+        first.entry->pin_count == 2 && session->filt_cache_active_pins == 2 &&
+        cached->nrows == 4)) goto cleanup;
+    col_filt_cache_entry_t *entry = first.entry;
+    col_relation_snapshot_t old_source = wl_columnar_relation_snapshot(right),
+        old_filtered = wl_columnar_relation_snapshot(cached);
+    const wl_compute_backend_t *backend = wl_backend_columnar();
+    if (!(ok = backend->session_remove(&session->base, "right",
+        (int64_t[]){3, 203}, 1, 2) == 0 &&
+        backend->session_insert(&session->base, "right", (int64_t[]){4, 204}, 1,
+        2) == 0 &&
+        right->nrows == 8 && !wl_columnar_relation_snapshot_equal(old_source,
+        wl_columnar_relation_snapshot(right)) &&
+        session->filt_cache_count == 1 && entry == session->filt_cache &&
+        entry->evict_deferred &&
+        entry->pin_count == 2 && entry->filtered == cached &&
+        cached->nrows == 4 &&
+        wl_columnar_relation_snapshot_equal(old_filtered,
+        wl_columnar_relation_snapshot(cached)))) goto cleanup;
+    bool unavailable = false; col_rel_t *hidden = NULL;
+    int rc = wl_columnar_filter_apply_right_filter_cached_pin_checked(session,
+            &expression, "right", right, &blocked, &hidden, &unavailable);
+    if (!(ok = !rc && unavailable && !hidden && !blocked.active &&
+        !session->memory_budget_denied &&
+        consume_filtered_future(session, 23,
+        false) && entry->filtered == cached && entry->pin_count == 2 &&
+        entry->evict_deferred && session->filt_cache_count == 1 &&
+        !session->filt_arr_count)) goto cleanup;
+    /* The held relation still has original keys0..3, never the replacement4. */
+    unsigned stale = 0;
+    for (uint32_t row = 0; row < cached->nrows; ++row) {
+        int64_t key = col_rel_get(cached, row, 0);
+        if (key < 0 || key > 3 || col_rel_get(cached, row, 1) != 200+key) {
+            ok = false; goto cleanup;
+        }
+        stale |= 1u<<(unsigned)key;
+    }
+    if (!(ok = stale == 15))goto cleanup;
+    col_filt_cache_pin_release(&first);
+    if (!(ok = entry->pin_count == 1 && session->filt_cache_active_pins == 1 &&
+        second.active &&
+        second.rel == cached && entry->filtered == cached &&
+        entry->evict_deferred &&
+        wl_columnar_relation_snapshot_equal(old_filtered,
+        wl_columnar_relation_snapshot(cached)) &&
+        consume_filtered_future(session, 23, false)))goto cleanup;
+    col_filt_cache_pin_release(&second);
+    if (!(ok = !entry->pin_count && !session->filt_cache_active_pins &&
+        !entry->filtered && !entry->evict_deferred &&
+        !entry->source_nrows && !entry->source_snapshot.relation_identity &&
+        !entry->source_snapshot.view_generation &&
+        !entry->source_snapshot.storage_generation && entry->rel_name &&
+        entry->filter_data &&
+        consume_filtered_future(session, 23,
+        false) && session->filt_cache_count == 1 &&
+        session->filt_arr_count == 1 &&
+        entry->filtered && entry->filtered->nrows == 4 &&
+        entry->source_nrows == 8 &&
+        wl_columnar_relation_snapshot_equal(entry->source_snapshot,
+        wl_columnar_relation_snapshot(right)))) goto cleanup;
+    col_rel_t *current = entry->filtered;
+    col_filt_arr_entry_t *arr = &session->filt_arr_entries[0];
+    uint64_t *heads = arr->arr.ht_head; uint32_t *next = arr->arr.ht_next;
+    uint32_t generation = arr->arr.generation;
+    col_relation_snapshot_t filtered_snapshot =
+        wl_columnar_relation_snapshot(current);
+    if (!(ok = arr->arr.indexed_rows == 4 && consume_filtered_future(session,
+        23, false) && entry->filtered == current &&
+        arr->arr.ht_head == heads && arr->arr.ht_next == next &&
+        arr->arr.generation == generation &&
+        wl_columnar_relation_snapshot_equal(filtered_snapshot,
+        wl_columnar_relation_snapshot(current)) &&
+        wl_columnar_relation_snapshot_equal(arr->source_snapshot,
+        filtered_snapshot))) goto cleanup;
+    if (!(ok = backend->session_insert(&session->base, "right",
+        (int64_t[]){3, 303}, 1, 2) == 0 &&
+        right->nrows == 9 && consume_filtered_future(session, 31, true) &&
+        !session->filt_cache_active_pins && !session->memory_budget_denied &&
+        !wl_columnar_memory_denials(wl_columnar_memory_governor_ref_get(
+            ref)))) goto cleanup;
+cleanup:
+    col_filt_cache_pin_release(&blocked); col_filt_cache_pin_release(&second);
+    col_filt_cache_pin_release(&first);
+    if (session) {
+        session->memory_governor = NULL; destroy_mock_session(session);
+    }
+    if (ref) {
+        ok = ok &&
+            !wl_columnar_memory_reserved(wl_columnar_memory_governor_ref_get(
+                    ref)); wl_columnar_memory_governor_ref_release(ref);
+    }
+    if (ok) PASS(); else FAIL("filtered consuming deferred cycle contract");
+}
+
 int
 main(void)
 {
@@ -1354,6 +1497,7 @@ main(void)
     test_filter_cache_admission_and_growth();
     test_join_cached_filter_admission();
     test_join_filter_cache_unavailable_fallback();
+    test_join_filter_cache_deferred_cycle();
     for (unsigned grow = 0; grow < 2; grow++)
         for (unsigned exhaust = 0; exhaust < 2; exhaust++)
             test_managed_right_filter(wl_columnar_join_op, WL_PLAN_OP_JOIN,

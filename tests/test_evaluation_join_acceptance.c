@@ -904,6 +904,212 @@ static void ordinary_fallback_reasons(void) {
     }
 }
 
+typedef struct {
+    profile_t p;
+    unsigned builds, reuses, indexed, probes, private_rows, source_mask;
+} cache_cycle_t;
+static cache_cycle_t *cache_cycle_active;
+static void cache_cycle_source(wl_evaluation_control_t *control) {
+    cache_cycle_t *f = cache_cycle_active; CHECK(f && control == f->p.control);
+    wl_col_session_t *s = COL_SESSION(f->p.session);
+    wl_columnar_eval_serial_framed_attempt_t *r = NULL;
+    wl_columnar_filter_context_t *ctx = NULL;
+    CHECK(!wl_columnar_eval_stack_framed_context(s->cleanup_active, s, &r) &&
+        r->capture_only && r->child_bound && r->private_bindings &&
+        wl_columnar_session_observed_bindings_authorized(s,
+        r->private_bindings) &&
+        !wl_columnar_eval_stack_filter_context_owned(s->cleanup_active, &ctx,
+        &r->child) &&
+        ctx->join_operation == &r->child.plan->ops[r->child.cursor] &&
+        ctx->join_operation->op == WL_PLAN_OP_JOIN &&
+        ctx->join_operation->key_count == 1 &&
+        !ctx->join_operation->right_filter_expr.size);
+    const wl_columnar_relation_scalar_source_t *source = &ctx->join_right;
+    const col_rel_t *right = session_find_rel(s, "right");
+    CHECK(source->identity == source &&
+        source->phase == WL_COLUMNAR_RELATION_SCALAR_SOURCE_HELD &&
+        source->descriptor == right && source->width == 2 &&
+        source->nrows == 2 &&
+        source->owner_reader.owner == &right->storage_owner->source_access &&
+        source->descriptor_reader.owner == &right->descriptor_access);
+    unsigned keys = 0;
+    for (uint32_t row = 0; row < 2; ++row) {
+        int64_t key = col_rel_get(right, row, 0); CHECK(key >= 1 && key <= 3 &&
+            col_rel_get(right, row, 1) == 10*key);
+        unsigned bit = 1u<<((unsigned)key-1); CHECK(!(keys&bit)); keys |= bit;
+    }
+    CHECK(keys == f->source_mask);
+}
+static void cache_cycle_arrangement(wl_evaluation_control_t *control,
+    unsigned phase, uint64_t progress) {
+    (void)progress; if (phase != 13 && phase != 14)return;
+    cache_cycle_source(control);
+    if (phase == 14)++cache_cycle_active->builds;
+    else ++cache_cycle_active->reuses;
+}
+static void cache_cycle_join(wl_evaluation_control_t *control, unsigned phase,
+    uint64_t progress) {
+    (void)progress; if (phase != 28 && phase != 47 && phase != 29)return;
+    cache_cycle_source(control);
+    if (phase == 28)++cache_cycle_active->private_rows;
+    else if (phase == 47)++cache_cycle_active->indexed;
+    else ++cache_cycle_active->probes;
+}
+static void cache_cycle_evaluate(cache_cycle_t *f, unsigned old, unsigned want,
+    unsigned builds, unsigned reuses) {
+    f->builds = f->reuses = f->indexed = f->probes = f->private_rows = 0;
+    cache_cycle_active = f;
+    wl_columnar_arrangement_test_diff_checkpoint = cache_cycle_arrangement;
+    wl_columnar_join_test_attempt_checkpoint = cache_cycle_join;
+    CHECK(!finish(&f->p)); content(&f->p, want);
+    fprintf(stdout,
+        "CACHE CYCLE mask=%u build=%u/%u reuse=%u/%u indexed=%u probes=%u private=%u count=%u\n",
+        want, f->builds, builds, f->reuses, reuses, f->indexed, f->probes,
+        f->private_rows, COL_SESSION(f->p.session)->diff_arr_count);
+    CHECK(f->builds == builds && f->reuses == reuses &&
+        f->indexed == 2u*builds &&
+        f->probes && !f->private_rows);
+    for (unsigned i = 1; i <= 4; ++i) {
+        int change = (int)((want>>(i-1))&1u)-(int)((old>>(i-1))&1u);
+        CHECK(f->p.events[i] == change && f->p.calls[i] == (change?1u:0u));
+    }
+    memset(f->p.events, 0, sizeof(f->p.events));
+    memset(f->p.calls, 0, sizeof(f->p.calls));
+    f->builds = f->reuses = f->indexed = f->probes = f->private_rows = 0;
+    CHECK(!finish(&f->p)); content(&f->p, want);
+    CHECK(!f->builds && !f->reuses && !f->indexed && !f->probes &&
+        !f->private_rows);
+    for (unsigned i = 1; i <= 4; ++i)CHECK(!f->p.events[i] && !f->p.calls[i]);
+    wl_columnar_arrangement_test_diff_checkpoint = NULL;
+    wl_columnar_join_test_attempt_checkpoint = NULL;
+    cache_cycle_active = NULL;
+}
+static void cache_clear_cycle(void) {
+    wirelog_error_t error; wirelog_program_t *program = wirelog_parse_string(
+        ".decl left(k:int64)\n.decl right(k:int64,v:int64)\n.decl out(k:int64)\n"
+        "out(k):-left(k),right(k,v).\n", &error);
+    CHECK(program); wl_plan_t *plan = NULL;
+    CHECK(!wl_plan_from_program(program, &plan));
+    cache_cycle_t f = {0}; wl_columnar_memory_resolution_t resolution = {
+        .budget_bytes = WL_COLUMNAR_MEMORY_MIN_BUDGET,
+        .usable_bytes = WL_COLUMNAR_MEMORY_MIN_BUDGET,
+        .mode = WL_COLUMNAR_MEMORY_MODE_ENFORCING
+    };
+    f.p.governor = wl_columnar_memory_governor_ref_create(&resolution);
+    CHECK(f.p.governor && !wl_evaluation_control_create(UINT64_C(1000000000),
+        &f.p.control));
+    wl_session_options_t options; wl_session_options_init(&options);
+    options.memory_governor = f.p.governor;
+    options.evaluation_control = f.p.control;
+    CHECK(!wl_session_create_with_options(wl_backend_columnar(), plan, 1,
+        &options, &f.p.session));
+    wl_session_set_delta_cb(f.p.session, delta, &f.p); CHECK(!finish(&f.p));
+    const int64_t left[] = {1, 2, 3}, right[] = {1, 10, 2, 20},
+        removed[] = {1, 10}, replacement[] = {3, 30};
+    CHECK(!wl_session_insert(f.p.session, "left", left, 3, 1) &&
+        !wl_session_insert(f.p.session, "right", right, 2, 2));
+    f.source_mask = 3; cache_cycle_evaluate(&f, 0, 3, 1, 0);
+    wl_col_session_t *session = COL_SESSION(f.p.session);
+    CHECK(session->diff_arr_count == 1);
+    col_relation_snapshot_t old_snapshot =
+        session->diff_arr_entries[0].diff_arr->source_snapshot;
+    CHECK(!wl_session_remove(f.p.session, "right", removed, 1, 2) &&
+        !wl_session_insert(f.p.session, "right", replacement, 1, 2));
+    f.source_mask = 6; cache_cycle_evaluate(&f, 3, 6, 1, 0);
+    col_rel_t *canonical = session_find_rel(session, "right");
+    CHECK(canonical->nrows == 2 &&
+        !wl_columnar_relation_snapshot_equal(old_snapshot,
+        wl_columnar_relation_snapshot(canonical)));
+    col_relation_snapshot_t snapshot = wl_columnar_relation_snapshot(canonical);
+    int64_t extra = 4;
+    CHECK(!wl_session_insert(f.p.session, "left", &extra, 1, 1));
+    cache_cycle_evaluate(&f, 6, 6, 0, 1);
+    CHECK(wl_columnar_relation_snapshot_equal(snapshot,
+        wl_columnar_relation_snapshot(canonical)));
+    CHECK(session->diff_arr_count == 1 && !session->diff_txn_count);
+    col_diff_arr_entry_t *entry = &session->diff_arr_entries[0];
+    col_diff_arrangement_t *index = entry->diff_arr;
+    CHECK(index && index->indexed_rows == 2 && index->nbuckets <= 8 &&
+        index->ht_cap <= 8);
+    uint32_t heads[8], next[8];
+    memcpy(heads, index->ht_head, index->nbuckets*sizeof(*heads));
+    memcpy(next, index->ht_next, index->ht_cap*sizeof(*next));
+    uint64_t generation = entry->generation;
+    wl_columnar_memory_governor_t *g =
+        wl_columnar_memory_governor_ref_get(f.p.governor);
+    uint64_t baseline = wl_columnar_memory_reserved(g);
+    wl_columnar_source_access_reader_t reader = {0};
+    CHECK(!col_rel_source_reader_acquire(canonical, &reader));
+    wl_columnar_arrangement_diff_txn_t txn = {0}; uint32_t key = 0;
+    CHECK(!wl_columnar_arrangement_diff_txn_begin(session, "right", canonical,
+        &key, 1, &txn) &&
+        txn.working && txn.entry == entry && entry->transaction_pending &&
+        session->diff_txn_count == 1);
+    col_diff_arrangement_t *working = txn.working;
+    CHECK(col_session_free_diff_arrangements(session) == EBUSY &&
+        txn.working == working &&
+        txn.entry == entry && session->diff_txn_count == 1 &&
+        entry->transaction_pending &&
+        entry->diff_arr == index && entry->generation == generation &&
+        wl_columnar_relation_snapshot_equal(snapshot, index->source_snapshot) &&
+        !memcmp(heads, index->ht_head, index->nbuckets*sizeof(*heads)) &&
+        !memcmp(next, index->ht_next, index->ht_cap*sizeof(*next)));
+    wl_columnar_arrangement_diff_txn_abort(&txn);
+    CHECK(!col_rel_source_reader_release(&reader));
+    CHECK(!session->diff_txn_count && !entry->transaction_pending &&
+        entry->diff_arr == index && wl_columnar_memory_reserved(g) == baseline);
+    col_diff_arrangement_pin_t pin = {0};
+    CHECK(!col_session_pin_diff_arrangement(session,
+        "right", canonical, &key, 1, &pin));
+    CHECK(pin.active && pin.entry == entry && pin.arr == index &&
+        pin.source == canonical &&
+        pin.source_reader.identity == (uintptr_t)&pin.source_reader &&
+        pin.source_reader.owner == &canonical->storage_owner->source_access &&
+        pin.source_reader.secondary_owner == &canonical->descriptor_access &&
+        wl_columnar_relation_snapshot_equal(snapshot, pin.source_snapshot) &&
+        atomic_load(&canonical->source_access.state) == 1 &&
+        atomic_load(&canonical->descriptor_access.state) == 1 &&
+        entry->pin_count == 1 &&
+        col_session_free_diff_arrangements(session) == EBUSY && pin.active &&
+        entry->generation == generation && entry->pin_count == 1 &&
+        entry->diff_arr == index &&
+        !entry->transaction_pending && !entry->invalidation_deferred &&
+        wl_columnar_relation_snapshot_equal(snapshot, index->source_snapshot) &&
+        !memcmp(heads, index->ht_head, index->nbuckets*sizeof(*heads)) &&
+        !memcmp(next, index->ht_next, index->ht_cap*sizeof(*next)));
+    col_diff_arrangement_pin_release(&pin);
+    CHECK(!entry->pin_count && !pin.active &&
+        !atomic_load(&canonical->source_access.state) &&
+        !atomic_load(&canonical->descriptor_access.state));
+    uint64_t owned = index->reserved_bytes+
+        session->diff_arr_registry_reservation.bytes;
+    CHECK(index->reservation.bytes == index->reserved_bytes &&
+        baseline >= owned &&
+        !col_session_free_diff_arrangements(session) &&
+        !session->diff_arr_entries &&
+        !session->diff_arr_count && !session->diff_arr_cap &&
+        !session->diff_arr_registry_reserved_bytes &&
+        !session->diff_arr_registry_metadata_reserved_bytes &&
+        wl_columnar_memory_reserved(g) == baseline-owned);
+    extra = -1; CHECK(!wl_session_insert(f.p.session, "left", &extra, 1, 1));
+    cache_cycle_evaluate(&f, 6, 6, 1, 0);
+    CHECK(session->diff_arr_count == 1 &&
+        wl_columnar_relation_snapshot_equal(snapshot,
+        wl_columnar_relation_snapshot(canonical)));
+    index = session->diff_arr_entries[0].diff_arr;
+    generation = session->diff_arr_entries[0].generation;
+    extra = -2; CHECK(!wl_session_insert(f.p.session, "left", &extra, 1, 1));
+    cache_cycle_evaluate(&f, 6, 6, 0, 1);
+    CHECK(session->diff_arr_entries[0].diff_arr == index &&
+        session->diff_arr_entries[0].generation == generation &&
+        wl_columnar_relation_snapshot_equal(snapshot, index->source_snapshot));
+    CHECK(!wl_session_try_destroy(&f.p.session));
+    wl_evaluation_control_release(f.p.control);
+    wl_plan_free(plan); wirelog_program_free(program);
+    CHECK(!wl_columnar_memory_reserved(g));
+    wl_columnar_memory_governor_ref_release(f.p.governor);
+}
+
 int main(int argc, char **argv) {
     CHECK(argc == 2);
     const char *vars[] = {"WIRELOG_DIFF_ENABLED", "WIRELOG_JOIN_BATCH_BYTES",
@@ -918,6 +1124,8 @@ int main(int argc, char **argv) {
             chain_case(widths[i], -1, 0); chain_case(widths[i], 0, 0);
             chain_case(widths[i], (int)widths[i]-1, 0);
         }
+    } else if (!strcmp(argv[1], "cache-clear-cycle")) {
+        cache_clear_cycle();
     } else if (!strcmp(argv[1], "fallbacks")) {
         ordinary_fallback_reasons();
     } else if (!strcmp(argv[1], "selectors")) {

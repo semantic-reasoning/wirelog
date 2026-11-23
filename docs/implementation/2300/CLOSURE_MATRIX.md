@@ -300,3 +300,12 @@ missing new-metadata/later-owned-index failure representatives. Exact routes and
 same-input recovery are recorded in `ORDINARY_JOIN_CACHE_ACCEPTANCE.md`. No new
 engine domain/refusal or whole-path accounting claim follows; primary/filtered/
 differential consuming lifecycle completion and final local inventory remain.
+
+Ordinary cache-family consuming lifecycle evidence now includes public same-count
+differential rebuild/reuse and real active/pinned clear/refund/rebuild; raw primary
+two-pin stale EBUSY/deferred eviction/lazy consuming rebuild and genuine measured
+LRU victim/reaccess; and raw filtered two-pin hide/same-count owned fallback/
+last-release refill/warm relation+arrangement reuse/future mutation. Existing
+component cases stay intact. `ORDINARY_JOIN_CACHE_ACCEPTANCE.md` names exact
+consumers and independent literals; final local reconciliation remains required,
+and no materialized/recursive/accounting/platform containing row closes here.
