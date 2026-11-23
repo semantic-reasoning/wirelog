@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Offline end-to-end exact-merge size policy using real synthetic Meson libraries."""
 import json
+import importlib.util
 import os
 from pathlib import Path
 import subprocess
@@ -41,7 +42,11 @@ with tempfile.TemporaryDirectory(prefix="wirelog-size-merge-fixture-") as temp_n
     run(["git","config","user.name","Wirelog fixture"],cwd=repo)
     run(["git","config","user.email","fixture@example.invalid"],cwd=repo)
     (repo/"meson_options.txt").write_text("option('tests', type: 'boolean', value: true)\noption('mbedTLS', type: 'combo', choices: ['disabled', 'enabled', 'auto'], value: 'disabled')\n", encoding="utf-8")
-    (repo/"meson.build").write_text("project('wirelog', 'c', version: '0.70.0')\nshared_library('wirelog', 'wirelog.c', install: false)\n", encoding="utf-8")
+    (repo/"meson.build").write_text("""project('wirelog', 'c', version: '0.70.0')
+shared_library('wirelog', 'wirelog.c', install: false,
+  version: meson.project_version(), soversion: '1',
+  c_args: ['-DFIXTURE_RELEASE="0.70.0"'])
+""", encoding="utf-8")
     def write_source(nops):
         (repo/"wirelog.c").write_text(f'void fixture(void) {{ __asm__ volatile(".rept {nops}\\n nop\\n .endr"); }}\n', encoding="utf-8")
     write_source(10000)
@@ -62,9 +67,29 @@ with tempfile.TemporaryDirectory(prefix="wirelog-size-merge-fixture-") as temp_n
         run(["git","update-ref","refs/heads/main",merge],cwd=repo)
         run(["git","checkout","-q","-f","main"],cwd=repo)
 
+    head_build=temp/"head build"
+
+    # Unsupported outputs and lookalikes cannot confer private-path identity.
+    spec=importlib.util.spec_from_file_location("size_profile",root/"scripts/ci/size-profile.py")
+    profile_module=importlib.util.module_from_spec(spec); spec.loader.exec_module(profile_module)
+    own=head_build/"libwirelog.so.0.72.0.p"
+    private=profile_module.production_private_include({"filename":[str(head_build/"libwirelog.so.0.72.0")]},head_build)
+    alias=str(head_build/"<PRODUCTION_PRIVATE>")
+    operands=["-I"+str(own),"-I",str(own),"-I"+str(own)+"/headers",
+              "-I"+str(own)+"-extra","-isystem"+str(own),
+              "-DPRIVATE="+str(own),"-Wl,-soname,"+str(own),str(own)]
+    expected=["-I"+alias,"-I",alias,*operands[3:]]
+    assert profile_module.compile_private_includes(operands,private)==expected
+    assert profile_module.compile_private_includes(operands,None)==operands
+    for target in ({}, {"filename":[]}, {"filename":[str(head_build/"a"),str(head_build/"b")]},
+                   {"filename":[str(temp/"outside"/"libwirelog.so")]},
+                   {"filename":[str(head_build/".."/"outside.so")]},
+                   {"filename":["relative.so"]}, {"filename":[str(head_build)]}):
+        assert profile_module.production_private_include(target,head_build) is None, target
+
     pr_doc=commit_branch("pr-doc",lambda: (repo/"README.md").write_text("docs only\n", encoding="utf-8"))
     merge_doc=merge_commit(pr_doc); checkout_merge(merge_doc)
-    head_build=temp/"head build"; report=temp/"size report.json"
+    report=temp/"size report.json"
     run(["meson","setup",str(head_build),str(repo),"-Dtests=true","-DmbedTLS=disabled"])
 
     verifier_stub=temp/"verifier stub"; verifier_stub.mkdir()
@@ -76,6 +101,10 @@ with tempfile.TemporaryDirectory(prefix="wirelog-size-merge-fixture-") as temp_n
     python_stub.chmod(0o755)
 
     def compare(base_sha, pr_sha, merge_sha, expected=0, verifier_result=None):
+        # Each tested merge gets a fresh configured head, as in CI. Otherwise
+        # Meson may resolve the old versioned target before Ninja regenerates.
+        run(["meson","setup","--wipe",str(head_build),str(repo),
+             "-Dtests=true","-DmbedTLS=disabled"])
         if report.exists(): report.unlink()
         env={**fixture_env,"GITHUB_REPOSITORY":"fixture/wirelog"}
         if verifier_result is not None:
@@ -93,6 +122,51 @@ with tempfile.TemporaryDirectory(prefix="wirelog-size-merge-fixture-") as temp_n
     assert doc_report["inherited_overage"] is True
     assert doc_report["base_bytes"]==doc_report["head_bytes"]
     assert doc_report["base_sha"]==base and doc_report["head_sha"]==merge_doc
+
+    # A release changes the generated target-private include spelling, while
+    # the compiler recipe, public SONAME and measured code remain identical.
+    def release_edit(extra=None):
+        recipe=(repo/"meson.build").read_text(encoding="utf-8")
+        recipe=recipe.replace("version: '0.70.0'", "version: '0.72.0'", 1)
+        if extra:
+            recipe=extra(recipe)
+        (repo/"meson.build").write_text(recipe, encoding="utf-8")
+
+    pr_version=commit_branch("pr-version",release_edit)
+    merge_version=merge_commit(pr_version); checkout_merge(merge_version)
+    compare(base,pr_version,merge_version,0)
+    version_report=json.loads(report.read_text(encoding="utf-8"))
+    assert version_report["base_bytes"]==version_report["head_bytes"]
+    assert version_report["base_profile"]==version_report["head_profile"]
+    targets=json.loads(run(["meson","introspect","--targets",str(head_build)]).stdout)
+    target=next(t for t in targets if t["name"]=="wirelog")
+    private_include="-I"+str(head_build/"libwirelog.so.0.72.0.p")
+    assert any(private_include in item.get("parameters",[]) for item in target["target_sources"] if "compiler" in item), "versioned Meson include must really be observed"
+
+    # Each deliberate drift remains visible even while the release version
+    # changes. The similarly named user path must not be aliased as private.
+    changes={
+        "define": lambda r: r.replace('FIXTURE_RELEASE="0.70.0"', 'FIXTURE_RELEASE="0.72.0"'),
+        "optimization": lambda r: r.replace("version: '0.72.0')", "version: '0.72.0', default_options: ['optimization=s'])"),
+        "user-include": lambda r: r.replace("c_args: [", "c_args: ['-I' + meson.project_source_root() / 'api-0.72.0', "),
+        "private-lookalike": lambda r: r.replace("c_args: [", "c_args: ['-I' + meson.current_build_dir() / 'libwirelog.so.0.72.0.p-extra', "),
+        "soname": lambda r: r.replace("soversion: '1'", "soversion: '2'"),
+        "link": lambda r: r.replace("install: false,", "install: false, link_args: ['-Wl,--no-as-needed'],"),
+    }
+    for name,change in changes.items():
+        pr_changed=commit_branch("pr-version-"+name,lambda change=change: release_edit(change))
+        merge_changed=merge_commit(pr_changed); checkout_merge(merge_changed)
+        result=compare(base,pr_changed,merge_changed,2)
+        assert "production profile mismatch" in result.stderr
+        assert not report.exists(), "profile drift must fail before policy output"
+        if name in ("define","user-include","private-lookalike","soname"):
+            profile_file=temp/(name+".profile.json")
+            run([sys.executable,root/"scripts/ci/size-profile.py","capture","--build-dir",head_build,"--source-dir",repo,"--source-sha",merge_changed,"--output",profile_file])
+            captured=json.loads(profile_file.read_text(encoding="utf-8"))
+            parameters=[p for field in ("effective_compile_arguments","effective_link_arguments")
+                        for item in captured[field] for p in item["parameters"]]
+            wanted={"define":'FIXTURE_RELEASE="0.72.0"',"user-include":"api-0.72.0","private-lookalike":"libwirelog.so.0.72.0.p-extra","soname":"libwirelog.so.2"}[name]
+            assert any(wanted in value for value in parameters), (name,parameters)
 
     pr_growth=commit_branch("pr-growth",lambda: write_source(10100))
     merge_growth=merge_commit(pr_growth); checkout_merge(merge_growth)
