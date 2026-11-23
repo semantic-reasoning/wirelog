@@ -263,3 +263,13 @@ unchanged-RHS rebuild and typed/public-route recovery are recorded in the
 pending/unpinned-deferred/malformed errors stay authoritative. This discharges
 that local deferred-pin transition; other ordinary cache-family/selector/policy
 items are still pending in the inventory, and global rows remain OPEN.
+
+
+The shared differential index producer now propagates the first clone/growth
+admission, overflow, physical allocation or protocol error. Genuine quiescent
+pin pressure retains its ephemeral alternative. Actual paired API/producer
+failures and subsequent public ordinary typed reuse are recorded in the
+[ordinary inventory](ORDINARY_JOIN_CACHE_ACCEPTANCE.md); raw differential default
+selection is not relabelled ordinary dispatch. This closes that shared producer
+error distinction within C01/P03, not their remaining ordinary products or any
+global recursive/accounting row.

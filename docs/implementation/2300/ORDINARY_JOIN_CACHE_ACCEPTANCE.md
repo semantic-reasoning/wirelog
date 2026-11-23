@@ -52,3 +52,27 @@ protocol refusal, including later malformed/overflow priority controls. The
 preflight still validates the complete registry with unchanged per-action128
 charges, zero-work footers, action bound and quantum256. No stale index is read,
 no image starts and no cache/pin/transaction state is changed by availability.
+
+
+## Shared differential producer current-error evidence (C01/P03 subset)
+
+`evaluation_join_runtime_cache_raw-*` contains eleven finite direct producer
+histories. Paired API/operator clone denial returns ENOSPC, and capacity denial
+returns ENOSPC at its first denial instead of reaching another fallback. Physical
+clone header/key/head/next and growth head/next NULL remain ENOMEM with stable
+denials; one stale session flag proves current classification. Cold-new-entry
+abort and owned LEFT disposal preserve their real resource boundaries. A genuine
+outer transaction remains active after inner EBUSY and is explicitly aborted;
+a genuine pin permits correct ephemeral results without replacing the leased
+index. Source/index/pin/metadata and local token refund assertions are separate
+from a whole-session accounting certificate.
+
+After clearing/releasing only the real cause, a new real stack over unchanged
+facts yields independently specified literal rows. A subsequent public ordinary
+call requires two actual persistent reuses of the raw-produced typed index,
+while the deliberately private comparison checks the same content separately.
+`diff_arrangement` additionally distinguishes invalid shape/arguments and checked
+capacity overflow without changing source arrays; its real governor growth test
+now requires ENOSPC and pending denial. `diff_join` retains the actual batch
+admission/growth and stale-state regressions with current session denial transfer.
+C01/P03 remain PENDING until their other ordinary products finish in this PR.

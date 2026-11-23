@@ -348,10 +348,8 @@ index_right(wl_col_session_t *sess, const char *name, const col_rel_t *right,
     rc = col_diff_arrangement_ensure_ht_capacity(arr, right->nrows);
     /* The working copy carrying the denial is discarded by the abort below,
      * so the session records it (#2185). */
-    if (rc == ENOMEM && arr->memory_budget_denial_pending) {
-        rc = ENOSPC;
+    if (rc == ENOSPC)
         sess->memory_budget_denied = true;
-    }
     if (rc == 0) {
         /* A source snapshot change resets this private copy in txn_begin,
          * so public appends rebuild from row zero.  Retain the tail walk for

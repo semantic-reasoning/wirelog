@@ -910,6 +910,45 @@ Broader typed/predicate/representation/policy and interruption products,
 containing Native/Source/carry, deferred eviction and current MSVC/TSan runtime
 qualification remain open. This does not close F05a, #2371 or #2300.
 
+## Differential producer failure causes and ordinary reuse
+
+The actual raw differential producer supplies the same typed index format used
+by controlled ordinary JOIN. Its clone/growth failures previously fell through
+to ephemeral indexing: a real clone denial could return success with a denial
+flag, and a growth denial could reach a second fallback denial before returning.
+Physical clone/growth NULL could also be hidden by a successful alternative.
+
+Create/copy admission status now distinguishes invalid arguments/shape, checked
+sizing and governor denial. Raw transaction copy denial returns ENOSPC;
+physical NULL after admission remains ENOMEM. Capacity growth returns precise
+ENOSPC/EOVERFLOW/EINVAL/ENOMEM, and both raw JOIN and the existing differential
+batch caller record the current denial before abort destroys the working copy.
+The producer propagates the initiating cause instead of trying another index.
+Only EBUSY positively attributable to a pin in a quiescent registry remains an
+availability alternative; an actual foreign transaction stays EBUSY. No stale
+session/arrangement flag classifies a new physical failure.
+
+Eleven `evaluation_join_runtime_cache_raw-*` histories pair genuine raw producer
+operations with a later public ordinary cache reuse. Actual peer reservations
+exercise clone and growth denial, including paired API and caller outcomes under
+the same held pressure. Site-specific physical clone header/key/head/next and
+growth head/next NULLs follow real admission, including a cold new-entry rollback
+and an owned LEFT. Actual foreign transaction and actual pin leases distinguish
+conflict from availability. Cache object/generation/hash payload, input snapshots,
+source writers, no escaping error output, metadata/local reservations and peer
+refund remain exact. One physical failure starts with a stale session denial flag
+and must still return ENOMEM without a new denial. Retry restacks the unchanged
+facts, produces independent literal rows, then a genuine controlled public call
+must reuse the initialized index for both heads without rebuilding. The private
+comparison profile independently matches those same literals and repeats.
+
+These are internal shared-producer tests: normal raw public ordinary dispatch is
+not claimed to select raw differential JOIN. Its actual dispatch is recursive;
+existing differential/batch/recursive tests are affected-caller regressions, not
+whole recursive qualification. The finite helper invalid/overflow tests retain
+source storage, and existing managed growth/batch-denial tests verify the precise
+errno and caller denial transfer. Other ordinary inventory items remain pending.
+
 ## Reused evidence and remaining acceptance
 
 | Obligation | Existing evidence reused | Still outstanding for complete #2371 acceptance |

@@ -4633,8 +4633,27 @@ wl_columnar_semijoin_op(const wl_plan_op_t *op, eval_stack_t *stack,
  * Falls back to ephemeral hash table when:
  *   - No key columns (kc == 0)
  *   - Delta-substituted right relation (no persistent arrangement)
- *   - Diff arrangement creation/resize fails
+ *   - A genuine pin makes a quiescent persistent cache unavailable
+ * Allocation, admission, overflow and transaction errors are propagated.
  */
+/* Raw cache availability is distinct from a transaction or allocation failure.
+ * A real pin can prevent use/relocation of an otherwise quiescent registry. */
+static bool
+wl_columnar_join_diff_cache_unavailable(const wl_col_session_t *sess)
+{
+    if (sess->diff_txn_count || sess->diff_arr_count > sess->diff_arr_cap
+        || (sess->diff_arr_count && !sess->diff_arr_entries)) return false;
+    bool pinned = false;
+    for (uint32_t i = 0; i < sess->diff_arr_count; ++i) {
+        const col_diff_arr_entry_t *e = &sess->diff_arr_entries[i];
+        if (e->transaction_pending ||
+            (e->invalidation_deferred && !e->pin_count))
+            return false;
+        if (e->pin_count) pinned = true;
+    }
+    return pinned;
+}
+
 int
 wl_columnar_join_diff_op(const wl_plan_op_t *op, eval_stack_t *stack,
     wl_col_session_t *sess)
@@ -4997,7 +5016,8 @@ wl_columnar_join_diff_op(const wl_plan_op_t *op, eval_stack_t *stack,
             darr = diff_txn.working;
         else {
             (void)col_arrangement_probe_bundle_release(&diff_bundle);
-            if (txn_rc == ENOTSUP) {
+            if (txn_rc != EBUSY ||
+                !wl_columnar_join_diff_cache_unavailable(sess)) {
                 WL_DIFF_RELEASE_TMP();
                 col_rel_destroy(out);
                 wl_columnar_join_key_scratch_free(&key_scratch, &lk);
@@ -5017,10 +5037,20 @@ wl_columnar_join_diff_op(const wl_plan_op_t *op, eval_stack_t *stack,
          * A worker's clone starts with no hash table at all, and an empty
          * right relation would otherwise probe it as it is (#2348). */
         wl_columnar_arrangement_diff_reset_state(darr);
-        if (col_diff_arrangement_ensure_ht_capacity(darr, right->nrows) != 0) {
+        int capacity_rc = col_diff_arrangement_ensure_ht_capacity(darr,
+                right->nrows);
+        if (capacity_rc != 0) {
+            /* Capture the current cause before abort destroys the working
+             * arrangement. A stale denial flag cannot classify this call. */
+            if (capacity_rc == ENOSPC) sess->memory_budget_denied = true;
             wl_columnar_arrangement_diff_txn_abort(&diff_txn);
-            darr = NULL; /* fall through to the ephemeral arrangement */
             (void)col_arrangement_probe_bundle_release(&diff_bundle);
+            WL_DIFF_RELEASE_TMP();
+            col_rel_destroy(out);
+            wl_columnar_join_key_scratch_free(&key_scratch, &lk);
+            wl_columnar_join_key_scratch_free(&key_scratch, &rk);
+            if (right_filtered) col_rel_destroy(right_filtered);
+            return wl_columnar_join_dispose_left(stack, &left_e, capacity_rc);
         }
     }
 
@@ -5312,8 +5342,8 @@ wl_columnar_join_diff_op(const wl_plan_op_t *op, eval_stack_t *stack,
             return wl_columnar_join_dispose_left(stack, &left_e, join_rc);
         }
     } else {
-        /* Every fallback owns no transaction state, including capacity and
-         * preparation failures that arrived here after an explicit abort. */
+        /* Only nonpersistent selection or genuine pin availability reaches
+         * this alternative; failed acquisition/growth already returned. */
         wl_columnar_arrangement_diff_txn_abort(&diff_txn);
         /* Ephemeral hash table fallback (same as col_op_join) */
         uint32_t nbuckets_ep;

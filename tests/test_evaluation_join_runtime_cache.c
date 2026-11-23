@@ -12,7 +12,7 @@
 #define CHECK(x) do { if (!(x)) { fprintf(stderr, "%s:%d: %s\n", __FILE__, \
                                       __LINE__,#x); abort(); } } while (0)
 #define IDS 8
-#define CACHE_SLOTS 1024
+#define CACHE_SLOTS 2048
 static const char *const heads[] = {"out", "mirror"};
 typedef struct { bool cell[2][IDS][IDS]; } image_t;
 typedef struct {
@@ -35,7 +35,8 @@ typedef struct {
     profile_t p[2]; unsigned kind, route, stage, profile, fault;
     bool left[IDS], right[IDS], seed, pin_mode, deferred, armed, stopped;
     int64_t key[3], payload[2];
-    unsigned builds, reuses, indexed, probes, private_rows, delta_mask;
+    unsigned builds, reuses, indexed, probes, private_rows, delta_mask,
+        raw_extra;
     col_diff_arrangement_pin_t pin, second_pin; uint64_t failed_attempt;
 } fixture_t;
 static fixture_t *active;
@@ -216,6 +217,12 @@ static wl_columnar_filter_context_t *context(fixture_t *f) {
     }
     for (unsigned row = 0; row < right->nrows; ++row) {
         int64_t id = col_rel_get(right, row, 1), want[4];
+        if (f->raw_extra && id >= 10 && id < (int64_t)(10 + f->raw_extra)) {
+            right_row(f, 1, want); want[0] = f->key[1]; want[1] = id;
+            for (unsigned c = 0; c < 4;
+                ++c) CHECK(col_rel_get(right, row, c) == want[c]);
+            continue;
+        }
         CHECK(id > 0 && id < 5 && f->right[id]);
         right_row(f, (unsigned)id, want);
         if (f->kind == 2 && right_key[id] == 0)want[0] = 0; /* public FLOAT storage canonicalizes signed zero */
@@ -466,6 +473,240 @@ static void invalid_float(fixture_t *f) {
             cache_t after = cache(q); same_cache(&index, &after, true);
         }
 }
+/* Actual raw DIFFERENTIAL producer failures; this is not natural public
+ * ordinary dispatch. A later public controlled call separately proves reuse. */
+static fixture_t *raw_fixture;
+static wl_columnar_diff_arrangement_test_alloc_site_t raw_site;
+static bool raw_injected;
+static bool raw_allocation(wl_columnar_diff_arrangement_test_alloc_site_t site,
+    size_t bytes)
+{
+    if (site != raw_site || raw_injected) return false;
+    fixture_t *f = raw_fixture;
+    wl_col_session_t *s = COL_SESSION(f->p[0].session);
+    CHECK(!wl_evaluation_control_active_attempt_id(f->p[0].control)
+        && s->diff_arr_count == 1 &&
+        s->diff_arr_entries[0].transaction_pending);
+    const col_diff_arrangement_t *a = s->diff_arr_entries[0].diff_arr;
+    size_t expected = site ==
+        WL_COLUMNAR_DIFF_ARRANGEMENT_TEST_CLONE_HEADER ? sizeof(*a)
+        : site ==
+        WL_COLUMNAR_DIFF_ARRANGEMENT_TEST_CLONE_KEYS ? sizeof(uint32_t)
+        : site ==
+        WL_COLUMNAR_DIFF_ARRANGEMENT_TEST_CLONE_HEADS ? a->nbuckets*
+        sizeof(uint32_t)
+        : site ==
+        WL_COLUMNAR_DIFF_ARRANGEMENT_TEST_CLONE_NEXT ? a->ht_cap*
+        sizeof(uint32_t)
+        : site ==
+        WL_COLUMNAR_DIFF_ARRANGEMENT_TEST_GROW_HEADS ? 2*a->nbuckets*
+        sizeof(uint32_t)
+        : 2*a->ht_cap*sizeof(uint32_t);
+    CHECK(bytes == expected && s->diff_txn_count ==
+        (site >= WL_COLUMNAR_DIFF_ARRANGEMENT_TEST_GROW_HEADS ? 1u : 0u));
+    raw_injected = true; return true;
+}
+static void raw_literal(const col_rel_t *out, unsigned extra)
+{
+    CHECK(out && out->ncols == 2 && out->nrows == 3 + extra && out->column_types
+        && out->column_types[0] == WIRELOG_TYPE_INT64 &&
+        out->column_types[1] == WIRELOG_TYPE_INT64);
+    bool seen[1120] = {false};
+    CHECK(10 + extra < sizeof(seen)/sizeof(seen[0]));
+    for (uint32_t row = 0; row < out->nrows; ++row) {
+        int64_t l = col_rel_get(out, row, 0), r = col_rel_get(out, row, 1);
+        CHECK(r > 0 && r < (int64_t)(sizeof(seen)/sizeof(seen[0])) && !seen[r]);
+        CHECK((r <= 3 && l == r) ||
+            (r >= 10 && r < (int64_t)(10 + extra) && l == 2));
+        seen[r] = true;
+    }
+    for (unsigned i = 1; i <= 3; ++i) CHECK(seen[i]);
+    for (unsigned i = 0; i < extra; ++i) CHECK(seen[10+i]);
+}
+static void raw_errors(fixture_t *f, const char *mode)
+{
+    CHECK(f->route == 1); profile_t *p = &f->p[0];
+    wl_col_session_t *s = COL_SESSION(p->session);
+    bool cold = !strcmp(mode, "raw-cold-clone-nomem"),
+        pin = !strcmp(mode, "raw-pin"),
+        conflict = !strcmp(mode, "raw-active"),
+        clone_denied = !strcmp(mode, "raw-clone-denied"),
+        growth_denied = !strcmp(mode, "raw-growth-denied"),
+        stale = !strcmp(mode, "raw-clone-next-nomem");
+    raw_site = !strcmp(mode,
+            "raw-clone-nomem") ||
+        cold ? WL_COLUMNAR_DIFF_ARRANGEMENT_TEST_CLONE_HEADER
+        : !strcmp(mode,
+            "raw-clone-keys-nomem") ?
+        WL_COLUMNAR_DIFF_ARRANGEMENT_TEST_CLONE_KEYS
+        : !strcmp(mode,
+            "raw-clone-heads-nomem") ?
+        WL_COLUMNAR_DIFF_ARRANGEMENT_TEST_CLONE_HEADS
+        : stale ? WL_COLUMNAR_DIFF_ARRANGEMENT_TEST_CLONE_NEXT
+        : !strcmp(mode,
+            "raw-growth-heads-nomem") ?
+        WL_COLUMNAR_DIFF_ARRANGEMENT_TEST_GROW_HEADS
+        : !strcmp(mode,
+            "raw-growth-next-nomem") ?
+        WL_COLUMNAR_DIFF_ARRANGEMENT_TEST_GROW_NEXT : 0;
+    CHECK(cold || pin || conflict || clone_denied || growth_denied || raw_site);
+    insert_left(f, 1); insert_left(f, 2); insert_left(f, 3);
+    change_right(f, 1, false); change_right(f, 2, false);
+    change_right(f, 3, false);
+    if (!cold) seed(f);
+    if (growth_denied ||
+        raw_site == WL_COLUMNAR_DIFF_ARRANGEMENT_TEST_GROW_HEADS
+        || raw_site == WL_COLUMNAR_DIFF_ARRANGEMENT_TEST_GROW_NEXT) {
+        f->raw_extra = raw_site ==
+            WL_COLUMNAR_DIFF_ARRANGEMENT_TEST_GROW_NEXT ? 1100u : 800u;
+        for (unsigned i = 0; i < f->raw_extra; ++i) {
+            int64_t row[4]; right_row(f, 1, row); row[0] = f->key[1];
+            row[1] = 10+i;
+            for (unsigned q = 0; q < 2;
+                ++q) CHECK(!wl_session_insert(f->p[q].session, "right", row, 1,
+                    4));
+        }
+    }
+    col_rel_t *left = session_find_rel(s, "left"),
+        *right = session_find_rel(s, "right");
+    col_relation_snapshot_t ls = wl_columnar_relation_snapshot(left),
+        rs = wl_columnar_relation_snapshot(right);
+    cache_t before = cache(p);
+    wl_columnar_memory_governor_t *g =
+        wl_columnar_memory_governor_ref_get(p->governor);
+    uint64_t baseline = wl_columnar_memory_reserved(g),
+        registry_bytes = s->diff_arr_registry_reserved_bytes,
+        metadata_bytes = s->diff_arr_registry_metadata_reserved_bytes;
+    wl_columnar_arrangement_diff_txn_t outer = {0};
+    wl_columnar_source_access_reader_t outer_reader = {0};
+    uint32_t key = 0;
+    if (conflict) {
+        CHECK(!col_rel_source_reader_acquire(right, &outer_reader));
+        CHECK(!wl_columnar_arrangement_diff_txn_begin(s, "right", right, &key,
+            1, &outer));
+        CHECK(s->diff_txn_count == 1 && outer.working &&
+            outer.entry->transaction_pending);
+    }
+    if (pin) CHECK(!col_session_pin_diff_arrangement(s, "right", right, &key, 1,
+            &f->pin));
+    col_rel_t *input = left;
+    bool owned = raw_site == WL_COLUMNAR_DIFF_ARRANGEMENT_TEST_CLONE_KEYS;
+    if (owned) {
+        CHECK(!wl_columnar_relation_new_auto_governed("$owned_left", 2, 0,
+            false, p->governor, &input));
+        CHECK(!col_rel_set_column_types(input, left->column_types, 2));
+        CHECK(!col_rel_append_all(input, left, NULL));
+    }
+    wl_columnar_memory_reservation_t peer;
+    wl_columnar_memory_reservation_init(&peer);
+    uint64_t spare = clone_denied ? 4096u : 11000u;
+    uint64_t peer_bytes = clone_denied ||
+        growth_denied ? WL_COLUMNAR_MEMORY_MIN_BUDGET -
+        wl_columnar_memory_reserved(g) - spare : 37u;
+    CHECK(wl_columnar_memory_reserve_checked(g, peer_bytes,
+        &peer) == WL_COLUMNAR_MEMORY_ADMISSION_OK);
+    uint64_t denials = wl_columnar_memory_denials(g);
+    if (clone_denied || growth_denied) {
+        /* Pair the real API cause with the caller outcome under unchanged
+         * facts and the SAME still-held peer reservation. */
+        wl_columnar_source_access_reader_t reader = {0};
+        CHECK(!col_rel_source_reader_acquire(right, &reader));
+        wl_columnar_arrangement_diff_txn_t probe = {0};
+        int api = wl_columnar_arrangement_diff_txn_begin(s, "right", right,
+                &key, 1, &probe);
+        if (growth_denied) {
+            CHECK(!api && probe.working && s->diff_txn_count == 1);
+            api = col_diff_arrangement_ensure_ht_capacity(probe.working,
+                    right->nrows);
+            CHECK(api == ENOSPC &&
+                probe.working->memory_budget_denial_pending &&
+                !s->memory_budget_denied);
+            wl_columnar_arrangement_diff_txn_abort(&probe);
+        } else CHECK(s->memory_budget_denied && !probe.working);
+        CHECK(api == ENOSPC && wl_columnar_memory_denials(g) == denials+1 &&
+            !s->diff_txn_count);
+        CHECK(!col_rel_source_reader_release(&reader));
+        cache_t api_after = cache(p); same_cache(&before, &api_after, true);
+        CHECK(wl_columnar_memory_reserved(g) == baseline+peer.bytes);
+        fprintf(stdout, "raw API first cause %s rc=%d denial=1\n", mode, api);
+        wl_columnar_session_budget_denial_clear(s);
+        denials = wl_columnar_memory_denials(g);
+    }
+    s->memory_budget_denied = stale;
+    raw_fixture = f; raw_injected = false;
+    wl_columnar_diff_arrangement_test_fail_allocation =
+        raw_site ? raw_allocation : NULL;
+    eval_stack_t stack; eval_stack_init(&stack);
+    CHECK(!eval_stack_push(&stack, input, owned));
+    int rc = col_op_join_diff(f->op, &stack, s);
+    wl_columnar_diff_arrangement_test_fail_allocation = NULL;
+    int expected = pin ? 0 : conflict ? EBUSY : clone_denied ||
+        growth_denied ? ENOSPC : ENOMEM;
+    fprintf(stdout, "raw current cause %s rc=%d denials=%llu\n", mode, rc,
+        (unsigned long long)(wl_columnar_memory_denials(g)-denials));
+    CHECK(rc == expected && raw_injected == (raw_site != 0));
+    CHECK(wl_columnar_memory_denials(g) == denials + (clone_denied ||
+        growth_denied ? 1u : 0u));
+    CHECK(s->memory_budget_denied == (stale || clone_denied || growth_denied));
+    CHECK(stack.top == (pin ? 1u : 0u));
+    if (pin) {
+        raw_literal(stack.items[0].rel, f->raw_extra); eval_stack_drain(&stack);
+        cache_t held = cache(p), wanted = before;
+        ++wanted.pins; ++wanted.readers; ++wanted.descriptor_readers;
+        same_cache(&wanted, &held, true);
+        col_diff_arrangement_pin_release(&f->pin);
+    }
+    if (conflict) {
+        CHECK(s->diff_txn_count == 1 && outer.working &&
+            outer.entry->transaction_pending
+            && atomic_load_explicit(&right->descriptor_access.state,
+            memory_order_acquire) == 1);
+        wl_columnar_arrangement_diff_txn_abort(&outer);
+        CHECK(!col_rel_source_reader_release(&outer_reader));
+    }
+    CHECK(!s->diff_txn_count);
+    cache_t after = cache(p); same_cache(&before, &after, !cold);
+    CHECK(wl_columnar_relation_snapshot_equal(ls,
+        wl_columnar_relation_snapshot(left))
+        && wl_columnar_relation_snapshot_equal(rs,
+        wl_columnar_relation_snapshot(right)));
+    for (unsigned i = 0; i < 2; ++i) {
+        wl_columnar_source_access_writer_t writer = {0};
+        CHECK(!col_rel_source_writer_acquire(i?right:left, &writer)
+            && !wl_columnar_source_access_writer_release(&writer));
+    }
+    CHECK(s->diff_arr_registry_metadata_reserved_bytes == metadata_bytes);
+    CHECK(wl_columnar_memory_reserved(g) == baseline + peer.bytes
+        + s->diff_arr_registry_reserved_bytes - registry_bytes);
+    CHECK(atomic_load_explicit(&peer.state,
+        memory_order_acquire) == WL_COLUMNAR_MEMORY_RESERVATION_RESERVED);
+    uint64_t held_bytes = wl_columnar_memory_reserved(g), refund = peer.bytes;
+    CHECK(wl_columnar_memory_rollback(&peer) &&
+        wl_columnar_memory_reserved(g) == held_bytes-refund);
+    wl_columnar_session_budget_denial_clear(s);
+    eval_stack_init(&stack); CHECK(!eval_stack_push(&stack, left, false));
+    CHECK(!col_op_join_diff(f->op, &stack, s));
+    raw_literal(stack.items[0].rel, f->raw_extra);
+    eval_stack_drain(&stack);
+    cache_t initialized = cache(p);
+    CHECK(initialized.indexed == right->nrows && !initialized.pins);
+    for (unsigned q = 0; q < 2; ++q) {
+        watch(f, q, true); CHECK(!finish(f, &f->p[q]));
+        for (unsigned h = 0; h < 2;
+            ++h) raw_literal(session_find_rel(COL_SESSION(f->p[q].session),
+                heads[h]), f->raw_extra);
+        if (!q) {
+            cache_t reused = cache(p); same_cache(&initialized, &reused, false);
+            CHECK(f->reuses == 2 && !f->builds && !f->indexed &&
+                !f->private_rows && f->probes);
+        } else CHECK(!cache(&f->p[q]).count && f->private_rows);
+        watch(f, q, false); CHECK(!finish(f, &f->p[q]));
+        for (unsigned h = 0; h < 2;
+            ++h) raw_literal(session_find_rel(COL_SESSION(f->p[q].session),
+                heads[h]), f->raw_extra);
+    }
+}
+
 int main(int argc, char **argv) {
     CHECK(argc == 4); fixture_t f = {0}; f.kind = (unsigned)atoi(argv[1]);
     f.route = (unsigned)atoi(argv[2]); CHECK(f.kind < 3 && f.route < 3);
@@ -477,7 +718,9 @@ int main(int argc, char **argv) {
     f.fault = !strcmp(argv[3], "cancel") ? 1u : !strcmp(argv[3], "nomem") ? 2u
         : !strcmp(argv[3], "deferred-cancel") ? 3u : !strcmp(argv[3],
             "deferred-work") ? 4u : 0u;
-    CHECK(!strcmp(argv[3], "healthy") || f.seed || f.pin_mode || f.fault);
+    bool raw_mode = !strncmp(argv[3], "raw-", 4);
+    CHECK(!strcmp(argv[3],
+        "healthy") || f.seed || f.pin_mode || f.fault || raw_mode);
     const char *vars[] = {"WIRELOG_DIFF_ENABLED", "WIRELOG_JOIN_BATCH_BYTES",
                           "WIRELOG_JOIN_BATCH_STRICT",
                           "WIRELOG_JOIN_OUTPUT_LIMIT",
@@ -536,6 +779,9 @@ int main(int argc, char **argv) {
         else COL_SESSION(q->session)->diff_enabled = false;
         if (!f.route)wl_session_set_delta_cb(q->session, event, q);
         CHECK(!finish(&f, q));
+    }
+    if (raw_mode) {
+        raw_errors(&f, argv[3]); goto teardown;
     }
     image_t old = {0};
     for (f.stage = 0; f.stage < 5; ++f.stage) {
@@ -623,6 +869,7 @@ int main(int argc, char **argv) {
         old = want;
         if (f.deferred && f.stage == 1) deferred_rebuild(&f, &old);
     }
+teardown:
     CHECK(!f.fault || f.stopped); CHECK(!f.pin.active && !f.second_pin.active);
     for (unsigned p = 0; p < 2; ++p) {
         CHECK(!wl_session_try_destroy(&f.p[p].session));
