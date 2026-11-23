@@ -28,6 +28,15 @@
 
 static void diff_entry_reset(col_diff_arr_entry_t *entry);
 
+static int
+wl_columnar_arrangement_diff_admission_error(
+    wl_columnar_memory_admission_status_t status)
+{
+    return status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED ? ENOSPC
+        : status == WL_COLUMNAR_MEMORY_ADMISSION_OVERFLOW ? EOVERFLOW
+        : status == WL_COLUMNAR_MEMORY_ADMISSION_INVALID ? EINVAL : ENOMEM;
+}
+
 /* ======================================================================== */
 /* Arrangement Layer (Phase 3C)                                             */
 /* ======================================================================== */
@@ -3057,10 +3066,7 @@ col_session_get_diff_arrangement(wl_col_session_t *cs, const char *rel_name,
         diff_registry_metadata_rollback(cs, metadata_governed);
         if (status_out)
             *status_out =
-                admission_status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED
-                ? ENOSPC
-                : admission_status == WL_COLUMNAR_MEMORY_ADMISSION_OVERFLOW
-                ? EOVERFLOW : ENOMEM;
+                wl_columnar_arrangement_diff_admission_error(admission_status);
         return NULL;
     }
     diff_registry_metadata_commit(cs, metadata_bytes, metadata_governed);
@@ -3238,11 +3244,8 @@ wl_columnar_arrangement_diff_txn_begin(wl_col_session_t *cs,
             free(entry->key_cols);
             memset(entry, 0, sizeof(*entry));
             diff_registry_metadata_rollback(cs, metadata_governed);
-            return admission_status
-                   == WL_COLUMNAR_MEMORY_ADMISSION_DENIED ? ENOSPC
-                : admission_status
-                   == WL_COLUMNAR_MEMORY_ADMISSION_OVERFLOW ? EOVERFLOW
-                : ENOMEM;
+            return wl_columnar_arrangement_diff_admission_error(
+                admission_status);
         }
         diff_registry_metadata_commit(cs, metadata_bytes,
             metadata_governed);
@@ -3283,7 +3286,7 @@ wl_columnar_arrangement_diff_txn_begin(wl_col_session_t *cs,
             entry->transaction_pending = false;
         }
         memset(txn, 0, sizeof(*txn));
-        return ENOMEM;
+        return wl_columnar_arrangement_diff_admission_error(admission_status);
     }
     col_diff_arrangement_attach_ledger(txn->working,
         txn->pending_entry ? &cs->mem_ledger : txn->persistent->ledger);

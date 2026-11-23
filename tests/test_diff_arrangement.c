@@ -242,7 +242,9 @@ test_diff_arrangement_governor_growth_commit(void)
         ? wl_columnar_memory_reserved(growth_governor) : 0;
     if (!growth_ref || !growth_arr
         || col_diff_arrangement_ensure_ht_capacity(
-            growth_arr, growth_arr->ht_cap + 1u) != ENOMEM
+            growth_arr, growth_arr->ht_cap + 1u) != ENOSPC
+        || !growth_arr->memory_budget_denial_pending
+        || wl_columnar_memory_denials(growth_governor) != 1
         || growth_arr->ht_head != old_head
         || growth_arr->ht_next != old_next
         || growth_arr->reserved_bytes != old_reserved
@@ -308,6 +310,50 @@ test_diff_arrangement_governor_growth_commit(void)
     PASS;
 }
 
+static void
+test_diff_arrangement_precise_status(void)
+{
+    TEST("invalid and overflow status preserve their cause");
+    wl_columnar_memory_admission_status_t status =
+        WL_COLUMNAR_MEMORY_ADMISSION_OK;
+    col_diff_arrangement_t *copy =
+        col_diff_arrangement_create_with_memory_governor_status(NULL, 1, 0,
+            NULL, &status);
+    if (copy || status != WL_COLUMNAR_MEMORY_ADMISSION_INVALID) {
+        FAIL("invalid create status"); col_diff_arrangement_destroy(copy);
+        return;
+    }
+    copy = col_diff_arrangement_deep_copy_with_memory_governor_status(NULL,
+            NULL, &status);
+    if (copy || status != WL_COLUMNAR_MEMORY_ADMISSION_INVALID) {
+        FAIL("invalid clone status"); col_diff_arrangement_destroy(copy);
+        return;
+    }
+    uint32_t key = 0;
+    col_diff_arrangement_t *arr = col_diff_arrangement_create(&key, 1, 0);
+    if (!arr) {
+        FAIL("source allocation"); return;
+    }
+    uint32_t *keys = arr->key_cols; arr->key_cols = NULL;
+    copy = col_diff_arrangement_deep_copy_with_memory_governor_status(arr, NULL,
+            &status);
+    arr->key_cols = keys;
+    if (copy || status != WL_COLUMNAR_MEMORY_ADMISSION_INVALID) {
+        FAIL("invalid clone shape"); col_diff_arrangement_destroy(copy);
+        col_diff_arrangement_destroy(arr); return;
+    }
+    uint32_t *heads = arr->ht_head, *next = arr->ht_next;
+    uint32_t buckets = arr->nbuckets, capacity = arr->ht_cap;
+    if (col_diff_arrangement_ensure_ht_capacity(arr, UINT32_MAX) != EOVERFLOW
+        || arr->ht_head != heads || arr->ht_next != next ||
+        arr->nbuckets != buckets
+        || arr->ht_cap != capacity || arr->memory_budget_denial_pending) {
+        FAIL("overflow altered the existing source");
+        col_diff_arrangement_destroy(arr); return;
+    }
+    col_diff_arrangement_destroy(arr); PASS;
+}
+
 int
 main(void)
 {
@@ -320,6 +366,7 @@ main(void)
     test_diff_arrangement_deep_copy();
     test_diff_arrangement_reset_delta();
     test_diff_arrangement_governor_growth_commit();
+    test_diff_arrangement_precise_status();
 
     printf("\n==========================================\n");
     printf("Results: %d/%d passed\n", pass_count, test_count);

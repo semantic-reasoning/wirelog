@@ -18,6 +18,24 @@
 
 #define DIFF_ARRANGEMENT_INITIAL_BUCKETS 1024
 
+#ifdef WL_SESSION_TEST_HOOKS
+bool (*wl_columnar_diff_arrangement_test_fail_allocation)(
+    wl_columnar_diff_arrangement_test_alloc_site_t site, size_t bytes);
+#endif
+static void *
+wl_columnar_diff_arrangement_allocate(size_t bytes, bool zero,
+    wl_columnar_diff_arrangement_test_alloc_site_t site)
+{
+#ifdef WL_SESSION_TEST_HOOKS
+    if (wl_columnar_diff_arrangement_test_fail_allocation
+        && wl_columnar_diff_arrangement_test_fail_allocation(site, bytes))
+        return NULL;
+#else
+    (void)site;
+#endif
+    return zero ? calloc(1, bytes) : malloc(bytes);
+}
+
 uint64_t
 col_diff_arrangement_bytes(const col_diff_arrangement_t *arr)
 {
@@ -250,8 +268,10 @@ col_diff_arrangement_create_with_memory_governor_status(
 
     if (status_out)
         *status_out = WL_COLUMNAR_MEMORY_ADMISSION_OK;
-    if (key_count > 0 && !key_cols)
+    if (key_count > 0 && !key_cols) {
+        if (status_out) *status_out = WL_COLUMNAR_MEMORY_ADMISSION_INVALID;
         return NULL;
+    }
     if (!wl_columnar_memory_size_mul(key_count, sizeof(uint32_t),
         &key_bytes)
         || !wl_columnar_memory_size_mul(DIFF_ARRANGEMENT_INITIAL_BUCKETS,
@@ -259,8 +279,10 @@ col_diff_arrangement_create_with_memory_governor_status(
         || !diff_shape_bytes(key_count, DIFF_ARRANGEMENT_INITIAL_BUCKETS,
         DIFF_ARRANGEMENT_INITIAL_BUCKETS, &initial_bytes)
         || !diff_size_arg(key_bytes, &key_size)
-        || !diff_size_arg(next_bytes, &next_size))
+        || !diff_size_arg(next_bytes, &next_size)) {
+        if (status_out) *status_out = WL_COLUMNAR_MEMORY_ADMISSION_OVERFLOW;
         return NULL;
+    }
 
     wl_columnar_memory_reservation_init(&pending);
     if (memory_governor) {
@@ -403,8 +425,11 @@ col_diff_arrangement_deep_copy_with_memory_governor_status(
     if (!arr
         || (arr->key_count > 0 && !arr->key_cols)
         || (arr->nbuckets > 0 && !arr->ht_head)
-        || (arr->ht_cap > 0 && !arr->ht_next)
-        || !wl_columnar_memory_size_mul(arr->key_count, sizeof(uint32_t),
+        || (arr->ht_cap > 0 && !arr->ht_next)) {
+        if (status_out) *status_out = WL_COLUMNAR_MEMORY_ADMISSION_INVALID;
+        return NULL;
+    }
+    if (!wl_columnar_memory_size_mul(arr->key_count, sizeof(uint32_t),
         &key_bytes)
         || !wl_columnar_memory_size_mul(arr->nbuckets, sizeof(uint32_t),
         &bucket_bytes)
@@ -414,8 +439,10 @@ col_diff_arrangement_deep_copy_with_memory_governor_status(
         &copy_bytes)
         || !diff_size_arg(key_bytes, &key_size)
         || !diff_size_arg(bucket_bytes, &bucket_size)
-        || !diff_size_arg(next_bytes, &next_size))
+        || !diff_size_arg(next_bytes, &next_size)) {
+        if (status_out) *status_out = WL_COLUMNAR_MEMORY_ADMISSION_OVERFLOW;
         return NULL;
+    }
 
     wl_columnar_memory_reservation_init(&pending);
     if (memory_governor) {
@@ -432,12 +459,19 @@ col_diff_arrangement_deep_copy_with_memory_governor_status(
         pending_valid = true;
     }
 
-    copy = malloc(sizeof(*copy));
+    copy = wl_columnar_diff_arrangement_allocate(sizeof(*copy), false,
+            WL_COLUMNAR_DIFF_ARRANGEMENT_TEST_CLONE_HEADER);
     if (!copy)
         goto fail;
-    copy->key_cols = key_bytes ? malloc(key_size) : NULL;
-    copy->ht_head = bucket_bytes ? malloc(bucket_size) : NULL;
-    copy->ht_next = next_bytes ? malloc(next_size) : NULL;
+    copy->key_cols = key_bytes ? wl_columnar_diff_arrangement_allocate(key_size,
+            false,
+            WL_COLUMNAR_DIFF_ARRANGEMENT_TEST_CLONE_KEYS) : NULL;
+    copy->ht_head =
+        bucket_bytes ? wl_columnar_diff_arrangement_allocate(bucket_size, false,
+            WL_COLUMNAR_DIFF_ARRANGEMENT_TEST_CLONE_HEADS) : NULL;
+    copy->ht_next =
+        next_bytes ? wl_columnar_diff_arrangement_allocate(next_size, false,
+            WL_COLUMNAR_DIFF_ARRANGEMENT_TEST_CLONE_NEXT) : NULL;
     if ((key_bytes && !copy->key_cols)
         || (bucket_bytes && !copy->ht_head)
         || (next_bytes && !copy->ht_next))
@@ -528,7 +562,7 @@ col_diff_arrangement_ensure_ht_capacity(col_diff_arrangement_t *arr,
     replace_next = !arr->ht_next || target_cap != arr->ht_cap;
     before = col_diff_arrangement_bytes(arr);
     if (before == 0)
-        return ENOMEM;
+        return EOVERFLOW;
 
     wl_columnar_memory_reservation_init(&pending);
     if (arr->memory_governor && prospective > arr->reserved_bytes) {
@@ -540,7 +574,9 @@ col_diff_arrangement_ensure_ht_capacity(col_diff_arrangement_t *arr,
             && status != WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY) {
             if (status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED)
                 arr->memory_budget_denial_pending = true;
-            return ENOMEM;
+            return status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED ? ENOSPC
+                : status == WL_COLUMNAR_MEMORY_ADMISSION_OVERFLOW ? EOVERFLOW
+                : EINVAL;
         }
         pending_valid = true;
     }
@@ -557,7 +593,8 @@ col_diff_arrangement_ensure_ht_capacity(col_diff_arrangement_t *arr,
             failure_rc = EOVERFLOW;
             goto fail;
         }
-        new_next = malloc(next_size);
+        new_next = wl_columnar_diff_arrangement_allocate(next_size, false,
+                WL_COLUMNAR_DIFF_ARRANGEMENT_TEST_GROW_NEXT);
         if (!new_next)
             goto fail;
         if (!replace_head && arr->ht_next && arr->ht_cap > 0) {
@@ -585,7 +622,8 @@ col_diff_arrangement_ensure_ht_capacity(col_diff_arrangement_t *arr,
             failure_rc = EOVERFLOW;
             goto fail;
         }
-        new_head = calloc(1, head_size);
+        new_head = wl_columnar_diff_arrangement_allocate(head_size, true,
+                WL_COLUMNAR_DIFF_ARRANGEMENT_TEST_GROW_HEADS);
         if (!new_head)
             goto fail;
     }

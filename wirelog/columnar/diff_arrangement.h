@@ -97,6 +97,8 @@ col_diff_arrangement_t *col_diff_arrangement_create(
 col_diff_arrangement_t *col_diff_arrangement_create_with_memory_governor(
     const uint32_t *key_cols, uint32_t key_count, uint32_t worker_id,
     wl_columnar_memory_governor_ref_t *memory_governor);
+/* On NULL, status distinguishes invalid arguments, checked-size overflow,
+ * governor denial and a post-admission physical failure (status remains OK). */
 col_diff_arrangement_t *col_diff_arrangement_create_with_memory_governor_status(
     const uint32_t *key_cols, uint32_t key_count, uint32_t worker_id,
     wl_columnar_memory_governor_ref_t *memory_governor,
@@ -158,6 +160,9 @@ col_diff_arrangement_t *col_diff_arrangement_deep_copy(
 col_diff_arrangement_t *col_diff_arrangement_deep_copy_with_memory_governor(
     const col_diff_arrangement_t *arr,
     wl_columnar_memory_governor_ref_t *memory_governor);
+/* On NULL, status distinguishes invalid shape, checked-size overflow and
+ * governor denial. OK means admission succeeded (or was not required), so
+ * a later physical allocation failure is ENOMEM, not a budget denial. */
 col_diff_arrangement_t *
 col_diff_arrangement_deep_copy_with_memory_governor_status(
     const col_diff_arrangement_t *arr,
@@ -177,9 +182,26 @@ void col_diff_arrangement_reset_delta(col_diff_arrangement_t *arr);
  * Ensures ht_next can hold at least nrows entries. If load factor exceeds
  * 75%, rebuilds bucket array (sets indexed_rows = 0 to force full re-index).
  *
- * Returns: 0 on success, ENOMEM on allocation failure
+ * Returns: 0 on success; ENOSPC on governor denial (also marks the arrangement),
+ * EOVERFLOW on checked sizing, EINVAL on invalid arguments/admission, or
+ * ENOMEM on a physical allocation failure after successful admission.
  */
 int col_diff_arrangement_ensure_ht_capacity(col_diff_arrangement_t *arr,
     uint32_t nrows);
+
+/* Narrow allocation decisions used only by the differential producer tests.
+ * Each site is after real admission and before the actual allocation. */
+typedef enum {
+    WL_COLUMNAR_DIFF_ARRANGEMENT_TEST_CLONE_HEADER = 1,
+    WL_COLUMNAR_DIFF_ARRANGEMENT_TEST_CLONE_KEYS,
+    WL_COLUMNAR_DIFF_ARRANGEMENT_TEST_CLONE_HEADS,
+    WL_COLUMNAR_DIFF_ARRANGEMENT_TEST_CLONE_NEXT,
+    WL_COLUMNAR_DIFF_ARRANGEMENT_TEST_GROW_HEADS,
+    WL_COLUMNAR_DIFF_ARRANGEMENT_TEST_GROW_NEXT
+} wl_columnar_diff_arrangement_test_alloc_site_t;
+#ifdef WL_SESSION_TEST_HOOKS
+extern bool (*wl_columnar_diff_arrangement_test_fail_allocation)(
+    wl_columnar_diff_arrangement_test_alloc_site_t site, size_t bytes);
+#endif
 
 #endif /* WL_COLUMNAR_DIFF_ARRANGEMENT_H */

@@ -8338,3 +8338,12 @@ foreach mode : ['deferred-cancel', 'deferred-work']
   test('evaluation_join_runtime_cache_' + mode, join_runtime_cache_exe,
     args: ['2', '0', mode], suite: ['unit', 'tsan', 'evaluation_join_hosts'], timeout: 120)
 endforeach
+
+# Shared raw DIFFERENTIAL producer causes, then genuine public ordinary cache reuse.
+foreach mode : ['raw-clone-denied', 'raw-growth-denied', 'raw-clone-nomem',
+                'raw-cold-clone-nomem', 'raw-clone-keys-nomem', 'raw-clone-heads-nomem',
+                'raw-clone-next-nomem', 'raw-growth-heads-nomem', 'raw-growth-next-nomem',
+                'raw-active', 'raw-pin']
+  test('evaluation_join_runtime_cache_' + mode, join_runtime_cache_exe,
+    args: ['2', '1', mode], suite: ['unit', 'tsan', 'evaluation_join_hosts'], timeout: 120)
+endforeach
