@@ -112,6 +112,133 @@ run_case() {
     printf '%s' "$output" > "$tmp/$name.out"
 }
 
+# The runner's child starts in the runner's process group and setsid(1)
+# moves it out only once it runs.  These shims replay the losing order
+# without timing luck: setsid waits until ps has been asked about the child,
+# so the first answer always names the runner's own group.  In "never" mode
+# setsid does not move the child at all; in "group-only" mode the child leads
+# a new group but stays in the runner's session, as when setsid forks.  The
+# runner runs in a session of its own under a leader that records any TERM
+# sent to that group, so a runner that signals the group it saw is caught
+# even when its own trap survives the signal, and never reaches this script.
+real_ps=$(command -v ps)
+real_setsid=$(command -v setsid)
+mkdir -p "$tmp/race-bin"
+cat > "$tmp/race-bin/ps" <<EOF
+#!/usr/bin/env bash
+target=
+args=("\$@")
+for ((i = 0; i < \${#args[@]}; i++)); do
+    [[ \${args[i]} == -p ]] && target=\${args[i + 1]}
+done
+pid=\$\$
+while [[ -n \$target && \$pid -gt 1 ]]; do
+    [[ \$pid == "\$target" ]] && exec "$real_ps" "\$@"
+    read -r _ _ _ pid _ < "/proc/\$pid/stat" || break
+done
+# Answer first, then let setsid run: the child cannot have moved yet.
+out=\$("$real_ps" "\$@")
+rc=\$?
+[[ -n \$target ]] && : > "$tmp/race-asked"
+printf '%s\\n' "\$out"
+exit "\$rc"
+EOF
+cat > "$tmp/race-bin/setsid" <<EOF
+#!/usr/bin/env bash
+for _ in \$(seq 1 200); do
+    [[ -e "$tmp/race-asked" ]] && break
+    sleep 0.05
+done
+[[ \$1 == --wait ]] && shift
+if [[ -e "$tmp/race-never" ]]; then
+    exec "\$@"
+fi
+if [[ -e "$tmp/race-group-only" ]]; then
+    exec python3 -c 'import os, sys; os.setpgid(0, 0); os.execvp(sys.argv[1], sys.argv[1:])' "\$@"
+fi
+exec "$real_setsid" "\$@"
+EOF
+chmod +x "$tmp/race-bin/ps" "$tmp/race-bin/setsid"
+
+race_case() {
+    local name=$1 want=$2 evidence="$tmp/evidence-$1" status
+    rm -f "$tmp/race-asked" "$tmp/race-signalled"
+    set +e
+    DOOP_FIXTURE_MODE=success DOOP_DATA_DIR="$tmp/data" DOOP_CGROUP_ROOT="$tmp/cgroup" \
+        DOOP_FIXTURE_CHILD="$tmp/child.pid" DOOP_CGROUP_MARKER="$evidence/cgroup-attached" \
+        DOOP_CALIBRATION_ISOLATE_POLLS=20 PATH="$tmp/race-bin:$PATH" \
+        "$real_setsid" --wait bash -c '
+            trap ": > \"\$0\"" TERM
+            "$@" &
+            child=$!
+            while :; do
+                wait "$child"
+                rc=$?
+                kill -0 "$child" 2>/dev/null || break
+            done
+            exit "$rc"' "$tmp/race-signalled" \
+        "$fixture/scripts/run_doop_validation.sh" --calibration \
+        --memory-limit-kb 1024 --evidence-dir "$evidence" --wall-timeout 10 \
+        > "$tmp/$name.out" 2>&1
+    status=$?
+    set -e
+    if [[ ! -e "$tmp/race-asked" || -e "$tmp/race-signalled" || "$status" != "$want" ]]; then
+        printf 'test-doop-validation: FAIL %s (want %s got %s, child queried: %s, group signalled: %s)\n' \
+            "$name" "$want" "$status" "$([[ -e "$tmp/race-asked" ]] && echo yes || echo no)" \
+            "$([[ -e "$tmp/race-signalled" ]] && echo yes || echo no)" >&2
+        sed 's/^/    /' "$tmp/$name.out" >&2
+        return 1
+    fi
+}
+
+race_case setsid_race 0
+grep -q 'RESULT: PASS' "$tmp/setsid_race.out"
+[[ -s "$tmp/evidence-setsid_race/cgroup-attached" ]]
+printf 'test-doop-validation: ok setsid_race\n'
+
+# A child that never leads its own session must be refused without
+# signalling any group, because the only one seen is the runner's own.
+: > "$tmp/race-never"
+race_case setsid_never 1
+rm -f "$tmp/race-never"
+grep -q 'could not isolate calibration process group' "$tmp/setsid_never.out"
+[[ ! -e "$tmp/evidence-setsid_never/cgroup-attached" ]]
+[[ ! -e "$tmp/evidence-setsid_never/final.tsv" ]]
+printf 'test-doop-validation: ok setsid_never\n'
+
+command -v python3 > /dev/null || {
+    echo 'test-doop-validation: FAIL setsid_group_only (python3 not found)' >&2
+    exit 1
+}
+: > "$tmp/race-group-only"
+race_case setsid_group_only 1
+rm -f "$tmp/race-group-only"
+grep -q 'could not isolate calibration process group' "$tmp/setsid_group_only.out"
+[[ ! -e "$tmp/evidence-setsid_group_only/cgroup-attached" ]]
+printf 'test-doop-validation: ok setsid_group_only\n'
+
+# The poll count reaches bash arithmetic, which would run a subscript, and
+# zero polls, or a count that wraps in bash arithmetic, would refuse before
+# the child has run.  All are rejected before anything is launched.
+for polls in 0 9223372036854775808 "a[\$(: > $tmp/polls-ran)]"; do
+    rm -rf "$tmp/evidence-polls"
+    set +e
+    DOOP_FIXTURE_MODE=success DOOP_DATA_DIR="$tmp/data" DOOP_CGROUP_ROOT="$tmp/cgroup" \
+        DOOP_CALIBRATION_ISOLATE_POLLS="$polls" \
+        timeout 20 "$fixture/scripts/run_doop_validation.sh" --calibration --memory-limit-kb 1024 \
+        --evidence-dir "$tmp/evidence-polls" --wall-timeout 2 > "$tmp/polls.out" 2>&1
+    status=$?
+    set -e
+    [[ "$status" == 1 && ! -e "$tmp/polls-ran" && ! -e "$tmp/evidence-polls/cgroup-attached" ]] &&
+        grep -q 'DOOP_CALIBRATION_ISOLATE_POLLS must be an integer from 1 to 999999' "$tmp/polls.out" || {
+        printf 'test-doop-validation: FAIL isolate_polls_rejected (%s: want 1 got %s)\n' \
+            "$polls" "$status" >&2
+        sed 's/^/    /' "$tmp/polls.out" >&2
+        exit 1
+    }
+done
+printf 'test-doop-validation: ok isolate_polls_rejected\n'
+
 run_case success success 0 10
 grep -q 'RESULT: PASS' "$tmp/success.out"
 [[ $(wc -l < "$tmp/evidence-success/repeat-progress.tsv") -eq 11 ]]
