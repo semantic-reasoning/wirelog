@@ -1013,10 +1013,12 @@ The self-test uses no network, no `gh` and no build directory.
 
 The `Build / ubuntu-26.04 / clang` leg of `build-matrix` ran the whole suite
 in one hosted job and began hitting its 60-minute timeout.  It now runs as
-three `build-linux-clang-shards` jobs, each executing
-`meson test --slice K/3`, plus a `build-linux-clang` job that keeps the
-original context name.  This section records what was measured before the
-change, kept apart from what was inferred from it.
+five `build-linux-clang-shards` jobs, each executing
+`meson test --slice K/5`, plus a `build-linux-clang` job that keeps the
+original context name.  It started at three shards; the count was raised to
+five when run 45104151262 crossed the re-sharding trigger (below).  This
+section records what was measured before each change, kept apart from what
+was inferred from it.
 
 ### Observed facts
 
@@ -1071,7 +1073,7 @@ These were not established and the change does not depend on them.
 - The suite will keep growing at a similar rate, so a larger single-job
   budget would only postpone the next timeout.
 
-### Decision and headroom
+### Original decision: three shards (1454 tests)
 
 Three shards, each a separate job with its own 60-minute limit.  The test
 step inside each shard has a 40-minute limit, so a timed-out suite still
@@ -1106,7 +1108,15 @@ and the count should rise while there are still about 13 minutes of
 headroom, not after a job hits 60.  The count is `SHARD_COUNT` in
 `scripts/ci/test-ci-pr-build-timeouts.py`, which requires the shard job
 name, its `shard:` list, `--slice K/N` and both `--count` arguments in the
-workflow to agree with it.
+workflow to agree with it; `scripts/ci/test-ci-run-telemetry.py` reads the
+shard job name from the workflow.  Those are the only places a test checks.
+Prose also states the count and goes stale silently: the header comment of
+`build-linux-clang-shards` in `ci-pr.yml`, the shell-seed range in its
+walltime comment, and the opening paragraph of "Linux Clang PR lane
+(#2397)" above.
+
+The rule fired first on run 45104151262 (45.3 min), and the count went from
+three to five.
 
 ### Hosted runs with the sharded lane
 
@@ -1131,6 +1141,48 @@ elapsed seconds.
   trigger.  Two of the three shards built in about 16 minutes, the slow
   build the headroom projection assumed.
 
+Run 44917119134, head 5375ba46 (PR #2401), 1511 tests, three shards, the same
+image and Meson.  Job minutes, with the share of the 60-minute limit:
+
+| attempt | shard 1 | shard 2 | shard 3 | collecting | attempt result |
+| --- | --- | --- | --- | --- | --- |
+| 1 | 25.6 (43%) | 38.6 (64%) | 31.0 (52%) | 9 s | success |
+| 2 | 40.6 (68%) | 36.3 (61%) | 21.6, failed | 2 s, failed | failure |
+| 3 | kept from 2 | kept from 2 | 27.0 (45%) | 7 s | success |
+
+- Attempt 1: queue about 2 s per job; builds 8.5, 16.1 and 13.1 min; test
+  steps 16.6, 22.1 and 17.4 min; aggregate "1511 tests in 3 shards, each
+  executed exactly once".
+- Attempt 2: shard 3's `doop_validation` was killed by SIGTERM after 0.15 s.
+  Its verify step passed and its evidence was uploaded; the collecting job
+  failed at "Require every shard to succeed", as designed.  The cause was a
+  race in `scripts/run_doop_validation.sh`, which could signal its own
+  process group.  PR #2412 fixed it (commit 1e2c813c on `main`); run
+  45104151262 below, on that PR's head 1002d4fa, is the first run of this
+  lane that includes the fix.
+- Attempt 3 re-ran only the failed jobs on the same head, without the fix:
+  shard 3 passed in 27.0 min and the collecting job succeeded.
+
+Run 45104151262, attempt 1, head 1002d4fa (PR #2412, merge commit
+93d4737d): 1658 tests, three shards, Meson 1.10.1, image 20261116.202.1 for
+shards 1 and 2 and the collecting job, 20261116.88.1 for shard 3.  Queue is
+in minutes here.
+
+| job | queue min | setup | build | test | job min | of limit | tests | parallelism |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| shard 1 (137568310900) | 24.7 | 0.4 | 16.7 | 28.1 | 45.3 | 76% | 553 | 2.86 |
+| shard 2 (137568311055) | 39.0 | 0.3 | 12.8 | 22.5 | 35.7 | 59% | 553 | 3.27 |
+| shard 3 (137568310750) | 3.3 | 0.8 | 9.5 | 14.4 | 24.7 | 41% | 552 | 3.45 |
+| collecting (137603273605) | 11.6 | | | | 0.1 | <1% | | |
+
+- The aggregate step reported "1658 tests in 3 shards, each executed exactly
+  once"; no test failed (4, 5 and 8 runtime skips).
+- Summed test time was 203.3 CPU-min (4816, 4408 and 2974 s per shard).
+- The lane took 86.3 min from the shards' creation to the collecting job's
+  end, most of it queueing, and 105.8 runner-minutes.  Queue time does not
+  count against `timeout-minutes`; the trigger is on job time.
+- Shard 1's 45.3 min is over the 45-minute re-sharding trigger.
+
 For comparison, every successful unsharded `Build / ubuntu-26.04 / clang`
 job in the ci-pr runs created on 2026-11-20 and 2026-11-21 (UTC):
 
@@ -1154,3 +1206,73 @@ The evidence artifacts are kept for 7 days.  Re-running only the
 collecting job after that cannot pass: either the download step fails or
 `check-test-shards.py aggregate` rejects a folder without every shard's
 evidence.  Re-run the shard jobs with it.
+
+### Re-sharding to five shards (1658 tests)
+
+No hosted run with five shards had been measured when the count was raised.
+
+Arithmetic on run 45104151262's evidence (facts).  Applying Meson's
+`tests[K-1::N]` to that run's 1658-test list, with each test's measured
+duration, gives these CPU-min per shard:
+
+| N | CPU-min per shard | worst |
+| --- | --- | --- |
+| 3 | 80.3, 73.5, 49.6 | 80.3 |
+| 4 | 46.4, 60.8, 40.8, 55.3 | 60.8 |
+| 5 | 47.8, 43.0, 36.9, 39.1, 36.5 | 47.8 |
+| 6 | 36.0, 44.6, 22.4, 44.3, 28.9, 27.2 | 44.6 |
+
+The N=3 row equals the observed per-shard sums by construction; it checks the
+slicing, not the model.  Shell-seeded tests per slice, from the local build's
+introspection with the shared `shell_seed_from_cmd` classifier that
+`check-shell-gate-walltime.py` uses, are 18, 20 and 20 at N=3 (the hosted
+counts) and 12, 11, 11, 12 and 12 at N=5.
+
+Shard 1's low parallelism has a visible cause in its results.
+`clang_tidy_ratchet` (358 s) runs first in slice 1.  The first non-parallel
+test in that slice, `perf_batch_append_execution_contract` (20th of 553),
+could not start until the ratchet finished, and the tests behind it waited
+too.  Only the 18 short tests before it, about 10 s in total, overlapped the
+ratchet's 358 s.
+
+Projection (hypotheses).  A replay of that scheduling, in list order with 4
+slots and each non-parallel test running alone, reproduces the three shards'
+elapsed test time from the aggregate table (1684, 1347 and 861 s) to within a
+second.  That fit is in-sample: the durations come from the same run,
+measured on three runners with different parallelism and two images.  Adding
+0.4 min setup, the worst observed build of 16.7 min and 1 min for listing,
+checks and upload:
+
+| N | test step per slice, min | worst job min |
+| --- | --- | --- |
+| 4 | 16.8, 23.2, 11.9, 16.1 | 41.3 |
+| 5 | 16.7, 16.3, 11.5, 12.8, 9.6 | 34.8 |
+| 6 | 9.3, 15.4, 6.6, 13.8, 8.4, 8.0 | 33.5 |
+
+The assignment moves whenever tests are added ahead of the heavy ones.
+Replaying 300 random insertions of 1 to 40 one-second parallel tests (Python
+`random.seed(1)`; the replay script is not kept in the repository), with no
+other growth, put the worst job at a median of 39.1, 34.9 and 32.5 min for
+N=4, 5 and 6, a 90th percentile of 41.8, 36.4 and 34.4, and a maximum of
+46.3, 42.2 and 39.5.
+
+Decision: five.
+
+- Four leaves 3.7 min under the trigger on the replay, and reordering alone
+  crossed it in that sample.
+- Six gains 1.3 min on the point estimate for one more build per PR.
+- At five, the test step and the worst build are about equal (16.7 min each).
+  Each further shard repeats the build for a shrinking gain, so raising the
+  count is not a lasting answer to suite growth.  Expect to revisit it within
+  weeks at the recent pace (hypothesis): summed test time went from about
+  184.5 CPU-min on run 44882426643 (1511 tests) to 203.3 on run 45104151262.
+- Five shards also run two more concurrent jobs per PR.  That will cost about
+  25 to 30 more runner-minutes per PR (hypothesis), and it may lengthen
+  queueing: on run 45104151262 shard 2 already waited 39.0 min for a runner,
+  longer than its 35.7-minute job.
+
+The hard-cancel budget still holds with the new build figure.  The worst
+setup plus build is now 17.2 min (shard 1 of run 45104151262, from job start
+to the end of its build step), so a test step that runs to its 40-minute
+limit leaves about 2.8 min of the job's 60 for verify and upload.  A build
+past about 19 minutes would again let the job limit pre-empt the upload.

@@ -32,6 +32,7 @@ import copy
 import importlib.util
 import io
 import json
+import re
 import tempfile
 import unittest
 from datetime import datetime, timedelta
@@ -974,6 +975,20 @@ class GraphAbsence(unittest.TestCase):
                         True)
 
 
+def linux_clang_shard_node(graph):
+    """The one Linux Clang shard matrix node and its shard count.
+
+    Read from the workflow so that the synthesized shard rows below follow
+    the count ci-pr.yml declares instead of restating it.
+    """
+    found = [(name, int(match[1])) for name in graph
+             for match in [re.fullmatch(
+                 r"Build / ubuntu-26\.04 / clang / shard "
+                 r"\$\{\{ matrix\.shard \}\} of (\d+)", name)] if match]
+    assert len(found) == 1, f"expected one Linux Clang shard node, got {found}"
+    return found[0]
+
+
 class DependencyGraph(unittest.TestCase):
     """The graph is read from the workflow files, never hard-coded: #1574 will
     change it, and a copy here would drift exactly when that happens."""
@@ -1024,11 +1039,13 @@ class DependencyGraph(unittest.TestCase):
 
     def test_every_node_resolves_against_a_real_run(self):
         # run-success was recorded before #2397 sharded Linux Clang, so the
-        # three shard job names GitHub reports are added here; the recorded
+        # shard job names GitHub reports are added here; the recorded
         # fixture itself stays as captured.
         _, jobs = fixture("run-success")
+        node, count = linux_clang_shard_node(self.graph)
         names = [j["name"] for j in jobs["jobs"]] + [
-            f"Build / ubuntu-26.04 / clang / shard {k} of 3" for k in (1, 2, 3)]
+            node.replace("${{ matrix.shard }}", str(k))
+            for k in range(1, count + 1)]
         edges, drift = tool.match_graph_to_jobs(self.graph, names)
         self.assertEqual(drift["nodes_without_job"], [])
         self.assertEqual(drift["jobs_without_node"], [])
@@ -1148,8 +1165,9 @@ class CriticalPath(unittest.TestCase):
         # fails under !cancelled()), so only the cascade is under test here.
         run, jobs = fixture("run-skip-cascade")
         jobs = copy.deepcopy(jobs)
+        graph = tool.extract_graph(self.WORKFLOW)
         jobs["jobs"] += [
-            {"name": "Build / ubuntu-26.04 / clang / shard ${{ matrix.shard }} of 3",
+            {"name": linux_clang_shard_node(graph)[0],
              "conclusion": "skipped", "status": "completed", "steps": [],
              "created_at": "2026-09-11T07:14:47Z",
              "started_at": "2026-09-11T07:14:47Z",
@@ -1159,7 +1177,6 @@ class CriticalPath(unittest.TestCase):
              "created_at": "2026-09-11T07:14:47Z",
              "started_at": "2026-09-11T07:14:53Z",
              "completed_at": "2026-09-11T07:15:01Z"}]
-        graph = tool.extract_graph(self.WORKFLOW)
         edges, drift = tool.match_graph_to_jobs(
             graph, [j["name"] for j in jobs["jobs"]])
         paths = tool.analyze(run, jobs, edges, drift)["critical_path"]

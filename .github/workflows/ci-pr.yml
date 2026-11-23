@@ -488,8 +488,9 @@ jobs:
   # Issue #2397: the unsharded Linux Clang job outgrew its 60-minute budget as
   # the suite grew (1035 -> 1454 tests in about two days) and on slower hosted
   # runners (1.41x slower in aggregate). Each shard builds the same
-  # configuration and runs `meson test --slice K/3`, which takes every third
-  # test of the same list a plain `meson test` runs. check-test-shards.py
+  # configuration and runs `meson test --slice K/5`, which takes every fifth
+  # test of the same list a plain `meson test` runs (three shards until run
+  # 45104151262 crossed the re-sharding trigger). check-test-shards.py
   # records each slice before the run and proves after it that the shards
   # executed every test exactly once; build-linux-clang below keeps the
   # `Build / ubuntu-26.04 / clang` context and fails unless every shard
@@ -499,7 +500,7 @@ jobs:
   # out, the verify and upload steps still run and keep the partial results.
   # ==========================================================================
   build-linux-clang-shards:
-    name: Build / ubuntu-26.04 / clang / shard ${{ matrix.shard }} of 3
+    name: Build / ubuntu-26.04 / clang / shard ${{ matrix.shard }} of 5
     needs: [build-arm, build-mbedtls, build-scope]
     if: ${{ needs.build-scope.outputs.build-required == 'true' }}
     runs-on: ubuntu-26.04
@@ -507,7 +508,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        shard: [1, 2, 3]
+        shard: [1, 2, 3, 4, 5]
 
     steps:
       - uses: actions/checkout@v5
@@ -532,12 +533,12 @@ jobs:
         id: plan
         run: >-
           python3 scripts/ci/check-test-shards.py plan --builddir builddir
-          --shard ${{ matrix.shard }} --count 3 --sha "${{ github.sha }}"
+          --shard ${{ matrix.shard }} --count 5 --sha "${{ github.sha }}"
           --run-attempt "${{ github.run_attempt }}" --out shard-evidence
 
       - name: Test (Linux Clang shard)
         timeout-minutes: 40
-        run: meson test -C builddir --print-errorlogs --slice ${{ matrix.shard }}/3
+        run: meson test -C builddir --print-errorlogs --slice ${{ matrix.shard }}/5
 
       - name: Verify shard coverage
         if: ${{ always() && steps.plan.outcome == 'success' }}
@@ -546,7 +547,7 @@ jobs:
           --testlog builddir/meson-logs/testlog.json
 
       # #1487 walltime budget over the shell gates this shard ran. Each slice
-      # currently holds 18-20 shell-seeded tests; with
+      # currently holds 11-12 shell-seeded tests; with
       # WIRELOG_WALLTIME_REQUIRED=1 the gate fails loudly if one ever holds
       # none.
       - name: Shell gate walltime budget (Linux Clang shard)
@@ -594,7 +595,7 @@ jobs:
 
       - name: Aggregate shard coverage
         run: >-
-          python3 scripts/ci/check-test-shards.py aggregate --count 3
+          python3 scripts/ci/check-test-shards.py aggregate --count 5
           --sha "${{ github.sha }}" --summary "$GITHUB_STEP_SUMMARY" shard-evidence
 
   # ==========================================================================
