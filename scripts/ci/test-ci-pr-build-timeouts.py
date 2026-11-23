@@ -21,8 +21,10 @@ EXPECTED_TIMEOUTS = {
 # Issue #2397: Linux Clang runs as SHARD_COUNT `meson test --slice K/N` jobs
 # with a per-shard job budget, a shorter test-step budget (so the evidence
 # steps still run after a test-step timeout) and a collecting job that keeps
-# the `Build / ubuntu-26.04 / clang` context.
-SHARD_COUNT = 3
+# the `Build / ubuntu-26.04 / clang` context.  Raise SHARD_COUNT and the
+# workflow's count sites together; docs/CI_TELEMETRY.md records why the count
+# is what it is.
+SHARD_COUNT = 5
 SHARD_JOB_TIMEOUT = 60
 SHARD_TEST_STEP_TIMEOUT = 40
 COLLECT_TIMEOUT = 10
@@ -266,6 +268,18 @@ class CiPrBuildTimeoutTests(unittest.TestCase):
             validate(mutated)
 
 
+# The mutation tests below derive every anchor from SHARD_COUNT, so a bump is
+# one constant here; N - 1 must still be a valid shard count.
+assert SHARD_COUNT >= 2
+N = str(SHARD_COUNT)
+FEWER = str(SHARD_COUNT - 1)
+SHARD_LIST = ", ".join(str(k) for k in range(1, SHARD_COUNT + 1))
+SLICE = "--slice ${{ matrix.shard }}/"
+PLAN_COUNT = "--shard ${{ matrix.shard }} --count "
+AGGREGATE_COUNT = "aggregate --count "
+JOB_NAME = "clang / shard ${{ matrix.shard }} of "
+
+
 class LinuxClangShardTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -285,31 +299,35 @@ class LinuxClangShardTests(unittest.TestCase):
         validate_linux_clang_shards(self.text)
 
     def test_dropping_a_shard_is_rejected(self):
-        self.rejects(self.mutate("shard: [1, 2, 3]", "shard: [1, 2]"),
-                     "exactly 1..3")
+        self.rejects(self.mutate("shard: [" + SHARD_LIST + "]",
+                                 "shard: [" + SHARD_LIST.rsplit(", ", 1)[0] + "]"),
+                     re.escape("exactly 1.." + N))
 
     def test_slice_count_must_agree(self):
-        self.rejects(self.mutate("--slice ${{ matrix.shard }}/3",
-                                 "--slice ${{ matrix.shard }}/2"),
+        self.rejects(self.mutate(SLICE + N + "\n", SLICE + FEWER + "\n"),
                      "sliced")
 
     def test_plan_count_must_agree(self):
-        self.rejects(self.mutate("--shard ${{ matrix.shard }} --count 3",
-                                 "--shard ${{ matrix.shard }} --count 2"),
+        self.rejects(self.mutate(PLAN_COUNT + N + " ", PLAN_COUNT + FEWER + " "),
                      "same count")
 
     def test_aggregate_count_must_agree(self):
-        self.rejects(self.mutate("aggregate --count 3", "aggregate --count 2"),
+        self.rejects(self.mutate(AGGREGATE_COUNT + N + "\n",
+                                 AGGREGATE_COUNT + FEWER + "\n"),
                      "same shard count")
 
     def test_plan_count_must_match_exactly(self):
-        self.rejects(self.mutate("--shard ${{ matrix.shard }} --count 3",
-                                 "--shard ${{ matrix.shard }} --count 30"),
+        self.rejects(self.mutate(PLAN_COUNT + N + " ", PLAN_COUNT + N + "0 "),
                      "same count")
 
     def test_aggregate_count_must_match_exactly(self):
-        self.rejects(self.mutate("aggregate --count 3", "aggregate --count 31"),
+        self.rejects(self.mutate(AGGREGATE_COUNT + N + "\n",
+                                 AGGREGATE_COUNT + N + "1\n"),
                      "same shard count")
+
+    def test_job_name_count_must_agree(self):
+        self.rejects(self.mutate(JOB_NAME + N + "\n", JOB_NAME + FEWER + "\n"),
+                     "state the shard count")
 
     def test_download_must_match_upload_name(self):
         self.rejects(self.mutate("pattern: linux-clang-shard-*",
