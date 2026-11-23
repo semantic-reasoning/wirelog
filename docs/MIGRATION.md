@@ -1,9 +1,105 @@
 # Migration Guide
 
-**Last Updated:** 2026-09-22
+**Last Updated:** 2026-11-23
 
 This document describes breaking changes, opt-in features, and migration
 steps for each significant Wirelog release. Entries are ordered newest first.
+
+---
+
+## 0.70 -> 0.72
+
+0.72.0 is an intermediate release of the merged correctness, memory-management,
+cold-input and inspection work since 0.70.0. Existing session constructors
+remain available; new APIs require rebuilding against the new headers and
+linking the matching library. Continue initializing easy options with
+`WIRELOG_EASY_OPEN_OPTS_INIT`. This release does not change the library's
+configured SONAME major (`1`). That version policy alone is not an ABI
+compatibility test.
+
+### Distinguish budget denial from allocation failure
+
+Public operations now distinguish `WIRELOG_ERR_MEMORY_BUDGET` (value `8`) for
+configured managed-memory admission denial from `WIRELOG_ERR_MEMORY` for
+allocator failure. Update error-code switches and retry policies that treated
+all memory failures as `WIRELOG_ERR_MEMORY`, including session creation and
+easy/advanced mutations. Budget refusal can require a larger configured budget;
+it is not evidence that the system allocator failed. The installed headers
+specify each operation's error and rollback contract.
+
+Advanced multi-row insert/remove calls apply atomically on failure; typed
+mutations roll back earlier typed rows on budget denial. Do not continue using
+an assumed successfully applied prefix after a failed call. Invalid or
+unsupported operations retain their documented errors.
+
+### Opt in explicitly to cold-input storage
+
+`wirelog_session_create_with_options()` accepts the new
+`wirelog_session_options_v1_t`: zero-initialize it, set `struct_size` to
+`sizeof(wirelog_session_options_v1_t)` and `abi_version` to `1`, then fill the
+supported options. NULL options preserve legacy defaults. Zero spill limits
+and a NULL directory disable spilling; an enabled store requires an existing
+directory and valid positive limits. JOIN caps bound individual batches/index
+windows, not total session memory, and final output and intern strings remain
+resident. Spill files are ephemeral session-owned data, not a reopenable store.
+
+The advanced API adds `wirelog_session_seal_input()` (with the compatibility
+spelling `wirelog_session_seal_join_input()`) and chunked
+`wirelog_session_begin_cold_input()` / `wirelog_session_append_cold_input()` /
+`wirelog_session_finish_cold_input()`. Use only their admitted serial plans,
+physical types, lifecycle and provenance contracts. Successful begin freezes
+ordinary fact/compound mutation sessionwide; unfinished loading refuses
+evaluation, and successful finish forbids further append. A failed append or
+finish preserves the loading prefix for retry. The program must outlive the
+session, and STRING IDs must come from that program's intern table.
+
+`WIRELOG_JOIN_BATCH_BYTES` is read at session creation. When its documented
+parse enables the existing batching path, that session selects no spill JOIN
+and sealing is refused, even with positive explicit JOIN caps. Changing the
+environment afterward does not reconfigure an existing session. See
+[`wirelog-advanced.h`](../wirelog/wirelog-advanced.h) for exact eligibility,
+configuration, error and lifetime rules; successful bounded loading does not
+promise that every evaluation fits its budget.
+
+### Inspect host sources without evaluating
+
+`WIRELOG_SOURCE_QUERY_VERSION` is `1`. The new advanced
+`wirelog_session_source_count()`, `wirelog_session_source_key_exists()`,
+`wirelog_session_source_validate()` and `wirelog_session_lookup_symbol()` have
+corresponding `wirelog_easy_*` wrappers. Count and key queries use explicit
+`max_rows` bounds. They inspect host-inserted source occurrences, including
+pending mutations, rather than derived model rows; they do not run evaluation.
+
+Handle `wirelog_source_query_status_t` independently of `wirelog_error_t`.
+Outputs are meaningful only on `WIRELOG_SOURCE_QUERY_OK`: reset zero/false/`-1`
+outputs after a failure must not be interpreted as absence. The inspected
+subset excludes inline-fact relations, unsupported schemas, cold/sealed input,
+controlled sessions and callback re-entry. A source count is a multiplicity,
+not a distinct-tuple count. Symbol lookup does not intern a missing string.
+
+Before a lazy easy session is built, supported source queries answer from
+program metadata without creating it; after failed initialization they report
+`WIRELOG_SOURCE_QUERY_INITIALIZATION_FAILED` until a later build succeeds.
+See the installed advanced/easy headers for per-call admission and ownership
+requirements.
+
+### Retain the qualified execution boundaries
+
+0.72.0 does not claim that an arbitrary evaluation step can be interrupted or
+bounded by a host. Budget/cancellation completion remains tracked by
+[#1817](https://github.com/semantic-reasoning/wirelog/issues/1817), and scalar
+expression integration by [#2299](https://github.com/semantic-reasoning/wirelog/issues/2299).
+The internal unary STRING recursive projection route has a narrow declared
+single-worker STEP scope; wider/mixed/FLOAT SCCs, additional topology,
+expression/K bodies, evaluating Snapshot/C1/batch modes, seeded heads,
+pool/prepared-sort transport and remaining Source/carry proofs are outside its
+qualified scope. Internal interfaces are not installed API commitments.
+
+The [expression acceptance ledger](implementation/2299/EXPRESSION_ACCEPTANCE.md)
+and [serial coverage ledger](implementation/1821/SERIAL_COVERAGE.md) record
+actual qualified intersections and remaining work. Existing historical benchmark
+results are not measurements of 0.72.0; a current refresh remains
+[#1361](https://github.com/semantic-reasoning/wirelog/issues/1361).
 
 ---
 

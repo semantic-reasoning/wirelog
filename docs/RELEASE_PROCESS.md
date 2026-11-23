@@ -195,9 +195,10 @@ When cutting a release tag:
      PRs; the release PR consolidates).
 2. **Wait for every required CI check** to pass on the release PR,
    including the platform build matrix, ABI, mbedTLS, ASan/UBSan, and TSan
-   checks. For 0.80.0 and later, the tag workflow also requires the hosted
-   release performance job's correctness, RSS, and evidence contract. Its
-   wall-clock timing observations are advisory because GitHub-hosted runners
+   checks. For every supported release tag, the tag workflow also requires
+   the hosted release performance job's correctness, RSS, and evidence
+   contract. Its wall-clock timing observations are advisory because
+   GitHub-hosted runners
    do not provide a stable cpufreq governor; strict timing remains a separate
    stable-runner contract. The former 0.30.0 upgrade matrix is unsupported and
    is not part of release verification.

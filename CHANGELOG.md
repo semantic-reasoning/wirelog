@@ -6,6 +6,24 @@ All notable changes to wirelog are documented in this file.
 
 ### Added
 
+### Changed
+
+### Deprecated
+
+### Removed
+
+### Fixed
+
+### Performance
+
+### Security
+
+### Documentation
+
+## [0.72.0] - 2026-11-23
+
+### Added
+
 - A deterministic 150-program recursive evaluation campaign compares exact
   models with an independent finite-domain interpreter, covering body constants,
   repeated variables, differently keyed cached joins and filtered recursive

@@ -50,9 +50,10 @@ For fine-grained control over plans, backends, or worker counts, use the `wirelo
 
 The future weighted/probabilistic evaluation design is documented in
 [`docs/design/weighted-semiring-addon.md`](docs/design/weighted-semiring-addon.md).
-The future scalar-function addon design is documented in
-[`docs/design/scalar-function-addon.md`](docs/design/scalar-function-addon.md).
-It is a design proposal, not a currently available API.
+The installed scalar-function addon API is documented in
+[`wirelog/wirelog-extension.h`](wirelog/wirelog-extension.h). The broader design
+is recorded in [`docs/design/scalar-function-addon.md`](docs/design/scalar-function-addon.md);
+its proposed scope is not a guarantee that every host context is supported.
 
 ## Features
 
@@ -65,7 +66,12 @@ It is a design proposal, not a currently available API.
 
 ## Performance
 
-The complete benchmark evidence is recorded in [the campaign index](docs/benchmarks/2026-09-26-flowlog/campaign-index.json). It contains two immutable 48-record matrices: the historical revision `7e498e782a4cca96175d34f86bf5b958d042552d` and the current benchmark head `afcdd8a3f05f67daaeb003c7acd25e96e2433419`, whose product base is main merge commit `30b19ba3` from #1975. Both use release `-Os`, LTO, GCC 16.2.1, `wirelog_log_max_level=error`, CPUs 0-15, and the same 82-file data inventory. Non-DOOP workloads use five-trial medians; DOOP uses one authoritative trial per width because each run is very long.
+The following results are archived evidence from the pinned 2026-09-26 campaign,
+not measurements of 0.72.0. A current release benchmark refresh remains tracked
+in [#1361](https://github.com/semantic-reasoning/wirelog/issues/1361); these
+numbers do not establish a speedup or current-release performance baseline.
+
+The complete benchmark evidence is recorded in [the campaign index](docs/benchmarks/2026-09-26-flowlog/campaign-index.json). It contains two immutable 48-record matrices: the historical revision `7e498e782a4cca96175d34f86bf5b958d042552d` and the campaign candidate revision `afcdd8a3f05f67daaeb003c7acd25e96e2433419`, whose product base is main merge commit `30b19ba3` from #1975. Both use release `-Os`, LTO, GCC 16.2.1, `wirelog_log_max_level=error`, CPUs 0-15, and the same 82-file data inventory. Non-DOOP workloads use five-trial medians; DOOP uses one authoritative trial per width because each run is very long.
 
 **Test environment:** Intel Xeon E5-2696 v4 (2 sockets, 44 physical cores total, 88 logical CPUs), Linux 7.2.6, 125 GiB RAM. Wall-clock values are descriptive and affected by governor, thermal state, memory pressure, and the campaigns' separate execution times. Peak RSS is shown in MiB.
 
@@ -87,11 +93,11 @@ The complete benchmark evidence is recorded in [the campaign index](docs/benchma
 | CRDT | CRDT | 44.87s | 45.54s | 46.81s | 2,152,328 | 14,148 | 123.4 / 488.1 / 770.7 |
 | Program Analysis | DOOP (zxing) | 4,677.9s | 2,871.6s | 2,847.9s | 13,828,835 | 153 | 53,369.6 / 55,158.3 / 55,231.1 |
 
-The CSPA static row is `cspa-fast`. The separate incremental CSPA check (`cspa`) inserted 35 synthetic `Assign` facts (20% of the 179 input rows) and produced 21,063 tuples: baseline/re-evaluation medians were 4,733.6/101.4ms (W=1), 2,530.5/168.7ms (W=8), and 2,425.9/161.6ms (W=16). These are five-trial medians from the machine-verifiable current matrix.
+The CSPA static row is `cspa-fast`. The separate incremental CSPA check (`cspa`) inserted 35 synthetic `Assign` facts (20% of the 179 input rows) and produced 21,063 tuples: baseline/re-evaluation medians were 4,733.6/101.4ms (W=1), 2,530.5/168.7ms (W=8), and 2,425.9/161.6ms (W=16). These are five-trial medians from the machine-verifiable archived candidate matrix.
 
 DOOP uses the pinned 35-file extracted manifest (SHA-256 `215ddcc50bca70c0089e0ced9298274aec4edb6741736d03cc3c4386b96f831c`; declared archive SHA-256 `154593343fefd18306d4098ba9f6286947b134b56ebcf83d8e8eae368d5867e7`). It consumed up to about 54 GiB RSS in this campaign and caused substantial swap pressure; the DOOP rows are authoritative completed runs but should be treated as descriptive. The historical campaign produced different outputs (CRDT 2,156,530 and DOOP 6,069,774 tuples) because commits #955/#956/#957 changed benchmark semantics and duplicate handling. Those historical values are preserved for attribution and are not claimed as equivalent-workload timing baselines.
 
-Pre-fix CRDT diagnostics are excluded from this table; the complete current-main matrix above is the README calibration.
+Pre-fix CRDT diagnostics are excluded from this table; the table above preserves the archived campaign results.
 
 Reproduce the matrix with the reviewed runner and pinned data manifest:
 
@@ -141,7 +147,7 @@ The runner records source/tree cleanliness, binary and data hashes, commands, JS
 ```bash
 meson setup build
 meson compile -C build
-meson test -C build --print-errorlogs    # 284 tests
+meson test -C build --print-errorlogs
 
 # Sanitizer build (optional)
 meson setup build-san -Db_sanitize=address,undefined
