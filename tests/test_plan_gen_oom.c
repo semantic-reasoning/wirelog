@@ -15,6 +15,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdio.h>
+#include <string.h>
 
 void *__real_malloc(size_t size);
 void *__real_calloc(size_t count, size_t size);
@@ -25,11 +26,25 @@ static long allocation_calls;
 static bool mr1_capture_session, mr1_malloc_failed;
 static wl_col_session_t *mr1_session;
 
+/* Target real RHS byte buffers and the wide source-column context.  Calibration
+* derives allocation ordinals from this build, independently of clone layout. */
+static bool rhs_armed, rhs_injected;
+static long rhs_fail = -1, rhs_calls;
+static unsigned rhs_classes[3];
+static bool rhs_fault(unsigned kind, bool match) {
+    if (!rhs_armed || !match) return false;
+    rhs_classes[kind]++;
+    if (rhs_calls++ != rhs_fail) return false;
+    rhs_injected = true;
+    return true;
+}
+
 void *
 __wrap_malloc(size_t size)
 {
     if (fail_at >= 0 && allocation_calls++ == fail_at)
         return NULL;
+    if (rhs_fault(0, size == 64)) return NULL;
     if (mr1_capture_session && mr1_session) {
         wl_columnar_memory_reservation_t *token =
             &mr1_session->controlled_scalar_view_reservation;
@@ -49,6 +64,7 @@ __wrap_calloc(size_t count, size_t size)
 {
     if (fail_at >= 0 && allocation_calls++ == fail_at)
         return NULL;
+    if (rhs_fault(1, count == 34)) return NULL;
     void *storage = __real_calloc(count, size);
     if (mr1_capture_session && !mr1_session && count == 1
         && size == sizeof(wl_col_session_t)) mr1_session = storage;
@@ -60,6 +76,7 @@ __wrap_realloc(void *ptr, size_t size)
 {
     if (fail_at >= 0 && allocation_calls++ == fail_at)
         return NULL;
+    if (rhs_fault(2, size >= 128)) return NULL;
     return __real_realloc(ptr, size);
 }
 
@@ -198,6 +215,94 @@ test_mr1_session_arena_malloc(bool serial)
     return true;
 }
 
+static const wl_plan_expr_buffer_t *rhs_buffer(const wl_plan_t *plan) {
+    const wl_plan_expr_buffer_t *buffer = NULL;
+    for (uint32_t s = 0; s < plan->stratum_count; ++s)
+        for (uint32_t r = 0; r < plan->strata[s].relation_count; ++r)
+            for (uint32_t o = 0; o < plan->strata[s].relations[r].op_count;
+                ++o) {
+                const wl_plan_op_t *op = &plan->strata[s].relations[r].ops[o];
+                if (op->op == WL_PLAN_OP_JOIN) {
+                    if (buffer) abort();
+                    buffer = &op->right_filter_expr;
+                }
+            }
+    if (!buffer || !buffer->data || !buffer->size) abort();
+    return buffer;
+}
+static void rhs_equal(const wl_plan_t *plan,
+    const wl_plan_expr_buffer_t *expected) {
+    const wl_plan_expr_buffer_t *got = rhs_buffer(plan);
+    if (got->size != expected->size ||
+        memcmp(got->data, expected->data, expected->size)) abort();
+}
+static void rhs_retry_execution(wl_plan_t *plan) {
+    wl_session_t *session = NULL;
+    if (wl_session_create(wl_backend_columnar(), plan, 1, &session)) abort();
+    int64_t left = 1, right[34];
+    for (unsigned i = 0; i < 34; ++i) right[i] = 1;
+    right[1] = 2;
+    if (wl_session_insert(session, "left", &left, 1, 1) ||
+        wl_session_insert(session, "right", right, 1, 34) ||
+        wl_session_step(session)) abort();
+    const col_rel_t *out = session_find_rel(COL_SESSION(session), "out");
+    if (!out || out->nrows) abort();
+    if (wl_session_remove(session, "right", right, 1, 34)) abort();
+    right[1] = 1;
+    if (wl_session_insert(session, "right", right, 1, 34) ||
+        wl_session_step(session)) abort();
+    out = session_find_rel(COL_SESSION(session), "out");
+    if (!out || out->nrows != 1 || col_rel_get(out, 0, 0) != 1 ||
+        wl_session_step(session) || wl_session_try_destroy(&session)) abort();
+}
+static void test_rhs_compiler_atomicity(void) {
+    char text[4096];
+    size_t at = (size_t)snprintf(text, sizeof(text),
+            ".decl left(k:int64)\n.decl right(k:int64");
+    for (unsigned c = 0; c < 33; ++c)
+        at += (size_t)snprintf(text+at, sizeof(text)-at, ",c%u:int64", c);
+    at += (size_t)snprintf(text+at, sizeof(text)-at,
+            ")\n.decl out(k:int64)\nout(k):-left(k),right(k");
+    for (unsigned c = 0; c < 33; ++c)
+        at += (size_t)snprintf(text+at, sizeof(text)-at, ",1");
+    at += (size_t)snprintf(text+at, sizeof(text)-at, ").\n");
+    if (at >= sizeof(text)) abort();
+    wirelog_error_t error;
+    wirelog_program_t *reference_program = wirelog_parse_string(text, &error);
+    wl_plan_t *reference = NULL;
+    rhs_armed = true; rhs_calls = 0; rhs_fail = -1;
+    if (!reference_program || wl_plan_from_program(reference_program,
+        &reference)) abort();
+    rhs_armed = false;
+    long count = rhs_calls;
+    if (!rhs_classes[0] || !rhs_classes[1] || !rhs_classes[2]) abort();
+    const wl_plan_expr_buffer_t *expected = rhs_buffer(reference);
+    unsigned failures = 0;
+    for (long i = 0; i < count; ++i) {
+        wirelog_program_t *program = wirelog_parse_string(text, &error);
+        if (!program) abort();
+        wl_plan_t *plan = NULL;
+        rhs_calls = 0; rhs_fail = i; rhs_injected = false; rhs_armed = true;
+        int rc = wl_plan_from_program(program, &plan);
+        rhs_armed = false;
+        if (!rhs_injected) abort();
+        if (rc) {
+            if (plan) abort();
+            failures++;
+        } else rhs_equal(plan, expected);
+        wl_plan_free(plan); plan = NULL;
+        /* Retry exactly the same parsed program, without reinsertion/reparse. */
+        if (wl_plan_from_program(program, &plan)) abort();
+        rhs_equal(plan, expected); rhs_retry_execution(plan);
+        wl_plan_free(plan); wirelog_program_free(program);
+    }
+    if (!failures) abort();
+    printf("RHS compiler real NULL sites=%ld atomic failures=%u; same-program "
+        "retry preserves all33 predicates and literal execution\n", count,
+        failures);
+    wl_plan_free(reference); wirelog_program_free(reference_program);
+}
+
 int
 main(void)
 {
@@ -275,6 +380,7 @@ main(void)
         wirelog_program_free(program);
     }
 
+    test_rhs_compiler_atomicity();
     if (!test_mr1_session_arena_malloc(false) ||
         !test_mr1_session_arena_malloc(true)) return 1;
     return saw_success && saw_injected_failure && saw_lftj &&

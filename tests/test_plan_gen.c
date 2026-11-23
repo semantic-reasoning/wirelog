@@ -503,6 +503,77 @@ test_extension_right_filters_rejected(void)
     PASS();
 }
 
+static wirelog_ir_node_t *find_wide_join(wirelog_ir_node_t *node) {
+    if (!node) return NULL;
+    if (node->type == WIRELOG_IR_JOIN) return node;
+    for (uint32_t i = 0; i < node->child_count; ++i) {
+        wirelog_ir_node_t *got = find_wide_join(node->children[i]);
+        if (got) return got;
+    }
+    return NULL;
+}
+static void test_wide_right_filter_guards(void) {
+    TEST("full RHS chain checks deep extensions and skips null predicates");
+    for (unsigned mode = 0; mode < 2; ++mode) {
+        char source[4096];
+        size_t at = (size_t)snprintf(source, sizeof(source),
+                ".decl left(k:int64)\n.decl right(k:int64");
+        for (unsigned i = 0; i < 33; ++i)
+            at += (size_t)snprintf(source+at, sizeof(source)-at,
+                    ",c%u:int64", i);
+        at += (size_t)snprintf(source+at, sizeof(source)-at,
+                ")\n.decl out(k:int64)\nout(k):-left(k),right(k");
+        for (unsigned i = 0; i < 33; ++i)
+            at += (size_t)snprintf(source+at, sizeof(source)-at, ",1");
+        at += (size_t)snprintf(source+at, sizeof(source)-at, ").\n");
+        ASSERT(at < sizeof(source), "fixture text overflow");
+        wirelog_error_t err;
+        wirelog_program_t *prog = wirelog_parse_string(source, &err);
+        ASSERT(prog, "wide filter parse");
+        wirelog_ir_node_t *join = find_wide_join(prog->rules[0].ir_root);
+        ASSERT(join && join->child_count == 2, "wide JOIN missing");
+        wirelog_ir_node_t **base = &join->children[1];
+        unsigned count = 0;
+        while ((*base)->type == WIRELOG_IR_FILTER) {
+            if (mode) {
+                wl_ir_expr_free((*base)->filter_expr);
+                (*base)->filter_expr = NULL;
+            }
+            count++; base = &(*base)->children[0];
+        }
+        ASSERT(count == 33, "not a genuine33-predicate RHS chain");
+        if (!mode) {
+            *base = test_wrap_right_filter(*base);
+            ASSERT(*base, "deep extension wrapper");
+        }
+        ASSERT(!wl_ir_program_rebuild_relation_irs(prog), "IR rebuild");
+        wl_plan_t *plan = NULL;
+        int rc = wl_plan_from_program(prog, &plan);
+        if (!mode) {
+            ASSERT(rc && !plan, "deep extension escaped full-chain guard");
+        } else {
+            ASSERT(!rc && plan, "null predicates rejected");
+            unsigned joins = 0;
+            for (uint32_t st = 0; st < plan->stratum_count; ++st)
+                for (uint32_t r = 0; r < plan->strata[st].relation_count; ++r)
+                    for (uint32_t o = 0;
+                        o < plan->strata[st].relations[r].op_count; ++o) {
+                        const wl_plan_op_t *op =
+                            &plan->strata[st].relations[r].ops[o];
+                        if (op->op == WL_PLAN_OP_JOIN) {
+                            joins++;
+                            ASSERT(!op->right_filter_expr.data &&
+                                !op->right_filter_expr.size,
+                                "null chain emitted bytes");
+                        }
+                    }
+            ASSERT(joins == 1, "expected actual JOIN occurrence");
+        }
+        wl_plan_free(plan); wirelog_program_free(prog);
+    }
+    PASS();
+}
+
 /* ----------------------------------------------------------------
  * Snapshot counting callback
  * ---------------------------------------------------------------- */
@@ -2197,6 +2268,7 @@ main(void)
     test_extension_call_unsupported_contexts_rejected();
     test_optimized_flatmap_extension_filter_rejected();
     test_extension_right_filters_rejected();
+    test_wide_right_filter_guards();
     test_scalar_serial_view_negatives();
     test_scalar_serial_view();
     test_scalar_view_owned_branches();

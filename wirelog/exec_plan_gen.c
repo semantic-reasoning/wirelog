@@ -205,12 +205,19 @@ expr_buf_init(expr_buf_t *buf)
 static int
 expr_buf_ensure(expr_buf_t *buf, uint32_t extra)
 {
+    if (extra > UINT32_MAX - buf->size)
+        return -1;
     uint32_t need = buf->size + extra;
     if (need <= buf->capacity)
         return 0;
-    uint32_t cap = buf->capacity;
-    while (cap < need)
-        cap *= 2;
+    uint32_t cap = buf->capacity ? buf->capacity : 64u;
+    while (cap < need) {
+        if (cap > UINT32_MAX / 2u) {
+            cap = need;
+            break;
+        }
+        cap *= 2u;
+    }
     uint8_t *p = (uint8_t *)realloc(buf->data, cap);
     if (!p)
         return -1;
@@ -1870,88 +1877,68 @@ static const wirelog_ir_node_t *
 unwrap_filters_collect(const wirelog_ir_node_t *node,
     wl_plan_expr_buffer_t *out_buf)
 {
-    /* Collect up to 32 filter_expr pointers while traversing FILTER chain */
-    const wl_ir_expr_t *filt_exprs[32];
-    uint32_t nfilts = 0;
-
-    while (node && node->type == WIRELOG_IR_FILTER && node->child_count > 0) {
-        if (node->filter_expr) {
-            if (nfilts < 32) {
-                filt_exprs[nfilts++] = node->filter_expr;
-            } else {
-                fprintf(stderr,
-                    "warning: right_filter: >32 nested FILTERs, "
-                    "truncating\n");
-            }
-        }
-        node = node->children[0];
-    }
-
+    const wirelog_ir_node_t *first = node;
+    bool predicates = false;
     out_buf->data = NULL;
     out_buf->size = 0;
 
-    if (nfilts == 0)
+    /* Validate the complete chain without a predicate-count limit.  Keep the
+     * borrowed IR in place; the second pass serializes in the original order. */
+    while (node && node->type == WIRELOG_IR_FILTER && node->child_count > 0) {
+        if (node->filter_expr) {
+            if (expr_contains_extension_call(node->filter_expr))
+                return NULL;
+            predicates = true;
+        }
+        node = node->children[0];
+    }
+    if (!predicates)
         return node;
 
-    for (uint32_t i = 0; i < nfilts; i++) {
-        if (expr_contains_extension_call(filt_exprs[i])) {
-            /* Right-filter expressions are evaluated by join operators in a
-             * separate context.  This unit supports only the ordinary FILTER
-             * operator, so reject rather than emit a plan that silently
-             * ignores the call. */
-            return NULL;
-        }
-    }
-
-    /* Resolve column names from the base SCAN for variable resolution */
     col_ctx_t ctx;
-    collect_output_columns(node, &ctx);
-
-    expr_buf_t combined;
+    expr_buf_t combined = {0};
+    if (collect_output_columns(node, &ctx) != 0)
+        goto failure;
     if (expr_buf_init(&combined) != 0)
-        goto cleanup;
+        goto failure;
 
-    bool ok = true;
-    for (uint32_t i = 0; i < nfilts && ok; i++) {
+    bool first_predicate = true;
+    for (const wirelog_ir_node_t *filter = first; filter != node;
+        filter = filter->children[0]) {
+        if (!filter->filter_expr)
+            continue;
         expr_buf_t tmp;
-        if (expr_buf_init(&tmp) != 0) {
-            ok = false;
-            break;
-        }
-        if (serialize_expr(&tmp, filt_exprs[i], &ctx, false) != 0) {
+        if (expr_buf_init(&tmp) != 0)
+            goto failure;
+        if (serialize_expr(&tmp, filter->filter_expr, &ctx, false) != 0) {
             free(tmp.data);
-            ok = false;
-            break;
+            goto failure;
         }
-        if (i == 0) {
-            /* First predicate: replace empty combined with serialized expr */
+        if (first_predicate) {
             free(combined.data);
             combined = tmp;
+            first_predicate = false;
         } else {
-            /* Subsequent predicate: append bytes then BAND to form conjunction.
-             * BAND combines predicates: correct because comparisons return {0,1} */
+            /* Preserve the existing non-short-circuit postfix conjunction
+             * and outer-to-inner predicate order. */
             if (expr_buf_push_bytes(&combined, tmp.data, tmp.size) != 0
-                || expr_buf_push_u8(
-                    &combined, (uint8_t)WL_PLAN_EXPR_ARITH_BAND)
-                != 0) {
+                || expr_buf_push_u8(&combined,
+                (uint8_t)WL_PLAN_EXPR_ARITH_BAND) != 0) {
                 free(tmp.data);
-                ok = false;
-                break;
+                goto failure;
             }
             free(tmp.data);
         }
     }
-
-    if (ok) {
-        out_buf->data = combined.data;
-        out_buf->size = combined.size;
-    } else {
-        free(combined.data);
-    }
-
-cleanup:
+    out_buf->data = combined.data;
+    out_buf->size = combined.size;
     col_ctx_free(&ctx);
     return node;
+
+failure:
+    free(combined.data);
+    col_ctx_free(&ctx);
+    return NULL;
 }
 
 /**
