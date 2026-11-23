@@ -83,7 +83,9 @@ typedef struct {
     unsigned index_allocation, allocation_calls[9], allocation_phase;
     uint64_t allocation_progress, allocation_attempt, failed_allocation_attempt;
     unsigned injected_allocations, allocation_ordinal, new_metadata;
-    wl_test_join_cache_build_t prefix[3];
+    wl_test_join_cache_build_t prefix[3], start[3];
+    witnesses_t build_base[3];
+    unsigned build_calls[3][9], later_signature;
     uint64_t denials;
     wl_columnar_memory_reservation_t peer;
     bool pin_mode;
@@ -589,6 +591,104 @@ wl_test_join_cache_new_metadata(fixture_t *f, wl_columnar_filter_context_t *ctx,
     fprintf(stdout, "new signature=%u slot=%u keys=%u prior-owned=%u\n",
         slot + 1, slot, ctx->join_operation->key_count, slot);
 }
+static void
+wl_test_join_cache_later_start(fixture_t *f, wl_columnar_filter_context_t *ctx)
+{
+    unsigned signature = f->head < 2 ? 1u : f->head, slot = signature - 1;
+    wl_test_join_cache_signature(f, ctx, signature);
+    wl_test_join_cache_build_t *b = &f->start[slot];
+    CHECK(!b->operation);
+    b->session = (uintptr_t)COL_SESSION(f->active->session);
+    b->control = (uintptr_t)f->active->control;
+    b->control_identity = wl_evaluation_control_identity(f->active->control);
+    b->attempt = wl_evaluation_control_active_attempt_id(f->active->control);
+    b->generation = f->bindings->generation;
+    b->plan = (uintptr_t)f->selected;
+    b->operation = (uintptr_t)ctx->join_operation;
+    b->occurrence = (unsigned)(ctx->join_operation - f->selected->ops);
+    b->source = (uintptr_t)ctx->join_right.descriptor;
+    b->snapshot = wl_columnar_relation_snapshot(ctx->join_right.descriptor);
+    b->slot = slot; b->key_count = ctx->join_operation->key_count;
+    b->key = signature == 2 ? 1u : 0u; b->rows = ctx->join_right.nrows;
+    b->pending = true;
+    f->build_base[slot] = f->seen;
+    memcpy(f->build_calls[slot], f->allocation_calls,
+        sizeof(f->allocation_calls));
+}
+static void
+wl_test_join_cache_later_allocation(fixture_t *f,
+    wl_columnar_filter_context_t *ctx,
+    wl_columnar_arrangement_test_diff_alloc_site_t site, size_t bytes)
+{
+    unsigned prior = f->later_signature - 1;
+    wl_test_join_cache_signature(f, ctx, f->later_signature);
+    wl_test_join_cache_prior(f, ctx, prior);
+    const wl_test_join_cache_build_t *b = &f->start[prior];
+    const witnesses_t *base = &f->build_base[prior];
+    wl_col_session_t *s = COL_SESSION(f->active->session);
+    CHECK(f->stage == 5 && s->diff_arr_count == 3
+        && site >= WL_COLUMNAR_ARRANGEMENT_TEST_DIFF_ALLOC_HEADER
+        && f->allocation_phase == 2 && b->pending
+        && b->operation == (uintptr_t)ctx->join_operation &&
+        b->plan == (uintptr_t)f->selected
+        && b->occurrence == (unsigned)(ctx->join_operation - f->selected->ops)
+        && b->session == (uintptr_t)s &&
+        b->control == (uintptr_t)f->active->control
+        && b->control_identity ==
+        wl_evaluation_control_identity(f->active->control)
+        && b->attempt ==
+        wl_evaluation_control_active_attempt_id(f->active->control)
+        && b->generation == f->bindings->generation && b->slot == prior
+        && b->key_count == ctx->join_operation->key_count
+        && b->source == (uintptr_t)ctx->join_right.descriptor &&
+        b->rows == ctx->join_right.nrows
+        && wl_columnar_relation_snapshot_equal(b->snapshot,
+        wl_columnar_relation_snapshot(ctx->join_right.descriptor)));
+    uint64_t buckets = 1, capacity = s->diff_arr_count;
+    while (buckets < 2u * b->rows) buckets *= 2;
+    for (uint32_t st = 0; st < f->plan->stratum_count; ++st)
+        for (uint32_t h = 0; h < f->plan->strata[st].relation_count; ++h)
+            capacity += f->plan->strata[st].relations[h].op_count + 2u;
+    CHECK(base->image_cells ==
+        capacity *
+        (sizeof(col_diff_arr_entry_t) +
+        sizeof(wl_columnar_arrangement_diff_slot_t))
+        && base->copied_entries == 3 &&
+        base->metadata_name_bytes == 3u * sizeof("right")
+        && base->metadata_key_cells == 4u + prior /* copied pairs + earlier build keys */
+        && base->header_cells == prior * (sizeof(col_diff_arrangement_t) + 1u)
+        && base->bucket_cells == prior * (buckets + b->rows)
+        && f->seen.image_cells == base->image_cells &&
+        f->seen.copied_entries == base->copied_entries
+        && f->seen.metadata_name_bytes == base->metadata_name_bytes
+        && f->seen.metadata_key_cells == base->metadata_key_cells
+        && f->seen.bucket_cells == base->bucket_cells
+        && f->allocation_calls[WL_COLUMNAR_ARRANGEMENT_TEST_DIFF_ALLOC_IMAGE] ==
+        1
+        && f->allocation_calls[WL_COLUMNAR_ARRANGEMENT_TEST_DIFF_ALLOC_SLOTS] ==
+        1
+        && f->allocation_calls[WL_COLUMNAR_ARRANGEMENT_TEST_DIFF_ALLOC_NAME] ==
+        3
+        && f->allocation_calls[
+            WL_COLUMNAR_ARRANGEMENT_TEST_DIFF_ALLOC_METADATA_KEYS] == 3);
+    uint64_t sizes[] = {sizeof(col_diff_arrangement_t),
+                        b->key_count * sizeof(uint32_t),
+                        buckets * sizeof(uint32_t), b->rows * sizeof(uint32_t)};
+    unsigned target = site - WL_COLUMNAR_ARRANGEMENT_TEST_DIFF_ALLOC_HEADER;
+    CHECK(bytes == sizes[target] &&
+        f->allocation_progress ==
+        (target ? bytes : sizes[0]+sizes[1]+sizes[2]+sizes[3])
+        && f->seen.header_cells - base->header_cells ==
+        (target ? sizeof(col_diff_arrangement_t) + 1u : 0u));
+    for (unsigned i = 0; i < 4; ++i) {
+        unsigned tag = WL_COLUMNAR_ARRANGEMENT_TEST_DIFF_ALLOC_HEADER + i;
+        CHECK(f->build_calls[prior][tag] == prior
+            && f->allocation_calls[tag] == prior + (i <= target ? 1u : 0u));
+    }
+    fprintf(stdout,
+        "later signature=%u keys=%u prior-owned=%u target-prefix=%u\n",
+        f->later_signature, b->key_count, prior, target);
+}
 /* Observe only the real controlled allocator boundary, never its private owner. */
 static bool
 wl_test_join_cache_index_allocation(wl_evaluation_control_t *control,
@@ -613,6 +713,8 @@ wl_test_join_cache_index_allocation(wl_evaluation_control_t *control,
         || (f->allocation_ordinal &&
         f->allocation_calls[site] < f->allocation_ordinal)) return false;
     if (f->new_metadata) wl_test_join_cache_new_metadata(f, ctx, site, bytes);
+    else if (f->later_signature) wl_test_join_cache_later_allocation(f, ctx,
+            site, bytes);
     else {
         CHECK(f->stage ==
             (f->index_allocation >=
@@ -756,6 +858,8 @@ static void arrangement(wl_evaluation_control_t *control, unsigned phase,
         if (phase == 8) ++f->seen.header_cells;
         if (phase == 9) ++f->seen.bucket_cells;
     }
+    if (!f->profile && f->later_signature && phase == 7 && progress == 1)
+        wl_test_join_cache_later_start(f, context(f));
     if (!f->profile && f->armed && f->pin_mode && !f->stopped
         && phase == 0 && COL_SESSION(f->active->session)->diff_txn_count == 1) {
         wl_columnar_filter_context_t *ctx = context(f);
@@ -794,7 +898,8 @@ static void arrangement(wl_evaluation_control_t *control, unsigned phase,
     CHECK(!f->profile && !ctx->join_operation->right_filter_expr.size &&
         ctx->join_right.nrows && !rhs_delta(f));
     if (phase == 14) {
-        if (f->new_metadata) wl_test_join_cache_prefix(f, ctx, 0, progress);
+        if (f->new_metadata || f->later_signature) wl_test_join_cache_prefix(f,
+                ctx, 0, progress);
         ++f->seen.builds;
         f->building = ctx->join_operation;
     } else {
@@ -855,14 +960,16 @@ static void join(wl_evaluation_control_t *control, unsigned phase,
         CHECK(!ctx->join_operation->right_filter_expr.size &&
             ctx->join_right.nrows && f->building == ctx->join_operation &&
             !rhs_delta(f));
-        if (f->new_metadata) wl_test_join_cache_prefix(f, ctx, 1, progress);
+        if (f->new_metadata || f->later_signature) wl_test_join_cache_prefix(f,
+                ctx, 1, progress);
         ++f->seen.indexed;
         if (progress == 1) stop_at(f, control, 2);
     }
     if (phase == 48) {
         CHECK(!f->profile && !ctx->join_operation->right_filter_expr.size &&
             !rhs_delta(f) && progress < ctx->join_right.nrows);
-        if (f->new_metadata) wl_test_join_cache_prefix(f, ctx, 2, progress);
+        if (f->new_metadata || f->later_signature) wl_test_join_cache_prefix(f,
+                ctx, 2, progress);
         ++f->seen.persistent;
         stop_at(f, control, 3);
     }
@@ -1183,6 +1290,9 @@ static void watch(fixture_t *f, unsigned profile, bool enabled) {
     memset(&f->cycle_build, 0, sizeof(f->cycle_build));
     f->build_ordinal = 0;
     memset(f->prefix, 0, sizeof(f->prefix));
+    memset(f->start, 0, sizeof(f->start));
+    memset(f->build_base, 0, sizeof(f->build_base));
+    memset(f->build_calls, 0, sizeof(f->build_calls));
     memset(f->allocation_calls, 0, sizeof(f->allocation_calls));
     f->allocation_attempt = 0;
     f->allocation_phase = 0; f->allocation_progress = 0;
@@ -1815,6 +1925,15 @@ int main(int argc, char **argv) {
                     2) ? WL_COLUMNAR_ARRANGEMENT_TEST_DIFF_ALLOC_METADATA_KEYS
                 : WL_COLUMNAR_ARRANGEMENT_TEST_DIFF_ALLOC_NAME;
             }
+        const char *const later_modes[] = {"index-key1-header",
+                                           "index-key1-keys",
+                                           "index-key1-heads",
+                                           "index-key1-next"};
+        for (unsigned i = 0; i < 4; ++i) if (!strcmp(argv[3], later_modes[i])) {
+                f.later_signature = 2; f.allocation_ordinal = 2;
+                f.index_allocation =
+                    WL_COLUMNAR_ARRANGEMENT_TEST_DIFF_ALLOC_HEADER + i;
+            }
         f.pin_mode = !strcmp(argv[3], "pin-held");
         f.cycle = !strcmp(argv[3], "empty-cycle");
         const char *const cycle_modes[] = {"empty-right-cancel",
@@ -1970,7 +2089,7 @@ int main(int argc, char **argv) {
                     WL_COLUMNAR_ARRANGEMENT_TEST_DIFF_ALLOC_HEADER ? 3u : 1u)
                     && f.seen.image_cells &&
                     f.seen.copied_entries == (f.new_metadata ? 0u : 3u));
-                if (f.new_metadata) {
+                if (f.new_metadata || f.later_signature) {
                     CHECK(f.seen.builds == 3 && f.seen.reuses == 1);
                     for (unsigned i = 0; i < 3;
                         ++i) CHECK(f.prefix[i].ordinal && !f.prefix[i].pending

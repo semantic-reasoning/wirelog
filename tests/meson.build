@@ -8293,3 +8293,12 @@ foreach pair : [['scalar', 'observed'], ['scalar', 'plain'], ['scalar', 'snapsho
       suite: ['unit', 'tsan', 'evaluation_join_hosts'], timeout: 120)
   endforeach
 endforeach
+
+# Later key1 replacement faults must unwind the earlier owned key0 index.
+foreach pair : [['scalar', 'observed'], ['scalar', 'plain'], ['scalar', 'snapshot'], ['inline', 'observed']]
+  foreach mode : ['index-key1-header', 'index-key1-keys', 'index-key1-heads', 'index-key1-next']
+    test('evaluation_join_cache_@0@_@1@_@2@'.format(pair[0], pair[1], mode),
+      test_evaluation_join_cache_exe, args: [pair[0], pair[1], mode],
+      suite: ['unit', 'tsan', 'evaluation_join_hosts'], timeout: 120)
+  endforeach
+endforeach
