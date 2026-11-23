@@ -320,3 +320,63 @@ warm reuse against unchanged RHS. The closed2410 full56-case matrix is excluded.
 These assertions close these local representation/policy/prefix products only;
 cache-family consuming invalidation/clear/LRU cycles and final reconciliation
 remain in progress in this PR.
+
+## Cache-family consuming lifecycle closure
+
+`evaluation_join_acceptance_cache-clear-cycle` is a genuine observed controlled
+public ordinary JOIN with literal signed sets. Replacing RHS key1 with key3 keeps
+the actual consuming source at two rows, changes its snapshot and requires one
+persistent build, old-key absence and new-key presence. An unmatched LEFT-only
+append then requires warm reuse and real per-LEFT phase29 probe work, even when
+there is no phase48 candidate or emitted pair. Unchanged STEPs remain no-work
+controls. This distinguishes cache reuse from a cached result or no execution.
+
+The same completed session opens a real native differential transaction under
+a source reader, checks free EBUSY with exact working/published owner and hash
+payload preserved, then aborts and requires the exact local credit refund. A real
+pin separately keeps free EBUSY with its actual source snapshot, two reader gates,
+entry/generation and arrays unchanged. Releasing the pin permits actual registry
+free, NULL/count/cap/reserved reset and the measured refund of only differential
+index plus registry credit. New unmatched LEFT-only appends over unchanged RHS
+must first build the absent index and then reuse its exact current payload/token.
+No differential LRU policy or invented zero-row append producer is claimed.
+
+`arrangement_lru_eviction:test_primary_consuming_deferred` adds real raw ordinary
+nonunary consumers to the primary protocol. Two actual index pins survive a real
+same-count mutation/invalidation; stale-held consumption returns EBUSY with no
+escaping output, original hash payload/token/bytes intact and canonical readers
+released. First release preserves the held state; last release marks unbuilt
+without eager rebuilding. Actual JOIN then lazily builds the fresh index and
+returns literal new-key values, followed by warm consuming reuse. Its cap-pressure
+variant starts with a real unpinned alternate candidate, evicts/reuses that slot
+while deferring the pinned index, and verifies final-release disposal before
+consuming rebuild. No registry-capacity or tombstone field is fabricated.
+
+`test_primary_consuming_lru` separately starts with two fresh unpinned equal-byte
+candidates, establishes recency by actual ordinary consumption, sets the limit to
+measured current bytes and requests a third signature. The real75% target evicts
+only the older candidate and reuses its slot, preserving the survivor's payload
+and generation. After explicitly lifting the cap, a real ordinary JOIN reaccesses
+and rebuilds the evicted signature with independent literals. Existing detailed
+primary seven-scenario/deferred/empty/tombstone/failure/byte-sum checks remain
+supporting component evidence and are not re-registered as a duplicate matrix.
+
+`join_right_filter_cleanup:test_join_filter_cache_deferred_cycle` adds a genuine
+two-pin filtered relation cycle while retaining the earlier append-fallback case.
+Actual backend removal/insertion replaces passing key3 with key4 at physical row
+count8, changes the source snapshot and invokes real per-relation invalidation.
+The hidden entry, stale four-row filtered payload and metadata remain address-
+stable; checked lookup reports availability rather than denial. Actual raw JOIN
+must produce new literal keys0/1/2/4 through an owned alternative without
+publishing it into either filtered cache. First release preserves the last lease;
+last release destroys only the stale payload and resets source fields/deferral,
+retaining reusable entry metadata. Subsequent actual JOIN refills, creates the
+current filtered arrangement and warm-reuses its exact arrays/generation/token.
+A later real source mutation requires new key3 value303 and literal keys0..4.
+Governor credit reaches zero after retirement. These raw primary/filtered consumers
+are separate from default controlled differential/private routing.
+
+All existing cache tests remain. These finite consuming cycles finish the cache
+protocol gaps identified by the local inventory; final integrated reconciliation
+and the explicit containing-domain/platform boundaries are still recorded below
+and in the containing ledgers, without closing #2371/#2300.

@@ -975,6 +975,195 @@ test_append_failure_rolls_back(void)
     PASS();
 }
 
+/* Direct raw ordinary consumers: two-column LEFT avoids the unary bypass. */
+static bool consume_primary(wl_session_t *session, unsigned key_col,
+    bool replaced, int expected) {
+    const char *names[] = {"k", "padding"};
+    const wirelog_column_type_t types[] = {WIRELOG_TYPE_INT32,
+                                           WIRELOG_TYPE_INT32};
+    col_rel_t *left = col_rel_new_auto("$primary_left", 2);
+    eval_stack_t stack; eval_stack_init(&stack);
+    bool transferred = false, ok = false;
+    if (!left || col_rel_set_schema(left, 2,
+        names) || col_rel_set_column_types(left, types, 2)) goto done;
+    const int64_t xkeys[] = {10, 11, 20, 30}, ykeys[] = {1, 2, 3};
+    for (unsigned i = 0; i < (key_col?3u:4u); ++i) {
+        int64_t key = key_col?ykeys[i]:xkeys[i], row[] = {key, 1000+key};
+        if (col_rel_append_row(left, row))goto done;
+    }
+    col_rel_t *right = session_find_rel(COL_SESSION(session), "edge");
+    if (!right || !right->col_names || !right->col_names[key_col]) goto done;
+    const char *lkeys[] = {"k"}, *rkeys[] = {right->col_names[key_col]};
+    if (col_rel_col_idx(right, rkeys[0]) != (int)key_col)goto done;
+    wl_plan_op_t op = {.op = WL_PLAN_OP_JOIN, .right_relation = "edge",
+                       .key_count = 1,
+                       .left_keys = lkeys, .right_keys = rkeys,
+                       .delta_mode = WL_DELTA_FORCE_FULL};
+    col_relation_snapshot_t snapshot = wl_columnar_relation_snapshot(right);
+    if (eval_stack_push(&stack, left, true))goto done; transferred = true;
+    int rc = col_op_join(&op, &stack, COL_SESSION(session));
+    if (rc != expected || !wl_columnar_relation_snapshot_equal(snapshot,
+        wl_columnar_relation_snapshot(right)) ||
+        atomic_load(&right->source_access.state) ||
+        atomic_load(&right->descriptor_access.state)) goto done;
+    if (expected) {
+        ok = stack.top == 0; goto done;
+    }
+    if (stack.top != 1 || !stack.items[0].owned)goto done;
+    const col_rel_t *out = stack.items[0].rel;
+    if (!out || out->nrows != 3 || out->ncols != 4)goto done;
+    unsigned seen = 0;
+    for (uint32_t row = 0; row < out->nrows; ++row) {
+        int64_t y = col_rel_get(out, row, 3);
+        if (y < 1 || y > 3)goto done;
+        int64_t x = y == 1?(replaced?11:10):y*10, key = key_col?y:x;
+        unsigned bit = 1u<<((unsigned)y-1);
+        if ((seen&bit) || col_rel_get(out, row, 0) != key || col_rel_get(out,
+            row, 1) != 1000+key || col_rel_get(out, row, 2) != x) goto done;
+        seen |= bit;
+    }
+    ok = seen == 7;
+done:
+    (void)eval_stack_drain(&stack);
+    if (!transferred) col_rel_destroy(left); return ok;
+}
+static void test_primary_consuming_deferred(unsigned eviction) {
+    TEST(eviction?"primary real cap deferral then consuming rebuild":
+        "primary stale pin refusal then consuming rebuild");
+    const char *text =
+        ".decl edge(x:int32,y:int32)\nedge(10,1).edge(20,2).edge(30,3).\n"
+        ".decl path(x:int32,y:int32)\npath(x,y):-edge(x,y).\n";
+    wl_session_t *session = NULL; wl_plan_t *plan = NULL;
+    wirelog_program_t *program = NULL;
+    col_arrangement_pin_t first = {0}, second = {0}; const char *failure = NULL;
+#define CYCLE_CHECK(c, m) do {if (!(c)) {failure = m; goto cleanup;}} while (0)
+    CYCLE_CHECK(!make_session(text, &session, &plan, &program), "setup");
+    wl_col_session_t *s = COL_SESSION(session);
+    col_rel_t *right = session_find_rel(s, "edge");
+    uint32_t key = 0, alternate = 1, pair[] = {0, 1};
+    CYCLE_CHECK(consume_primary(session, 0, false, 0) && s->arr_count == 1,
+        "initial actual primary consumption");
+    if (eviction) CYCLE_CHECK(col_session_get_arrangement(session, "edge",
+            &alternate, 1), "unpinned eviction candidate");
+    CYCLE_CHECK(!col_session_pin_arrangement(session, "edge", &key, 1,
+        &first) &&
+        !col_session_pin_arrangement(session, "edge", &key, 1, &second),
+        "two pins");
+    col_arr_entry_t *entry = first.entry; col_arrangement_t *index = first.arr;
+    uint64_t *heads = index->ht_head; uint32_t *next = index->ht_next;
+    uint32_t generation = index->generation; size_t bytes = entry->mem_bytes;
+    uint64_t stored_heads[32]; uint32_t stored_next[3];
+    CYCLE_CHECK(index->nbuckets <= 32 && index->indexed_rows == 3,
+        "actual small initialized payload");
+    memcpy(stored_heads, index->ht_head, index->nbuckets*sizeof(*stored_heads));
+    memcpy(stored_next, index->ht_next, sizeof(stored_next));
+    col_relation_snapshot_t old_source = entry->source_snapshot;
+
+    CYCLE_CHECK(right && !col_rel_set(right, 0, 0, 11),
+        "real same-count mutation");
+    col_session_invalidate_arrangements(session, "edge");
+    if (eviction) {
+        s->arr_cache_limit_bytes = 0;
+        CYCLE_CHECK(col_session_get_arrangement(session, "edge", pair,
+            2) && entry == first.entry &&
+            entry->evict_deferred,
+            "actual cap pressure must defer pinned victim and reuse unpinned slot");
+    }
+    CYCLE_CHECK(entry->pin_count == 2 && entry->rebuild_deferred &&
+        consume_primary(session, 0, true, EBUSY) && entry->pin_count == 2 &&
+        index->ht_head == heads && index->ht_next == next &&
+        index->indexed_rows == 3 &&
+        index->generation == generation && entry->mem_bytes == bytes &&
+        wl_columnar_relation_snapshot_equal(old_source,
+        entry->source_snapshot) &&
+        !memcmp(stored_heads, index->ht_head,
+        index->nbuckets*sizeof(*stored_heads)) &&
+        !memcmp(stored_next, index->ht_next, sizeof(stored_next)),
+        "held ordinary refusal/index preservation");
+    col_arrangement_pin_release(&second);
+    CYCLE_CHECK(entry->pin_count == 1 && entry->rebuild_deferred &&
+        index->ht_head == heads && index->ht_next == next &&
+        entry->mem_bytes == bytes &&
+        consume_primary(session, 0, true, EBUSY) &&
+        !memcmp(stored_heads, index->ht_head,
+        index->nbuckets*sizeof(*stored_heads)) &&
+        !memcmp(stored_next, index->ht_next, sizeof(stored_next)),
+        "first release preserves held refusal");
+    col_arrangement_pin_release(&first);
+    CYCLE_CHECK(!entry->pin_count && !entry->rebuild_deferred &&
+        !index->indexed_rows &&
+        (!eviction ||
+        (!entry->mem_bytes && !index->ht_head && !index->ht_next)),
+        "last release lazy invalidation/eviction");
+    s->arr_cache_limit_bytes = SIZE_MAX;
+    CYCLE_CHECK(consume_primary(session, 0, true, 0),
+        "actual post-release rebuild literals");
+    col_arrangement_t *rebuilt = col_session_get_arrangement(session, "edge",
+            &key, 1);
+    CYCLE_CHECK(rebuilt && rebuilt->indexed_rows == 3 &&
+        wl_columnar_relation_snapshot_equal(entry->source_snapshot,
+        wl_columnar_relation_snapshot(right)), "rebuilt snapshot");
+    generation = rebuilt->generation; heads = rebuilt->ht_head;
+    next = rebuilt->ht_next;
+    CYCLE_CHECK(consume_primary(session, 0, true,
+        0) && rebuilt->generation == generation &&
+        rebuilt->ht_head == heads && rebuilt->ht_next == next,
+        "warm consuming reuse");
+    size_t total = 0;
+    for (uint32_t i = 0; i < s->arr_count;
+        ++i) total += s->arr_entries[i].mem_bytes;
+    CYCLE_CHECK(total == s->arr_total_bytes, "exact primary byte sum");
+cleanup:
+    col_arrangement_pin_release(&second); col_arrangement_pin_release(&first);
+    if (session) free_session(session, plan, program);
+    if (failure) FAIL(failure); PASS();
+#undef CYCLE_CHECK
+}
+static void test_primary_consuming_lru(void) {
+    TEST("genuine two-candidate LRU victim and consuming reaccess");
+    const char *text =
+        ".decl edge(x:int32,y:int32)\nedge(10,1).edge(20,2).edge(30,3).\n"
+        ".decl path(x:int32,y:int32)\npath(x,y):-edge(x,y).\n";
+    wl_session_t *session = NULL; wl_plan_t *plan = NULL;
+    wirelog_program_t *program = NULL;
+    ASSERT(!make_session(text, &session, &plan, &program), "setup");
+    wl_col_session_t *s = COL_SESSION(session);
+    uint32_t k0 = 0, k1 = 1, pair[] = {0, 1};
+    ASSERT(col_session_get_arrangement(session, "edge", &k0, 1) &&
+        col_session_get_arrangement(session, "edge", &k1,
+        1) && s->arr_count == 2, "two genuine fresh candidates");
+    ASSERT(s->arr_entries[0].mem_bytes &&
+        s->arr_entries[0].mem_bytes == s->arr_entries[1].mem_bytes,
+        "equal real candidate bytes");
+    uint64_t *survivor = s->arr_entries[0].arr.ht_head;
+    uint32_t generation = s->arr_entries[0].arr.generation;
+    ASSERT(consume_primary(session, 0, false, 0) &&
+        s->arr_entries[0].lru_clock > s->arr_entries[1].lru_clock,
+        "actual consuming touch establishes recency");
+    s->arr_cache_limit_bytes = s->arr_total_bytes;
+    ASSERT(col_session_get_arrangement(session, "edge", pair,
+        2) && s->arr_count == 2 &&
+        s->arr_entries[0].key_count == 1 &&
+        s->arr_entries[0].key_cols[0] == 0 &&
+        s->arr_entries[0].arr.ht_head == survivor &&
+        s->arr_entries[0].arr.generation == generation &&
+        s->arr_entries[1].key_count == 2 &&
+        s->arr_entries[1].key_cols[0] == 0 &&
+        s->arr_entries[1].key_cols[1] == 1,
+        "older candidate evicted and reused without losing survivor");
+    s->arr_cache_limit_bytes = SIZE_MAX;
+    ASSERT(consume_primary(session, 1, false, 0),
+        "actual evicted-signature consuming rebuild");
+    bool found = false; for (uint32_t i = 0; i < s->arr_count; ++i)
+        if (s->arr_entries[i].key_count == 1 &&
+            s->arr_entries[i].key_cols[0] == 1)
+            found = s->arr_entries[i].arr.indexed_rows == 3 &&
+                s->arr_entries[i].mem_bytes;
+    ASSERT(found && s->arr_entries[0].arr.ht_head == survivor,
+        "reaccess installed fresh victim signature");
+    free_session(session, plan, program); PASS();
+}
+
 int
 main(void)
 {
@@ -993,6 +1182,9 @@ main(void)
         test_pinned_rebuild(scenario);
     test_pinned_empty_index();
     test_unpinned_empty_index_no_rebuild();
+    test_primary_consuming_deferred(0);
+    test_primary_consuming_deferred(1);
+    test_primary_consuming_lru();
 
     printf("\n%d/%d tests passed", pass_count, test_count);
     if (fail_count > 0)
