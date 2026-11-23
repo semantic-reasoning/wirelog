@@ -25,17 +25,18 @@ typedef struct {
 typedef struct {
     uintptr_t container, arr, heads, next;
     uint32_t count, buckets, capacity, indexed, rows, pins;
-    uint64_t generation;
+    uint64_t generation, readers, descriptor_readers;
+    bool deferred;
     col_relation_snapshot_t snapshot;
     uint32_t bucket[CACHE_SLOTS], link[CACHE_SLOTS];
 } cache_t;
 typedef struct {
     wirelog_program_t *program; wl_plan_t *plan; const wl_plan_op_t *op;
     profile_t p[2]; unsigned kind, route, stage, profile, fault;
-    bool left[IDS], right[IDS], seed, pin_mode, armed, stopped;
+    bool left[IDS], right[IDS], seed, pin_mode, deferred, armed, stopped;
     int64_t key[3], payload[2];
     unsigned builds, reuses, indexed, probes, private_rows, delta_mask;
-    col_diff_arrangement_pin_t pin; uint64_t failed_attempt;
+    col_diff_arrangement_pin_t pin, second_pin; uint64_t failed_attempt;
 } fixture_t;
 static fixture_t *active;
 static unsigned head(const char *name) {
@@ -143,7 +144,7 @@ static cache_t cache(profile_t *p) {
     const col_diff_arr_entry_t *e = &s->diff_arr_entries[0];
     const col_diff_arrangement_t *a = e->diff_arr;
     CHECK(a && e->key_count == 1 && e->key_cols[0] == 0 && !strcmp(e->rel_name,
-        "right") && !e->transaction_pending && !e->invalidation_deferred);
+        "right") && !e->transaction_pending);
     CHECK(a->nbuckets <= CACHE_SLOTS && a->ht_cap <= CACHE_SLOTS &&
         a->ht_head && a->ht_next);
     c.arr = (uintptr_t)a; c.heads = (uintptr_t)a->ht_head;
@@ -151,6 +152,12 @@ static cache_t cache(profile_t *p) {
     c.buckets = a->nbuckets; c.capacity = a->ht_cap;
     c.indexed = a->indexed_rows; c.rows = a->current_nrows;
     c.generation = e->generation; c.pins = e->pin_count;
+    c.deferred = e->invalidation_deferred;
+    const col_rel_t *right = session_find_rel(s, "right");
+    c.readers = atomic_load_explicit(&right->storage_owner->source_access.state,
+            memory_order_acquire);
+    c.descriptor_readers = atomic_load_explicit(&right->descriptor_access.state,
+            memory_order_acquire);
     c.snapshot = a->source_snapshot;
     memcpy(c.bucket, a->ht_head, c.buckets*sizeof(uint32_t));
     memcpy(c.link, a->ht_next, c.capacity*sizeof(uint32_t)); return c;
@@ -163,6 +170,8 @@ static void same_cache(const cache_t *a, const cache_t *b, bool container) {
         a->buckets == b->buckets && a->capacity == b->capacity
         && a->indexed == b->indexed && a->rows == b->rows &&
         a->generation == b->generation && a->pins == b->pins
+        && a->deferred == b->deferred && a->readers == b->readers
+        && a->descriptor_readers == b->descriptor_readers
         && a->snapshot.relation_identity == b->snapshot.relation_identity
         && a->snapshot.view_generation == b->snapshot.view_generation
         && a->snapshot.storage_generation == b->snapshot.storage_generation
@@ -232,7 +241,21 @@ static void join(wl_evaluation_control_t *control, unsigned phase,
     if (control != f->p[f->profile].control ||
         (phase != 28 && phase != 47 && phase != 48)) return;
     wl_columnar_filter_context_t *ctx = context(f);
-    if (phase == 28)++f->private_rows;
+    if (phase == 28) {
+        ++f->private_rows;
+        if (f->armed && !f->stopped && f->fault >= 3 && f->stage == 1 &&
+            progress == 1){
+            CHECK(f->deferred && f->pin.active && f->second_pin.active
+                && f->pin.entry->invalidation_deferred &&
+                f->pin.entry->pin_count == 2);
+            f->stopped = true;
+            if (f->fault == 3) wl_evaluation_control_request_cancel(control);
+            else CHECK(wl_evaluation_control_charge_attempt(control,
+                    wl_evaluation_control_active_attempt_id(control),
+                    UINT64_MAX)
+                    == WL_EVALUATION_CONTROL_WORK_LIMIT);
+        }
+    }
     if (phase == 48)++f->probes;
     if (phase == 47) {
         CHECK(!f->profile && ctx->join_right.nrows &&
@@ -275,11 +298,29 @@ static void stopped(fixture_t *f, const image_t *old, const cache_t *before) {
         wl_columnar_memory_denials(wl_columnar_memory_governor_ref_get(
                 p->governor));
     f->armed = true;
-    int expected = f->fault == 1?WL_EVALUATION_CONTROL_CANCELLED:ENOMEM;
+    int expected = f->fault == 1 ||
+        f->fault == 3 ? WL_EVALUATION_CONTROL_CANCELLED
+        : f->fault == 4 ? WL_EVALUATION_CONTROL_WORK_LIMIT : ENOMEM;
     CHECK(finish(f, p) == expected && f->stopped && s->pending_input_change);
     f->armed = false;
     wl_columnar_arrangement_test_diff_fail_allocation = NULL;
-    cache_t after = cache(p); same_cache(before, &after, true);
+    cache_t after = cache(p);
+    uint64_t owner[8];
+    CHECK(!wl_columnar_session_test_retained_work_owner(s, owner));
+    bool retained = f->fault == 4;
+    if (retained) {
+        /* This acyclic STEP WORK keeps the real EVALUATE parent and its
+         * public EDB leases; the two external pins are separate owners. */
+        CHECK(owner[0] && owner[1] && owner[2] && owner[3] == 8 && owner[4]
+            && owner[4] == owner[5] && owner[6] && owner[7]
+            && p->session->backend->session_controlled_step_state(p->session)
+            == WL_CONTROLLED_STEP_PENDING);
+    } else CHECK(!owner[0] && !owner[1] && !owner[2]);
+    cache_t expected_cache = *before;
+    if (retained) {
+        ++expected_cache.readers; ++expected_cache.descriptor_readers;
+    }
+    same_cache(&expected_cache, &after, true);
     content(p, old);
     CHECK(!memcmp(p->events, (int[2][IDS][IDS]){{{0}}},
         sizeof(p->events)) && !memcmp(p->calls, (unsigned[2][IDS][IDS]){{{0}}},
@@ -300,15 +341,100 @@ static void stopped(fixture_t *f, const image_t *old, const cache_t *before) {
     f->failed_attempt = report.attempt_id;
     CHECK(wl_columnar_memory_denials(wl_columnar_memory_governor_ref_get(
             p->governor)) == denials);
-    uint64_t owner[8];
-    CHECK(!wl_columnar_session_test_retained_work_owner(s,
-        owner) && !owner[0] && !owner[1] && !owner[2]);
     for (unsigned i = 0; i < 2; ++i) {
         wl_columnar_source_access_writer_t w = {0};
-        CHECK(!col_rel_source_writer_acquire(i?r:l,
-            &w) && !wl_columnar_source_access_writer_release(&w));
+        if (retained ||
+            (i && f->pin.active)) CHECK(col_rel_source_writer_acquire(i?r:l,
+                &w) == EBUSY);
+        else CHECK(!col_rel_source_writer_acquire(i?r:l, &w)
+                && !wl_columnar_source_access_writer_release(&w));
+    }
+    if (retained) {
+        int64_t left_row[] = {f->key[0], 7}, right[4]; right_row(f, 1, right);
+        CHECK(wl_session_insert(p->session, "left", left_row, 1, 2) == EBUSY);
+        CHECK(wl_session_remove(p->session, "right", right, 1, 4) == EBUSY);
+        image_t unexpected = {0};
+        CHECK(wl_session_snapshot(p->session, tuple, &unexpected) == EBUSY);
+        CHECK(!memcmp(&unexpected, &(image_t){0}, sizeof(unexpected)));
+        wl_evaluation_control_report_t frozen;
+        CHECK(!wl_evaluation_control_report(p->control, &frozen)
+            && report.attempt_id == frozen.attempt_id &&
+            report.limit == frozen.limit
+            && report.consumed == frozen.consumed &&
+            report.stop_reason == frozen.stop_reason
+            && report.execution_status == frozen.execution_status
+            && report.cleanup_status == frozen.cleanup_status &&
+            report.result == frozen.result);
+        uint64_t again[8];
+        CHECK(!wl_columnar_session_test_retained_work_owner(s, again));
+        for (unsigned i = 0; i < 8; ++i) CHECK(owner[i] == again[i]);
+        after = cache(p); same_cache(&expected_cache, &after, true);
     }
     CHECK(!wl_evaluation_control_reset(p->control));
+}
+/* The real invalidate API and two leases, not fabricated deferred/pin flags. */
+static void deferred_hold(fixture_t *f) {
+    wl_col_session_t *s = COL_SESSION(f->p[0].session);
+    col_rel_t *right = session_find_rel(s, "right"); uint32_t key = 0;
+    CHECK(!col_session_pin_diff_arrangement(s, "right", right, &key, 1,
+        &f->second_pin));
+    CHECK(f->pin.entry == f->second_pin.entry && f->pin.entry->pin_count == 2);
+    cache_t before = cache(&f->p[0]);
+    col_session_invalidate_arrangements(f->p[0].session, "right");
+    cache_t after = cache(&f->p[0]); before.deferred = true;
+    same_cache(&before, &after, true);
+    CHECK(after.readers == 2 && after.descriptor_readers == 2 &&
+        f->pin.source_reader.identity == (uintptr_t)&f->pin.source_reader &&
+        f->second_pin.source_reader.identity ==
+        (uintptr_t)&f->second_pin.source_reader &&
+        f->pin.source_reader.owner == &right->storage_owner->source_access &&
+        f->second_pin.source_reader.secondary_owner ==
+        &right->descriptor_access);
+}
+static void deferred_release(fixture_t *f, const cache_t *held) {
+    profile_t *p = &f->p[0]; col_rel_t *right =
+        session_find_rel(COL_SESSION(p->session), "right");
+    col_diff_arrangement_pin_release(&f->second_pin);
+    CHECK(!f->second_pin.active && f->pin.active);
+    cache_t expected = *held, after = cache(p);
+    --expected.pins; --expected.readers; --expected.descriptor_readers;
+    same_cache(&expected, &after, true);
+    wl_columnar_source_access_writer_t writer = {0};
+    CHECK(col_rel_source_writer_acquire(right, &writer) == EBUSY);
+    col_diff_arrangement_pin_release(&f->pin); CHECK(!f->pin.active);
+    after = cache(p);
+    CHECK(after.container == held->container && after.arr == held->arr
+        && after.heads == held->heads && after.next == held->next
+        && after.generation == held->generation + 1 && !after.deferred
+        && !after.pins && !after.readers && !after.descriptor_readers
+        && !after.indexed && !after.rows && !after.snapshot.relation_identity
+        && !after.snapshot.view_generation &&
+        !after.snapshot.storage_generation);
+    for (uint32_t i = 0; i < after.buckets; ++i) CHECK(!after.bucket[i]);
+    for (uint32_t i = 0; i < after.capacity; ++i) CHECK(!after.link[i]);
+    CHECK(!col_rel_source_writer_acquire(right, &writer)
+        && !wl_columnar_source_access_writer_release(&writer));
+}
+/* Change only LEFT after the final reset: the unchanged RHS must rebuild,
+ * rather than waiting for a later RHS mutation to invalidate a stale cache. */
+static void deferred_rebuild(fixture_t *f, image_t *old) {
+    insert_left(f, 6); image_t want = reference(f);
+    for (unsigned p = 0; p < 2; ++p) {
+        profile_t *q = &f->p[p]; watch(f, p, true);
+        CHECK(!finish(f, q)); delivery(f, q, old, &want);
+        cache_t after = cache(q);
+        if (!p) {
+            CHECK(f->builds == 1 && f->reuses == 1 && f->indexed && f->probes
+                && !f->private_rows && after.indexed == 3 && !after.deferred
+                && !after.pins && !after.readers && !after.descriptor_readers
+                && wl_columnar_relation_snapshot_equal(after.snapshot,
+                wl_columnar_relation_snapshot(session_find_rel(COL_SESSION(
+                    q->session), "right"))));
+        } else CHECK(!after.count && f->private_rows && !f->builds &&
+                !f->reuses);
+        watch(f, p, false); CHECK(!finish(f, q)); delivery(f, q, &want, &want);
+    }
+    *old = want;
 }
 static void seed(fixture_t *f) {
     profile_t *p = &f->p[0];
@@ -343,8 +469,14 @@ static void invalid_float(fixture_t *f) {
 int main(int argc, char **argv) {
     CHECK(argc == 4); fixture_t f = {0}; f.kind = (unsigned)atoi(argv[1]);
     f.route = (unsigned)atoi(argv[2]); CHECK(f.kind < 3 && f.route < 3);
-    f.seed = !strcmp(argv[3], "seed"); f.pin_mode = !strcmp(argv[3], "pin");
-    f.fault = !strcmp(argv[3], "cancel")?1u:!strcmp(argv[3], "nomem")?2u:0u;
+    f.seed = !strcmp(argv[3], "seed");
+    f.deferred = !strcmp(argv[3], "deferred") || !strcmp(argv[3],
+            "deferred-cancel")
+        || !strcmp(argv[3], "deferred-work");
+    f.pin_mode = !strcmp(argv[3], "pin") || f.deferred;
+    f.fault = !strcmp(argv[3], "cancel") ? 1u : !strcmp(argv[3], "nomem") ? 2u
+        : !strcmp(argv[3], "deferred-cancel") ? 3u : !strcmp(argv[3],
+            "deferred-work") ? 4u : 0u;
     CHECK(!strcmp(argv[3], "healthy") || f.seed || f.pin_mode || f.fault);
     const char *vars[] = {"WIRELOG_DIFF_ENABLED", "WIRELOG_JOIN_BATCH_BYTES",
                           "WIRELOG_JOIN_BATCH_STRICT",
@@ -424,15 +556,17 @@ int main(int argc, char **argv) {
             CHECK(!col_session_pin_diff_arrangement(COL_SESSION(f.p[0].session),
                 "right", session_find_rel(COL_SESSION(f.p[0].session), "right"),
                 &key, 1, &f.pin));
+            if (f.deferred) deferred_hold(&f);
         }
         for (unsigned p = 0; p < 2; ++p) {
             profile_t *q = &f.p[p]; cache_t before = cache(q);
             watch(&f, p, true);
-            if (!p && f.fault && !f.stopped && f.stage == 3) {
+            if (!p && f.fault && !f.stopped &&
+                f.stage == (f.deferred ? 1u : 3u)) {
                 stopped(&f, &old, &before); watch(&f, p, true);
             }
             CHECK(!finish(&f, q)); delivery(&f, q, &old, &want);
-            if (!p && f.stage == 3 && f.failed_attempt) {
+            if (!p && f.stage == (f.deferred ? 1u : 3u) && f.failed_attempt) {
                 wl_evaluation_control_report_t report;
                 CHECK(!wl_evaluation_control_report(q->control,
                     &report) && report.attempt_id &&
@@ -445,12 +579,21 @@ int main(int argc, char **argv) {
                 f.private_rows); fflush(stdout);
             if (!p) {
                 cache_t after = cache(q);
+                CHECK(after.deferred == (f.deferred && f.stage == 1));
                 if (f.stage == 1 && f.pin_mode) {
                     CHECK(!f.builds && !f.reuses && !f.indexed && !f.probes &&
                         f.private_rows);
                     same_cache(&before, &after, true);
-                    CHECK(f.pin.active && f.pin.entry->pin_count == 1);
-                    col_diff_arrangement_pin_release(&f.pin);
+                    CHECK(f.pin.active &&
+                        f.pin.entry->pin_count == (f.deferred ? 2u : 1u));
+                    /* Prove both external leases survive successful repeat too. */
+                    if (f.deferred) {
+                        CHECK(before.deferred); watch(&f, p, false);
+                        CHECK(!finish(&f, q)); delivery(&f, q, &want, &want);
+                        cache_t repeated = cache(q);
+                        same_cache(&after, &repeated, true);
+                        deferred_release(&f, &repeated);
+                    } else col_diff_arrangement_pin_release(&f.pin);
                     CHECK(!f.pin.active);
                 }else if (f.delta_mask) {
                     CHECK(f.stage == 2 && f.delta_mask == 3 && !f.builds &&
@@ -478,8 +621,9 @@ int main(int argc, char **argv) {
             delivery(&f, q, &want, &want);
         }
         old = want;
+        if (f.deferred && f.stage == 1) deferred_rebuild(&f, &old);
     }
-    CHECK(!f.fault || f.stopped); CHECK(!f.pin.active);
+    CHECK(!f.fault || f.stopped); CHECK(!f.pin.active && !f.second_pin.active);
     for (unsigned p = 0; p < 2; ++p) {
         CHECK(!wl_session_try_destroy(&f.p[p].session));
         wl_evaluation_control_release(f.p[p].control);

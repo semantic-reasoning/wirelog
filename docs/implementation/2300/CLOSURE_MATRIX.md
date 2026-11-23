@@ -254,3 +254,12 @@ alongside146 existing cache cases. This is a runtime capability/performance
 change with necessary regressions, not completion of the remaining full
 cache/type/policy/lifecycle/Native/Source/carry or platform products. F05a,
 #2371 and #2300 remain OPEN.
+
+
+The genuine differential-deferred increment permits ordinary private execution
+while an authentic pinned index awaits invalidation. Two-pin first/last release,
+unchanged-RHS rebuild and typed/public-route recovery are recorded in the
+[ordinary/cache local inventory](ORDINARY_JOIN_CACHE_ACCEPTANCE.md). Independent
+pending/unpinned-deferred/malformed errors stay authoritative. This discharges
+that local deferred-pin transition; other ordinary cache-family/selector/policy
+items are still pending in the inventory, and global rows remain OPEN.

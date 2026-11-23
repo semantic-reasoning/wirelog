@@ -8327,3 +8327,14 @@ foreach mode : ['cancel', 'nomem', 'pin']
   test('evaluation_join_runtime_cache_' + mode, join_runtime_cache_exe,
     args: ['2', '0', mode], suite: ['unit', 'tsan', 'evaluation_join_hosts'], timeout: 120)
 endforeach
+
+# Genuine deferred invalidation under two differential pins, then last-release reset.
+foreach pair : [[0, 0], [1, 1], [2, 2]]
+  test('evaluation_join_runtime_cache_deferred_@0@'.format(pair[0]),
+    join_runtime_cache_exe, args: [pair[0].to_string(), pair[1].to_string(), 'deferred'],
+    suite: ['unit', 'tsan', 'evaluation_join_hosts'], timeout: 120)
+endforeach
+foreach mode : ['deferred-cancel', 'deferred-work']
+  test('evaluation_join_runtime_cache_' + mode, join_runtime_cache_exe,
+    args: ['2', '0', mode], suite: ['unit', 'tsan', 'evaluation_join_hosts'], timeout: 120)
+endforeach
