@@ -2344,11 +2344,12 @@ wl_columnar_session_cold_layout(const wl_col_session_t *sess,
  * cold JOIN audits bound the rule. The scan's output holds the source's
  * columns under generated positional names; the JOIN resolves its keys
  * against them as the uncontrolled route resolves them against the source,
- * whose names must then be positional too. Each JOIN has one key, and an
- * INLINE compound source, whose layout the scan's output does not carry,
- * stays refused. A REDUCE may follow only as the rule's next to last op,
- * where the uncontrolled cold JOIN aggregate admits it, with an operand
- * type the controlled REDUCE accepts. */
+ * whose names must then be positional too. The JOIN that reads the scan's
+ * output has one key or more, every later JOIN has one, and an INLINE
+ * compound source, whose layout the scan's output does not carry, stays
+ * refused. A REDUCE may follow only as the rule's next to last op, where
+ * the uncontrolled cold JOIN aggregate admits it, with an operand type the
+ * controlled REDUCE accepts. */
 static bool
 wl_columnar_session_cold_join_rule(const wl_col_session_t *sess,
     const wl_plan_relation_t *rp, uint32_t end, const char *name)
@@ -2359,7 +2360,8 @@ wl_columnar_session_cold_join_rule(const wl_col_session_t *sess,
     for (uint32_t i = end; i < rp->op_count; i++)
         if ((rp->ops[i].op == WL_PLAN_OP_REDUCE &&
             (!reduction || i != last)) ||
-            (rp->ops[i].op == WL_PLAN_OP_JOIN && rp->ops[i].key_count != 1))
+            (rp->ops[i].op == WL_PLAN_OP_JOIN && (i == end ?
+            !rp->ops[i].key_count : rp->ops[i].key_count != 1)))
             return false;
     uint32_t join = 0;
     if (reduction ? !wl_columnar_join_aggregate_decode(sess, rp, &join) ||
@@ -2375,19 +2377,20 @@ wl_columnar_session_cold_join_rule(const wl_col_session_t *sess,
 
 /* A controlled JOIN of a cold right input (#2301): the JOIN at ops[1]
  * after a VARIABLE over another input that is resident or declared, not
- * this one (a self-JOIN) and not another cold one, every JOIN with one key,
- * of a shape the uncontrolled cold JOIN prefix admits. A REDUCE may follow
- * only as the rule's next to last op, where the uncontrolled cold JOIN
- * aggregate admits it with this JOIN, with an operand type the controlled
- * REDUCE accepts. The composed attempt copies the input whole into the
- * frame's cold right slot and the controlled JOIN reads the copy. */
+ * this one (a self-JOIN) and not another cold one, with one key or more
+ * and every later JOIN with one, of a shape the uncontrolled cold JOIN
+ * prefix admits. A REDUCE may follow only as the rule's next to last op,
+ * where the uncontrolled cold JOIN aggregate admits it with this JOIN,
+ * with an operand type the controlled REDUCE accepts. The composed
+ * attempt copies the input whole into the frame's cold right slot and
+ * the controlled JOIN reads the copy. */
 static bool
 wl_columnar_session_cold_right_rule(const wl_col_session_t *sess,
     const wl_plan_relation_t *rp, const char *name)
 {
     if (rp->op_count < 3 || rp->ops[0].op != WL_PLAN_OP_VARIABLE ||
         !rp->ops[0].relation_name || rp->ops[1].op != WL_PLAN_OP_JOIN ||
-        rp->ops[1].key_count != 1 || !rp->ops[1].right_relation ||
+        !rp->ops[1].key_count || !rp->ops[1].right_relation ||
         strcmp(rp->ops[1].right_relation, name) != 0 ||
         !strcmp(rp->ops[0].relation_name, name) ||
         wl_columnar_session_cold_find(sess, rp->ops[0].relation_name))
@@ -2398,7 +2401,8 @@ wl_columnar_session_cold_right_rule(const wl_col_session_t *sess,
     for (uint32_t i = 0; i < rp->op_count; i++)
         if ((rp->ops[i].op == WL_PLAN_OP_REDUCE &&
             (!reduction || i != last)) ||
-            (rp->ops[i].op == WL_PLAN_OP_JOIN && rp->ops[i].key_count != 1))
+            (rp->ops[i].op == WL_PLAN_OP_JOIN && i != 1 &&
+            rp->ops[i].key_count != 1))
             return false;
     if (reduction ? !wl_columnar_join_aggregate_decode(sess, rp, &join) ||
         join != 1 ||
