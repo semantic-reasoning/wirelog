@@ -6648,7 +6648,7 @@ test_controlled_persistent_refusals(void)
         }
         if (rc == EAGAIN) rc = observed_multi_step(session);
         wl_columnar_arrangement_test_diff_checkpoint = NULL;
-        int wanted = mode == 0 || mode == 3 || mode == 4 ? ENOTSUP
+        int wanted = mode == 3 || mode == 4 ? ENOTSUP
             : denial ? ENOSPC : mode == 5 ||
             mode == 6 ? WL_EVALUATION_CONTROL_WORK_LIMIT : 0;
         if (rc != wanted) fprintf(stderr,
@@ -6661,7 +6661,17 @@ test_controlled_persistent_refusals(void)
                 registry[0].diff_arr == arr);
             CHECK(session_find_rel(cs, "a") == head && !cs->diff_txn_count);
         }
-        if (mode == 0) col_diff_arrangement_pin_release(&pin);
+        if (mode == 0) {
+            CHECK(pin.active && pin.entry == registry && pin.arr == arr
+                && cs->diff_arr_entries == registry &&
+                registry[0].pin_count == 1
+                && registry[0].diff_arr == arr);
+            wl_columnar_source_access_writer_t writer = {0};
+            CHECK(col_rel_source_writer_acquire(session_find_rel(cs, "r"),
+                &writer) == EBUSY);
+            col_diff_arrangement_pin_release(&pin);
+            CHECK(!pin.active && registry[0].pin_count == 0);
+        }
         if (mode == 3) registry[0].transaction_pending = false;
         if (mode == 4) registry[0].invalidation_deferred = false;
         CHECK(!wl_evaluation_control_reset(control));

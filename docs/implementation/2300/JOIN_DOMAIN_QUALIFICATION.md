@@ -623,8 +623,8 @@ semantic comparisons, not equal-pressure resource/error certificates.
 `pin-held` acquires a genuine differential pin on the published canonical RHS/
 key0 index after stage0. Exact entry/index/generation/snapshots, the authentic
 source reader and one-pin count are asserted. Stage1 mutates LEFT only; RHS
-writer acquisition returns EBUSY. The actual controlled image-entry check rejects
-that held pin with its existing ENOTSUP policy, without injected errno. Public
+writer acquisition returns EBUSY. At that checkpoint the controlled image-entry check rejected
+that held pin with ENOTSUP. The runtime increment below supersedes that refusal. Public
 failure preserves the pin, registry location/payload, heads and inputs. Registry
 snapshots compare pins, pending and deferred flags; the sole one-pin exception
 requires the actual live pin's exact session/entry, and all older modes retain
@@ -809,6 +809,34 @@ obligations remain OPEN. No opaque private allocation-address/payload, full
 financial certificate or complete malloc-failure product is inferred. F05a,
 #2371 and #2300 remain OPEN.
 
+## Ordinary JOIN with a live differential pin
+
+Ordinary controlled JOIN previously returned ENOTSUP when a valid published
+index pin prevented relocation of its registry. It now treats that cache as
+unavailable before starting an image and evaluates through the existing charged,
+governed private hash index. This is a runtime success-path change, not a new
+raw fallback or a test-only qualification increment. Configured batch/strict,
+started-image and conflicting-transaction protocols retain their own paths.
+
+The read-only preflight keeps pending/deferred ENOTSUP and malformed/duplicate/
+name/generation/overflow errors as errors. Every registry/name/pairwise action
+has its existing128 charge and a stop footer; it allocates no image and changes
+no pin or transaction state. With N entries, M plan operations, J included JOIN
+names and B name bytes including NUL, additional actions are N+1 normally, or
+3N+M+J+B+N(N-1)/2+3 while pinned. This is extra bounded work at unchanged unit
+prices, not an unchanged whole-call total or containing Source/carry certificate.
+
+The five existing pin-held histories now require committed independent literal/
+signed/Snapshot output with real private indexing and zero persistent image
+activity, retaining exact pinned registry payload/location/source/generation
+and writer exclusion. Deliberate release restores the registry and writer access;
+future unpinned calls use normal persistent work. Two scalar observed private-
+insertion CANCEL/WORK cases retain the external pin through internal disposal,
+genuine reset and same-input retry. Internal malformed-state probes ensure an
+earlier pin cannot mask later protocol errors. The public query changes from
+ENOTSUP to success; no public API, quantum or price constant changes. Wider
+policy/deferred/eviction and platform/Native/Source/carry obligations stay OPEN.
+
 ## Reused evidence and remaining acceptance
 
 | Obligation | Existing evidence reused | Still outstanding for complete #2371 acceptance |
@@ -940,7 +968,7 @@ compile-before-no-rebuild commands above. Clang JOIN hosts332/332 and related
 checks7/7, GCC104/104 and ASan/UBSan104/104 passed on the executable tree before
 the ledger-only commit; no hosted/final-platform or containing Source proof follows.
 
-The wildcard now selects144 cases: those104 plus eight image/slot,16 copied-
+The previous wildcard checkpoint selected144 cases: those104 plus eight image/slot,16 copied-
 metadata and16 replacement-build allocation-failure histories. Reuse the same
 compile-before-no-rebuild commands above. Clang JOIN hosts372/372, affected
 serial/source/arrangement/cache/pin/drain checks20/20 and ABI/header/threading
@@ -948,3 +976,7 @@ contracts5/5, GCC144/144 and ASan/UBSan144/144 passed on the final executable
 tree before the ledger-only commit. The normal production library built without
 the new callback/helper symbols. Hosted published-HEAD/MSVC and containing
 Native/Source/carry qualification remain outstanding.
+
+The current cache wildcard selects146 cases: the five pin-held cases now require
+success through bounded private indexing and two new pin-held insertion stops
+verify CANCEL/WORK recovery. Other139 original modes retain their assertions.

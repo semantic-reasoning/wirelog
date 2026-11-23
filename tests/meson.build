@@ -8298,3 +8298,10 @@ foreach heads : [1, 2]
       suite: ['unit', 'tsan', 'evaluation_recursive_string_unbound'], timeout: 120)
   endforeach
 endforeach
+
+# Recovery through the bounded private JOIN while an external pin remains live.
+foreach mode : ['pin-cancel', 'pin-work']
+  test('evaluation_join_cache_scalar_observed_' + mode, test_evaluation_join_cache_exe,
+    args: ['scalar', 'observed', mode],
+    suite: ['unit', 'tsan', 'evaluation_join_hosts'], timeout: 120)
+endforeach
