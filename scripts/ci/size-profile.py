@@ -120,6 +120,45 @@ def selected_linker_fingerprint(compiler, parameters):
             raise ValueError("could not identify/version the selected linker; refusing unknown profile")
         return {"version_line": lines[-1], "selected_flags": selected}
 
+def production_private_include(target, build):
+    """Recognize one introspected Meson output's own private directory only.
+
+    Unsupported/ambiguous layouts retain literal parameters. In particular,
+    this does not infer a directory from version-looking text in user flags.
+    """
+    filenames = target.get("filename")
+    if not isinstance(filenames, list) or len(filenames) != 1:
+        return None
+    if not isinstance(filenames[0], str):
+        return None
+    output = Path(filenames[0])
+    if not output.is_absolute():
+        return None
+    try:
+        relative = output.relative_to(build)
+    except ValueError:
+        return None
+    if not relative.name or ".." in relative.parts:
+        return None
+    private = output.with_name(output.name + ".p")
+    # Preserve any parent subdirectory, only alias the output-derived basename.
+    return str(private), str(private.with_name("<PRODUCTION_PRIVATE>"))
+
+
+def compile_private_includes(values, private):
+    """Alias exact -I operands, never definitions, neighbors or link options."""
+    result = list(values)
+    if private is None:
+        return result
+    directory, alias = private
+    for index, value in enumerate(values):
+        if value == "-I" + directory:
+            result[index] = "-I" + alias
+        elif index and values[index - 1] == "-I" and value == directory:
+            result[index] = alias
+    return result
+
+
 def capture(build_dir, source_dir, source_sha):
     build = Path(build_dir).resolve()
     source = Path(source_dir).resolve()
@@ -160,13 +199,14 @@ def capture(build_dir, source_dir, source_sha):
             text = replace_root(text, source, "<SOURCE>")
             normalized_values.append(text)
         return normalized_values
+    private = production_private_include(target, build)
     compile_profile = []
     link_profile = []
     for item in target.get("target_sources", []):
         if "compiler" in item:
             compile_profile.append({"language": item.get("language"), "machine": item.get("machine"),
                                    "compiler": normalized(item.get("compiler", [])),
-                                   "parameters": normalized(item.get("parameters", []))})
+                                   "parameters": normalized(compile_private_includes(item.get("parameters", []), private))})
         if "linker" in item:
             link_profile.append({"linker": normalized(item.get("linker", [])),
                                  "parameters": normalized(item.get("parameters", []))})
