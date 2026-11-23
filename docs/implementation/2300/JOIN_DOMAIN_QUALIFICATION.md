@@ -818,7 +818,7 @@ governed private hash index. This is a runtime success-path change, not a new
 raw fallback or a test-only qualification increment. Configured batch/strict,
 started-image and conflicting-transaction protocols retain their own paths.
 
-The read-only preflight keeps pending/deferred ENOTSUP and malformed/duplicate/
+The read-only preflight keeps pending or unpinned-deferred ENOTSUP and malformed/duplicate/
 name/generation/overflow errors as errors. Every registry/name/pairwise action
 has its existing128 charge and a stop footer; it allocates no image and changes
 no pin or transaction state. With N entries, M plan operations, J included JOIN
@@ -836,6 +836,41 @@ genuine reset and same-input retry. Internal malformed-state probes ensure an
 earlier pin cannot mask later protocol errors. The public query changes from
 ENOTSUP to success; no public API, quantum or price constant changes. Wider
 policy/deferred/eviction and platform/Native/Source/carry obligations stay OPEN.
+
+## Genuine deferred differential invalidation
+
+A live pinned index can legitimately receive an invalidation request. Previously
+that deferred flag still caused ordinary controlled JOIN to return ENOTSUP.
+The same read-only availability preflight now admits a deferred entry only while
+that entry is pinned, leaving its index and deferred reset untouched and using
+the existing governed private JOIN. Pending transactions and unpinned deferred
+flags remain errors; all original setup/metadata/overflow priority checks and
+charged actions/footers remain intact. The action count and unit prices do not
+change in this increment.
+
+Five `evaluation_join_runtime_cache_deferred*` selections use the actual
+invalidation API under two genuine pins: INT64/STRING/FLOAT keys through observed
+STEP/plain STEP/Snapshot, plus actual private-insertion CANCEL and WORK. The
+post-invalidation registry, payload, generation and exact external reader counts
+survive success and unchanged repeat. First pin release preserves deferral;
+last release resets exactly once, zeroes the index and restores writer access.
+A LEFT-only change then requires a persistent rebuild against the unchanged RHS;
+future mutation, deletion and stable-source reuse retain independent literal
+content and delivery semantics. The deliberately private profile is separately
+checked against the same logical oracle.
+
+CANCEL disposes its internal owner. This particular acyclic STEP WORK instead
+retains the authenticated EVALUATE parent, metadata credit/financier and one
+additional EDB lease. The test requires that fixed PENDING disposition, frozen
+report and owner across protected mutation/Snapshot refusals, then genuine reset/fresh retry
+returns readers to the two external pins before deliberate release. This is not
+a reader leak or a universal disposed-WORK claim. Existing fourteen malformed,
+pending, unpinned-deferred and mixed-priority negative probes remain unchanged.
+
+The ordinary/cache local completion inventory is tracked in
+[ORDINARY_JOIN_CACHE_ACCEPTANCE.md](ORDINARY_JOIN_CACHE_ACCEPTANCE.md). Other
+ordinary items remain pending until their integration units finish; no global
+#2371/#2300 or containing lifecycle/accounting/platform closure is claimed here.
 
 ## Typed canonical RHS index reuse
 

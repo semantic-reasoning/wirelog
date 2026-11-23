@@ -1790,7 +1790,11 @@ wl_columnar_session_diff_index_pinned(wl_col_session_t *sess,
         rc = wl_evaluation_control_charge_attempt(control, id, 128);
         if (rc) return rc;
         const col_diff_arr_entry_t *entry = &sess->diff_arr_entries[i];
-        int invalid = entry->transaction_pending || entry->invalidation_deferred
+        /* A pinned invalidation is a normal request to reset at last release.
+         * Leave its leased index untouched and use the private JOIN. An
+         * unpinned deferred flag and a pending transaction remain errors. */
+        int invalid = entry->transaction_pending
+            || (entry->invalidation_deferred && !entry->pin_count)
             ? ENOTSUP : !entry->diff_arr || !entry->key_count ||
             !entry->key_cols
             || !entry->generation ||
