@@ -459,8 +459,12 @@ if [[ "$CALIBRATION" -eq 1 ]]; then
     calibration_pgid=""
     interrupted=0
     leader_early=0
+    # Only a group the launched child leads, in a session of its own, is ever
+    # signalled; calibration_pgid stays empty until the launch has proved that.
     group_exists() {
-        [[ -n "$calibration_pgid" ]] && kill -0 -- "-$calibration_pgid" 2>/dev/null
+        [[ "$calibration_pgid" =~ ^[0-9]+$ && "$calibration_pgid" != 1 &&
+            "$calibration_pgid" == "$calibration_pid" ]] &&
+            kill -0 -- "-$calibration_pgid" 2>/dev/null
     }
     stop_calibration_group() {
         if group_exists; then
@@ -482,6 +486,15 @@ if [[ "$CALIBRATION" -eq 1 ]]; then
         interrupted=1
         stop_calibration_group
     }
+    # Launch isolation is polled every 0.05 s, 200 times (10 s) by default.
+    isolate_polls=${DOOP_CALIBRATION_ISOLATE_POLLS:-200}
+    # Zero polls would refuse before the child can have run setsid, and such
+    # a refusal can be lost in the fork, leaving its launch-gate loop behind.
+    # Six digits keep the count inside bash arithmetic.
+    if [[ ! "$isolate_polls" =~ ^[1-9][0-9]{0,5}$ ]]; then
+        echo "ERROR: DOOP_CALIBRATION_ISOLATE_POLLS must be an integer from 1 to 999999" >&2
+        exit 1
+    fi
     export WIRELOG_DOOP_CGROUP_DIR="$CGROUP_DIR"
     export WIRELOG_DOOP_CGROUP_MARKER="${DOOP_CGROUP_MARKER:-}"
     trap calibration_interrupt INT TERM HUP
@@ -496,11 +509,27 @@ if [[ "$CALIBRATION" -eq 1 ]]; then
         --repeat-progress "$PROGRESS_FILE" \
         >"$BENCH_LOG" 2>&1 &
     calibration_pid=$!
-    calibration_pgid=$(ps -o pgid= -p "$calibration_pid" 2>/dev/null | tr -d ' ')
-    shell_pgid=$(ps -o pgid= -p $$ 2>/dev/null | tr -d ' ')
-    if [[ ! "$calibration_pgid" =~ ^[0-9]+$ || "$calibration_pgid" == "$shell_pgid" ]]; then
+    # Without job control the child starts in this shell's process group and
+    # setsid(1) moves it out only once it runs, so a look right after the
+    # fork can still name this shell's own group, and signalling that group
+    # kills this script and whatever started it.  The launch gate holds the
+    # benchmark back, so poll until the child leads both its group and its
+    # session; a setsid that forked instead (job control) never gets there
+    # and is refused.
+    for ((poll = 0; poll < isolate_polls; poll++)); do
+        child_ids=$(ps -o pgid=,sid= -p "$calibration_pid" 2>/dev/null) || child_ids=""
+        read -r child_pgid child_sid _ <<< "$child_ids" || true
+        if [[ "${child_pgid:-}" == "$calibration_pid" && "${child_sid:-}" == "$calibration_pid" ]]; then
+            calibration_pgid=$calibration_pid
+            break
+        fi
+        kill -0 "$calibration_pid" 2>/dev/null || break
+        sleep 0.05
+    done
+    if [[ -z "$calibration_pgid" ]]; then
         echo "ERROR: could not isolate calibration process group" >&2
-        stop_calibration_group
+        # Never signal a group here: none has been shown to be the child's.
+        kill -TERM "$calibration_pid" 2>/dev/null || true
         wait "$calibration_pid" 2>/dev/null || true
         exit 1
     fi
@@ -529,6 +558,9 @@ if [[ "$CALIBRATION" -eq 1 ]]; then
     set +e
     wait "$calibration_pid"
     BENCH_RC=$?
+    # The reaped pid can be reused; forgetting the group narrows the window
+    # in which a late trap could signal someone else's.
+    calibration_pgid=""
     set -e
     trap - INT TERM HUP
     memory_oom_after=$(awk '$1 == "oom" { print $2 + 0 }' "$CGROUP_DIR/memory.events")
