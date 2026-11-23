@@ -241,3 +241,16 @@ Clang372/372, related checks20/20, contracts5/5 and GCC/ASan144/144 are local
 pre-ledger executable evidence. New-entry/all-width/competing-error/concurrent
 fault products and deferred/eviction, full platform/Native/Source/carry remain
 OPEN. This does not close F05a, #2371 or #2300.
+
+
+The [typed canonical RHS runtime change](JOIN_DOMAIN_QUALIFICATION.md#typed-canonical-rhs-index-reuse)
+permits existing controlled persistent indexing for INT64/FLOAT/STRING scalar
+keys and payloads. Stable-source two-head calls replace six private RHS
+insertions with two persistent reuses and no RHS insertion. Nine public
+histories check literal results/delivery across mutations and repeats; three
+actual raw differential seeds verify compatible typed reuse. Narrow FLOAT
+CANCEL/ENOMEM retry and live-pin composition bring the new selection to15,
+alongside146 existing cache cases. This is a runtime capability/performance
+change with necessary regressions, not completion of the remaining full
+cache/type/policy/lifecycle/Native/Source/carry or platform products. F05a,
+#2371 and #2300 remain OPEN.
