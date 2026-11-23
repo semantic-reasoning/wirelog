@@ -8355,7 +8355,7 @@ join_acceptance_exe = executable('test_evaluation_join_acceptance',
   c_args: ['-DWL_SESSION_TEST_HOOKS=1'],
   dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
   link_with: [testlib_prod])
-foreach mode : ['chains', 'probe-chains']
+foreach mode : ['chains', 'probe-chains', 'expressions', 'expression-faults', 'selectors']
   test('evaluation_join_acceptance_' + mode, join_acceptance_exe, args: [mode],
     suite: ['unit', 'tsan', 'evaluation_join_hosts'], timeout: 120)
 endforeach

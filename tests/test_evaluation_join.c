@@ -424,6 +424,104 @@ parity_cases(void)
     }
 }
 
+/* Explicit supported ordinary primitive selectors; natural public immutable
+ * append/refill source overrides are exercised by the cache cycle fixture. */
+static fixture_t *selector_fixture;
+static const col_rel_t *selector_right;
+static unsigned selector_witnesses;
+static void selector_checkpoint(wl_evaluation_control_t *control,
+    unsigned phase, uint64_t progress) {
+    (void)progress;
+    if (phase != 24) return;
+    fixture_t *f = selector_fixture;
+    CHECK(f && control == f->operation);
+    wl_columnar_filter_context_t *ctx = NULL;
+    CHECK(!wl_columnar_eval_stack_filter_context(f->frame, &ctx) &&
+        ctx->join_operation == &f->op && ctx->source.descriptor == f->left &&
+        ctx->join_right.descriptor == selector_right &&
+        ctx->join_right.identity == &ctx->join_right &&
+        ctx->join_right.phase == WL_COLUMNAR_RELATION_SCALAR_SOURCE_HELD &&
+        ctx->join_right.owner_reader.owner ==
+        &selector_right->storage_owner->source_access &&
+        ctx->join_right.descriptor_reader.owner ==
+        &selector_right->descriptor_access &&
+        ctx->join_right.nrows == selector_right->nrows &&
+        ctx->join_right.width == selector_right->ncols &&
+        ctx->join_right.descriptor_identity ==
+        selector_right->relation_identity &&
+        ctx->join_right.descriptor_storage_generation ==
+        selector_right->storage_generation);
+    ++selector_witnesses;
+}
+static void ordinary_selector_sources(void) {
+    const wl_delta_mode_t modes[] = {WL_DELTA_AUTO, WL_DELTA_FORCE_FULL,
+                                     WL_DELTA_FORCE_DELTA};
+    const int delta_rows[] = {-1, 0, 1, 3, 5};
+    for (unsigned m = 0; m < 3; ++m)
+        for (unsigned seed = 0; seed < 2; ++seed)
+            for (unsigned ld = 0; ld < 2; ++ld)
+                for (unsigned d = 0; d < 5; ++d) {
+                    fixture_t f; fixture_init(&f, 2, 2, 3, 0);
+                    f.op.delta_mode = modes[m];
+                    f.session.delta_seeded = seed != 0;
+                    wl_columnar_eval_stack_cleanup_stack(
+                        f.frame)->items[0].is_delta = ld != 0;
+                    for (uint32_t r = 0; r < 3; ++r) {
+                        f.registry[0]->columns[0][r] = 7+r;
+                        f.registry[0]->columns[1][r] = 17+r;
+                    }
+                    if (delta_rows[d] >= 0) {
+                        f.registry[1] = relation_new("$d$right", 2,
+                                (uint32_t)delta_rows[d]);
+                        f.session.nrels = 2;
+                        for (uint32_t r = 0; r < f.registry[1]->nrows; ++r) {
+                            f.registry[1]->columns[0][r] = 37+r;
+                            f.registry[1]->columns[1][r] = 47+r;
+                        }
+                    }
+                    bool chosen_delta = delta_rows[d] > 0 &&
+                        (modes[m] == WL_DELTA_FORCE_DELTA ||
+                        (modes[m] == WL_DELTA_AUTO && !ld &&
+                        delta_rows[d] < 3));
+                    bool empty = modes[m] == WL_DELTA_FORCE_DELTA &&
+                        delta_rows[d] <= 0 && seed;
+                    selector_fixture = &f;
+                    selector_right =
+                        chosen_delta ? f.registry[1] : f.registry[0];
+                    col_relation_snapshot_t full =
+                        wl_columnar_relation_snapshot(f.registry[0]);
+                    col_relation_snapshot_t chosen =
+                        wl_columnar_relation_snapshot(selector_right);
+                    selector_witnesses = 0;
+                    wl_columnar_join_test_attempt_checkpoint =
+                        selector_checkpoint;
+                    run(&f); wl_columnar_join_test_attempt_checkpoint = NULL;
+                    CHECK(selector_witnesses == 1 &&
+                        !f.status.semantic_result && f.status.committed);
+                    const col_rel_t *out =
+                        wl_columnar_eval_stack_cleanup_stack(
+                        f.frame)->items[0].rel;
+                    CHECK(out->ncols == 4 && out->nrows ==
+                        (empty ? 0u : 2u*selector_right->nrows));
+                    for (uint32_t row = 0; row < out->nrows; ++row) {
+                        int64_t left = col_rel_get(out, row, 0);
+                        int64_t right = col_rel_get(out, row, 2);
+                        int64_t base = chosen_delta ? 37 : 7;
+                        CHECK(left >= 0 && left < 2 &&
+                            col_rel_get(out, row,
+                            1) == left+1 && right >= base &&
+                            right < base+(int64_t)selector_right->nrows &&
+                            col_rel_get(out, row, 3) == right+10);
+                    }
+                    CHECK(wl_columnar_relation_snapshot_equal(full,
+                        wl_columnar_relation_snapshot(f.registry[0])) &&
+                        wl_columnar_relation_snapshot_equal(chosen,
+                        wl_columnar_relation_snapshot(selector_right)));
+                    fixture_close(&f);
+                }
+    selector_fixture = NULL; selector_right = NULL;
+}
+
 static void
 generated_case(bool keyed)
 {
@@ -2003,6 +2101,20 @@ probe_right_filter_edges(void)
 static void
 right_filter_cases(void)
 {
+    /* Decoder-accepted BOOL is an explicit internal bytecode control, not a
+     * claim that a rule-body bool literal is naturally emitted on the RHS. */
+    for (unsigned truth = 0; truth < 2; ++truth) {
+        fixture_t f; fixture_init(&f, 2, 3, 5, 0);
+        uint8_t boolean[] = {WL_PLAN_EXPR_BOOL, (uint8_t)truth};
+        f.op.right_filter_expr = (wl_plan_expr_buffer_t){boolean,
+                                                         sizeof(boolean)};
+        run(&f);
+        CHECK(!f.status.semantic_result && f.status.committed &&
+            wl_columnar_eval_stack_cleanup_stack(
+                f.frame)->items[0].rel->nrows == (truth?15u:0u));
+        fixture_close(&f);
+    }
+
     for (unsigned keyed = 0; keyed < 2; ++keyed) {
         for (unsigned mode = 0; mode < 3; ++mode) {
             fixture_t f; fixture_init(&f, 2, 3, 9, 0);
@@ -2731,6 +2843,42 @@ right_scalar_function_cases(void)
         }
 }
 
+/* EQ/NEQ compile to canonical-id comparisons naturally; these two STRING
+ * opcodes are decoder compatibility controls, with genuine RHS intern context. */
+static void right_string_comparator_compatibility(void) {
+    for (unsigned neq = 0; neq < 2; ++neq) {
+        fixture_t f; fixture_init(&f, 2, 3, 5, 0); f.op.key_count = 1;
+        wl_intern_t *intern = wl_intern_create(); CHECK(intern);
+        f.session.intern = intern;
+        int64_t yes = wl_intern_put(intern, "echo"),
+            no = wl_intern_put(intern, "absent");
+        CHECK(yes >= 0 && no >= 0);
+        wirelog_column_type_t types[] = {WIRELOG_TYPE_INT64,
+                                         WIRELOG_TYPE_STRING};
+        CHECK(!col_rel_set_column_types(f.registry[0], types, 2));
+        for (uint32_t r = 0; r < 5;
+            ++r) f.registry[0]->columns[1][r] = r%2?no:yes;
+        uint8_t expression[] = {WL_PLAN_EXPR_VAR_STRING, 4, 0, 'c', 'o', 'l',
+                                '1',
+                                WL_PLAN_EXPR_CONST_STR, 6, 0, 'a', 'b', 's',
+                                'e', 'n', 't', 0};
+        expression[sizeof(expression)-
+            1] =
+            (uint8_t)(neq?WL_PLAN_EXPR_CMP_STR_NEQ:WL_PLAN_EXPR_CMP_STR_EQ);
+        f.op.right_filter_expr = (wl_plan_expr_buffer_t){expression,
+                                                         sizeof(expression)};
+        run(&f); CHECK(!f.status.semantic_result && f.status.committed);
+        const col_rel_t *out =
+            wl_columnar_eval_stack_cleanup_stack(f.frame)->items[0].rel;
+        CHECK(out->nrows == (neq?2u:1u)); unsigned mask = 0;
+        for (uint32_t r = 0; r < out->nrows; ++r) {
+            int64_t key = col_rel_get(out, r, 0); CHECK(key >= 0 && key <= 2);
+            unsigned bit = 1u<<(unsigned)key; CHECK(!(mask&bit)); mask |= bit;
+        }
+        CHECK(mask == (neq?5u:2u)); fixture_close(&f); wl_intern_free(intern);
+    }
+}
+
 /* Constructed internal descriptors verify the admission/error boundary;
  * public compiler-selected representation histories live in join_inline. */
 static void
@@ -2781,8 +2929,10 @@ main(void)
     keyed_cases(); key_grammar_cases(); key_empty_and_type_cases();
     key_interrupt_cases(); key_governor_cases(); key_literal_prefixes();
     hash_literal_prefixes(); batch_knob_refused_case();
+    ordinary_selector_sources();
     probe_right_filter_edges();
     right_scalar_function_cases();
+    right_string_comparator_compatibility();
     right_filter_cases();
     right_filter_owned_storage_case();
     right_filter_owned_refusal_retry_case();
