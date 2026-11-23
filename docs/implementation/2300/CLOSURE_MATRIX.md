@@ -281,3 +281,13 @@ and calibrated real-NULL same-program retries are recorded in
 `ORDINARY_JOIN_CACHE_ACCEPTANCE.md`. This is a production correctness repair;
 remaining ordinary inventory items stay open until their consuming proof is
 reconciled, and no containing global row is closed by this subset.
+
+The ordinary predicate/source integration now has a finite84-tag/context map in
+`ORDINARY_JOIN_CACHE_ACCEPTANCE.md`, real natural post-JOIN versus explicit RHS-IR
+compiler/session campaigns (crypto enabled/disabled), exact created-result error/
+stop ownership and selected descriptor/snapshot proofs. Registered zero delta,
+forced empty, legacy initial selector compatibility, configured refusals and
+natural nonempty immutable append overrides are distinguished. No zero-row public
+append producer or universal selector refusal is invented. This discharges only
+these local contexts; remaining representations/cache/policy inventory remains
+in progress and containing global rows remain open.

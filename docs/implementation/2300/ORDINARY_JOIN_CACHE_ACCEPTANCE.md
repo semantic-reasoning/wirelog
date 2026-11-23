@@ -100,3 +100,159 @@ predicate wrappers emit no RHS bytes. Existing ANTI/SEMI extension guards remain
 The checked uint32 buffer addition/doubling is reviewed statically at extreme
 representability bounds; no giant-allocation runtime proof is claimed. Other
 ordinary expression/context/selector obligations remain PENDING here.
+
+## Predicate and selected-source consumers
+
+`evaluation_join_acceptance_expressions` parses and compiles each table rule twice:
+the natural JOIN followed by FILTER, and a clearly labelled read-only RHS FILTER
+IR repositioned before the real compiler. No bytecode patch is presented as natural
+emission. The compiled occurrence, key, RHS buffer presence and separate FILTER
+count are asserted. Actual evaluation/selection checkpoints authenticate the frame,
+private bindings, source row/column mapping, descriptor/owner leases and numeric
+versus scalar programs. Literal key masks, signed removals, unchanged repeats and
+zero governor credit after program/plan teardown are independent of raw output.
+Numeric, FLOAT and all STRING ordering classes include accepted/rejected rows;
+division/modulo by zero, invalid numeric text and nonfinite FLOAT arithmetic are
+semantic false. UTF-8 concat/contains consumes created and borrowed storage.
+
+`evaluation_join_acceptance_expression-faults` uses an actually compiled RHS CAT:
+real NULL after admitted5-byte scratch, a genuine peer leaving1 byte before the
+same reserve, and CANCEL/WORK after the created4-byte result has been filled.
+These require ENOMEM/no denial versus ENOSPC/one denial and exact scratch disposal.
+Physical/admission errors are disposed RETRYABLE; CANCEL is disposed PENDING;
+WORK is the authenticated retained EVALUATE8 parent with metadata, matching closed
+generation, financier, drained child and exactly one EDB reader per input. Only
+that retained owner is subjected to protected mutation/Snapshot refusals; reports
+and owner identity remain frozen. All four reset and retry the same pending facts,
+then perform normal later signed removal and teardown. No blanket all-WORK-disposes
+or all-positive-errors-block-mutation claim is made.
+
+`evaluation_join_acceptance_selectors` contains fifty explicit ordinary unconfigured
+VARIABLE controls and four legacy initial-frame compatibility controls. Actual
+framed child source_full/selected/empty/is_delta, HELD descriptor, full snapshot,
+width/extent and both readers are matched to registered absent/zero/smaller/equal/
+larger delta sources, with disjoint literal key sets. AUTO, FULL, DELTA, EMPTY and
+EMPTY_AFTER_SEED preserve their iteration0 semantics. FORCE_EMPTY retains full as
+the schema source and constructs empty output; it is not a zero-row override.
+`evaluation_join:ordinary_selector_sources` separately binds ordinary JOIN RHS
+selection across sixty AUTO/FULL/DELTA, seed and LEFT-delta controls, source
+snapshots/leases and literal product values. Existing configured batch/refusal
+controls remain labelled by their narrower route; legacy initial compatibility
+for unknown VARIABLE and JOIN EMPTY/EMPTY_AFTER_SEED/unknown is preserved as AUTO,
+not silently changed to a universal ENOTSUP rule.
+
+A natural observed public LEFT-only append additionally requires the actual
+phase44 authorized nonNULL1-row immutable override and matches that exact pointer
+and snapshot to VARIABLE's HELD source, then checks literal head1..4 and repeat.
+The cache cycle fixture separately binds natural JOIN-right append overrides.
+Ordinary public append producers require a positive successful physical suffix;
+zero-row requests do not notify, duplicate rows physically append, and remove/mixed
+mutations invalidate provenance. Their unfiltered leased COPY cannot produce a
+zero-row immutable override. That is a reviewed static producer boundary, not an
+executed zero-override claim; registered zero delta, forced empty and nonempty
+append consumers are separate executable controls. Recursive frontier producers
+retain their distinct containing scope.
+
+### Finite expression-tag/context map
+
+Each row maps the exact enum to its existing semantic leaf ledger and a consuming
+context. Leaf IDs retain their detailed function/vector/owner/error evidence in
+`../2299/EXPRESSION_ACCEPTANCE.md`; current validation runs the named numeric,
+expression-bytes/hosts/crypto/extensions/reduce and STRING/hash targets explicitly.
+`RHS` means the real compiler/controlled source-and-selection campaign above plus
+the separate natural post-FILTER route, not a claim that the parser pushes it down.
+Crypto means both feature configurations, including false on disabled evaluation;
+UUID4 uses the mask invariant while the crypto leaf verifies random UUID structure.
+Extension sessions' `host_open(route1)`, `session_stops` and `host_errors` use a
+natural JOIN composition with real snapshot/callback/ABI context. Extensions remain
+compiler-forbidden on RHS with no callback execution; shared plan_gen guards check
+that boundary, including deep chains. Aggregate markers belong to aggregate hosts,
+not a claim of natural ordinary RHS emission. AVG stays rejected. Decoder-only
+BOOL and STRING EQ/NEQ compatibility use explicit actual ordinary RHS controls.
+
+| Exact tag | Semantic leaf | Actual consumer/context |
+|---|---|---|
+| `WL_PLAN_EXPR_VAR` | baseline-numeric | RHS numeric/typed FLOAT context; evaluated/selected literal masks and failure-as-false; numeric boundary leafs |
+| `WL_PLAN_EXPR_CONST_INT` | baseline-numeric | RHS numeric/typed FLOAT context; evaluated/selected literal masks and failure-as-false; numeric boundary leafs |
+| `WL_PLAN_EXPR_CONST_STR` | unit4-sessions | RHS scalar borrowed/created/interned context; expression-faults for created result; STRING/hash leaf vectors |
+| `WL_PLAN_EXPR_BOOL` | baseline-numeric | evaluation_join:right_filter_cases explicit BOOL true/false RHS |
+| `WL_PLAN_EXPR_VAR_FLOAT` | baseline-numeric | RHS numeric/typed FLOAT context; evaluated/selected literal masks and failure-as-false; numeric boundary leafs |
+| `WL_PLAN_EXPR_CONST_FLOAT` | baseline-numeric | RHS numeric/typed FLOAT context; evaluated/selected literal masks and failure-as-false; numeric boundary leafs |
+| `WL_PLAN_EXPR_VAR_STRING` | unit4-sessions | RHS scalar borrowed/created/interned context; expression-faults for created result; STRING/hash leaf vectors |
+| `WL_PLAN_EXPR_EXTENSION_CALL` | unit8-extensions | Natural JOIN → extension FILTER/MAP host (both ABI); RHS compile-forbidden |
+| `WL_PLAN_EXPR_EXTENSION_CALL_ABI` | unit8-extensions | Natural JOIN → extension FILTER/MAP host (both ABI); RHS compile-forbidden |
+| `WL_PLAN_EXPR_ARITH_ADD` | baseline-numeric | RHS numeric/typed FLOAT context; evaluated/selected literal masks and failure-as-false; numeric boundary leafs |
+| `WL_PLAN_EXPR_ARITH_SUB` | baseline-numeric | RHS numeric/typed FLOAT context; evaluated/selected literal masks and failure-as-false; numeric boundary leafs |
+| `WL_PLAN_EXPR_ARITH_MUL` | baseline-numeric | RHS numeric/typed FLOAT context; evaluated/selected literal masks and failure-as-false; numeric boundary leafs |
+| `WL_PLAN_EXPR_ARITH_DIV` | baseline-numeric | RHS numeric/typed FLOAT context; evaluated/selected literal masks and failure-as-false; numeric boundary leafs |
+| `WL_PLAN_EXPR_ARITH_MOD` | baseline-numeric | RHS numeric/typed FLOAT context; evaluated/selected literal masks and failure-as-false; numeric boundary leafs |
+| `WL_PLAN_EXPR_ARITH_BAND` | baseline-numeric | RHS numeric/typed FLOAT context; evaluated/selected literal masks and failure-as-false; numeric boundary leafs |
+| `WL_PLAN_EXPR_ARITH_BOR` | baseline-numeric | RHS numeric/typed FLOAT context; evaluated/selected literal masks and failure-as-false; numeric boundary leafs |
+| `WL_PLAN_EXPR_ARITH_BXOR` | baseline-numeric | RHS numeric/typed FLOAT context; evaluated/selected literal masks and failure-as-false; numeric boundary leafs |
+| `WL_PLAN_EXPR_ARITH_SHL` | baseline-numeric | RHS numeric/typed FLOAT context; evaluated/selected literal masks and failure-as-false; numeric boundary leafs |
+| `WL_PLAN_EXPR_ARITH_SHR` | baseline-numeric | RHS numeric/typed FLOAT context; evaluated/selected literal masks and failure-as-false; numeric boundary leafs |
+| `WL_PLAN_EXPR_ARITH_FLOAT_ADD` | baseline-numeric | RHS numeric/typed FLOAT context; evaluated/selected literal masks and failure-as-false; numeric boundary leafs |
+| `WL_PLAN_EXPR_ARITH_FLOAT_SUB` | baseline-numeric | RHS numeric/typed FLOAT context; evaluated/selected literal masks and failure-as-false; numeric boundary leafs |
+| `WL_PLAN_EXPR_ARITH_FLOAT_MUL` | baseline-numeric | RHS numeric/typed FLOAT context; evaluated/selected literal masks and failure-as-false; numeric boundary leafs |
+| `WL_PLAN_EXPR_ARITH_FLOAT_DIV` | baseline-numeric | RHS numeric/typed FLOAT context; evaluated/selected literal masks and failure-as-false; numeric boundary leafs |
+| `WL_PLAN_EXPR_ARITH_BNOT` | baseline-numeric | RHS numeric/typed FLOAT context; evaluated/selected literal masks and failure-as-false; numeric boundary leafs |
+| `WL_PLAN_EXPR_ARITH_HASH` | baseline-numeric | RHS numeric/typed FLOAT context; evaluated/selected literal masks and failure-as-false; numeric boundary leafs |
+| `WL_PLAN_EXPR_ARITH_CRC32_ETH` | baseline-numeric | RHS numeric/typed FLOAT context; evaluated/selected literal masks and failure-as-false; numeric boundary leafs |
+| `WL_PLAN_EXPR_ARITH_CRC32_CAST` | baseline-numeric | RHS numeric/typed FLOAT context; evaluated/selected literal masks and failure-as-false; numeric boundary leafs |
+| `WL_PLAN_EXPR_ARITH_MD5` | unit7-digests | RHS crypto typed variants; enabled/disabled feature and created/interned owner where applicable |
+| `WL_PLAN_EXPR_ARITH_SHA1` | unit7-digests | RHS crypto typed variants; enabled/disabled feature and created/interned owner where applicable |
+| `WL_PLAN_EXPR_ARITH_SHA256` | unit7-digests | RHS crypto typed variants; enabled/disabled feature and created/interned owner where applicable |
+| `WL_PLAN_EXPR_ARITH_SHA512` | unit7-digests | RHS crypto typed variants; enabled/disabled feature and created/interned owner where applicable |
+| `WL_PLAN_EXPR_ARITH_HMAC_SHA256` | unit7-hmac | RHS crypto typed variants; enabled/disabled feature and created/interned owner where applicable |
+| `WL_PLAN_EXPR_ARITH_UUID4` | unit7-uuid-numeric | RHS crypto typed variants; enabled/disabled feature and created/interned owner where applicable |
+| `WL_PLAN_EXPR_ARITH_UUID5` | unit7-uuid-numeric | RHS crypto typed variants; enabled/disabled feature and created/interned owner where applicable |
+| `WL_PLAN_EXPR_CMP_EQ` | baseline-numeric | RHS numeric/typed FLOAT context; evaluated/selected literal masks and failure-as-false; numeric boundary leafs |
+| `WL_PLAN_EXPR_CMP_NEQ` | baseline-numeric | RHS numeric/typed FLOAT context; evaluated/selected literal masks and failure-as-false; numeric boundary leafs |
+| `WL_PLAN_EXPR_CMP_LT` | baseline-numeric | RHS numeric/typed FLOAT context; evaluated/selected literal masks and failure-as-false; numeric boundary leafs |
+| `WL_PLAN_EXPR_CMP_GT` | baseline-numeric | RHS numeric/typed FLOAT context; evaluated/selected literal masks and failure-as-false; numeric boundary leafs |
+| `WL_PLAN_EXPR_CMP_LTE` | baseline-numeric | RHS numeric/typed FLOAT context; evaluated/selected literal masks and failure-as-false; numeric boundary leafs |
+| `WL_PLAN_EXPR_CMP_GTE` | baseline-numeric | RHS numeric/typed FLOAT context; evaluated/selected literal masks and failure-as-false; numeric boundary leafs |
+| `WL_PLAN_EXPR_CMP_FLOAT_EQ` | baseline-numeric | RHS numeric/typed FLOAT context; evaluated/selected literal masks and failure-as-false; numeric boundary leafs |
+| `WL_PLAN_EXPR_CMP_FLOAT_NEQ` | baseline-numeric | RHS numeric/typed FLOAT context; evaluated/selected literal masks and failure-as-false; numeric boundary leafs |
+| `WL_PLAN_EXPR_CMP_FLOAT_LT` | baseline-numeric | RHS numeric/typed FLOAT context; evaluated/selected literal masks and failure-as-false; numeric boundary leafs |
+| `WL_PLAN_EXPR_CMP_FLOAT_GT` | baseline-numeric | RHS numeric/typed FLOAT context; evaluated/selected literal masks and failure-as-false; numeric boundary leafs |
+| `WL_PLAN_EXPR_CMP_FLOAT_LTE` | baseline-numeric | RHS numeric/typed FLOAT context; evaluated/selected literal masks and failure-as-false; numeric boundary leafs |
+| `WL_PLAN_EXPR_CMP_FLOAT_GTE` | baseline-numeric | RHS numeric/typed FLOAT context; evaluated/selected literal masks and failure-as-false; numeric boundary leafs |
+| `WL_PLAN_EXPR_AGG_COUNT` | baseline-numeric | Aggregate-only compiler emission; evaluation_expression_reduce and numeric marker compatibility |
+| `WL_PLAN_EXPR_AGG_SUM` | baseline-numeric | Aggregate-only compiler emission; evaluation_expression_reduce and numeric marker compatibility |
+| `WL_PLAN_EXPR_AGG_MIN` | baseline-numeric | Aggregate-only compiler emission; evaluation_expression_reduce and numeric marker compatibility |
+| `WL_PLAN_EXPR_AGG_MAX` | baseline-numeric | Aggregate-only compiler emission; evaluation_expression_reduce and numeric marker compatibility |
+| `WL_PLAN_EXPR_AGG_AVG` | legacy-rejected | Rejected decoder/legacy boundary; numeric and expression inventory guards |
+| `WL_PLAN_EXPR_STR_FN_STRLEN` | unit5-sessions | RHS scalar borrowed/created/interned context; expression-faults for created result; STRING/hash leaf vectors |
+| `WL_PLAN_EXPR_STR_FN_CAT` | unit6-builders | RHS scalar borrowed/created/interned context; expression-faults for created result; STRING/hash leaf vectors |
+| `WL_PLAN_EXPR_STR_FN_SUBSTR` | unit6-selectors | RHS scalar borrowed/created/interned context; expression-faults for created result; STRING/hash leaf vectors |
+| `WL_PLAN_EXPR_STR_FN_CONTAINS` | unit5-sessions | RHS scalar borrowed/created/interned context; expression-faults for created result; STRING/hash leaf vectors |
+| `WL_PLAN_EXPR_STR_FN_STR_PREFIX` | unit5-sessions | RHS scalar borrowed/created/interned context; expression-faults for created result; STRING/hash leaf vectors |
+| `WL_PLAN_EXPR_STR_FN_STR_SUFFIX` | unit5-sessions | RHS scalar borrowed/created/interned context; expression-faults for created result; STRING/hash leaf vectors |
+| `WL_PLAN_EXPR_STR_FN_STR_ORD` | unit5-sessions | RHS scalar borrowed/created/interned context; expression-faults for created result; STRING/hash leaf vectors |
+| `WL_PLAN_EXPR_STR_FN_TO_UPPER` | unit6-builders | RHS scalar borrowed/created/interned context; expression-faults for created result; STRING/hash leaf vectors |
+| `WL_PLAN_EXPR_STR_FN_TO_LOWER` | unit6-builders | RHS scalar borrowed/created/interned context; expression-faults for created result; STRING/hash leaf vectors |
+| `WL_PLAN_EXPR_STR_FN_STR_REPLACE` | unit6-replace | RHS scalar borrowed/created/interned context; expression-faults for created result; STRING/hash leaf vectors |
+| `WL_PLAN_EXPR_STR_FN_TRIM` | unit6-selectors | RHS scalar borrowed/created/interned context; expression-faults for created result; STRING/hash leaf vectors |
+| `WL_PLAN_EXPR_STR_FN_TO_STRING` | unit6-builders | RHS scalar borrowed/created/interned context; expression-faults for created result; STRING/hash leaf vectors |
+| `WL_PLAN_EXPR_STR_FN_TO_NUMBER` | unit5-decimal | RHS scalar borrowed/created/interned context; expression-faults for created result; STRING/hash leaf vectors |
+| `WL_PLAN_EXPR_STR_FN_UUID5_RFC` | unit7-uuid-rfc | RHS crypto typed variants; enabled/disabled feature and created/interned owner where applicable |
+| `WL_PLAN_EXPR_CMP_STR_EQ` | unit4-sessions | evaluation_join:right_string_comparator_compatibility explicit scalar RHS; compiler naturally uses canonical-id EQ/NEQ |
+| `WL_PLAN_EXPR_CMP_STR_NEQ` | unit4-sessions | evaluation_join:right_string_comparator_compatibility explicit scalar RHS; compiler naturally uses canonical-id EQ/NEQ |
+| `WL_PLAN_EXPR_CMP_STR_LT` | unit4-sessions | RHS scalar borrowed/created/interned context; expression-faults for created result; STRING/hash leaf vectors |
+| `WL_PLAN_EXPR_CMP_STR_GT` | unit4-sessions | RHS scalar borrowed/created/interned context; expression-faults for created result; STRING/hash leaf vectors |
+| `WL_PLAN_EXPR_CMP_STR_LTE` | unit4-sessions | RHS scalar borrowed/created/interned context; expression-faults for created result; STRING/hash leaf vectors |
+| `WL_PLAN_EXPR_CMP_STR_GTE` | unit4-sessions | RHS scalar borrowed/created/interned context; expression-faults for created result; STRING/hash leaf vectors |
+| `WL_PLAN_EXPR_ARITH_HASH_S` | unit5-digests | RHS scalar borrowed/created/interned context; expression-faults for created result; STRING/hash leaf vectors |
+| `WL_PLAN_EXPR_ARITH_CRC32_ETH_S` | unit5-digests | RHS scalar borrowed/created/interned context; expression-faults for created result; STRING/hash leaf vectors |
+| `WL_PLAN_EXPR_ARITH_CRC32_CAST_S` | unit5-digests | RHS scalar borrowed/created/interned context; expression-faults for created result; STRING/hash leaf vectors |
+| `WL_PLAN_EXPR_ARITH_MD5_S` | unit7-digests | RHS crypto typed variants; enabled/disabled feature and created/interned owner where applicable |
+| `WL_PLAN_EXPR_ARITH_SHA1_S` | unit7-digests | RHS crypto typed variants; enabled/disabled feature and created/interned owner where applicable |
+| `WL_PLAN_EXPR_ARITH_SHA256_S` | unit7-digests | RHS crypto typed variants; enabled/disabled feature and created/interned owner where applicable |
+| `WL_PLAN_EXPR_ARITH_SHA512_S` | unit7-digests | RHS crypto typed variants; enabled/disabled feature and created/interned owner where applicable |
+| `WL_PLAN_EXPR_ARITH_HMAC_SHA256_SS` | unit7-hmac | RHS crypto typed variants; enabled/disabled feature and created/interned owner where applicable |
+| `WL_PLAN_EXPR_ARITH_HMAC_SHA256_SI` | unit7-hmac | RHS crypto typed variants; enabled/disabled feature and created/interned owner where applicable |
+| `WL_PLAN_EXPR_ARITH_HMAC_SHA256_IS` | unit7-hmac | RHS crypto typed variants; enabled/disabled feature and created/interned owner where applicable |
+| `WL_PLAN_EXPR_ARITH_UUID5_SS` | unit7-uuid-numeric | RHS crypto typed variants; enabled/disabled feature and created/interned owner where applicable |
+| `WL_PLAN_EXPR_ARITH_UUID5_SI` | unit7-uuid-numeric | RHS crypto typed variants; enabled/disabled feature and created/interned owner where applicable |
+| `WL_PLAN_EXPR_ARITH_UUID5_IS` | unit7-uuid-numeric | RHS crypto typed variants; enabled/disabled feature and created/interned owner where applicable |
