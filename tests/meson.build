@@ -2441,6 +2441,9 @@ test_fpga_backend_exe = executable(
   include_directories: [wirelog_inc, wirelog_src_inc],
   dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
   link_with: [testlib_prod],
+  # Keep this test non-LTO alongside testlib_prod: Clang ASan/UBSan LTO
+  # linking otherwise fails with discarded sanitizer ctor/dtor sections.
+  override_options: ['b_lto=false'],
 )
 
 test('fpga_backend', test_fpga_backend_exe)
@@ -4658,6 +4661,9 @@ test_join_batch_resume_arrangement = static_library(
   include_directories: [wirelog_inc, wirelog_src_inc],
   dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
   c_args: ['-DWL_COLUMNAR_ARRANGEMENT_PROBE_TEST_HOOKS=1'],
+  # Keep the hook and its consumer non-LTO alongside testlib_prod to avoid
+  # the observed Clang ASan/UBSan discarded-section link failure.
+  override_options: ['b_lto=false'],
 )
 
 test_join_batch_resume_exe = executable(
@@ -4668,6 +4674,7 @@ test_join_batch_resume_exe = executable(
   c_args: ['-DWL_COLUMNAR_ARRANGEMENT_PROBE_TEST_HOOKS=1',
     '-DWL_TEST_RELATION_RESIZE_HOOK=1'],
   link_with: [test_join_batch_resume_arrangement, testlib_prod],
+  override_options: ['b_lto=false'],
 )
 
 test('join_batch_resume', test_join_batch_resume_exe)
@@ -4922,6 +4929,7 @@ test_col_rel_deep_copy_exe = executable(
   include_directories: [wirelog_inc, wirelog_src_inc],
   dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
   link_with: [testlib_prod],
+  override_options: ['b_lto=false'],
 )
 
 test('col_rel_deep_copy', test_col_rel_deep_copy_exe, timeout: 120)
@@ -7306,6 +7314,7 @@ test_join_spill_exe = executable(
   include_directories: [wirelog_inc, wirelog_src_inc],
   dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
   link_with: [testlib_prod],
+  override_options: ['b_lto=false'],
 )
 test('join_spill', test_join_spill_exe, suite: ['unit', 'tsan'], timeout: 120)
 # #2287: the spill fixtures must not inherit the bounded join knob.
@@ -7331,6 +7340,7 @@ test_batch_payload_exe = executable(
   include_directories: [wirelog_inc, wirelog_src_inc],
   dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
   link_with: [testlib_prod],
+  override_options: ['b_lto=false'],
 )
 test('batch_payload', test_batch_payload_exe, suite: ['unit', 'tsan'], timeout: 120)
 
@@ -7342,6 +7352,7 @@ test_payload_join_exe = executable(
   include_directories: [wirelog_inc, wirelog_src_inc],
   dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
   link_with: [testlib_prod],
+  override_options: ['b_lto=false'],
 )
 test('payload_join', test_payload_join_exe, suite: ['unit', 'tsan'], timeout: 120)
 
@@ -7352,6 +7363,7 @@ test_session_cold_relation_exe = executable(
   include_directories: [wirelog_inc, wirelog_src_inc],
   dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
   link_with: [testlib_prod],
+  override_options: ['b_lto=false'],
 )
 test('session_cold_relation', test_session_cold_relation_exe, suite: ['unit', 'tsan'], timeout: 120)
 # #2287: the spill fixtures must not inherit the bounded join knob.
@@ -7395,6 +7407,7 @@ test_trace_store_exe = executable(
   include_directories: [wirelog_inc, wirelog_src_inc],
   dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
   link_with: [testlib_prod],
+  override_options: ['b_lto=false'],
 )
 test('trace_store', test_trace_store_exe, suite: ['unit', 'tsan'], timeout: 120)
 # The real private image journals physical frees separately from attribution,
@@ -7629,6 +7642,7 @@ test_evaluation_cold_sources_exe = executable(
   dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
   c_args: ['-DWL_TEST_SPILL=1', '-DWL_SESSION_TEST_HOOKS=1'],
   link_with: [testlib_prod],
+  override_options: ['b_lto=false'],
 )
 test('evaluation_cold_sources', test_evaluation_cold_sources_exe,
      suite: ['unit', 'tsan'], timeout: 300)
