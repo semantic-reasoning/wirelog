@@ -713,3 +713,14 @@ single-worker sessions (#2301)". A cold right input after a prefix or read by a
 later JOIN, a self-JOIN, two cold inputs of one rule, an aggregate after a
 later JOIN, a SNAPSHOT or an observed STEP over a cold input, the program
 refusals of the sixth bundle and more than one worker stay open.
+
+A fourteenth bundle admits, under control, a cold right input of the rule's
+first JOIN after a MAP/FILTER prefix over the resident left input, alone or
+before the aggregates the earlier bundles admit, under the uncontrolled route's
+audits. No new operator runs the rule: the prefix runs as the controlled FILTER
+and MAP attempts, and the cold scan copies the right input whole, its own
+prefix the VARIABLE alone; see "Cold JOIN right inputs after a prefix in
+controlled single-worker sessions (#2301)". A cold right input read by a later
+JOIN, a self-JOIN, two cold inputs of one rule, an aggregate after a later
+JOIN, a SNAPSHOT or an observed STEP over a cold input, the program refusals of
+the sixth bundle and more than one worker stay open.
