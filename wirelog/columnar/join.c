@@ -489,6 +489,19 @@ col_join_output_limit_reached(wl_col_session_t *sess, const col_rel_t *out)
     return wl_columnar_join_output_limit_reached(sess, out, 1);
 }
 
+/* A cache twin is not a second logical output. Replay only its produced
+ * prefix through the same inclusive cap/shared-counter contract as a miss.
+ * Copy admission has already succeeded; a refusal never publishes the twin. */
+static bool
+wl_columnar_join_cached_output_limit(wl_col_session_t *sess,
+    const col_rel_t *copy)
+{
+    for (uint32_t row = 0; row < copy->nrows; ++row)
+        if (wl_columnar_join_output_count_limit(sess, (uint64_t)row + 1, 1))
+            return true;
+    return false;
+}
+
 static int
 col_join_reserve_exact(col_rel_t *rel, uint32_t nrows)
 {
@@ -2715,6 +2728,11 @@ wl_columnar_join_op(const wl_plan_op_t *op, eval_stack_t *stack,
             if (copy_rc != 0)
                 return wl_columnar_join_dispose_left(stack, &left_e,
                            wl_columnar_join_memory_error(sess, copy_rc));
+            if (wl_columnar_join_cached_output_limit(sess, copy)) {
+                col_rel_destroy(copy);
+                return wl_columnar_join_dispose_left(stack, &left_e,
+                           EOVERFLOW);
+            }
             return wl_columnar_join_publish_after_left(stack, &left_e, copy,
                        left_e.is_delta || used_right_delta);
         }
@@ -4791,6 +4809,11 @@ wl_columnar_join_diff_op(const wl_plan_op_t *op, eval_stack_t *stack,
             if (copy_rc != 0)
                 return wl_columnar_join_dispose_left(stack, &left_e,
                            wl_columnar_join_memory_error(sess, copy_rc));
+            if (wl_columnar_join_cached_output_limit(sess, copy)) {
+                col_rel_destroy(copy);
+                return wl_columnar_join_dispose_left(stack, &left_e,
+                           EOVERFLOW);
+            }
             return wl_columnar_join_publish_after_left(stack, &left_e, copy,
                        left_e.is_delta || used_right_delta);
         }

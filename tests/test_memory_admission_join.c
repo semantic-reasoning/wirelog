@@ -5139,6 +5139,209 @@ out:
     destroy_session(sess);
 }
 
+/* Real producer-seeded materialized hits; literal rows are independent of
+ * both the cached payload and a cold execution. These are direct operators,
+ * not the controlled preserved-body dispatcher. */
+static bool
+materialized_policy_rows(const col_rel_t *r, bool empty)
+{
+    static const int64_t rows[2][4] = {{0, 0, 0, 0}, {1, 1, 1, 1000}};
+    if (!r || r->ncols != 4 || r->nrows != (empty ? 0u : 2u)) return false;
+    for (unsigned c = 0; c < 4; ++c) {
+        char name[16]; snprintf(name, sizeof(name), "col%u", c);
+        if (!r->col_names || strcmp(r->col_names[c], name)
+            || (r->column_types && r->column_types[c] != WIRELOG_TYPE_INT64))
+            return false;
+    }
+    unsigned seen = 0;
+    for (uint32_t i = 0; i < r->nrows; ++i) {
+        unsigned row = 2;
+        for (unsigned k = 0; k < 2; ++k) {
+            bool match = true;
+            for (unsigned c = 0; c < 4; ++c)
+                match &= col_rel_get(r, i, c) == rows[k][c];
+            if (match) row = k;
+        }
+        if (row == 2 || (seen & (1u << row))) return false;
+        seen |= 1u << row;
+    }
+    return empty || seen == 3;
+}
+
+#define MAT_CHECK(c) do { if (!(c)) { FAIL(#c); goto out; } } while (0)
+
+static void
+test_materialized_cache_output_policy(bool diff, bool empty, bool shared,
+    uint64_t limit, uint64_t prior)
+{
+    wl_col_session_t *s = make_session(64ull * 1024 * 1024);
+    col_rel_t *left = make_left(empty ? 0 : 2, 2), *right = make_right(2, 1);
+    wl_columnar_memory_governor_ref_t *final_ref =
+        s ? s->memory_governor : NULL;
+    if (final_ref) wl_columnar_memory_governor_ref_retain(final_ref);
+    eval_entry_t result = {0};
+    wl_plan_op_t op;
+    atomic_uint_fast64_t count;
+    atomic_init(&count, prior);
+    int (*run)(wl_col_session_t *, col_rel_t *, const wl_plan_op_t *,
+        eval_entry_t *) = diff ? run_diff_join : run_join;
+    TEST("real warm materialized output respects cap and shared prefix");
+    MAT_CHECK(s && left && right && !session_add_rel(s, right));
+    right = NULL;
+    init_diff_keyed_op(&op);
+    MAT_CHECK(!run(s, left, &op, &result) && result.owned
+        && materialized_policy_rows(result.rel, empty));
+    col_rel_destroy(result.rel); result = (eval_entry_t){0};
+    const col_rel_t *cached = cached_output(s, left);
+    MAT_CHECK(cached && materialized_policy_rows(cached, empty));
+    uint64_t baseline = reserved_of(s), hits = s->mat_cache.hits,
+        identity = s->mat_cache.entries[0].identity;
+    s->join_output_peak = 0;
+    s->join_output_limit = shared ? 1 : limit; /* shared policy takes priority */
+    s->join_output_shared_count = shared ? &count : NULL;
+    s->join_output_shared_limit = limit;
+    uint64_t prefix = 0, expected_count = prior;
+    bool refused = false;
+    for (unsigned row = 0; row < (empty ? 0u : 2u); ++row) {
+        ++prefix;
+        if (shared && limit && expected_count != UINT64_MAX) ++expected_count;
+        if (limit && (shared ? expected_count : prefix) >= limit) {
+            refused = true; break;
+        }
+    }
+    int rc = run(s, left, &op, &result);
+    MAT_CHECK(rc == (refused ? EOVERFLOW : 0)
+        && s->mat_cache.hits == hits + 1 && !s->mat_cache.active_pins
+        && cached_output(s, left) == cached
+        && s->mat_cache.entries[0].identity == identity
+        && s->join_output_peak == prefix
+        && atomic_load_explicit(&count,
+        memory_order_seq_cst) == expected_count);
+    if (refused) MAT_CHECK(!result.rel && reserved_of(s) == baseline);
+    else {
+        MAT_CHECK(result.owned && result.rel != cached
+            && materialized_policy_rows(result.rel, empty)
+            && admission_invariant(result.rel)
+            && reserved_of(s) == baseline + relation_charge(result.rel));
+        col_rel_destroy(result.rel); result = (eval_entry_t){0};
+    }
+    MAT_CHECK(reserved_of(s) == baseline);
+    /* Same valid cached owner succeeds after policy restoration. */
+    s->join_output_limit = 0; s->join_output_shared_count = NULL;
+    MAT_CHECK(!run(s, left, &op, &result) && result.owned
+        && materialized_policy_rows(result.rel, empty)
+        && cached_output(s, left) == cached && !s->mat_cache.active_pins);
+    col_rel_destroy(result.rel); result = (eval_entry_t){0};
+    /* Genuine cache clear supplies the independently checked cold comparison. */
+    col_mat_cache_clear(&s->mat_cache);
+    s->join_output_peak = 0; s->join_output_limit = shared ? 1 : limit;
+    s->join_output_shared_count = shared ? &count : NULL;
+    atomic_store_explicit(&count, prior, memory_order_seq_cst);
+    rc = run(s, left, &op, &result);
+    MAT_CHECK(rc == (refused ? EOVERFLOW : 0) && s->join_output_peak == prefix
+        && atomic_load_explicit(&count,
+        memory_order_seq_cst) == expected_count);
+    if (!rc) MAT_CHECK(materialized_policy_rows(result.rel, empty));
+    PASS();
+out:
+    if (result.owned && result.rel) col_rel_destroy(result.rel);
+    if (s) s->join_output_shared_count = NULL;
+    col_rel_destroy(left); col_rel_destroy(right); destroy_session(s);
+    if (final_ref) {
+        if (reserved_for(final_ref)) FAIL(
+                "materialized fixture leaked governed credit");
+        wl_columnar_memory_governor_ref_release(final_ref);
+    }
+}
+
+static void
+test_materialized_cache_copy_failure(bool diff, bool physical, bool owned)
+{
+    wl_col_session_t *s = make_session(64ull * 1024 * 1024);
+    col_rel_t *left = make_left(2, 2), *right = make_right(2, 1);
+    wl_columnar_memory_governor_ref_t *final_ref =
+        s ? s->memory_governor : NULL;
+    if (final_ref) wl_columnar_memory_governor_ref_retain(final_ref);
+    eval_entry_t result = {0};
+    wl_columnar_memory_reservation_t peer;
+    wl_columnar_memory_reservation_init(&peer);
+    bool held = false;
+    wl_plan_op_t op;
+    int (*run)(wl_col_session_t *, col_rel_t *, const wl_plan_op_t *,
+        eval_entry_t *) = diff ? run_diff_join : run_join;
+    TEST("real warm materialized copy failure retains cache and exact credit");
+    MAT_CHECK(s && left && right && !session_add_rel(s, right)); right = NULL;
+    init_diff_keyed_op(&op);
+    MAT_CHECK(!run(s, left, &op, &result)
+        && materialized_policy_rows(result.rel, false));
+    col_rel_destroy(result.rel); result = (eval_entry_t){0};
+    const col_rel_t *cached = cached_output(s, left);
+    wl_columnar_memory_governor_t *g =
+        wl_columnar_memory_governor_ref_get(s->memory_governor);
+    uint64_t baseline = reserved_of(s), hits = s->mat_cache.hits,
+        denials = wl_columnar_memory_denials(g);
+    s->join_output_peak = 0; s->join_output_limit = 1;
+    s->memory_budget_denied = false;
+    if (physical)
+        wl_columnar_relation_test_fail_next_governed_copy_payload_alloc();
+    else {
+        uint64_t available = atomic_load_explicit(&g->usable_bytes,
+                memory_order_seq_cst) - baseline;
+        MAT_CHECK(available > 1 && wl_columnar_memory_reserve_checked(g,
+            available - 1, &peer) == WL_COLUMNAR_MEMORY_ADMISSION_OK);
+        held = true;
+    }
+    eval_stack_t stack; eval_stack_init(&stack);
+    MAT_CHECK(!eval_stack_push(&stack, left, owned));
+    int rc = diff ? col_op_join_diff(&op, &stack, s) : col_op_join(&op, &stack,
+            s);
+    if (owned) left = NULL; /* Operator consumed the actual owned LEFT. */
+    MAT_CHECK(rc == (physical ? ENOMEM : ENOSPC) && !stack.top
+        && s->mat_cache.hits == hits + 1 && !s->mat_cache.active_pins
+        && cached_output(s, left) == cached
+        && materialized_policy_rows(cached, false)
+        && reserved_of(s) == baseline + (held ? peer.bytes : 0)
+        && !s->join_output_peak
+        && s->memory_budget_denied == !physical
+        && (physical ? wl_columnar_memory_denials(g) == denials
+                     : wl_columnar_memory_denials(g) > denials));
+    /* Pressure remains owned through the complete failed return. */
+    if (held) {
+        MAT_CHECK(wl_columnar_memory_rollback(&peer)); held = false;
+        MAT_CHECK(reserved_of(s) == baseline);
+    }
+    s->join_output_limit = 0;
+    if (!left) {
+        left = make_left(2, 2); MAT_CHECK(left);
+    }
+    hits = s->mat_cache.hits;
+    MAT_CHECK(!run(s, left, &op, &result) && result.owned
+        && materialized_policy_rows(result.rel, false)
+        && !s->mat_cache.active_pins);
+    if (!owned) MAT_CHECK(s->mat_cache.hits == hits + 1
+            && cached_output(s, left) == cached);
+    col_rel_destroy(result.rel); result = (eval_entry_t){0};
+    /* Mutating a real source invalidates the old snapshot; no stale hit. */
+    col_rel_t *source = session_find_rel(s, "right");
+    int64_t extra[] = {2, 2000};
+    MAT_CHECK(!col_rel_append_row(source, extra));
+    hits = s->mat_cache.hits;
+    MAT_CHECK(!run(s, left, &op, &result)
+        && materialized_policy_rows(result.rel,
+        false) && s->mat_cache.hits == hits);
+    PASS();
+out:
+    if (held) (void)wl_columnar_memory_rollback(&peer);
+    if (result.owned && result.rel) col_rel_destroy(result.rel);
+    col_rel_destroy(left); col_rel_destroy(right); destroy_session(s);
+    if (final_ref) {
+        if (reserved_for(final_ref)) FAIL(
+                "materialized fixture leaked governed credit");
+        wl_columnar_memory_governor_ref_release(final_ref);
+    }
+}
+#undef MAT_CHECK
+
 static void
 test_cache_copy_governor_precedence(void)
 {
@@ -5686,6 +5889,22 @@ main(void)
     test_diff_commit_refusal_retains_complete_stack_entry();
     test_differential_cache_hit_reclaim_pin();
     test_materialized_stack_copy_contract();
+    for (unsigned diff = 0; diff < 2; ++diff) {
+        for (uint64_t cap = 0; cap < 4; ++cap)
+            test_materialized_cache_output_policy(diff != 0, false, false, cap,
+                0);
+        test_materialized_cache_output_policy(diff != 0, true, false, 1, 0);
+        for (uint64_t cap = 2; cap < 5; ++cap)
+            test_materialized_cache_output_policy(diff != 0, false, true, cap,
+                1);
+        test_materialized_cache_output_policy(diff != 0, false, true, 0, 7);
+        test_materialized_cache_output_policy(diff != 0, true, true, 1, 1);
+        test_materialized_cache_output_policy(diff != 0, false, true,
+            UINT64_MAX, UINT64_MAX - 1);
+        test_materialized_cache_copy_failure(diff != 0, false, false);
+        test_materialized_cache_copy_failure(diff != 0, true, false);
+        test_materialized_cache_copy_failure(diff != 0, true, true);
+    }
     test_cache_copy_governor_precedence();
     test_governed_copy_payload_failure_falls_back_to_accounted_original();
     test_materialized_cache_insert_failure_unwinds_both_results();
