@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Keep CI budgets and the production/test LTO boundary explicit.
+"""Keep CI budgets, the production/test LTO boundary and the clang-tidy
+ratchet's exclusive scheduling explicit.
 
 This is intentionally a small structural check rather than a general YAML
 parser.  The build-matrix block has a stable layout, and checking that layout
@@ -149,13 +150,11 @@ def validate(text: str) -> None:
     validate_linux_clang_shards(text)
 
 
-def library(text: str, name: str) -> str:
-    """Read one balanced static_library call, ignoring comments and strings."""
-    match = re.search(r"^" + re.escape(name) + r" = static_library\(",
-                      text, re.MULTILINE)
-    assert match, f"missing {name} archive"
+def call_end(text: str, start: int):
+    """Return the offset of the ')' that closes a call whose body starts at
+    start, ignoring comments and strings; None if it never closes."""
     depth, quote, comment = 1, None, False
-    for offset in range(match.end(), len(text)):
+    for offset in range(start, len(text)):
         char = text[offset]
         if comment:
             comment = char != "\n"
@@ -171,8 +170,54 @@ def library(text: str, name: str) -> str:
         elif char == ")":
             depth -= 1
             if not depth:
-                return text[match.start():offset + 1]
-    raise AssertionError(f"unterminated {name} archive")
+                return offset
+    return None
+
+
+def library(text: str, name: str) -> str:
+    """Read one balanced static_library call, ignoring comments and strings."""
+    match = re.search(r"^" + re.escape(name) + r" = static_library\(",
+                      text, re.MULTILINE)
+    assert match, f"missing {name} archive"
+    end = call_end(text, match.end())
+    if end is None:
+        raise AssertionError(f"unterminated {name} archive")
+    return text[match.start():end + 1]
+
+
+def code_only(block: str) -> str:
+    """Drop meson '#' comments and blank string contents, keeping quotes."""
+    kept, quote, comment = [], None, False
+    for char in block:
+        if comment:
+            if char != "\n":
+                continue
+            comment = False
+        elif quote:
+            if char == quote:
+                quote = None
+            else:
+                char = " "
+        elif char == "#":
+            comment = True
+            continue
+        elif char in "\"'":
+            quote = char
+        kept.append(char)
+    return "".join(kept)
+
+
+def validate_tidy_scheduling(text: str) -> None:
+    """#2397: the ratchet runs min(8, ncpu) clang-tidy processes by default,
+    so it must not share the runner with other tests."""
+    openers = list(re.finditer(r"^[ \t]*test\('clang_tidy_ratchet',",
+                               text, re.MULTILINE))
+    assert len(openers) == 1, "expected exactly one clang_tidy_ratchet test"
+    end = call_end(text, openers[0].end())
+    assert end is not None, "unterminated clang_tidy_ratchet test"
+    block = code_only(text[openers[0].start():end + 1])
+    assert re.search(r"\bis_parallel\s*:\s*false\b", block), \
+        "clang_tidy_ratchet must stay is_parallel: false (#2397)"
 
 
 def validate_archives(text: str) -> None:
@@ -482,6 +527,52 @@ class CiPrLtoCostTests(unittest.TestCase):
         mutated = self.project.replace("'b_lto=true'", "'b_lto=false'", 1)
         with self.assertRaisesRegex(AssertionError, "production default"):
             validate_profiles(self.workflow, mutated)
+
+
+class TidySchedulingTests(unittest.TestCase):
+    FLAG = "priority: 100,\n       is_parallel: false)"
+    MESSAGE = "must stay is_parallel: false"
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tests = TEST_MESON.read_text(encoding="utf-8")
+
+    def mutate(self, text, old, new):
+        self.assertEqual(text.count(old), 1, old)
+        mutated = text.replace(old, new)
+        self.assertNotEqual(mutated, text)
+        return mutated
+
+    def rejects(self, mutated):
+        with self.assertRaisesRegex(AssertionError, self.MESSAGE):
+            validate_tidy_scheduling(mutated)
+
+    def test_actual_ratchet_scheduling(self):
+        validate_tidy_scheduling(self.tests)
+
+    def test_parallel_ratchet_is_rejected(self):
+        self.rejects(self.mutate(self.tests, self.FLAG, "priority: 100)"))
+
+    def test_explicit_true_is_rejected(self):
+        self.rejects(self.mutate(self.tests, self.FLAG,
+                                 "priority: 100,\n       is_parallel: true)"))
+
+    def test_commented_flag_is_rejected(self):
+        self.rejects(self.mutate(
+            self.tests, self.FLAG,
+            "priority: 100,\n       # is_parallel: false\n       )"))
+
+    def test_flag_in_a_string_is_rejected(self):
+        self.rejects(self.mutate(
+            self.tests, self.FLAG,
+            "priority: 100,\n       env: ['is_parallel: false'])"))
+
+    def test_flag_on_sibling_does_not_count(self):
+        mutated = self.mutate(self.tests, self.FLAG, "priority: 100)")
+        mutated = self.mutate(mutated, "timeout: 300,\n       priority: 100)",
+                              "timeout: 300,\n       priority: 100,\n"
+                              "       is_parallel: false)")
+        self.rejects(mutated)
 
 
 if __name__ == "__main__":
