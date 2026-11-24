@@ -333,14 +333,17 @@ jobs:
 
       # -Dexamples=false: skip the examples/ demos under sanitizers (each re-compiles the
       # full wirelog_sources instrumented); they are already covered by the non-sanitized legs.
+      # Match the PR ASan profile: unoptimized debug timed out in the growing
+      # lifecycle matrices. Keep debug info, assertions and both sanitizers.
       - name: Configure with sanitizers
         run: >
           meson setup builddir
           -Db_sanitize=address,undefined
           -Db_lundef=false
+          -Db_lto=false
           -Dtests=true
           -Dexamples=false
-          --buildtype=debug
+          --buildtype=debugoptimized
         env:
           CC: ${{ matrix.cc }}
 
