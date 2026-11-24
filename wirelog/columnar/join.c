@@ -2709,7 +2709,11 @@ wl_columnar_join_op(const wl_plan_op_t *op, eval_stack_t *stack,
     /* An owned filtered fallback has a fresh identity for every operation.
     * It cannot hit again during the lease window, so bypass the
     * materialization cache rather than occupying a slot until eviction. */
-    if (op->materialized && !sess->tdd_input_run && !projected_join &&
+    /* A warm copy must not bypass configured producer/exclusion policy.
+     * Keep the entry for later unconfigured reuse; the miss path still owns
+     * materialization insertion and its accounted-original alternative. */
+    if (op->materialized && !sess->join_batch_bytes && !sess->tdd_input_run &&
+        !projected_join &&
         !right_filtered) {
         col_mat_cache_pin_t cache_pin = { 0 };
         col_rel_t *cached = col_mat_cache_lookup_pin_keyed(&sess->mat_cache,
@@ -4794,7 +4798,10 @@ wl_columnar_join_diff_op(const wl_plan_op_t *op, eval_stack_t *stack,
     /* Materialization cache check */
     bool projected_join = op->project_count > 0 && op->project_indices;
     /* Owned filtered fallbacks are operation-local; see the ordinary path. */
-    if (op->materialized && !projected_join && !right_filtered) {
+    /* As in the ordinary path, configured policy must be decided by the
+     * existing miss path rather than bypassed by a cached result. */
+    if (op->materialized && !sess->join_batch_bytes && !projected_join &&
+        !right_filtered) {
         col_mat_cache_pin_t cache_pin = { 0 };
         col_rel_t *cached = col_mat_cache_lookup_pin_keyed(&sess->mat_cache,
                 left_e.rel, right, col_mat_cache_join_signature(op, true),

@@ -3584,9 +3584,8 @@ run_excluded_diff_case(fixture_t *f, wl_plan_op_t *op, uint64_t knob,
         eval_stack_drain(&stack);
     }
 
-    /* A cached materialized result would be copied before the bounded-mode
-     * decision is reached. */
-    col_mat_cache_clear(&f->sess->mat_cache);
+    /* Retain the genuine materialized result: warmth must not bypass the
+     * same strict decision or release its cached owner on refusal. */
     f->sess->join_batch_strict = true;
     reserved = reserved_of(f->sess);
     eval_stack_init(&stack);
