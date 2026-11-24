@@ -1004,8 +1004,10 @@ static bool consume_primary(wl_session_t *session, unsigned key_col,
     int rc = col_op_join(&op, &stack, COL_SESSION(session));
     if (rc != expected || !wl_columnar_relation_snapshot_equal(snapshot,
         wl_columnar_relation_snapshot(right)) ||
-        atomic_load(&right->source_access.state) ||
-        atomic_load(&right->descriptor_access.state)) goto done;
+        atomic_load_explicit(&right->source_access.state,
+        memory_order_seq_cst) ||
+        atomic_load_explicit(&right->descriptor_access.state,
+        memory_order_seq_cst)) goto done;
     if (expected) {
         ok = stack.top == 0; goto done;
     }
