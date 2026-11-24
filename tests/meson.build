@@ -1971,8 +1971,8 @@ if host_machine.system() == 'linux' and sh.found()
        timeout: 120)
 endif
 
-# Issue #1100: clang-tidy ratchet (suite 'tidy').  No CI job has run
-# clang-tidy since efbde27 removed it, and wirelog/ir/program.c regressed
+# Issue #1100: clang-tidy ratchet (suite 'tidy').  Before it, no CI job had
+# run clang-tidy since efbde27 removed it, and wirelog/ir/program.c regressed
 # after f1d2a2c with nothing failing. The gate re-analyses every active file
 # in scripts/ci/clang-tidy-allowlist.txt; backlog files are excluded. Both
 # thread backend alternatives are registered, while the compile database
@@ -1982,15 +1982,17 @@ endif
 #
 # As with the perf gate above, suite membership excludes nothing (there is
 # no add_test_setup in this project), so these run in a default
-# `meson test`.  Opting out is a runtime decision instead: the ratchet SKIPs
-# unless clang-tidy is present at a supported major
+# `meson test`.  The block below is not defined on Windows, so the MSVC job
+# never runs it.  Elsewhere opting out is a runtime decision: the ratchet
+# SKIPs unless clang-tidy is present at a supported major
 # (scripts/ci/clang-tidy-supported-majors.txt), the host is Linux on
 # x86_64, and the database is free of -fsanitize= / MSVC command lines --
-# so the sanitizer, tsan, macOS, MSVC and build-arm jobs skip it rather
-# than reporting an uncalibrated verdict.  The arch guard is what covers
-# build-arm: it is Linux, uninstrumented and not MSVC, so only the target
-# check distinguishes it.  WIRELOG_TIDY_REQUIRED=1 (set by build-primary)
-# turns those skips into failures; WIRELOG_TIDY_SKIP=1 forces a skip.
+# so sanitizer-matrix, both tsan legs, the macOS jobs and build-arm skip it
+# rather than reporting an uncalibrated verdict.  The arch guard is what
+# covers build-arm: it is Linux, uninstrumented and not MSVC, so only the
+# target check distinguishes it.  WIRELOG_TIDY_REQUIRED=1 (set by
+# build-primary's "clang-tidy ratchet gate" step) turns those skips into
+# failures; WIRELOG_TIDY_SKIP=1 forces a skip.
 #
 # Cost: about 12-16 s wall at 8 jobs and about 113 s summed CPU when it was
 # added (#1100); the hosted Linux Clang ratchet durations recorded in

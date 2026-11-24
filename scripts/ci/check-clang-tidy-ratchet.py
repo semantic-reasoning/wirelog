@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """clang-tidy ratchet: files already clean must stay clean (Issue #1100).
 
-No CI job has run clang-tidy since `efbde27` removed the job, so the only
-thing keeping the tree lint-clean has been reviewer attention.  It does not
-hold: `wirelog/ir/program.c` was clean, regressed after `f1d2a2c`, and now
-reports `bugprone-branch-clone` with nothing failing.
+Before this gate, no CI job had run clang-tidy since `efbde27` removed the
+job, so the only thing keeping the tree lint-clean had been reviewer
+attention.  It did not hold: `wirelog/ir/program.c` was clean, regressed
+after `f1d2a2c`, and reported `bugprone-branch-clone` with nothing failing.
 
 This gate is a ratchet over the `libwirelog.so` translation units in the
 build's `compile_commands.json`:
@@ -43,11 +43,11 @@ SKIPs, with a named reason, unless all of the following hold:
 
 The architecture guard is not redundant with the OS one: `build-arm`
 (`.github/workflows/ci-pr.yml`, ubuntu-26.04-arm) is Linux, uninstrumented
-and not MSVC, and runs an unfiltered `meson test`.  It is protected today
-only by clang-tidy 22 being absent from that image, which is an accident of
-the runner rather than a guarantee.  `clang-analyzer-*` results are
-target-dependent, so an image bump could otherwise yield an aarch64 verdict
-against an x86_64-calibrated allowlist.
+and not MSVC, and runs an unfiltered `meson test`.  Without this guard it
+would be protected only by whether its image ships a supported clang-tidy,
+which is an accident of the runner rather than a guarantee.
+`clang-analyzer-*` results are target-dependent, so an image bump could
+otherwise yield an aarch64 verdict against an x86_64-calibrated allowlist.
 
 Environment:
 
@@ -310,8 +310,9 @@ def resolve_clang_tidy() -> str:
     # Versioned names first: an unsuffixed `clang-tidy` is whatever the
     # distribution happens to default to, so preferring it would SKIP for a
     # developer who has clang-tidy-20 as the default and a supported
-    # clang-tidy-22 installed alongside it.  CI is unaffected either way --
-    # it exports CLANG_TIDY explicitly.
+    # clang-tidy-22 installed alongside it.  CI's "clang-tidy ratchet gate"
+    # step exports CLANG_TIDY explicitly; a plain `meson test` elsewhere in
+    # CI does not, and resolves through this order.
     override = os.environ.get("CLANG_TIDY")
     candidates = [override] if override else []
     for major in supported_majors():
