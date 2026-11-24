@@ -378,7 +378,8 @@ static void expression_fault_checkpoint(wl_evaluation_control_t *control,
     else if (expression_fault == 2) {
         wl_columnar_memory_governor_t *g =
             wl_columnar_memory_governor_ref_get(f->p.governor);
-        uint64_t available = atomic_load(&g->usable_bytes)-
+        uint64_t available = atomic_load_explicit(&g->usable_bytes,
+                memory_order_seq_cst)-
             wl_columnar_memory_reserved(g);
         CHECK(available > 5);
         wl_columnar_memory_reservation_init(&f->peer);
@@ -501,9 +502,11 @@ static void expression_case(const char *predicate, unsigned mask,
         col_rel_t *left = session_find_rel(session, "left");
         col_rel_t *inputs[] = {left, (col_rel_t *)right};
         for (unsigned i = 0; i < 2; ++i) {
-            CHECK(atomic_load(&inputs[i]->source_access.state) ==
+            CHECK(atomic_load_explicit(&inputs[i]->source_access.state,
+                memory_order_seq_cst) ==
                 (retained?1u:0u) &&
-                atomic_load(&inputs[i]->descriptor_access.state) ==
+                atomic_load_explicit(&inputs[i]->descriptor_access.state,
+                memory_order_seq_cst) ==
                 (retained?1u:0u));
             wl_columnar_source_access_writer_t writer = {0};
             if (retained) CHECK(col_rel_source_writer_acquire(inputs[i],
@@ -888,8 +891,10 @@ static void ordinary_fallback_reasons(void) {
             (filtered?COL_JOIN_BATCH_EXCLUDED_FILTERED_RIGHT:
             COL_JOIN_BATCH_EXCLUDED_DELTA_RIGHT) &&
             canonical->nrows == 3 && canonical->ncols == 2 &&
-            !atomic_load(&canonical->source_access.state) &&
-            !atomic_load(&canonical->descriptor_access.state));
+            !atomic_load_explicit(&canonical->source_access.state,
+            memory_order_seq_cst) &&
+            !atomic_load_explicit(&canonical->descriptor_access.state,
+            memory_order_seq_cst));
         unsigned source_keys = 0;
         for (uint32_t row = 0; row < canonical->nrows; ++row) {
             int64_t key = col_rel_get(canonical, row, 0);
@@ -1067,8 +1072,10 @@ static void cache_clear_cycle(void) {
         pin.source_reader.owner == &canonical->storage_owner->source_access &&
         pin.source_reader.secondary_owner == &canonical->descriptor_access &&
         wl_columnar_relation_snapshot_equal(snapshot, pin.source_snapshot) &&
-        atomic_load(&canonical->source_access.state) == 1 &&
-        atomic_load(&canonical->descriptor_access.state) == 1 &&
+        atomic_load_explicit(&canonical->source_access.state,
+        memory_order_seq_cst) == 1 &&
+        atomic_load_explicit(&canonical->descriptor_access.state,
+        memory_order_seq_cst) == 1 &&
         entry->pin_count == 1 &&
         col_session_free_diff_arrangements(session) == EBUSY && pin.active &&
         entry->generation == generation && entry->pin_count == 1 &&
@@ -1079,8 +1086,10 @@ static void cache_clear_cycle(void) {
         !memcmp(next, index->ht_next, index->ht_cap*sizeof(*next)));
     col_diff_arrangement_pin_release(&pin);
     CHECK(!entry->pin_count && !pin.active &&
-        !atomic_load(&canonical->source_access.state) &&
-        !atomic_load(&canonical->descriptor_access.state));
+        !atomic_load_explicit(&canonical->source_access.state,
+        memory_order_seq_cst) &&
+        !atomic_load_explicit(&canonical->descriptor_access.state,
+        memory_order_seq_cst));
     uint64_t owned = index->reserved_bytes+
         session->diff_arr_registry_reservation.bytes;
     CHECK(index->reservation.bytes == index->reserved_bytes &&

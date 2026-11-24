@@ -2975,8 +2975,10 @@ static void ordinary_shared_stamped_source(void) {
         wl_columnar_relation_snapshot(f.registry[0])) &&
         wl_columnar_relation_snapshot_equal(root_snapshot,
         wl_columnar_relation_snapshot(root)) &&
-        !atomic_load(&root->source_access.state) &&
-        !atomic_load(&f.registry[0]->descriptor_access.state));
+        !atomic_load_explicit(&root->source_access.state,
+        memory_order_seq_cst) &&
+        !atomic_load_explicit(&f.registry[0]->descriptor_access.state,
+        memory_order_seq_cst));
     CHECK(wl_evaluation_control_finish(f.operation, &f.operation_owner,
         WL_EVALUATION_CONTROL_CANCELLED, 0) == WL_EVALUATION_CONTROL_CANCELLED);
     wl_evaluation_control_report_t report;
@@ -3010,8 +3012,10 @@ static void ordinary_shared_stamped_source(void) {
         wl_columnar_relation_snapshot(f.registry[0])) &&
         wl_columnar_relation_snapshot_equal(root_snapshot,
         wl_columnar_relation_snapshot(root)) &&
-        !atomic_load(&root->source_access.state) &&
-        !atomic_load(&f.registry[0]->descriptor_access.state));
+        !atomic_load_explicit(&root->source_access.state,
+        memory_order_seq_cst) &&
+        !atomic_load_explicit(&f.registry[0]->descriptor_access.state,
+        memory_order_seq_cst));
     fixture_close(&f); CHECK(!col_rel_storage_alias_borrow_count(root));
     col_rel_destroy(root);
     shared_fixture = NULL; shared_owner = NULL;
