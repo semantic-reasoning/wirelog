@@ -125,7 +125,7 @@ references, not interruption evidence.
 | F05a | Ordinary keyed persistent arrangement/probe bundle versus ephemeral hash; cached right filter versus operation-owned filtered relation | General serial STEP owns a private native index registry for full-right public EDB INT64 JOIN, with bounded creation/reuse/probes and a common head/index cutoff. Existing pins/pending/deferred entries refuse replacement. Filtered/private-head/batch representations retain their previous controlled disposition; this does not qualify raw cache alternatives, G5/G6 |
 | F06a | LFTJ cache/probe versus owned source rebuild and raw output callback versus private owned-row append | Controlled session uses per-attempt bounded rebuild, no unlimited raw fallback; actual writer/ROW/ACK/drain ownership and precommit/postcutoff delivery qualified | Host failure/native/microsteps/policy and `test_lftj_postcut_delivery`; current-generation raw probe/pin checks; [source map](../2298/LFTJ_SOURCE_ACCOUNTING.md) |
 | F07a | Scalar-source compound kind NONE versus INLINE/SIDE, declared schema/type validity, timestamps and row weights | Admission predicates differ by child; no cross-operator representation support inferred. Managed copies/readers can be bounded while a surrounding child refuses the representation; G5. #2301: VARIABLE, MAP and FILTER admit compound_kind INLINE after a metered arity-map check; ordinary JOIN also admits INLINE through the existing bounded reader (#2371); SEMIJOIN/ANTIJOIN remain scalar-only; compound_kind SIDE stays ENOTSUP at the scalar source reader, and an EDB declared with a side compound column has compound_kind NONE in sessions, with controlled make_compound after a completed evaluation admitted on the ordinary and general observed hosts, `evaluation_side_compounds` (#2301), see "SIDE compound EDBs in controlled single-worker sessions (#2301)"; no timestamped/weighted source found in controlled single-worker sessions, `evaluation_source_shapes` (#2301), see "Source shapes in controlled single-worker sessions (#2301)" |
-| F07b | Retained/borrowed/owned, contiguous/segmented/spill-backed storage and empty/nullary/wide rows | Source reader/descriptor and copy helpers must preserve representation and governor state; capacity/overflow errors remain errors. Enumerated qualification combinations, not an invitation to raw fallback; G5/G6. #2301: borrowed public INLINE descriptors, empty, wide and arity-1 INLINE layouts; a controlled single-worker STEP reads a cold (spill-backed) source through a direct MAP/FILTER projection, through the aggregates the uncontrolled cold aggregate admits, through a JOIN whose right input is not a cold binding, through the COUNT, MIN or MAX after that JOIN that the uncontrolled cold JOIN aggregate admits, as the right input of a JOIN at a rule's second op after a resident left input, alone or before the COUNT, MIN or MAX the uncontrolled cold JOIN aggregate admits, the JOIN that reads the cold input having one key or more and every later JOIN one, and seal and begin refuse the other cold consumers under control, `evaluation_cold_sources`, see "Cold sources in controlled single-worker sessions (#2301)", "Cold aggregates in controlled single-worker sessions (#2301)", "Cold JOINs in controlled single-worker sessions (#2301)", "Cold JOIN aggregates in controlled single-worker sessions (#2301)", "Cold JOIN right inputs in controlled single-worker sessions (#2301)", "Cold JOIN right aggregates in controlled single-worker sessions (#2301)" and "Cold multi-key JOINs in controlled single-worker sessions (#2301)"; a never-inserted EDB through MAP, FILTER and REDUCE on the unobserved STEP; no lazy-owner, aliased or segmented source found in controlled single-worker sessions, `evaluation_source_shapes`, see "Source shapes in controlled single-worker sessions (#2301)" |
+| F07b | Retained/borrowed/owned, contiguous/segmented/spill-backed storage and empty/nullary/wide rows | Source reader/descriptor and copy helpers must preserve representation and governor state; capacity/overflow errors remain errors. Enumerated qualification combinations, not an invitation to raw fallback; G5/G6. #2301: borrowed public INLINE descriptors, empty, wide and arity-1 INLINE layouts; a controlled single-worker STEP reads a cold (spill-backed) source through a direct MAP/FILTER projection, through the aggregates the uncontrolled cold aggregate admits, through a JOIN whose right input is not a cold binding, through the COUNT, MIN or MAX after that JOIN that the uncontrolled cold JOIN aggregate admits, as the right input of a JOIN at a rule's second op after a resident left input, alone or before the COUNT, MIN or MAX the uncontrolled cold JOIN aggregate admits, every JOIN of the rule having one key or more, and seal and begin refuse the other cold consumers under control, `evaluation_cold_sources`, see "Cold sources in controlled single-worker sessions (#2301)", "Cold aggregates in controlled single-worker sessions (#2301)", "Cold JOINs in controlled single-worker sessions (#2301)", "Cold JOIN aggregates in controlled single-worker sessions (#2301)", "Cold JOIN right inputs in controlled single-worker sessions (#2301)", "Cold JOIN right aggregates in controlled single-worker sessions (#2301)", "Cold multi-key JOINs in controlled single-worker sessions (#2301)" and "Cold later multi-key JOINs in controlled single-worker sessions (#2301)"; a never-inserted EDB through MAP, FILTER and REDUCE on the unobserved STEP; no lazy-owner, aliased or segmented source found in controlled single-worker sessions, `evaluation_source_shapes`, see "Source shapes in controlled single-worker sessions (#2301)" |
 
 ## Configuration predicates
 
@@ -3664,11 +3664,11 @@ key: the JOIN that reads the cold input, as its left input after the cold scan
 prefix or as its right input at the rule's second op, may have two keys or
 more, of which the tests run two, in the shapes of the four previous sections,
 alone or before the COUNT, MIN or MAX they admit. Every later JOIN of the rule
-keeps one key. The rule must still pass the uncontrolled route's audit for its
-shape: `wl_columnar_join_cold_prefix`, which for a rule with a JOIN of more
-than one key checks the ops after the VARIABLE with
-`wl_columnar_join_cold_suffix`, `wl_columnar_join_cold_scan_prefix` after a
-nonempty prefix, or `wl_columnar_join_aggregate_decode` before an aggregate.
+keeps one key, which the next section relaxes. The rule must still pass the
+uncontrolled route's audit for its shape: `wl_columnar_join_cold_prefix`, which
+for a rule with a JOIN of more than one key checks the ops after the VARIABLE
+with `wl_columnar_join_cold_suffix`, `wl_columnar_join_cold_scan_prefix` after
+a nonempty prefix, or `wl_columnar_join_aggregate_decode` before an aggregate.
 `wl_columnar_session_cold_join_rule` and `wl_columnar_session_cold_right_rule`
 check this at seal and begin and keep their other refusals. A JOIN with no key
 stays refused; the uncontrolled audits refuse it as well, so the controlled
@@ -3727,15 +3727,99 @@ returned, and the JOINs over 20 rows with the cold input on either side consume
 the same work on both routes, a limit one unit lower stopping the STEP. In
 `evaluation_cold_sources`, under control, seal and begin refuse a second JOIN
 with two keys after the one that reads the cold input, on either side, which
-the uncontrolled route admits, each refusal asserting its op order and the key
-count of that JOIN; both routes refuse a JOIN with no key.
+the uncontrolled route admits and the next section admits under control, each
+refusal asserting its op order and the key count of that JOIN; both routes
+refuse a JOIN with no key.
 
 Open after this unit: a cold right input after a FILTER or MAP prefix or read
 by a later JOIN, a self-JOIN and two cold inputs of one rule; a later JOIN with
-more than one key; a source with an INLINE compound column before a JOIN; a
-SNAPSHOT or an observed STEP over a cold input; the program refusals of the
-earlier units; and more than one worker. Limits: no case puts a MAP before a
-JOIN with more than one key, carries a FLOAT or unsigned key, or sets a JOIN
-batch size (`WIRELOG_JOIN_BATCH_BYTES`); the read fault, the cancellation
-inside a spill read, the parked STEP, the parked destroy, the governor denials
-and an insert into the right input were run with one key only.
+more than one key, which the next section admits; a source with an INLINE
+compound column before a JOIN; a SNAPSHOT or an observed STEP over a cold
+input; the program refusals of the earlier units; and more than one worker.
+Limits: no case puts a MAP before a JOIN with more than one key, carries a
+FLOAT or unsigned key, or sets a JOIN batch size (`WIRELOG_JOIN_BATCH_BYTES`);
+the read fault, the cancellation inside a spill read, the parked STEP, the
+parked destroy, the governor denials and an insert into the right input were
+run with one key only.
+
+### Cold later multi-key JOINs in controlled single-worker sessions (#2301)
+
+A controlled STEP now also reads a cold input through a rule whose JOIN after
+the one that reads the cold input has more than one key: with the cold input on
+the left, after the VARIABLE or after the cold scan prefix, or on the right at
+the rule's second op, a later JOIN may have two keys or more, of which the
+tests run two. Every JOIN of such a rule needs one key or more, and the rule
+must still pass the uncontrolled route's audit for its shape, as in the
+previous section: for a rule with a JOIN of more than one key
+`wl_columnar_join_cold_prefix` checks the ops after the VARIABLE with
+`wl_columnar_join_cold_suffix`, which takes a later JOIN of one key or more,
+with named keys when it has more than one, left keys of INT64 or STRING type
+and, when its right input is resident or cold, right keys of the same types,
+and `wl_columnar_join_cold_scan_prefix` checks them after a nonempty prefix. A
+REDUCE in a rule with a later JOIN stays refused on both routes, because
+`wl_columnar_join_aggregate_decode`, the only one of these audits that admits a
+REDUCE, admits no JOIN other than the first one after the cold scan prefix. A
+later JOIN with no key stays refused on both routes as well; the controlled
+rules' own check of it is redundant with the audits.
+`wl_columnar_session_cold_join_rule` and `wl_columnar_session_cold_right_rule`
+check this at seal and begin and keep their other refusals.
+
+No new operator runs the later JOIN, and the composed attempt is unchanged. It
+runs as the same controlled JOIN attempt as the JOIN before it, which resolves,
+hashes and matches every key of its op. Its left input is the output of the op
+before it, the earlier JOIN or a FILTER or MAP after it, whose columns carry
+generated positional names; in every case here that op is the earlier JOIN, and
+each `col<N>` key resolves against them as the uncontrolled audit resolves it
+with `wl_columnar_join_auto_key`; its right input is resident or declared,
+never cold. While a cold binding is held the later JOIN builds a local index
+rather than read a persistent arrangement: the cold mode requires
+`spill_join_batch_bytes`, and `wl_columnar_session_diff_index` returns without
+an arrangement when that field is set. No case here inserts into a resident
+input after the seal or load. The peak memory of the controlled route and the
+least free memory at which a STEP succeeds were not measured for these shapes.
+
+`evaluation_cold_sources` and `evaluation_cold_right_sources` add cases with a
+later JOIN of two keys to the comparison with an uncontrolled session, on the
+seal and the loading route unless the rows come from program facts. The
+generated cases use the skewed resident rows of the previous section, and each
+head row is checked to hold two equal values or, after a one-key JOIN of a cold
+right input, an even row index of the resident input; in the generated cases
+with 20 rows in both inputs a later JOIN on its first or its second key alone
+gives a head row that fails that check. With the cold input on the left the
+corpus has a one-key JOIN followed by a two-key JOIN of the right input over 6
+and 20 cold rows, with an empty right input and after an equality FILTER, a
+two-key JOIN followed by another and, from program facts, two two-key JOINs
+whose INT64 and STRING keys sit at other positions in the two inputs. With the
+cold input on the right it has a one-key JOIN followed by a two-key JOIN of the
+left input over 6 and 20 cold rows and with a left input declared but never
+inserted, and a two-key JOIN followed by another. Each of these rules reads the
+same resident input in both JOINs, not the cold one. Each case asserts its op
+order and that its last JOIN comes after the one that reads the cold input and
+has two keys, and each case other than those from program facts is also
+compared with an uncontrolled and a controlled session that keep the inputs
+resident. A work-limit stop at every checkpoint of either JOIN over 6 cold rows
+on the left on the seal route and a cancellation at every one over 6 cold rows
+on the right on the loading route behave as the earlier stops do. An allocation
+that the JOIN of a cold right input cannot make before a later JOIN with two
+keys fails the STEP with ENOMEM and every reservation returned, and the rules
+with a one-key JOIN followed by a two-key JOIN over 20 rows, with the cold
+input on either side, consume the same work on the seal and the loading route,
+a limit one unit lower stopping the STEP. The rules of the previous section's
+two refusals of a second JOIN with two keys, one of whose later keys is a
+column of the cold input, run now from program facts as admitted cases,
+compared with an uncontrolled session. Both routes refuse a later JOIN with no
+key, after a one-key JOIN with the cold input on the left and after a two-key
+JOIN with it on the right, and a COUNT after a two-key JOIN that follows a
+one-key JOIN, with the cold input on either side, each refusal asserting its op
+order and the key count of its last JOIN.
+
+Open after this unit: a cold right input after a FILTER or MAP prefix or read
+by a later JOIN, a self-JOIN of the cold input and two cold inputs of one rule;
+an aggregate after a later JOIN; a source with an INLINE compound column before
+a JOIN; a SNAPSHOT or an observed STEP over a cold input; the program refusals
+of the earlier units; and more than one worker. Limits: no case puts a MAP
+before a JOIN with more than one key, carries a FLOAT or unsigned key, or sets
+a JOIN batch size (`WIRELOG_JOIN_BATCH_BYTES`); no case fails an allocation
+inside the later JOIN; the read fault, the cancellation inside a spill read,
+the parked STEP, the parked destroy, the governor denials and an insert into a
+resident input were not run for a rule with a later JOIN of two keys.

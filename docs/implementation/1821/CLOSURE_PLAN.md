@@ -702,3 +702,14 @@ sessions (#2301)". A cold right input after a prefix or read by a later JOIN, a
 self-JOIN, two cold inputs of one rule, a later JOIN with more than one key, a
 SNAPSHOT or an observed STEP over a cold input, the program refusals of the
 sixth bundle and more than one worker stay open.
+
+A thirteenth bundle admits, under control, a JOIN with more than one key after
+the JOIN that reads the cold input, with the cold input on the left after the
+VARIABLE or the cold scan prefix or on the right at the rule's second op, under
+the uncontrolled route's audits, which still refuse an aggregate after such a
+later JOIN and a JOIN with no key. No operator changes: the later JOIN runs as
+the same controlled JOIN attempt; see "Cold later multi-key JOINs in controlled
+single-worker sessions (#2301)". A cold right input after a prefix or read by a
+later JOIN, a self-JOIN, two cold inputs of one rule, an aggregate after a
+later JOIN, a SNAPSHOT or an observed STEP over a cold input, the program
+refusals of the sixth bundle and more than one worker stay open.
