@@ -631,7 +631,7 @@ wl_columnar_ops_cold_scan_attempt_begin(wl_columnar_cold_scan_attempt_t *a,
         !plan->ops || begin || !end || end >= plan->op_count ||
         (end < 2 && plan->ops[end].op != WL_PLAN_OP_REDUCE &&
         plan->ops[end].op != WL_PLAN_OP_JOIN) ||
-        (right && (end != 1 || plan->ops[end].op != WL_PLAN_OP_JOIN)) ||
+        (right && plan->ops[end].op != WL_PLAN_OP_JOIN) ||
         !output || *output || !control || !attempt_id ||
         !session->base.evaluation_control) return EINVAL;
     memset(a, 0, sizeof(*a));
@@ -689,6 +689,15 @@ wl_columnar_cold_scan_resolve_name(wl_columnar_cold_scan_attempt_t *a,
     return 0;
 }
 
+/* The end of the prefix the scan applies. A right input is read whole
+* whatever precedes the JOIN that names it: its prefix is the VARIABLE
+* alone, and the left input's ops before that JOIN are not its own. */
+static uint32_t
+wl_columnar_cold_scan_prefix_end(const wl_columnar_cold_scan_attempt_t *a)
+{
+    return a->right ? 1u : a->end;
+}
+
 static int
 wl_columnar_cold_scan_resolve(wl_columnar_cold_scan_attempt_t *a)
 {
@@ -700,7 +709,8 @@ wl_columnar_cold_scan_resolve(wl_columnar_cold_scan_attempt_t *a)
      * and once for the aggregate, and traces each group key and the
      * operand back through the prefix; the sizing pass counts all three. */
     bool reduce_end = a->plan->ops[a->end].op == WL_PLAN_OP_REDUCE;
-    uint32_t sized = a->end + (reduce_end ? 1u : 0u);
+    uint32_t prefix_end = wl_columnar_cold_scan_prefix_end(a);
+    uint32_t sized = prefix_end + (reduce_end ? 1u : 0u);
     if (a->decode_op < sized) {
         const wl_plan_op_t *op = &a->plan->ops[a->decode_op];
         bool reduce = op->op == WL_PLAN_OP_REDUCE;
@@ -711,7 +721,7 @@ wl_columnar_cold_scan_resolve(wl_columnar_cold_scan_attempt_t *a)
                 WL_EVALUATION_CONTROL_QUANTUM));
         if (rc) return wl_columnar_cold_scan_fail(a, rc);
         /* Larger lane counts are charged through the prepayment below. */
-        uint64_t cost = 1u + a->end, lane_cost = 1u + a->end;
+        uint64_t cost = 1u + prefix_end, lane_cost = 1u + prefix_end;
         for (uint64_t i = 0; (op->op == WL_PLAN_OP_MAP || reduce) &&
             i < lanes; i++) {
             uint64_t bytes = reduce ? (i ? 0u : op->agg_expr.size)
@@ -746,7 +756,7 @@ wl_columnar_cold_scan_resolve(wl_columnar_cold_scan_attempt_t *a)
     bool join_end = a->plan->ops[a->end].op == WL_PLAN_OP_JOIN;
     uint32_t logical = 0;
     /* A right input is read whole: no MAP, no FILTER, the source's columns
-     * in their order, which the TYPES lanes at end == 1 keep. */
+     * in their order, which the TYPES lanes over its own prefix keep. */
     if (a->right) memset(&a->decoded, 0, sizeof(a->decoded));
     if (a->cold->state == WL_COLUMNAR_COLD_LOADING || (!a->right &&
         !wl_columnar_eval_plan_cold_scan_decode(a->plan, a->cold->name,
@@ -830,13 +840,14 @@ wl_columnar_cold_scan_alloc(wl_columnar_cold_scan_attempt_t *a)
 static int
 wl_columnar_cold_scan_decode_op(wl_columnar_cold_scan_attempt_t *a)
 {
-    if (a->decode_op == a->end) {
+    uint32_t prefix_end = wl_columnar_cold_scan_prefix_end(a);
+    if (a->decode_op == prefix_end) {
         if (a->next_predicate != a->decoded.filter_count)
             return wl_columnar_cold_scan_fail(a, ENOTSUP);
         a->phase = WL_COLUMNAR_COLD_SCAN_ATTEMPT_TYPES;
         return 0;
     }
-    int rc = wl_columnar_cold_scan_charge(a, 1u + a->end);
+    int rc = wl_columnar_cold_scan_charge(a, 1u + prefix_end);
     if (rc) return wl_columnar_cold_scan_fail(a, rc);
     const wl_plan_op_t *op = &a->plan->ops[a->decode_op];
     if (op->op == WL_PLAN_OP_MAP) {
@@ -862,10 +873,11 @@ wl_columnar_cold_scan_types(wl_columnar_cold_scan_attempt_t *a)
         a->phase = WL_COLUMNAR_COLD_SCAN_ATTEMPT_OUTPUT_CREATE;
         return 0;
     }
-    int rc = wl_columnar_cold_scan_charge(a, 1u + a->end);
+    uint32_t prefix_end = wl_columnar_cold_scan_prefix_end(a);
+    int rc = wl_columnar_cold_scan_charge(a, 1u + prefix_end);
     if (rc) return wl_columnar_cold_scan_fail(a, rc);
     uint32_t lane = a->type_lane;
-    if (!wl_columnar_eval_plan_cold_column(a->plan, a->end, lane,
+    if (!wl_columnar_eval_plan_cold_column(a->plan, prefix_end, lane,
         a->cold->ncols, &a->indices[lane]))
         return wl_columnar_cold_scan_fail(a, ENOTSUP);
     a->type_codes[lane] =

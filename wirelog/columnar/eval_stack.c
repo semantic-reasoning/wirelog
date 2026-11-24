@@ -4322,9 +4322,10 @@ wl_columnar_eval_stack_composed_cold_install(
 }
 
 /* Lend the frame's cold right slot to the controlled cold scan of the
- * JOIN right input at ops[1] (#2301). The left input is already installed;
- * the slot stays held until the RELEASE drop, after every child that read
- * it has finished. */
+ * right input of the rule's first JOIN (#2301), which follows the left
+ * input's VARIABLE and its MAP/FILTER prefix, if any. The left input, or
+ * the prefix's output, is already on the stack; the slot stays held until
+ * the RELEASE drop, after every child that read it has finished. */
 int
 wl_columnar_eval_stack_composed_cold_right_output(
     wl_columnar_eval_stack_cleanup_frame_t *frame, wl_col_session_t *sess,
@@ -4336,7 +4337,9 @@ wl_columnar_eval_stack_composed_cold_right_output(
     if (owner->phase != WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_COLD_RIGHT_SLOT
         || owner->cold_right_held || owner->cold.identity
         || owner->source_slot_borrowed || owner->source_initialized
-        || owner->source_bare || owner->cursor != 1 || frame->stack.top != 1
+        || owner->source_bare
+        || owner->cursor != wl_columnar_ops_cold_scan_end(owner->plan, 0)
+        || frame->stack.top != 1
         || !wl_columnar_eval_stack_unary_entry_inert(&frame->cold_right))
         return EBUSY;
     for (unsigned i = 0; i < 4; ++i) {
@@ -4367,8 +4370,10 @@ wl_columnar_eval_stack_composed_cold_right(
         return EINVAL;
     const wl_columnar_eval_plan_numeric_attempt_t *n = owner;
     if (!n->composed_mode || !n->cold_right_held) return 0;
-    if (n->cold.identity || !n->plan || n->cursor != 1
-        || op != &n->plan->ops[1] || op->op != WL_PLAN_OP_JOIN
+    if (n->cold.identity || !n->plan
+        || n->cursor != wl_columnar_ops_cold_scan_end(n->plan, 0)
+        || n->cursor >= n->plan->op_count
+        || op != &n->plan->ops[n->cursor] || op->op != WL_PLAN_OP_JOIN
         || !frame->cold_right.owned || !frame->cold_right.rel)
         return EINVAL;
     *out = frame->cold_right.rel;
