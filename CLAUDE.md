@@ -97,14 +97,23 @@ at a major listed in `scripts/ci/clang-tidy-supported-majors.txt`, the host
 is Linux on x86_64, and the compilation database is free of `-fsanitize=`
 and MSVC command lines — the allowlist was calibrated on one toolchain,
 one architecture and one build configuration, and `clang-analyzer-*`
-results move between LLVM releases and between targets. CI's
-`build-primary` job sets `WIRELOG_TIDY_REQUIRED=1`, which turns those skips
-into failures; `WIRELOG_TIDY_SKIP=1` forces a skip and
-`WIRELOG_TIDY_JOBS=N` overrides the parallelism (default `min(8, ncpu)`).
+results move between LLVM releases and between targets. The
+`clang-tidy ratchet gate` step of CI's `build-primary` job sets
+`WIRELOG_TIDY_REQUIRED=1`, which turns those skips into failures; nothing
+else in CI sets it, so elsewhere a SKIP does not fail the run.
+`WIRELOG_TIDY_SKIP=1` forces a skip and `WIRELOG_TIDY_JOBS=N` overrides the
+parallelism (default `min(8, ncpu)`).
 
-Cost is ~113 s of summed CPU, so the wall-clock hit depends entirely on
-core count: about +15 s on an 8-core workstation, but roughly **+60 s on a
-standard 2-vCPU GitHub runner**, where `min(8, ncpu)` yields 2 jobs.
+Cost: when the gate was added (#1100) a scan took about 113 s of summed CPU
+and about 15 s wall at 8 jobs. In run 45172454684 (attempts 1 and 2) on
+hosted ubuntu-26.04 runners, `clang_tidy_ratchet` took 316 and 345 s in
+`build-primary`'s dedicated tidy step, 329 and 362 s in its Test step, and
+332 and 461 s in slice 1 of the Linux Clang shards. Those runs predate
+`is_parallel: false` on the ratchet (#2397). In shard 1, 138 other tests
+ran beside it; in the Test step, 37 did, all finishing within its first
+33 s; in the dedicated step, three short tidy tests did.
+`docs/CI_TELEMETRY.md` ("Linux Clang PR lane (#2397)") records the shard
+runs.
 
 After a toolchain bump, re-derive the lists with:
 

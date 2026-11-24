@@ -192,19 +192,28 @@ jobs:
       # =======================================================================
       # Issue #1100: clang-tidy ratchet CI gate
       #
-      # Installed AFTER the Test step on purpose: the tidy suite runs in a
-      # default `meson test` (there is no add_test_setup in this project), so
-      # having clang-tidy on PATH earlier would run the ~15 s scan twice.
-      # Without it there, the Test step reports the tidy tests as SKIPped and
-      # the dedicated step below runs them once with WIRELOG_TIDY_REQUIRED=1,
-      # which turns any skip into a failure.
+      # The tidy suite runs in a default `meson test` (there is no
+      # add_test_setup in this project), so the Test step above runs it too,
+      # before the pinned install below.  Whether it scans there depends on
+      # whether a supported clang-tidy is already on PATH; no step before the
+      # install provides one.  In run 45172454684 the ratchet passed in the
+      # Test step (attempt 1, 329.30 s; attempt 2, 362.24 s), and the install
+      # step's apt output unpacks clang-tidy-22 1:22.1.8 over an already
+      # installed 1:22.1.2-1ubuntu1; which executable the Test step ran is not
+      # logged.  On both attempts the scan therefore ran twice in this job:
+      # the dedicated step below took 316.28 s (attempt 1) and 344.87 s
+      # (attempt 2).  Only that step exports CLANG_TIDY and sets
+      # WIRELOG_TIDY_REQUIRED=1, which turns any skip into a failure; in the
+      # other steps and jobs of this workflow a SKIP does not fail the run.
       #
-      # This is the only job that installs clang-tidy, so the ratchet's
-      # guarantee is Linux/gcc-configured-build only.  The other jobs
-      # (build-arm, build-matrix macOS + MSVC, build-linux-clang-shards,
-      # build-mbedtls, sanitizer-matrix, tsan) skip it at runtime rather than
-      # reporting a verdict from a configuration the allowlist was not
-      # calibrated for.
+      # This is the only job that installs clang-tidy.  In run 45172454684
+      # attempt 1 the ratchet also passed in build-linux-clang-shards (in
+      # slice 1; the other slices did not hold it) and reported SKIP in
+      # build-arm, build-matrix macOS, sanitizer-matrix and tsan; the logs do
+      # not show which guard each skip hit.  The build-matrix MSVC leg never
+      # defines it (tests/meson.build registers the tidy suite under
+      # `if not is_windows`), and build-mbedtls and tsan-native run only
+      # named tests that do not include it.
       # =======================================================================
       - name: Install clang-tidy (pinned major)
         run: |
