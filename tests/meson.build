@@ -1151,7 +1151,8 @@ endif
 
 # Keep the longer Windows/MSVC build budget platform-specific and the Linux
 # Clang lane sharded under its own budgets (#2397); a global timeout increase
-# would hide Linux/macOS regressions in the PR gate.
+# would hide Linux/macOS regressions in the PR gate.  The same contract keeps
+# clang_tidy_ratchet non-parallel (#2397).
 test('ci_pr_build_timeout_contract', py3,
      args: [meson.project_source_root() / 'scripts/ci/test-ci-pr-build-timeouts.py'],
      suite: 'abi')
@@ -1994,16 +1995,22 @@ endif
 # check distinguishes it.  WIRELOG_TIDY_REQUIRED=1 (set by build-primary)
 # turns those skips into failures; WIRELOG_TIDY_SKIP=1 forces a skip.
 #
-# Cost: ~12-16 s wall at 8 jobs, ~113 s summed CPU, on a suite whose
-# baseline is ~20 s wall; the hosted Linux Clang ratchet durations recorded
-# in docs/CI_TELEMETRY.md ("Linux Clang PR lane (#2397)") include 196, 353
-# and 358 s.  priority: 100 starts it first, but it overlaps only the
-# parallel tests queued ahead of the next non-parallel one: Meson waits for
-# every running test before it starts a non-parallel test, so that test and
-# the rest of the queue wait for the ratchet.  In shard 1 of run 45104151262
-# the first non-parallel test was 20th, and about 10 s of other test time
-# overlapped the ratchet's 358 s.  The 900 s timeout is generous against the
-# 12.7 s worst single file (exec_plan_gen.c) on a loaded runner.
+# Cost: about 12-16 s wall at 8 jobs and about 113 s summed CPU when it was
+# added (#1100); the hosted Linux Clang ratchet durations recorded in
+# docs/CI_TELEMETRY.md ("Linux Clang PR lane (#2397)") include 196, 332, 353,
+# 358 and 461 s.  It scans with min(8, ncpu) clang-tidy processes by default
+# (WIRELOG_TIDY_JOBS overrides), so is_parallel: false keeps other tests off
+# those CPUs: Meson waits for every running test before it starts a
+# non-parallel test, and waits for that test before it starts the next.
+# priority: 100, shared only with clang_tidy_sensitivity, which is defined
+# after it (the sort is stable), puts it first in the test list, so it starts
+# while nothing else runs and lands in slice 1 of `meson test --slice K/N`.
+# The price is that nothing else in the run starts until it finishes; a SKIP
+# returns before the scan starts.  Before this, shard 1 of the five-shard run
+# 45172454684 ran 138 tests beside it; wirelog_advanced_spill overlapped it
+# for its whole duration on both attempts and hit its 120 s timeout on the
+# second.  The 900 s timeout is generous against the 12.7 s worst single file
+# (exec_plan_gen.c) on a loaded runner.
 if not is_windows
   test('clang_tidy_ratchet', py3,
        args: [meson.project_source_root() / 'scripts/ci/check-clang-tidy-ratchet.py',
@@ -2011,7 +2018,8 @@ if not is_windows
               '--mode', 'ratchet'],
        suite: 'tidy',
        timeout: 900,
-       priority: 100)
+       priority: 100,
+       is_parallel: false)
 
   # Sensitivity control: a fixture that no meson target compiles and that
   # appears in neither list, carrying one deliberate bugprone-integer-

@@ -1183,6 +1183,8 @@ in minutes here.
   count against `timeout-minutes`; the trigger is on job time.
 - Shard 1's 45.3 min is over the 45-minute re-sharding trigger.
 
+Five-shard runs are recorded under "Five shards on hosted runners" below.
+
 For comparison, every successful unsharded `Build / ubuntu-26.04 / clang`
 job in the ci-pr runs created on 2026-11-20 and 2026-11-21 (UTC):
 
@@ -1269,10 +1271,98 @@ Decision: five.
 - Five shards also run two more concurrent jobs per PR.  That will cost about
   25 to 30 more runner-minutes per PR (hypothesis), and it may lengthen
   queueing: on run 45104151262 shard 2 already waited 39.0 min for a runner,
-  longer than its 35.7-minute job.
+  longer than its 35.7-minute job.  The measurement exceeded that
+  hypothesis: the shard jobs of run 45172454684 attempt 1 took 139.0
+  runner-minutes against 105.7 for those of run 45104151262, 33.3 more.
 
 The hard-cancel budget still holds with the new build figure.  The worst
 setup plus build is now 17.2 min (shard 1 of run 45104151262, from job start
 to the end of its build step), so a test step that runs to its 40-minute
 limit leaves about 2.8 min of the job's 60 for verify and upload.  A build
 past about 19 minutes would again let the job limit pre-empt the upload.
+Run 45172454684's shards did not raise it: their worst setup plus build was
+16.7 min on attempt 1 and 17.1 on attempt 2.
+
+### Five shards on hosted runners
+
+Facts.  Run 45172454684, attempt 1, head 9e3ec039 (PR #2415, merge commit
+e2f2d6ba): 1658 tests, Meson 1.10.1, image 20261116.202.1 for every shard.
+Columns as in the tables above; queue is in seconds.  In this subsection a
+job's minutes run from its start to its completion as the jobs API reports
+them.
+
+| job | queue s | setup | build | test | job min | of limit | tests | parallelism |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| shard 1 (137897222345) | 2 | 0.4 | 11.4 | 15.0 | 26.9 | 45% | 332 | 3.16 |
+| shard 2 (137897222398) | 2 | 0.3 | 11.2 | 14.1 | 25.7 | 43% | 332 | 2.75 |
+| shard 3 (137897222357) | 2 | 0.4 | 16.1 | 13.0 | 29.5 | 49% | 332 | 3.21 |
+| shard 4 (137897222276) | 2 | 0.5 | 14.9 | 13.6 | 29.1 | 49% | 331 | 3.22 |
+| shard 5 (137897222286) | 2 | 0.4 | 16.4 | 10.9 | 27.7 | 46% | 331 | 3.90 |
+| collecting (137915787075) | 2 | | | | 0.2 | <1% | | |
+
+- The aggregate step reported "1658 tests in 5 shards, each executed exactly
+  once"; no test failed (3, 3, 2, 2 and 7 runtime skips).
+- Summed test time was 214.3 CPU-min.  The lane took 29.7 min from the
+  shards' creation to the collecting job's end.  The worst job, 29.5 min,
+  compares with the 34.8 projected above.
+
+Attempt 2 re-ran the same head.  Shard 1 (138106321819) failed:
+`wirelog_advanced_spill` reached its 120 s timeout (TIMEOUT at 120.11 s,
+SIGTERM); 328 tests passed, 3 skipped and 1 timed out of 332.  Its build
+took 16.6 min, its test step 19.6 and its job 36.8.  Shards 2 to 5 succeeded
+in 23.0, 29.7, 31.3 and 28.2 min, and the collecting job failed at "Require
+every shard to succeed", as designed.
+
+Shard 1's results, from each test's start time and duration:
+
+| run | shards | `wirelog_advanced_spill` | its overlap with the ratchet | `clang_tidy_ratchet` |
+| --- | --- | --- | --- | --- |
+| 45104151262 | 3 | 70.9 s, OK | 0 s | 358 s |
+| 45172454684 attempt 1 | 5 | 110.4 s, OK | 110.4 s | 332 s |
+| 45172454684 attempt 2 | 5 | 120.1 s, TIMEOUT | 120.1 s | 461 s |
+
+- At five shards the first non-parallel test in slice 1 is 140th, so 138
+  tests ran beside the ratchet: 588 s of their time on attempt 1 and 743 s
+  on attempt 2.  At three shards the first was 20th (see above).
+- The ratchet runs `min(8, ncpu)` clang-tidy processes by default; at most
+  4 tests ran at once in each downloaded five-shard result.
+- The tests in shard 1 other than the ratchet summed 1.26 times more on
+  attempt 2 than on attempt 1, so that runner was slower throughout.
+- The replay above modelled each test at its measured duration and modelled
+  no CPU contention, so it could not show this.
+
+Hypothesis: the timeout came from the ratchet's processes taking the
+runner's CPUs, on a runner that was already slower, not from a change in the
+test.  The three rows support it but come from different runners.
+
+Change: `clang_tidy_ratchet` is `is_parallel: false`.  Meson waits for every
+running test before it starts a non-parallel test and waits for that test
+before it starts the next, so the ratchet now runs alone at the head of
+slice 1.  The slices do not change.
+
+Projection (hypotheses).  The same replay as above, with the ratchet
+non-parallel, gives shard 1 a test step of 18.6 min on attempt 1's
+durations (measured 15.0) and 23.8 min on attempt 2's (measured 19.6).
+Without the change the replay reproduces the six five-shard elapsed times
+in the downloaded evidence (attempt 1 shards 1 to 5, attempt 2 shard 1)
+within a second; that fit is in-sample.  The other tests' durations were
+measured under contention and probably overstate their solo times.  The
+ratchet's hosted durations with little else beside it are 316 and 345 s
+(`build-primary`'s tidy step on attempts 1 and 2) and 358 s (run
+45104151262).  Attempt 1's 332 s lies inside that range, and those three
+durations put attempt 1's replay at 18.3 to 19.0 min.  Attempt 2's 461 s was
+measured beside 138 other tests and may include contention, so its 23.8 min
+is an upper estimate; with the ratchet at 358 s the same replay gives 22.1
+min.  With the worst setup plus build of 17.2 min and 1 min for listing,
+checks and upload, shard 1's job is about 36.8 min (61%) on attempt 1's
+durations and at most about 42.0 min (70%) on attempt 2's.
+
+- Shard 1's test step, already the longest (15.0 and 19.6 min against at
+  most 14.3 in shards 2 to 5), grows further; the replay of shards 2 to 5
+  does not change.
+- Both job projections are under the 45-minute trigger, the slow one by at
+  least 3.0 min, so growth in slice 1 can cross it first.  Both test steps
+  are under the 40-minute step limit, and the hard-cancel arithmetic above
+  does not depend on this change.
+- The change adds about 3.6 runner-minutes per run to shard 1 on attempt
+  1's durations.
