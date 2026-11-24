@@ -27,6 +27,7 @@
 
 #include "../wirelog/backend.h"
 #include "../wirelog/columnar/internal.h"
+#include "../wirelog/columnar/join_batch.h"
 #include "../wirelog/exec_plan_gen.h"
 #include "../wirelog/session.h"
 #include "../wirelog/wirelog.h"
@@ -5342,6 +5343,117 @@ out:
 }
 #undef MAT_CHECK
 
+static bool
+materialized_batch_rows(const col_rel_t *r, unsigned shape)
+{
+    if (shape == 1 || shape == 2 || shape == 4)
+        return materialized_policy_rows(r, false);
+    static const int64_t rows[4][4] = {
+        {0, 0, 0, 0}, {0, 0, 1, 1000}, {1, 1, 0, 0}, {1, 1, 1, 1000}
+    };
+    if (!r || r->ncols != 4 || r->nrows != (shape == 3 ? 0u : 4u))
+        return false;
+    unsigned seen = 0;
+    for (uint32_t i = 0; i < r->nrows; ++i) {
+        unsigned row = 4;
+        for (unsigned k = 0; k < 4; ++k) {
+            bool match = true;
+            for (unsigned c = 0; c < 4; ++c)
+                match &= col_rel_get(r, i, c) == rows[k][c];
+            if (match) row = k;
+        }
+        if (row == 4 || (seen & (1u << row))) return false;
+        seen |= 1u << row;
+    }
+    return shape == 3 || seen == 15;
+}
+
+#define MAT_CHECK(c) do { if (!(c)) { FAIL(#c); goto out; } } while (0)
+static void
+test_materialized_cache_batch_policy(unsigned shape)
+{
+    wl_col_session_t *s = make_session(64ull * 1024 * 1024);
+    wl_columnar_memory_governor_ref_t *final_ref =
+        s ? s->memory_governor : NULL;
+    if (final_ref) wl_columnar_memory_governor_ref_retain(final_ref);
+    col_rel_t *left = make_left(shape == 3 ? 0 : 2, 2),
+        *right = make_right(2, 1);
+    eval_entry_t result = {0}; wl_plan_op_t op;
+    atomic_uint_fast64_t count; atomic_init(&count, 1);
+    int (*run)(wl_col_session_t *, col_rel_t *, const wl_plan_op_t *,
+        eval_entry_t *) = shape == 1 ? run_diff_join : run_join;
+    TEST("warm materialized cache cannot bypass configured JOIN policy");
+    MAT_CHECK(s && left && right && !session_add_rel(s, right)); right = NULL;
+    init_diff_keyed_op(&op);
+    if (shape == 0 || shape == 3) init_cross_op(&op);
+    MAT_CHECK(!run(s, left, &op, &result) && result.owned
+        && materialized_batch_rows(result.rel, shape));
+    col_rel_destroy(result.rel); result = (eval_entry_t){0};
+    const col_rel_t *cached = cached_output(s, left);
+    uint64_t baseline = reserved_of(s), hits = s->mat_cache.hits;
+    uint32_t fallbacks = s->join_batch_fallback_count;
+    uint32_t runs = s->join_batch_runs[COL_JOIN_BATCH_RUN_ORDINARY];
+    s->join_batch_bytes = shape == 4 ? 1 : 64;
+    s->join_batch_strict = true; s->join_output_peak = 0;
+    s->join_output_shared_count = &count; s->join_output_shared_limit = 10;
+    int rc = run(s, left, &op, &result);
+    MAT_CHECK(rc == (shape == 2 ? 0 : ENOTSUP)
+        && s->mat_cache.hits == hits && !s->mat_cache.active_pins
+        && s->join_batch_fallback_count == fallbacks);
+    if (shape == 2) {
+        MAT_CHECK(result.owned && materialized_batch_rows(result.rel, shape)
+            && s->join_batch_runs[COL_JOIN_BATCH_RUN_ORDINARY] == runs + 1
+            && atomic_load_explicit(&count, memory_order_seq_cst) == 3);
+        col_rel_destroy(result.rel); result = (eval_entry_t){0};
+        ++runs;
+    } else MAT_CHECK(!result.rel && reserved_of(s) == baseline
+            && cached_output(s, left) == cached && !s->join_output_peak
+            && atomic_load_explicit(&count, memory_order_seq_cst) == 1);
+    s->join_batch_strict = false; s->join_output_peak = 0;
+    atomic_store_explicit(&count, 1, memory_order_seq_cst);
+    MAT_CHECK(!run(s, left, &op, &result) && result.owned
+        && materialized_batch_rows(result.rel, shape)
+        && s->mat_cache.hits == hits && !s->mat_cache.active_pins);
+    unsigned rows = shape == 3 ? 0 : shape == 0 ? 4 : 2;
+    MAT_CHECK(atomic_load_explicit(&count, memory_order_seq_cst) == 1u + rows
+        && s->join_output_peak == rows);
+    if (shape == 2) MAT_CHECK(s->join_batch_fallback_count == fallbacks
+            && s->join_batch_runs[COL_JOIN_BATCH_RUN_ORDINARY] == runs + 1);
+    else {
+        col_join_batch_eligibility_t reason = shape == 1
+            ? COL_JOIN_BATCH_EXCLUDED_MATERIALIZED : shape == 4
+            ? COL_JOIN_BATCH_EXCLUDED_ROW_TOO_LARGE :
+            COL_JOIN_BATCH_EXCLUDED_CROSS;
+        MAT_CHECK(s->join_batch_fallback_count == fallbacks + 1
+            && s->join_batch_last_reason == reason);
+    }
+    col_rel_destroy(result.rel); result = (eval_entry_t){0};
+    /* A successful miss may insert or replace an entry under existing cache
+     * policy. Authenticate the current owner for later unconfigured reuse. */
+    const col_rel_t *retained = cached_output(s, left);
+    MAT_CHECK(retained && materialized_batch_rows(retained, shape));
+    s->join_batch_bytes = 0;
+    atomic_store_explicit(&count, 1, memory_order_seq_cst);
+    runs = s->join_batch_runs[COL_JOIN_BATCH_RUN_ORDINARY];
+    MAT_CHECK(!run(s, left, &op, &result) && result.owned
+        && materialized_batch_rows(result.rel, shape)
+        && s->mat_cache.hits == hits + 1 && !s->mat_cache.active_pins
+        && cached_output(s, left) == retained
+        && s->join_batch_runs[COL_JOIN_BATCH_RUN_ORDINARY] == runs
+        && atomic_load_explicit(&count, memory_order_seq_cst) == 1u + rows);
+    PASS();
+out:
+    if (result.owned && result.rel) col_rel_destroy(result.rel);
+    if (s) s->join_output_shared_count = NULL;
+    col_rel_destroy(left); col_rel_destroy(right); destroy_session(s);
+    if (final_ref) {
+        if (reserved_for(final_ref)) FAIL(
+                "configured cache fixture leaked credit");
+        wl_columnar_memory_governor_ref_release(final_ref);
+    }
+}
+#undef MAT_CHECK
+
 static void
 test_cache_copy_governor_precedence(void)
 {
@@ -5889,6 +6001,8 @@ main(void)
     test_diff_commit_refusal_retains_complete_stack_entry();
     test_differential_cache_hit_reclaim_pin();
     test_materialized_stack_copy_contract();
+    for (unsigned shape = 0; shape < 5;
+        ++shape) test_materialized_cache_batch_policy(shape);
     for (unsigned diff = 0; diff < 2; ++diff) {
         for (uint64_t cap = 0; cap < 4; ++cap)
             test_materialized_cache_output_policy(diff != 0, false, false, cap,
