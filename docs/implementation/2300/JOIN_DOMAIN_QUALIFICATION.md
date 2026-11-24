@@ -41,6 +41,70 @@ acceptance” below records that current boundary. Earlier increment description
 and numeric test counts are historical checkpoints: their “remaining ordinary”
 phrases are superseded by the completed17-row inventory, not new residual tasks.
 
+## Materialized warm-result policy increment
+
+Two real result-cache defects are repaired in `wirelog/columnar/join.c`.
+With identical two-row input and cap2, a warm ordinary materialized JOIN
+previously succeeded while its cold equivalent returned EOVERFLOW. A warm
+internal raw-DIFF materialized result similarly bypassed strict batching,
+returning success where its cold equivalent returned ENOTSUP.
+
+The governed independent stack copy now follows the existing inclusive output
+cap, high-water and shared-counter contract. It accounts only the logical
+prefix through the first refusal, with no second charge for the cached owner.
+Disabled limits retain peak-only behavior, selected shared policy takes priority,
+saturation stays in the existing primitive, and empty output performs no
+spurious zero-row check. Copy admission still happens first under the authentic
+cache pin; current ENOSPC/ENOMEM precedes row charges. A refused completed twin
+is destroyed before stack publication. Warm/cold allocation traces are not
+claimed identical.
+
+Configured batching bypasses result-cache lookup, preserving the original
+key/type, strict/exclusion, row-fit, fallback-reason and actual producer decisions.
+It does not clear the cache or change successful miss insertion/owned fallback.
+A refusal retains its original valid cache owner; successful insertion may
+replace an owner, and later unconfigured reuse authenticates the current entry.
+Controlled literal-materialized admission and compiler selection are unchanged.
+
+The existing `memory_admission_join` executable adds33 internal cases to147,
+for180 cases total; these are not33 new Meson registrations:
+
+| Named evidence | Finite consuming contract |
+|---|---|
+| `test_materialized_cache_output_policy` (22) | Genuine ordinary/raw-DIFF seeds and independent complete tuples/schema; below/equal/above/disabled caps, nonzero shared prefix, empty-at-cap and saturation; exact cache/twin credit, policy-restored hit and real cold clear |
+| `test_materialized_cache_copy_failure` (6) | Real peer-held ENOSPC through completed return versus actual payload NULL ENOMEM; borrowed/owned LEFT disposition, mixed cap1 admission priority, pin0, exact rollback/retry, source snapshot invalidation and final governor0 |
+| `test_materialized_cache_batch_policy` (5) | Warm ordinary CROSS, raw-DIFF materialized, genuine bounded ordinary keyed, empty CROSS and too-small row budget; strict refusal, exact permissive reason, actual producer counters, shared output once and later unconfigured hit |
+| `run_excluded_diff_case` (retained) | Existing combined exclusion/strict oracles now retain the materialized cache across refusal instead of clearing away the hit |
+| `evaluation_materialized_body_*` (existing78) | Actual natural compiler K-fusion lineage and controlled preserved-body/public histories; this destination remains ordinary/materialized=false, distinct from the direct literal-cache consumers |
+
+Frozen fixtures linked to their preceding actual production revisions reproduce
+18 output-policy and5 configured-policy failures. Current Clang, GCC and
+ASan/UBSan each pass92 affected registrations; native216 replay passes all28
+previous recursive/multiworker CI failures and188 cold/cache consumers. Complete
+native non-ABI validation of the output-policy commit passes1557 with11
+conditional skips; it predates the configured lookup guard and is supporting
+pre-integration evidence. The combined runtime's complete ASan/UBSan non-ABI
+campaign passes1552 with16 conditional skips across1568 registrations. Current
+ABI checks pass26 with1 conditional skip; the unchanged-input114-check contract
+campaign supplies109 passes with5 skips after the unchanged size fixture is rerun using
+canonical TMPDIR. Production no-hook and all five CI contracts pass.
+
+The additional1693-registration attempt is not a pass: two unchanged benchmark
+Git-fixture contracts hit120-second watchdogs, followed by six deliberate
+interruptions. Calibration passes its isolated85.67s replay. The plan fixture
+still exceeds120s; its exact unchanged-main inputs complete all13 functional
+assertions with exit0 in479s. Those immutable Git/snapshot/benchmark overlay
+inputs do not consume the repaired C paths. No watchdog or assertion is relaxed;
+the remaining benchmark-fixture limitation and interruptions are retained rather
+than counted as passing. Hosted published-SHA CI is separate from these local
+results.
+
+These finite result-policy contracts do not complete materialized selector,
+empty/nullary/wide/metadata/representation/cache-equivalence products, recursive
+scheduling, RUNNING/consume/ACK/FINISH or containing Source/Native/carry and
+platform certificates. F05, #2371 and #2300 remain OPEN. Existing ordinary/cache
+local completion is unchanged.
+
 ## Historical implementation increments
 
 ## Configured no-tail INLINE policy increment
@@ -984,7 +1048,7 @@ errno and caller denial transfer. Other ordinary inventory items remain pending.
 | Full/delta/empty/append and signed future changes | COMPLETE-local J06/J08; exact source descriptor/snapshot/leases, explicit supported/legacy selectors, natural positive override provenance and independent signed/literal histories | Recursive/frontier producers and pipeline consume/ACK remain separate; no fabricated ordinary zero-row append override |
 | Persistent differential/private and primary/filtered cache | COMPLETE-local C01–C05/P03; same-count mutation, real build/reuse, two-pin defer/hide/release, genuine primary LRU and real differential free/refund/rebuild, with actual consuming JOIN results | Materialized-result cache equivalence and containing financial/platform obligations; raw primary/filtered versus controlled differential/private labels retained |
 | Ordinary representations and strict/permissive/cap policy | COMPLETE-local J07/J08/P01/P02; scalar/INLINE/shared/stamped/cold/wide/nullary actual consumers, selected-source errors, caps/duplicates and genuine negative guards | Other operators, pipeline/recursive representation intersections and containing bounds; existing SIDE/unknown/invalid protocols remain errors |
-| Materialized policy/memory and future calls | Existing78 materialized-body selections and strict/policy/lifecycle evidence remain partial for that separate domain | Remaining materialized empty/wide/metadata/selector/cache-equivalence and containing bounds |
+| Materialized policy/memory and future calls | Existing78 materialized-body selections plus the [warm-result policy increment](#materialized-warm-result-policy-increment):33 real direct-cache cap/shared/failure/configured-policy cases, current180-case memory fixture and preserved strict/fallback/producer ownership | Remaining materialized empty/nullary/wide/metadata/selector/representation and complete cache-equivalence products, containing bounds |
 | Batch/pipeline and recursive/frontier | Existing JOIN hosts and natural recursive materialized histories remain partial for those domains | Actual operator-by-representation RUNNING/FINISH, consume/ACK and recursive signed scheduling intersections |
 | Reached ordinary owner stops/retry | COMPLETE-local L01; exact disposed/retained states, reports, prepublication rollback, reset/same-facts retry and future signed changes | Remaining #2367/#2368 funding/caller/ACK and platform qualification; local governor0 does not certify full Native/Source/carry |
 | RUNNING/FINISH and containing accounting | Existing components and local interval notes | #2369 adapters, #2370 whole entry/return, Original/SOURCE identity and correlated carry certificates |
