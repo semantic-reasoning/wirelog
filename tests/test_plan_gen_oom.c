@@ -4,6 +4,7 @@
 #include "../wirelog/columnar/internal.h"
 #include "../wirelog/session_options.h"
 #include "../wirelog/session.h"
+#include "../wirelog/session_facts.h"
 #include "../wirelog/intern.h"
 #include "../wirelog/passes/fusion.h"
 #include "../wirelog/passes/jpp.h"
@@ -22,6 +23,7 @@ void *__real_malloc(size_t size);
 void *__real_calloc(size_t count, size_t size);
 void *__real_realloc(void *ptr, size_t size);
 
+static bool kf_results_null_armed;
 static long fail_at = -1;
 static long allocation_calls;
 static bool mr1_capture_session, mr1_malloc_failed;
@@ -63,6 +65,10 @@ __wrap_malloc(size_t size)
 void *
 __wrap_calloc(size_t count, size_t size)
 {
+    if (kf_results_null_armed && count == 3 && size == sizeof(col_rel_t *)) {
+        kf_results_null_armed = false;
+        return NULL;
+    }
     if (fail_at >= 0 && allocation_calls++ == fail_at)
         return NULL;
     if (rhs_fault(1, count == 34)) return NULL;
@@ -352,6 +358,60 @@ test_kfusion_target_ownership(void)
         "fallbacks, all same-program retries build/free\n", count, fallbacks);
 }
 
+static void
+test_kfusion_results_physical_null(void)
+{
+    wirelog_error_t error;
+    wirelog_program_t *program = wirelog_parse_string(
+        ".decl path(x:int64,y:int64)\n"
+        "path(1,2). path(2,3). path(3,4).\n"
+        "path(x,z):-path(x,y),path(y,w),path(w,z).\n", &error);
+    wl_plan_t *plan = NULL;
+    if (!program || wl_plan_from_program(program, &plan)) abort();
+    const wl_plan_op_t *op = NULL;
+    for (uint32_t s = 0; s < plan->stratum_count; ++s)
+        for (uint32_t r = 0; r < plan->strata[s].relation_count; ++r) {
+            const wl_plan_relation_t *rel = &plan->strata[s].relations[r];
+            for (uint32_t o = 0; o < rel->op_count; ++o)
+                if (rel->ops[o].op == WL_PLAN_OP_K_FUSION) op = &rel->ops[o];
+        }
+    wl_columnar_memory_resolution_t resolution = {
+        .budget_bytes = UINT64_C(64) << 20,
+            .usable_bytes = UINT64_C(64) << 20,
+            .mode = WL_COLUMNAR_MEMORY_MODE_ENFORCING,
+    };
+    wl_columnar_memory_governor_ref_t *ref =
+        wl_columnar_memory_governor_ref_create(&resolution);
+    wl_session_options_t options; wl_session_options_init(&options);
+    options.memory_governor = ref;
+    wl_session_t *base = NULL;
+    if (!op || !ref || wl_session_create_with_options(wl_backend_columnar(),
+        plan, 1, &options, &base) || wl_session_load_facts(base,
+        program)) abort();
+    wl_col_session_t *sess = COL_SESSION(base);
+    wl_columnar_memory_governor_t *g = wl_columnar_memory_governor_ref_get(ref);
+    uint64_t reserved = wl_columnar_memory_reserved(g);
+    uint64_t denials = wl_columnar_memory_denials(g);
+    eval_stack_t stack; eval_stack_init(&stack);
+    kf_results_null_armed = true;
+    int rc = col_op_k_fusion(op, &stack, sess);
+    if (kf_results_null_armed || rc != ENOMEM || stack.top
+        || sess->memory_budget_denied ||
+        wl_columnar_memory_reserved(g) != reserved
+        || wl_columnar_memory_denials(g) != denials) abort();
+    if (col_op_k_fusion(op, &stack, sess)) abort();
+    eval_entry_t retry = eval_stack_pop(&stack);
+    if (!retry.owned || !retry.rel || retry.rel->nrows != 1
+        || retry.rel->columns[0][0] != 1 ||
+        retry.rel->columns[1][0] != 4) abort();
+    col_rel_destroy(retry.rel); eval_stack_drain(&stack);
+    wl_session_destroy(base); wl_plan_free(plan); wirelog_program_free(program);
+    if (wl_columnar_memory_reserved(g)) abort();
+    wl_columnar_memory_governor_ref_release(ref);
+    puts(
+        "K-fusion results real calloc NULL: ENOMEM/no denial/exact refund/retry");
+}
+
 int
 main(void)
 {
@@ -429,6 +489,7 @@ main(void)
         wirelog_program_free(program);
     }
 
+    test_kfusion_results_physical_null();
     test_kfusion_target_ownership();
     test_rhs_compiler_atomicity();
     if (!test_mr1_session_arena_malloc(false) ||

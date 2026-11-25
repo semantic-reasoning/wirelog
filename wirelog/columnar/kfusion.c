@@ -80,8 +80,7 @@ col_kfusion_dispose_entry(eval_stack_t *stack, eval_entry_t *entry,
  * @relations: Array of K col_rel_t pointers (caller-owned, each sorted)
  * @k:         Number of relations to merge
  *
- * Returns: Newly allocated merged relation (caller must free).
- *          Returns NULL on allocation failure.
+ * Returns: checked current status, with an owned output only on success.
  *
  * The output relation name is "<merged-k>" and contains all rows from
  * the K input relations with duplicates removed.
@@ -98,40 +97,51 @@ col_kfusion_dispose_entry(eval_stack_t *stack, eval_entry_t *entry,
  * Precondition: each input relation is already sorted+deduped
  *   (WL_PLAN_OP_CONSOLIDATE is the last K-fusion worker op).
  */
-static col_rel_t *
-col_rel_merge_k(col_rel_t **relations, uint32_t k)
+#ifdef WL_SESSION_TEST_HOOKS
+/* Observers only: called after real child production, and before final copy
+ * with a genuinely owned pairwise prefix. No status or ownership override. */
+void (*wl_columnar_kfusion_test_merge)(wl_col_session_t *sess,
+    col_rel_t **relations, uint32_t k, const col_rel_t *prefix);
+#endif
+
+static int
+col_rel_merge_k(col_rel_t **relations, uint32_t k,
+    wl_col_session_t *sess, col_rel_t **output)
 {
+    *output = NULL;
     if (k == 0)
-        return NULL;
+        return EINVAL;
+    col_rel_t *temp = NULL;
+    col_rel_t *out = NULL;
+    int rc;
 
     /* All K relations must have the same schema */
     uint32_t nc = relations[0]->ncols;
-    uint32_t total_rows = 0;
+    bool any_rows = false;
     for (uint32_t i = 0; i < k; i++) {
         if (relations[i]->ncols != nc)
-            return NULL; /* Schema mismatch */
+            return EINVAL; /* Schema mismatch */
         if (!wl_columnar_relation_float_values_valid(relations[i]))
-            return NULL;
+            return EINVAL;
         for (uint32_t c = 0; c < nc; c++) {
             wirelog_column_type_t expected = relations[0]->column_types
                 ? relations[0]->column_types[c] : WIRELOG_TYPE_INT64;
             wirelog_column_type_t actual = relations[i]->column_types
                 ? relations[i]->column_types[c] : WIRELOG_TYPE_INT64;
             if (expected != actual)
-                return NULL;
+                return EINVAL;
         }
-        total_rows += relations[i]->nrows;
+        any_rows = any_rows || relations[i]->nrows != 0;
     }
 
-    if (total_rows == 0) {
-        /* Create empty result with correct schema */
-        return col_rel_new_like("<merged-k>", relations[0]);
+    rc = wl_columnar_relation_new_like_governed_checked_mode("<merged-k>",
+            relations[0], sess->memory_governor, false, &out);
+    if (rc != 0)
+        return rc;
+    if (!any_rows) {
+        *output = out;
+        return 0;
     }
-
-    /* Create output relation with capacity for all rows */
-    col_rel_t *out = col_rel_new_like("<merged-k>", relations[0]);
-    if (!out)
-        return NULL;
 
     /* Per-block scratch (#1000): both the staging row and the dedup key must
      * be nc wide, not COL_STACK_MAX wide.  MERGE_K_SETUP declares and
@@ -146,8 +156,8 @@ col_rel_merge_k(col_rel_t **relations, uint32_t k)
         if (!_rb || !last_row_buf) {                                             \
             col_row_buf_release(&_rowbuf);                                       \
             col_row_buf_release(&_lastbuf);                                      \
-            col_rel_destroy(out);                                                \
-            return NULL;                                                         \
+            rc = ENOMEM;                                                       \
+            goto fail;                                                         \
         }
 
 #define MERGE_K_RELEASE()                                                    \
@@ -164,10 +174,12 @@ col_rel_merge_k(col_rel_t **relations, uint32_t k)
             col_rel_row_copy_out((rel_ptr), (row_idx), _rb);                     \
             if (last_row == NULL                                                 \
                 || col_rel_row_values_cmp(relations[0], last_row, _rb) != 0) {  \
-                if (col_rel_append_row(out, _rb) != 0) {                         \
-                    MERGE_K_RELEASE();                                           \
-                    col_rel_destroy(out);                                        \
-                    return NULL;                                                 \
+                rc = col_rel_append_row(out, _rb);                              \
+                if (rc != 0) {                                                  \
+                    if (rc == ENOMEM && out->memory_budget_denial_pending)       \
+                    rc = ENOSPC;                                            \
+                    MERGE_K_RELEASE();                                          \
+                    goto fail;                                                  \
                 }                                                                \
                 col_rel_row_copy_out(out, out->nrows - 1, last_row_buf);         \
                 last_row = last_row_buf;                                         \
@@ -182,7 +194,8 @@ col_rel_merge_k(col_rel_t **relations, uint32_t k)
             MERGE_K_APPEND(src, r);
         }
         MERGE_K_RELEASE();
-        return out;
+        *output = out;
+        return 0;
     }
 
     /* K=2: Optimized 2-pointer merge using append */
@@ -196,8 +209,8 @@ col_rel_merge_k(col_rel_t **relations, uint32_t k)
             int cmp = col_rel_row_cmp2(left, li, right, ri);
             if (cmp == WL_COLUMNAR_CMP_INCOMPATIBLE) {
                 MERGE_K_RELEASE();
-                col_rel_destroy(out);
-                return NULL;
+                rc = EINVAL;
+                goto fail;
             }
 
             if (cmp < 0) {
@@ -227,25 +240,26 @@ col_rel_merge_k(col_rel_t **relations, uint32_t k)
         }
 
         MERGE_K_RELEASE();
-        return out;
+        *output = out;
+        return 0;
     }
 
     /* K >= 3: Pairwise merge fallback */
-    col_rel_t *temp = relations[0];
     for (uint32_t i = 1; i < k; i++) {
-        col_rel_t *pair[2] = { temp, relations[i] };
-        col_rel_t *merged = col_rel_merge_k(pair, 2);
-        if (!merged) {
-            col_rel_destroy(out);
-            if (i > 1)
-                col_rel_destroy(temp);
-            return NULL;
-        }
+        col_rel_t *pair[2] = { temp ? temp : relations[0], relations[i] };
+        col_rel_t *merged = NULL;
+        rc = col_rel_merge_k(pair, 2, sess, &merged);
+        if (rc != 0)
+            goto fail;
         if (i > 1)
             col_rel_destroy(temp);
         temp = merged;
     }
 
+#ifdef WL_SESSION_TEST_HOOKS
+    if (wl_columnar_kfusion_test_merge)
+        wl_columnar_kfusion_test_merge(sess, relations, k, temp);
+#endif
     /* Move final result into output using append */
     {
         MERGE_K_SETUP();
@@ -254,12 +268,18 @@ col_rel_merge_k(col_rel_t **relations, uint32_t k)
         }
         MERGE_K_RELEASE();
         col_rel_destroy(temp);
+        temp = NULL;
     }
 
 #undef MERGE_K_APPEND
 #undef MERGE_K_RELEASE
 #undef MERGE_K_SETUP
-    return out;
+    *output = out;
+    return 0;
+fail:
+    col_rel_destroy(temp);
+    col_rel_destroy(out);
+    return rc;
 }
 /**
  * Worker task context for K-fusion evaluation.
@@ -607,9 +627,13 @@ col_op_k_fusion_serial(const wl_plan_op_t *op, eval_stack_t *stack,
                 wl_columnar_memory_governor_ref_get(sess->memory_governor),
                 results_bytes, &results_reservation);
         if (admission != WL_COLUMNAR_MEMORY_ADMISSION_OK
-            && admission != WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY)
+            && admission != WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY) {
+            if (admission == WL_COLUMNAR_MEMORY_ADMISSION_DENIED)
+                sess->memory_budget_denied = true;
             return admission == WL_COLUMNAR_MEMORY_ADMISSION_OVERFLOW
-                ? EOVERFLOW : ENOMEM;
+                ? EOVERFLOW : admission == WL_COLUMNAR_MEMORY_ADMISSION_DENIED
+                ? ENOSPC : ENOMEM;
+        }
     }
 
     uint64_t _phase_t0 = now_ns();
@@ -708,7 +732,15 @@ col_op_k_fusion_serial(const wl_plan_op_t *op, eval_stack_t *stack,
             if (rc != 0)
                 goto cleanup;
         } else {
-            merged = col_rel_merge_k(results, n_results);
+#ifdef WL_SESSION_TEST_HOOKS
+            if (wl_columnar_kfusion_test_merge)
+                wl_columnar_kfusion_test_merge(sess, results, n_results, NULL);
+#endif
+            rc = col_rel_merge_k(results, n_results, sess, &merged);
+            if (rc != 0) {
+                if (rc == ENOSPC) sess->memory_budget_denied = true;
+                goto cleanup;
+            }
         }
         if (!merged) {
             rc = ENOMEM;
@@ -1332,8 +1364,12 @@ col_op_k_fusion_dispatch(const wl_plan_op_t *op, eval_stack_t *stack,
         if (n_results == 0) {
             rc = wl_columnar_kfusion_empty(op, sess, &merged);
         } else {
-            rc = 0;
-            merged = col_rel_merge_k(compact, n_results);
+#ifdef WL_SESSION_TEST_HOOKS
+            if (wl_columnar_kfusion_test_merge)
+                wl_columnar_kfusion_test_merge(sess, compact, n_results, NULL);
+#endif
+            rc = col_rel_merge_k(compact, n_results, sess, &merged);
+            if (rc == ENOSPC) sess->memory_budget_denied = true;
         }
         free((void *)compact);
         if (rc != 0)

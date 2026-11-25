@@ -1367,7 +1367,8 @@ test_k4_branch_sorted_arrangements_are_branch_owned(void)
  * hand-bound direct K2 control above. Iteration1 has genuinely absent deltas;
  * this observes an internal empty result, not a public wrong-tuple claim. */
 static bool
-wl_test_compiled_empty(const char *text, uint32_t workers, uint32_t width)
+wl_test_compiled_schema(const char *text, uint32_t workers, uint32_t width,
+    bool live)
 {
     wirelog_error_t error;
     wirelog_program_t *program = wirelog_parse_string(text, &error);
@@ -1406,28 +1407,36 @@ wl_test_compiled_empty(const char *text, uint32_t workers, uint32_t width)
     ok = ok && wl_session_load_facts(base, program) == 0;
     struct result_ctx initial = {0};
     ok = ok && wl_session_snapshot(base, count_tuples_cb, &initial) == 0
-        && initial.total == 0;
+        && initial.total == (live ? 4 : 0);
     wl_col_session_t *sess = COL_SESSION(base);
     col_rel_t *target = session_find_rel(sess, "path");
     ok = ok && target && target->ncols == width;
-    sess->current_iteration = 1;
+    sess->current_iteration = live ? 0 : 1;
     eval_stack_t stack;
     eval_stack_init(&stack);
     int rc = op ? col_op_k_fusion(op, &stack, sess) : EINVAL;
     eval_entry_t result = {0};
     if (!rc) result = eval_stack_pop(&stack);
     ok = ok && !rc && result.owned && result.rel
-        && result.rel->nrows == 0 && result.rel->ncols == width
-        && result.rel->declared_ncols == target->declared_ncols
+        && result.rel->nrows == (live ? 1u : 0u) && result.rel->ncols == width
+        && (live || result.rel->declared_ncols == target->declared_ncols)
         && result.rel->memory_governor == ref && !result.rel->timestamps;
     if (ok) for (uint32_t c = 0; c < width; ++c) {
             wirelog_column_type_t a = target->column_types
             ? target->column_types[c] : WIRELOG_TYPE_INT64;
             wirelog_column_type_t b = result.rel->column_types
             ? result.rel->column_types[c] : WIRELOG_TYPE_INT64;
-            ok = ok && a == b && !strcmp(target->col_names[c],
-                    result.rel->col_names[c]);
+            ok = ok && a == b && (live || !strcmp(target->col_names[c],
+                result.rel->col_names[c]));
         }
+    if (ok && live) for (uint32_t c = 0; c < width; ++c)
+            ok = ok &&
+                result.rel->columns[c][0] == (c == 0 ? 1 : c == 1 ? 4 : 7);
+    if (!ok && live) fprintf(stderr,
+            "wide live rc%d initial%lld target%u result%u rows%u\n",
+            rc, (long long)initial.total, target ? target->ncols : 0,
+            result.rel ? result.rel->ncols : 0,
+            result.rel ? result.rel->nrows : 0);
     if (result.owned && result.rel) col_rel_destroy(result.rel);
     eval_stack_drain(&stack);
     wl_session_destroy(base);
@@ -1443,17 +1452,18 @@ static void
 test_compiled_inactive_schema(void)
 {
     TEST("compiled materialized K3/K4 inactive scalar and wide schema");
-    ASSERT(wl_test_compiled_empty(
+    ASSERT(wl_test_compiled_schema(
             ".decl path(x:float,y:float)\n"
-            "path(x,z):-path(x,y),path(y,w),path(w,z).\n", 1, 2),
+            "path(x,z):-path(x,y),path(y,w),path(w,z).\n", 1, 2, false),
         "compiled serial FLOAT schema");
-    ASSERT(wl_test_compiled_empty(
+    ASSERT(wl_test_compiled_schema(
             ".decl path(x:int64,y:int64)\n"
-            "path(x,z):-path(x,y),path(y,w),path(w,v),path(v,z).\n", 4, 2),
+            "path(x,z):-path(x,y),path(y,w),path(w,v),path(v,z).\n", 4, 2,
+            false),
         "compiled K4 dispatch inactive INT schema");
-    ASSERT(wl_test_compiled_empty(
+    ASSERT(wl_test_compiled_schema(
             ".decl path(x:string,y:string,v:float)\n"
-            "path(x,z,v):-path(x,y,v),path(y,w,v),path(w,z,v).\n", 1, 3),
+            "path(x,z,v):-path(x,y,v),path(y,w,v),path(w,z,v).\n", 1, 3, false),
         "compiled mixed STRING/FLOAT schema");
     char text[16384];
     size_t used = 0;
@@ -1476,9 +1486,16 @@ test_compiled_inactive_schema(void)
         WL_SCHEMA_TEXT(")");
     }
     WL_SCHEMA_TEXT(".\n");
-#undef WL_SCHEMA_TEXT
-    ASSERT(wl_test_compiled_empty(text, 1, COL_STACK_MAX + 1),
+    ASSERT(wl_test_compiled_schema(text, 1, COL_STACK_MAX + 1, false),
         "compiled wide schema");
+    for (unsigned b = 1; b <= 3; ++b) {
+        WL_SCHEMA_TEXT("path(%u,%u", b, b+1);
+        for (uint32_t c = 2; c <= COL_STACK_MAX; ++c) WL_SCHEMA_TEXT(",7");
+        WL_SCHEMA_TEXT(").\n");
+    }
+#undef WL_SCHEMA_TEXT
+    ASSERT(wl_test_compiled_schema(text, 1, COL_STACK_MAX + 1, true),
+        "actual wide merge dynamic scratch and complete literal row");
     PASS();
 }
 
@@ -1589,6 +1606,302 @@ test_inactive_nullary_and_missing_target(void)
     PASS();
 }
 
+extern void (*wl_columnar_kfusion_test_merge)(wl_col_session_t *,
+    col_rel_t **, uint32_t, const col_rel_t *);
+extern void wl_columnar_relation_test_fail_next_metadata_alloc(void);
+extern void wl_columnar_relation_test_fail_next_prepare_resize(void);
+static unsigned wl_test_merge_fault;
+static unsigned wl_test_merge_reached;
+static unsigned wl_test_merge_clones;
+static uint64_t wl_test_merge_denials;
+static wl_columnar_memory_reservation_t wl_test_merge_peer;
+static bool wl_test_merge_peer_held;
+
+static void
+wl_test_merge_clone(wl_col_session_t *parent, wl_col_session_t *child,
+    bool before)
+{
+    (void)parent; (void)child;
+    if (before) ++wl_test_merge_clones;
+}
+
+/* Runs on the coordinator after actual children completed. Prefix!=NULL is
+ * the actual owned3+ pairwise fold, immediately before the final output copy. */
+static void
+wl_test_merge_observe(wl_col_session_t *sess, col_rel_t **relations,
+    uint32_t k, const col_rel_t *prefix)
+{
+    wl_columnar_memory_governor_t *g =
+        wl_columnar_memory_governor_ref_get(sess->memory_governor);
+    bool selected = prefix ? wl_test_merge_fault >= 4
+        : wl_test_merge_fault < 4;
+    if (!selected) return;
+    ++wl_test_merge_reached;
+    if (!k || !relations[0] || !relations[0]->nrows) abort();
+    if (prefix && (!prefix->nrows || prefix->memory_governor
+        != sess->memory_governor)) abort();
+    wl_test_merge_denials = wl_columnar_memory_denials(g);
+    if (wl_test_merge_fault == 2 || wl_test_merge_fault == 4) {
+        uint64_t available = atomic_load_explicit(&g->usable_bytes,
+                memory_order_seq_cst) - wl_columnar_memory_reserved(g);
+        if (available <= 1 || wl_columnar_memory_reserve_checked(g, available-1,
+            &wl_test_merge_peer) != WL_COLUMNAR_MEMORY_ADMISSION_OK) abort();
+        wl_test_merge_peer_held = true;
+    }
+    if (wl_test_merge_fault == 3)
+        wl_columnar_relation_test_fail_next_metadata_alloc();
+    if (wl_test_merge_fault == 5)
+        wl_columnar_relation_test_fail_next_prepare_resize();
+}
+
+static bool
+wl_test_merge_output(col_rel_t *rel, uint32_t workers,
+    wl_columnar_memory_governor_ref_t *ref, bool large)
+{
+    if (!rel || rel->ncols != 2 ||
+        rel->nrows != (large ? COL_REL_INIT_CAP + 2u : 1u)
+        || rel->memory_governor != ref || rel->timestamps) return false;
+    double first, second;
+    int64_t row[2];
+    col_rel_row_copy_out(rel, 0, row);
+    memcpy(&first, &row[0], sizeof(first));
+    memcpy(&second, &row[1], sizeof(second));
+    if (first != 1.5 || second != (workers > 1 ? 5.5 : 4.5)) return false;
+    for (uint32_t r = 1; large && r < rel->nrows; ++r) {
+        col_rel_row_copy_out(rel, r, row);
+        memcpy(&first, &row[0], sizeof(first));
+        memcpy(&second, &row[1], sizeof(second));
+        if (first != (double)(r + 9u) + 0.5 || second != first) return false;
+    }
+    return true;
+}
+
+static void
+test_governed_compiled_merge(void)
+{
+    TEST(
+        "actual compiled K3/K4 governed merge cause/refund/owned-prefix retry");
+    for (unsigned parallel = 0; parallel < 2; ++parallel) {
+        uint32_t workers = parallel ? 4 : 1;
+        const char *text = parallel
+            ? ".decl path(x:float,y:float)\n"
+            "path(1.5,2.5). path(2.5,3.5). path(3.5,4.5). path(4.5,5.5).\n"
+            "path(x,z):-path(x,y),path(y,w),path(w,v),path(v,z).\n"
+            : ".decl path(x:float,y:float)\n"
+            "path(1.5,2.5). path(2.5,3.5). path(3.5,4.5).\n"
+            "path(x,z):-path(x,y),path(y,w),path(w,z).\n";
+        for (unsigned fault = 0; fault <= 7; ++fault) {
+            if (parallel && (fault == 1 || fault >= 6)) continue; /* serial scratch control */
+            char large_text[16384];
+            const char *selected_text = text;
+            bool large = fault == 4 || fault == 5;
+            if (large) {
+                int used = snprintf(large_text, sizeof(large_text), "%s", text);
+                ASSERT(used > 0 && (size_t)used < sizeof(large_text),
+                    "prefix text");
+                for (unsigned r = 10; r <= 10 + COL_REL_INIT_CAP; ++r) {
+                    int n = snprintf(large_text + used,
+                            sizeof(large_text) - (size_t)used,
+                            "path(%u.5,%u.5).\n", r, r);
+                    ASSERT(n > 0 &&
+                        (size_t)n < sizeof(large_text) - (size_t)used,
+                        "prefix facts text");
+                    used += n;
+                }
+                selected_text = large_text;
+            }
+            wirelog_error_t error;
+            wirelog_program_t *program = wirelog_parse_string(selected_text,
+                    &error);
+            wl_plan_t *plan = NULL;
+            ASSERT(program && !wl_plan_from_program(program, &plan),
+                "merge plan");
+            const wl_plan_op_t *op = NULL;
+            for (uint32_t s = 0; s < plan->stratum_count; ++s)
+                for (uint32_t r = 0; r < plan->strata[s].relation_count; ++r) {
+                    const wl_plan_relation_t *rel =
+                        &plan->strata[s].relations[r];
+                    for (uint32_t o = 0; o < rel->op_count; ++o)
+                        if (rel->ops[o].op ==
+                            WL_PLAN_OP_K_FUSION) op = &rel->ops[o];
+                }
+            ASSERT(op && op->relation_name, "actual compiled target");
+            wl_columnar_memory_resolution_t resolution = {
+                .budget_bytes = UINT64_C(64) << 20,
+                    .usable_bytes = UINT64_C(64) << 20,
+                    .mode = WL_COLUMNAR_MEMORY_MODE_ENFORCING,
+            };
+            wl_columnar_memory_governor_ref_t *ref =
+                wl_columnar_memory_governor_ref_create(&resolution);
+            wl_session_options_t options;
+            wl_session_options_init(&options); options.memory_governor = ref;
+            wl_session_t *base = NULL;
+            ASSERT(ref && !wl_session_create_with_options(wl_backend_columnar(),
+                plan, workers, &options, &base), "governed merge session");
+            ASSERT(!wl_session_load_facts(base, program), "merge facts");
+            struct result_ctx initial = {0};
+            ASSERT(!wl_session_snapshot(base, count_tuples_cb, &initial),
+                "merge snapshot");
+            wl_col_session_t *sess = COL_SESSION(base);
+            wl_columnar_memory_governor_t *g =
+                wl_columnar_memory_governor_ref_get(ref);
+            /* The admitted direct consumer can select one/two original
+             * compiler-produced branches; this is not a natural K1 rewrite. */
+            wl_plan_op_t selected_op = *op;
+            wl_plan_op_k_fusion_t selected_meta =
+                *(wl_plan_op_k_fusion_t *)op->opaque_data;
+            if (fault >= 6) {
+                selected_meta.k = fault == 6 ? 1 : 2;
+                selected_op.opaque_data = &selected_meta;
+            }
+            op = &selected_op;
+            wl_test_merge_fault = fault >= 6 ? 0 : fault;
+            wl_test_merge_reached = 0;
+            wl_test_merge_clones = 0; wl_test_merge_peer_held = false;
+            wl_columnar_memory_reservation_init(&wl_test_merge_peer);
+            if (fault == 1) {
+                uint64_t available = atomic_load_explicit(&g->usable_bytes,
+                        memory_order_seq_cst) - wl_columnar_memory_reserved(g);
+                ASSERT(available > 1 && wl_columnar_memory_reserve_checked(g,
+                    available-1,
+                    &wl_test_merge_peer) == WL_COLUMNAR_MEMORY_ADMISSION_OK,
+                    "actual serial scratch pressure");
+                wl_test_merge_peer_held = true;
+                wl_test_merge_denials = wl_columnar_memory_denials(g);
+            }
+            sess->current_iteration = 0; sess->memory_budget_denied = false;
+            wl_columnar_kfusion_test_clone = wl_test_merge_clone;
+            wl_columnar_kfusion_test_merge = wl_test_merge_observe;
+            eval_stack_t stack; eval_stack_init(&stack);
+            int rc = col_op_k_fusion(op, &stack, sess);
+            wl_columnar_kfusion_test_clone = NULL;
+            wl_columnar_kfusion_test_merge = NULL;
+            int expected = (fault == 0 || fault >= 6) ? 0 : fault == 3 ||
+                fault == 5 ? ENOMEM : ENOSPC;
+            if (rc != expected) fprintf(stderr,
+                    "merge W%u fault%u rc%d expected%d\n",
+                    workers, fault, rc, expected);
+            ASSERT(rc == expected, "exact current merge cause");
+            ASSERT(fault == 1 ? wl_test_merge_reached ==
+                0 : wl_test_merge_reached == 1,
+                "genuine selected merge boundary");
+            ASSERT(!parallel || wl_test_merge_clones == 4,
+                "real parallel cohort");
+            ASSERT(sess->memory_budget_denied == (expected == ENOSPC),
+                "current denial flag");
+            ASSERT(wl_columnar_memory_denials(g) - wl_test_merge_denials
+                == (expected == ENOSPC ? 1u : 0u),
+                "selected-stage denial delta");
+
+            if (!rc) {
+                eval_entry_t result = eval_stack_pop(&stack);
+                ASSERT(result.owned && wl_test_merge_output(result.rel, workers,
+                    ref, large),
+                    "complete literal FLOAT result and governor identity");
+                uint64_t bytes = result.rel->descriptor_reserved_bytes
+                    + result.rel->metadata_reserved_bytes +
+                    result.rel->retained_reserved_bytes;
+                uint64_t before = wl_columnar_memory_reserved(g);
+                ASSERT(bytes > 0, "positive retained output credit");
+                col_rel_destroy(result.rel);
+                ASSERT(before - wl_columnar_memory_reserved(g) == bytes,
+                    "exact output refund");
+            } else ASSERT(stack.top == 0, "no published failed output");
+            if (wl_test_merge_peer_held) {
+                ASSERT(atomic_load_explicit(&wl_test_merge_peer.state,
+                    memory_order_seq_cst)
+                    == WL_COLUMNAR_MEMORY_RESERVATION_RESERVED,
+                    "peer stays RESERVED through cleanup");
+                ASSERT(wl_columnar_memory_rollback(&wl_test_merge_peer),
+                    "peer refund");
+            }
+            /* Same session/compiled op, unchanged real inputs, capacity restored. */
+            sess->memory_budget_denied = false; sess->current_iteration = 0;
+            ASSERT(!col_op_k_fusion(op, &stack, sess),
+                "same-session merge retry");
+            eval_entry_t retry = eval_stack_pop(&stack);
+            ASSERT(retry.owned && wl_test_merge_output(retry.rel, workers, ref,
+                large), "retry literals");
+            col_rel_destroy(retry.rel); eval_stack_drain(&stack);
+            ASSERT(!sess->kfusion_pending_cohort, "cohort retired");
+            wl_session_destroy(base); wl_plan_free(plan);
+            wirelog_program_free(program);
+            ASSERT(!wl_columnar_memory_reserved(g),
+                "all owned prefixes and inputs refunded");
+            printf("\n    merge W=%u selected=%u fault=%u rc=%d clones=%u "
+                "boundary=%u final_reserved=0 ", workers,
+                selected_meta.k, fault, expected, wl_test_merge_clones,
+                wl_test_merge_reached);
+            wl_columnar_memory_governor_ref_release(ref);
+        }
+    }
+    PASS();
+}
+
+static void
+test_direct_merge_type_mismatch(void)
+{
+    TEST("admitted direct K consumer preserves real schema mismatch EINVAL");
+    wirelog_error_t error;
+    wirelog_program_t *program = wirelog_parse_string(
+        ".decl a(x:int64)\n.decl b(x:float)\n.decl out(x:int64)\n"
+        "a(1). b(1.5). out(x):-a(x).\n", &error);
+    wl_plan_t *plan = NULL;
+    ASSERT(program && !wl_plan_from_program(program, &plan), "negative plan");
+    wl_columnar_memory_resolution_t resolution = {
+        .budget_bytes = UINT64_C(64) << 20,
+            .usable_bytes = UINT64_C(64) << 20,
+            .mode = WL_COLUMNAR_MEMORY_MODE_ENFORCING,
+    };
+    wl_columnar_memory_governor_ref_t *ref =
+        wl_columnar_memory_governor_ref_create(&resolution);
+    wl_session_options_t options; wl_session_options_init(&options);
+    options.memory_governor = ref;
+    wl_session_t *base = NULL;
+    ASSERT(ref && !wl_session_create_with_options(wl_backend_columnar(), plan,
+        1, &options, &base), "negative session");
+    ASSERT(!wl_session_load_facts(base, program), "negative facts");
+    struct result_ctx image = {0};
+    ASSERT(!wl_session_snapshot(base, count_tuples_cb, &image),
+        "negative seed");
+    wl_col_session_t *sess = COL_SESSION(base);
+    col_rel_t *a = session_find_rel(sess, "a"),
+        *b = session_find_rel(sess, "b");
+    ASSERT(a && b && a->nrows == 1 && b->nrows == 1, "genuine typed inputs");
+    wl_plan_op_t left[] = {{.op = WL_PLAN_OP_VARIABLE,
+                            .relation_name = "a",
+                            .delta_mode = WL_DELTA_FORCE_FULL},
+                           {.op = WL_PLAN_OP_CONSOLIDATE}};
+    wl_plan_op_t right[] = {{.op = WL_PLAN_OP_VARIABLE,
+                             .relation_name = "b",
+                             .delta_mode = WL_DELTA_FORCE_FULL},
+                            {.op = WL_PLAN_OP_CONSOLIDATE}};
+    wl_plan_op_t *branches[] = {left, right}; uint32_t counts[] = {2, 2};
+    wl_plan_op_k_fusion_t meta = {.k = 2, .k_ops = branches,
+                                  .k_op_counts = counts};
+    wl_plan_op_t op = {.op = WL_PLAN_OP_K_FUSION,
+                       .relation_name = "out", .opaque_data = &meta};
+    eval_stack_t stack; eval_stack_init(&stack);
+    sess->current_iteration = 0; sess->memory_budget_denied = false;
+    uint64_t denials =
+        wl_columnar_memory_denials(wl_columnar_memory_governor_ref_get(ref));
+    ASSERT(col_op_k_fusion(&op, &stack, sess) == EINVAL && stack.top == 0,
+        "actual checked type mismatch rather than ENOMEM");
+    ASSERT(!sess->memory_budget_denied && denials == wl_columnar_memory_denials(
+            wl_columnar_memory_governor_ref_get(ref)),
+        "no spurious budget denial");
+    ASSERT(session_find_rel(sess, "a") == a && session_find_rel(sess, "b") == b
+        && a->nrows == 1 && b->nrows == 1,
+        "borrowed input identities preserved");
+    eval_stack_drain(&stack); wl_session_destroy(base); wl_plan_free(plan);
+    wirelog_program_free(program);
+    ASSERT(!wl_columnar_memory_reserved(wl_columnar_memory_governor_ref_get(
+            ref)),
+        "negative owners fully retired");
+    wl_columnar_memory_governor_ref_release(ref);
+    PASS();
+}
+
 /* ================================================================
  * main
  * ================================================================ */
@@ -1598,6 +1911,8 @@ main(void)
 {
     printf("\n=== K-Fusion End-to-End Integration Tests ===\n\n");
 
+    test_governed_compiled_merge();
+    test_direct_merge_type_mismatch();
     test_inactive_nullary_and_missing_target();
     test_compiled_inactive_schema();
     test_compiled_empty_refill_history();
