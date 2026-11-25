@@ -8383,3 +8383,13 @@ foreach heads : [1, 2]
       suite: ['unit', 'tsan', 'evaluation_recursive_string_cleared'], timeout: 120)
   endforeach
 endforeach
+
+# Frame-absent retained receipt custody, using every discovered endpoint.
+foreach heads : [1, 2]
+  foreach observed : [0, 1]
+    test('evaluation_recursive_string_receipt_@0@_@1@'.format(heads, observed),
+      evaluation_recursive_string_exe,
+      args: ['receipt', heads.to_string(), observed.to_string()],
+      suite: ['unit', 'tsan', 'evaluation_recursive_string_receipt'], timeout: 120)
+  endforeach
+endforeach
