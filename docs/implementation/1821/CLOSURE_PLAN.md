@@ -724,3 +724,16 @@ controlled single-worker sessions (#2301)". A cold right input read by a later
 JOIN, a self-JOIN, two cold inputs of one rule, an aggregate after a later
 JOIN, a SNAPSHOT or an observed STEP over a cold input, the program refusals of
 the sixth bundle and more than one worker stay open.
+
+A fifteenth bundle admits, under control, a cold right input of a JOIN after
+the rule's first, with no aggregate, under the uncontrolled route's audits and
+the uncontrolled cold JOIN suffix audit, which compares the later JOIN's key
+types that the one-key prefix audit does not. The registry bound refuses a
+third input before that JOIN, and every admitted test case joins the resident
+input with itself first. No new operator runs the rule: the cold scan copies
+the right input whole when the rule reaches that JOIN, and the slot records the
+JOIN it was scanned for; see "Cold right inputs of a later JOIN in controlled
+single-worker sessions (#2301)". A third input before such a JOIN, a self-JOIN
+of the cold input, two cold inputs of one rule, an aggregate after a later
+JOIN, a SNAPSHOT or an observed STEP over a cold input, the program refusals of
+the sixth bundle and more than one worker stay open.
