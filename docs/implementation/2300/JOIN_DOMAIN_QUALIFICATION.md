@@ -1240,3 +1240,113 @@ failed CI registrations are part of the expanded shared regression validation.
 The precise canonical producer ENOSPC/ENOMEM/overflow/protocol contracts are
 unchanged. No budget increase or errno fallback repairs this defect, and these
 regressions do not certify the whole recursive/accounting containing domain.
+
+## K-fusion empty-schema and governed merge increment
+
+This bundle extends the compiler-selected materialized K-fusion producer from
+merged #2418. It repairs two runtime boundaries, with their regressions in the
+real `k_fusion_e2e` consumer rather than the mock merge test. It does not enable
+controlled literal-materialized execution or close #2371/#2300.
+
+Before the first repair, actual compiler-created K3/W1 and K4/W4 operators had
+no target binding. Invoking those compiled operators in an admitted inactive
+iteration with genuinely absent forced deltas returned an owned width0 result
+for a real two-column FLOAT target. These are internal compiled-operator schema
+witnesses, not a claim of a public wrong tuple. The compiler now owns a duplicate
+of the target name before publishing the optional rewrite. Failed allocation
+unwinds the unpublished replacement and retains the valid old plan; a real
+170-allocation sweep observes55 safe optional fallbacks and successful
+same-program rebuild/free.
+
+All three inactive-output sites share a checked constructor. Existing targets
+copy physical/declared width, names, types and accepted schema metadata through
+the established new-like contract, explicitly without timestamps. Missing or
+unnamed direct targets retain their width0 contract with both managed and
+unmanaged allocation. Six direct controls distinguish these alternatives and a
+true timestamped nullary target. Actual compiled FLOAT, STRING/FLOAT, INT64 and
+33-column inactive schemas compare exact target metadata. The target binding
+also feeds the existing adaptive size-class lookup; it does not change that
+algorithm or imply every multiworker call dispatches workers.
+
+Before the second repair, a real live K3 merge still succeeded outside the parent
+governor when a genuine peer reservation left only one byte at its constructor
+boundary. The peer stayed RESERVED through the completed producer cleanup.
+Serial results-array denial also returned ENOMEM without a current denial flag,
+and an admitted direct mixed-type consumer flattened EINVAL to ENOMEM.
+
+The merge now returns checked status plus an output pointer. Final and pairwise
+owned results use the actual parent governor before allocation. Typed ordering,
+left-fold deduplication, branch schema and historical no-timestamp behavior are
+preserved; live output aliases are those of the generated branch, while inactive
+output copies its target schema. A boolean detects any rows without summing
+uint32 input counts just to test emptiness. Current constructor/append causes
+survive cleanup; serial scratch DENIED returns ENOSPC with the current flag,
+physical NULL remains ENOMEM, and invalid schema remains EINVAL. Failure retires
+both the final output and any owned pairwise prefix, without retiring borrowed
+inputs or charging merged tuples again as new JOIN rows.
+
+The finite consuming evidence is:
+
+- Actual natural K3 and K4 plans, real W4 clone count4, complete literal FLOAT
+  results and exactly refunded positive descriptor/metadata/payload credit.
+- Admitted direct selection of one/two original compiled branches, separately
+  labelled from natural K3/K4 selection, plus a real33-column live merge reaching
+  dynamic row scratch and a complete independent integer row oracle.
+- Genuine serial scratch pressure; after-child constructor admission pressure
+  and metadata-allocation failure injection; and after-owned-prefix resize refusal/failure.
+  The prefix case adds65 genuine self-loop facts to the chain, producing66 rows
+  and reaching resize beyond the unchanged64-row initial output capacity.
+- Thirteen consuming configurations distinguish ENOSPC from ENOMEM at the
+  selected boundary, prove no failed output, keep peer credit RESERVED through
+  cleanup, retry the same session/compiled op/input and end with zero credit.
+  A GNU linker-wrapper companion reaches the real serial results calloc NULL
+  and verifies unchanged denial count, exact scratch refund and literal retry.
+- A real internal mixed-type branch consumer verifies EINVAL and unchanged
+  borrowed inputs; it is not a claim that a naturally generated invalid program
+  is supported. Existing primed parent registry/worker token isolation remains
+  asserted by the actual threaded/inline ownership fixtures.
+- A natural raw public empty/insert/repeat/remove/refill history matches complete
+  independent images. Existing78 natural controlled preserved-body selections
+  and33 direct ordinary/raw-DIFF cache-policy cases remain distinct and intact.
+
+The original successful parallel before probe's global denial count included a
+failed optional worker delta-pool allocation, not a selected merge failure. A
+forward-only reserve wrapper localized the actual call. New cause assertions
+sample at the after-child merge boundary, excluding earlier optional attempts;
+no stale global denial counter selects the result status.
+
+Validation on the integrated runtime is recorded below. All test names are
+matched to current registration manifests, with distinct log bases; optional
+skips are reported separately. The standalone production library excludes test
+hooks. Hosted MSVC/ARM/macOS/TSan results are outstanding until those jobs run.
+
+- Clang, GCC and ASan/UBSan focused selections:84/84 each.
+- Complete native non-ABI campaign:1558 pass,10 conditional skips,0 fail
+  (1568 exact unique registrations).
+- Complete ASan/UBSan non-ABI campaign:1552 pass,16 conditional skips,0 fail
+  (the same1568 registrations); address and undefined instrumentation active,
+  LTO disabled, and the existing b_lundef=false link configuration retained.
+- All28 prior recursive/multiworker regressions and all78 natural materialized
+  registrations are actually OK in both complete campaigns.
+- Relevant ABI/public-header/export/no-hook and five CI contracts:11 pass,
+ 1 optional testhook-provenance skip. That skip is not a provenance pass.
+- D1 additionally passed216 explicit native regression consumers and10 actual
+  acceptance/constructor selections before D2; they are historical unit evidence,
+  not substitutes for the integrated campaigns.
+
+The complete campaigns precede the final rebase onto main98bf8761, whose only
+change is three dependencies inside the disabled fuzz build. Rebase verification
+matches all runtime/test source hashes,426 native and426 sanitizer target hashes,
+18 focused GCC target hashes and all build options. All three84-test focused
+selections pass again. Enabled test commands/names/timeouts/environments remain
+equivalent; Meson only reordered independent shared-library directories (with
+proven disjoint library basenames) and an unordered build dependency list. The
+complete results are retained as evidence for those identical binaries, not
+mislabelled as newly executed full campaigns after the rebase.
+
+This qualifies only finite scalar/empty/wide schema and retained merge-result
+admission/error/cleanup boundaries. Dynamic row scratch and every dispatch array
+are not newly covered by a complete financial certificate. Remaining materialized
+predicate/selector/representation/cache-equivalence and signed recursive/pipeline
+products, lifecycle intersections, full Source/Native/carry accounting and hosted
+platform qualification remain OPEN. O04/F05/F05a and #2371/#2300 do not close here.
