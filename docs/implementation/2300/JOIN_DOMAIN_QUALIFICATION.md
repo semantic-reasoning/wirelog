@@ -1350,3 +1350,108 @@ are not newly covered by a complete financial certificate. Remaining materialize
 predicate/selector/representation/cache-equivalence and signed recursive/pipeline
 products, lifecycle intersections, full Source/Native/carry accounting and hosted
 platform qualification remain OPEN. O04/F05/F05a and #2371/#2300 do not close here.
+
+## Exact long-name insertion-delta selectors
+
+The compiler creates the complete `$d$` plus relation identifier. The former
+256-byte raw consumer buffers and explicit byte255 paid terminators instead
+selected a truncated key once the source identifier exceeded252 bytes. This
+was a correctness defect: a genuine delta could disappear from branch liveness
+and source selection, or a shorter prefix relation could be consumed.
+
+Before the repair, a natural raw K3/W1 chain with a300-byte IDB name returned
+six of12 independently expected pairs; K4/W4 returned12 of30. Both reported
+success. Short and252-byte K3 names returned12/12, while253 bytes reproduced
+the missing-six result. Controlled natural K3 Snapshot already returned12/12;
+it remains a healthy control, not evidence of a controlled natural failure.
+After the repair, all natural K3 boundaries return12/12 initially and long K4
+returns30/30, followed by complete independent append/remove/repeat images.
+The K4 history observes48 genuine worker clones; K3 takes its actual serial route.
+Separate admitted direct/framed numeric VARIABLE, composed VARIABLE and JOIN
+consumers missed a genuine303-byte delta name and incorrectly consumed a
+255-byte prefix decoy. Those registries are explicitly constructed consumers,
+not natural public append overrides.
+
+Raw VARIABLE, shared ordinary/raw-DIFF JOIN selection and eval-plan liveness
+now use exact virtual prefix+name lookup. It hashes the same unsigned bytes as
+canonical registry lookup and retains existing lazy hash and linear fallback
+semantics. No concatenated scratch key is allocated; optional lazy hash building
+still uses its existing governed allocation contract. Paid numeric, composed
+and JOIN lookups consume the full immutable name through their existing charged
+byte actions. No tariff, quantum, cursor layout, eligibility mode, public API,
+cache key or source ownership protocol changes.
+
+The finite registrations are:
+
+- `evaluation_materialized_selectors_hash`: true long key versus prefix decoy,
+  suffix sibling, short candidate, holes, unsigned UTF-8, insertion/retraction
+  distinction, lazy/built hash, actual built-miss linear fallback and genuine
+  governor-denied optional build with exact linear success and final zero credit.
+  The post-build hole-fill case is a direct registry control.
+- `evaluation_materialized_selectors_natural`: actual compiled K3/K4 and
+  materialized hints, short/252/253/300 boundaries, independent complete chain
+  images through initial/append/repeat/plain full-rebuild remove/repeat, natural
+  controlled K3 Snapshot and actual positive K4 worker-clone observations.
+- `evaluation_materialized_selectors_cache`: raw VARIABLE and actual ordinary
+  and raw-DIFF materialized JOIN source switches, independently specified
+  four-column output, delta flags, actual same-source cache hits and cross-source
+  misses, AUTO/left-delta/full/absent/empty and read-only retraction controls,
+  branch liveness, pin/governor cleanup. This is direct materialized execution,
+  not a new controlled materialized-cache route.
+- `evaluation_join`: admitted paid JOIN lengths252/253/300, full/empty/prefix-only
+  alternatives, exact descriptor/snapshot/delta flags and both reader leases.
+  Its real charged lookup checkpoint reaches byte257 before CANCEL or calibrated
+  finite WORK refusal; ACK/cleanup/report, reset and raised-limit same-input retry,
+  genuine future delta append and repeat retain complete literal outputs.
+- `evaluation_numeric_plan`: the existing251/252/253/511 source test now registers
+  full delta keys and distinct prefix decoys, retains actual raw parity and adds
+  independent complete row checks. Both real numeric-source and composed hosts
+  consume compiler-produced FILTER/MAP fragments with explicitly selected admitted
+  FORCE_DELTA. Exact descriptor/generations/leases, positive selection, empty and
+  prefix-only negatives, actual delta cursor257 CANCEL/WORK, real report/reset,
+  same-fact retry and future mutation/repeat are checked independently.
+
+The late stop checks observe real paid work; they do not move a cursor or assign
+an accounting counter to force eligibility. JOIN uses its existing observational
+checkpoint and local charged loop, while numeric/composed consumers retain their
+persisted source cursor. A control stop is reported in stop_reason/result with
+zero execution_status and cleanup_status under the existing report contract.
+The direct stopped frames retain no installed output; original registry snapshots
+and the JOIN borrowed-left stack remain unchanged before reset. This is not a
+claim about unobserved public callbacks or all WORK parent-retention products.
+
+Existing78 natural controlled preserved-body selections,33 direct cache-policy
+cases and merged scalar/empty/wide governed-merge evidence remain separate.
+They are not counted as newly added long-name products.
+
+Validation on the integrated runtime:
+
+- Clang, GCC and ASan/UBSan focused selections:93/93 each.
+- Explicit native broader regression replay:229/229, including all28 prior
+  recursive/multiworker CI regressions.
+- Complete native non-ABI campaign:1573 pass,10 conditional skips,0 fail;
+  complete ASan/UBSan campaign:1567 pass,16 conditional skips,0 fail. Both
+  select the same1583 exact unique registrations. Native skips are conditional
+  tidy/SBOM/performance checks and the optional full-fixture
+  `crdt_correctness_full` correctness gate; sanitizer additionally skips six
+  rotate-latency configurations. Skips are not passes or waived failures.
+- All28 prior regressions and all78 materialized-body registrations are actually
+  OK in both complete campaigns.
+- Relevant ABI/public-header/export/no-hook and five CI contract checks:
+  11 pass,1 optional testhook-provenance skip. Actual standalone no-hook passes.
+- Address and undefined instrumentation is verified in actual changed-source
+  compile commands; LTO is disabled. Hosted MSVC/macOS/ARM/TSan remains pending.
+
+The final ledger is documentation only. Runtime evidence is reused after exact
+comparison of1151 non-document tracked source hashes,427 native/427 sanitizer/
+22 focused GCC target hashes, build options and effective test registrations,
+commands and environments. These are identical executable results, not claimed
+new full executions after a documentation edit.
+
+The checked long-name observed-retraction producer still returns EOVERFLOW;
+read-only `$r$` consumers above do not remove that separate producer limit.
+The natural remove history uses a short EDB and supported plain full rebuild.
+Remaining materialized predicate/type/representation/cache-equivalence products,
+signed recursive/frontier/pipeline and lifecycle intersections, complete
+Source/Native/carry accounting and hosted-platform qualification remain OPEN.
+This finite selector repair does not close F05/F05a, #2371 or #2300.

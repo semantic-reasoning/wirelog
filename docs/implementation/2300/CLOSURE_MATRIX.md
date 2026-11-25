@@ -373,3 +373,31 @@ failed CI registrations are part of the expanded shared regression validation.
 The precise canonical producer ENOSPC/ENOMEM/overflow/protocol contracts are
 unchanged. No budget increase or errno fallback repairs this defect, and these
 regressions do not certify the whole recursive/accounting containing domain.
+
+
+## Exact long-name delta selection subset
+
+The compiler's full insertion-delta key and raw/paid consuming keys now agree
+for accepted identifiers beyond252 bytes. Raw VARIABLE, ordinary/raw-DIFF JOIN,
+branch liveness and paid numeric/composed/JOIN consume the complete name rather
+than a255-byte prefix alias. The [long-name selector qualification](JOIN_DOMAIN_QUALIFICATION.md#exact-long-name-insertion-delta-selectors)
+records actual natural K3/K4 missing-result before witnesses and complete
+initial/append/remove/repeat after images, direct materialized cache source
+identity/hits/misses, actual reader leases and beyond255 CANCEL/WORK with real
+report/reset/same-input retry/future mutation. The existing251/252/253/511 raw
+parity oracle remains and now uses full true keys plus independent literals and
+negative prefix decoys. No controlled materialized-cache destination is invented.
+
+The full native and ASan/UBSan1583-registration campaigns retain all28 prior
+recursive/multiworker regressions and78 natural materialized-body registrations.
+Conditional skips and unavailable hosted platforms remain explicitly distinct
+from passes. Exact executable/source/options/command equality supports reusing
+these campaigns for the final documentation-only ledger.
+
+This is a finite F05/F05a selector correctness repair, not closure of those rows,
+#2371 or #2300. Long-name observed-retraction producer EOVERFLOW, remaining
+predicate/type/representation/cache-equivalence and signed recursive/pipeline/
+lifecycle products, full Source/Native/carry accounting and hosted-platform
+qualification remain OPEN. The natural remove uses supported plain full rebuild
+and short EDB input; long read-only retraction controls do not certify the separate
+producer or staging limit.
