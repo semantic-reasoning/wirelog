@@ -2201,25 +2201,36 @@ test_source_long_names(void)
 {
     const unsigned lengths[] = {251, 252, 253, 511};
     for (unsigned n = 0; n < 4; ++n) {
-        char name[513], other[513], delta_name[256];
+        char name[513], other[513], delta_name[516];
         memset(name, 'a', lengths[n]); name[lengths[n]] = '\0';
         memcpy(other, name, lengths[n] + 1); other[lengths[n] - 1] = 'b';
-        snprintf(delta_name, sizeof(delta_name), "$d$%.252s", name);
+        snprintf(delta_name, sizeof(delta_name), "$d$%s", name);
         fixture_t f; source_fixture(&f, 1, 7, 0);
         CHECK(!wl_columnar_relation_rename_checked(f.input, name));
         col_rel_t *miss = source_new(1, 7), *delta = source_new(1, 3);
         CHECK(!wl_columnar_relation_rename_checked(miss, other));
         CHECK(!wl_columnar_relation_rename_checked(delta, delta_name));
-        col_rel_t *registry[] = {miss, NULL, f.input, delta};
+        col_rel_t *decoy = source_new(1, 0);
+        char prefix[256]; memcpy(prefix, delta_name, 255); prefix[255] = '\0';
+        CHECK(!wl_columnar_relation_rename_checked(decoy, prefix));
+        const int64_t decoy_row[] = {777};
+        CHECK(!col_rel_append_row(decoy, decoy_row));
+        col_rel_t *registry[] = {miss, NULL, f.input,
+                                 lengths[n] > 252 ? decoy : NULL, delta};
         wl_plan_op_t ops[] = {{.op = WL_PLAN_OP_VARIABLE,
                                .relation_name = name},
                               {.op = WL_PLAN_OP_MAP, .project_count = 1}};
         wl_plan_relation_t rp = {.ops = ops, .op_count = 2};
-        source_begin(&f, &rp, registry, 4); run(&f);
+        source_begin(&f, &rp, registry, 5); run(&f);
         CHECK(!f.record.semantic_result && f.record.source_full == f.input
             && f.record.source_selected == delta);
+        eval_stack_t *stack = wl_columnar_eval_stack_cleanup_stack(f.frame);
+        CHECK(stack && stack->top == 1 && stack->items[0].rel->nrows == 3
+            && stack->items[0].rel->ncols == 1);
+        for (unsigned i = 0; i < 3; ++i)
+            CHECK(stack->items[0].rel->columns[0][i] == (int64_t)i);
         source_raw_parity(&f, &rp); fixture_close(&f);
-        col_rel_destroy(miss); col_rel_destroy(delta);
+        col_rel_destroy(miss); col_rel_destroy(delta); col_rel_destroy(decoy);
     }
 }
 
@@ -17172,9 +17183,192 @@ test_operator_finish_typed_targets(void)
         }
 }
 
+/* Compiled FILTER/MAP consumers with an explicitly selected, admitted framed
+ * FORCE_DELTA source. These registries are not natural append overrides. */
+static void
+long_source_action(fixture_t *f, bool composed)
+{
+    if (composed) composed_action(f);
+    else {
+        engine_dispatch(f); ++f->witnesses;
+    }
+}
+
+static void
+long_source_run(fixture_t *f, bool composed, col_rel_t *selected,
+    bool cancel, uint64_t *late_spent, unsigned *late, unsigned *held)
+{
+    wl_columnar_eval_plan_numeric_phase_t done = composed
+        ? WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_DONE
+        : WL_COLUMNAR_EVAL_PLAN_NUMERIC_DONE;
+    wl_columnar_eval_plan_numeric_phase_t lookup = composed
+        ? WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_SOURCE_DELTA
+        : WL_COLUMNAR_EVAL_PLAN_NUMERIC_SOURCE_DELTA;
+    for (unsigned turn = 0; f->record.phase != done; ++turn) {
+        CHECK(turn < 100000);
+        if (f->record.phase == lookup && f->record.source_slot == 1
+            && f->record.source_byte == 257) {
+            ++*late;
+            CHECK(!wl_evaluation_control_test_active_consumed(f->operation,
+                f->operation_id, late_spent));
+            if (cancel) wl_evaluation_control_request_cancel(f->operation);
+        }
+        if (f->record.source_initialized
+            && f->record.source.phase ==
+            WL_COLUMNAR_RELATION_SCALAR_SOURCE_HELD) {
+            const wl_columnar_relation_scalar_source_t *s = &f->record.source;
+            const col_rel_t *expected = selected ? selected : f->input;
+            CHECK(f->record.source_selected == expected
+                && f->record.source_is_delta &&
+                f->record.source_empty == !selected
+                && s->descriptor == expected && s->owner == expected
+                && s->descriptor_identity == expected->relation_identity
+                && s->descriptor_view_generation == expected->view_generation
+                && s->descriptor_storage_generation ==
+                expected->storage_generation
+                && s->descriptor_reader.owner == &expected->descriptor_access
+                && s->owner_reader.owner ==
+                &expected->storage_owner->source_access
+                && s->nrows == expected->nrows && s->columns ==
+                (const int64_t *const *)expected->columns);
+            ++*held;
+        }
+        long_source_action(f, composed);
+    }
+}
+
+static void
+long_source_literal(fixture_t *f, unsigned rows)
+{
+    eval_stack_t *stack = wl_columnar_eval_stack_cleanup_stack(f->frame);
+    CHECK(!f->record.semantic_result && stack && stack->top == 1);
+    const col_rel_t *r = stack->items[0].rel;
+    CHECK(r && r->ncols == 1 && r->nrows == rows);
+    for (uint32_t i = 0; i < rows; ++i) CHECK(r->columns[0][i] == 37 + i);
+}
+
+static void
+long_source_retry(fixture_t *f, bool composed)
+{
+    int cause = f->record.semantic_result;
+    if (composed) CHECK(!composed_host_turn(f, true));
+    else CHECK(!wl_columnar_eval_plan_numeric_attempt_ack(&f->record,
+            f->funding, f->funding_id));
+    CHECK(!wl_columnar_eval_stack_cleanup_finish(&f->frame));
+    CHECK(wl_evaluation_control_finish(f->operation, &f->operation_owner,
+        cause, 0) == cause);
+    wl_evaluation_control_report_t report;
+    CHECK(!wl_evaluation_control_report(f->operation, &report));
+    CHECK(!wl_evaluation_control_report(f->operation, &report)
+        && report.result == cause && !report.execution_status
+        && report.stop_reason == cause && !report.cleanup_status);
+    CHECK(!wl_evaluation_control_reset(f->operation)
+        && !wl_evaluation_control_configure(f->operation, 0)
+        && !wl_evaluation_control_begin(f->operation, &f->operation_owner));
+    f->operation_id = wl_evaluation_control_active_attempt_id(f->operation);
+    CHECK(!wl_evaluation_control_finish(f->funding, &f->funding_owner, 0, 0)
+        && !wl_evaluation_control_reset(f->funding)
+        && !wl_evaluation_control_begin(f->funding, &f->funding_owner));
+    f->funding_id = wl_evaluation_control_active_attempt_id(f->funding);
+    wl_columnar_eval_plan_numeric_attempt_init(&f->record);
+    CHECK(!wl_columnar_eval_stack_cleanup_begin(&f->session, &f->frame));
+    f->pending_protocol = 0;
+}
+
+static void
+long_delta_variable_sources(void)
+{
+    const unsigned lengths[] = {252, 253, 300, 300, 300};
+    const double values[] = {7, 8, 9};
+    for (unsigned composed = 0; composed < 2; ++composed) {
+        uint64_t budget = 0;
+        for (unsigned c = 0; c < 7; ++c) {
+            unsigned length = c < 5 ? lengths[c] : 300;
+            bool alias = c == 3, empty = c == 4, stopped = c >= 5;
+            char name[513], delta_name[516], decoy[256], text[2048];
+            memset(name, 'a', length); name[length] = '\0';
+            snprintf(delta_name, sizeof(delta_name), "$d$%s", name);
+            memcpy(decoy, delta_name, 255); decoy[255] = '\0';
+            snprintf(text, sizeof(text),
+                ".decl %s(x:int64)\n.decl out(x:int64)\nout(x):-%s(x),x>=0.\n",
+                name, name);
+            wirelog_error_t error;
+            wirelog_program_t *program = wirelog_parse_string(text, &error);
+            wl_plan_t *compiled = NULL;
+            CHECK(program && !wl_plan_from_program(program, &compiled));
+            const wl_plan_relation_t *rp = composed_find_relation(compiled,
+                    "out");
+            CHECK(rp && rp->op_count < 16);
+            wl_plan_op_t ops[16];
+            memcpy(ops, rp->ops, rp->op_count * sizeof(*ops));
+            ops[0].delta_mode = WL_DELTA_FORCE_DELTA;
+            wl_plan_relation_t plan = *rp; plan.ops = ops;
+            if (!composed) for (uint32_t i = 1; i < plan.op_count; ++i)
+                    if (ops[i].op == WL_PLAN_OP_CONSOLIDATE) {
+                        plan.op_count = i; break;
+                    }
+            fixture_t f;
+            composed_fixture(&f, composed_source(name, 1, values, 3, false),
+                c == 6 ? budget : 0);
+            const double value = alias ? 777 : 37;
+            col_rel_t *delta = composed_source(alias ? decoy : delta_name, 1,
+                    &value, empty ? 0 : 1, false);
+            col_rel_t *registry[] = {f.input, delta};
+            f.session.delta_seeded = true;
+            col_relation_snapshot_t before[] =
+            {wl_columnar_relation_snapshot(f.input),
+             wl_columnar_relation_snapshot(
+                 delta)};
+            if (composed) composed_begin(&f, &plan, registry, 2, 0);
+            else source_begin(&f, &plan, registry, 2);
+            uint64_t spent = 0; unsigned late = 0, held = 0;
+            long_source_run(&f, composed, alias || empty ? NULL : delta,
+                c == 5, &spent, &late, &held);
+            CHECK(wl_columnar_relation_snapshot_equal(before[0],
+                wl_columnar_relation_snapshot(f.input))
+                && wl_columnar_relation_snapshot_equal(before[1],
+                wl_columnar_relation_snapshot(delta)));
+            if (!stopped) {
+                long_source_literal(&f, alias || empty ? 0 : 1);
+                if (!alias && !empty) CHECK(held);
+                if (c == 2) {
+                    CHECK(late == 1 && spent); budget = spent;
+                }
+            } else {
+                int cause = c == 5 ? WL_EVALUATION_CONTROL_CANCELLED
+                    : WL_EVALUATION_CONTROL_WORK_LIMIT;
+                CHECK(late == 1 && f.record.semantic_result == cause
+                    && !f.record.source_installed && !f.record.completed
+                    && !wl_columnar_eval_stack_cleanup_stack(f.frame)->top);
+                long_source_retry(&f, composed);
+                for (unsigned retry = 0; retry < 3; ++retry) {
+                    if (retry == 1) {
+                        const int64_t row[] = {38};
+                        CHECK(!col_rel_append_row(delta, row));
+                    }
+                    if (composed) composed_begin(&f, &plan, registry, 2, 0);
+                    else source_begin(&f, &plan, registry, 2);
+                    spent = 0; late = held = 0;
+                    long_source_run(&f, composed, delta, false, &spent, &late,
+                        &held);
+                    CHECK(late == 1 && held);
+                    long_source_literal(&f, retry ? 2 : 1);
+                    if (retry < 2) long_source_retry(&f, composed);
+                }
+            }
+            if (composed) composed_close(&f); else fixture_close(&f);
+            col_rel_destroy(delta); wl_plan_free(compiled);
+            wirelog_program_free(program);
+        }
+    }
+    puts(
+        "paid numeric/composed exact long delta/leases/late CANCEL+WORK/retry passed");
+}
+
 int
 main(void)
 {
+    long_delta_variable_sources();
     test_abort_scan_semantics_and_boundaries();
     test_abort_scan_probe_boundaries();
     test_abort_scan_generated_reduce();
