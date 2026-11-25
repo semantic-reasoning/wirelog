@@ -3302,3 +3302,90 @@ remaining containing Source/carry proofs remain open. Existing unary STRING
 ordinary STEP scope is unchanged; wider/mixed/FLOAT, extra topology/expression/K,
 evaluating Snapshot/C1/batch, seeds and pool/prepared-sort remain outside scope.
 This increment does not close #2299.
+
+
+### Adjacent public END custody bundle and phase-8 partition (2026-11-25)
+
+This three-commit bundle qualifies the two adjacent public END families left
+open by the preceding frame-present unbound increment: bound-but-numeric-cleared
+and frame-absent retained receipt custody. It adds no runtime admission, language
+feature or production hook. The earlier statements that these two families remain
+open are superseded only for the finite fixtures and endpoints described here.
+
+`cleared` requires an initialized capture-only frame, child-bound set and numeric
+identity absent. The exported numeric words5..9 must be zero. Actual observations
+are framed PENDING with pending action CHILD_ACK, capture-done set and no Session
+receipt flags. This is distinct from an unbound child: the framed ACK has not yet
+cleared child-bound. The `partition` audit checks phase and pending action
+separately; they must not be conflated.
+
+`receipt` requires an eligible frame-absent public return with positive copied
+receipt custody, all16 child words zero, and the immediately preceding copied
+observation at the same round/head authenticated as a real unbound frame. The
+observed Session tuple is pending=1, ACK=1, acknowledged=0, index-valid=0,
+ACK-committed=0 (tuple3, reported receipt bitmap8). Zero copied child phase/pending
+words are absent-frame initialization, not observed framed execution stages.
+No vanished payload is inspected and no receipt, grant or owner is manufactured.
+
+Both selectors discover healthy actual public EAGAIN observations after typed
+bottom, group initialized finite stage/custody tuples and union each class's
+first/last endpoints. Full copied keys and actual public ordinals independently
+authenticate replay. Every selected endpoint executes both genuine Original END
+and Original END with a live successor. The shared oracle retains first visible
+EINVAL and the frozen Original report, unchanged old public heads/STRING values/
+schemas/generations and no events, protected API EBUSY, successor identity and
+zero consumption, genuine cleanup closure without frame/transaction/MAIN/parent/
+retirement debt, successor finish, reset/same-input raw retry, exact rows/signed
+events and final governor/reference balance. The20000-call drain and120-second
+registration watchdogs are unchanged.
+
+| Family | Heads | Observer modes | Observations/classes/cuts per cell | END/successor histories per cell |
+| --- | --- | --- | --- | --- |
+| Bound numeric-cleared | 1 | off/on | 2/2/2 | 4 |
+| Bound numeric-cleared | 2 | off/on | 6/6/6 | 12 |
+| Frame-absent receipt | 1 | off/on | 2/2/2 | 4 |
+| Frame-absent receipt | 2 | off/on | 6/6/6 | 12 |
+
+The two families contribute64 new histories per profile. Here first and last
+coincide for every newly discovered class; the runner unions endpoints rather
+than double-counting them. Validation parses each cut/class/ordinal/outcome
+record, requiring exactly one outcome2 and one outcome3 for each cut and both
+endpoints of every class.
+
+The independent `partition` census takes **all** recorded eligible phase8
+EVALUATE returns as its domain, not the union of accepted predicates. It fails
+on unknown or overlapping shapes and requires each family at every reached
+round/head. Observer off/on yield the same current discovery:
+
+| Heads | Domain | Bound live numeric | Frame-present unbound | Bound cleared | Frame-absent receipt | Rounds |
+| --- | --- | --- | --- | --- | --- | --- |
+| 1 | 1696 | 1604 | 88 | 2 | 2 | 2 |
+| 2 | 4065 | 3798 | 255 | 6 | 6 | 3 |
+
+Eligible other-phase observations are counted separately (zero in these current
+fixtures); COMPARE/REBIND19/20 are not silently admitted. Outside eligibility,
+retirement and selected-owner exclusion counters are939 each for one head and
+2807 each for two; they overlap and must not be summed.
+
+Validation on the combined test source: all12 new-family/partition registrations
+pass in Clang native, Clang ASan/UBSan, enabled-mbedTLS native and ASan/UBSan, and
+GCC/Clang POSIX TSan (72 registration executions total). Every profile executes
+all four head/observer cells and all new endpoints/outcomes; native/ASan builds
+use debugoptimized and non-LTO. Existing native/ASan regression selections also
+pass36 adjacent registrations (CONCAT END, unbound, retirement, focused lifecycle
+and bound-stage cases) and14 broader registrations (STRING rows/stops/refusals/
+failures, resident facts, cold-right JOIN and selected source/build policy guards)
+each. Another12 registrations per native/ASan profile cover metadata shard0,
+public-focused shard0 and bottom-allocation cases across all four fixtures.
+Seven additional source-access/public-header/expression-inventory/shard contract
+guards pass. Full earlier internal metadata, bound-stage and public
+CANCEL/WORK campaigns are historical unless explicitly named as rerun; no full
+matrix or hosted MSVC certification is inferred from this local selection.
+
+This closes the **discovered phase8 four-family custody partition and the two
+new finite END endpoint families**, not every offset, transition pair, concurrent
+schedule or financial product. Retirement/MAIN/observer/claims/publication END,
+containing Source/carry proofs and other legal hosts remain open. The qualified
+ordinary unary STRING STEP domain is unchanged: wider/mixed/FLOAT, additional
+topology, expression/K bodies, evaluating Snapshot/C1/batch, seeded heads and
+pool/prepared-sort remain outside scope. This bundle does not close #2299.

@@ -1962,11 +1962,78 @@ run_custody(unsigned heads, bool observed, bool receipt)
     free(t.pick); free(t.class_id); free(t.public_ordinal); free(t.keys);
 }
 
+/* Domain comes from all eligible EVALUATE observations, not accepted families. */
+static void
+run_partition(unsigned heads, bool observed)
+{
+    public_trace_t t = {0};
+    t.keys = calloc(16384, sizeof(*t.keys));
+    t.public_ordinal = calloc(16384, sizeof(*t.public_ordinal));
+    CHECK(t.keys && t.public_ordinal);
+    unsigned retained = 0;
+    public_replay(heads, observed, NULL, &t, UINT32_MAX, 0, &retained);
+    unsigned counts[4] = {0}, domain = 0, other_phase = 0, rounds = 0;
+    bool reached[16][2][4] = {{{false}}};
+    for (unsigned i = 0; i < t.count; i++) {
+        const public_key_t *k = &t.keys[i];
+        CHECK(k->available && k->eligible);
+        if (k->phase != 8) {
+            other_phase++; continue;
+        }
+        domain++;
+        CHECK(k->round < 16 && k->head < heads);
+        if (k->round + 1 > rounds) rounds = (unsigned)k->round + 1;
+        const bool family[] = {endstage_eligible(k), unbound_eligible(k),
+                               cleared_eligible(k), receipt_eligible(k)};
+        unsigned matches = 0;
+        for (unsigned f = 0; f < 4; f++) {
+            if (!family[f]) continue;
+            matches++; counts[f]++; reached[k->round][k->head][f] = true;
+        }
+        CHECK(matches == 1);
+        if (family[2]) {
+            CHECK(k->child[2] == WL_COLUMNAR_EVAL_SERIAL_FRAMED_PENDING
+                && k->child[3] == WL_COLUMNAR_EVAL_SERIAL_FRAMED_CHILD_ACK
+                && (k->child[4] & 128));
+            for (unsigned j = 5; j <= 9; j++) CHECK(!k->child[j]);
+            CHECK(!k->receipt_pending && !k->receipt_ack
+                && !k->receipt_acknowledged && !k->receipt_index_valid
+                && !k->ack_committed);
+        }
+        if (family[3]) {
+            for (unsigned j = 0; j < 16; j++) CHECK(!k->child[j]);
+            CHECK(k->receipt_pending && k->receipt_ack
+                && !k->receipt_acknowledged && !k->receipt_index_valid
+                && !k->ack_committed && i
+                && t.keys[i - 1].round == k->round
+                && t.keys[i - 1].head == k->head
+                && unbound_eligible(&t.keys[i - 1]));
+        }
+    }
+    CHECK(domain && rounds &&
+        domain == counts[0] + counts[1] + counts[2] + counts[3]
+        && domain + other_phase == t.count);
+    for (unsigned r = 0; r < rounds; r++)
+        for (unsigned h = 0; h < heads; h++)
+            for (unsigned f = 0; f < 4; f++) CHECK(reached[r][h][f]);
+    printf(
+        "partition heads%u observer%d domain%u bound_live%u unbound%u cleared%u receipt%u other_phase%u rounds%u excluded%u retirement%u owner%u passed\n",
+        heads, observed, domain, counts[0], counts[1], counts[2], counts[3],
+        other_phase, rounds, t.excluded, t.excluded_retire, t.excluded_owner);
+    free(t.public_ordinal); free(t.keys);
+}
+
 int
 main(int argc, char **argv)
 {
     CHECK(!environment("WIRELOG_JOIN_BATCH_BYTES", "")
         && !environment("WIRELOG_JOIN_BATCH_STRICT", ""));
+    if (argc == 4 && !strcmp(argv[1], "partition")) {
+        unsigned heads = (unsigned)strtoul(argv[2], NULL, 10);
+        unsigned observed = (unsigned)strtoul(argv[3], NULL, 10);
+        CHECK(heads >= 1 && heads <= 2 && observed <= 1);
+        run_partition(heads, observed != 0); return 0;
+    }
     if (argc == 4 && (!strcmp(argv[1], "cleared") || !strcmp(argv[1],
         "receipt"))) {
         unsigned heads = (unsigned)strtoul(argv[2], NULL, 10);
