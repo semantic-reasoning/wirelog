@@ -562,6 +562,28 @@ col_op_k_fusion_worker(void *ctx)
  * count on entry and trimming any branch-added entries on return, so outside
  * code sees identical K-Fusion side-effects regardless of worker count.
  */
+/* Copy the target's actual schema; K-fusion historically has no timestamps.
+* Unnamed/missing targets remain supported for direct internal operators. */
+static int
+wl_columnar_kfusion_empty(const wl_plan_op_t *op, wl_col_session_t *sess,
+    col_rel_t **out)
+{
+    col_rel_t *target = op->relation_name
+        ? session_find_rel(sess, op->relation_name) : NULL;
+    if (!target && !sess->memory_governor) {
+        *out = col_rel_new_auto("$kfusion_empty", 0);
+        return *out ? 0 : ENOMEM;
+    }
+    int rc = target
+        ? wl_columnar_relation_new_like_governed_checked_mode("$kfusion_empty",
+            target, sess->memory_governor, false, out)
+        : wl_columnar_relation_new_auto_governed("$kfusion_empty", 0, 0,
+            false, sess->memory_governor, out);
+    if (rc == ENOSPC)
+        sess->memory_budget_denied = true;
+    return rc;
+}
+
 static int
 col_op_k_fusion_serial(const wl_plan_op_t *op, eval_stack_t *stack,
     wl_col_session_t *sess)
@@ -682,14 +704,9 @@ col_op_k_fusion_serial(const wl_plan_op_t *op, eval_stack_t *stack,
     {
         col_rel_t *merged;
         if (n_results == 0) {
-            /* All copies skipped: empty output with target relation schema. */
-            uint32_t ncols = 0;
-            if (op->relation_name) {
-                col_rel_t *target = session_find_rel(sess, op->relation_name);
-                if (target)
-                    ncols = target->ncols;
-            }
-            merged = col_rel_new_auto("$kfusion_empty", ncols);
+            rc = wl_columnar_kfusion_empty(op, sess, &merged);
+            if (rc != 0)
+                goto cleanup;
         } else {
             merged = col_rel_merge_k(results, n_results);
         }
@@ -840,16 +857,11 @@ col_op_k_fusion_dispatch(const wl_plan_op_t *op, eval_stack_t *stack,
     }
     if (live_count == 0) {
         COL_SESSION(sess)->kfusion_alloc_ns += now_ns() - _phase_t0;
-        uint32_t ncols = 0;
-        if (op->relation_name) {
-            col_rel_t *target = session_find_rel(sess, op->relation_name);
-            if (target)
-                ncols = target->ncols;
-        }
-        col_rel_t *empty = col_rel_new_auto("$kfusion_empty", ncols);
+        col_rel_t *empty = NULL;
+        int empty_rc = wl_columnar_kfusion_empty(op, sess, &empty);
         free(live_indices);
-        if (!empty)
-            return ENOMEM;
+        if (empty_rc != 0)
+            return empty_rc;
         int push_rc = eval_stack_push(stack, empty, true);
         if (push_rc != 0)
             col_rel_destroy(empty);
@@ -1318,19 +1330,14 @@ col_op_k_fusion_dispatch(const wl_plan_op_t *op, eval_stack_t *stack,
 
         col_rel_t *merged;
         if (n_results == 0) {
-            /* Defensive fallback: produce empty output with the target
-             * relation schema if no worker produced a relation. */
-            uint32_t ncols = 0;
-            if (op->relation_name) {
-                col_rel_t *target = session_find_rel(sess, op->relation_name);
-                if (target)
-                    ncols = target->ncols;
-            }
-            merged = col_rel_new_auto("$kfusion_empty", ncols);
+            rc = wl_columnar_kfusion_empty(op, sess, &merged);
         } else {
+            rc = 0;
             merged = col_rel_merge_k(compact, n_results);
         }
         free((void *)compact);
+        if (rc != 0)
+            goto cleanup_results;
         if (!merged) {
             rc = ENOMEM;
             goto cleanup_results;

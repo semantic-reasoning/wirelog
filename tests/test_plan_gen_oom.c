@@ -11,6 +11,7 @@
 #include "../wirelog/wirelog.h"
 
 #include <errno.h>
+#include <limits.h>
 #include <stdlib.h>
 #include <stdbool.h>
 #include <stddef.h>
@@ -303,6 +304,54 @@ static void test_rhs_compiler_atomicity(void) {
     wl_plan_free(reference); wirelog_program_free(reference_program);
 }
 
+static void
+test_kfusion_target_ownership(void)
+{
+    const char *text = ".decl path(x:int64,y:int64)\n"
+        "path(1,2). path(2,3). path(3,4).\n"
+        "path(x,z):-path(x,y),path(y,w),path(w,z).\n";
+    wirelog_error_t error;
+    wirelog_program_t *program = wirelog_parse_string(text, &error);
+    wl_plan_t *plan = NULL;
+    if (!program) abort();
+    fail_at = LONG_MAX; allocation_calls = 0;
+    if (wl_plan_from_program(program, &plan)) abort();
+    long count = allocation_calls;
+    fail_at = -1; wl_plan_free(plan); wirelog_program_free(program);
+    unsigned fallbacks = 0;
+    for (long i = 0; i < count; ++i) {
+        program = wirelog_parse_string(text, &error);
+        if (!program) abort();
+        plan = NULL; fail_at = i; allocation_calls = 0;
+        int rc = wl_plan_from_program(program, &plan);
+        bool injected = allocation_calls > i;
+        fail_at = -1;
+        if (!injected || (rc && plan)) abort();
+        if (!rc) {
+            bool found = false;
+            for (uint32_t s = 0; s < plan->stratum_count; ++s)
+                for (uint32_t r = 0; r < plan->strata[s].relation_count; ++r) {
+                    const wl_plan_relation_t *rel =
+                        &plan->strata[s].relations[r];
+                    for (uint32_t o = 0; o < rel->op_count; ++o)
+                        if (rel->ops[o].op == WL_PLAN_OP_K_FUSION) {
+                            found = true;
+                            if (!rel->ops[o].relation_name ||
+                                strcmp(rel->ops[o].relation_name,
+                                rel->name)) abort();
+                        }
+                }
+            fallbacks += !found;
+        }
+        wl_plan_free(plan); plan = NULL;
+        if (wl_plan_from_program(program, &plan)) abort();
+        wl_plan_free(plan); wirelog_program_free(program);
+    }
+    if (!fallbacks) abort();
+    printf("K-fusion owned target: %ld real allocation sites, %u safe optional "
+        "fallbacks, all same-program retries build/free\n", count, fallbacks);
+}
+
 int
 main(void)
 {
@@ -380,6 +429,7 @@ main(void)
         wirelog_program_free(program);
     }
 
+    test_kfusion_target_ownership();
     test_rhs_compiler_atomicity();
     if (!test_mr1_session_arena_malloc(false) ||
         !test_mr1_session_arena_malloc(true)) return 1;

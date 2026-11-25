@@ -3102,7 +3102,7 @@ free_exchange_opaque(wl_plan_op_t *op)
 static wl_plan_op_t *
 expand_multiway_k_fusion(const wl_plan_op_t *ops, uint32_t op_count,
     const uint32_t *delta_pos, uint32_t k,
-    uint32_t *out_count)
+    const char *target_name, uint32_t *out_count)
 {
     if (!ops || !delta_pos || !out_count)
         return NULL;
@@ -3248,6 +3248,11 @@ expand_multiway_k_fusion(const wl_plan_op_t *ops, uint32_t op_count,
         }
     }
 
+    /* Own the target like every other named plan operator. Publish only after
+     * this allocation succeeds, so optional rewrite failure keeps the old plan. */
+    result->relation_name = dup_str(target_name);
+    if (!result->relation_name)
+        goto fail;
     result->op = WL_PLAN_OP_K_FUSION;
     result->opaque_data = (void *)meta;
 
@@ -3372,7 +3377,7 @@ rewrite_multiway_delta(wl_plan_t *plan)
                 wl_plan_op_t *new_ops;
 #if ENABLE_K_FUSION
                 new_ops = expand_multiway_k_fusion(rel->ops, rel->op_count,
-                        dpos, k, &new_count);
+                        dpos, k, rel->name, &new_count);
 #else
                 new_ops = expand_multiway_delta(rel->ops, rel->op_count, dpos,
                         k, &new_count);

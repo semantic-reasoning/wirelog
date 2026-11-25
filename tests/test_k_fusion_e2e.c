@@ -1363,6 +1363,232 @@ test_k4_branch_sorted_arrangements_are_branch_owned(void)
     PASS();
 }
 
+/* Compiler-created operators are the principal schema witness, unlike the
+ * hand-bound direct K2 control above. Iteration1 has genuinely absent deltas;
+ * this observes an internal empty result, not a public wrong-tuple claim. */
+static bool
+wl_test_compiled_empty(const char *text, uint32_t workers, uint32_t width)
+{
+    wirelog_error_t error;
+    wirelog_program_t *program = wirelog_parse_string(text, &error);
+    wl_plan_t *plan = NULL;
+    if (!program || wl_plan_from_program(program, &plan))
+        return false;
+    const wl_plan_op_t *op = NULL;
+    for (uint32_t s = 0; s < plan->stratum_count; ++s) {
+        for (uint32_t r = 0; r < plan->strata[s].relation_count; ++r) {
+            const wl_plan_relation_t *rel = &plan->strata[s].relations[r];
+            if (strcmp(rel->name, "path")) continue;
+            for (uint32_t i = 0; i < rel->op_count; ++i)
+                if (rel->ops[i].op == WL_PLAN_OP_K_FUSION) op = &rel->ops[i];
+        }
+    }
+    bool ok = op && op->relation_name && !strcmp(op->relation_name, "path");
+    const wl_plan_op_k_fusion_t *meta = op ? op->opaque_data : NULL;
+    uint32_t hints = 0;
+    if (meta) for (uint32_t k = 0; k < meta->k; ++k)
+            for (uint32_t i = 0; i < meta->k_op_counts[k]; ++i)
+                hints += meta->k_ops[k][i].materialized ? 1u : 0u;
+    ok = ok && meta && meta->k >= 3 && hints > 0;
+    wl_columnar_memory_resolution_t resolution = {
+        .budget_bytes = UINT64_C(64) << 20,
+            .usable_bytes = UINT64_C(64) << 20,
+            .mode = WL_COLUMNAR_MEMORY_MODE_ENFORCING,
+    };
+    wl_columnar_memory_governor_ref_t *ref =
+        wl_columnar_memory_governor_ref_create(&resolution);
+    wl_session_options_t options;
+    wl_session_options_init(&options);
+    options.memory_governor = ref;
+    wl_session_t *base = NULL;
+    if (!ref || wl_session_create_with_options(wl_backend_columnar(), plan,
+        workers, &options, &base)) return false;
+    ok = ok && wl_session_load_facts(base, program) == 0;
+    struct result_ctx initial = {0};
+    ok = ok && wl_session_snapshot(base, count_tuples_cb, &initial) == 0
+        && initial.total == 0;
+    wl_col_session_t *sess = COL_SESSION(base);
+    col_rel_t *target = session_find_rel(sess, "path");
+    ok = ok && target && target->ncols == width;
+    sess->current_iteration = 1;
+    eval_stack_t stack;
+    eval_stack_init(&stack);
+    int rc = op ? col_op_k_fusion(op, &stack, sess) : EINVAL;
+    eval_entry_t result = {0};
+    if (!rc) result = eval_stack_pop(&stack);
+    ok = ok && !rc && result.owned && result.rel
+        && result.rel->nrows == 0 && result.rel->ncols == width
+        && result.rel->declared_ncols == target->declared_ncols
+        && result.rel->memory_governor == ref && !result.rel->timestamps;
+    if (ok) for (uint32_t c = 0; c < width; ++c) {
+            wirelog_column_type_t a = target->column_types
+            ? target->column_types[c] : WIRELOG_TYPE_INT64;
+            wirelog_column_type_t b = result.rel->column_types
+            ? result.rel->column_types[c] : WIRELOG_TYPE_INT64;
+            ok = ok && a == b && !strcmp(target->col_names[c],
+                    result.rel->col_names[c]);
+        }
+    if (result.owned && result.rel) col_rel_destroy(result.rel);
+    eval_stack_drain(&stack);
+    wl_session_destroy(base);
+    wl_plan_free(plan);
+    wirelog_program_free(program);
+    ok = ok && wl_columnar_memory_reserved(
+        wl_columnar_memory_governor_ref_get(ref)) == 0;
+    wl_columnar_memory_governor_ref_release(ref);
+    return ok;
+}
+
+static void
+test_compiled_inactive_schema(void)
+{
+    TEST("compiled materialized K3/K4 inactive scalar and wide schema");
+    ASSERT(wl_test_compiled_empty(
+            ".decl path(x:float,y:float)\n"
+            "path(x,z):-path(x,y),path(y,w),path(w,z).\n", 1, 2),
+        "compiled serial FLOAT schema");
+    ASSERT(wl_test_compiled_empty(
+            ".decl path(x:int64,y:int64)\n"
+            "path(x,z):-path(x,y),path(y,w),path(w,v),path(v,z).\n", 4, 2),
+        "compiled K4 dispatch inactive INT schema");
+    ASSERT(wl_test_compiled_empty(
+            ".decl path(x:string,y:string,v:float)\n"
+            "path(x,z,v):-path(x,y,v),path(y,w,v),path(w,z,v).\n", 1, 3),
+        "compiled mixed STRING/FLOAT schema");
+    char text[16384];
+    size_t used = 0;
+#define WL_SCHEMA_TEXT(...) do { \
+            int n = snprintf(text + used, sizeof(text) - used, __VA_ARGS__); \
+            ASSERT(n >= 0 && (size_t)n < sizeof(text) - used, \
+                "wide program buffer"); \
+            used += (size_t)n; \
+} while (0)
+    WL_SCHEMA_TEXT(".decl path(x:int64,y:int64");
+    for (uint32_t i = 2; i <= COL_STACK_MAX; ++i)
+        WL_SCHEMA_TEXT(",c%u:int64", i);
+    WL_SCHEMA_TEXT(")\npath(x,z");
+    for (uint32_t i = 2; i <= COL_STACK_MAX; ++i) WL_SCHEMA_TEXT(",v%u", i);
+    WL_SCHEMA_TEXT("):-");
+    const char *ends[] = {"x,y", "y,w", "w,z"};
+    for (uint32_t b = 0; b < 3; ++b) {
+        WL_SCHEMA_TEXT("%spath(%s", b ? "," : "", ends[b]);
+        for (uint32_t i = 2; i <= COL_STACK_MAX; ++i) WL_SCHEMA_TEXT(",v%u", i);
+        WL_SCHEMA_TEXT(")");
+    }
+    WL_SCHEMA_TEXT(".\n");
+#undef WL_SCHEMA_TEXT
+    ASSERT(wl_test_compiled_empty(text, 1, COL_STACK_MAX + 1),
+        "compiled wide schema");
+    PASS();
+}
+
+struct wl_test_kfusion_image {
+    unsigned mask;
+    unsigned count;
+    bool invalid;
+};
+
+static void
+wl_test_kfusion_image_cb(const char *name, const int64_t *row, uint32_t ncols,
+    void *data)
+{
+    struct wl_test_kfusion_image *image = data;
+    if (strcmp(name, "path")) return;
+    if (ncols != 2 || row[0] < 1 || row[0] > 4 || row[1] < 1 || row[1] > 4) {
+        image->invalid = true;
+        return;
+    }
+    unsigned bit = 1u << (unsigned)((row[0] - 1) * 4 + row[1] - 1);
+    if (image->mask & bit) image->invalid = true;
+    image->mask |= bit;
+    ++image->count;
+}
+
+static void
+test_compiled_empty_refill_history(void)
+{
+    TEST("natural K3 empty/insert/repeat/remove/refill literal images");
+    const char *text = ".decl path(x:int64,y:int64)\n"
+        "path(x,z):-path(x,y),path(y,w),path(w,z).\n";
+    wirelog_error_t error;
+    wirelog_program_t *program = wirelog_parse_string(text, &error);
+    wl_plan_t *plan = NULL;
+    ASSERT(program && !wl_plan_from_program(program, &plan), "history plan");
+    wl_session_t *base = NULL;
+    ASSERT(!wl_session_create(wl_backend_columnar(), plan, 1, &base),
+        "history session");
+    const int64_t rows[] = {1, 2, 2, 3, 3, 4};
+    const unsigned masks[] = {0, (1u << 1) | (1u << 6) | (1u << 11) | (1u << 3),
+                              (1u << 1) | (1u << 6) | (1u << 11) | (1u << 3), 0,
+                              (1u << 1) | (1u << 6) | (1u << 11) | (1u << 3)};
+    for (unsigned phase = 0; phase < 5; ++phase) {
+        if (phase == 1 || phase == 4)
+            ASSERT(!wl_session_insert(base, "path", rows, 3, 2),
+                "history insert");
+        if (phase == 3)
+            ASSERT(!wl_session_remove(base, "path", rows, 3, 2),
+                "history remove");
+        struct wl_test_kfusion_image image = {0};
+        ASSERT(!wl_session_snapshot(base, wl_test_kfusion_image_cb, &image),
+            "history snapshot");
+        ASSERT(!image.invalid && image.mask == masks[phase]
+            && image.count == (masks[phase] ? 4u : 0u),
+            "literal history image");
+    }
+    wl_session_destroy(base); wl_plan_free(plan); wirelog_program_free(program);
+    PASS();
+}
+
+static void
+test_inactive_nullary_and_missing_target(void)
+{
+    TEST("inactive true nullary and direct unnamed/missing-target contracts");
+    for (unsigned direct = 0; direct < 6; ++direct) {
+        wl_columnar_memory_resolution_t resolution = {
+            .budget_bytes = UINT64_C(64) << 20,
+                .usable_bytes = UINT64_C(64) << 20,
+                .mode = WL_COLUMNAR_MEMORY_MODE_ENFORCING,
+        };
+        wl_columnar_memory_governor_ref_t *ref =
+            wl_columnar_memory_governor_ref_create(&resolution);
+        wl_col_session_t sess = {0};
+        sess.num_workers = 4; sess.current_iteration = 1;
+        col_rel_t *target = col_rel_new_auto("out", 0);
+        ASSERT(ref && target && !session_add_rel(&sess, target),
+            "nullary target");
+        /* Govern only the operator output; the manual registry is unmanaged. */
+        sess.memory_governor = direct < 3 ? ref : NULL;
+        ASSERT(!col_rel_enable_timestamps(target),
+            "timestamped source control");
+        wl_plan_op_t branch = {.op = WL_PLAN_OP_VARIABLE,
+                               .relation_name = "absent",
+                               .delta_mode = WL_DELTA_FORCE_DELTA};
+        wl_plan_op_t *branches[] = {&branch, &branch, &branch, &branch};
+        uint32_t counts[] = {1, 1, 1, 1};
+        wl_plan_op_k_fusion_t meta = {.k = 4, .k_ops = branches,
+                                      .k_op_counts = counts};
+        wl_plan_op_t op = {.op = WL_PLAN_OP_K_FUSION, .opaque_data = &meta,
+                           .relation_name = direct % 3 ==
+                               0 ? NULL : direct % 3 == 1 ? "missing" : "out"};
+        eval_stack_t stack; eval_stack_init(&stack);
+        ASSERT(!col_op_k_fusion(&op, &stack, &sess), "direct inactive result");
+        eval_entry_t result = eval_stack_pop(&stack);
+        ASSERT(result.owned && result.rel && !result.rel->ncols &&
+            !result.rel->nrows
+            && !result.rel->timestamps &&
+            result.rel->memory_governor == sess.memory_governor,
+            "true width0 governed result with historical no-timestamps");
+        col_rel_destroy(result.rel); eval_stack_drain(&stack);
+        col_rel_destroy(target); free(sess.rels); session_rel_free_hash(&sess);
+        wl_kfusion_adaptive_destroy(sess.kfusion_adaptive);
+        ASSERT(!wl_columnar_memory_reserved(wl_columnar_memory_governor_ref_get(
+                ref)),
+            "direct nullary final refund");
+        wl_columnar_memory_governor_ref_release(ref);
+    }
+    PASS();
+}
+
 /* ================================================================
  * main
  * ================================================================ */
@@ -1372,6 +1598,9 @@ main(void)
 {
     printf("\n=== K-Fusion End-to-End Integration Tests ===\n\n");
 
+    test_inactive_nullary_and_missing_target();
+    test_compiled_inactive_schema();
+    test_compiled_empty_refill_history();
     test_k2_recursive_join_correct_count();
     test_k1_vs_k2_tc_parity();
     test_k2_iteration_count();

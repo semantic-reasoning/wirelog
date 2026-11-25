@@ -958,6 +958,9 @@ test_k_fusion_sequences_fuse_join_project(void)
                 continue;
             for (uint32_t i = 0; i < rel->op_count; i++) {
                 if (rel->ops[i].op == WL_PLAN_OP_K_FUSION) {
+                    ASSERT(rel->ops[i].relation_name
+                        && !strcmp(rel->ops[i].relation_name, rel->name),
+                        "compiler K_FUSION owns its target binding");
                     kf = (const wl_plan_op_k_fusion_t *)
                         rel->ops[i].opaque_data;
                     break;
