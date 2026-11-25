@@ -6922,6 +6922,11 @@ bool wl_columnar_join_cold_prefix(const wl_col_session_t *s,
  * resident or cold (#2301). */
 bool wl_columnar_join_cold_later_suffix(const wl_col_session_t *s,
     const wl_plan_relation_t *rp);
+/* The uncontrolled cold JOIN prefix audit with one key and the suffix audit
+ * from the rule's second op, each admitting a right filter on a JOIN whose
+ * right input is not the cold input `cold` (#2301). */
+bool wl_columnar_join_cold_later_filtered(const wl_col_session_t *s,
+    const wl_plan_relation_t *rp, const char *cold);
 int wl_columnar_join_cold_left(wl_col_session_t *s,
     const wl_plan_relation_t *rp,
     eval_stack_t *stack);

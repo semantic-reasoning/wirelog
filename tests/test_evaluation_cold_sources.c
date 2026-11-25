@@ -227,23 +227,46 @@
  * reads a cold right input, a JOIN with no key, a JOIN with no key after a
  * one-key JOIN with the cold input on the left and after a two-key JOIN with
  * it on the right, and a COUNT after a two-key JOIN that follows a one-key
- * JOIN, with the cold input on either side. Of two cold inputs of one JOIN,
- * the second seal is refused under control in either order, and the STEP gives
- * what an uncontrolled session with only the first sealed gives; of the
- * resident input of a JOIN with itself and the cold right input of a later
- * JOIN, the former is refused under control in either order, and the STEP
- * gives what an uncontrolled session with only the latter sealed gives. A
- * later JOIN of a cold right input whose left key is a STRING column, against
- * the cold input's INT64 key, is admitted at seal and begin uncontrolled and
- * fails its STEP with ENOTSUP, and is refused at seal and begin under control;
- * the parser refuses such a rule, so the key comes from an edited plan. Over a
- * resident input declared but never inserted, the earlier JOIN's output has no
- * column, and the STEP returns ENOTSUP on both sessions, the controlled one
- * before the scan with every reservation returned. A controlled SNAPSHOT
- * returns ENOTSUP and a STEP with a delta callback set returns ENOTSUP. A STEP
- * after a callback was set and cleared following a completed STEP completes
- * without an attempt, the inputs being frozen; a callback set while an attempt
- * is parked is ignored, as in a resident controlled session.
+ * JOIN, with the cold input on either side. With a right filter and a cold
+ * right input they also refuse the rule with the filter after a prefix, with
+ * the filter on the JOIN that reads the cold input, with two keys at the
+ * earlier JOIN or at the cold one and with the cold input at the first JOIN,
+ * and with no prefix and one key a comparison that the planner emits as a
+ * FILTER after the JOINs. Of two cold inputs of one JOIN, the second seal is
+ * refused under control in either order, and the STEP gives what an
+ * uncontrolled session with only the first sealed gives; of the resident input
+ * of a JOIN with itself and the cold right input of a later JOIN, the former
+ * is refused under control in either order, and the STEP gives what an
+ * uncontrolled session with only the latter sealed gives. A later JOIN of a
+ * cold right input whose left key is a STRING column, against the cold input's
+ * INT64 key, is admitted at seal and begin uncontrolled and fails its STEP
+ * with ENOTSUP, and is refused at seal and begin under control; the parser
+ * refuses such a rule, so the key comes from an edited plan. Over a resident
+ * input declared but never inserted, the earlier JOIN's output has no column,
+ * and the STEP returns ENOTSUP on both sessions, the controlled one before the
+ * scan with every reservation returned. A controlled SNAPSHOT returns ENOTSUP
+ * and a STEP with a delta callback set returns ENOTSUP. A STEP after a
+ * callback was set and cleared following a completed STEP completes without an
+ * attempt, the inputs being frozen; a callback set while an attempt is parked
+ * is ignored, as in a resident controlled session.
+ *
+ * Right filters: with no prefix and one key at every JOIN, a JOIN of the
+ * resident input before or after the one that reads a cold right input may
+ * carry a right filter, a constant in its right input. The corpus has an INT64
+ * constant at the earlier JOIN over 6 and 20 cold rows, one that no resident
+ * row matches, two filtered JOINs before the cold one, a filtered JOIN after
+ * it and a STRING constant from program facts, each compared with the
+ * uncontrolled session and, with generated rows, with the sessions that keep
+ * both inputs resident. With the earlier JOIN filtered, both stops at every
+ * scan checkpoint on both routes, a work-limit stop at every JOIN checkpoint
+ * on the seal route and a cancellation at every one on the loading route, the
+ * parks in the earlier JOIN and in the one that reads the copy, an allocation
+ * that a JOIN cannot make, also with the filtered JOIN after the cold one, the
+ * read cancellation, the read fault and the denials on both routes, on the
+ * seal route also with the filtered JOIN after the cold one, behave as without
+ * the filter; the full STEP consumes the same work on both routes, the STRING
+ * left key from an edited plan is refused under control, and over a resident
+ * input never inserted the STEP returns ENOTSUP on both sessions.
  *
  * Not checked here: more than one worker; an observed STEP or an observed
  * SNAPSHOT over a cold source, both refused; a MAP whose lanes, or a REDUCE
@@ -1267,6 +1290,38 @@ static qcase_t qcases[] = {
      "c(\"q\",10). c(\"p\",20). c(\"r\",30). c(\"p\",40).\n"
      "out(x,z) :- a(x,y,s), a(y,v,t), c(t,z).\n", "c", 0, 0, "VJJC", 0, "out",
      NULL, NULL, 0, 0, 0, true, .second = true},
+    /* A constant in a resident JOIN's right input, which the planner emits
+     * as a right filter of that JOIN. Only resident row 9, (11, 1, 4), has
+     * a first JOIN partner (1, 4, 7) whose second column is 4, and cold row
+     * 1, (7, 10), extends it. */
+    {"right_second_filter", RIGHT_SECOND
+     "out(x,z) :- a(x,y,w), a(y,4,u), c(u,z).\n", "c", 2, 20, "VJJC", 0,
+     "out", NULL, "a", 3, 20, 0, true, .second = true},
+    {"right_second_filter_few", RIGHT_SECOND
+     "out(x,z) :- a(x,y,w), a(y,4,u), c(u,z).\n", "c", 2, 6, "VJJC", 0,
+     "out", NULL, "a", 3, 13, 0, true, .second = true},
+    /* No resident row has 99 in its second column: the earlier JOIN's
+     * output is empty, with its columns. */
+    {"right_second_all_filtered", RIGHT_SECOND
+     "out(x,z) :- a(x,y,w), a(y,99,u), c(u,z).\n", "c", 2, 20, "VJJC", 0,
+     "out", NULL, "a", 3, 20, 0, true, .second = true},
+    /* Two filtered JOINs: (11, 1, 4), (1, 4, 7), (7, 10, 0), cold (0, 3). */
+    {"right_second_filter_third", RIGHT_SECOND
+     "out(x,z) :- a(x,y,w), a(y,4,u), a(u,10,t), c(t,z).\n", "c", 2, 20,
+     "VJJJC", 0, "out", NULL, "a", 3, 20, 0, true, .second = true},
+    /* A filtered JOIN after the one that reads the cold input. */
+    {"right_second_filter_then_join", ".decl a(x:int64,y:int64,w:int64)\n"
+     ".decl c(v:int64,z:int64)\n.decl out(x:int64,t:int64)\n"
+     "out(x,t) :- a(x,y,w), a(y,v,u), c(v,z), a(z,3,t).\n", "c", 2, 20,
+     "VJJJC", 0, "out", NULL, "a", 3, 20, 0, true, .second = true},
+    /* A STRING constant: a(2,3,"q") fails the filter, so (1,10) is not a
+     * head row. */
+    {"right_second_filter_string", ".decl a(x:int64,y:int64,s:symbol)\n"
+     ".decl c(v:int64,z:int64)\n.decl out(x:int64,z:int64)\n"
+     "a(1,2,\"p\"). a(2,3,\"q\"). a(2,4,\"p\"). a(3,1,\"p\").\n"
+     "c(3,10). c(4,20). c(1,30).\n"
+     "out(x,z) :- a(x,y,s), a(y,v,\"p\"), c(v,z).\n", "c", 0, 0, "VJJC", 0,
+     "out", NULL, NULL, 0, 0, 0, true, .second = true},
 };
 
 #define NQCASES (sizeof(qcases) / sizeof(qcases[0]))
@@ -1382,6 +1437,15 @@ run_qcase(const qcase_t *c, via_t via)
         CHECK(rp->ops[join].op != WL_PLAN_OP_JOIN ||
             !strcmp(rp->ops[join].right_relation, rp->ops[0].relation_name));
     CHECK(!c->second || join < rp->op_count);
+    /* Exactly the right filter cases carry a right filter, on a JOIN of the
+     * resident input with itself. */
+    bool right_filter = false;
+    for (uint32_t i = 0; i < rp->op_count; i++)
+        right_filter |= rp->ops[i].op == WL_PLAN_OP_JOIN &&
+            rp->ops[i].right_filter_expr.size &&
+            !strcmp(rp->ops[i].right_relation, rp->ops[0].relation_name);
+    CHECK(right_filter == (!strncmp(c->name, "right_second_filter", 19) ||
+        !strcmp(c->name, "right_second_all_filtered")));
     CHECK(join == rp->op_count ||
         (c->cold_right == !strcmp(rp->ops[join].right_relation, c->cold) &&
         c->cold_right == !!strcmp(rp->ops[0].relation_name, c->cold)));
@@ -1446,6 +1510,10 @@ run_qcase(const qcase_t *c, via_t via)
         /* A JOIN case with right rows and no all-rejecting FILTER yields. */
         CHECK(!strchr(c->ops, 'J') || !c->right_rows ||
             strstr(c->name, "all_filtered") || head_rows(f.s, c->head) > 0);
+        /* Program facts give no generated rows to check: the STRING right
+         * filter case keeps (1, 20) and (2, 30) and drops (1, 10). */
+        CHECK(strcmp(c->name, "right_second_filter_string") ||
+            head_rows(f.s, c->head) == 2);
         /* Each left row joins right_rows / right_fan right rows; inserted
          * duplicates stay, and the COUNT counts every pair. */
         const col_rel_t *out = session_find_rel((wl_col_session_t *)f.s,
@@ -1518,8 +1586,8 @@ run_qcase(const qcase_t *c, via_t via)
         CHECK(a && b);
         image_of(f.s, c->head, a);
         image_of(g.raw, c->head, b);
-        CHECK((a->count > 0 || (c->right && !c->right_rows)) &&
-            image_equal(a, b));
+        CHECK((a->count > 0 || (c->right && !c->right_rows) ||
+            strstr(c->name, "all_filtered")) && image_equal(a, b));
         if (join_reduce || c->cold_right || composite || c->later) {
             hooks_clear();
             CHECK(!until_done(g.s));
@@ -1851,12 +1919,16 @@ cold_both_later_case(bool left_first)
  * refuses a variable over a STRING and an INT64 column, so the key comes
  * from an edited plan. */
 static void
-key_type_case(via_t via)
+key_type_case(via_t via, bool filtered)
 {
-    snprintf(where_buf, sizeof(where_buf), "key_type/%s",
-        via == VIA_SEAL ? "seal" : "load");
+    snprintf(where_buf, sizeof(where_buf), "key_type/%s%s",
+        via == VIA_SEAL ? "seal" : "load", filtered ? "/filtered" : "");
     where = where_buf;
-    const char *text = ".decl a(x:int64,y:int64,s:symbol)\n"
+    const char *text = filtered ? ".decl a(x:int64,y:int64,s:symbol)\n"
+        ".decl c(v:int64,z:int64)\n.decl out(x:int64,z:int64)\n"
+        "a(1,2,\"p\"). a(2,3,\"q\"). a(3,1,\"p\").\n"
+        "out(x,z) :- a(x,y,s), a(y,v,\"p\"), c(v,z).\n" :
+        ".decl a(x:int64,y:int64,s:symbol)\n"
         ".decl c(v:int64,z:int64)\n.decl out(x:int64,z:int64)\n"
         "a(1,2,\"p\"). a(2,3,\"q\"). a(3,1,\"p\").\n"
         "out(x,z) :- a(x,y,s), a(y,v,u), c(v,z).\n";
@@ -1866,6 +1938,8 @@ key_type_case(via_t via)
     char got[16];
     ops_of(&f, got);
     CHECK(!strcmp(got, "VJJC"));
+    const wl_plan_relation_t *rp = &f.plan->strata[0].relations[0];
+    CHECK(!rp->ops[1].right_filter_expr.size == !filtered);
     if (via == VIA_SEAL) {
         fill(&f, "c", 2, 4, true);
         CHECK(wl_columnar_session_seal_join_input(f.raw, "c", NULL, NULL) ==
@@ -1898,12 +1972,12 @@ key_type_case(via_t via)
  * the controlled STEP returns ENOTSUP too, before the scan, with every
  * reservation returned. */
 static void
-second_absent_case(via_t via)
+second_absent_case(via_t via, const char *name)
 {
-    snprintf(where_buf, sizeof(where_buf), "second_absent/%s",
+    snprintf(where_buf, sizeof(where_buf), "second_absent/%s/%s", name,
         via == VIA_SEAL ? "seal" : "load");
     where = where_buf;
-    const qcase_t *c = find_qcase("right_second_self");
+    const qcase_t *c = find_qcase(name);
     qcase_t absent = *c;
     absent.right_rows = 0;
     fixture_t f;
@@ -2397,6 +2471,35 @@ static const refusal_t refusals[] = {
      ".decl c(v:int64,z:int64)\n.decl out(x:int64,n:int64)\n"
      "out(x,count(z)) :- a(x,y,w), a(y,v,u), c(v,z).\n", "c", 2, false,
      true, "VJJRC", 1},
+    /* A right filter and a cold right input, refused uncontrolled too: the
+     * filter after a prefix, on the JOIN of the cold input, with two keys at
+     * the earlier JOIN or at the cold one, and with the cold input at the
+     * first JOIN. A comparison that the planner emits here as a FILTER after
+     * the JOINs, with no prefix and one key, is refused as well. */
+    {"right_filter_after_prefix", ".decl a(x:int64,y:int64,w:int64)\n"
+     ".decl c(v:int64,z:int64)\n.decl out(x:int64,z:int64)\n"
+     "out(x,z) :- a(x,y,w), w = 7, a(y,3,u), c(u,z).\n", "c", 2, false,
+     true, "VFJJFMC", 1},
+    {"right_filter_on_cold", ".decl a(x:int64,y:int64,w:int64)\n"
+     ".decl c(v:int64,z:int64)\n.decl out(x:int64,v:int64)\n"
+     "out(x,v) :- a(x,y,w), a(y,v,u), c(u,3).\n", "c", 2, false, true,
+     "VJJC", 1},
+    {"right_filter_keys", ".decl a(x:int64,y:int64,w:int64)\n"
+     ".decl c(v:int64,z:int64)\n.decl out(x:int64,z:int64)\n"
+     "out(x,z) :- a(x,y,w), a(y,w,3), c(y,z).\n", "c", 2, false, true,
+     "VJJC", 1},
+    {"right_filter_cold_keys", ".decl a(x:int64,y:int64,w:int64)\n"
+     ".decl c(v:int64,x:int64,z:int64)\n.decl out(x:int64,z:int64)\n"
+     "out(x,z) :- a(x,y,w), a(y,3,u), c(u,x,z).\n", "c", 3, false, true,
+     "VJJC", 2},
+    {"right_filter_first_cold", ".decl a(x:int64,y:int64,w:int64)\n"
+     ".decl c(v:int64,z:int64)\n.decl out(x:int64,z:int64)\n"
+     "out(x,z) :- a(x,y,w), c(y,z), a(z,3,u).\n", "c", 2, false, true,
+     "VJJC", 1},
+    {"right_compare_after", ".decl a(x:int64,y:int64,w:int64)\n"
+     ".decl c(v:int64,z:int64)\n.decl out(x:int64,z:int64)\n"
+     "out(x,z) :- a(x,y,w), a(y,v,u), u < 9, c(v,z).\n", "c", 2, false,
+     true, "VJJFMC", 1},
     /* A later JOIN with no key, and one with two keys before a COUNT. */
     {"later_cross_join", ".decl c(x:int64,y:int64)\n"
      ".decl r(a:int64,b:int64,c:int64)\n.decl out(x:int64,u:int64)\n"
@@ -2700,8 +2803,8 @@ right_cases(void)
     denial_case(find_qcase("right_after_filter_wide"), VIA_SEAL);
     const char *exact[] = {"right_pair", "right_composite",
                            "right_later_keys", "right_after_filter_join",
-                           "right_second_self"};
-    for (int i = 0; i < 5; i++) {
+                           "right_second_self", "right_second_filter"};
+    for (size_t i = 0; i < sizeof(exact) / sizeof(exact[0]); i++) {
         uint64_t sealed = exact_case(find_qcase(exact[i]), VIA_SEAL);
         uint64_t loaded = exact_case(find_qcase(exact[i]), VIA_LOAD);
         if (sealed != loaded)
@@ -2737,9 +2840,31 @@ right_cases(void)
     denial_case(find_qcase("right_second_self"), VIA_LOAD);
     for (int v = 0; v < 2; v++) {
         via_t via = v ? VIA_LOAD : VIA_SEAL;
-        key_type_case(via);
-        second_absent_case(via);
+        key_type_case(via, false);
+        key_type_case(via, true);
+        second_absent_case(via, "right_second_self");
+        second_absent_case(via, "right_second_filter");
     }
+    /* With a right filter on a resident JOIN before or after the one that
+     * reads the cold input: stops in the scan and in either JOIN, parks in
+     * the earlier JOIN and in the one that reads the copy, faults, a read
+     * cancellation and fault, and the denials on both routes. */
+    for (int mode = 1; mode <= 2; mode++) {
+        stop_case(find_qcase("right_second_filter_few"), VIA_SEAL, mode, 0);
+        stop_case(find_qcase("right_second_filter_few"), VIA_LOAD, mode, 0);
+    }
+    stop_case(find_qcase("right_second_filter_few"), VIA_SEAL, 2, 2);
+    stop_case(find_qcase("right_second_filter_few"), VIA_LOAD, 1, 2);
+    parked_destroy_case(find_qcase("right_second_filter"));
+    parked_first_join_case(find_qcase("right_second_filter"));
+    parked_join_case(find_qcase("right_second_filter"), false);
+    join_fault_case(find_qcase("right_second_filter"));
+    join_fault_case(find_qcase("right_second_filter_then_join"));
+    read_cancel_case(find_qcase("right_second_filter"));
+    read_fault_case(find_qcase("right_second_filter"));
+    denial_case(find_qcase("right_second_filter"), VIA_SEAL);
+    denial_case(find_qcase("right_second_filter"), VIA_LOAD);
+    denial_case(find_qcase("right_second_filter_then_join"), VIA_SEAL);
     cold_both_later_case(true);
     cold_both_later_case(false);
 }

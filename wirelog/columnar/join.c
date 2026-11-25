@@ -1874,14 +1874,17 @@ wl_columnar_join_source_valid(const wl_columnar_join_source_t *src,
     return true;
 }
 
+/* `right_filter` admits a right filter on the JOIN; the controlled cold
+ * right rule passes it for a JOIN whose right input is not the cold one. */
 static bool
 wl_columnar_join_cold_single_shape(const wl_plan_op_t *op,
     const wl_columnar_join_source_t *left,
-    const wl_columnar_join_source_t *right)
+    const wl_columnar_join_source_t *right, bool right_filter)
 {
     if (!left->schema_valid || !right->schema_valid ||
         op->op != WL_PLAN_OP_JOIN || op->key_count != 1 || op->opaque_data ||
-        op->materialized || op->right_filter_expr.size || !op->right_relation ||
+        op->materialized || (!right_filter && op->right_filter_expr.size) ||
+        !op->right_relation ||
         (op->project_count && !op->project_indices) ||
         (op->delta_mode != WL_DELTA_AUTO &&
         op->delta_mode != WL_DELTA_FORCE_FULL))
@@ -1926,10 +1929,10 @@ wl_columnar_join_cold_key_names(const wl_plan_op_t *op)
 static bool
 wl_columnar_join_cold_shape(const wl_plan_op_t *op,
     const wl_columnar_join_source_t *left,
-    const wl_columnar_join_source_t *right)
+    const wl_columnar_join_source_t *right, bool right_filter)
 {
     if (op->key_count == 1) return wl_columnar_join_cold_single_shape(op, left,
-                   right);
+                   right, right_filter);
     if (!left->schema_valid || !right->schema_valid ||
         op->op != WL_PLAN_OP_JOIN || !wl_columnar_join_cold_key_names(op) ||
         op->opaque_data || op->materialized || op->right_filter_expr.size ||
@@ -2057,9 +2060,12 @@ wl_columnar_join_scan_key(const wl_col_session_t *s,
     return wl_columnar_join_auto_key(width, name);
 }
 
+/* With `cold` set, a JOIN whose right input is not `cold` may carry a right
+ * filter, which changes no width or type that the audit computes. */
 static bool
 wl_columnar_join_cold_suffix(const wl_col_session_t *s,
-    const wl_plan_relation_t *rp, uint32_t first, bool reduction)
+    const wl_plan_relation_t *rp, uint32_t first, bool reduction,
+    const char *cold)
 {
     wl_columnar_join_source_t source = wl_columnar_join_source(s,
             rp->ops[0].relation_name, NULL);
@@ -2082,7 +2088,9 @@ wl_columnar_join_cold_suffix(const wl_col_session_t *s,
         if (op->opaque_data || op->materialized || op->relation_name ||
             (op->op != WL_PLAN_OP_FILTER &&
             (op->filter_expr.size || op->filter_expr.data)) ||
-            op->right_filter_expr.size || op->right_filter_expr.data ||
+            ((op->right_filter_expr.size || op->right_filter_expr.data) &&
+            !(cold && op->op == WL_PLAN_OP_JOIN && op->right_relation &&
+            strcmp(op->right_relation, cold) != 0)) ||
             (op->delta_mode != WL_DELTA_AUTO &&
             op->delta_mode != WL_DELTA_FORCE_FULL))
             return false;
@@ -2176,7 +2184,7 @@ wl_columnar_join_aggregate_decode(const wl_col_session_t *s,
             op->group_by_count || op->group_by_indices)) ||
             (i != first && op->op == WL_PLAN_OP_JOIN)) return false;
     }
-    if (!wl_columnar_join_cold_suffix(s, rp, first, true)) return false;
+    if (!wl_columnar_join_cold_suffix(s, rp, first, true, NULL)) return false;
     const wl_plan_op_t *reduce = &rp->ops[reduce_index];
     if (reduce->op != WL_PLAN_OP_REDUCE ||
         (reduce->agg_fn != WIRELOG_AGG_COUNT &&
@@ -2225,7 +2233,8 @@ wl_columnar_join_cold_scan_prefix(const wl_col_session_t *s,
         rp->ops[first].op == WL_PLAN_OP_FILTER)) first++;
     if (first < 2 || first >= rp->op_count ||
         rp->ops[first].op != WL_PLAN_OP_JOIN) return false;
-    if (!wl_columnar_join_cold_suffix(s, rp, first, false)) return false;
+    if (!wl_columnar_join_cold_suffix(s, rp, first, false, NULL))
+        return false;
     if (join_index) *join_index = first;
     return true;
 }
@@ -2245,14 +2254,14 @@ wl_columnar_join_cold_later_suffix(const wl_col_session_t *s,
     if (variable->opaque_data || variable->materialized ||
         (variable->delta_mode != WL_DELTA_AUTO &&
         variable->delta_mode != WL_DELTA_FORCE_FULL)) return false;
-    return wl_columnar_join_cold_suffix(s, rp, 1, false);
+    return wl_columnar_join_cold_suffix(s, rp, 1, false, NULL);
 }
 
-/* The same complete prefix contract is used before retirement and at runtime.
-* Its first JOIN creates an ordinary resident entry for the audited suffix. */
-bool
-wl_columnar_join_cold_prefix(const wl_col_session_t *s,
-    const wl_plan_relation_t *rp)
+/* With `cold` set, a JOIN whose right input is not `cold` may carry a right
+ * filter; a rule with a JOIN on two keys or more is then refused. */
+static bool
+wl_columnar_join_cold_prefix_audit(const wl_col_session_t *s,
+    const wl_plan_relation_t *rp, const char *cold)
 {
     if (!rp || !rp->ops || rp->op_count < 3 ||
         rp->ops[0].op != WL_PLAN_OP_VARIABLE || !rp->ops[0].relation_name ||
@@ -2261,7 +2270,7 @@ wl_columnar_join_cold_prefix(const wl_col_session_t *s,
     for (uint32_t i = 0; i < rp->op_count; i++)
         composite |= rp->ops[i].op == WL_PLAN_OP_JOIN &&
             rp->ops[i].key_count > 1;
-    if (composite) return wl_columnar_join_cold_later_suffix(s, rp);
+    if (composite) return !cold && wl_columnar_join_cold_later_suffix(s, rp);
     for (uint32_t i = 0; i < rp->op_count; i++) {
         const wl_plan_op_t *op = &rp->ops[i];
         if (op->opaque_data || op->materialized ||
@@ -2275,7 +2284,9 @@ wl_columnar_join_cold_prefix(const wl_col_session_t *s,
             rp->ops[0].relation_name, NULL);
     wl_columnar_join_source_t right = wl_columnar_join_source(s,
             rp->ops[1].right_relation, NULL);
-    if (!wl_columnar_join_cold_shape(&rp->ops[1], &left, &right)) return false;
+    if (!wl_columnar_join_cold_shape(&rp->ops[1], &left, &right,
+        cold && rp->ops[1].right_relation &&
+        strcmp(rp->ops[1].right_relation, cold) != 0)) return false;
     uint64_t width = left.width;
     for (uint32_t i = 1; i < rp->op_count; i++) {
         const wl_plan_op_t *op = &rp->ops[i];
@@ -2283,7 +2294,8 @@ wl_columnar_join_cold_prefix(const wl_col_session_t *s,
             width = op->project_count;
         } else if (op->op == WL_PLAN_OP_JOIN) {
             if (op->key_count != 1 || !op->right_relation ||
-                op->right_filter_expr.size ||
+                (op->right_filter_expr.size &&
+                !(cold && strcmp(op->right_relation, cold) != 0)) ||
                 (op->project_count && !op->project_indices)) return false;
             wl_columnar_join_source_t rhs = wl_columnar_join_source(s,
                     op->right_relation, NULL);
@@ -2301,6 +2313,34 @@ wl_columnar_join_cold_prefix(const wl_col_session_t *s,
         }
     }
     return true;
+}
+
+/* The same complete prefix contract is used before retirement and at runtime.
+* Its first JOIN creates an ordinary resident entry for the audited suffix. */
+bool
+wl_columnar_join_cold_prefix(const wl_col_session_t *s,
+    const wl_plan_relation_t *rp)
+{
+    return wl_columnar_join_cold_prefix_audit(s, rp, NULL);
+}
+
+/* The prefix audit with one key and the suffix audit from the rule's second
+ * op, each admitting a right filter on a JOIN whose right input is not the
+ * cold input `cold`. */
+bool
+wl_columnar_join_cold_later_filtered(const wl_col_session_t *s,
+    const wl_plan_relation_t *rp, const char *cold)
+{
+    if (!s || !rp || !rp->ops || rp->op_count < 3 || !cold ||
+        rp->ops[0].op != WL_PLAN_OP_VARIABLE || !rp->ops[0].relation_name ||
+        rp->ops[1].op != WL_PLAN_OP_JOIN)
+        return false;
+    const wl_plan_op_t *variable = &rp->ops[0];
+    if (variable->opaque_data || variable->materialized ||
+        (variable->delta_mode != WL_DELTA_AUTO &&
+        variable->delta_mode != WL_DELTA_FORCE_FULL)) return false;
+    return wl_columnar_join_cold_prefix_audit(s, rp, cold) &&
+           wl_columnar_join_cold_suffix(s, rp, 1, false, cold);
 }
 
 #ifdef WL_SESSION_TEST_HOOKS
@@ -2332,7 +2372,7 @@ wl_columnar_join_cold_run(wl_col_session_t *sess, const wl_plan_op_t *op,
     };
     int rc = wl_columnar_session_cold_execution_check(sess);
     if (rc || left->is_delta || !wl_columnar_join_cold_shape(op, &sources[0],
-        &sources[1]))
+        &sources[1], false))
         return wl_columnar_join_dispose_left(stack, left, rc ? rc : ENOTSUP);
     uint32_t lk = wl_columnar_join_source_key(&sources[0],
             op->left_keys ? op->left_keys[0] : NULL);
