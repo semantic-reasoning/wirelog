@@ -6909,6 +6909,11 @@ uint32_t wl_columnar_join_cold_source_key(const wl_col_session_t *s,
     const char *relation, const char *key);
 bool wl_columnar_join_cold_prefix(const wl_col_session_t *s,
     const wl_plan_relation_t *rp);
+/* The uncontrolled cold JOIN suffix audit from a JOIN at the rule's second
+ * op, which compares the key types of every JOIN whose right input is
+ * resident or cold (#2301). */
+bool wl_columnar_join_cold_later_suffix(const wl_col_session_t *s,
+    const wl_plan_relation_t *rp);
 int wl_columnar_join_cold_left(wl_col_session_t *s,
     const wl_plan_relation_t *rp,
     eval_stack_t *stack);
@@ -8629,6 +8634,8 @@ typedef struct wl_columnar_eval_plan_numeric_attempt {
      * of a cold JOIN right input (#2301). */
     bool cold_right_held;
     col_rel_t **cold_right_output;
+    /* The JOIN the held copy was scanned for; 0 when none is held. */
+    uint32_t cold_right_cursor;
     void *join_host;
     uint64_t join_host_initialized_bytes;
     uint32_t join_host_tail_count;
@@ -9232,10 +9239,10 @@ int wl_columnar_eval_stack_composed_cold_output(
 int wl_columnar_eval_stack_composed_cold_install(
     wl_columnar_eval_stack_cleanup_frame_t *, wl_col_session_t *,
     wl_columnar_eval_plan_numeric_attempt_t *);
-/* The frame's cold right slot (#2301): lend it to the right scan, give the
- * controlled JOIN after the left input's MAP/FILTER prefix, if any, the
- * scanned copy (NULL when the owner holds no slot), and drop the copy under
- * separate funding once no child holds it. */
+/* The frame's cold right slot (#2301): lend it to the right scan of a JOIN,
+ * or refuse with ENOTSUP an earlier JOIN's output with no column, give that
+ * JOIN the scanned copy (NULL when the owner holds no slot), and drop the
+ * copy under separate funding once no child holds it. */
 int wl_columnar_eval_stack_composed_cold_right_output(
     wl_columnar_eval_stack_cleanup_frame_t *, wl_col_session_t *,
     wl_columnar_eval_plan_numeric_attempt_t *);

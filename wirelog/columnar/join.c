@@ -2236,6 +2236,24 @@ wl_columnar_join_cold_scan_prefix(const wl_col_session_t *s,
     return true;
 }
 
+/* The suffix audit from a JOIN at the rule's second op: every op from that
+ * JOIN on, and for a JOIN whose right input is resident or cold the type of
+ * each left key against that of its right key. */
+bool
+wl_columnar_join_cold_later_suffix(const wl_col_session_t *s,
+    const wl_plan_relation_t *rp)
+{
+    if (!s || !rp || !rp->ops || rp->op_count < 3 ||
+        rp->ops[0].op != WL_PLAN_OP_VARIABLE || !rp->ops[0].relation_name ||
+        rp->ops[1].op != WL_PLAN_OP_JOIN)
+        return false;
+    const wl_plan_op_t *variable = &rp->ops[0];
+    if (variable->opaque_data || variable->materialized ||
+        (variable->delta_mode != WL_DELTA_AUTO &&
+        variable->delta_mode != WL_DELTA_FORCE_FULL)) return false;
+    return wl_columnar_join_cold_suffix(s, rp, 1, false);
+}
+
 /* The same complete prefix contract is used before retirement and at runtime.
 * Its first JOIN creates an ordinary resident entry for the audited suffix. */
 bool
@@ -2249,13 +2267,7 @@ wl_columnar_join_cold_prefix(const wl_col_session_t *s,
     for (uint32_t i = 0; i < rp->op_count; i++)
         composite |= rp->ops[i].op == WL_PLAN_OP_JOIN &&
             rp->ops[i].key_count > 1;
-    if (composite) {
-        const wl_plan_op_t *variable = &rp->ops[0];
-        if (!s || rp->ops[1].op != WL_PLAN_OP_JOIN || variable->opaque_data ||
-            variable->materialized || (variable->delta_mode != WL_DELTA_AUTO &&
-            variable->delta_mode != WL_DELTA_FORCE_FULL)) return false;
-        return wl_columnar_join_cold_suffix(s, rp, 1, false);
-    }
+    if (composite) return wl_columnar_join_cold_later_suffix(s, rp);
     for (uint32_t i = 0; i < rp->op_count; i++) {
         const wl_plan_op_t *op = &rp->ops[i];
         if (op->opaque_data || op->materialized ||

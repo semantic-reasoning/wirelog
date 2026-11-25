@@ -4322,10 +4322,10 @@ wl_columnar_eval_stack_composed_cold_install(
 }
 
 /* Lend the frame's cold right slot to the controlled cold scan of the
- * right input of the rule's first JOIN (#2301), which follows the left
- * input's VARIABLE and its MAP/FILTER prefix, if any. The left input, or
- * the prefix's output, is already on the stack; the slot stays held until
- * the RELEASE drop, after every child that read it has finished. */
+ * right input of a JOIN of the rule (#2301), at or after the end of the left
+ * input's MAP/FILTER prefix. The output of the ops before that JOIN is
+ * already on the stack; the slot stays held, bound to that JOIN, until the
+ * RELEASE drop, after every child that read it has finished. */
 int
 wl_columnar_eval_stack_composed_cold_right_output(
     wl_columnar_eval_stack_cleanup_frame_t *frame, wl_col_session_t *sess,
@@ -4338,10 +4338,20 @@ wl_columnar_eval_stack_composed_cold_right_output(
         || owner->cold_right_held || owner->cold.identity
         || owner->source_slot_borrowed || owner->source_initialized
         || owner->source_bare
-        || owner->cursor != wl_columnar_ops_cold_scan_end(owner->plan, 0)
+        || owner->cursor < wl_columnar_ops_cold_scan_end(owner->plan, 0)
+        || owner->cursor >= owner->plan->op_count
+        || owner->plan->ops[owner->cursor].op != WL_PLAN_OP_JOIN
         || frame->stack.top != 1
         || !wl_columnar_eval_stack_unary_entry_inert(&frame->cold_right))
         return EBUSY;
+    /* After an earlier JOIN the left entry is that JOIN's output, which has
+     * no declared schema to fall back on: over a left input never inserted
+     * it has no column, and the uncontrolled JOIN of a cold right input
+     * refuses such a left input at its STEP. So does this one. */
+    const col_rel_t *left = frame->stack.items[0].rel;
+    if (owner->cursor > wl_columnar_ops_cold_scan_end(owner->plan, 0)
+        && (!left || !left->ncols))
+        return ENOTSUP;
     for (unsigned i = 0; i < 4; ++i) {
         rc = wl_columnar_eval_stack_attempt_charge(owner->control,
                 owner->attempt_id, 192);
@@ -4353,6 +4363,7 @@ wl_columnar_eval_stack_composed_cold_right_output(
     wl_columnar_eval_stack_unary_entry_clear(&frame->cold_right);
     frame->cold_right.owned = true;
     owner->cold_right_output = &frame->cold_right.rel;
+    owner->cold_right_cursor = owner->cursor;
     owner->cold_right_held = true;
     return 0;
 }
@@ -4371,7 +4382,7 @@ wl_columnar_eval_stack_composed_cold_right(
     const wl_columnar_eval_plan_numeric_attempt_t *n = owner;
     if (!n->composed_mode || !n->cold_right_held) return 0;
     if (n->cold.identity || !n->plan
-        || n->cursor != wl_columnar_ops_cold_scan_end(n->plan, 0)
+        || n->cursor != n->cold_right_cursor
         || n->cursor >= n->plan->op_count
         || op != &n->plan->ops[n->cursor] || op->op != WL_PLAN_OP_JOIN
         || !frame->cold_right.owned || !frame->cold_right.rel)
@@ -4405,6 +4416,7 @@ wl_columnar_eval_stack_composed_cold_right_drop(
     if (rc) return rc;
     wl_columnar_eval_stack_unary_entry_clear(&frame->cold_right);
     owner->cold_right_output = NULL;
+    owner->cold_right_cursor = 0;
     owner->cold_right_held = false;
     return 0;
 }
