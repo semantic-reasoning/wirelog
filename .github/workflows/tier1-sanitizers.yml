@@ -74,14 +74,17 @@ jobs:
 
       # -Dexamples=false: skip the examples/ demos under sanitizers (each re-compiles the
       # full wirelog_sources instrumented); they are already covered by the non-sanitized legs.
+      # Match main/PR: retain assertions and instrumentation without the
+      # unoptimized profile that exhausted lifecycle-test watchdogs.
       - name: Configure ASan/UBSan
         run: >
           meson setup builddir-san
           -Db_sanitize=address,undefined
           -Db_lundef=false
+          -Db_lto=false
           -Dtests=true
           -Dexamples=false
-          --buildtype=debug
+          --buildtype=debugoptimized
         env:
           CC: ${{ matrix.cc }}
 
