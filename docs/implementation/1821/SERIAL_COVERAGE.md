@@ -4008,16 +4008,18 @@ both routes refuse a grouped COUNT after a later JOIN that reads a cold right
 input.
 
 Open after this unit: a third input before a later JOIN that reads a cold right
-input, which the registry bound refuses; a FILTER between the JOINs with no
-prefix and one key, which `wl_columnar_join_cold_prefix` refuses; a self-JOIN
-of the cold input and two cold inputs of one rule, which for a later JOIN under
-the registry bound comes down to that self-JOIN; an aggregate after a later
-JOIN; a source with an INLINE compound column before a JOIN; a SNAPSHOT or an
-observed STEP over a cold input; the program refusals of the earlier units; and
-more than one worker. Limits: for a cold right input of a later JOIN, no case
-has a MAP that the planner emits between the JOINs, an earlier JOIN with a
-projection over a resident input never inserted, a key type other than INT64
-and STRING declared on the resident input, or a JOIN batch size
+input, which the registry bound refuses; a self-JOIN of the cold input and two
+cold inputs of one rule, which for a later JOIN under the registry bound comes
+down to that self-JOIN; an aggregate after a later JOIN; a source with an
+INLINE compound column before a JOIN; a SNAPSHOT or an observed STEP over a
+cold input; the program refusals of the earlier units; and more than one
+worker. A comparison in the body of such a rule with no prefix, which in the
+cases tried the planner emits as a FILTER after the JOINs, is refused with one
+key by the uncontrolled seal as well (`right_compare_after`, from the next
+section). Limits: for a cold right input of a later JOIN, no case has a MAP
+that the planner emits between the JOINs, an earlier JOIN with a projection
+over a resident input never inserted, a key type other than INT64 and STRING
+declared on the resident input, or a JOIN batch size
 (`WIRELOG_JOIN_BATCH_BYTES`); in the cases tried, a resident input declared
 with an INT32 column and filled by inserts carries no column types, so both
 routes read its keys as INT64 and admit such a rule. A cancellation at every
@@ -4028,4 +4030,71 @@ uncontrolled route admits and completes; one that a review run found has no
 prefix and a constant in a column of the earlier JOIN's right input that is not
 its key (`a(x,y,w), a(y,3,u), c(u,z)`), which the planner emits as a right
 filter of that JOIN and the one-key branch of `wl_columnar_join_cold_prefix`
-refuses.
+refuses; the next section admits it.
+
+### Right filters beside a cold right input of a later JOIN in controlled single-worker sessions (#2301)
+
+A controlled STEP now also runs a rule of the previous section with a right
+filter, a constant in the right input of a JOIN whose right input is not the
+cold one, on one or more JOINs before or after the one that reads the cold
+input, when the rule has no MAP/FILTER prefix and every JOIN has one key. The
+uncontrolled seal admits such a rule and its STEP runs the filtered JOIN as an
+ordinary JOIN. Both audits of the previous section refuse a right filter on any
+JOIN, so `wl_columnar_session_cold_right_rule` refused the rule under control.
+When the rule has a right filter it now requires instead the JOIN that reads
+the cold input to come after the first and the new
+`wl_columnar_join_cold_later_filtered` to pass: the one-key branch of
+`wl_columnar_join_cold_prefix` and `wl_columnar_join_cold_suffix` from the
+rule's second op, each run with a right filter admitted on a JOIN whose right
+input is not the cold one. A right filter changes no width or column type that
+the audits compute, and the suffix audit still compares the key types of the
+JOIN that reads the cold input. A rule with a JOIN on two keys or more, with a
+prefix or with a right filter on the JOIN that reads the cold input stays
+refused, as it is uncontrolled in the cases tried, and so does one with a
+REDUCE, which `wl_columnar_join_aggregate_decode` refuses with a right filter.
+Their uncontrolled callers name no cold input, and the audits are then those of
+the previous section; a rule with no right filter takes the previous section's
+predicate unchanged.
+
+No operator changes. The filtered JOIN runs as the controlled JOIN attempt,
+which applies the right filter to its resident right input as it does in a
+resident controlled rule; the cold scan and the slot of the previous section do
+not read the filter. When no resident row passes the filter, the earlier JOIN's
+output keeps its columns with no row, so neither the uncontrolled JOIN of the
+cold input nor `wl_columnar_eval_stack_composed_cold_right_output` refuses it,
+and both STEPs complete with no head row.
+
+`evaluation_cold_right_sources` adds to the comparison with an uncontrolled
+session, on the seal and the loading route, an INT64 constant at the earlier
+JOIN over 6 and 20 cold rows, one that no resident row matches, two filtered
+JOINs before the one that reads the cold input, a filtered JOIN after it and a
+STRING constant from program facts, whose two head rows the test checks; the
+cases with generated rows are also compared with the sessions that keep both
+inputs resident. With the earlier JOIN filtered, both stops at every checkpoint
+of the scan on both routes, a work-limit stop at every JOIN checkpoint on the
+seal route and a cancellation at every one on the loading route, a park inside
+the earlier JOIN and inside the one that reads the copy, an allocation that a
+JOIN cannot make, a cancellation from inside a spill read, a read fault and the
+governor denials on both routes behave as without the filter, the allocation
+fault and the seal route denials also with the filtered JOIN after the cold
+one; the full STEP over 20 cold rows consumes the same work on both routes, a
+limit one unit lower stopping it; a STRING left key at the later JOIN from an
+edited plan is refused under control while the uncontrolled STEP returns
+ENOTSUP; and over a resident input declared but never inserted both STEPs
+return ENOTSUP. Both sessions refuse a right filter after a prefix, on the JOIN
+that reads the cold input, with two keys at the earlier JOIN or at the cold
+one, and with the cold input at the first JOIN.
+
+Open after this unit: those of the previous section. Limits: no admitted case
+has a right filter on a column that is also the JOIN's key, a repeated variable
+in a resident JOIN's right input, which the generated rows never satisfy, or a
+filtered JOIN whose right input is a resident input other than the rule's
+first, which under control needs a third input that the registry bound refuses.
+In `wl_columnar_join_cold_later_filtered` and
+`wl_columnar_session_cold_right_rule`, the refusals of a JOIN on two keys with
+a right filter, of a right filter on the JOIN that reads the cold input and of
+the cold input at the first JOIN with a right filter elsewhere are made again
+by the uncontrolled seal audit, which the controlled session also runs, so the
+refusal tests do not tell them apart; nor do they tell apart the right filter
+that the prefix audit admits at the shape audit of the rule's first JOIN, which
+its loop over the JOINs checks again.

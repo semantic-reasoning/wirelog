@@ -737,3 +737,16 @@ single-worker sessions (#2301)". A third input before such a JOIN, a self-JOIN
 of the cold input, two cold inputs of one rule, an aggregate after a later
 JOIN, a SNAPSHOT or an observed STEP over a cold input, the program refusals of
 the sixth bundle and more than one worker stay open.
+
+A sixteenth bundle admits, under control, a right filter on a JOIN whose right
+input is not the cold input, before or after a later JOIN that reads a cold
+right input, in a rule with no prefix and one key at every JOIN, which the
+uncontrolled route admits at seal and runs as an ordinary JOIN. The two audits
+of the fifteenth bundle run with such a filter admitted, and refuse it
+everywhere else as before. No operator changes: the filtered JOIN runs as the
+controlled JOIN attempt with its right filter; see "Right filters beside a cold
+right input of a later JOIN in controlled single-worker sessions (#2301)". A
+third input before such a JOIN, a self-JOIN of the cold input, two cold inputs
+of one rule, an aggregate after a later JOIN, a SNAPSHOT or an observed STEP
+over a cold input, the program refusals of the sixth bundle and more than one
+worker stay open.
