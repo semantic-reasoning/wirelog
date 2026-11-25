@@ -2529,12 +2529,17 @@ wl_columnar_session_cold_join_rule(const wl_col_session_t *sess,
  * with one key compares no key type of a later JOIN, which the uncontrolled
  * route compares only at its STEP, so a later JOIN after no prefix must
  * also pass the uncontrolled cold JOIN suffix audit from the first JOIN on,
- * which compares them. A REDUCE may follow only as the rule's next to last
- * op, and the rule must then instead pass the uncontrolled cold JOIN
- * aggregate audit with this JOIN as its first, with an operand type the
- * controlled REDUCE accepts. The composed attempt runs the ops before this
- * JOIN over the resident input, copies the cold input whole into the
- * frame's cold right slot, and the controlled JOIN reads the copy. */
+ * which compares them. Those audits refuse a right filter. A rule with one
+ * that has no prefix, a later JOIN reading the input and one key at every
+ * JOIN must instead pass both audits as they run with a right filter
+ * admitted on a JOIN whose right input is not this one, which the
+ * uncontrolled route runs as an ordinary JOIN. A REDUCE may follow only as
+ * the rule's next to last op, and the rule must then instead pass the
+ * uncontrolled cold JOIN aggregate audit with this JOIN as its first, with
+ * an operand type the controlled REDUCE accepts. The composed attempt runs
+ * the ops before this JOIN over the resident input, copies the cold input
+ * whole into the frame's cold right slot, and the controlled JOIN reads the
+ * copy. */
 static bool
 wl_columnar_session_cold_right_rule(const wl_col_session_t *sess,
     const wl_plan_relation_t *rp, const char *name, uint32_t at)
@@ -2551,16 +2556,21 @@ wl_columnar_session_cold_right_rule(const wl_col_session_t *sess,
         return false;
     uint32_t last = rp->op_count - 2, join = 0;
     bool reduction = rp->op_count >= 4 &&
-        rp->ops[last].op == WL_PLAN_OP_REDUCE;
-    for (uint32_t i = 0; i < rp->op_count; i++)
+        rp->ops[last].op == WL_PLAN_OP_REDUCE, filtered = false;
+    for (uint32_t i = 0; i < rp->op_count; i++) {
         if ((rp->ops[i].op == WL_PLAN_OP_REDUCE &&
             (!reduction || i != last)) ||
             (rp->ops[i].op == WL_PLAN_OP_JOIN && !rp->ops[i].key_count))
             return false;
+        filtered |= rp->ops[i].right_filter_expr.size ||
+            rp->ops[i].right_filter_expr.data;
+    }
     if (reduction ? !wl_columnar_join_aggregate_decode(sess, rp, &join) ||
         join != at ||
         rp->ops[last].agg_operand_type > WL_PLAN_AGG_OPERAND_FLOAT :
         !(first_join >= 2 ? wl_columnar_join_cold_scan_prefix(sess, rp, NULL) :
+        filtered ? at > first_join &&
+        wl_columnar_join_cold_later_filtered(sess, rp, name) :
         wl_columnar_join_cold_prefix(sess, rp) &&
         (at == first_join || wl_columnar_join_cold_later_suffix(sess, rp))))
         return false;
