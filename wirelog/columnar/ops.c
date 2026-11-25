@@ -135,7 +135,6 @@ col_op_variable(const wl_plan_op_t *op, eval_stack_t *stack,
      *
      * Issue #158 extension: When retraction_seeded and iteration == 0,
      * look for $r$<name> (retraction delta) instead of $d$<name> */
-    char dname[256];
     col_rel_t *delta = NULL;
 
     if (sess->retraction_seeded && sess->current_iteration == 0
@@ -143,12 +142,12 @@ col_op_variable(const wl_plan_op_t *op, eval_stack_t *stack,
         /* Retraction mode (left pass): look for $r$<name> retraction delta.
          * Issue #472: Skip during right pass — VARIABLE loads full relation
          * so JOIN/SEMIJOIN can use $r$ on the right side instead. */
-        if (retraction_rel_name(op->relation_name, dname, sizeof(dname)) == 0)
-            delta = session_find_rel(sess, dname);
+        delta = wl_columnar_session_find_prefixed(sess, "$r$",
+                op->relation_name);
     } else {
         /* Normal mode: look for $d$<name> insertion delta */
-        snprintf(dname, sizeof(dname), "$d$%s", op->relation_name);
-        delta = session_find_rel(sess, dname);
+        delta = wl_columnar_session_find_prefixed(sess, "$d$",
+                op->relation_name);
     }
 
     if (op->delta_mode == WL_DELTA_FORCE_EMPTY

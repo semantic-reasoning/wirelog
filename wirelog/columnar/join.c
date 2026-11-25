@@ -1480,15 +1480,13 @@ wl_columnar_join_select_right(const wl_plan_op_t *op,
     };
 
     if (op->delta_mode == WL_DELTA_FORCE_DELTA && op->right_relation) {
-        char rdname[256];
-        snprintf(rdname, sizeof(rdname), "$d$%s", op->right_relation);
-        col_rel_t *rdelta = session_find_rel(sess, rdname);
+        col_rel_t *rdelta = wl_columnar_session_find_prefixed(sess, "$d$",
+                op->right_relation);
         /* At iteration zero, seeded retractions use $r$ when $d$ is absent. */
         if (!rdelta && sess->retraction_seeded
             && sess->current_iteration == 0) {
-            if (retraction_rel_name(op->right_relation, rdname,
-                sizeof(rdname)) == 0)
-                rdelta = session_find_rel(sess, rdname);
+            rdelta = wl_columnar_session_find_prefixed(sess, "$r$",
+                    op->right_relation);
         }
         if (rdelta && rdelta->nrows > 0) {
             selection.right = rdelta;
@@ -1500,9 +1498,8 @@ wl_columnar_join_select_right(const wl_plan_op_t *op,
     } else if (op->delta_mode != WL_DELTA_FORCE_FULL && op->right_relation
         && (!left_is_delta || (sess->tdd_outbound_only_active
         && sess->current_iteration > 0))) {
-        char rdname[256];
-        snprintf(rdname, sizeof(rdname), "$d$%s", op->right_relation);
-        col_rel_t *rdelta = session_find_rel(sess, rdname);
+        col_rel_t *rdelta = wl_columnar_session_find_prefixed(sess, "$d$",
+                op->right_relation);
         if (rdelta && (((rdelta->nrows > 0
             && rdelta->nrows < right->nrows) || (rdelta->nrows > 0
             && sess->tdd_subpass_active))
@@ -1517,14 +1514,11 @@ wl_columnar_join_select_right(const wl_plan_op_t *op,
     if (!selection.force_empty && !selection.used_right_delta
         && sess->retraction_right_pass && sess->current_iteration == 0
         && op->right_relation) {
-        char rdname[256];
-        if (retraction_rel_name(op->right_relation, rdname,
-            sizeof(rdname)) == 0) {
-            col_rel_t *rdelta = session_find_rel(sess, rdname);
-            if (rdelta && rdelta->nrows > 0) {
-                selection.right = rdelta;
-                selection.used_right_delta = true;
-            }
+        col_rel_t *rdelta = wl_columnar_session_find_prefixed(sess, "$r$",
+                op->right_relation);
+        if (rdelta && rdelta->nrows > 0) {
+            selection.right = rdelta;
+            selection.used_right_delta = true;
         }
     }
 
@@ -5718,7 +5712,7 @@ wl_columnar_join_attempt_lookup(wl_col_session_t *session, const char *name,
                     WL_COLUMNAR_JOIN_ATTEMPT_CELL_WORK);
             if (rc) return rc;
             char wanted = !delta ? name[byte]
-                : byte < 3 ? "$d$"[byte] : byte == 255 ? '\0' : name[byte - 3];
+                : byte < 3 ? "$d$"[byte]  : name[byte - 3];
             char value = actual[byte];
             bool match = wanted == value;
             rc = wl_columnar_join_attempt_tail(control, id, 6, byte);

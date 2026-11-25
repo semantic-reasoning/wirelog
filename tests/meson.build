@@ -8412,7 +8412,7 @@ test_evaluation_materialized_selectors_exe = executable(
   dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
   link_with: [testlib_prod],
 )
-foreach selector_case : ['hash']
+foreach selector_case : ['hash', 'cache', 'natural']
   test('evaluation_materialized_selectors_' + selector_case,
        test_evaluation_materialized_selectors_exe, args: [selector_case],
        suite: ['unit', 'tsan', 'evaluation_join_hosts'], timeout: 120)

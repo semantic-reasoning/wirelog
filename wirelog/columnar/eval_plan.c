@@ -238,9 +238,7 @@ wl_columnar_eval_plan_var_skip_scan(const wl_plan_relation_t *rplan,
 static bool
 session_has_delta_rows(void *ctx, const char *relation_name)
 {
-    char dname[256];
-    snprintf(dname, sizeof(dname), "$d$%s", relation_name);
-    col_rel_t *d = session_find_rel((wl_col_session_t *)ctx, dname);
+    col_rel_t *d = wl_columnar_session_find_prefixed(ctx, "$d$", relation_name);
     return d && d->nrows > 0;
 }
 
@@ -289,9 +287,8 @@ wl_columnar_eval_plan_body(const wl_plan_relation_t *rplan, eval_stack_t *stack,
             if (!next_is_join
                 && wl_columnar_eval_plan_var_skip_scan(rplan, i,
                 session_has_delta_rows, sess)) {
-                char dname[256];
-                snprintf(dname, sizeof(dname), "$d$%s", op->relation_name);
-                col_rel_t *d = session_find_rel(sess, dname);
+                col_rel_t *d = wl_columnar_session_find_prefixed(sess, "$d$",
+                        op->relation_name);
                 if (!d || d->nrows == 0) {
                     /* Check: is this relation also used as a JOIN right_relation
                      * anywhere in this plan? If so, it's a shared EDB (e.g.
@@ -944,16 +941,10 @@ has_empty_forced_delta(const wl_plan_relation_t *rp, wl_col_session_t *sess,
             rel_name = op->right_relation;
 
         if (rel_name) {
-            char dname[256];
-            if (sess->retraction_seeded && iteration == 0) {
-                /* Retraction mode: look for $r$<name> */
-                if (retraction_rel_name(rel_name, dname, sizeof(dname)) != 0)
-                    return false; /* Buffer overflow, skip check */
-            } else {
-                /* Normal mode: look for $d$<name> */
-                snprintf(dname, sizeof(dname), "$d$%s", rel_name);
-            }
-            col_rel_t *d = session_find_rel(sess, dname);
+            const char *prefix = sess->retraction_seeded && iteration == 0
+                ? "$r$" : "$d$";
+            col_rel_t *d = wl_columnar_session_find_prefixed(sess, prefix,
+                    rel_name);
             if (!d || d->nrows == 0)
                 return true; /* Found empty forced-delta */
         }
@@ -1581,8 +1572,8 @@ wl_columnar_eval_plan_numeric_attempt_begin(
 
 /* Each lookup action visits one NULL slot or one name byte. The registry,
  * names and descriptors are immutable under the serialized host contract.
- * The virtual delta name matches snprintf(dname,256,"$d$%s",name), including
- * its 252-byte source-name truncation; full names remain unbounded. */
+ * The virtual delta name includes the complete prefix and source name,
+ * one already charged byte per action. */
 static col_rel_t *
 wl_columnar_eval_plan_numeric_source_candidate(
     wl_columnar_eval_plan_numeric_attempt_t *record, uint32_t slot,
@@ -1636,7 +1627,6 @@ wl_columnar_eval_plan_numeric_source_lookup(
     char wanted;
     if (!delta) wanted = name[byte];
     else if (byte < 3) wanted = "$d$"[byte];
-    else if (byte == 255) wanted = '\0';
     else wanted = name[byte - 3];
     char actual = actual_name[byte];
     if (actual != wanted) {
@@ -2629,7 +2619,6 @@ wl_columnar_eval_plan_composed_source_lookup(
     char wanted;
     if (!delta) wanted = name[byte];
     else if (byte < 3) wanted = "$d$"[byte];
-    else if (byte == 255) wanted = '\0';
     else wanted = name[byte - 3];
     char actual = actual_name[byte];
     if (actual != wanted) {

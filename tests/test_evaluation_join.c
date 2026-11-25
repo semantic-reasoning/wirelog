@@ -3130,9 +3130,184 @@ inline_admission_boundaries(void)
         }
 }
 
+/* Actual paid JOIN registry consumption; these are admitted direct consumers,
+ * not natural immutable append producers or a controlled materialized cache. */
+static unsigned long_lookup_slot, long_lookup_late;
+static uint64_t long_lookup_spent;
+static bool long_lookup_cancel, long_lookup_expected_delta;
+
+static void
+long_lookup_checkpoint(wl_evaluation_control_t *control, unsigned phase,
+    uint64_t progress)
+{
+    if (phase == 5) long_lookup_slot = (unsigned)progress;
+    if (phase == 6 && long_lookup_slot == 1 && progress == 257) {
+        ++long_lookup_late;
+        CHECK(!wl_evaluation_control_test_active_consumed(control,
+            wl_evaluation_control_active_attempt_id(control),
+            &long_lookup_spent));
+        if (long_lookup_cancel) wl_evaluation_control_request_cancel(control);
+    }
+    if (phase == 24) {
+        selector_checkpoint(control, phase, progress);
+        wl_columnar_filter_context_t *ctx = NULL;
+        CHECK(!wl_columnar_eval_stack_filter_context(selector_fixture->frame,
+            &ctx));
+        CHECK(ctx->join_right.descriptor_view_generation ==
+            selector_right->view_generation
+            && ctx->join_result_is_delta == long_lookup_expected_delta);
+    }
+}
+
+static void
+long_join_setup(fixture_t *f, char *name, char *delta_name, unsigned length,
+    bool decoy_only, bool empty_delta, bool full)
+{
+    memset(name, 'a', length); name[length] = '\0';
+    snprintf(delta_name, 516, "$d$%s", name);
+    fixture_init(f, 2, 1, 0, 0);
+    col_rel_destroy(f->registry[0]);
+    f->registry[0] = relation_new(name, 2, 0);
+    const int64_t rows[][2] = {{7, 17}, {8, 18}, {9, 19}};
+    for (unsigned i = 0; i < 3;
+        ++i) CHECK(!col_rel_append_row(f->registry[0], rows[i]));
+    char decoy[256]; memcpy(decoy, delta_name, 255); decoy[255] = '\0';
+    f->registry[1] = relation_new(decoy_only ? decoy : delta_name, 2, 0);
+    const int64_t value[] = {decoy_only ? 777 : 37, decoy_only ? 778 : 47};
+    if (!empty_delta) CHECK(!col_rel_append_row(f->registry[1], value));
+    f->session.nrels = 2; f->session.delta_seeded = true;
+    f->op.right_relation = name;
+    f->op.delta_mode = full ? WL_DELTA_FORCE_FULL : WL_DELTA_FORCE_DELTA;
+}
+
+static void
+long_join_literal(fixture_t *f, unsigned rows, int64_t first, bool delta)
+{
+    eval_stack_t *stack = wl_columnar_eval_stack_cleanup_stack(f->frame);
+    CHECK(stack && stack->top == 1 && stack->items[0].owned
+        && stack->items[0].is_delta == delta);
+    const col_rel_t *r = stack->items[0].rel;
+    CHECK(r && r->ncols == 4 && r->nrows == rows);
+    for (uint32_t i = 0; i < rows; ++i) {
+        CHECK(r->columns[0][i] == 0 && r->columns[1][i] == 1);
+        CHECK(r->columns[2][i] == first + i &&
+            r->columns[3][i] == first + i + 10);
+    }
+}
+
+static void
+long_join_retry_frame(fixture_t *f)
+{
+    int cause = f->status.semantic_result;
+    CHECK(f->phase == 3 && !wl_columnar_eval_stack_cleanup_finish(&f->frame));
+    CHECK(wl_evaluation_control_finish(f->operation, &f->operation_owner, cause,
+        0) == cause);
+    wl_evaluation_control_report_t report;
+    CHECK(!wl_evaluation_control_report(f->operation, &report));
+    CHECK(!wl_evaluation_control_report(f->operation, &report)
+        && report.result == cause && !report.execution_status
+        && report.stop_reason == cause && !report.cleanup_status);
+    CHECK(!wl_evaluation_control_reset(f->operation)
+        && !wl_evaluation_control_configure(f->operation, 0)
+        && !wl_evaluation_control_begin(f->operation, &f->operation_owner));
+    f->operation_id = wl_evaluation_control_active_attempt_id(f->operation);
+    CHECK(!wl_evaluation_control_finish(f->funding, &f->funding_owner, 0, 0)
+        && !wl_evaluation_control_reset(f->funding)
+        && !wl_evaluation_control_begin(f->funding, &f->funding_owner));
+    f->funding_id = wl_evaluation_control_active_attempt_id(f->funding);
+    CHECK(!wl_columnar_eval_stack_cleanup_begin(&f->session, &f->frame));
+    CHECK(!eval_stack_push(wl_columnar_eval_stack_cleanup_stack(f->frame),
+        f->left, false));
+    memset(&f->status, 0, sizeof(f->status));
+    f->phase = f->turns = f->witnesses = 0; f->protocol = 0;
+}
+
+static void
+long_delta_join_sources(void)
+{
+    const unsigned lengths[] = {252, 253, 300, 300, 300, 300};
+    uint64_t late_budget = 0;
+    for (unsigned c = 0; c < 6; ++c) {
+        char name[513], delta_name[516]; fixture_t f;
+        bool decoy = c == 3, empty = c == 4, full = c == 5;
+        long_join_setup(&f, name, delta_name, lengths[c], decoy, empty, full);
+        bool chosen = !decoy && !empty && !full;
+        selector_fixture = &f;
+        selector_right = chosen ? f.registry[1] : f.registry[0];
+        selector_witnesses = long_lookup_late = 0; long_lookup_cancel = false;
+        long_lookup_expected_delta = chosen;
+        col_relation_snapshot_t before[] =
+        {wl_columnar_relation_snapshot(f.registry[0]),
+         wl_columnar_relation_snapshot(
+             f.registry[1])};
+        wl_columnar_join_test_attempt_checkpoint = long_lookup_checkpoint;
+        run(&f); wl_columnar_join_test_attempt_checkpoint = NULL;
+        CHECK(selector_witnesses == 1 && !f.status.semantic_result &&
+            f.status.committed);
+        long_join_literal(&f, full ? 3u : chosen ? 1u : 0u, full ? 7 : 37,
+            chosen);
+        for (unsigned i = 0; i < 2; ++i)
+            CHECK(wl_columnar_relation_snapshot_equal(before[i],
+                wl_columnar_relation_snapshot(f.registry[i])));
+        if (c == 2) {
+            CHECK(long_lookup_late == 1 && long_lookup_spent > 0);
+            late_budget = long_lookup_spent;
+        }
+        fixture_close(&f);
+    }
+    CHECK(late_budget);
+    for (unsigned work = 0; work < 2; ++work) {
+        char name[513], delta_name[516]; fixture_t f;
+        long_join_setup(&f, name, delta_name, 300, false, false, false);
+        if (work) {
+            CHECK(!wl_evaluation_control_finish(f.operation, &f.operation_owner,
+                0, 0)
+                && !wl_evaluation_control_reset(f.operation)
+                && !wl_evaluation_control_configure(f.operation, late_budget)
+                && !wl_evaluation_control_begin(f.operation,
+                &f.operation_owner));
+            f.operation_id =
+                wl_evaluation_control_active_attempt_id(f.operation);
+        }
+        selector_fixture = &f; selector_right = f.registry[1];
+        selector_witnesses = long_lookup_late = 0; long_lookup_cancel = !work;
+        long_lookup_expected_delta = true;
+        col_relation_snapshot_t input =
+            wl_columnar_relation_snapshot(f.registry[1]);
+        wl_columnar_join_test_attempt_checkpoint = long_lookup_checkpoint;
+        run(&f); wl_columnar_join_test_attempt_checkpoint = NULL;
+        long_lookup_cancel = false;
+        int cause =
+            work ? WL_EVALUATION_CONTROL_WORK_LIMIT :
+            WL_EVALUATION_CONTROL_CANCELLED;
+        CHECK(long_lookup_late == 1 && f.status.semantic_result == cause
+            && f.status.execution_result == cause && !f.status.cleanup_result &&
+            !f.status.committed);
+        eval_stack_t *stack = wl_columnar_eval_stack_cleanup_stack(f.frame);
+        CHECK(stack && stack->top == 1 && stack->items[0].rel == f.left
+            && !stack->items[0].owned
+            && wl_columnar_relation_snapshot_equal(input,
+            wl_columnar_relation_snapshot(f.registry[1])));
+        long_join_retry_frame(&f);
+        run(&f); CHECK(!f.status.semantic_result);
+        long_join_literal(&f, 1, 37, true);
+        long_join_retry_frame(&f);
+        const int64_t future[] = {38, 48};
+        CHECK(!col_rel_append_row(f.registry[1], future));
+        run(&f); CHECK(!f.status.semantic_result);
+        long_join_literal(&f, 2, 37, true);
+        long_join_retry_frame(&f); run(&f); long_join_literal(&f, 2, 37, true);
+        fixture_close(&f);
+    }
+    selector_fixture = NULL; selector_right = NULL;
+    puts(
+        "paid JOIN exact long delta identity/leases/late CANCEL+WORK/reset/future passed");
+}
+
 int
 main(void)
 {
+    long_delta_join_sources();
     inline_admission_boundaries();
     filtered_probe_cases(); filtered_probe_error_and_stop_cases();
     probe_semantics(); probe_metadata(); probe_float_keys(); probe_rejections();
