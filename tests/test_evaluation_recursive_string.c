@@ -1532,6 +1532,17 @@ cleared_eligible(const public_key_t *k)
            && (k->child[4] & 4) && !k->child[5];
 }
 
+/* Frame disposal has completed; the Session retains the captured receipt. */
+static bool
+receipt_eligible(const public_key_t *k)
+{
+    return k->available && k->eligible && k->phase == 8 && k->round_active
+           && !k->published && !k->committed && !k->main[0] && !k->retirement[0]
+           && !k->child[0] && (k->receipt_pending || k->receipt_ack
+           || k->receipt_acknowledged || k->receipt_index_valid ||
+           k->ack_committed);
+}
+
 static void
 ended_case(unsigned heads, bool observed, ended_trace_t *record,
     const public_key_t *expected, unsigned target, unsigned outcome, bool early)
@@ -1582,7 +1593,8 @@ ended_case(unsigned heads, bool observed, ended_trace_t *record,
         if (!stop.hit && stopping_case && rc == EAGAIN
             && (early ? category == 2 : calls == target)) {
             CHECK(category >= 0 || endstage_eligible(&key)
-                || unbound_eligible(&key) || cleared_eligible(&key));
+                || unbound_eligible(&key) || cleared_eligible(&key)
+                || receipt_eligible(&key));
             if (expected) CHECK(public_equal(&key, expected));
             inject(&stop);
             CHECK(wl_session_insert(f.session, "input", &fresh, 1, 1) == EBUSY
@@ -1879,7 +1891,7 @@ run_unbound(unsigned heads, bool observed)
 
 /* Discover finite stage classes, then authenticate complete copied keys on replay. */
 static void
-run_cleared(unsigned heads, bool observed)
+run_custody(unsigned heads, bool observed, bool receipt)
 {
     public_trace_t t = {0};
     t.keys = calloc(16384, sizeof(*t.keys));
@@ -1894,10 +1906,15 @@ run_cleared(unsigned heads, bool observed)
     uint64_t phases = 0, pending = 0, flags = 0, receipts = 0;
     for (unsigned i = 0; i < t.count; i++) {
         const public_key_t *k = &t.keys[i]; t.class_id[i] = UINT32_MAX;
-        if (!cleared_eligible(k)) continue;
+        if (!(receipt ? receipt_eligible(k) : cleared_eligible(k))) continue;
         CHECK(k->round < 16 && k->head < heads && k->child[2] < 64
             && k->child[3] < 64);
-        for (unsigned j = 5; j <= 9; j++) CHECK(!k->child[j]);
+        if (receipt) {
+            for (unsigned j = 0; j < 16; j++) CHECK(!k->child[j]);
+            CHECK(i && t.keys[i - 1].round == k->round
+                && t.keys[i - 1].head == k->head
+                && unbound_eligible(&t.keys[i - 1]));
+        } else for (unsigned j = 5; j <= 9; j++) CHECK(!k->child[j]);
         observations++; reached[k->round][k->head] = true;
         if (k->round + 1 > rounds) rounds = (unsigned)k->round + 1;
         phases |= UINT64_C(1) << k->child[2];
@@ -1929,15 +1946,17 @@ run_cleared(unsigned heads, bool observed)
                 t.public_ordinal[i], outcome, false);
             selected++;
             printf(
-                "cleared_cut heads%u observer%d index%u class%u public%u first%d last%d outcome%u passed\n",
-                heads, observed, index, c, t.public_ordinal[i],
+                "%s_cut heads%u observer%d index%u class%u public%u first%d last%d outcome%u passed\n",
+                receipt ? "receipt" : "cleared", heads, observed, index, c,
+                t.public_ordinal[i],
                 i == first[c], i == last[c], outcome);
         }
     }
     CHECK(selected == 2 * cuts);
     printf(
-        "cleared heads%u observer%d observations%u classes%u cuts%u selected%u rounds%u phases%llu pending%llu flags%llu receipts%llu passed\n",
-        heads, observed, observations, classes, cuts, selected, rounds,
+        "%s heads%u observer%d observations%u classes%u cuts%u selected%u rounds%u phases%llu pending%llu flags%llu receipts%llu passed\n",
+        receipt ? "receipt" : "cleared", heads, observed, observations, classes,
+        cuts, selected, rounds,
         (unsigned long long)phases, (unsigned long long)pending,
         (unsigned long long)flags, (unsigned long long)receipts);
     free(t.pick); free(t.class_id); free(t.public_ordinal); free(t.keys);
@@ -1948,11 +1967,13 @@ main(int argc, char **argv)
 {
     CHECK(!environment("WIRELOG_JOIN_BATCH_BYTES", "")
         && !environment("WIRELOG_JOIN_BATCH_STRICT", ""));
-    if (argc == 4 && !strcmp(argv[1], "cleared")) {
+    if (argc == 4 && (!strcmp(argv[1], "cleared") || !strcmp(argv[1],
+        "receipt"))) {
         unsigned heads = (unsigned)strtoul(argv[2], NULL, 10);
         unsigned observed = (unsigned)strtoul(argv[3], NULL, 10);
         CHECK(heads >= 1 && heads <= 2 && observed <= 1);
-        run_cleared(heads, observed != 0); return 0;
+        run_custody(heads, observed != 0, !strcmp(argv[1], "receipt"));
+        return 0;
     }
     if (argc == 4 && !strcmp(argv[1], "unbound")) {
         unsigned heads = (unsigned)strtoul(argv[2], NULL, 10);
