@@ -8419,3 +8419,17 @@ foreach heads : [1, 2]
       suite: ['unit', 'tsan', 'evaluation_recursive_string_partition'], timeout: 120)
   endforeach
 endforeach
+
+# Exact insertion-delta names consumed by natural K-fusion and direct caches.
+test_evaluation_materialized_selectors_exe = executable(
+  'test_evaluation_materialized_selectors',
+  files('test_evaluation_materialized_selectors.c'),
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
+  link_with: [testlib_prod],
+)
+foreach selector_case : ['hash']
+  test('evaluation_materialized_selectors_' + selector_case,
+       test_evaluation_materialized_selectors_exe, args: [selector_case],
+       suite: ['unit', 'tsan', 'evaluation_join_hosts'], timeout: 120)
+endforeach
