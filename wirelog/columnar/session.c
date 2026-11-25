@@ -2519,24 +2519,29 @@ wl_columnar_session_cold_join_rule(const wl_col_session_t *sess,
     return wl_columnar_session_cold_layout(sess, name);
 }
 
-/* A controlled JOIN of a cold right input (#2301): the rule's first JOIN,
- * at `at`, after a VARIABLE over another input that is resident or
- * declared, not this one (a self-JOIN) and not another cold one, and after
- * that input's MAP/FILTER prefix, if any; every JOIN of the rule with one
- * key or more. Without a REDUCE, the rule must pass the uncontrolled cold
- * JOIN prefix audit when it has no prefix and the uncontrolled cold scan
- * prefix audit when it has one. A REDUCE may follow only as the rule's next
- * to last op, and the rule must then instead pass the uncontrolled cold JOIN
- * aggregate audit with this JOIN, with an operand type the controlled
- * REDUCE accepts. The composed attempt runs the prefix over the resident
- * input, copies the cold input whole into the frame's cold right slot, and
- * the controlled JOIN reads the copy. */
+/* A controlled JOIN of a cold right input (#2301): a JOIN of the rule at
+ * `at`, its first or a later one, after a VARIABLE over another input that
+ * is resident or declared, not this one (a self-JOIN) and not another cold
+ * one, and after that input's MAP/FILTER prefix, if any; every JOIN of the
+ * rule with one key or more. Without a REDUCE, the rule must pass the
+ * uncontrolled cold JOIN prefix audit when it has no prefix and the
+ * uncontrolled cold scan prefix audit when it has one. The prefix audit
+ * with one key compares no key type of a later JOIN, which the uncontrolled
+ * route compares only at its STEP, so a later JOIN after no prefix must
+ * also pass the uncontrolled cold JOIN suffix audit from the first JOIN on,
+ * which compares them. A REDUCE may follow only as the rule's next to last
+ * op, and the rule must then instead pass the uncontrolled cold JOIN
+ * aggregate audit with this JOIN as its first, with an operand type the
+ * controlled REDUCE accepts. The composed attempt runs the ops before this
+ * JOIN over the resident input, copies the cold input whole into the
+ * frame's cold right slot, and the controlled JOIN reads the copy. */
 static bool
 wl_columnar_session_cold_right_rule(const wl_col_session_t *sess,
     const wl_plan_relation_t *rp, const char *name, uint32_t at)
 {
-    if (rp->op_count < 3 || at >= rp->op_count ||
-        at != wl_columnar_ops_cold_scan_end(rp, 0) ||
+    uint32_t first_join = wl_columnar_ops_cold_scan_end(rp, 0);
+    if (rp->op_count < 3 || at >= rp->op_count || at < first_join ||
+        rp->ops[first_join].op != WL_PLAN_OP_JOIN ||
         rp->ops[0].op != WL_PLAN_OP_VARIABLE ||
         !rp->ops[0].relation_name || rp->ops[at].op != WL_PLAN_OP_JOIN ||
         !rp->ops[at].key_count || !rp->ops[at].right_relation ||
@@ -2555,27 +2560,29 @@ wl_columnar_session_cold_right_rule(const wl_col_session_t *sess,
     if (reduction ? !wl_columnar_join_aggregate_decode(sess, rp, &join) ||
         join != at ||
         rp->ops[last].agg_operand_type > WL_PLAN_AGG_OPERAND_FLOAT :
-        !(at >= 2 ? wl_columnar_join_cold_scan_prefix(sess, rp, NULL) :
-        wl_columnar_join_cold_prefix(sess, rp))) return false;
+        !(first_join >= 2 ? wl_columnar_join_cold_scan_prefix(sess, rp, NULL) :
+        wl_columnar_join_cold_prefix(sess, rp) &&
+        (at == first_join || wl_columnar_join_cold_later_suffix(sess, rp))))
+        return false;
     return wl_columnar_session_cold_layout(sess, name);
 }
 
 /* A controlled session reads a cold binding only through the composed cold
  * scan attempt: VARIABLE(name), a direct MAP/FILTER prefix holding at least
  * one MAP, then the rule's final CONSOLIDATE (#2301). The prefix may instead
- * end at a REDUCE that the uncontrolled cold aggregate admits, followed by
- * the final CONSOLIDATE, or at a JOIN that the cold JOIN rule above admits,
- * and then needs no MAP; the composed attempt runs its controlled REDUCE or
- * JOIN over the scan's output, and after the JOIN the operators and the
- * REDUCE that follow it. The rule's first JOIN, after a VARIABLE over
- * another input and that input's MAP/FILTER prefix, if any, may instead read
- * the binding as its right input, under the cold right rule above, and a
- * REDUCE may then follow it. Programs that a controlled STEP routes to the
- * general observed transaction are refused here, while the source is still
- * resident: a head that is also an EDB, the two-EDB single-rule seed shape,
- * and a registry that a successor STEP would find larger than three
- * relations. The registry never shrinks after a seal, so its size plus the
- * heads not yet registered bounds it. */
+ * end at a REDUCE that the uncontrolled cold aggregate admits, followed by the
+ * final CONSOLIDATE, or at a JOIN that the cold JOIN rule above admits, and
+ * then needs no MAP; the composed attempt runs its controlled REDUCE or JOIN
+ * over the scan's output, and after the JOIN the operators and the REDUCE that
+ * follow it. One JOIN of the rule, its first, after a VARIABLE over another
+ * input and that input's MAP/FILTER prefix, if any, or a later one, may
+ * instead read the binding as its right input, under the cold right rule
+ * above, and a REDUCE may then follow the first. Programs that a controlled
+ * STEP routes to the general observed transaction are refused here, while the
+ * source is still resident: a head that is also an EDB, the two-EDB
+ * single-rule seed shape, and a registry that a successor STEP would find
+ * larger than three relations. The registry never shrinks after a seal, so its
+ * size plus the heads not yet registered bounds it. */
 static bool
 wl_columnar_session_cold_controlled_plan(const wl_col_session_t *sess,
     const char *name)
@@ -2598,25 +2605,25 @@ wl_columnar_session_cold_controlled_plan(const wl_col_session_t *sess,
                     first = strcmp(plan->strata[sj].relations[rj].name,
                             rp->name) != 0;
             if (first) heads++;
-            bool uses = false, right = false;
+            bool uses = false;
             uint32_t first_join = wl_columnar_ops_cold_scan_end(rp, 0);
+            uint32_t at = rp->op_count;
             for (uint32_t oi = 0; oi < rp->op_count; oi++) {
                 const wl_plan_op_t *op = &rp->ops[oi];
                 bool left_here = op->relation_name &&
                     !strcmp(op->relation_name, name);
                 bool right_here = op->right_relation &&
                     !strcmp(op->right_relation, name);
-                /* The rule's first JOIN, after the left input's MAP/FILTER
-                * prefix, if any, may read the input as its right input. */
-                if (right_here && oi && oi == first_join && !left_here &&
-                    op->op == WL_PLAN_OP_JOIN) right = true;
+                /* One JOIN, at or after the end of the left input's
+                 * MAP/FILTER prefix, may read the input as its right input. */
+                if (right_here && oi && oi >= first_join && !left_here &&
+                    op->op == WL_PLAN_OP_JOIN && at == rp->op_count) at = oi;
                 else if ((left_here || right_here) && oi) return false;
                 uses |= left_here || right_here;
             }
             if (!uses) continue;
-            if (right) {
-                if (!wl_columnar_session_cold_right_rule(sess, rp, name,
-                    first_join))
+            if (at < rp->op_count) {
+                if (!wl_columnar_session_cold_right_rule(sess, rp, name, at))
                     return false;
                 continue;
             }

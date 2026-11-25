@@ -2502,6 +2502,7 @@ wl_columnar_eval_plan_numeric_composed_attempt_begin_internal(
     record->source_full = NULL; record->source_delta = NULL;
     record->source_selected = NULL; record->source_output = NULL;
     record->cold_right_held = false; record->cold_right_output = NULL;
+    record->cold_right_cursor = 0;
     record->composed_mode = true;
     record->controlled_materialized_batch_fallback =
         controlled_materialized_batch_fallback;
@@ -3614,13 +3615,13 @@ wl_columnar_eval_plan_numeric_composed_attempt_step_validated_body(
             return 0;
         }
         /* A cold right input is first scanned into its frame slot (#2301),
-         * at the rule's first JOIN, after the left input's VARIABLE and its
-         * MAP/FILTER prefix, if any. */
+         * at a JOIN of the rule at or after the end of the left input's
+         * MAP/FILTER prefix. */
         if (record->plan->ops[record->cursor].op == WL_PLAN_OP_JOIN
             && !record->cold_right_held && record->session->cold_relation
             && wl_columnar_session_cold_find(record->session,
             record->plan->ops[record->cursor].right_relation)) {
-            if (record->cursor != wl_columnar_ops_cold_scan_end(record->plan,
+            if (record->cursor < wl_columnar_ops_cold_scan_end(record->plan,
                 0) || record->begin
                 || record->cursor + 1 >= record->end
                 || wl_columnar_session_cold_find(record->session,
@@ -4191,7 +4192,7 @@ wl_columnar_eval_plan_composed_ack_clear(
     record->join_host_terminal = record->join_host_declined = false;
     record->join_host_busy = false;
     record->private_bindings = NULL;
-    record->cold_right_output = NULL;
+    record->cold_right_output = NULL; record->cold_right_cursor = 0;
     record->lftj_metadata_dispatch = false;
     record->abort_supported = false; record->abort_requested = false;
     record->composed_busy = record->lftj_cleanup_authorized = false;
