@@ -1522,6 +1522,16 @@ unbound_eligible(const public_key_t *k)
            && !(k->child[4] & 4);
 }
 
+/* A bound framed child whose numeric executor has already closed. */
+static bool
+cleared_eligible(const public_key_t *k)
+{
+    return k->available && k->eligible && k->phase == 8 && k->round_active
+           && !k->published && !k->committed && !k->main[0] && !k->retirement[0]
+           && k->child[0] && k->child[1] && (k->child[4] & 64)
+           && (k->child[4] & 4) && !k->child[5];
+}
+
 static void
 ended_case(unsigned heads, bool observed, ended_trace_t *record,
     const public_key_t *expected, unsigned target, unsigned outcome, bool early)
@@ -1572,7 +1582,7 @@ ended_case(unsigned heads, bool observed, ended_trace_t *record,
         if (!stop.hit && stopping_case && rc == EAGAIN
             && (early ? category == 2 : calls == target)) {
             CHECK(category >= 0 || endstage_eligible(&key)
-                || unbound_eligible(&key));
+                || unbound_eligible(&key) || cleared_eligible(&key));
             if (expected) CHECK(public_equal(&key, expected));
             inject(&stop);
             CHECK(wl_session_insert(f.session, "input", &fresh, 1, 1) == EBUSY
@@ -1867,11 +1877,83 @@ run_unbound(unsigned heads, bool observed)
     free(t.pick); free(t.class_id); free(t.public_ordinal); free(t.keys);
 }
 
+/* Discover finite stage classes, then authenticate complete copied keys on replay. */
+static void
+run_cleared(unsigned heads, bool observed)
+{
+    public_trace_t t = {0};
+    t.keys = calloc(16384, sizeof(*t.keys));
+    t.public_ordinal = calloc(16384, sizeof(*t.public_ordinal));
+    t.class_id = calloc(16384, sizeof(*t.class_id));
+    t.pick = calloc(16384, sizeof(*t.pick));
+    CHECK(t.keys && t.public_ordinal && t.class_id && t.pick);
+    unsigned retained = 0;
+    public_replay(heads, observed, NULL, &t, UINT32_MAX, 0, &retained);
+    unsigned first[2048], last[2048], classes = 0, observations = 0, rounds = 0;
+    bool reached[16][2] = {{false}};
+    uint64_t phases = 0, pending = 0, flags = 0, receipts = 0;
+    for (unsigned i = 0; i < t.count; i++) {
+        const public_key_t *k = &t.keys[i]; t.class_id[i] = UINT32_MAX;
+        if (!cleared_eligible(k)) continue;
+        CHECK(k->round < 16 && k->head < heads && k->child[2] < 64
+            && k->child[3] < 64);
+        for (unsigned j = 5; j <= 9; j++) CHECK(!k->child[j]);
+        observations++; reached[k->round][k->head] = true;
+        if (k->round + 1 > rounds) rounds = (unsigned)k->round + 1;
+        phases |= UINT64_C(1) << k->child[2];
+        pending |= UINT64_C(1) << k->child[3]; flags |= k->child[4];
+        unsigned receipt = k->receipt_pending | (k->receipt_ack << 1)
+            | (k->receipt_acknowledged << 2) | (k->receipt_index_valid << 3)
+            | (k->ack_committed << 4);
+        CHECK(receipt < 32); receipts |= UINT64_C(1) << receipt;
+        unsigned c = 0;
+        for (; c < classes; c++)
+            if (endstage_equal(k, &t.keys[first[c]])) break;
+        if (c == classes) {
+            CHECK(c < 2048); first[c] = i; classes++;
+        }
+        last[c] = i; t.class_id[i] = c;
+    }
+    CHECK(observations && classes && rounds);
+    for (unsigned r = 0; r < rounds; r++)
+        for (unsigned h = 0; h < heads; h++) CHECK(reached[r][h]);
+    for (unsigned c = 0; c < classes; c++) {
+        CHECK(first[c] <= last[c]); t.pick[first[c]] = t.pick[last[c]] = true;
+    }
+    unsigned cuts = 0, selected = 0;
+    for (unsigned i = 0; i < t.count; i++) {
+        if (!t.pick[i]) continue;
+        unsigned index = cuts++, c = t.class_id[i]; CHECK(c < classes);
+        for (unsigned outcome = 2; outcome <= 3; outcome++) {
+            ended_case(heads, observed, NULL, &t.keys[i],
+                t.public_ordinal[i], outcome, false);
+            selected++;
+            printf(
+                "cleared_cut heads%u observer%d index%u class%u public%u first%d last%d outcome%u passed\n",
+                heads, observed, index, c, t.public_ordinal[i],
+                i == first[c], i == last[c], outcome);
+        }
+    }
+    CHECK(selected == 2 * cuts);
+    printf(
+        "cleared heads%u observer%d observations%u classes%u cuts%u selected%u rounds%u phases%llu pending%llu flags%llu receipts%llu passed\n",
+        heads, observed, observations, classes, cuts, selected, rounds,
+        (unsigned long long)phases, (unsigned long long)pending,
+        (unsigned long long)flags, (unsigned long long)receipts);
+    free(t.pick); free(t.class_id); free(t.public_ordinal); free(t.keys);
+}
+
 int
 main(int argc, char **argv)
 {
     CHECK(!environment("WIRELOG_JOIN_BATCH_BYTES", "")
         && !environment("WIRELOG_JOIN_BATCH_STRICT", ""));
+    if (argc == 4 && !strcmp(argv[1], "cleared")) {
+        unsigned heads = (unsigned)strtoul(argv[2], NULL, 10);
+        unsigned observed = (unsigned)strtoul(argv[3], NULL, 10);
+        CHECK(heads >= 1 && heads <= 2 && observed <= 1);
+        run_cleared(heads, observed != 0); return 0;
+    }
     if (argc == 4 && !strcmp(argv[1], "unbound")) {
         unsigned heads = (unsigned)strtoul(argv[2], NULL, 10);
         unsigned observed = (unsigned)strtoul(argv[3], NULL, 10);

@@ -8373,3 +8373,13 @@ foreach mode : ['index-new-key0-name', 'index-new-key0-keys', 'index-new-key1-ke
     test_evaluation_join_cache_exe, args: ['scalar', 'observed', mode],
     suite: ['unit', 'tsan', 'evaluation_join_hosts'], timeout: 120)
 endforeach
+
+# Bound framed children after their numeric executor has closed.
+foreach heads : [1, 2]
+  foreach observed : [0, 1]
+    test('evaluation_recursive_string_cleared_@0@_@1@'.format(heads, observed),
+      evaluation_recursive_string_exe,
+      args: ['cleared', heads.to_string(), observed.to_string()],
+      suite: ['unit', 'tsan', 'evaluation_recursive_string_cleared'], timeout: 120)
+  endforeach
+endforeach
