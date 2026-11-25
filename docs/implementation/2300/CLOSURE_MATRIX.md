@@ -35,6 +35,20 @@ full ASan/UBSan and current focused/replay/ABI checks. The linked inventory
 records exact counts and the unchanged benchmark Git-fixture watchdog limits;
 neither an interrupted1693 run nor unavailable hosted results count as passed.
 
+The subsequent [K-fusion schema/governed-merge increment](JOIN_DOMAIN_QUALIFICATION.md#k-fusion-empty-schema-and-governed-merge-increment)
+adds owned compiler target binding, checked schema-preserving inactive output,
+parent-governed final/pairwise merge results, precise serial/merge error causes
+and complete owned-prefix failure cleanup. Real compiled K3/K4, thirteen reached
+merge/refusal/retry configurations, six managed/unmanaged width0 controls, live
+wide output and literal public empty/refill histories qualify these finite
+boundaries. The integrated runtime now has complete native1558pass/10skip and
+ASan/UBSan1552pass/16skip campaigns across1568 exact registrations each; all28
+prior recursive/worker regressions and78 materialized-body selections are OK in
+both. These current integrated results supersede the preceding checkpoint's
+runtime campaign timing; its benchmark Git-fixture limits remain historical.
+No complete containing financial, materialized/recursive/pipeline or hosted
+platform certificate follows. O04/F05/F05a and #2371/#2300 remain OPEN.
+
 ## Scope and evaluating Roots
 
 The issue owns O04/O05/O06/O09 and F05/F05a. The X rows qualify accepted
