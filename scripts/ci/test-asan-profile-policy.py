@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Keep main and PR ASan/UBSan jobs on the same optimized debug profile.
+"""Keep main, PR and release Tier-1 ASan/UBSan on one optimized debug profile.
 
 The grown lifecycle matrices time out in main's unoptimized debug profile.
 This contract reads the canonical folded/literal Meson setup commands, like
@@ -12,17 +12,20 @@ import shlex
 import unittest
 
 ROOT = Path(__file__).resolve().parents[2]
-BUILDS = {"ci-main.yml": "builddir", "ci-pr.yml": "builddir-san"}
+BUILDS = {"ci-main.yml": "builddir", "ci-pr.yml": "builddir-san",
+          "tier1-sanitizers.yml": "builddir-san"}
+JOBS = {"ci-main.yml": "sanitizer-matrix", "ci-pr.yml": "sanitizer-matrix",
+        "tier1-sanitizers.yml": "asan-ubsan"}
 REQUIRED = ("-Db_sanitize=address,undefined", "-Db_lundef=false",
             "-Db_lto=false", "-Dtests=true", "-Dexamples=false",
             "--buildtype=debugoptimized")
 OPTIONAL = {"-Doptimization": "2", "-Ddebug": "true", "-Db_ndebug": "false"}
 
 
-def sanitizer_job(text):
-    jobs = re.findall(r"^  sanitizer-matrix:\n(.*?)(?=^  [\w-]+:\n|\Z)",
+def sanitizer_job(text, job):
+    jobs = re.findall(r"^  " + re.escape(job) + r":\n(.*?)(?=^  [\w-]+:\n|\Z)",
                       text, re.MULTILINE | re.DOTALL)
-    assert len(jobs) == 1, "expected exactly one sanitizer-matrix job"
+    assert len(jobs) == 1, f"expected exactly one {job} job"
     return jobs[0]
 
 
@@ -46,9 +49,9 @@ def setup_commands(job):
 
 
 def validate(sources):
-    assert set(sources) == set(BUILDS), "expected both main and PR workflows"
+    assert set(sources) == set(BUILDS), "expected all known ASan workflows"
     for name, build in BUILDS.items():
-        commands = setup_commands(sanitizer_job(sources[name]))
+        commands = setup_commands(sanitizer_job(sources[name], JOBS[name]))
         assert len(commands) == 1, f"{name}: expected one sanitizer setup"
         tokens = commands[0]
         assert tokens[:3] == ["meson", "setup", build], (name, tokens)
@@ -74,7 +77,7 @@ class AsanProfilePolicyTests(unittest.TestCase):
 
     def mutated(self, name, transform):
         sources = dict(self.sources)
-        old = sanitizer_job(sources[name])
+        old = sanitizer_job(sources[name], JOBS[name])
         # Mutate commands, never an explanatory comment containing a flag.
         commands = "".join(line for line in old.splitlines(keepends=True)
                            if not line.lstrip().startswith("#"))
@@ -88,7 +91,7 @@ class AsanProfilePolicyTests(unittest.TestCase):
 
     def test_folded_and_literal_commands(self):
         for style in (">", "|"):
-            sources = {name: "  sanitizer-matrix:\n    steps:\n      - run: " + style +
+            sources = {name: "  " + JOBS[name] + ":\n    steps:\n      - run: " + style +
                        "\n          meson setup " + build + "\n          " +
                        "\n          ".join(REQUIRED) + "\n"
                        for name, build in BUILDS.items()}
@@ -106,9 +109,33 @@ class AsanProfilePolicyTests(unittest.TestCase):
             validate({"ci-main.yml": self.sources["ci-main.yml"]})
         for name in BUILDS:
             sources = dict(self.sources)
-            sources[name] = sources[name].replace("  sanitizer-matrix:", "  removed:", 1)
+            sources[name] = sources[name].replace("  " + JOBS[name] + ":", "  removed:", 1)
             with self.subTest(name=name), self.assertRaises(AssertionError):
                 validate(sources)
+
+    def test_duplicate_job_rejected(self):
+        for name in BUILDS:
+            sources = dict(self.sources)
+            sources[name] += "\n  " + JOBS[name] + ":\n    steps: []\n"
+            with self.subTest(name=name), self.assertRaises(AssertionError):
+                validate(sources)
+
+    def test_tier1_exact_job_boundary(self):
+        name = "tier1-sanitizers.yml"
+        for decoy in ("sanitizer-matrix", "tsan", "msan-fuzz"):
+            sources = dict(self.sources)
+            # A valid-looking other job must not replace the missing ASan job.
+            sources[name] = sources[name].replace("  asan-ubsan:", "  removed:", 1)
+            sources[name] += ("\n  " + decoy + ":\n    steps:\n      - run: |\n" +
+                              "          meson setup builddir-san " +
+                              " ".join(REQUIRED) + "\n")
+            with self.subTest(decoy=decoy), self.assertRaises(AssertionError):
+                validate(sources)
+        # An unrelated bad profile is ignored when the real job is present.
+        sources = dict(self.sources)
+        sources[name] += ("\n  sanitizer-matrix:\n    steps:\n      - run: |\n" +
+                          "          meson setup decoy --buildtype=debug\n")
+        validate(sources)
 
     def test_missing_or_duplicate_setup(self):
         for name in BUILDS:
@@ -128,14 +155,15 @@ class AsanProfilePolicyTests(unittest.TestCase):
                         with self.assertRaises(AssertionError):
                             validate(sources)
 
-    def test_old_main_profile_rejected(self):
-        sources = self.mutated("ci-main.yml", lambda job: job.replace(
-            "--buildtype=debugoptimized", "--buildtype=debug", 1).replace(
-            "-Db_lto=false", "", 1))
-        with self.assertRaises(AssertionError):
-            validate(sources)
+    def test_old_profile_rejected_in_each_workflow(self):
+        for name in BUILDS:
+            sources = self.mutated(name, lambda job: job.replace(
+                "--buildtype=debugoptimized", "--buildtype=debug", 1).replace(
+                "-Db_lto=false", "", 1))
+            with self.subTest(name=name), self.assertRaises(AssertionError):
+                validate(sources)
 
-    def test_profile_overrides_rejected_in_either_workflow(self):
+    def test_profile_overrides_rejected_in_each_workflow(self):
         for name in BUILDS:
             for extra in ("-Doptimization=0", "-Doptimization=1", "-Ddebug=false",
                           "-Db_ndebug=true", "-Db_ndebug=if-release", "-Db_lto=true",
