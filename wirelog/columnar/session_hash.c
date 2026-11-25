@@ -184,6 +184,36 @@ session_rel_hash_lookup(wl_col_session_t *sess, const char *name)
     return NULL;
 }
 
+/* The identical FNV byte stream used by canonical name lookup, without a
+ * bounded concatenation buffer. Prefix/name input strings remain borrowed. */
+col_rel_t *
+wl_columnar_session_hash_lookup_prefixed(wl_col_session_t *sess,
+    const char *prefix, const char *name)
+{
+    if (!prefix || !name || sess->rel_hash_nbuckets == 0)
+        return NULL;
+    uint64_t hash = 14695981039346656037ULL;
+    for (const unsigned char *p = (const unsigned char *)prefix; *p; ++p) {
+        hash ^= *p;
+        hash *= 1099511628211ULL;
+    }
+    for (const unsigned char *p = (const unsigned char *)name; *p; ++p) {
+        hash ^= *p;
+        hash *= 1099511628211ULL;
+    }
+    uint32_t bucket = (uint32_t)(hash & (sess->rel_hash_nbuckets - 1u));
+    size_t prefix_len = strlen(prefix);
+    uint32_t index = sess->rel_hash_head[bucket];
+    while (index != UINT32_MAX) {
+        col_rel_t *rel = sess->rels[index];
+        if (rel && !strncmp(rel->name, prefix, prefix_len)
+            && !strcmp(rel->name + prefix_len, name))
+            return rel;
+        index = sess->rel_hash_next[index];
+    }
+    return NULL;
+}
+
 /*
  * session_rel_hash_insert: Add a new relation to the hash table.
  * Called after session_add_rel appends to rels[] array.

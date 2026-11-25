@@ -6098,6 +6098,11 @@ col_session_peak_rss_bytes(void);
 
 col_rel_t *
 session_find_rel(wl_col_session_t *sess, const char *name);
+/* Exact virtual prefix+name key; no temporary concatenation allocation.
+ * Lazy hash construction retains its existing allocation/fallback contract. */
+col_rel_t *
+wl_columnar_session_find_prefixed(wl_col_session_t *sess, const char *prefix,
+    const char *name);
 
 /*
  * The entry of @sess's plan->idb_schemas for the IDB @name, or NULL when
@@ -6248,6 +6253,9 @@ int
 session_rel_build_hash(wl_col_session_t *sess);
 col_rel_t *
 session_rel_hash_lookup(wl_col_session_t *sess, const char *name);
+col_rel_t *
+wl_columnar_session_hash_lookup_prefixed(wl_col_session_t *sess,
+    const char *prefix, const char *name);
 int
 session_rel_hash_insert(wl_col_session_t *sess, uint32_t idx);
 int

@@ -2213,6 +2213,36 @@ session_find_rel(wl_col_session_t *sess, const char *name)
     return NULL;
 }
 
+col_rel_t *
+wl_columnar_session_find_prefixed(wl_col_session_t *sess, const char *prefix,
+    const char *name)
+{
+    if (!prefix || !name)
+        return NULL;
+    if (sess->rel_hash_nbuckets > 0) {
+        col_rel_t *rel = wl_columnar_session_hash_lookup_prefixed(sess,
+                prefix, name);
+        if (rel)
+            return rel;
+    }
+    if (sess->rel_hash_nbuckets == 0 && sess->nrels > 0) {
+        if (session_rel_build_hash(sess) == 0)
+            return wl_columnar_session_hash_lookup_prefixed(sess, prefix,
+                       name);
+    }
+    /* Like session_find_rel, a built-hash miss and a failed lazy build may
+     * still find an entry in the current registry. Short candidates stop
+     * at NUL in strncmp before suffix pointer arithmetic is attempted. */
+    size_t prefix_len = strlen(prefix);
+    for (uint32_t i = 0; i < sess->nrels; ++i) {
+        col_rel_t *rel = sess->rels[i];
+        if (rel && !strncmp(rel->name, prefix, prefix_len)
+            && !strcmp(rel->name + prefix_len, name))
+            return rel;
+    }
+    return NULL;
+}
+
 #ifdef WL_SESSION_TEST_HOOKS
 /* Serial qualification policy only. Detach the same source but retain its
  * allocation until this session is destroyed; never change admission results.
