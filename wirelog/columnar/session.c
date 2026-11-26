@@ -917,6 +917,7 @@ struct wl_columnar_controlled_step {
     wl_columnar_session_unary_cleanup_t unary_cleanup;
     wl_columnar_session_observed_transaction_t *transaction;
     bool general_observed, transaction_initialized, transaction_discard;
+    bool matching_ended_completed; /* Descriptive refusal, never Native authority. */
     wl_columnar_session_observed_transaction_t *seed_pending_owner;
     wl_columnar_session_seed_observation_t seed_observation_kind;
     wl_columnar_session_seed_header_owner_t seed_header_cleanup_class;
@@ -17879,6 +17880,49 @@ wl_columnar_session_recursive_retire(wl_columnar_controlled_step_t *step,
     return rc ? rc : EAGAIN;
 }
 
+/* END is not forward authority. Authenticate the actual retained round owner
+ * before reusing retirement_drive's matching-Original disposal registration. */
+static bool
+wl_columnar_session_recursive_retirement_ended(const wl_col_session_t *sess,
+    const wl_columnar_controlled_step_t *step)
+{
+    if (!step || !step->general_observed || !step->operation_active
+        || !step->operation_id || !step->transaction_initialized
+        || step->transaction_initialized_bytes != sizeof(*step->transaction)
+        || !step->transaction || step->transaction_discard || step->published
+        || step->snapshot || step->snapshot_owned || step->snapshot_retry
+        || sess->base.source_c1_admission || sess->join_batch_bytes
+        || step->main_action.identity || step->retirement_busy
+        || step->retirement_begin_failure_pending ||
+        step->staging_cancel_pending
+        || step->staging_progress.identity || step->previous_valid
+        || step->previous_funding || sess->cleanup_active ||
+        sess->cleanup_pending
+        || step->join_cleanup.kind || step->unary_cleanup.registered
+        || !wl_columnar_session_observed_origin_current(sess, step)
+        || step->observed_origin.attempt_id != step->operation_id
+        || wl_evaluation_control_active_attempt_id(
+            sess->base.evaluation_control)
+        == step->operation_id) return false;
+    const wl_columnar_session_observed_transaction_t *tx = step->transaction;
+    if (!tx->string_projection || tx->seed_selected || tx->committed
+        || !tx->round_active || tx->phase != WL_SESSION_RECURSIVE_RETIRE
+        || !tx->heads || tx->head_count < 1 || tx->head_count > 2
+        || tx->round_index >= tx->head_count || tx->child_active
+        || tx->receipt_pending || tx->receipt_ack) return false;
+    const wl_columnar_session_retirement_progress_t *p = &tx->round_progress;
+    const wl_columnar_session_observed_head_t *h = &tx->heads[tx->round_index];
+    return p->identity == p && p->step == step && p->parent == tx
+           && p->receipt == &tx->round_retirement && p->registered && !p->busy
+           && p->role == 2 && p->index == tx->round_index && p->target
+           && !p->replacement && p->slot == tx->round_owner
+           && (p->slot == &h->previous || p->slot == &h->frontier
+           || p->slot == &h->next_frontier)
+           && step->retirement_native_count
+           && wl_columnar_session_retirement_native_equal(step)
+           && wl_columnar_session_retirement_thread(p);
+}
+
 static int
 wl_columnar_session_native_error_recursive_retire(
     wl_columnar_controlled_step_t *step,
@@ -24836,6 +24880,20 @@ wl_columnar_session_terminal_finish_observe(wl_col_session_t *sess,
         && o->terminal_route != WL_COLUMNAR_SESSION_TERMINAL_ENDED_PRODUCER
         && o->terminal_route != WL_COLUMNAR_SESSION_TERMINAL_ENDED_FRONTIER)
         || step->operation_active || step->finish_source_pending) return;
+    /* Record genuine refusal completion before ACK consumes its provenance.
+     * Keep the observed route: the next BEGIN still needs that retry host. */
+    if (o->terminal_route == WL_COLUMNAR_SESSION_TERMINAL_NORMAL
+        && o->disposal_registered
+        && o->disposal_kind ==
+        WL_COLUMNAR_SESSION_PRODUCER_MATCHING_ORIGINAL_ENDED
+        && o->disposal_operation_id
+        && o->disposal_operation_id == o->terminal_operation_id
+        && o->disposal_result > 0 && o->disposal_result == o->terminal_result
+        && result != EAGAIN && result == o->terminal_result
+        && step->refused && !step->operation_id && !step->transaction
+        && !step->transaction_initialized
+        && wl_columnar_session_observed_origin_forget_ready(step))
+        step->matching_ended_completed = true;
     o->terminal_semantic_done = true;
     o->terminal_value = result == EAGAIN ? o->terminal_result : result;
     if (result != EAGAIN) wl_columnar_session_terminal_ack(step);
@@ -29131,6 +29189,7 @@ col_controlled_step_drive(wl_col_session_t *sess,
         step->operation_id = begin.attempt_id;
         if (!step->operation_id) return EINVAL;
         step->operation_active = true;
+        step->matching_ended_completed = false;
         if (parent->retained_retry) step->refused = false;
         /* Old cleanup may record abort intent before any parent is born.
          * Only a genuine new BEGIN consumes that entirely unbound intent;
@@ -29226,6 +29285,11 @@ col_controlled_step_drive(wl_col_session_t *sess,
          * Only real maintenance rollback may run; forward work stays excluded. */
         if (wl_columnar_session_general_rollback_pending(sess, step, true))
             return wl_columnar_session_observed_drive(sess, step);
+
+        if (wl_columnar_session_recursive_retirement_ended(sess, step))
+            return wl_columnar_session_retirement_drive(step,
+                       &tx->round_progress,
+                       control, step->operation_id, 1);
 
         if (step->general_observed && step->transaction_initialized && tx
             && step->transaction_discard && !tx->committed
@@ -30400,6 +30464,7 @@ col_controlled_step(wl_col_session_t *sess,
                 return begin.protocol;
             }
             step->operation_active = true;
+            step->matching_ended_completed = false;
             step->operation_id = begin.attempt_id;
             if (snapshot) wl_columnar_session_snapshot_attempt_set(snapshot,
                     begin.attempt_id);
@@ -31201,6 +31266,39 @@ col_session_controlled_step_state(const wl_session_t *session)
             return WL_CONTROLLED_STEP_NATIVE_ERROR_CLEANUP_PENDING;
         return WL_CONTROLLED_STEP_PENDING;
     }
+    /* A recorded refusal cannot mask any live generation or physical/financial
+    * debt. The record classifies quiescence only; it authorizes no cleanup. */
+    if (step->matching_ended_completed && step->refused
+        && !step->operation_active && !step->operation_id &&
+        !step->relation_active
+        && !step->transaction && !step->transaction_initialized
+        && !step->transaction_discard && !step->finish_source_pending
+        && !step->recursive && !step->previous_valid && !step->previous_funding
+        && !sess->cleanup_active && !sess->cleanup_pending
+        && !sess->cleanup_reserved_bytes && !step->retirement_native_count
+        && !step->retirement_busy && !step->retirement_begin_failure_pending
+        && !step->staging_cancel_pending && !step->staging_progress.identity
+        && !step->main_action.identity && !step->observed_origin.identity
+        && !step->observed_origin.transaction &&
+        !step->observed_origin.terminal_phase
+        && !step->observed_origin.terminal_funding.control
+        && !step->observed_origin.terminal_funding.phase
+        && !step->observed_origin.terminal_funding.metadata.ready
+        && !step->observed_origin.terminal_funding.metadata.scheduled
+        && !step->observed_origin.terminal_funding.outer_source.ready
+        && !step->observed_origin.terminal_funding.snapshot_financial_stop
+        && !step->observed_origin.terminal_maintenance.control
+        && !step->observed_origin.terminal_maintenance.phase
+        && !step->observed_origin.terminal_maintenance.metadata.ready
+        && !step->observed_origin.terminal_maintenance.metadata.scheduled
+        && !step->observed_origin.terminal_maintenance.outer_source.ready
+        && !step->observed_origin.terminal_maintenance.snapshot_financial_stop
+        && !step->prepared_parent.action_frame &&
+        !step->prepared_parent.action_pending
+        && !step->prepared_parent.finish_pending
+        && !wl_columnar_session_close_live(step)
+        && wl_columnar_session_observed_origin_forget_ready(step))
+        return WL_CONTROLLED_STEP_IDLE;
     if (step->general_observed &&
         !step->complete) return WL_CONTROLLED_STEP_PENDING;
     if (step->complete) {
