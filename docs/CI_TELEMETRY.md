@@ -1274,6 +1274,10 @@ Decision: five.
   longer than its 35.7-minute job.  The measurement exceeded that
   hypothesis: the shard jobs of run 45172454684 attempt 1 took 139.0
   runner-minutes against 105.7 for those of run 45104151262, 33.3 more.
+  The shard jobs of run 45539317908, on 1704 tests (46 more), took
+  147.5 runner-minutes on attempt 1 and 137.5 on attempt 2, so their figures
+  are not a delta against 105.7.  They queued from 1 to 573 s on attempt 1
+  (573 s for shard 2) and 2 s each on attempt 2.
 
 The hard-cancel budget still holds with the new build figure.  The worst
 setup plus build is now 17.2 min (shard 1 of run 45104151262, from job start
@@ -1282,6 +1286,8 @@ limit leaves about 2.8 min of the job's 60 for verify and upload.  A build
 past about 19 minutes would again let the job limit pre-empt the upload.
 Run 45172454684's shards did not raise it: their worst setup plus build was
 16.7 min on attempt 1 and 17.1 on attempt 2.
+Run 45539317908's shards did not raise it either: 16.9 min on attempt 1 and
+17.1 on attempt 2.
 
 ### Five shards on hosted runners
 
@@ -1313,6 +1319,13 @@ took 16.6 min, its test step 19.6 and its job 36.8.  Shards 2 to 5 succeeded
 in 23.0, 29.7, 31.3 and 28.2 min, and the collecting job failed at "Require
 every shard to succeed", as designed.
 
+Attempt 3 re-ran only the failed jobs on the same head.  Shard 1
+(138151056170) failed the same way: `wirelog_advanced_spill` TIMEOUT at
+120.12 s while the ratchet took 446.71 s; 328 tests passed, 3 skipped and 1
+timed out.  Its build took 16.2 min, its test step 19.2 and its job 35.8,
+and the collecting job failed again.  Its evidence was not downloaded, so
+the table below has no row for it; these figures come from its job log.
+
 Shard 1's results, from each test's start time and duration:
 
 | run | shards | `wirelog_advanced_spill` | its overlap with the ratchet | `clang_tidy_ratchet` |
@@ -1338,7 +1351,8 @@ test.  The three rows support it but come from different runners.
 Change: `clang_tidy_ratchet` is `is_parallel: false`.  Meson waits for every
 running test before it starts a non-parallel test and waits for that test
 before it starts the next, so the ratchet now runs alone at the head of
-slice 1.  The slices do not change.
+slice 1.  The slices do not change with it; a test inserted ahead of
+another moves that test's slice (see run 45539317908 below).
 
 Projection (hypotheses).  The same replay as above, with the ratchet
 non-parallel, gives shard 1 a test step of 18.6 min on attempt 1's
@@ -1366,3 +1380,96 @@ durations and at most about 42.0 min (70%) on attempt 2's.
   does not depend on this change.
 - The change adds about 3.6 runner-minutes per run to shard 1 on attempt
   1's durations.
+
+Facts.  Run 45539317908, head cc99cba1 (PR #2415 with the change above,
+rebased onto `main` 42309861; merge commit 12ff31d6): 1704 tests, Meson
+1.10.1, image 20261116.202.1 for every shard and collecting job and for
+`build-primary`, except attempt 2's shard 4 (20261116.88.1).
+`git range-diff` shows its four commits identical to f1ecb8b6, e28d9245,
+9b2d7597 and 1fa07f68 on `main`.  Columns and conventions as in the first
+table of this subsection; values are rounded half up, and parallelism is the
+aggregate table's summed seconds over its elapsed seconds.
+
+Attempt 1:
+
+| job | queue s | setup | build | test | job min | of limit | tests | parallelism |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| shard 1 (139090493924) | 139 | 0.4 | 16.5 | 16.9 | 33.8 | 56% | 341 | 2.86 |
+| shard 2 (139090493964) | 573 | 0.4 | 16.2 | 14.3 | 31.0 | 52% | 341 | 3.32 |
+| shard 3 (139090493854) | 1 | 0.4 | 16.3 | 17.4 | 34.1 | 57% | 341 | 2.75 |
+| shard 4 (139090494085) | 96 | 0.3 | 9.0 | 9.5 | 18.9 | 32% | 341 | 3.07 |
+| shard 5 (139090493893) | 52 | 0.3 | 16.0 | 13.4 | 29.7 | 50% | 340 | 3.31 |
+| collecting (139112113738) | 55 | | | | 0.1 | <1% | | |
+
+Attempt 2, a re-run of the whole run on the same head:
+
+| job | queue s | setup | build | test | job min | of limit | tests | parallelism |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| shard 1 (139347688445) | 2 | 0.4 | 12.9 | 14.7 | 28.0 | 47% | 341 | 2.96 |
+| shard 2 (139347688499) | 2 | 0.4 | 11.5 | 11.6 | 23.6 | 39% | 341 | 3.30 |
+| shard 3 (139347688325) | 2 | 0.4 | 16.6 | 17.8 | 34.9 | 58% | 341 | 2.76 |
+| shard 4 (139347688283) | 2 | 0.7 | 9.6 | 9.8 | 20.1 | 34% | 341 | 3.05 |
+| shard 5 (139347688363) | 2 | 0.4 | 16.7 | 13.8 | 31.0 | 52% | 340 | 3.29 |
+| collecting (139370249047) | 2 | | | | 0.1 | <1% | | |
+
+- Both attempts' aggregate step reported "1704 tests in 5 shards, each
+  executed exactly once"; no test failed (7, 2, 3, 2 and 3 runtime skips on
+  both).
+- Summed test time was 217.1 CPU-min on attempt 1 and 206.0 on attempt 2.
+  The lane took 41.5 and 35.1 min from the shards' creation to the
+  collecting job's end, and the shard jobs took 147.5 and
+  137.5 runner-minutes.
+- The worst job was shard 3 on both attempts, 34.1 and 34.9 min, 10.9 and
+  10.1 min under the 45-minute trigger.
+- In shard 1, `clang_tidy_ratchet` started first and no other test's run
+  overlapped it: 361.1 s on attempt 1 and 284.1 s on attempt 2.
+  `build-primary` ran it in its Test step (360.74 and 355.52 s) and again in
+  its "clang-tidy ratchet gate" step (350.75 and 345.21 s).
+- No test was removed.  One of the 46 added tests sits at index 50 of the
+  list and shifted the tests from there to index 1648 by one place; the
+  other 45 sit at indices 1649 to 1693.  So only 10 of slice 1's 341 tests,
+  those at indices 0 to 45, were also in slice 1 of run 45172454684, and
+  `wirelog_advanced_spill` moved from index 690 (slice 1) to 691 (slice 2),
+  which does not hold the ratchet.  It passed in 70.5 and 60.2 s.
+
+Against the projection.  The shard-1 projection above (a test step of
+18.6 min and at most 23.8; a job of about 36.8 min and at most 42.0) was
+made on run 45172454684's 1658-test slice 1, on other runners.  These runs
+are not a like-for-like test of it: 46 more tests, a slice 1 that shares 10
+of 341 tests with the modelled one, no spill test beside the ratchet, and
+different runners.  They neither confirm nor refute the replay.  They do
+show the ratchet running alone at the head of slice 1 on both attempts, and
+every shard job finishing under the trigger; shard 1's test step was 16.9
+and 14.7 min and its job 33.8 and 28.0 min.
+
+- "Shard 1's test step ... grows further" is not tested: slice 1 changed,
+  and its test step was not the longest on either attempt (shard 3's took
+  17.4 and 17.8 min).
+- "the slow one by at least 3.0 min" remains a projection for the modelled
+  slice.
+- "about 3.6 runner-minutes per run" cannot be measured from these runs:
+  neither attempt ran these tests with the ratchet parallel.
+
+Hypotheses, unchanged by these runs:
+
+- The contention hypothesis above is not tested.  `wirelog_advanced_spill`
+  no longer shares a slice with the ratchet, its neighbours in slice 2
+  differ, and its 120.1 s TIMEOUTs on attempts 2 and 3 of run 45172454684
+  are lower bounds on its duration, so these runs cannot attribute the
+  difference from its 70.5 and 60.2 s to the ratchet.
+- In shard 1, with no other test beside it, the ratchet took 361.1 and
+  284.1 s.  Run 45172454684's 461 s on attempt 2 and 446.71 s on attempt 3
+  are above both, but its attempt 1 took 332 s with 138 tests beside it,
+  below this run's 361.1 s with nothing beside it, on an earlier tree and
+  another runner.  These runs cannot separate contention from a slow runner.
+- The suite-growth pace hypothesis under "Decision: five" is not tested.
+  Summed test time differed by 11.1 CPU-min between the two attempts on the
+  same tests, and is 2.8 above and 8.3 below run 45172454684 attempt 1's
+  214.3 at 1658 tests, so these runs do not measure suite growth.
+
+Run 45378953021, on the earlier head 41c5dab9, measured nothing about this
+lane.  `build-primary` stopped at its "Check binary size" step with "tested
+merge first parent differs from event base SHA; refresh/retrigger this PR"
+(event base add4983c, merge built on `main` 08d82566), so no shard ran and
+the collecting job failed at "Require every shard to succeed".  The branch
+was then rebased, giving run 45539317908's head.
