@@ -750,3 +750,15 @@ third input before such a JOIN, a self-JOIN of the cold input, two cold inputs
 of one rule, an aggregate after a later JOIN, a SNAPSHOT or an observed STEP
 over a cold input, the program refusals of the sixth bundle and more than one
 worker stay open.
+
+A seventeenth bundle admits, under control, a rule in which two JOINs or more
+read a cold input as their right input, which the uncontrolled route admits at
+seal and reads at each of them. The composed attempt scans the input once and
+every such JOIN reads the copy; with no prefix, no right filter and one key,
+the suffix audit now also runs, and a rule that reads the cold input again is
+refused under control while its first input was declared but never inserted.
+See "A cold right input read by more than one JOIN in controlled single-worker
+sessions (#2301)". A cold input read as the rule's first input and again as a
+right input, a third input before a later JOIN, two cold inputs of one rule, an
+aggregate after a later JOIN, a SNAPSHOT or an observed STEP over a cold input,
+the program refusals of the sixth bundle and more than one worker stay open.
