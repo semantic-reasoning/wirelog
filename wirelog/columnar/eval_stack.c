@@ -12,6 +12,7 @@
 #include <assert.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 #ifdef WL_SESSION_TEST_HOOKS
 /* Observe real private operator publication before its input is retired. */
@@ -4325,7 +4326,8 @@ wl_columnar_eval_stack_composed_cold_install(
  * right input of a JOIN of the rule (#2301), at or after the end of the left
  * input's MAP/FILTER prefix. The output of the ops before that JOIN is
  * already on the stack; the slot stays held, bound to that JOIN, until the
- * RELEASE drop, after every child that read it has finished. */
+ * RELEASE drop, after every child that read it has finished, the later
+ * JOINs of the rule that read the same input included. */
 int
 wl_columnar_eval_stack_composed_cold_right_output(
     wl_columnar_eval_stack_cleanup_frame_t *frame, wl_col_session_t *sess,
@@ -4368,6 +4370,9 @@ wl_columnar_eval_stack_composed_cold_right_output(
     return 0;
 }
 
+/* The held copy, for the JOIN it is bound to or a later JOIN of the rule
+ * whose right input is the same cold input; no copy outside composed mode
+ * or before the scan. */
 int
 wl_columnar_eval_stack_composed_cold_right(
     const wl_columnar_eval_stack_cleanup_frame_t *frame, const void *owner,
@@ -4382,8 +4387,12 @@ wl_columnar_eval_stack_composed_cold_right(
     const wl_columnar_eval_plan_numeric_attempt_t *n = owner;
     if (!n->composed_mode || !n->cold_right_held) return 0;
     if (n->cold.identity || !n->plan
-        || n->cursor != n->cold_right_cursor
+        || n->cursor < n->cold_right_cursor
         || n->cursor >= n->plan->op_count
+        || !op->right_relation
+        || !n->plan->ops[n->cold_right_cursor].right_relation
+        || strcmp(op->right_relation,
+        n->plan->ops[n->cold_right_cursor].right_relation) != 0
         || op != &n->plan->ops[n->cursor] || op->op != WL_PLAN_OP_JOIN
         || !frame->cold_right.owned || !frame->cold_right.rel)
         return EINVAL;

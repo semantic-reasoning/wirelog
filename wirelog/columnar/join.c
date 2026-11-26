@@ -6445,8 +6445,9 @@ wl_columnar_join_op_attempt_start_owned_initialize(const wl_plan_op_t *op,
     rc = wl_columnar_join_attempt_return(control, id, rc);
     if (rc) goto done;
     col_rel_t *right = NULL, *delta = NULL;
-    /* A cold right input is the composed owner's scanned copy (#2301); it
-     * has no registry slot and no delta. */
+    /* A cold right input is the composed owner's scanned copy (#2301), one
+     * for every JOIN of the rule that reads it; it has no registry slot and
+     * no delta. */
     bool cold_right = session->cold_relation
         && wl_columnar_session_cold_find(session, op->right_relation);
     if (cold_right) {

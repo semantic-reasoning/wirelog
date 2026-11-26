@@ -2566,10 +2566,19 @@ wl_columnar_session_cold_join_rule(const wl_col_session_t *sess,
  * uncontrolled route runs as an ordinary JOIN. A REDUCE may follow only as
  * the rule's next to last op, and the rule must then instead pass the
  * uncontrolled cold JOIN aggregate audit with this JOIN as its first, with
- * an operand type the controlled REDUCE accepts. The composed attempt runs
- * the ops before this JOIN over the resident input, copies the cold input
- * whole into the frame's cold right slot, and the controlled JOIN reads the
- * copy. */
+ * an operand type the controlled REDUCE accepts. Later JOINs of the rule
+ * may read the input as their right input too. With no prefix, no right
+ * filter and one key at every JOIN, such a rule must then also pass the
+ * suffix audit, as the prefix audit compares the key types of the rule's
+ * first JOIN only. Over a first input declared but never inserted, the
+ * output of a controlled JOIN holds none of that input's columns, while
+ * the uncontrolled one takes them from its declaration, so a later JOIN
+ * of the input would resolve its keys against other columns; a rule that
+ * reads the input again is refused while its first input has neither a
+ * column nor a row or is not registered. The composed attempt runs the ops
+ * before this JOIN over the resident input, copies the cold input whole
+ * into the frame's cold right slot, and every controlled JOIN of the rule
+ * that reads the input reads the copy. */
 static bool
 wl_columnar_session_cold_right_rule(const wl_col_session_t *sess,
     const wl_plan_relation_t *rp, const char *name, uint32_t at)
@@ -2586,7 +2595,19 @@ wl_columnar_session_cold_right_rule(const wl_col_session_t *sess,
         return false;
     uint32_t last = rp->op_count - 2, join = 0;
     bool reduction = rp->op_count >= 4 &&
-        rp->ops[last].op == WL_PLAN_OP_REDUCE, filtered = false;
+        rp->ops[last].op == WL_PLAN_OP_REDUCE, filtered = false, again = false;
+    for (uint32_t i = at + 1; i < rp->op_count; i++)
+        again |= rp->ops[i].op == WL_PLAN_OP_JOIN &&
+            rp->ops[i].right_relation &&
+            !strcmp(rp->ops[i].right_relation, name);
+    if (again) {
+        const col_rel_t *left = NULL;
+        for (uint32_t i = 0; !left && i < sess->nrels; i++)
+            if (sess->rels[i] &&
+                !strcmp(sess->rels[i]->name, rp->ops[0].relation_name))
+                left = sess->rels[i];
+        if (!left || (!left->ncols && !left->nrows)) return false;
+    }
     for (uint32_t i = 0; i < rp->op_count; i++) {
         if ((rp->ops[i].op == WL_PLAN_OP_REDUCE &&
             (!reduction || i != last)) ||
@@ -2602,7 +2623,8 @@ wl_columnar_session_cold_right_rule(const wl_col_session_t *sess,
         filtered ? at > first_join &&
         wl_columnar_join_cold_later_filtered(sess, rp, name) :
         wl_columnar_join_cold_prefix(sess, rp) &&
-        (at == first_join || wl_columnar_join_cold_later_suffix(sess, rp))))
+        ((at == first_join && !again) ||
+        wl_columnar_join_cold_later_suffix(sess, rp))))
         return false;
     return wl_columnar_session_cold_layout(sess, name);
 }
@@ -2616,13 +2638,14 @@ wl_columnar_session_cold_right_rule(const wl_col_session_t *sess,
  * over the scan's output, and after the JOIN the operators and the REDUCE that
  * follow it. One JOIN of the rule, its first, after a VARIABLE over another
  * input and that input's MAP/FILTER prefix, if any, or a later one, may
- * instead read the binding as its right input, under the cold right rule
- * above, and a REDUCE may then follow the first. Programs that a controlled
- * STEP routes to the general observed transaction are refused here, while the
- * source is still resident: a head that is also an EDB, the two-EDB
- * single-rule seed shape, and a registry that a successor STEP would find
- * larger than three relations. The registry never shrinks after a seal, so its
- * size plus the heads not yet registered bounds it. */
+ * instead read the binding as its right input, and so may JOINs after it,
+ * under the cold right rule above; a REDUCE may then follow the first.
+ * Programs that a controlled STEP routes to the general observed transaction
+ * are refused here, while the source is still resident: a head that is also
+ * an EDB, the two-EDB single-rule seed shape, and a registry that a
+ * successor STEP would find larger than three relations. The registry never
+ * shrinks after a seal, so its size plus the heads not yet registered bounds
+ * it. */
 static bool
 wl_columnar_session_cold_controlled_plan(const wl_col_session_t *sess,
     const char *name)
@@ -2654,11 +2677,13 @@ wl_columnar_session_cold_controlled_plan(const wl_col_session_t *sess,
                     !strcmp(op->relation_name, name);
                 bool right_here = op->right_relation &&
                     !strcmp(op->right_relation, name);
-                /* One JOIN, at or after the end of the left input's
-                 * MAP/FILTER prefix, may read the input as its right input. */
+                /* JOINs at or after the end of the left input's MAP/FILTER
+                 * prefix may read the input as their right input; `at` is
+                 * the first of them. */
                 if (right_here && oi && oi >= first_join && !left_here &&
-                    op->op == WL_PLAN_OP_JOIN && at == rp->op_count) at = oi;
-                else if ((left_here || right_here) && oi) return false;
+                    op->op == WL_PLAN_OP_JOIN) {
+                    if (at == rp->op_count) at = oi;
+                } else if ((left_here || right_here) && oi) return false;
                 uses |= left_here || right_here;
             }
             if (!uses) continue;

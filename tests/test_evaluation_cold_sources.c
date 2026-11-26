@@ -268,6 +268,25 @@
  * left key from an edited plan is refused under control, and over a resident
  * input never inserted the STEP returns ENOTSUP on both sessions.
  *
+ * Twice, run with the argument "twice": two JOINs of a rule or more may read a
+ * cold right input, which is scanned once, every such JOIN reading the copy.
+ * The corpus has two such JOINs with no prefix over 8 and 20 cold rows, after
+ * the resident input's prefix, after a JOIN of the resident input with itself
+ * and with one between them, and three such JOINs; two keys at the first and
+ * at the second; a right filter at an earlier JOIN of the resident input; a
+ * second JOIN that no row matches; and STRING keys from program facts, each
+ * compared with the uncontrolled session and, with generated rows, with the
+ * sessions that keep both inputs resident. Both stops at every scan checkpoint
+ * on both routes, a work-limit stop at every JOIN checkpoint on the seal route
+ * and a cancellation at every one on the loading route, parks after the scan
+ * and in the first and a later JOIN of the copy, an allocation that the first
+ * or a later one cannot make, the read cancellation, the read fault and the
+ * denials on both routes behave as with one such JOIN; the full STEP consumes
+ * the same work on both routes; a STRING left key at the later JOIN from an
+ * edited plan is refused under control; and over a first input never inserted
+ * the controlled session refuses the seal or load, the uncontrolled STEP
+ * returning ENOTSUP or no head row.
+ *
  * Not checked here: more than one worker; an observed STEP or an observed
  * SNAPSHOT over a cold source, both refused; a MAP whose lanes, or a REDUCE
  * whose group keys and operand, exceed one quantum of resolution lanes; a
@@ -594,6 +613,11 @@ static int allocations_before_right = -1;
 
 static wl_columnar_cold_scan_attempt_phase_t last_phase;
 static bool right_scan_seen; /* A checkpoint of a JOIN right input's scan. */
+static uint64_t right_scans; /* Scans of a JOIN right input that ended. */
+/* JOIN attempts started; at the start of number `join_latch`, the JOIN
+ * checkpoints and the JOIN attempt allocations made before it. */
+static uint64_t join_starts, join_latch, joins_before_latch;
+static int allocations_before_latch = -1;
 
 static uint64_t cell_consumed, cell_run;
 
@@ -652,6 +676,8 @@ cold_checkpoint(wl_evaluation_control_t *control,
                 wl_columnar_join_test_attempt_fail_allocation;
     }
     right_scan_seen |= a->right;
+    right_scans += a->right &&
+        a->phase == WL_COLUMNAR_COLD_SCAN_ATTEMPT_WRITER_END;
     if (!stop_mode) {
         cell_bound(control, a);
         resolve_bound(control, a);
@@ -680,13 +706,19 @@ reduce_checkpoint(wl_evaluation_control_t *control, unsigned phase,
             WL_EVALUATION_CONTROL_WORK_LIMIT);
 }
 
-/* The controlled JOIN that consumes the scan's output (#2301). */
+/* The controlled JOIN that consumes the scan's output (#2301). Phase 3 is
+ * passed once by each JOIN attempt, as it starts. */
 static void
 join_checkpoint(wl_evaluation_control_t *control, unsigned phase,
     uint64_t progress)
 {
-    (void)phase;
     (void)progress;
+    if (phase == 3 && ++join_starts == join_latch) {
+        joins_before_latch = join_checkpoints;
+        if (wl_columnar_join_test_attempt_fail_allocation >= 0)
+            allocations_before_latch = JOIN_ALLOCATION_BOUND -
+                wl_columnar_join_test_attempt_fail_allocation;
+    }
     if (++join_checkpoints != stop_at || !stop_mode || stop_child != 2)
         return;
     stop_hit = true;
@@ -709,6 +741,9 @@ hooks_clear(void)
     last_phase = WL_COLUMNAR_COLD_SCAN_ATTEMPT_INERT;
     resolve_seen = false;
     right_scan_seen = false;
+    right_scans = 0;
+    join_starts = 0;
+    joins_before_latch = 0;
 }
 
 /* The bound turns a livelock into a prompt CHECK failure. */
@@ -756,6 +791,8 @@ typedef struct {
     bool second; /* The JOIN that reads the cold right input comes after
                   * one or more JOINs of the resident left input with
                   * itself. */
+    bool twice; /* Two JOINs of the rule or more read the cold input as
+                 * their right input. */
 } qcase_t;
 
 static int64_t
@@ -1322,6 +1359,61 @@ static qcase_t qcases[] = {
      "c(3,10). c(4,20). c(1,30).\n"
      "out(x,z) :- a(x,y,s), a(y,v,\"p\"), c(v,z).\n", "c", 0, 0, "VJJC", 0,
      "out", NULL, NULL, 0, 0, 0, true, .second = true},
+    /* A cold right input read by two JOINs or more, which read one copy. A
+     * generated row with first column r is (r, r + 3) in a two-column
+     * input and (r, r + 3, r + 6) in a three-column one, modulo 13, so over
+     * 13 rows or more every key finds a row. */
+#define RIGHT_TWICE ".decl a(x:int64,y:int64)\n.decl c(y:int64,z:int64)\n" \
+        ".decl out(x:int64,u:int64)\n"
+#define RIGHT_TWICE3 ".decl a(x:int64,y:int64,w:int64)\n" \
+        ".decl c(y:int64,z:int64)\n.decl out(x:int64,u:int64)\n"
+    {"right_twice", RIGHT_TWICE "out(x,u) :- a(x,y), c(y,z), c(z,u).\n", "c",
+     2, 20, "VJJC", 0, "out", NULL, "a", 2, 20, 0, true, .twice = true},
+    /* Over 8 cold rows, cold row 0, (0, 3), has the partner (3, 6). */
+    {"right_twice_few", RIGHT_TWICE "out(x,u) :- a(x,y), c(y,z), c(z,u).\n",
+     "c", 2, 8, "VJJC", 0, "out", NULL, "a", 2, 13, 0, true, .twice = true},
+    /* Resident row 2, (1, 4, 7), passes the FILTER. */
+    {"right_twice_after_filter", RIGHT_TWICE3
+     "out(x,u) :- a(x,y,w), w = 7, c(y,z), c(z,u).\n", "c", 2, 20,
+     "VFJJFMC", 0, "out", NULL, "a", 3, 20, 0, true, .twice = true},
+    {"right_twice_second", RIGHT_TWICE3
+     "out(x,u) :- a(x,y,w), a(y,v,t), c(v,z), c(z,u).\n", "c", 2, 20,
+     "VJJJC", 0, "out", NULL, "a", 3, 20, 0, true, .second = true,
+     .twice = true},
+    /* A JOIN of the resident input between the two that read the copy. */
+    {"right_twice_between", RIGHT_TWICE3
+     "out(x,u) :- a(x,y,w), c(y,z), a(z,v,t), c(v,u).\n", "c", 2, 20,
+     "VJJJC", 0, "out", NULL, "a", 3, 20, 0, true, .twice = true},
+    {"right_thrice", RIGHT_TWICE
+     "out(x,u) :- a(x,y), c(y,z), c(z,w), c(w,u).\n", "c", 2, 20, "VJJJC", 0,
+     "out", NULL, "a", 2, 20, 0, true, .twice = true},
+    /* Two keys at the first JOIN that reads the copy, and at the second. */
+    {"right_twice_composite", ".decl a(x:int64,y:int64,w:int64)\n"
+     ".decl c(y:int64,z:int64,v:int64)\n.decl out(x:int64,u:int64)\n"
+     "out(x,u) :- a(x,y,w), c(y,w,v), c(v,z,u).\n", "c", 3, 20, "VJJC", 0,
+     "out", NULL, "a", 3, 20, 0, true, .twice = true},
+    {"right_twice_keys_second", ".decl a(x:int64,y:int64,w:int64)\n"
+     ".decl c(y:int64,z:int64,v:int64)\n.decl out(x:int64,u:int64)\n"
+     "out(x,u) :- a(x,y,w), c(y,z,v), c(z,v,u).\n", "c", 3, 20, "VJJC", 0,
+     "out", NULL, "a", 3, 20, 0, true, .twice = true},
+    /* Resident row 9, (11, 1, 4), has the filtered partner (1, 4, 7). */
+    {"right_second_filter_twice", RIGHT_TWICE3
+     "out(x,u) :- a(x,y,w), a(y,4,t), c(t,z), c(z,u).\n", "c", 2, 20,
+     "VJJJC", 0, "out", NULL, "a", 3, 20, 0, true, .second = true,
+     .twice = true},
+    /* The second JOIN's two keys: no cold row (z, y) follows a cold row
+     * (y, z), since 3 + 3 is not 0 modulo 13. */
+    {"right_twice_all_filtered", ".decl a(x:int64,y:int64)\n"
+     ".decl c(y:int64,z:int64)\n.decl out(x:int64,y:int64)\n"
+     "out(x,y) :- a(x,y), c(y,z), c(z,y).\n", "c", 2, 20, "VJJC", 0, "out",
+     NULL, "a", 2, 20, 0, true, .twice = true},
+    /* STRING keys at both JOINs: 1 reaches "r" and 2 reaches "p". */
+    {"right_twice_string", ".decl a(x:int64,s:symbol)\n"
+     ".decl c(s:symbol,t:symbol)\n.decl out(x:int64,u:symbol)\n"
+     "a(1,\"p\"). a(2,\"q\").\n"
+     "c(\"p\",\"q\"). c(\"q\",\"r\"). c(\"r\",\"p\").\n"
+     "out(x,u) :- a(x,s), c(s,t), c(t,u).\n", "c", 0, 0, "VJJC", 0, "out",
+     NULL, NULL, 0, 0, 0, true, .twice = true},
 };
 
 #define NQCASES (sizeof(qcases) / sizeof(qcases[0]))
@@ -1449,6 +1541,14 @@ run_qcase(const qcase_t *c, via_t via)
     CHECK(join == rp->op_count ||
         (c->cold_right == !strcmp(rp->ops[join].right_relation, c->cold) &&
         c->cold_right == !!strcmp(rp->ops[0].relation_name, c->cold)));
+    /* Exactly the twice cases read the cold input at two JOINs or more. */
+    uint32_t cold_joins = 0, joins = 0;
+    for (uint32_t i = 0; i < rp->op_count; i++) {
+        joins += rp->ops[i].op == WL_PLAN_OP_JOIN;
+        cold_joins += rp->ops[i].op == WL_PLAN_OP_JOIN &&
+            !strcmp(rp->ops[i].right_relation, c->cold);
+    }
+    CHECK((cold_joins > 1) == c->twice);
     /* The JOIN that reads the cold input has two keys exactly in the
      * composite cases, and the permuted ones pair each left key with a
      * right column of another position. */
@@ -1504,6 +1604,10 @@ run_qcase(const qcase_t *c, via_t via)
         CHECK(round || (joins_before_right > 0) == c->second);
         CHECK(round || !c->cold_right ||
             join_checkpoints > joins_before_right);
+        /* The input is scanned once, and every JOIN of the rule runs; in
+         * the twice cases the later ones read the same copy. */
+        CHECK(round || !c->cold_right || right_scans == 1);
+        CHECK(round || !c->twice || join_starts == joins);
         CHECK(wl_columnar_join_test_raw_cold_right_joins == raw_right_joins);
         CHECK(round || !strchr(c->ops, 'R') || reduce_checkpoints > 0);
         CHECK(round || !strchr(c->ops, 'J') || join_checkpoints > 0);
@@ -1511,8 +1615,10 @@ run_qcase(const qcase_t *c, via_t via)
         CHECK(!strchr(c->ops, 'J') || !c->right_rows ||
             strstr(c->name, "all_filtered") || head_rows(f.s, c->head) > 0);
         /* Program facts give no generated rows to check: the STRING right
-         * filter case keeps (1, 20) and (2, 30) and drops (1, 10). */
-        CHECK(strcmp(c->name, "right_second_filter_string") ||
+         * filter case keeps (1, 20) and (2, 30) and drops (1, 10), and the
+         * STRING twice case gives (1, "r") and (2, "p"). */
+        CHECK((strcmp(c->name, "right_second_filter_string") &&
+            strcmp(c->name, "right_twice_string")) ||
             head_rows(f.s, c->head) == 2);
         /* Each left row joins right_rows / right_fan right rows; inserted
          * duplicates stay, and the COUNT counts every pair. */
@@ -1917,21 +2023,31 @@ cold_both_later_case(bool left_first)
  * its STEP returns ENOTSUP; the controlled one refuses it, and its STEP
  * returns what it returns in a session that never tried. The parser
  * refuses a variable over a STRING and an INT64 column, so the key comes
- * from an edited plan. */
+ * from an edited plan. Kind 0 has a JOIN of the resident input before that
+ * one, kind 1 with a right filter, and in kind 2 the earlier JOIN reads
+ * the cold input too. */
 static void
-key_type_case(via_t via, bool filtered)
+key_type_case(via_t via, int kind)
 {
+    static const char *const kinds[3] = {"", "/filtered", "/twice"};
     snprintf(where_buf, sizeof(where_buf), "key_type/%s%s",
-        via == VIA_SEAL ? "seal" : "load", filtered ? "/filtered" : "");
+        via == VIA_SEAL ? "seal" : "load", kinds[kind]);
     where = where_buf;
-    const char *text = filtered ? ".decl a(x:int64,y:int64,s:symbol)\n"
-        ".decl c(v:int64,z:int64)\n.decl out(x:int64,z:int64)\n"
-        "a(1,2,\"p\"). a(2,3,\"q\"). a(3,1,\"p\").\n"
-        "out(x,z) :- a(x,y,s), a(y,v,\"p\"), c(v,z).\n" :
+    static const char *const texts[3] = {
         ".decl a(x:int64,y:int64,s:symbol)\n"
         ".decl c(v:int64,z:int64)\n.decl out(x:int64,z:int64)\n"
         "a(1,2,\"p\"). a(2,3,\"q\"). a(3,1,\"p\").\n"
-        "out(x,z) :- a(x,y,s), a(y,v,u), c(v,z).\n";
+        "out(x,z) :- a(x,y,s), a(y,v,u), c(v,z).\n",
+        ".decl a(x:int64,y:int64,s:symbol)\n"
+        ".decl c(v:int64,z:int64)\n.decl out(x:int64,z:int64)\n"
+        "a(1,2,\"p\"). a(2,3,\"q\"). a(3,1,\"p\").\n"
+        "out(x,z) :- a(x,y,s), a(y,v,\"p\"), c(v,z).\n",
+        ".decl a(x:int64,y:int64,s:symbol)\n"
+        ".decl c(v:int64,z:int64)\n.decl out(x:int64,u:int64)\n"
+        "a(1,2,\"p\"). a(2,3,\"q\"). a(3,1,\"p\").\n"
+        "out(x,u) :- a(x,y,s), c(y,z), c(z,u).\n"
+    };
+    const char *text = texts[kind];
     fixture_t f;
     plan_edit = 4;
     fixture(&f, text);
@@ -1939,7 +2055,8 @@ key_type_case(via_t via, bool filtered)
     ops_of(&f, got);
     CHECK(!strcmp(got, "VJJC"));
     const wl_plan_relation_t *rp = &f.plan->strata[0].relations[0];
-    CHECK(!rp->ops[1].right_filter_expr.size == !filtered);
+    CHECK(!rp->ops[1].right_filter_expr.size == (kind != 1));
+    CHECK(!strcmp(rp->ops[1].right_relation, kind == 2 ? "c" : "a"));
     if (via == VIA_SEAL) {
         fill(&f, "c", 2, 4, true);
         CHECK(wl_columnar_session_seal_join_input(f.raw, "c", NULL, NULL) ==
@@ -1989,6 +2106,128 @@ second_absent_case(via_t via, const char *name)
     CHECK(until_done(f.s) == ENOTSUP);
     CHECK(!checkpoints && join_checkpoints > 0);
     CHECK(head_rows(f.s, "out") == 0 && reserved(&f) == before);
+    fixture_destroy(&f);
+}
+
+/* A cold right input read twice over a resident first input declared but
+ * never inserted. The uncontrolled session admits the seal or load; its
+ * STEP checks the left input of each JOIN of the cold input, and returns
+ * ENOTSUP where a later one's left key is not a column of the earlier
+ * JOINs' output, completing with no head row otherwise. Over such an input
+ * the output of a controlled JOIN has none of its columns, so a later JOIN
+ * of the copy would resolve its keys against other columns than the
+ * uncontrolled one: the controlled session refuses the seal or load, and
+ * its STEP returns what it returns in a session that never tried. */
+static void
+twice_absent_case(via_t via, const char *name, int raw_rc)
+{
+    snprintf(where_buf, sizeof(where_buf), "twice_absent/%s/%s", name,
+        via == VIA_SEAL ? "seal" : "load");
+    where = where_buf;
+    const qcase_t *c = find_qcase(name);
+    fixture_t f;
+    fixture(&f, case_text(c));
+    if (via == VIA_SEAL) {
+        fill(&f, c->cold, c->width, c->rows, true);
+        CHECK(wl_columnar_session_seal_join_input(f.raw, c->cold, NULL,
+            NULL) == WL_COLUMNAR_SPILL_OK);
+        CHECK(wl_columnar_session_seal_join_input(f.s, c->cold, NULL,
+            NULL) == WL_COLUMNAR_SPILL_UNSUPPORTED);
+    } else {
+        CHECK(load(f.raw, c->cold, c->width, c->rows) ==
+            WL_COLUMNAR_SPILL_OK);
+        CHECK(load(f.s, c->cold, c->width, c->rows) ==
+            WL_COLUMNAR_SPILL_UNSUPPORTED);
+    }
+    CHECK(until_done(f.raw) == raw_rc && head_rows(f.raw, "out") == 0);
+    hooks_clear();
+    int rc = until_done(f.s);
+    CHECK(!checkpoints);
+    fixture_t g;
+    fixture(&g, case_text(c));
+    if (via == VIA_SEAL) fill(&g, c->cold, c->width, c->rows, false);
+    int expected = until_done(g.s);
+    if (rc != expected)
+        fprintf(stderr, "%s: rc %d, unsealed %d\n", where, rc, expected);
+    CHECK(rc == expected);
+    fixture_destroy(&g);
+    fixture_destroy(&f);
+}
+
+/* An allocation that the nth JOIN attempt of the rule cannot make, its
+ * first one, after an earlier JOIN read the copy of the cold right input:
+ * the STEP fails, the copy is dropped, and a later STEP gives the
+ * uncontrolled heads. */
+static void
+join_fault_nth(const qcase_t *c, uint64_t n)
+{
+    char what[32];
+    snprintf(what, sizeof(what), "join_fault_%llu", (unsigned long long)n);
+    set_where(c, VIA_SEAL, what);
+    fixture_t f;
+    fixture(&f, case_text(c));
+    prepare(&f, c, VIA_SEAL);
+    hooks_clear();
+    join_latch = n;
+    allocations_before_latch = -1;
+    wl_columnar_join_test_attempt_fail_allocation = JOIN_ALLOCATION_BOUND;
+    CHECK(!until_done(f.s));
+    wl_columnar_join_test_attempt_fail_allocation = -1;
+    CHECK(join_starts >= n && allocations_before_latch > 0);
+    int skip = allocations_before_latch;
+    fixture_destroy(&f);
+    fixture(&f, case_text(c));
+    prepare(&f, c, VIA_SEAL);
+    CHECK(!until_done(f.raw));
+    uint64_t before = reserved(&f);
+    hooks_clear();
+    wl_columnar_join_test_attempt_fail_allocation = skip;
+    int rc = until_done(f.s);
+    wl_columnar_join_test_attempt_fail_allocation = -1;
+    join_latch = 0;
+    CHECK(rc == ENOMEM && right_scans == 1 && join_starts == n);
+    CHECK(head_rows(f.s, c->head) == 0 && reserved(&f) == before);
+    CHECK(!wl_evaluation_control_reset(f.control));
+    CHECK(!until_done(f.s));
+    expect_heads(&f, c);
+    fixture_destroy(&f);
+}
+
+/* Parked inside the nth JOIN attempt of the rule, after a checkpoint of
+ * it, with the copy of the cold right input held for an earlier JOIN: the
+ * session refuses checked destruction; after a cancellation the STEP ends
+ * with every reservation returned, and a later STEP gives the uncontrolled
+ * heads. */
+static void
+parked_later_join_case(const qcase_t *c, uint64_t n)
+{
+    char what[32];
+    snprintf(what, sizeof(what), "parked_join_%llu", (unsigned long long)n);
+    set_where(c, VIA_SEAL, what);
+    fixture_t f;
+    fixture(&f, case_text(c));
+    prepare(&f, c, VIA_SEAL);
+    CHECK(!until_done(f.raw));
+    uint64_t before = reserved(&f);
+    hooks_clear();
+    join_latch = n;
+    int rc = EAGAIN;
+    for (unsigned i = 0; rc == EAGAIN && !(join_starts >= n &&
+        join_checkpoints > joins_before_latch + 1); i++) {
+        CHECK(i < 200000);
+        rc = wl_session_step(f.s);
+    }
+    join_latch = 0;
+    CHECK(rc == EAGAIN && right_scans == 1 && join_starts == n);
+    wl_session_t *s = f.s;
+    CHECK(wl_session_try_destroy(&s) == EBUSY && s == f.s);
+    wl_evaluation_control_request_cancel(f.control);
+    rc = until_done(f.s);
+    CHECK(rc == WL_EVALUATION_CONTROL_CANCELLED);
+    CHECK(head_rows(f.s, c->head) == 0 && reserved(&f) == before);
+    CHECK(!wl_evaluation_control_reset(f.control));
+    CHECK(!until_done(f.s));
+    expect_heads(&f, c);
     fixture_destroy(&f);
 }
 
@@ -2456,16 +2695,29 @@ static const refusal_t refusals[] = {
      "out(x,z) :- a(x,y), r(y,w), c(w,z).\n", "c", 2, false},
     {"self_join", ".decl c(x:int64,y:int64)\n.decl out(x:int64,z:int64)\n"
      "out(x,z) :- c(x,y), c(y,z).\n", "c", 2, false},
-    /* A cold right input read again by a later JOIN, after a FILTER and
-     * with no prefix. */
-    {"right_twice_after_filter", ".decl a(x:int64,y:int64,w:int64)\n"
-     ".decl c(y:int64,z:int64)\n.decl out(x:int64,u:int64)\n"
-     "out(x,u) :- a(x,y,w), w = 7, c(y,z), c(z,u).\n", "c", 2, false,
-     false, "VFJJFMC", 1},
-    {"right_twice", ".decl a(x:int64,y:int64)\n"
-     ".decl c(y:int64,z:int64)\n.decl out(x:int64,u:int64)\n"
-     "out(x,u) :- a(x,y), c(y,z), c(z,u).\n", "c", 2, false, false, "VJJC",
+    /* A cold right input read twice, refused uncontrolled too: a constant
+     * in the second JOIN's cold input, over two columns of it and over
+     * three, a comparison between the JOINs, a COUNT after them, and two
+     * reads on the same key, which the planner emits in another shape. */
+    {"right_twice_filter_on_cold", ".decl a(x:int64,y:int64,w:int64)\n"
+     ".decl c(y:int64,z:int64)\n.decl out(x:int64,z:int64)\n"
+     "out(x,z) :- a(x,y,w), c(y,z), c(z,4).\n", "c", 2, false, true, "VJJC",
      1},
+    {"right_twice_filter_cold_keys", ".decl a(x:int64,y:int64,w:int64)\n"
+     ".decl c(y:int64,z:int64,v:int64)\n.decl out(x:int64,u:int64)\n"
+     "out(x,u) :- a(x,y,w), c(y,z,v), c(z,4,u).\n", "c", 3, false, true,
+     "VJJC", 1},
+    {"right_twice_compare", ".decl a(x:int64,y:int64)\n"
+     ".decl c(y:int64,z:int64)\n.decl out(x:int64,u:int64)\n"
+     "out(x,u) :- a(x,y), c(y,z), z < 9, c(z,u).\n", "c", 2, false, true,
+     "VJJFMC", 1},
+    {"right_twice_count", ".decl a(x:int64,y:int64)\n"
+     ".decl c(y:int64,z:int64)\n.decl out(x:int64,n:int64)\n"
+     "out(x,count(u)) :- a(x,y), c(y,z), c(z,u).\n", "c", 2, false, true,
+     "VJJRC", 1},
+    {"right_twice_same_key", ".decl a(x:int64,y:int64)\n"
+     ".decl c(y:int64,z:int64)\n.decl out(x:int64,u:int64)\n"
+     "out(x,u) :- a(x,y), c(y,z), c(y,u).\n", "c", 2, false, true},
     /* A COUNT after a later JOIN that reads a cold right input. */
     {"right_second_count", ".decl a(x:int64,y:int64,w:int64)\n"
      ".decl c(v:int64,z:int64)\n.decl out(x:int64,n:int64)\n"
@@ -2750,7 +3002,7 @@ static void
 right_cases(void)
 {
     for (size_t i = 0; i < NQCASES; i++) {
-        if (!qcases[i].cold_right) continue;
+        if (!qcases[i].cold_right || qcases[i].twice) continue;
         run_qcase(&qcases[i], VIA_SEAL);
         run_qcase(&qcases[i], VIA_LOAD);
     }
@@ -2840,8 +3092,8 @@ right_cases(void)
     denial_case(find_qcase("right_second_self"), VIA_LOAD);
     for (int v = 0; v < 2; v++) {
         via_t via = v ? VIA_LOAD : VIA_SEAL;
-        key_type_case(via, false);
-        key_type_case(via, true);
+        key_type_case(via, 0);
+        key_type_case(via, 1);
         second_absent_case(via, "right_second_self");
         second_absent_case(via, "right_second_filter");
     }
@@ -2869,6 +3121,64 @@ right_cases(void)
     cold_both_later_case(false);
 }
 
+/* A cold right input read by two JOINs of the rule or more (#2301). */
+static void
+twice_cases(void)
+{
+    for (size_t i = 0; i < NQCASES; i++) {
+        if (!qcases[i].twice) continue;
+        run_qcase(&qcases[i], VIA_SEAL);
+        run_qcase(&qcases[i], VIA_LOAD);
+    }
+    /* Stops in the scan with each mode on both routes, and at every JOIN
+     * checkpoint, those of the JOIN that reads the copy again included,
+     * with each mode on one route. */
+    for (int mode = 1; mode <= 2; mode++) {
+        stop_case(find_qcase("right_twice_few"), VIA_SEAL, mode, 0);
+        stop_case(find_qcase("right_twice_few"), VIA_LOAD, mode, 0);
+    }
+    stop_case(find_qcase("right_twice_few"), VIA_SEAL, 2, 2);
+    stop_case(find_qcase("right_twice_few"), VIA_LOAD, 1, 2);
+    /* Parks after the scan, in the first JOIN that reads the copy and in a
+     * later one; allocation faults in a later one. */
+    parked_destroy_case(find_qcase("right_twice"));
+    parked_join_case(find_qcase("right_twice"), false);
+    parked_later_join_case(find_qcase("right_twice"), 2);
+    parked_later_join_case(find_qcase("right_twice_between"), 3);
+    parked_later_join_case(find_qcase("right_thrice"), 3);
+    join_fault_case(find_qcase("right_twice"));
+    join_fault_nth(find_qcase("right_twice"), 2);
+    join_fault_nth(find_qcase("right_twice_between"), 3);
+    join_fault_nth(find_qcase("right_thrice"), 3);
+    join_fault_nth(find_qcase("right_twice_composite"), 2);
+    join_fault_nth(find_qcase("right_twice_keys_second"), 2);
+    join_fault_nth(find_qcase("right_twice_second"), 3);
+    read_cancel_case(find_qcase("right_twice"));
+    read_fault_case(find_qcase("right_twice"));
+    denial_case(find_qcase("right_twice_second"), VIA_SEAL);
+    denial_case(find_qcase("right_twice_second"), VIA_LOAD);
+    const char *exact[] = {"right_twice", "right_twice_between"};
+    for (size_t i = 0; i < sizeof(exact) / sizeof(exact[0]); i++) {
+        uint64_t sealed = exact_case(find_qcase(exact[i]), VIA_SEAL);
+        uint64_t loaded = exact_case(find_qcase(exact[i]), VIA_LOAD);
+        if (sealed != loaded)
+            fprintf(stderr, "exact %s: sealed %llu loaded %llu\n", exact[i],
+                (unsigned long long)sealed, (unsigned long long)loaded);
+        CHECK(sealed == loaded);
+    }
+    for (int v = 0; v < 2; v++) {
+        via_t via = v ? VIA_LOAD : VIA_SEAL;
+        key_type_case(via, 2);
+        twice_absent_case(via, "right_twice", 0);
+        twice_absent_case(via, "right_twice_after_filter", 0);
+        twice_absent_case(via, "right_thrice", 0);
+        twice_absent_case(via, "right_twice_composite", 0);
+        twice_absent_case(via, "right_twice_between", ENOTSUP);
+        twice_absent_case(via, "right_twice_second", ENOTSUP);
+        twice_absent_case(via, "right_second_filter_twice", ENOTSUP);
+    }
+}
+
 int
 main(int argc, char **argv)
 {
@@ -2879,6 +3189,12 @@ main(int argc, char **argv)
         right_cases();
         wl_columnar_join_test_attempt_checkpoint = NULL;
         printf("evaluation_cold_sources right: ok\n");
+        return 0;
+    }
+    if (argc > 1 && !strcmp(argv[1], "twice")) {
+        twice_cases();
+        wl_columnar_join_test_attempt_checkpoint = NULL;
+        printf("evaluation_cold_sources twice: ok\n");
         return 0;
     }
     for (size_t i = 0; i < NQCASES; i++) {

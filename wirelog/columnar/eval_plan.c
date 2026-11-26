@@ -3605,7 +3605,8 @@ wl_columnar_eval_plan_numeric_composed_attempt_step_validated_body(
         }
         /* A cold right input is first scanned into its frame slot (#2301),
          * at a JOIN of the rule at or after the end of the left input's
-         * MAP/FILTER prefix. */
+         * MAP/FILTER prefix; a later JOIN of the same input finds the slot
+         * held and runs as an ordinary JOIN that reads it. */
         if (record->plan->ops[record->cursor].op == WL_PLAN_OP_JOIN
             && !record->cold_right_held && record->session->cold_relation
             && wl_columnar_session_cold_find(record->session,
