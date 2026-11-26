@@ -8433,3 +8433,13 @@ foreach selector_case : ['hash', 'cache', 'natural']
        test_evaluation_materialized_selectors_exe, args: [selector_case],
        suite: ['unit', 'tsan', 'evaluation_join_hosts'], timeout: 120)
 endforeach
+
+# Genuine END and successor recovery for every discovered fresh retirement class.
+foreach heads : [1, 2]
+  foreach observed : [0, 1]
+    test('evaluation_recursive_string_owner_@0@_@1@'.format(heads, observed),
+      evaluation_recursive_string_exe,
+      args: ['owner', heads.to_string(), observed.to_string()],
+      suite: ['unit', 'tsan', 'evaluation_recursive_string_owner'], timeout: 120)
+  endforeach
+endforeach

@@ -1543,9 +1543,24 @@ receipt_eligible(const public_key_t *k)
            k->ack_committed);
 }
 
+/* Actual recursive retirement returns, including the terminal head boundary. */
+static bool
+owner_domain(const public_key_t *k)
+{
+    return k->available && k->round_active && k->phase == 21
+           && !k->published && !k->committed;
+}
+
+static bool
+owner_unselected(const public_key_t *k)
+{
+    return owner_domain(k) && !k->main[0];
+}
+
 static void
-ended_case(unsigned heads, bool observed, ended_trace_t *record,
-    const public_key_t *expected, unsigned target, unsigned outcome, bool early)
+ended_case_record(unsigned heads, bool observed, ended_trace_t *record,
+    const public_key_t *expected, unsigned target, unsigned outcome, bool early,
+    public_trace_t *owner_record)
 {
     fixture_t f; fixture_init(&f, heads, observed);
     CHECK(!step(&f) && !wl_session_step(f.reference));
@@ -1573,6 +1588,12 @@ ended_case(unsigned heads, bool observed, ended_trace_t *record,
             && !wl_columnar_session_test_string_custody(col, &key));
         if (stopping_case || (rc == EAGAIN && !key.published && !key.committed))
             life_public(&f, old, snapshots, stop.successor);
+        if (owner_record && rc == EAGAIN && owner_domain(&key)) {
+            CHECK(owner_record->count < 16384);
+            unsigned at = owner_record->count++;
+            owner_record->keys[at] = key;
+            owner_record->public_ordinal[at] = calls;
+        }
         int category = ended_category(&key);
         if (record && rc == EAGAIN && category >= 0 && category < 2) {
             unsigned i = 0;
@@ -1594,7 +1615,7 @@ ended_case(unsigned heads, bool observed, ended_trace_t *record,
             && (early ? category == 2 : calls == target)) {
             CHECK(category >= 0 || endstage_eligible(&key)
                 || unbound_eligible(&key) || cleared_eligible(&key)
-                || receipt_eligible(&key));
+                || receipt_eligible(&key) || owner_unselected(&key));
             if (expected) CHECK(public_equal(&key, expected));
             inject(&stop);
             CHECK(wl_session_insert(f.session, "input", &fresh, 1, 1) == EBUSY
@@ -1665,12 +1686,118 @@ ended_case(unsigned heads, bool observed, ended_trace_t *record,
                 && !ended.report.result);
         } else CHECK(!wl_evaluation_control_active_attempt_id(f.control));
         CHECK(!wl_evaluation_control_reset(f.control)
-            && !wl_evaluation_control_configure(f.control, 0) && !step(&f));
+            && !wl_evaluation_control_configure(f.control, 0));
+        int retried = EAGAIN;
+        for (unsigned retry_calls = 0;
+            retried == EAGAIN && retry_calls < 1000000;
+            retry_calls++) {
+            retried = wl_session_step(f.session);
+            if (expected && owner_domain(expected) && retried == EAGAIN)
+                CHECK(f.session->backend->session_controlled_step_state(
+                        f.session)
+                    != WL_CONTROLLED_STEP_IDLE);
+        }
+        if (retried) fprintf(stderr,
+                "ended retry target%u outcome%u result%d\n",
+                target, outcome, retried);
+        CHECK(!retried);
     } else CHECK(!rc);
     CHECK(!wl_session_step(f.reference));
     const int64_t all[] = {0, 1, 2}; check_rows(&f, all, 3);
     check_events(&f, 2, 1);
     fixture_close(&f);
+}
+
+static void
+ended_case(unsigned heads, bool observed, ended_trace_t *record,
+    const public_key_t *expected, unsigned target, unsigned outcome, bool early)
+{
+    ended_case_record(heads, observed, record, expected, target, outcome, early,
+        NULL);
+}
+
+/* Only initialized semantic custody enters the finite key, never raw IDs or
+ * row/copy offsets. The complete normalized snapshot still authenticates replay. */
+static bool
+owner_equal(const public_key_t *a, const public_key_t *b)
+{
+    return a->round == b->round && a->round_index == b->round_index
+           && a->round_changed == b->round_changed
+           && a->child_active == b->child_active
+           && a->child_thread_valid == b->child_thread_valid
+           && a->receipt_pending == b->receipt_pending
+           && a->receipt_ack == b->receipt_ack
+           && a->receipt_acknowledged == b->receipt_acknowledged
+           && a->receipt_index_valid == b->receipt_index_valid
+           && a->ack_committed == b->ack_committed
+           && !memcmp(a->owners, b->owners, sizeof(a->owners))
+           && !memcmp(a->retirement, b->retirement, sizeof(a->retirement))
+           && !memcmp(a->main, b->main, sizeof(a->main))
+           && !memcmp(a->child, b->child, sizeof(a->child));
+}
+
+static void
+run_owner(unsigned heads, bool observed, bool census)
+{
+    public_trace_t t = {0};
+    t.keys = calloc(16384, sizeof(*t.keys));
+    t.public_ordinal = calloc(16384, sizeof(*t.public_ordinal));
+    t.class_id = calloc(16384, sizeof(*t.class_id));
+    t.pick = calloc(16384, sizeof(*t.pick));
+    CHECK(t.keys && t.public_ordinal && t.class_id && t.pick);
+    ended_case_record(heads, observed, NULL, NULL, UINT32_MAX, 0, false, &t);
+    unsigned first[2048], last[2048], classes = 0, observations = 0;
+    unsigned markers[4] = {0}, rounds = 0;
+    bool reached[16][3] = {{false}};
+    uint64_t roles = 0, native = 0;
+    for (unsigned i = 0; i < t.count; i++) {
+        const public_key_t *k = &t.keys[i]; t.class_id[i] = UINT32_MAX;
+        CHECK(owner_domain(k) && k->round < 16 && k->round_index <= heads);
+        markers[(k->retirement[0] != 0) | ((k->main[0] != 0) << 1)]++;
+        if (!owner_unselected(k)) continue;
+        observations++; reached[k->round][k->round_index] = true;
+        if (k->round + 1 > rounds) rounds = (unsigned)k->round + 1;
+        if (k->retirement[0]) {
+            CHECK(k->round_index < heads && k->retirement[4] < 64
+                && k->retirement[5] == k->round_index && k->retirement[7] < 64);
+            roles |= UINT64_C(1) << k->retirement[4];
+            native |= UINT64_C(1) << k->retirement[7];
+        }
+        unsigned c = 0;
+        for (; c < classes; c++) if (owner_equal(k, &t.keys[first[c]])) break;
+        if (c == classes) {
+            CHECK(c < 2048); first[c] = i; classes++;
+        }
+        last[c] = i; t.class_id[i] = c;
+    }
+    CHECK(observations && classes && rounds && roles && !markers[0] &&
+        markers[1]);
+    for (unsigned r = 0; r < rounds; r++)
+        for (unsigned h = 0; h < heads; h++) CHECK(reached[r][h]);
+    for (unsigned c = 0; c < classes;
+        c++) t.pick[first[c]] = t.pick[last[c]] = true;
+    unsigned cuts = 0, selected = 0;
+    for (unsigned i = 0; i < t.count; i++) {
+        if (!t.pick[i]) continue;
+        unsigned index = cuts++, c = t.class_id[i]; CHECK(c < classes);
+        if (census) continue;
+        for (unsigned outcome = 2; outcome <= 3; outcome++) {
+            ended_case(heads, observed, NULL, &t.keys[i],
+                t.public_ordinal[i], outcome, false);
+            selected++;
+            printf(
+                "owner_cut heads%u observer%d index%u class%u public%u first%d last%d outcome%u passed\n",
+                heads, observed, index, c, t.public_ordinal[i],
+                i == first[c], i == last[c], outcome);
+        }
+    }
+    CHECK(census || selected == 2 * cuts);
+    printf(
+        "owner heads%u observer%d census%d total%u observations%u classes%u cuts%u selected%u rounds%u markers%u/%u/%u/%u roles%llu native%llu passed\n",
+        heads, observed, census, t.count, observations, classes, cuts, selected,
+        rounds, markers[0], markers[1], markers[2], markers[3],
+        (unsigned long long)roles, (unsigned long long)native);
+    free(t.pick); free(t.class_id); free(t.public_ordinal); free(t.keys);
 }
 
 static void
@@ -2028,6 +2155,14 @@ main(int argc, char **argv)
 {
     CHECK(!environment("WIRELOG_JOIN_BATCH_BYTES", "")
         && !environment("WIRELOG_JOIN_BATCH_STRICT", ""));
+    if (argc == 4 && (!strcmp(argv[1], "owner") || !strcmp(argv[1],
+        "owner-census"))) {
+        unsigned heads = (unsigned)strtoul(argv[2], NULL, 10);
+        unsigned observed = (unsigned)strtoul(argv[3], NULL, 10);
+        CHECK(heads >= 1 && heads <= 2 && observed <= 1);
+        run_owner(heads, observed != 0, !strcmp(argv[1], "owner-census"));
+        return 0;
+    }
     if (argc == 4 && !strcmp(argv[1], "partition")) {
         unsigned heads = (unsigned)strtoul(argv[2], NULL, 10);
         unsigned observed = (unsigned)strtoul(argv[3], NULL, 10);
