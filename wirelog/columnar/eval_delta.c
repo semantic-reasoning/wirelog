@@ -577,14 +577,11 @@ col_stratum_step_retraction_nonrecursive(const wl_plan_stratum_t *sp,
                 if ((pop->op == WL_PLAN_OP_JOIN
                     || pop->op == WL_PLAN_OP_SEMIJOIN)
                     && pop->right_relation) {
-                    char rname[256];
-                    if (retraction_rel_name(pop->right_relation, rname,
-                        sizeof(rname)) == 0) {
-                        col_rel_t *rd = session_find_rel(sess, rname);
-                        if (rd && rd->nrows > 0) {
-                            need_right_pass = true;
-                            break;
-                        }
+                    col_rel_t *rd = wl_columnar_session_find_prefixed(sess,
+                            "$r$", pop->right_relation);
+                    if (rd && rd->nrows > 0) {
+                        need_right_pass = true;
+                        break;
                     }
                 }
             }

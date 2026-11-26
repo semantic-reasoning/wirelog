@@ -8513,3 +8513,18 @@ foreach heads : [1, 2]
       suite: ['unit', 'tsan', 'evaluation_recursive_string_observer_end'], timeout: 120)
   endforeach
 endforeach
+
+# Exact observed-retraction producer keys and transactional signed consumers.
+test_evaluation_retraction_domains_exe = executable(
+  'test_evaluation_retraction_domains',
+  files('test_evaluation_retraction_domains.c'),
+  c_args: ['-DWL_SESSION_TEST_HOOKS'],
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
+  link_with: [testlib_prod],
+)
+foreach retraction_case : ['public', 'staging']
+  test('evaluation_retraction_domains_' + retraction_case,
+       test_evaluation_retraction_domains_exe, args: [retraction_case],
+       suite: ['unit', 'tsan', 'evaluation_join_hosts'], timeout: 120)
+endforeach
