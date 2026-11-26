@@ -14425,7 +14425,8 @@ wl_columnar_session_retirement_drive_owned(wl_columnar_controlled_step_t *step,
  * A cleared READY progress is only a receipt; main_action consumes it without
  * invoking Native again, using the same completed-progress rule as before. */
 static bool
-wl_columnar_session_retirement_packet(const wl_columnar_controlled_step_t *step,
+wl_columnar_session_retirement_packet_lineage(
+    const wl_columnar_controlled_step_t *step,
     const wl_columnar_session_retirement_progress_t *p,
     wl_evaluation_control_t *control, uint64_t id, unsigned action)
 {
@@ -14437,16 +14438,61 @@ wl_columnar_session_retirement_packet(const wl_columnar_controlled_step_t *step,
         || j->operation_identity != step->operation_identity
         || j->operation_id != id || !wl_columnar_session_main_actor(j)
         || j->recipient != WL_COLUMNAR_SESSION_MAIN_SCALAR
-        || j->target != p || j->slot || j->action != action || j->executing
+        || j->target != p || j->slot || j->action != action ||
+        j->executing) return false;
+    return true;
+}
+
+/* The WORK continuation contract remains AVAILABLE/READY only. */
+static bool
+wl_columnar_session_retirement_packet(const wl_columnar_controlled_step_t *step,
+    const wl_columnar_session_retirement_progress_t *p,
+    wl_evaluation_control_t *control, uint64_t id, unsigned action)
+{
+    const wl_columnar_session_main_action_t *j = &step->main_action;
+    if (!wl_columnar_session_retirement_packet_lineage(step, p, control, id,
+        action)
         || !((j->phase == WL_COLUMNAR_SESSION_MAIN_AVAILABLE && !j->called)
-        || (j->phase == WL_COLUMNAR_SESSION_MAIN_READY && j->called)))
-        return false;
+        || (j->phase == WL_COLUMNAR_SESSION_MAIN_READY &&
+        j->called))) return false;
     if (!p->identity) return j->phase == WL_COLUMNAR_SESSION_MAIN_READY;
     return p->identity == p && p->step == step && p->registered
            && wl_columnar_session_retirement_thread(p)
            && j->resource_parent == p->parent && j->resource_target == p->target
            && j->resource_slot == p->slot && j->role == p->role
            && j->index == p->index;
+}
+
+/* Metadata registration only; callers separately prove the actual Native
+ * owner or completed packet. A successor never supplies disposal funding. */
+static int
+wl_columnar_session_retirement_register_ended(
+    wl_columnar_controlled_step_t *step,
+    wl_evaluation_control_t *control, uint64_t id)
+{
+    wl_col_session_t *sess = step->metadata_bind_session;
+    wl_columnar_session_observed_origin_t *o = &step->observed_origin;
+    if (!control || control != sess->base.evaluation_control || !id
+        || !step->operation_active || id != step->operation_id
+        || wl_evaluation_control_active_attempt_id(control) == id
+        || !step->transaction || !step->transaction_initialized
+        || !wl_columnar_session_observed_origin_current(sess, step)
+        || !wl_columnar_session_retirement_native_equal(step)) return EINVAL;
+    if (!o->disposal_registered) {
+        wl_evaluation_control_report_t report;
+        if (wl_evaluation_control_report(control, &report)
+            || report.attempt_id != id) return EINVAL;
+        o->disposal_kind = WL_COLUMNAR_SESSION_PRODUCER_MATCHING_ORIGINAL_ENDED;
+        o->disposal_operation_id = id;
+        o->disposal_result = step->primary_result ? step->primary_result :
+            report.result ? report.result : EINVAL;
+        o->disposal_registered = true;
+    } else if (o->disposal_kind !=
+        WL_COLUMNAR_SESSION_PRODUCER_MATCHING_ORIGINAL_ENDED
+        || o->disposal_operation_id != id || !o->disposal_result) return EINVAL;
+    step->transaction_discard = true;
+    if (!step->primary_result) step->primary_result = o->disposal_result;
+    return EAGAIN;
 }
 
 static int
@@ -14465,32 +14511,10 @@ wl_columnar_session_retirement_drive(wl_columnar_controlled_step_t *step,
         control == step->metadata_bind_session->base.evaluation_control){
         if (!step->operation_active || id != step->operation_id) return EINVAL;
         if (wl_evaluation_control_active_attempt_id(control) != id) {
-            wl_col_session_t *sess = step->metadata_bind_session;
-            wl_columnar_session_observed_origin_t *o = &step->observed_origin;
-            if (!step->transaction || !step->transaction_initialized
-                || !wl_columnar_session_observed_origin_current(sess, step)
-                || !wl_columnar_session_retirement_native_equal(step)
-                || p->identity != p || p->step != step || !p->registered
+            if (p->identity != p || p->step != step || !p->registered
                 || !wl_columnar_session_retirement_thread(p)) return EINVAL;
-            if (!o->disposal_registered) {
-                wl_evaluation_control_report_t report;
-                if (wl_evaluation_control_report(control, &report)
-                    || report.attempt_id != id) return EINVAL;
-                o->disposal_kind =
-                    WL_COLUMNAR_SESSION_PRODUCER_MATCHING_ORIGINAL_ENDED;
-                o->disposal_operation_id = id;
-                o->disposal_result = step->primary_result ?
-                    step->primary_result : report.result ? report.result :
-                    EINVAL;
-                o->disposal_registered = true;
-            } else if (o->disposal_kind !=
-                WL_COLUMNAR_SESSION_PRODUCER_MATCHING_ORIGINAL_ENDED
-                || o->disposal_operation_id != id || !o->disposal_result)
-                return EINVAL;
-            step->transaction_discard = true;
-            if (!step->primary_result) step->primary_result =
-                    o->disposal_result;
-            return EAGAIN;
+            return wl_columnar_session_retirement_register_ended(step, control,
+                       id);
         }
         int rc = wl_evaluation_control_charge_attempt(control, id, 0);
         if (rc && (rc != WL_EVALUATION_CONTROL_WORK_LIMIT
@@ -17892,7 +17916,7 @@ wl_columnar_session_recursive_retirement_ended(const wl_col_session_t *sess,
         || !step->transaction || step->transaction_discard || step->published
         || step->snapshot || step->snapshot_owned || step->snapshot_retry
         || sess->base.source_c1_admission || sess->join_batch_bytes
-        || step->main_action.identity || step->retirement_busy
+        || step->retirement_busy
         || step->retirement_begin_failure_pending ||
         step->staging_cancel_pending
         || step->staging_progress.identity || step->previous_valid
@@ -17912,15 +17936,40 @@ wl_columnar_session_recursive_retirement_ended(const wl_col_session_t *sess,
         || tx->receipt_pending || tx->receipt_ack) return false;
     const wl_columnar_session_retirement_progress_t *p = &tx->round_progress;
     const wl_columnar_session_observed_head_t *h = &tx->heads[tx->round_index];
-    return p->identity == p && p->step == step && p->parent == tx
-           && p->receipt == &tx->round_retirement && p->registered && !p->busy
-           && p->role == 2 && p->index == tx->round_index && p->target
-           && !p->replacement && p->slot == tx->round_owner
-           && (p->slot == &h->previous || p->slot == &h->frontier
-           || p->slot == &h->next_frontier)
-           && step->retirement_native_count
-           && wl_columnar_session_retirement_native_equal(step)
-           && wl_columnar_session_retirement_thread(p);
+    bool live = p->identity == p && p->step == step && p->parent == tx
+        && p->receipt == &tx->round_retirement && p->registered && !p->busy
+        && p->role == 2 && p->index == tx->round_index && p->target
+        && !p->replacement && p->slot == tx->round_owner
+        && (p->slot == &h->previous || p->slot == &h->frontier
+        || p->slot == &h->next_frontier)
+        && step->retirement_native_count
+        && wl_columnar_session_retirement_native_equal(step)
+        && wl_columnar_session_retirement_thread(p);
+    const wl_columnar_session_main_action_t *j = &step->main_action;
+    if (!j->identity) return live;
+    if (!wl_columnar_session_retirement_packet_lineage(step, p,
+        sess->base.evaluation_control, step->operation_id, 1)
+        || !(((j->phase == WL_COLUMNAR_SESSION_MAIN_EMPTY
+        || j->phase == WL_COLUMNAR_SESSION_MAIN_AVAILABLE) && !j->called)
+        || ((j->phase == WL_COLUMNAR_SESSION_MAIN_REPORT
+        || j->phase == WL_COLUMNAR_SESSION_MAIN_READY) &&
+        j->called))) return false;
+    if (p->identity) return live && j->resource_parent == p->parent
+               && j->resource_target == p->target && j->resource_slot == p->slot
+               && j->role == p->role && j->index == p->index;
+    /* The completed receipt, not a resurrected progress object, retains the
+     * real slot lineage after physical retirement and progress clearing. */
+    return (j->phase == WL_COLUMNAR_SESSION_MAIN_REPORT
+           || j->phase == WL_COLUMNAR_SESSION_MAIN_READY) && j->called &&
+           !j->result
+           && j->resource_parent == tx && j->resource_target
+           && j->role == 2 && j->index == tx->round_index
+           && j->resource_slot == tx->round_owner
+           && (j->resource_slot == &h->previous ||
+           j->resource_slot == &h->frontier
+           || j->resource_slot == &h->next_frontier)
+           && !*j->resource_slot && !step->retirement_native_count
+           && wl_columnar_session_retirement_native_equal(step);
 }
 
 static int
@@ -22762,6 +22811,21 @@ wl_columnar_session_main_dispatch(wl_col_session_t *sess,
     wl_columnar_controlled_step_t *step, bool *selected)
 {
     *selected = false;
+    if (step && step->main_action.identity == &step->main_action
+        && step->main_action.recipient == WL_COLUMNAR_SESSION_MAIN_SCALAR
+        && !step->transaction_discard && sess->base.evaluation_control
+        && wl_evaluation_control_active_attempt_id(
+            sess->base.evaluation_control)
+        != step->operation_id
+        && wl_columnar_session_recursive_retirement_ended(sess, step)) {
+        /* Record intent before REPORT can expose READY to Core. Continue the
+        * same actual financier/Source transitions; intent grants no work. */
+        int registered = wl_columnar_session_retirement_register_ended(step,
+                sess->base.evaluation_control, step->operation_id);
+        if (registered != EAGAIN) {
+            *selected = true; return registered;
+        }
+    }
     if (step && step->main_action.phase == WL_COLUMNAR_SESSION_MAIN_READY
         && wl_columnar_session_main_ledger_live(&step->main_action)) {
         wl_columnar_session_main_action_t *j = &step->main_action;
@@ -26590,6 +26654,26 @@ wl_columnar_session_observed_dispose(wl_col_session_t *sess,
         && !tx->originals_started)
         return wl_columnar_session_terminal_begin(sess, step, false);
     if (tx->child_active || sess->cleanup_active) return EBUSY;
+    wl_columnar_session_main_action_t *packet = &step->main_action;
+    if (step->observed_origin.disposal_registered
+        && step->observed_origin.disposal_kind ==
+        WL_COLUMNAR_SESSION_PRODUCER_MATCHING_ORIGINAL_ENDED
+        && tx->phase == WL_SESSION_RECURSIVE_RETIRE && tx->round_owner
+        && packet->identity == packet
+        && packet->recipient == WL_COLUMNAR_SESSION_MAIN_SCALAR
+        && packet->target == &tx->round_progress) {
+        /* Settle the real retained recipient before DIFF/reader selection can
+         * consume or replace its AVAILABLE/READY packet. No Original funding. */
+        if (!wl_columnar_session_observed_origin_current(sess, step)
+            || step->observed_origin.disposal_operation_id != step->operation_id
+            || step->observed_origin.disposal_result != step->primary_result
+            || !wl_columnar_session_retirement_packet(step, &tx->round_progress,
+            sess->base.evaluation_control, step->operation_id,
+            1)) return EINVAL;
+        int settled = wl_columnar_session_recursive_retire(step, tx,
+                tx->round_owner, NULL, 0);
+        return settled ? settled : EAGAIN;
+    }
     bool seed_selected;
     int seed_result = wl_columnar_session_seed_outer_drain(sess, step, true,
             &seed_selected);
@@ -29287,9 +29371,8 @@ col_controlled_step_drive(wl_col_session_t *sess,
             return wl_columnar_session_observed_drive(sess, step);
 
         if (wl_columnar_session_recursive_retirement_ended(sess, step))
-            return wl_columnar_session_retirement_drive(step,
-                       &tx->round_progress,
-                       control, step->operation_id, 1);
+            return wl_columnar_session_retirement_register_ended(step,
+                       control, step->operation_id);
 
         if (step->general_observed && step->transaction_initialized && tx
             && step->transaction_discard && !tx->committed
