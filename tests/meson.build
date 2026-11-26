@@ -8443,3 +8443,16 @@ foreach heads : [1, 2]
       suite: ['unit', 'tsan', 'evaluation_recursive_string_owner'], timeout: 120)
   endforeach
 endforeach
+
+# Full selected-MAIN class endpoints: ASan full cell exceeds120s, so all cuts
+# are assigned exactly once to eight modulo shards; both END outcomes remain.
+foreach heads : [1, 2]
+  foreach observed : [0, 1]
+    foreach shard : range(8)
+      test('evaluation_recursive_string_mainowner_@0@_@1@_@2@'.format(heads, observed, shard),
+        evaluation_recursive_string_exe,
+        args: ['mainowner', heads.to_string(), observed.to_string(), shard.to_string(), '8'],
+        suite: ['unit', 'tsan', 'evaluation_recursive_string_mainowner'], timeout: 120)
+    endforeach
+  endforeach
+endforeach

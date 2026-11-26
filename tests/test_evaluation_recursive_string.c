@@ -1557,6 +1557,47 @@ owner_unselected(const public_key_t *k)
     return owner_domain(k) && !k->main[0];
 }
 
+static bool
+owner_selected(const public_key_t *k)
+{
+    return owner_domain(k) && k->main[0] && k->main[2] == 2;
+}
+
+typedef struct { fixture_t *fixture; unsigned advances, reports; } owner_auth_t;
+static owner_auth_t *owner_auth;
+
+static void
+owner_advanced(wl_col_session_t *col, wl_evaluation_control_t *control,
+    uint64_t id, unsigned recipient, unsigned before, unsigned after,
+    int result)
+{
+    (void)before; (void)after; (void)result;
+    if (!owner_auth || recipient != 2) return;
+    CHECK(col == (wl_col_session_t *)owner_auth->fixture->session
+        && control != owner_auth->fixture->control && id
+        && wl_evaluation_control_active_attempt_id(control) == id);
+    owner_auth->advances++;
+}
+
+static void
+owner_report(const wl_col_session_t *col, wl_evaluation_control_t *control,
+    uint64_t allocation_identity, wl_evaluation_control_report_t report)
+{
+    if (!owner_auth) return;
+    uint64_t main[16];
+    CHECK(col == (wl_col_session_t *)owner_auth->fixture->session
+        && !wl_columnar_session_test_main_view(col, main));
+    if (!main[0] || main[2] != 2) return;
+    wl_evaluation_control_report_t actual;
+    CHECK(control != owner_auth->fixture->control && allocation_identity
+        && allocation_identity == wl_evaluation_control_identity(control)
+        && !wl_evaluation_control_active_attempt_id(control)
+        && !wl_evaluation_control_report(control, &actual)
+        && wl_test_completed_step_report_equal(&actual, &report)
+        && report.attempt_id && report.limit == 256);
+    owner_auth->reports++;
+}
+
 static void
 ended_case_record(unsigned heads, bool observed, ended_trace_t *record,
     const public_key_t *expected, unsigned target, unsigned outcome, bool early,
@@ -1578,6 +1619,15 @@ ended_case_record(unsigned heads, bool observed, ended_trace_t *record,
     }
     stop_t stop = {.fixture = &f, .outcome = outcome};
     bool stopping_case = expected || early;
+    owner_auth_t auth = {.fixture = &f};
+    bool authenticate_main = expected && owner_selected(expected);
+    if (authenticate_main) {
+        CHECK(!owner_auth && !wl_columnar_session_test_main_action_advanced
+            && !wl_columnar_session_test_main_report_finished);
+        owner_auth = &auth;
+        wl_columnar_session_test_main_action_advanced = owner_advanced;
+        wl_columnar_session_test_main_report_finished = owner_report;
+    }
     unsigned calls = 0, after_end = 0;
     int rc = EAGAIN, first_error = 0;
     bool terminal = false;
@@ -1615,7 +1665,8 @@ ended_case_record(unsigned heads, bool observed, ended_trace_t *record,
             && (early ? category == 2 : calls == target)) {
             CHECK(category >= 0 || endstage_eligible(&key)
                 || unbound_eligible(&key) || cleared_eligible(&key)
-                || receipt_eligible(&key) || owner_unselected(&key));
+                || receipt_eligible(&key) || owner_unselected(&key)
+                || owner_selected(&key));
             if (expected) CHECK(public_equal(&key, expected));
             inject(&stop);
             CHECK(wl_session_insert(f.session, "input", &fresh, 1, 1) == EBUSY
@@ -1641,6 +1692,12 @@ ended_case_record(unsigned heads, bool observed, ended_trace_t *record,
                     stop.successor, &used) && !used);
             }
             if (rc != EAGAIN) {
+                if (rc != EINVAL) fprintf(stderr,
+                        "ended unexpected target%u outcome%u rc%d first%d main%llu phase%llu progress%llu\n",
+                        target, outcome, rc, first_error,
+                        (unsigned long long)key.main[0],
+                        (unsigned long long)key.main[1],
+                        (unsigned long long)key.retirement[0]);
                 CHECK(rc == EINVAL);
                 if (!first_error) first_error = rc;
                 CHECK(first_error == rc);
@@ -1657,6 +1714,12 @@ ended_case_record(unsigned heads, bool observed, ended_trace_t *record,
             heads, observed, target, outcome, stop.hit, after_end, first_error,
             rc, terminal);
     CHECK(terminal);
+    if (authenticate_main) {
+        CHECK(auth.advances && auth.reports);
+        wl_columnar_session_test_main_action_advanced = NULL;
+        wl_columnar_session_test_main_report_finished = NULL;
+        owner_auth = NULL;
+    }
     if (stopping_case) {
         CHECK(stop.hit && rc == EINVAL && first_error == EINVAL
             && !col->cleanup_active && !col->cleanup_pending
@@ -1737,8 +1800,10 @@ owner_equal(const public_key_t *a, const public_key_t *b)
 }
 
 static void
-run_owner(unsigned heads, bool observed, bool census)
+run_owner(unsigned heads, bool observed, bool census, bool selected_main,
+    unsigned shard, unsigned shards)
 {
+    CHECK(shards && shard < shards);
     public_trace_t t = {0};
     t.keys = calloc(16384, sizeof(*t.keys));
     t.public_ordinal = calloc(16384, sizeof(*t.public_ordinal));
@@ -1749,12 +1814,29 @@ run_owner(unsigned heads, bool observed, bool census)
     unsigned first[2048], last[2048], classes = 0, observations = 0;
     unsigned markers[4] = {0}, rounds = 0;
     bool reached[16][3] = {{false}};
-    uint64_t roles = 0, native = 0;
+    uint64_t roles = 0, native = 0, main_phases = 0, finance_phases = 0;
+    bool packet_seen[64][2] = {{false}};
     for (unsigned i = 0; i < t.count; i++) {
         const public_key_t *k = &t.keys[i]; t.class_id[i] = UINT32_MAX;
         CHECK(owner_domain(k) && k->round < 16 && k->round_index <= heads);
         markers[(k->retirement[0] != 0) | ((k->main[0] != 0) << 1)]++;
-        if (!owner_unselected(k)) continue;
+        if (!(selected_main ? owner_selected(k) :
+            owner_unselected(k))) continue;
+        if (selected_main) {
+            CHECK(k->round_index < heads && k->main[1] < 64 && k->main[5] < 64);
+            main_phases |= UINT64_C(1) << k->main[1];
+            finance_phases |= UINT64_C(1) << k->main[5];
+            unsigned live = k->retirement[0] != 0;
+            if (census && !packet_seen[k->main[1]][live]) {
+                packet_seen[k->main[1]][live] = true;
+                printf(
+                    "mainowner_witness public%u phase%llu called%llu result%lld finance%llu progress%u\n",
+                    t.public_ordinal[i], (unsigned long long)k->main[1],
+                    (unsigned long long)k->main[3],
+                    (long long)(int64_t)k->main[14],
+                    (unsigned long long)k->main[5], live);
+            }
+        }
         observations++; reached[k->round][k->round_index] = true;
         if (k->round + 1 > rounds) rounds = (unsigned)k->round + 1;
         if (k->retirement[0]) {
@@ -1780,23 +1862,28 @@ run_owner(unsigned heads, bool observed, bool census)
     for (unsigned i = 0; i < t.count; i++) {
         if (!t.pick[i]) continue;
         unsigned index = cuts++, c = t.class_id[i]; CHECK(c < classes);
-        if (census) continue;
+        if (census || index % shards != shard) continue;
         for (unsigned outcome = 2; outcome <= 3; outcome++) {
             ended_case(heads, observed, NULL, &t.keys[i],
                 t.public_ordinal[i], outcome, false);
             selected++;
             printf(
-                "owner_cut heads%u observer%d index%u class%u public%u first%d last%d outcome%u passed\n",
-                heads, observed, index, c, t.public_ordinal[i],
-                i == first[c], i == last[c], outcome);
+                "%s_cut heads%u observer%d index%u class%u public%u first%d last%d outcome%u passed\n",
+                selected_main ? "mainowner" : "owner", heads, observed, index,
+                c,
+                t.public_ordinal[i], i == first[c], i == last[c], outcome);
         }
     }
-    CHECK(census || selected == 2 * cuts);
+    unsigned owned = cuts / shards + (shard < cuts % shards);
+    CHECK(census || selected == 2 * owned);
     printf(
-        "owner heads%u observer%d census%d total%u observations%u classes%u cuts%u selected%u rounds%u markers%u/%u/%u/%u roles%llu native%llu passed\n",
-        heads, observed, census, t.count, observations, classes, cuts, selected,
+        "%s heads%u observer%d census%d shard%u/%u total%u observations%u classes%u cuts%u selected%u rounds%u markers%u/%u/%u/%u roles%llu native%llu main_phases%llu finance_phases%llu passed\n",
+        selected_main ? "mainowner" : "owner", heads, observed, census, shard,
+        shards, t.count,
+        observations, classes, cuts, selected,
         rounds, markers[0], markers[1], markers[2], markers[3],
-        (unsigned long long)roles, (unsigned long long)native);
+        (unsigned long long)roles, (unsigned long long)native,
+        (unsigned long long)main_phases, (unsigned long long)finance_phases);
     free(t.pick); free(t.class_id); free(t.public_ordinal); free(t.keys);
 }
 
@@ -2155,12 +2242,17 @@ main(int argc, char **argv)
 {
     CHECK(!environment("WIRELOG_JOIN_BATCH_BYTES", "")
         && !environment("WIRELOG_JOIN_BATCH_STRICT", ""));
-    if (argc == 4 && (!strcmp(argv[1], "owner") || !strcmp(argv[1],
-        "owner-census"))) {
+    if ((argc == 4 || argc == 6) && (!strcmp(argv[1],
+        "owner") || !strcmp(argv[1],
+        "owner-census") || !strcmp(argv[1], "mainowner")
+        || !strcmp(argv[1], "mainowner-census"))) {
         unsigned heads = (unsigned)strtoul(argv[2], NULL, 10);
         unsigned observed = (unsigned)strtoul(argv[3], NULL, 10);
         CHECK(heads >= 1 && heads <= 2 && observed <= 1);
-        run_owner(heads, observed != 0, !strcmp(argv[1], "owner-census"));
+        run_owner(heads, observed != 0, strstr(argv[1], "census") != NULL,
+            !strncmp(argv[1], "mainowner", 9),
+            argc == 6 ? (unsigned)strtoul(argv[4], NULL, 10) : 0,
+            argc == 6 ? (unsigned)strtoul(argv[5], NULL, 10) : 1);
         return 0;
     }
     if (argc == 4 && !strcmp(argv[1], "partition")) {
