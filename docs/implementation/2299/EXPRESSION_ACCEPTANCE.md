@@ -3389,3 +3389,112 @@ containing Source/carry proofs and other legal hosts remain open. The qualified
 ordinary unary STRING STEP domain is unchanged: wider/mixed/FLOAT, additional
 topology, expression/K bodies, evaluating Snapshot/C1/batch, seeded heads and
 pool/prepared-sort remain outside scope. This bundle does not close #2299.
+
+## Retirement Original END and retained SCALAR MAIN endpoints
+
+This extends the previous phase8 END record with actual public EAGAIN returns
+in active, unpublished, uncommitted phase21 retirement. The host remains ordinary
+unary STRING STEP with one declared STRING input and one monotone, nonaggregate
+recursive stratum of one or two declared unary STRING pure-IDB heads, using
+VARIABLE, identity MAP and CONSOLIDATE projections with optional CONCAT. Only
+actual round-owner role2 lineage and the corresponding retained SCALAR MAIN
+packet are qualified here.
+
+The fresh-owner regression reaches an ended Original while retirement owns a
+real round resource. Before the fix, the mismatch route returns EINVAL with
+PENDING state and retains that progress over the observed follow-up calls. The
+fix authenticates the saved Original control/identity, transaction, actual head
+slot and registered native thread before recording matching-ended disposal
+intent. It records completed refusal only after actual terminal completion;
+existing observed route flags remain available to the next genuine begin. The
+state getter requires actual debt-free completion before reporting IDLE. Tests
+also require a genuine same-input retry to remain non-IDLE while it returns
+EAGAIN, then complete with reference rows/events and balanced ownership.
+
+For retained MAIN, a reproduced EMPTY endpoint failed to drain within the
+existing20000-call guard. A separately reproduced live-progress REPORT endpoint
+settled to READY with EAGAIN, ordinary PENDING and no registered disposal; the
+Core's existing pending check consequently converted that return to EIO. The
+fix records authenticated matching-ended metadata intent before the original
+EMPTY/REPORT settlement. It retains the Source, financier, ledger, capture and
+ACK sequence, and settles the authentic retained SCALAR packet before sibling
+DIFF/readers can replace it. READY is consumed once; recorded intent does not
+grant Native authority or charge a successor. Cleared progress is accepted only
+through the actual called, zero-result REPORT/READY resource receipt, without
+reading a freed owner payload. Existing WORK packet selection still restricts
+its own contract to uncalled AVAILABLE or called READY.
+
+The independent `owner-audit` domain is **every recorded phase21 EAGAIN return**,
+not the union of accepted predicates. It checks unique custody classification,
+actual round/head slots, role2 provenance, MAIN called/result shape and absence
+of child/receipt debt, requiring each observed family at every reached
+round/head. Both observer modes yield:
+
+| Heads | Domain | Neither marker | Fresh progress, no MAIN | Cleared progress, MAIN | Live progress, MAIN | Rounds |
+| --- | --- | --- | --- | --- | --- | --- |
+| 1 | 939 | 0 | 154 | 10 | 775 | 2 |
+| 2 | 2807 | 0 | 462 | 30 | 2315 | 3 |
+
+The selected slot mask is1 in all three observed families. Actual MAIN phases
+are EMPTY, AVAILABLE, REPORT and READY (bitmap30), finance phases have bitmap226
+and progress roles bitmap4 (role2). The marker-free descriptor is counted but
+unobserved and **unqualified**; the audit fails if it appears in these fixtures.
+These counts do not establish every possible runtime topology or schedule.
+
+The END runner builds finite classes from semantic round/round-index, ownership,
+receipt and normalized MAIN fields, excluding public ordinal, raw addresses and
+allocation identities. Full copied keys and actual public ordinals authenticate
+each replay. First/last endpoint unions execute both actual Original END and
+END with a live successor, retaining first EINVAL, the frozen Original report,
+unchanged public heads/schemas/generations and no events, protected API EBUSY,
+successor identity and zero consumption, strict debt-free IDLE, successor finish
+and same-input retry with exact reference output and final balance. Private
+callbacks authenticate the real advancing control/current attempt and actual
+finish report/allocation identity; no control, report or grant is fabricated.
+
+| Family | Heads | Observer modes | Observations/classes/cuts per cell | END/successor histories per cell |
+| --- | --- | --- | --- | --- |
+| Fresh role2 owner | 1 | off/on | 154/32/48 | 96 |
+| Fresh role2 owner | 2 | off/on | 462/96/144 | 288 |
+| Retained SCALAR MAIN | 1 | off/on | 785/175/255 | 510 |
+| Retained SCALAR MAIN | 2 | off/on | 2345/515/755 | 1510 |
+
+Together these contribute4808 histories per profile. The full two-head native
+selected cell passed1510 histories in55.694 seconds. The corresponding ASan
+pilot reached the120-second process guard while still passing cuts; it is not
+reported as a full-cell pass. Selected cells therefore use eight disjoint
+modulo shards, covering the complete endpoint/outcome union. The initial GCC TSan unsharded fresh two-head cells both timed out at480
+seconds, each with246 of288 outcome records completed. Those runs do not count
+as passes; the remaining initial TSan matrix was interrupted for rescheduling.
+Fresh cells therefore use two complete modulo shards. All endpoints and both
+outcomes remain required. The existing120-second registration watchdog and
+20000-call drain guard remain unchanged; TSan retains the existing multiplier4.
+
+Validation on the combined source: all44 new-family/audit registrations pass
+in Clang native and ASan/UBSan with mbedTLS disabled and enabled, and in GCC and
+Clang POSIX TSan (264 registration executions and28848 END/successor histories
+total). Native/ASan profiles use debugoptimized, non-LTO; TSan uses non-LTO,
+optimization1 and the existing multiplier4. An independent parser verifies all
+four head/observer cells, all eight selected shards, unique cut/outcome pairs
+and both endpoints of every finite class. The phase21 census also passes in
+each profile.
+
+Native and ASan each pass82 adjacent/broader registrations on the combined
+source: existing retirement WORK, phase8 END/unbound/cleared/receipt/partition,
+focused lifecycle/bound-stage cases, metadata/public-focused shard0 and bottom
+allocation, STRING rows/stops/refusals/failures, resident facts, cold-right JOIN,
+four K-fusion regressions and source/public-header/inventory/shard/profile
+policy guards. After the scheduling change, the eight applicable policy guards
+pass again in both profiles. Formatting and whitespace checks pass. Full earlier metadata,
+bound-stage and public CANCEL/WORK campaigns are historical unless named as
+rerun; no hosted MSVC or full historical matrix certification is inferred.
+
+This closes the **discovered finite phase21 role2/SCALAR MAIN END envelope** in
+these fixtures, including fresh, live-progress and completed-receipt cases. It
+does not qualify every offset, transition pair, concurrent schedule, financial
+product or marker-free state. Other recipients/roles and observer/claims/
+publication END, remaining containing Source/carry proofs and other legal hosts
+remain open. Wider/mixed/FLOAT SCCs, additional topology, expression/K bodies,
+evaluating Snapshot/C1/batch, seeded heads and pool/prepared-sort transport
+remain outside the qualified STRING scope. K-fusion regression checks do not
+expand that admission. This bundle does not close #2299.
