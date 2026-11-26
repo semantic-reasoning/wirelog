@@ -8435,12 +8435,15 @@ foreach selector_case : ['hash', 'cache', 'natural']
 endforeach
 
 # Genuine END and successor recovery for every discovered fresh retirement class.
+# GCC TSan exceeds the unsharded watchdog; two modulo shards retain every cut.
 foreach heads : [1, 2]
   foreach observed : [0, 1]
-    test('evaluation_recursive_string_owner_@0@_@1@'.format(heads, observed),
-      evaluation_recursive_string_exe,
-      args: ['owner', heads.to_string(), observed.to_string()],
-      suite: ['unit', 'tsan', 'evaluation_recursive_string_owner'], timeout: 120)
+    foreach shard : range(2)
+      test('evaluation_recursive_string_owner_@0@_@1@_@2@'.format(heads, observed, shard),
+        evaluation_recursive_string_exe,
+        args: ['owner', heads.to_string(), observed.to_string(), shard.to_string(), '2'],
+        suite: ['unit', 'tsan', 'evaluation_recursive_string_owner'], timeout: 120)
+    endforeach
   endforeach
 endforeach
 
@@ -8454,5 +8457,15 @@ foreach heads : [1, 2]
         args: ['mainowner', heads.to_string(), observed.to_string(), shard.to_string(), '8'],
         suite: ['unit', 'tsan', 'evaluation_recursive_string_mainowner'], timeout: 120)
     endforeach
+  endforeach
+endforeach
+
+# Noncircular census of every observed retirement/MAIN marker combination.
+foreach heads : [1, 2]
+  foreach observed : [0, 1]
+    test('evaluation_recursive_string_owner_audit_@0@_@1@'.format(heads, observed),
+      evaluation_recursive_string_exe,
+      args: ['owner-audit', heads.to_string(), observed.to_string()],
+      suite: ['unit', 'tsan', 'evaluation_recursive_string_owner_audit'], timeout: 120)
   endforeach
 endforeach

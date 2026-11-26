@@ -2237,11 +2237,84 @@ run_partition(unsigned heads, bool observed)
     free(t.public_ordinal); free(t.keys);
 }
 
+/* All recorded phase21 returns are the domain, independently of predicates.
+ * Neither marker is possible as a descriptor but unobserved/unqualified here. */
+static void
+run_owner_audit(unsigned heads, bool observed)
+{
+    public_trace_t t = {0};
+    t.keys = calloc(16384, sizeof(*t.keys));
+    t.public_ordinal = calloc(16384, sizeof(*t.public_ordinal));
+    CHECK(t.keys && t.public_ordinal);
+    ended_case_record(heads, observed, NULL, NULL, UINT32_MAX, 0, false, &t);
+    unsigned counts[4] = {0}, rounds = 0;
+    bool reached[16][2][4] = {{{false}}};
+    uint64_t slots[4] = {0}, phases = 0, finance = 0, roles = 0;
+    for (unsigned i = 0; i < t.count; i++) {
+        const public_key_t *k = &t.keys[i];
+        CHECK(owner_domain(k) && k->round < 16 && k->round_index <= heads);
+        const bool family[] = {!k->retirement[0] && !k->main[0],
+                               k->retirement[0] && owner_unselected(k),
+                               !k->retirement[0] && owner_selected(k),
+                               k->retirement[0] && owner_selected(k)};
+        unsigned matches = 0, bucket = 0;
+        for (unsigned f = 0; f < 4; f++) {
+            if (!family[f]) continue;
+            matches++; counts[f]++; bucket = f;
+        }
+        CHECK(matches == 1);
+        CHECK(!k->child_active && !k->receipt_pending && !k->receipt_ack);
+        for (unsigned j = 0; j < 16; j++) CHECK(!k->child[j]);
+        if (!bucket) continue;
+        CHECK(k->round_index < heads);
+        reached[k->round][k->round_index][bucket] = true;
+        if (k->round + 1 > rounds) rounds = (unsigned)k->round + 1;
+        uint64_t slot = (k->owners[k->round_index] >> 7) & 7;
+        CHECK(slot && !(slot & (slot - 1)));
+        slots[bucket] |= slot;
+        for (unsigned h = 0; h < heads; h++)
+            if (h !=
+                k->round_index) CHECK(!(k->owners[h] & (UINT64_C(7) << 7)));
+        if (k->retirement[0]) {
+            CHECK(k->retirement[4] == 2 && k->retirement[5] == k->round_index);
+            roles |= UINT64_C(1) << k->retirement[4];
+        }
+        if (k->main[0]) {
+            CHECK(k->main[1] >= 1 && k->main[1] <= 4 && k->main[5] < 64);
+            phases |= UINT64_C(1) << k->main[1];
+            finance |= UINT64_C(1) << k->main[5];
+            CHECK(k->main[3] == (k->main[1] >= 3));
+            if (!k->retirement[0])
+                CHECK(k->main[3] && !k->main[14]);
+        }
+    }
+    CHECK(t.count && rounds && !counts[0] && counts[1] && counts[2] && counts[3]
+        && counts[0] + counts[1] + counts[2] + counts[3] == t.count
+        && phases == 30 && roles == 4);
+    for (unsigned r = 0; r < rounds; r++)
+        for (unsigned h = 0; h < heads; h++)
+            for (unsigned f = 1; f < 4; f++) CHECK(reached[r][h][f]);
+    printf(
+        "owner_audit heads%u observer%d domain%u neither%u fresh%u cleared_main%u live_main%u rounds%u slots%llu/%llu/%llu main_phases%llu finance%llu roles%llu passed\n",
+        heads, observed, t.count, counts[0], counts[1], counts[2], counts[3],
+        rounds,
+        (unsigned long long)slots[1], (unsigned long long)slots[2],
+        (unsigned long long)slots[3], (unsigned long long)phases,
+        (unsigned long long)finance, (unsigned long long)roles);
+    free(t.public_ordinal); free(t.keys);
+}
+
 int
 main(int argc, char **argv)
 {
     CHECK(!environment("WIRELOG_JOIN_BATCH_BYTES", "")
         && !environment("WIRELOG_JOIN_BATCH_STRICT", ""));
+    if (argc == 4 && !strcmp(argv[1], "owner-audit")) {
+        unsigned heads = (unsigned)strtoul(argv[2], NULL, 10);
+        unsigned observed = (unsigned)strtoul(argv[3], NULL, 10);
+        CHECK(heads >= 1 && heads <= 2 && observed <= 1);
+        run_owner_audit(heads, observed != 0); return 0;
+    }
     if ((argc == 4 || argc == 6) && (!strcmp(argv[1],
         "owner") || !strcmp(argv[1],
         "owner-census") || !strcmp(argv[1], "mainowner")
