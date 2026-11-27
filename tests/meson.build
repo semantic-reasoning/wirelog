@@ -8489,3 +8489,13 @@ foreach heads : [1, 2]
       suite: ['unit', 'tsan', 'evaluation_recursive_string_observer_end'], timeout: 120)
   endforeach
 endforeach
+
+# Audit every phase 9/10 public return independently of the selected cuts.
+foreach heads : [1, 2]
+  foreach observed : [0, 1]
+    test('evaluation_recursive_string_observer_audit_@0@_@1@'.format(heads, observed),
+      evaluation_recursive_string_exe,
+      args: ['observer-audit', heads.to_string(), observed.to_string()],
+      suite: ['unit', 'tsan', 'evaluation_recursive_string_observer_end'], timeout: 120)
+  endforeach
+endforeach
