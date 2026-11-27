@@ -49,6 +49,40 @@ run(const char *source, bool delta_mode, int *rc)
     return rows;
 }
 
+/* Watch mode over a stdin file whose final line has no newline.  The
+ * closure starts with 10 edges (complete under limit 3); the second watched
+ * edge lengthens it past what limit 3 allows, so the step for the final
+ * line fails, and the run must fail with it. */
+static int
+run_watch(const char *final_suffix)
+{
+    char source[2048];
+    int n = snprintf(source, sizeof(source), "%s",
+            ".decl seed(x:int64)\n.decl edge(x:int64,y:int64)\n"
+            ".decl p(x:int64)\n.decl q(x:int64)\n"
+            "p(X) :- seed(X).\nq(X) :- p(X).\n"
+            "p(Y) :- q(X), edge(X,Y).\nseed(0).\n");
+    for (int i = 0; i < 10; i++)
+        n += snprintf(source + n, sizeof(source) - (size_t)n,
+                "edge(%d,%d).\n", i, i + 1);
+    CHECK(n > 0 && (size_t)n < sizeof(source));
+    const char *in_path = "test_cli_iteration_cap.in";
+    FILE *in = fopen(in_path, "w");
+    CHECK(in);
+    fprintf(in, "edge 10 11\nedge 11 12%s", final_suffix);
+    CHECK(fclose(in) == 0);
+    CHECK(freopen(in_path, "r", stdin));
+    FILE *out = fopen("test_cli_iteration_cap.out", "w");
+    CHECK(out);
+    set_limit(3);
+    int rc = wl_run_pipeline(source, 1, false, true, 0, out);
+    set_limit(0);
+    fclose(out);
+    remove("test_cli_iteration_cap.out");
+    remove(in_path);
+    return rc;
+}
+
 int
 main(void)
 {
@@ -72,6 +106,9 @@ main(void)
         CHECK(run(source, delta, &rc) == LENGTH + 1);
         CHECK(rc == 0);
     }
-    puts("cli iteration cap: snapshot and delta modes fail at the limit");
+    CHECK(run_watch("\n") != 0);
+    CHECK(run_watch("") != 0);
+    puts(
+        "cli iteration cap: snapshot, delta and watch modes fail at the limit");
     return 0;
 }
