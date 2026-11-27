@@ -762,3 +762,19 @@ sessions (#2301)". A cold input read as the rule's first input and again as a
 right input, a third input before a later JOIN, two cold inputs of one rule, an
 aggregate after a later JOIN, a SNAPSHOT or an observed STEP over a cold input,
 the program refusals of the sixth bundle and more than one worker stay open.
+
+An eighteenth bundle admits, under control, a rule whose first input is a cold
+input that one or more of its JOINs read again as their right input, in the
+shapes listed in the section below, which the uncontrolled route admits at
+seal: with or without a MAP/FILTER prefix, with one key or two, with later
+JOINs of the same input or of a resident one, and with a COUNT, MIN or MAX
+after its single JOIN. The new self rule runs the audits of the cold JOIN rule
+over a cold first input and, with no prefix and a later JOIN of the input, the
+suffix audit, which also refuses a constant or an arithmetic head column there.
+The composed attempt scans the input's prefix into the result slot and, at the
+first JOIN that reads it, the whole input into the cold right slot. See "A cold
+input read as the rule's first input and again as a right input in controlled
+single-worker sessions (#2301)". A single scan for both sides with no prefix, a
+third input in such a rule, two cold inputs of one rule, an aggregate after a
+later JOIN, a SNAPSHOT or an observed STEP over a cold input, the program
+refusals of the sixth bundle and more than one worker stay open.
