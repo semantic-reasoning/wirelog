@@ -1448,10 +1448,41 @@ comparison of1151 non-document tracked source hashes,427 native/427 sanitizer/
 commands and environments. These are identical executable results, not claimed
 new full executions after a documentation edit.
 
-The checked long-name observed-retraction producer still returns EOVERFLOW;
+At this insertion-selector checkpoint, long observed removal returned EOVERFLOW;
 read-only `$r$` consumers above do not remove that separate producer limit.
 The natural remove history uses a short EDB and supported plain full rebuild.
 Remaining materialized predicate/type/representation/cache-equivalence products,
 signed recursive/frontier/pipeline and lifecycle intersections, complete
 Source/Native/carry accounting and hosted-platform qualification remain OPEN.
 This finite selector repair does not close F05/F05a, #2371 or #2300.
+
+## Observed EDB removal and typed retractions
+
+Observed removal used a 256-byte buffer for the pending relation name. With a
+253-byte EDB name the public remove call returned EOVERFLOW before staging any
+rows. It now admits and owns the complete name. Tests exercise 252, 253, 300
+and 511 bytes, including distinct names with the same 252-byte prefix.
+
+The staged relation owns a copy of the source schema and its flat INLINE arity
+map. Previously, a compiled keyed self-JOIN consuming a staged FLOAT delta on
+either side returned EINVAL. With the same facts it now returns (7,9) on the
+left and (9,7) on the right. Public observed STEP uses full evaluation and diff.
+Its callback tests check the signed changes through repeated removals and later
+inserts. The physical retirement actor validates each map entry while holding
+both writers and frees the map once before refunding its metadata credit.
+
+The six evaluation_retraction_domains tests cover public events, stage identity,
+typed JOIN consumption, allocation and reader failures, cancellation and work
+limits, and INLINE metadata. They verify pending state, refund and same-input
+retry. The physical retirement component exercises governed and unmanaged maps
+with ordinary and finite preparation, including cancellation around disposal.
+
+Before rebasing, the complete native campaign passed 1,579 tests with 10 skips.
+ASan/UBSan passed 1,573 with 16 skips. Each campaign included all 78 materialized
+body cases and 28 prior recursive and multiworker regressions. The three focused
+compiler configurations passed 153 tests each. The native extended selection
+passed 287. ABI and CI contract checks passed 11 with one optional skip.
+
+Long input-rulehead seed and retired names (`$in$` and `$out$`), recursive and
+pipeline intersections, complete memory and work accounting, and hosted platform
+qualification remain open under #2371 and #2300.
