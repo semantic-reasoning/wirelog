@@ -30,6 +30,11 @@ status. Pointer-returning APIs may return NULL and optionally write a
 `wirelog_error_t` to an out-parameter. Easy and advanced session APIs return
 `wirelog_error_t` directly where applicable.
 
+`WIRELOG_ERR_ITERATION_LIMIT` (#2345) is a distinct non-success: an
+evaluation in the call reached the fixed-point iteration limit before
+convergence was established, and the call delivered no snapshot rows.  The
+limit is fixed, so retrying with the same input reaches it again.
+
 Current guidance:
 
 - Check every public API return value that can fail.

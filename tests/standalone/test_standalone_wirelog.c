@@ -6,6 +6,10 @@
  * pulls).  Failure = the header has an internal-only forward
  * declaration leaking into its visible API. */
 #include "wirelog/wirelog.h"
+#if !defined(WIRELOG_ITERATION_LIMIT_VERSION) \
+    || WIRELOG_ITERATION_LIMIT_VERSION < 1
+#error "wirelog.h must declare WIRELOG_ITERATION_LIMIT_VERSION >= 1"
+#endif
 int
 main(void)
 {

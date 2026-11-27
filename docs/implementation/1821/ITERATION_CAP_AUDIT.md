@@ -34,6 +34,15 @@ removal's retraction pre-seed (#2348). Input and snapshots are then accepted;
 on a committed session the STEP that finishes the evaluation reports nothing,
 and on a first evaluation it reports the whole model.
 
+The public facades do not pass that status on (#2345). `wirelog_easy_snapshot`,
+`wirelog_easy_step`, `wirelog_session_snapshot`, `wirelog_session_snapshot_typed`,
+`wirelog_session_step`, `wirelog_evaluate` and the CLI open a per-call cap scope
+around the raw call. `note_iteration_cap` sets `facade_cap_hit`; inside the scope
+both SNAPSHOT cap exits (the evaluating stratum loop and the drained plain STEP)
+return without emitting, and the facade returns `WIRELOG_ERR_ITERATION_LIMIT`
+with the retry state above intact. The insert route has no cap, so it never
+reports one.
+
 `evaluation_iteration_cap` runs a generated two-head SCC over a13-edge chain,
 checks its independent complete value set, and reaches boundaries through real
 evaluation. Four reduced outer strides allow32 effective passes; the controlled
@@ -42,7 +51,10 @@ succeeds, one fewer round fails privately, and cancellation/work exhaustion
 injected at the real cap decision wins. STEP/SNAPSHOT and observed/callback-free
 hosts check frozen reports, unchanged input generations, private publication,
 same-host reset/retry and duplicate-free notifications. Raw plain/observed STEP
-and SNAPSHOT exercise cap status0 followed by a raised-limit complete retry.
+and SNAPSHOT exercise cap status0 followed by a raised-limit complete retry;
+a raw capped SNAPSHOT delivers a nonempty partial image, and `cap_scope` checks
+the scope itself. `facade_iteration_cap` drives each facade (`wirelog_evaluate`
+at its one worker, the others at one and two), `cli_iteration_cap` the CLI.
 Checked teardown releases session/control storage; the explicitly program-owned
 intern-table reservation is detached separately and governor credit reaches0.
 

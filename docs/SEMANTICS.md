@@ -1211,7 +1211,14 @@ distinct stop errors through both facades, without exposing these internal types
 The raw serial iteration-cap exit also preserves pending inputs, requests a
 full retry, invalidates snapshot stability and clears plain-STEP completion
 tokens through `wl_columnar_session_note_iteration_cap`. Its historical status
-is zero; that status does not establish convergence. The table below includes
+is zero; that status does not establish convergence. The public facades
+(`wirelog_easy_snapshot`, `wirelog_easy_step`, `wirelog_session_snapshot`,
+`wirelog_session_snapshot_typed`, `wirelog_session_step`, `wirelog_evaluate`)
+and the CLI run the raw call inside a per-call cap scope
+(`col_session_cap_scope_open`/`_close`, #2345): `note_iteration_cap` sets
+`facade_cap_hit`, a capped snapshot inside the scope delivers no rows, and the
+facade returns `WIRELOG_ERR_ITERATION_LIMIT`. A raw call outside a scope still
+delivers its partial image with status zero. The table below includes
 these writers. A configured controlled attempt instead returns `EOVERFLOW`
 before private heads or notifications are published if its effective
 fixed-point allowance is exhausted; cancellation/work exhaustion observed at
