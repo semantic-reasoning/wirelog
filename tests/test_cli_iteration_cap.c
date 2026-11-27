@@ -10,6 +10,7 @@
 #include "../wirelog/cli/driver.h"
 #include "../wirelog/columnar/internal.h"
 
+#include <stdarg.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -27,6 +28,24 @@ set_limit(uint32_t limit)
 {
     wl_columnar_eval_serial_test_iteration_limit = limit;
     wl_columnar_session_test_iteration_limit = limit;
+}
+
+/* Append to buf at *pos, treating truncation as failure.  snprintf returns
+ * the length it would have written, so accumulating that return value lets
+ * *pos run past the buffer once anything truncates. */
+static bool
+append_fmt(char *buf, size_t bufsize, size_t *pos, const char *fmt, ...)
+{
+    if (*pos >= bufsize)
+        return false;
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(buf + *pos, bufsize - *pos, fmt, ap);
+    va_end(ap);
+    if (n < 0 || (size_t)n >= bufsize - *pos)
+        return false;
+    *pos += (size_t)n;
+    return true;
 }
 
 /* Run the pipeline into a file under the test's working directory and
@@ -57,15 +76,15 @@ static int
 run_watch(const char *final_suffix)
 {
     char source[2048];
-    int n = snprintf(source, sizeof(source), "%s",
-            ".decl seed(x:int64)\n.decl edge(x:int64,y:int64)\n"
-            ".decl p(x:int64)\n.decl q(x:int64)\n"
-            "p(X) :- seed(X).\nq(X) :- p(X).\n"
-            "p(Y) :- q(X), edge(X,Y).\nseed(0).\n");
+    size_t n = 0;
+    CHECK(append_fmt(source, sizeof(source), &n, "%s",
+        ".decl seed(x:int64)\n.decl edge(x:int64,y:int64)\n"
+        ".decl p(x:int64)\n.decl q(x:int64)\n"
+        "p(X) :- seed(X).\nq(X) :- p(X).\n"
+        "p(Y) :- q(X), edge(X,Y).\nseed(0).\n"));
     for (int i = 0; i < 10; i++)
-        n += snprintf(source + n, sizeof(source) - (size_t)n,
-                "edge(%d,%d).\n", i, i + 1);
-    CHECK(n > 0 && (size_t)n < sizeof(source));
+        CHECK(append_fmt(source, sizeof(source), &n, "edge(%d,%d).\n", i,
+            i + 1));
     const char *in_path = "test_cli_iteration_cap.in";
     FILE *in = fopen(in_path, "w");
     CHECK(in);
@@ -87,15 +106,15 @@ int
 main(void)
 {
     char source[2048];
-    int n = snprintf(source, sizeof(source), "%s",
-            ".decl seed(x:int64)\n.decl edge(x:int64,y:int64)\n"
-            ".decl p(x:int64)\n.decl q(x:int64)\n"
-            "p(X) :- seed(X).\nq(X) :- p(X).\n"
-            "p(Y) :- q(X), edge(X,Y).\nseed(0).\n");
+    size_t n = 0;
+    CHECK(append_fmt(source, sizeof(source), &n, "%s",
+        ".decl seed(x:int64)\n.decl edge(x:int64,y:int64)\n"
+        ".decl p(x:int64)\n.decl q(x:int64)\n"
+        "p(X) :- seed(X).\nq(X) :- p(X).\n"
+        "p(Y) :- q(X), edge(X,Y).\nseed(0).\n"));
     for (int i = 0; i < LENGTH; i++)
-        n += snprintf(source + n, sizeof(source) - (size_t)n,
-                "edge(%d,%d).\n", i, i + 1);
-    CHECK(n > 0 && (size_t)n < sizeof(source));
+        CHECK(append_fmt(source, sizeof(source), &n, "edge(%d,%d).\n", i,
+            i + 1));
 
     for (int delta = 0; delta < 2; delta++) {
         int rc = 0;

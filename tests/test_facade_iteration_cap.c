@@ -27,6 +27,7 @@
 #include "../wirelog/columnar/internal.h"
 
 #include <errno.h>
+#include <stdarg.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -85,6 +86,24 @@ set_limit(uint32_t limit)
 {
     wl_columnar_eval_serial_test_iteration_limit = limit;
     wl_columnar_session_test_iteration_limit = limit;
+}
+
+/* Append to buf at *pos, treating truncation as failure.  snprintf returns
+ * the length it would have written, so accumulating that return value lets
+ * *pos run past the buffer once anything truncates. */
+static bool
+append_fmt(char *buf, size_t bufsize, size_t *pos, const char *fmt, ...)
+{
+    if (*pos >= bufsize)
+        return false;
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(buf + *pos, bufsize - *pos, fmt, ap);
+    va_end(ap);
+    if (n < 0 || (size_t)n >= bufsize - *pos)
+        return false;
+    *pos += (size_t)n;
+    return true;
 }
 
 /* ---- row capture ------------------------------------------------------- */
@@ -586,31 +605,31 @@ easy_step_delta(uint32_t workers)
     wl_col_session_t *cs = inner(s);
     deltas_t d;
     capture_t c;
-    memset(&d, 0, sizeof(d));
+    d = (deltas_t){ 0 };
     CHECK(wirelog_easy_set_delta_cb(s, delta_row, &d) == WIRELOG_OK);
     set_limit(1);
     CHECK(wirelog_easy_step(s) == WIRELOG_ERR_ITERATION_LIMIT);
     CHECK(d.count == 0 && d.minus == 0 && d.foreign == 0);
     check_retry_state(cs, false);
     set_limit(0);
-    memset(&d, 0, sizeof(d));
+    d = (deltas_t){ 0 };
     CHECK(wirelog_easy_step(s) == WIRELOG_OK && deltas_exact(&d, 0, LENGTH));
 
     int64_t last[] = { LENGTH - 1, LENGTH };
     CHECK(wirelog_easy_remove(s, "edge", last, 2) == WIRELOG_OK);
     set_limit(1);
-    memset(&d, 0, sizeof(d));
+    d = (deltas_t){ 0 };
     CHECK(wirelog_easy_step(s) == WIRELOG_ERR_ITERATION_LIMIT);
     CHECK(d.count == 0 && d.minus == 0);
     check_retry_state(cs, true);
     set_limit(0);
-    memset(&d, 0, sizeof(d));
+    d = (deltas_t){ 0 };
     CHECK(wirelog_easy_step(s) == WIRELOG_OK);
     CHECK(d.count == 0 && d.minus == 0);
     CHECK(snap(s, "p", &c) == WIRELOG_OK && capture_exact(&c, 0, LENGTH - 1));
     /* The step after that reports from the completed model again. */
     CHECK(wirelog_easy_insert(s, "edge", last, 2) == WIRELOG_OK);
-    memset(&d, 0, sizeof(d));
+    d = (deltas_t){ 0 };
     CHECK(wirelog_easy_step(s) == WIRELOG_OK && deltas_exact(&d, LENGTH,
         LENGTH));
     CHECK(wirelog_easy_set_delta_cb(s, NULL, NULL) == WIRELOG_OK);
@@ -784,7 +803,7 @@ advanced_step(uint32_t workers, unsigned mode)
     deltas_t d;
     all_rows_t rows;
     advanced_open(&a, program_text, workers);
-    memset(&d, 0, sizeof(d));
+    d = (deltas_t){ 0 };
     if (mode == 1)
         CHECK(wirelog_session_set_delta_cb(a.session, delta_row, &d)
             == WIRELOG_OK);
@@ -797,7 +816,7 @@ advanced_step(uint32_t workers, unsigned mode)
     check_retry_state(a.inner, false);
     CHECK(wirelog_session_step(a.session) == WIRELOG_ERR_ITERATION_LIMIT);
     set_limit(0);
-    memset(&d, 0, sizeof(d));
+    d = (deltas_t){ 0 };
     CHECK(wirelog_session_step(a.session) == WIRELOG_OK);
     CHECK(mode == 0 ? d.count == 0 : deltas_exact(&d, 0, LENGTH));
 
@@ -805,7 +824,7 @@ advanced_step(uint32_t workers, unsigned mode)
     CHECK(wirelog_session_remove(a.session, "edge", last, 1, 2)
         == WIRELOG_OK);
     set_limit(1);
-    memset(&d, 0, sizeof(d));
+    d = (deltas_t){ 0 };
     CHECK(wirelog_session_step(a.session) == WIRELOG_ERR_ITERATION_LIMIT);
     CHECK(d.count == 0 && d.minus == 0);
     check_retry_state(a.inner, true);
@@ -843,11 +862,11 @@ static void
 executor_evaluate(void)
 {
     char text[2048];
-    int n = snprintf(text, sizeof(text), "%sseed(0).\n", program_text);
-    for (int64_t i = 0; i < LENGTH; i++)
-        n += snprintf(text + n, sizeof(text) - (size_t)n,
-                "edge(%d,%d).\n", (int)i, (int)i + 1);
-    CHECK(n > 0 && (size_t)n < sizeof(text));
+    size_t n = 0;
+    CHECK(append_fmt(text, sizeof(text), &n, "%sseed(0).\n", program_text));
+    for (int i = 0; i < LENGTH; i++)
+        CHECK(append_fmt(text, sizeof(text), &n, "edge(%d,%d).\n", i,
+            i + 1));
     wirelog_error_t err = WIRELOG_OK;
     wirelog_program_t *program = wirelog_parse_string(text, &err);
     CHECK(program && err == WIRELOG_OK);
