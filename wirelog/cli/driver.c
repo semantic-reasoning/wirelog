@@ -632,8 +632,10 @@ wl_run_pipeline(const char *source, uint32_t num_workers, bool delta_mode,
         if (read_rc < 0) {
             fprintf(stderr, "error: failed to read watch input\n");
             rc = -1;
-        } else if (feof(stdin)) {
-            /* Treat normal EOF as success */
+        } else if (read_rc == 0 && feof(stdin)) {
+            /* Treat normal EOF as success.  A step that failed broke out of
+             * the loop with read_rc > 0, even when it ran for a final line
+             * that reached EOF without a newline; keep its error. */
             rc = 0;
         }
     }
