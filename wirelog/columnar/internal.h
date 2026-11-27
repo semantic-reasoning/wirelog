@@ -892,7 +892,10 @@ int wl_columnar_relation_scalar_retirement_prepare(
  * Ledger step handles phase12 once; caller funds metadata128 and immediately
  * drains/cancels every local ledger publication before returning. */
 enum {
-    WL_COLUMNAR_RELATION_SCALAR_FINITE_PAYLOAD = 21
+    WL_COLUMNAR_RELATION_SCALAR_FREE_INLINE_MAP = 15,
+    WL_COLUMNAR_RELATION_SCALAR_FINITE_PAYLOAD = 21,
+    WL_COLUMNAR_RELATION_SCALAR_INLINE_HEADER = 22,
+    WL_COLUMNAR_RELATION_SCALAR_INLINE_ARITIES = 23
 };
 int wl_columnar_relation_scalar_retirement_prepare_finite(
     wl_columnar_relation_scalar_retirement_t *, wl_evaluation_control_t *,
@@ -1193,6 +1196,12 @@ typedef struct wl_columnar_merge_incremental_delta_attempt {
  * relation with the source's schema and interpretation metadata but no name,
  * rows, timestamps, or shared storage. */
 int wl_columnar_relation_new_empty_governed_like_locked(col_rel_t *source,
+    col_rel_t **out);
+/* Caller holds the actual source writer. Copy schema/interpretation into a
+ * new independently owned, named image. The explicit governor may be NULL;
+ * existing source publication restrictions belong to the caller. */
+int wl_columnar_relation_new_empty_named_like_locked(col_rel_t *source,
+    const char *name, wl_columnar_memory_governor_ref_t *governor,
     col_rel_t **out);
 int wl_columnar_relation_mutable_image_prepare_empty(col_rel_t *source,
     col_rel_mutable_image_t *transaction, uint32_t capacity);

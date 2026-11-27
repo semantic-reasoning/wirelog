@@ -9234,10 +9234,8 @@ col_session_remove_incremental(wl_session_t *session, const char *relation,
     rc = wl_columnar_session_retraction_name_prepare(&key, r->name,
             sess->memory_governor);
     if (rc == 0)
-        rc = sess->memory_governor
-            ? wl_columnar_relation_alloc_governed(&rdelta, key.name,
-                sess->memory_governor)
-            : col_rel_alloc(&rdelta, key.name);
+        rc = wl_columnar_relation_new_empty_named_like_locked(r, key.name,
+                sess->memory_governor, &rdelta);
     wl_columnar_session_retraction_name_discard(&key);
     if (rc != 0 || !rdelta) {
         budget_denied = rc == ENOSPC;
