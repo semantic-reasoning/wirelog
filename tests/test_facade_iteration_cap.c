@@ -708,6 +708,62 @@ advanced_snapshot(uint32_t workers)
     advanced_close(&a);
 }
 
+/* ---- advanced typed snapshot ---------------------------------------------- */
+
+typedef struct {
+    unsigned seen[2][NVALUES];
+    unsigned count, other;
+} typed_rows_t;
+
+static void
+typed_row(const char *name, const wirelog_typed_row_v1_t *row, int32_t diff,
+    void *data)
+{
+    typed_rows_t *t = data;
+    if (strcmp(name, "p") && strcmp(name, "q")) {
+        t->other++;
+        return;
+    }
+    CHECK(diff == 1 && row->logical_ncols == 1 && row->physical_nlanes == 1);
+    int64_t v = (int64_t)row->lanes[0];
+    CHECK(v >= 0 && v < NVALUES && !t->seen[name[0] == 'q'][v]++);
+    t->count++;
+}
+
+static bool
+typed_exact(const typed_rows_t *t, int64_t lo, int64_t hi)
+{
+    unsigned want = 0;
+    for (unsigned h = 0; h < 2; h++)
+        for (int64_t v = 0; v < NVALUES; v++) {
+            bool in = v >= lo && v <= hi;
+            if (t->seen[h][v] != (in ? 1u : 0u))
+                return false;
+            want += in;
+        }
+    return t->count == want;
+}
+
+static void
+advanced_snapshot_typed(uint32_t workers)
+{
+    advanced_t a;
+    typed_rows_t t;
+    advanced_open(&a, program_text, workers);
+    set_limit(1);
+    memset(&t, 0, sizeof(t));
+    CHECK(wirelog_session_snapshot_typed(a.session, typed_row, &t)
+        == WIRELOG_ERR_ITERATION_LIMIT);
+    CHECK(!t.count && !t.other);
+    check_retry_state(a.inner, false);
+    set_limit(0);
+    memset(&t, 0, sizeof(t));
+    CHECK(wirelog_session_snapshot_typed(a.session, typed_row, &t)
+        == WIRELOG_OK);
+    CHECK(typed_exact(&t, 0, LENGTH));
+    advanced_close(&a);
+}
+
 int
 main(void)
 {
@@ -726,6 +782,7 @@ main(void)
         easy_step_plain(w);
         easy_step_delta(w);
         advanced_snapshot(w);
+        advanced_snapshot_typed(w);
     }
     easy_snapshot_tdd_route();
     easy_snapshot_boundary();
