@@ -23,6 +23,7 @@
 #endif
 
 #include "../wirelog/wirelog-easy.h"
+#include "../wirelog/wirelog-advanced.h"
 #include "../wirelog/columnar/internal.h"
 
 #include <errno.h>
@@ -53,6 +54,7 @@ wl_test_unsetenv_(const char *name)
                       } } while (0)
 
 wl_session_t *wirelog_easy_testhook_inner(wirelog_easy_session_t *s);
+wl_session_t *wirelog_session_testhook_inner(wirelog_session_t *session);
 extern void (*wl_columnar_session_test_before_stable_emit)(
     wl_col_session_t *sess);
 extern void (*wl_columnar_eval_serial_test_after_plan)(wl_col_session_t *sess,
@@ -615,6 +617,97 @@ easy_step_delta(uint32_t workers)
     wirelog_easy_close(s);
 }
 
+/* ---- advanced snapshot ---------------------------------------------------- */
+
+typedef struct {
+    wirelog_program_t *program;
+    wirelog_session_t *session;
+    wl_col_session_t *inner;
+} advanced_t;
+
+static void
+advanced_open(advanced_t *a, const char *text, uint32_t workers)
+{
+    wirelog_error_t err = WIRELOG_OK;
+    a->program = wirelog_parse_string(text, &err);
+    CHECK(a->program && err == WIRELOG_OK);
+    a->session = NULL;
+    CHECK(wirelog_session_create(a->program, WIRELOG_BACKEND_DEFAULT, workers,
+        &a->session) == WIRELOG_OK && a->session);
+    a->inner = (wl_col_session_t *)wirelog_session_testhook_inner(a->session);
+    int64_t seed = 0, edges[2 * LENGTH];
+    for (int64_t i = 0; i < LENGTH; i++) {
+        edges[2 * i] = i;
+        edges[2 * i + 1] = i + 1;
+    }
+    CHECK(wirelog_session_insert(a->session, "seed", &seed, 1, 1)
+        == WIRELOG_OK);
+    CHECK(wirelog_session_insert(a->session, "edge", edges, LENGTH, 2)
+        == WIRELOG_OK);
+}
+
+static void
+advanced_close(advanced_t *a)
+{
+    wirelog_session_destroy(a->session);
+    wirelog_program_free(a->program);
+}
+
+/* Every IDB tuple, split by relation; p is checked exactly, the others
+ * only counted. */
+typedef struct {
+    capture_t p, q;
+    unsigned other;
+} all_rows_t;
+
+static void
+all_row(const char *name, const int64_t *values, uint32_t width, void *data)
+{
+    all_rows_t *a = data;
+    if (!strcmp(name, "p"))
+        capture_row(name, values, width, &a->p);
+    else if (!strcmp(name, "q"))
+        capture_row(name, values, width, &a->q);
+    else
+        a->other++;
+}
+
+static wirelog_error_t
+advanced_snap(advanced_t *a, all_rows_t *rows)
+{
+    memset(rows, 0, sizeof(*rows));
+    capture_reset(&rows->p, "p");
+    capture_reset(&rows->q, "q");
+    return wirelog_session_snapshot(a->session, all_row, rows);
+}
+
+static void
+advanced_snapshot(uint32_t workers)
+{
+    advanced_t a;
+    all_rows_t rows;
+    advanced_open(&a, program_text, workers);
+    set_limit(1);
+    CHECK(advanced_snap(&a, &rows) == WIRELOG_ERR_ITERATION_LIMIT);
+    CHECK(!rows.p.count && !rows.q.count && !rows.other);
+    check_retry_state(a.inner, false);
+    CHECK(advanced_snap(&a, &rows) == WIRELOG_ERR_ITERATION_LIMIT);
+    CHECK(!rows.p.count && !rows.q.count && !rows.other);
+    set_limit(0);
+    CHECK(advanced_snap(&a, &rows) == WIRELOG_OK);
+    CHECK(capture_exact(&rows.p, 0, LENGTH) && capture_exact(&rows.q, 0,
+        LENGTH));
+    /* Guard: the stable fast path stays OK under the limit. */
+    set_limit(1);
+    stable_emits = 0;
+    wl_columnar_session_test_before_stable_emit = count_stable_emit;
+    CHECK(advanced_snap(&a, &rows) == WIRELOG_OK);
+    wl_columnar_session_test_before_stable_emit = NULL;
+    CHECK(stable_emits == 1 && capture_exact(&rows.p, 0, LENGTH));
+    set_limit(0);
+    advanced_close(&a);
+}
+
 int
 main(void)
 {
@@ -632,6 +725,7 @@ main(void)
         easy_snapshot_dirtied(w);
         easy_step_plain(w);
         easy_step_delta(w);
+        advanced_snapshot(w);
     }
     easy_snapshot_tdd_route();
     easy_snapshot_boundary();
@@ -639,6 +733,6 @@ main(void)
     easy_snapshot_reentrant();
     easy_snapshot_drained_step();
     easy_step_plain_tdd();
-    puts("facade iteration cap: easy snapshot and step passed");
+    puts("facade iteration cap: easy and advanced facades passed");
     return 0;
 }

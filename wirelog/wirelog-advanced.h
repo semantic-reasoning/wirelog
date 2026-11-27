@@ -468,7 +468,13 @@ wirelog_session_set_delta_cb(wirelog_session_t *session,
  * snapshot() each derive IDB rows independently and combining them
  * produces duplicates).
  *
- * Returns: WIRELOG_OK on success, WIRELOG_ERR_EXEC on failure.
+ * If an evaluation in this call reaches the fixed-point iteration limit, the
+ * call forwards no tuples and returns WIRELOG_ERR_ITERATION_LIMIT.  The input
+ * stays pending, so the next call evaluates again; the limit is fixed, so
+ * with the same input it is reached again: remove input first.
+ *
+ * Returns: WIRELOG_OK on success, WIRELOG_ERR_ITERATION_LIMIT as above,
+ * WIRELOG_ERR_EXEC on failure.
  */
 WIRELOG_API wirelog_error_t
 wirelog_session_snapshot(wirelog_session_t *session,
