@@ -609,10 +609,14 @@ wirelog_easy_snapshot(wirelog_easy_session_t *s, const char *relation,
         return err;
     wirelog_easy_snapshot_filter_t filter
         = { .wanted = relation, .user_cb = cb, .user_data = user_data };
+    col_session_cap_scope_t cap_scope;
+    col_session_cap_scope_open(s->session, &cap_scope);
     int rc = wl_session_snapshot(s->session, snapshot_trampoline, &filter);
-    return (wirelog_error_t)wl_facade_session_error_code_with_budget(rc,
+    bool capped = col_session_cap_scope_close(s->session, &cap_scope);
+    return (wirelog_error_t)wl_facade_session_error_code_with_cap(rc,
                COL_SESSION(s->session)->extension_expr_status,
-               wl_columnar_session_budget_denied(COL_SESSION(s->session)));
+               wl_columnar_session_budget_denied(COL_SESSION(s->session)),
+               capped);
 }
 
 /* ======================================================================== */

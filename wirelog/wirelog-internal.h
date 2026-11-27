@@ -42,6 +42,13 @@ int
 wl_facade_session_error_code_with_budget(int rc, int expr_status,
     bool budget_denied);
 
+/* As _with_budget, then a successful raw call whose evaluation reached the
+ * iteration limit (col_session_cap_scope_close() returned true) becomes
+ * WIRELOG_ERR_ITERATION_LIMIT (#2345).  A raw error keeps its mapping. */
+int
+wl_facade_session_error_code_with_cap(int rc, int expr_status,
+    bool budget_denied, bool capped);
+
 /* A fact mutation begins by clearing the transient denial flag.  Some
  * relation growth paths still return ENOMEM for a denied reservation; scope
  * that translation to this operation so later snapshot errors stay distinct. */
