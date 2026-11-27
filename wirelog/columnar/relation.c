@@ -4812,6 +4812,100 @@ wl_columnar_relation_scalar_retirement_release_claims_controlled(
 }
 #undef WL_COLUMNAR_RELATION_SCALAR_INIT_HOOK
 
+/* INLINE retirement is flat scalar storage plus one separately owned map.
+ * Do not read the map until every header/column allocation alias is excluded. */
+static bool
+wl_columnar_relation_scalar_retirement_compound_candidate(const col_rel_t *r)
+{
+    return r->compound_kind == WIRELOG_COMPOUND_KIND_INLINE
+           || (r->compound_kind == WIRELOG_COMPOUND_KIND_NONE
+           && !r->compound_count && !r->compound_arity_map
+           && !r->compound_arity_len && !r->inline_physical_offset);
+}
+
+static bool
+wl_columnar_relation_scalar_retirement_map_column_independent(
+    const col_rel_t *r, uint32_t column)
+{
+    const void *map = r->compound_arity_map;
+    if (!map) return true;
+    if ((r->columns && map == (const void *)r->columns[column])
+        || (r->merge_columns && map == (const void *)r->merge_columns[column])
+        || (r->col_names && map == (const void *)r->col_names[column]))
+        return false;
+    if (r->schema_ok) {
+        const struct ArrowSchema *child = r->schema.children[column];
+        if (map == (const void *)child || map == (const void *)child->name
+            || map == (const void *)child->children
+            || map == (const void *)child->format
+            || map == (const void *)child->metadata)
+            return false;
+    }
+    return true;
+}
+
+static int
+wl_columnar_relation_scalar_retirement_inline_advance(
+    wl_columnar_relation_scalar_retirement_t *s)
+{
+    col_rel_t *r = s->storage.relation;
+    int rc = wl_columnar_relation_managed_gate_round_validate(
+        &s->storage.gate_round, r);
+    if (rc) return rc;
+    if (s->phase == WL_COLUMNAR_RELATION_SCALAR_INLINE_HEADER) {
+        if (r->compound_kind != WIRELOG_COMPOUND_KIND_INLINE
+            || !r->compound_arity_map || !r->compound_arity_len
+            || r->compound_arity_len > r->ncols || !r->compound_count
+            || r->compound_count > r->compound_arity_len
+            || r->inline_physical_offset >= r->ncols)
+            return EINVAL;
+        if (!r->schema_ok) return ENOTSUP;
+        uint64_t bytes;
+        if (!wl_columnar_memory_size_mul(r->compound_arity_len,
+            sizeof(*r->compound_arity_map), &bytes) || bytes > SIZE_MAX)
+            return EOVERFLOW;
+        if (s->storage.governor && bytes > r->metadata_reserved_bytes)
+            return EINVAL;
+        const void *map = r->compound_arity_map;
+        if (map == (const void *)r || map == (const void *)r->name
+            || map == (const void *)r->columns ||
+            map == (const void *)r->merge_columns
+            || map == (const void *)r->row_scratch ||
+            map == (const void *)r->column_types
+            || map == (const void *)r->dedup_slots ||
+            map == (const void *)r->timestamps
+            || map == (const void *)r->col_names ||
+            map == (const void *)r->schema.children
+            || map == (const void *)r->schema.name ||
+            map == (const void *)r->schema.format
+            || map == (const void *)r->schema.metadata
+            || map == (const void *)r->memory_governor ||
+            map == (const void *)r->mem_ledger)
+            return EINVAL;
+        /* Physical-column/Arrow aliases were proved in phases2/3. Reuse their
+         * cursors only now; payload/ledger accounting remains untouched. */
+        s->column = s->prior_column = 0;
+        s->phase = WL_COLUMNAR_RELATION_SCALAR_INLINE_ARITIES;
+        return 0;
+    }
+    if (s->phase != WL_COLUMNAR_RELATION_SCALAR_INLINE_ARITIES
+        || s->column > r->compound_arity_len || s->prior_column > r->ncols)
+        return EINVAL;
+    if (s->column < r->compound_arity_len) {
+        uint32_t arity = r->compound_arity_map[s->column];
+        if (!arity || arity > r->ncols - s->prior_column)
+            return EINVAL;
+        s->prior_column += arity;
+        ++s->column;
+        return 0;
+    }
+    if (s->prior_column != r->ncols) return EINVAL;
+    s->column = r->ncols;
+    s->prior_column = UINT32_MAX; /* Map proof done; not a READY cursor. */
+    s->phase = 2;
+    return 0;
+}
+
 int
 wl_columnar_relation_scalar_retirement_prepare(
     wl_columnar_relation_scalar_retirement_t *s,
@@ -4826,6 +4920,13 @@ wl_columnar_relation_scalar_retirement_prepare(
     if (!r) return EINVAL;
     struct ArrowSchema expected_schema;
     ArrowSchemaInit(&expected_schema);
+    if (s->phase == WL_COLUMNAR_RELATION_SCALAR_INLINE_HEADER
+        || s->phase == WL_COLUMNAR_RELATION_SCALAR_INLINE_ARITIES) {
+        rc = wl_columnar_relation_scalar_retirement_inline_advance(s);
+        if (rc) return rc;
+        rc = wl_evaluation_control_charge_attempt(control, id, 0);
+        return rc ? rc : EAGAIN;
+    }
     if (s->phase == 0) {
         wl_columnar_source_access_gate_request_t requests[2] = {
             {&r->descriptor_access, WL_COLUMNAR_SOURCE_ACCESS_GATE_WRITER},
@@ -4841,10 +4942,9 @@ wl_columnar_relation_scalar_retirement_prepare(
             r->retract_backup_timestamp_capacity
             || r->retract_backup_nrows || r->retract_backup_base_nrows
             || r->retract_backup_capacity || r->retract_backup_sorted_nrows
-            || r->col_shared || r->compound_kind != WIRELOG_COMPOUND_KIND_NONE
-            || r->compound_count || r->compound_arity_map ||
-            r->compound_arity_len
-            || r->inline_physical_offset || r->memory_budget_denial_pending
+            || r->col_shared
+            || !wl_columnar_relation_scalar_retirement_compound_candidate(r)
+            || r->memory_budget_denial_pending
             || r->pool_name_reserved_bytes
             || r->deferred_relation_next || r->deferred_relation_session
             || r->storage_owner != r || !r->relation_identity
@@ -4899,6 +4999,12 @@ wl_columnar_relation_scalar_retirement_prepare(
         s->phase = 2;
     } else if (s->phase == 2) {
         if (s->column == r->ncols) {
+            if (r->compound_kind == WIRELOG_COMPOUND_KIND_INLINE
+                && s->prior_column != UINT32_MAX) {
+                s->phase = WL_COLUMNAR_RELATION_SCALAR_INLINE_HEADER;
+                rc = wl_evaluation_control_charge_attempt(control, id, 0);
+                return rc ? rc : EAGAIN;
+            }
             if ((r->timestamps || s->ledger_timestamp_bytes)
                 && s->storage.governor) {
                 col_rel_payload_shape_t shape = {
@@ -4937,6 +5043,9 @@ wl_columnar_relation_scalar_retirement_prepare(
                     || ts == (const void *)child->metadata) return EINVAL;
             }
         }
+        if (!wl_columnar_relation_scalar_retirement_map_column_independent(r,
+            c))
+            return EINVAL;
         if (r->timestamps
             && ((r->columns && (void *)r->timestamps == r->columns[c])
             || (r->merge_columns
@@ -4983,6 +5092,13 @@ wl_columnar_relation_scalar_retirement_prepare_finite(
     if (!r) return EINVAL;
     struct ArrowSchema expected_schema;
     ArrowSchemaInit(&expected_schema);
+    if (s->phase == WL_COLUMNAR_RELATION_SCALAR_INLINE_HEADER
+        || s->phase == WL_COLUMNAR_RELATION_SCALAR_INLINE_ARITIES) {
+        rc = wl_columnar_relation_scalar_retirement_inline_advance(s);
+        if (rc) return rc;
+        rc = wl_evaluation_control_charge_attempt(control, id, 0);
+        return rc ? rc : EAGAIN;
+    }
     if (s->phase == WL_COLUMNAR_RELATION_SCALAR_FINITE_PAYLOAD) {
         rc = wl_evaluation_control_charge_attempt(control, id, 192);
         if (rc) return rc;
@@ -5016,10 +5132,9 @@ wl_columnar_relation_scalar_retirement_prepare_finite(
             r->retract_backup_timestamp_capacity
             || r->retract_backup_nrows || r->retract_backup_base_nrows
             || r->retract_backup_capacity || r->retract_backup_sorted_nrows
-            || r->col_shared || r->compound_kind != WIRELOG_COMPOUND_KIND_NONE
-            || r->compound_count || r->compound_arity_map ||
-            r->compound_arity_len
-            || r->inline_physical_offset || r->memory_budget_denial_pending
+            || r->col_shared
+            || !wl_columnar_relation_scalar_retirement_compound_candidate(r)
+            || r->memory_budget_denial_pending
             || r->pool_name_reserved_bytes
             || r->deferred_relation_next || r->deferred_relation_session
             || r->storage_owner != r || !r->relation_identity
@@ -5077,6 +5192,12 @@ wl_columnar_relation_scalar_retirement_prepare_finite(
         s->phase = 2;
     } else if (s->phase == 2) {
         if (s->column == r->ncols) {
+            if (r->compound_kind == WIRELOG_COMPOUND_KIND_INLINE
+                && s->prior_column != UINT32_MAX) {
+                s->phase = WL_COLUMNAR_RELATION_SCALAR_INLINE_HEADER;
+                rc = wl_evaluation_control_charge_attempt(control, id, 0);
+                return rc ? rc : EAGAIN;
+            }
             if ((r->timestamps || s->ledger_timestamp_bytes)
                 && s->storage.governor) {
                 /* Pending proof owns real writers, but is not READY. */
@@ -5107,6 +5228,9 @@ wl_columnar_relation_scalar_retirement_prepare_finite(
                     || ts == (const void *)child->metadata) return EINVAL;
             }
         }
+        if (!wl_columnar_relation_scalar_retirement_map_column_independent(r,
+            c))
+            return EINVAL;
         if (r->timestamps
             && ((r->columns && (void *)r->timestamps == r->columns[c])
             || (r->merge_columns
@@ -5249,6 +5373,15 @@ wl_columnar_relation_scalar_retirement_step(
         free(r->row_scratch); r->row_scratch = NULL;
         free(r->column_types); r->column_types = NULL;
         free(r->dedup_slots); r->dedup_slots = NULL;
+        s->phase = r->compound_arity_map
+            ? WL_COLUMNAR_RELATION_SCALAR_FREE_INLINE_MAP
+            : r->timestamps ? 14 : 12;
+        break;
+    case WL_COLUMNAR_RELATION_SCALAR_FREE_INLINE_MAP:
+        free(r->compound_arity_map); r->compound_arity_map = NULL;
+        r->compound_arity_len = 0;
+        r->compound_kind = WIRELOG_COMPOUND_KIND_NONE;
+        r->compound_count = r->inline_physical_offset = 0;
         s->phase = r->timestamps ? 14 : 12;
         break;
     case 14:
@@ -24132,27 +24265,20 @@ col_rel_mutable_image_prepare(col_rel_t *source,
     return rc;
 }
 
-int
-wl_columnar_relation_new_empty_governed_like_locked(col_rel_t *source,
+/* The source writer already pins the schema. This private constructor must
+ * not reacquire a source reader or import mutable-image publication guards. */
+static int
+wl_columnar_relation_new_empty_like_locked_impl(col_rel_t *source,
+    const char *name, wl_columnar_memory_governor_ref_t *governor,
     col_rel_t **out)
 {
     col_rel_t *image = NULL;
     int rc;
-
-    if (!source || !out || !source->memory_governor)
+    if (!source || !out)
         return EINVAL;
     *out = NULL;
-    if (source->storage_owner != source || source->col_shared
-        || col_rel_storage_alias_borrow_count(source) != 0
-        || source->pool_owned || source->arena_owned)
-        return EBUSY;
-
-    /* The caller holds source's canonical writer, so schema and compound
-     * metadata remain stable while this private descriptor is constructed.
-     * Passing a NULL name is intentional: mutable-image publication keeps
-     * the source's existing name and descriptor credit. */
-    rc = wl_columnar_relation_alloc_governed(&image, NULL,
-            source->memory_governor);
+    rc = governor ? wl_columnar_relation_alloc_governed(&image, name, governor)
+        : col_rel_alloc(&image, name);
     if (rc != 0)
         return rc;
     rc = col_rel_set_schema(image, source->ncols,
@@ -24176,6 +24302,34 @@ wl_columnar_relation_new_empty_governed_like_locked(col_rel_t *source,
     }
     col_rel_destroy(image);
     return rc;
+}
+
+int
+wl_columnar_relation_new_empty_named_like_locked(col_rel_t *source,
+    const char *name, wl_columnar_memory_governor_ref_t *governor,
+    col_rel_t **out)
+{
+    if (!name)
+        return EINVAL;
+    return wl_columnar_relation_new_empty_like_locked_impl(source, name,
+               governor, out);
+}
+
+int
+wl_columnar_relation_new_empty_governed_like_locked(col_rel_t *source,
+    col_rel_t **out)
+{
+    if (!source || !out || !source->memory_governor)
+        return EINVAL;
+    *out = NULL;
+    if (source->storage_owner != source || source->col_shared
+        || col_rel_storage_alias_borrow_count(source) != 0
+        || source->pool_owned || source->arena_owned)
+        return EBUSY;
+    /* Mutable-image publication keeps the original descriptor/name credit;
+     * retain this wrapper's existing unnamed, governed source contract. */
+    return wl_columnar_relation_new_empty_like_locked_impl(source, NULL,
+               source->memory_governor, out);
 }
 
 int

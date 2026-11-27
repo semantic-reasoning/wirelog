@@ -632,8 +632,142 @@ static void bounded_initializer(void)
     }
 }
 
+/* Real constructor-owned map: both preparation protocols retain the original
+ * receipt and two writers through incremental validation and disposal. */
+static void inline_retirement(bool governed, bool finite, unsigned malformed)
+{
+    wl_columnar_memory_resolution_t resolution = {
+        .budget_bytes = WL_COLUMNAR_MEMORY_MIN_BUDGET,
+        .usable_bytes = WL_COLUMNAR_MEMORY_MIN_BUDGET,
+        .mode = WL_COLUMNAR_MEMORY_MODE_ENFORCING
+    };
+    wl_columnar_memory_governor_ref_t *g = governed
+        ? wl_columnar_memory_governor_ref_create(&resolution) : NULL;
+    CHECK(!governed || g);
+    col_rel_t *r = NULL;
+    if (g) CHECK(!wl_columnar_relation_new_auto_governed("inline retire", 4,
+            4, true, g, &r));
+    else {
+        r = col_rel_new_auto("inline retire", 4);
+        CHECK(r && !col_rel_enable_timestamps(r));
+    }
+    const col_rel_logical_col_t logical[] = {
+        {WIRELOG_COMPOUND_KIND_NONE, 0, 0},
+        {WIRELOG_COMPOUND_KIND_INLINE, 2, 1},
+        {WIRELOG_COMPOUND_KIND_NONE, 0, 0}
+    };
+    CHECK(!col_rel_apply_compound_schema(r, logical, 3));
+    const int64_t row[] = {3, 5, 7, 11};
+    CHECK(!col_rel_append_row(r, row));
+    uint32_t *map = r->compound_arity_map;
+    uint64_t metadata = r->metadata_reserved_bytes;
+    uint64_t credit = reserved(g);
+    CHECK(map && map[0] == 1 && map[1] == 2 && map[2] == 1);
+    if (g) CHECK(metadata >= 3 * sizeof(*map));
+    col_relation_snapshot_t before = wl_columnar_relation_snapshot(r);
+    wl_evaluation_control_t *c = NULL;
+    CHECK(!wl_evaluation_control_create(0, &c));
+    CHECK(!wl_evaluation_control_attach(c, &owner)); restart(c, 0);
+    int (*prepare)(wl_columnar_relation_scalar_retirement_t *,
+        wl_evaluation_control_t *, uint64_t) = finite
+        ? wl_columnar_relation_scalar_retirement_prepare_finite
+        : wl_columnar_relation_scalar_retirement_prepare;
+    wl_columnar_relation_scalar_retirement_t receipt = {0};
+    if (malformed == 1) r->compound_arity_len = 5;
+    if (malformed == 2) map[1] = 0;
+    if (malformed == 3) map[1] = 1;
+    if (malformed == 4) r->inline_physical_offset = 4;
+    if (malformed == 5) r->compound_arity_map = (uint32_t *)r->columns[3];
+    if (malformed ==
+        6) r->compound_arity_map = (uint32_t *)r->schema.children[3]->format;
+    if (malformed == 7) r->compound_kind = WIRELOG_COMPOUND_KIND_SIDE;
+    if (malformed == 8) r->schema.children[3]->n_children = 1;
+    if (malformed == 9) r->compound_kind = WIRELOG_COMPOUND_KIND_NONE;
+    if (malformed ==
+        10) r->schema.children[3]->children = (struct ArrowSchema **)map;
+    CHECK(!wl_columnar_relation_scalar_retirement_begin(&receipt, r));
+    int rc; unsigned turns = 0;
+    if (malformed) {
+        do {
+            rc = prepare(&receipt, c,
+                    wl_evaluation_control_active_attempt_id(c));
+            CHECK(++turns < 10000);
+        } while (rc == EAGAIN);
+        CHECK((rc == EINVAL || rc == ENOTSUP) && !receipt.ready
+            && !receipt.committed && reserved(g) == credit);
+        CHECK(!wl_columnar_relation_scalar_retirement_cancel(&receipt));
+        r->compound_kind = WIRELOG_COMPOUND_KIND_INLINE;
+        r->compound_arity_map = map; r->compound_arity_len = 3;
+        r->inline_physical_offset = 1; map[1] = 2;
+        r->schema.children[3]->n_children = 0;
+        r->schema.children[3]->children = NULL;
+        CHECK(!col_rel_destroy_checked(r) && !reserved(g));
+    } else {
+        /* Reach validation naturally, then deny its next paid arity action. */
+        do {
+            rc = prepare(&receipt, c,
+                    wl_evaluation_control_active_attempt_id(c));
+            CHECK(rc == EAGAIN && ++turns < 10000);
+        } while (receipt.phase != WL_COLUMNAR_RELATION_SCALAR_INLINE_ARITIES);
+        CHECK(!receipt.ready &&
+            receipt.storage.identity == (uintptr_t)&receipt.storage);
+        restart(c, 1);
+        CHECK(prepare(&receipt, c,
+            wl_evaluation_control_active_attempt_id(c)) == EAGAIN);
+        CHECK(prepare(&receipt, c, wl_evaluation_control_active_attempt_id(c))
+            == WL_EVALUATION_CONTROL_WORK_LIMIT);
+        CHECK(r->compound_arity_map == map && map[1] == 2
+            && reserved(g) == credit && r->metadata_reserved_bytes == metadata);
+        CHECK(!wl_columnar_relation_scalar_retirement_cancel(&receipt));
+        CHECK(wl_columnar_relation_snapshot_equal(before,
+            wl_columnar_relation_snapshot(r)));
+        restart(c, 0);
+        CHECK(!wl_columnar_relation_scalar_retirement_begin(&receipt, r));
+        do {
+            rc = prepare(&receipt, c,
+                    wl_evaluation_control_active_attempt_id(c));
+            CHECK(++turns < 10000);
+        } while (rc == EAGAIN);
+        CHECK(!rc && receipt.ready && receipt.phase == 2 && !receipt.column);
+        CHECK(!wl_columnar_relation_scalar_retirement_commit(&receipt));
+        do {
+            rc = wl_columnar_relation_scalar_retirement_step(&receipt, c,
+                    wl_evaluation_control_active_attempt_id(c));
+            CHECK(rc == EAGAIN && ++turns < 10000);
+        } while (receipt.phase != WL_COLUMNAR_RELATION_SCALAR_FREE_INLINE_MAP);
+        CHECK(r->compound_arity_map == map);
+        CHECK(wl_columnar_relation_scalar_retirement_step(&receipt, c,
+            wl_evaluation_control_active_attempt_id(c)) == EAGAIN);
+        CHECK(!r->compound_arity_map && !r->compound_arity_len
+            && !r->compound_count && !r->inline_physical_offset
+            && r->compound_kind == WIRELOG_COMPOUND_KIND_NONE
+            && reserved(g) == credit);
+        wl_evaluation_control_request_cancel(c);
+        CHECK(wl_columnar_relation_scalar_retirement_step(&receipt, c,
+            wl_evaluation_control_active_attempt_id(c)) ==
+            WL_EVALUATION_CONTROL_CANCELLED);
+        CHECK(!r->compound_arity_map && reserved(g) == credit);
+        /* Real owner resumes its committed receipt on a fresh funded attempt. */
+        restart(c, 4096);
+        do {
+            rc = wl_columnar_relation_scalar_retirement_step(&receipt, c,
+                    wl_evaluation_control_active_attempt_id(c));
+            CHECK(++turns < 10000);
+        } while (rc == EAGAIN);
+        CHECK(!rc && !receipt.storage.relation && !reserved(g));
+    }
+    (void)wl_evaluation_control_finish(c, &owner, 0, 0);
+    CHECK(!wl_evaluation_control_detach(c, &owner));
+    wl_evaluation_control_release(c);
+    if (g) wl_columnar_memory_governor_ref_release(g);
+}
+
 int main(void)
 {
+    for (unsigned g = 0; g < 2; ++g)
+        for (unsigned finite = 0; finite < 2; ++finite)
+            for (unsigned malformed = 0; malformed < 11; ++malformed)
+                inline_retirement(g, finite, malformed);
     bounded_initializer();
     const uint32_t widths[] = {0, 1, 3, 257};
     for (unsigned w = 0; w < 4; ++w)for (unsigned governed = 0; governed < 2;

@@ -8506,12 +8506,12 @@ endforeach
 test_evaluation_retraction_domains_exe = executable(
   'test_evaluation_retraction_domains',
   files('test_evaluation_retraction_domains.c'),
-  c_args: ['-DWL_SESSION_TEST_HOOKS'],
+  c_args: ['-DWL_SESSION_TEST_HOOKS', '-DWL_TEST_RELATION_RESIZE_HOOK'],
   include_directories: [wirelog_inc, wirelog_src_inc],
   dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
   link_with: [testlib_prod],
 )
-foreach retraction_case : ['public', 'staging']
+foreach retraction_case : ['public', 'staging', 'typed', 'faults', 'stops', 'metadata']
   test('evaluation_retraction_domains_' + retraction_case,
        test_evaluation_retraction_domains_exe, args: [retraction_case],
        suite: ['unit', 'tsan', 'evaluation_join_hosts'], timeout: 120)
