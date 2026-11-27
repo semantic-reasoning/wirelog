@@ -214,18 +214,19 @@
  * insert into the right input returns ENOTSUP.
  *
  * Refusals: seal and begin return WL_COLUMNAR_SPILL_UNSUPPORTED under control,
- * and WL_COLUMNAR_SPILL_OK uncontrolled, for a cold input read by a self-JOIN,
- * a JOIN over a source with an INLINE compound column and a COUNT over one, a
- * cold right input read by a second JOIN, a cold right input read again by a
- * later JOIN, after an equality FILTER over the resident input and with no
- * prefix, a cold right input read by the rule's second JOIN after a JOIN of a
- * third input, whose registry the controlled bound refuses, a two-EDB
- * single-rule projection, a head that is also an EDB, with a projection and
- * with a COUNT, and a registry that a successor STEP would find larger than
- * three relations. Both sessions refuse a SUM over a JOIN, a cold right input
- * after an equality FILTER on its JOIN key, a COUNT after a later JOIN that
- * reads a cold right input, a JOIN with no key, a JOIN with no key after a
- * one-key JOIN with the cold input on the left and after a two-key JOIN with
+ * and WL_COLUMNAR_SPILL_OK uncontrolled, for a JOIN over a source with an
+ * INLINE compound column and a COUNT over one, a cold right input read by a
+ * second JOIN, a cold right input read again by a later JOIN, after an
+ * equality FILTER over the resident input and with no prefix, a cold right
+ * input read by the rule's second JOIN after a JOIN of a third input, whose
+ * registry the controlled bound refuses, a two-EDB single-rule projection, a
+ * head that is also an EDB, with a projection and with a COUNT, a registry
+ * that a successor STEP would find larger than three relations, and a constant
+ * or an arithmetic head column after a later JOIN that reads a cold right
+ * input, with no prefix. Both sessions refuse a SUM over a JOIN, a cold right
+ * input after an equality FILTER on its JOIN key, a COUNT after a later JOIN
+ * that reads a cold right input, a JOIN with no key, a JOIN with no key after
+ * a one-key JOIN with the cold input on the left and after a two-key JOIN with
  * it on the right, and a COUNT after a two-key JOIN that follows a one-key
  * JOIN, with the cold input on either side. With a right filter and a cold
  * right input they also refuse the rule with the filter after a prefix, with
@@ -234,21 +235,22 @@
  * and with no prefix and one key a comparison that the planner emits as a
  * FILTER after the JOINs. Of two cold inputs of one JOIN, the second seal is
  * refused under control in either order, and the STEP gives what an
- * uncontrolled session with only the first sealed gives; of the resident input
- * of a JOIN with itself and the cold right input of a later JOIN, the former
- * is refused under control in either order, and the STEP gives what an
- * uncontrolled session with only the latter sealed gives. A later JOIN of a
- * cold right input whose left key is a STRING column, against the cold input's
- * INT64 key, is admitted at seal and begin uncontrolled and fails its STEP
- * with ENOTSUP, and is refused at seal and begin under control; the parser
- * refuses such a rule, so the key comes from an edited plan. Over a resident
- * input declared but never inserted, the earlier JOIN's output has no column,
- * and the STEP returns ENOTSUP on both sessions, the controlled one before the
- * scan with every reservation returned. A controlled SNAPSHOT returns ENOTSUP
- * and a STEP with a delta callback set returns ENOTSUP. A STEP after a
- * callback was set and cleared following a completed STEP completes without an
- * attempt, the inputs being frozen; a callback set while an attempt is parked
- * is ignored, as in a resident controlled session.
+ * uncontrolled session with only the first sealed gives; of the input of a
+ * JOIN with itself and the cold right input of a later JOIN, the one sealed
+ * first is admitted under control and the other refused, in either order, and
+ * the STEP gives what an uncontrolled session with only the first sealed
+ * gives. A later JOIN of a cold right input whose left key is a STRING column,
+ * against the cold input's INT64 key, is admitted at seal and begin
+ * uncontrolled and fails its STEP with ENOTSUP, and is refused at seal and
+ * begin under control; the parser refuses such a rule, so the key comes from
+ * an edited plan. Over a resident input declared but never inserted, the
+ * earlier JOIN's output has no column, and the STEP returns ENOTSUP on both
+ * sessions, the controlled one before the scan with every reservation
+ * returned. A controlled SNAPSHOT returns ENOTSUP and a STEP with a delta
+ * callback set returns ENOTSUP. A STEP after a callback was set and cleared
+ * following a completed STEP completes without an attempt, the inputs being
+ * frozen; a callback set while an attempt is parked is ignored, as in a
+ * resident controlled session.
  *
  * Right filters: with no prefix and one key at every JOIN, a JOIN of the
  * resident input before or after the one that reads a cold right input may
@@ -287,6 +289,52 @@
  * the controlled session refuses the seal or load, the uncontrolled STEP
  * returning ENOTSUP or no head row.
  *
+ * Self, run with the argument "self": the rule's first input may be the cold
+ * input itself, which one JOIN or more of the rule read again as their right
+ * input; the scan of the first input installs its prefix's rows, and the input
+ * is scanned a second time, whole, into the copy, at the first JOIN that reads
+ * it. The corpus has a JOIN of the copy right after the VARIABLE over 8 and 20
+ * cold rows, over a three-column input, with a projected head, on the first
+ * column of both atoms, with a constant and an arithmetic head column and with
+ * two keys over skewed rows, on which the second key is checked to reject rows
+ * that the first alone pairs; after an equality FILTER over 9 and 20 rows,
+ * followed by a second JOIN of the copy, by a JOIN of a resident input and
+ * after one; two JOINs of the copy; a JOIN of a resident input before the one
+ * of the copy, which has one key or two, and after it; from program facts, a
+ * triangle, whose last JOIN has two keys, a STRING key and, from an edited
+ * plan, a permuting MAP over the first input; a COUNT, a MIN and a MAX after
+ * the JOIN and a COUNT after the FILTER; over cold rows whose keys repeat, the
+ * JOIN, the JOIN on the first column, a COUNT, a MIN and a MAX, each row of
+ * the first input then joining several rows of the copy; and empty inputs.
+ * Each case is compared with the uncontrolled session and with the sessions
+ * that keep the input resident, and checks that the scan of the first input
+ * comes first, that the copy is scanned once, that every JOIN starts, that the
+ * first scan prepays its prefix's resolution work and the second none, and
+ * which raw route the uncontrolled session took. Both stops at every
+ * checkpoint of the two scans on both routes, without and with the FILTER,
+ * landing inside the scan of the copy too, a work-limit stop at every JOIN
+ * checkpoint on the seal route and a cancellation at every one on the loading
+ * route, a cancellation at every REDUCE checkpoint of the COUNT, parks in the
+ * JOIN of the copy, in the REDUCE after it, in a later JOIN of the copy, in
+ * one after a resident JOIN and in that resident JOIN, an allocation that a
+ * JOIN cannot make, also with two keys, a cancellation from inside a spill
+ * read and a read fault, in the scan of the first input and in that of the
+ * copy, and the governor denials, some of them inside the scan of the copy, at
+ * its output and at its reader, behave as for one scan; the full STEP consumes
+ * the same work on both routes; a STRING left key at a later JOIN of the copy
+ * from an edited plan is refused under control while the uncontrolled STEP
+ * returns ENOTSUP; and of the input of the self-JOIN and a cold input of a
+ * later JOIN, the one sealed first is admitted under control and the other
+ * refused. Refused under control only: the self-JOIN with a third input, whose
+ * registry the controlled bound refuses, over a source with an INLINE compound
+ * column, with a JOIN and with a COUNT, and with a constant or an arithmetic
+ * head column after a later JOIN of the copy, with no prefix, after a JOIN of
+ * it or of a resident input, whose MAP lane, not a plain column, the suffix
+ * audit refuses; refused by both sessions: a SUM after it, a constant in the
+ * copy's input, a comparison that the planner emits after the JOIN, and an
+ * assignment between the atoms, which it emits as a FILTER and a MAP after the
+ * JOIN.
+ *
  * Not checked here: more than one worker; an observed STEP or an observed
  * SNAPSHOT over a cold source, both refused; a MAP whose lanes, or a REDUCE
  * whose group keys and operand, exceed one quantum of resolution lanes; a
@@ -313,7 +361,13 @@
  * carries no column types once inserted in the cases tried, a work-limit stop
  * at every JOIN checkpoint on the loading route and a cancellation at every
  * one on the seal route, the least free memory at which a STEP succeeds and an
- * insert into the resident input after the seal. */
+ * insert into the resident input after the seal; and, for a cold input read as
+ * the rule's first input and again as a right input, a single scan for both,
+ * the least free memory at which a STEP succeeds, which holds the first scan's
+ * output beside the copy when the copy's JOIN is the rule's first, a park
+ * between the two scans, which run within one public call, a MAP that the
+ * planner emits between JOINs of the copy, an aggregate after a later JOIN, a
+ * FLOAT or unsigned key and a cold input read by JOINs of two rules. */
 #include "../wirelog/columnar/internal.h"
 #include "../wirelog/exec_plan_gen.h"
 #include "../wirelog/session.h"
@@ -618,6 +672,12 @@ static uint64_t right_scans; /* Scans of a JOIN right input that ended. */
  * checkpoints and the JOIN attempt allocations made before it. */
 static uint64_t join_starts, join_latch, joins_before_latch;
 static int allocations_before_latch = -1;
+/* Cold scan checkpoints and spill reads before the scan of a cold right
+ * input began; in the self cases the scan of the first input came first. */
+static uint64_t checkpoints_before_right, reads_before_right;
+/* Set: at the first checkpoint of a cold right input's scan, arm the
+ * cancellation that the next spill read requests. */
+static bool right_read_cancel;
 
 static uint64_t cell_consumed, cell_run;
 
@@ -643,7 +703,9 @@ cell_bound(wl_evaluation_control_t *control,
 
 static uint64_t resolve_consumed;
 static bool resolve_seen;
-static uint64_t decode_work; /* Prepaid resolution work, seen at SCRATCH. */
+/* Prepaid resolution work, seen at the SCRATCH of the scan of the first
+ * input and of the scan of a right input. */
+static uint64_t decode_work, right_decode_work;
 
 /* Each resolution action, a name byte run, a sizing step or a prepayment,
  * charges at most one quantum plus the sizing step's own unit: consecutive
@@ -671,6 +733,12 @@ cold_checkpoint(wl_evaluation_control_t *control,
     last_phase = a->phase;
     if (a->right && !right_scan_seen) {
         joins_before_right = join_checkpoints;
+        checkpoints_before_right = checkpoints;
+        reads_before_right = read_ios;
+        if (right_read_cancel) {
+            right_read_cancel = false;
+            read_cancel = true;
+        }
         if (wl_columnar_join_test_attempt_fail_allocation >= 0)
             allocations_before_right = JOIN_ALLOCATION_BOUND -
                 wl_columnar_join_test_attempt_fail_allocation;
@@ -682,8 +750,10 @@ cold_checkpoint(wl_evaluation_control_t *control,
         cell_bound(control, a);
         resolve_bound(control, a);
     }
-    if (a->phase == WL_COLUMNAR_COLD_SCAN_ATTEMPT_SCRATCH)
-        decode_work = a->decode_work;
+    if (a->phase == WL_COLUMNAR_COLD_SCAN_ATTEMPT_SCRATCH) {
+        if (a->right) right_decode_work = a->decode_work;
+        else decode_work = a->decode_work;
+    }
     if (++checkpoints != stop_at || !stop_mode || stop_child) return;
     stop_hit = true;
     if (stop_mode == 1) wl_evaluation_control_request_cancel(control);
@@ -734,7 +804,11 @@ hooks_clear(void)
     reduce_checkpoints = 0;
     join_checkpoints = 0;
     joins_before_right = 0;
+    checkpoints_before_right = 0;
+    reads_before_right = 0;
+    right_read_cancel = false;
     decode_work = 0;
+    right_decode_work = 0;
     stop_at = 0;
     stop_mode = 0;
     stop_hit = false;
@@ -793,6 +867,12 @@ typedef struct {
                   * itself. */
     bool twice; /* Two JOINs of the rule or more read the cold input as
                  * their right input. */
+    uint32_t self; /* Nonzero: the rule's first input is the cold input,
+                    * which this many of its JOINs read again as their
+                    * right input. */
+    uint32_t self_fan; /* Nonzero: cold row i is (i % self_fan, i, ...). */
+    bool self_skew; /* The cold rows are skewed as `right`'s are; see
+                     * fill_fan. */
 } qcase_t;
 
 static int64_t
@@ -807,15 +887,21 @@ cell(uint32_t row, uint32_t col)
  * the cold rows with its first column on two keys, an odd one on the first
  * key only. */
 static void
+gen_row(int64_t *row, uint32_t i, uint32_t width, uint32_t fan, bool skew)
+{
+    for (uint32_t c = 0; c < width; c++)
+        row[c] = fan ? (c ? (int64_t)i : (int64_t)(i % fan)) :
+            !skew || !c ? cell(i, c) :
+            c == 1 ? (cell(i, 1) + (int64_t)(i % 2)) % 13 : (int64_t)i;
+}
+
+static void
 fill_fan(fixture_t *f, const char *name, uint32_t width, uint32_t rows,
     uint32_t fan, bool skew, bool both)
 {
     int64_t row[MAX_COLS];
     for (uint32_t i = 0; i < rows; i++) {
-        for (uint32_t c = 0; c < width; c++)
-            row[c] = fan ? (c ? (int64_t)i : (int64_t)(i % fan)) :
-                !skew || !c ? cell(i, c) :
-                c == 1 ? (cell(i, 1) + (int64_t)(i % 2)) % 13 : (int64_t)i;
+        gen_row(row, i, width, fan, skew);
         CHECK(!wl_session_insert(f->s, name, row, 1, width));
         if (both) CHECK(!wl_session_insert(f->raw, name, row, 1, width));
     }
@@ -828,6 +914,10 @@ fill(fixture_t *f, const char *name, uint32_t width, uint32_t rows,
     fill_fan(f, name, width, rows, 0, false, both);
 }
 
+/* The rows that load() appends: those of fill_fan with these. */
+static uint32_t load_fan;
+static bool load_skew;
+
 static wl_columnar_spill_status_t
 load(wl_session_t *s, const char *name, uint32_t width, uint32_t rows)
 {
@@ -838,8 +928,7 @@ load(wl_session_t *s, const char *name, uint32_t width, uint32_t rows)
     for (uint32_t i = 0; i < rows; i += 3) {
         uint32_t n = rows - i < 3 ? rows - i : 3;
         for (uint32_t r = 0; r < n; r++)
-            for (uint32_t c = 0; c < width; c++)
-                chunk[r * width + c] = cell(i + r, c);
+            gen_row(&chunk[r * width], i + r, width, load_fan, load_skew);
         st = wl_columnar_session_append_cold_input(s, name, chunk, n, width);
         if (st != WL_COLUMNAR_SPILL_OK) return st;
     }
@@ -864,16 +953,21 @@ prepare(fixture_t *f, const qcase_t *c, via_t via)
         fill_fan(f, c->right, c->right_width, c->right_rows, c->right_fan,
             c->skew, true);
     if (via == VIA_SEAL) {
-        fill(f, c->cold, c->width, c->rows, true);
+        fill_fan(f, c->cold, c->width, c->rows, c->self_fan, c->self_skew,
+            true);
         CHECK(wl_columnar_session_seal_join_input(f->raw, c->cold, NULL,
             NULL) == WL_COLUMNAR_SPILL_OK);
         CHECK(wl_columnar_session_seal_join_input(f->s, c->cold, NULL,
             NULL) == WL_COLUMNAR_SPILL_OK);
     } else {
+        load_fan = c->self_fan;
+        load_skew = c->self_skew;
         CHECK(load(f->raw, c->cold, c->width, c->rows) ==
             WL_COLUMNAR_SPILL_OK);
         CHECK(load(f->s, c->cold, c->width, c->rows) ==
             WL_COLUMNAR_SPILL_OK);
+        load_fan = 0;
+        load_skew = false;
     }
     registry_hash(f);
 }
@@ -1414,6 +1508,117 @@ static qcase_t qcases[] = {
      "c(\"p\",\"q\"). c(\"q\",\"r\"). c(\"r\",\"p\").\n"
      "out(x,u) :- a(x,s), c(s,t), c(t,u).\n", "c", 0, 0, "VJJC", 0, "out",
      NULL, NULL, 0, 0, 0, true, .twice = true},
+    /* A cold input read as the rule's first input and again as the right
+     * input of one JOIN or more, a self-JOIN: the first input's prefix and
+     * then the whole input are scanned, the latter into the copy. A
+     * generated row with first column r is (r, r + 3) or (r, r + 3, r + 6)
+     * modulo 13, so every row of the first input finds a row of the copy. */
+#define SELF2 ".decl c(x:int64,y:int64)\n.decl out(x:int64,z:int64)\n"
+#define SELF3 ".decl c(x:int64,y:int64,w:int64)\n" \
+        ".decl out(x:int64,z:int64)\n"
+#define SELF_A ".decl c(x:int64,y:int64)\n.decl a(y:int64,z:int64)\n" \
+        ".decl out(x:int64,u:int64)\n"
+#define SELF_A3 ".decl c(x:int64,y:int64,w:int64)\n" \
+        ".decl a(y:int64,u:int64)\n.decl out(x:int64,z:int64)\n"
+#define SELF_COUNT ".decl c(x:int64,y:int64)\n.decl out(x:int64,n:int64)\n"
+#define SELF_FACTS ".decl c(x:int64,y:int64)\n" \
+        ".decl out(x:int64,y:int64,z:int64)\n" \
+        "c(1,2). c(2,3). c(3,1). c(2,4). c(4,1). c(4,3).\n"
+    {"self", SELF2 "out(x,z) :- c(x,y), c(y,z).\n", "c", 2, 20, "VJC", 0,
+     "out", NULL, NULL, 0, 0, 0, false, .self = 1},
+    /* Over 8 cold rows, cold row 0, (0, 3), has the partner (3, 6). */
+    {"self_few", SELF2 "out(x,z) :- c(x,y), c(y,z).\n", "c", 2, 8, "VJC", 0,
+     "out", NULL, NULL, 0, 0, 0, false, .self = 1},
+    {"self_wide", SELF3 "out(x,z) :- c(x,y,w), c(y,z,v).\n", "c", 3, 20,
+     "VJC", 0, "out", NULL, NULL, 0, 0, 0, false, .self = 1},
+    {"self_projected", ".decl c(x:int64,y:int64,w:int64)\n"
+     ".decl out(z:int64)\nout(z) :- c(x,y,w), c(y,z,v).\n", "c", 3, 20,
+     "VJC", 0, "out", NULL, NULL, 0, 0, 0, false, .self = 1},
+    {"self_same_key", SELF2 "out(y,z) :- c(x,y), c(x,z).\n", "c", 2, 20,
+     "VJC", 0, "out", NULL, NULL, 0, 0, 0, false, .self = 1},
+    /* A constant and an arithmetic head column: the MAP after the JOIN. */
+    {"self_const_head", ".decl c(x:int64,y:int64)\n"
+     ".decl out(x:int64,k:int64)\nout(x,5) :- c(x,y), c(y,z).\n", "c", 2,
+     20, "VJMC", 0, "out", NULL, NULL, 0, 0, 0, false, .self = 1},
+    {"self_arith_head", ".decl c(x:int64,y:int64)\n"
+     ".decl out(x:int64,k:int64)\nout(x,z+1) :- c(x,y), c(y,z).\n", "c",
+     2, 20, "VJMC", 0, "out", NULL, NULL, 0, 0, 0, false, .self = 1},
+    /* Two keys over skewed rows, on which the second key rejects rows. */
+    {"self_composite", SELF3 "out(x,z) :- c(x,y,w), c(y,w,z).\n", "c", 3,
+     20, "VJC", 0, "out", NULL, NULL, 0, 0, 0, false, .self = 1,
+     .self_skew = true},
+    /* Cold row 2, (1, 4, 7), and row 8 pass the FILTER. */
+    {"self_filter", SELF3 "out(x,z) :- c(x,y,w), w = 7, c(y,z,v).\n", "c", 3,
+     20, "VFJFMC", 0, "out", NULL, NULL, 0, 0, 0, false, .self = 1},
+    {"self_filter_few", SELF3 "out(x,z) :- c(x,y,w), w = 7, c(y,z,v).\n",
+     "c", 3, 9, "VFJFMC", 0, "out", NULL, NULL, 0, 0, 0, false, .self = 1},
+    {"self_filter_twice", SELF3
+     "out(x,z) :- c(x,y,w), w = 7, c(y,u,v), c(u,z,t).\n", "c", 3, 20,
+     "VFJJFMC", 0, "out", NULL, NULL, 0, 0, 0, false, .self = 2},
+    {"self_filter_between", SELF_A3
+     "out(x,z) :- c(x,y,w), w = 7, a(y,u), c(u,z,v).\n", "c", 3, 20,
+     "VFJJFMC", 0, "out", NULL, "a", 2, 20, 0, false, .self = 1},
+    {"self_filter_then_resident", SELF_A3
+     "out(x,z) :- c(x,y,w), w = 7, c(y,u,v), a(u,z).\n", "c", 3, 20,
+     "VFJJFMC", 0, "out", NULL, "a", 2, 20, 0, false, .self = 1},
+    {"self_twice", SELF2 "out(x,z) :- c(x,y), c(y,u), c(u,z).\n", "c", 2, 20,
+     "VJJC", 0, "out", NULL, NULL, 0, 0, 0, false, .self = 2},
+    /* A JOIN of a resident input before the one that reads the copy, after
+     * it, and with two keys before it. */
+    {"self_between", SELF_A "out(x,u) :- c(x,y), a(y,z), c(z,u).\n", "c", 2,
+     20, "VJJC", 0, "out", NULL, "a", 2, 20, 0, false, .self = 1},
+    {"self_then_resident", SELF_A "out(x,u) :- c(x,y), c(y,z), a(z,u).\n",
+     "c", 2, 20, "VJJC", 0, "out", NULL, "a", 2, 20, 0, false, .self = 1},
+    {"self_resident_keys", ".decl c(x:int64,y:int64)\n"
+     ".decl a(y:int64,u:int64,w:int64)\n.decl out(x:int64,u:int64)\n"
+     "out(x,u) :- c(x,y), a(y,u,w), c(u,w).\n", "c", 2, 20, "VJJC", 0,
+     "out", NULL, "a", 3, 20, 0, false, .self = 1},
+    /* From program facts, the copy read twice, the last JOIN with two
+     * keys; and, from an edited plan, a permuting MAP over the first
+     * input, which the copy's columns do not follow. */
+    {"self_triangle", SELF_FACTS "out(x,y,z) :- c(x,y), c(y,z), c(z,x).\n",
+     "c", 0, 0, "VJJC", 0, "out", NULL, NULL, 0, 0, 0, false, .self = 2},
+    {"self_mapped", SELF_FACTS "out(x,y,z) :- c(x,y), c(y,z).\n", "c", 0, 0,
+     "VMJC", 3, "out", NULL, NULL, 0, 0, 0, false, .self = 1},
+    {"self_string", ".decl c(s:symbol,t:symbol)\n"
+     ".decl out(s:symbol,u:symbol)\n"
+     "c(\"p\",\"q\"). c(\"q\",\"r\"). c(\"r\",\"p\").\n"
+     "out(s,u) :- c(s,t), c(t,u).\n", "c", 0, 0, "VJC", 0, "out", NULL,
+     NULL, 0, 0, 0, false, .self = 1},
+    /* A COUNT, MIN or MAX after the JOIN, and a COUNT after a FILTER. */
+    {"self_count", SELF_COUNT "out(x,count(z)) :- c(x,y), c(y,z).\n", "c", 2,
+     20, "VJRC", 0, "out", NULL, NULL, 0, 0, 0, false, .self = 1},
+    {"self_count_few", SELF_COUNT "out(x,count(z)) :- c(x,y), c(y,z).\n",
+     "c", 2, 8, "VJRC", 0, "out", NULL, NULL, 0, 0, 0, false, .self = 1},
+    {"self_min", SELF_COUNT "out(x,min(z)) :- c(x,y), c(y,z).\n", "c", 2, 20,
+     "VJRC", 0, "out", NULL, NULL, 0, 0, 0, false, .self = 1},
+    {"self_max", SELF_COUNT "out(x,max(z)) :- c(x,y), c(y,z).\n", "c", 2, 20,
+     "VJRC", 0, "out", NULL, NULL, 0, 0, 0, false, .self = 1},
+    {"self_filter_count", ".decl c(x:int64,y:int64,w:int64)\n"
+     ".decl out(x:int64,n:int64)\n"
+     "out(x,count(z)) :- c(x,y,w), w = 7, c(y,z,v).\n", "c", 3, 20,
+     "VFJFRC", 0, "out", NULL, NULL, 0, 0, 0, false, .self = 1},
+    /* Over cold rows (i % 4, i), a row (x, x) of the first input, x < 4,
+     * joins every row i with i % 4 == x. */
+    {"self_fan", SELF2 "out(x,z) :- c(x,y), c(y,z).\n", "c", 2, 12, "VJC", 0,
+     "out", NULL, NULL, 0, 0, 0, false, .self = 1, .self_fan = 4},
+    {"self_fan_same_key", SELF2 "out(y,z) :- c(x,y), c(x,z).\n", "c", 2, 12,
+     "VJC", 0, "out", NULL, NULL, 0, 0, 0, false, .self = 1,
+     .self_fan = 4},
+    {"self_fan_count", SELF_COUNT "out(x,count(z)) :- c(x,y), c(y,z).\n",
+     "c", 2, 12, "VJRC", 0, "out", NULL, NULL, 0, 0, 0, false, .self = 1,
+     .self_fan = 4},
+    {"self_fan_min", SELF_COUNT "out(x,min(z)) :- c(x,y), c(y,z).\n", "c", 2,
+     12, "VJRC", 0, "out", NULL, NULL, 0, 0, 0, false, .self = 1,
+     .self_fan = 4},
+    {"self_fan_max", SELF_COUNT "out(x,max(z)) :- c(x,y), c(y,z).\n", "c", 2,
+     12, "VJRC", 0, "out", NULL, NULL, 0, 0, 0, false, .self = 1,
+     .self_fan = 4},
+    /* Empty inputs, loaded. */
+    {"self_empty", SELF2 "out(x,z) :- c(x,y), c(y,z).\n", "c", 2, 0, "VJC", 0,
+     "out", NULL, NULL, 0, 0, 0, false, .self = 1},
+    {"self_twice_empty", SELF2 "out(x,z) :- c(x,y), c(y,u), c(u,z).\n", "c",
+     2, 0, "VJJC", 0, "out", NULL, NULL, 0, 0, 0, false, .self = 2},
 };
 
 #define NQCASES (sizeof(qcases) / sizeof(qcases[0]))
@@ -1538,17 +1743,29 @@ run_qcase(const qcase_t *c, via_t via)
             !strcmp(rp->ops[i].right_relation, rp->ops[0].relation_name);
     CHECK(right_filter == (!strncmp(c->name, "right_second_filter", 19) ||
         !strcmp(c->name, "right_second_all_filtered")));
-    CHECK(join == rp->op_count ||
+    /* Exactly the twice cases read the cold input at two JOINs or more. In
+     * the self cases the rule's first input is the cold input, which `self`
+     * JOINs read again, `first_cold` the first of them and `later_cold`
+     * those after the rule's first JOIN. */
+    uint32_t cold_joins = 0, joins = 0, first_cold = rp->op_count;
+    uint32_t later_cold = 0;
+    for (uint32_t i = 0; i < rp->op_count; i++) {
+        bool cold_join = rp->ops[i].op == WL_PLAN_OP_JOIN &&
+            !strcmp(rp->ops[i].right_relation, c->cold);
+        joins += rp->ops[i].op == WL_PLAN_OP_JOIN;
+        cold_joins += cold_join;
+        later_cold += cold_join && i > join;
+        if (cold_join && first_cold == rp->op_count) first_cold = i;
+    }
+    CHECK(c->self ? !strcmp(rp->ops[0].relation_name, c->cold) &&
+        cold_joins == c->self && !c->cold_right && !c->twice &&
+        !c->second : join == rp->op_count ||
         (c->cold_right == !strcmp(rp->ops[join].right_relation, c->cold) &&
         c->cold_right == !!strcmp(rp->ops[0].relation_name, c->cold)));
-    /* Exactly the twice cases read the cold input at two JOINs or more. */
-    uint32_t cold_joins = 0, joins = 0;
-    for (uint32_t i = 0; i < rp->op_count; i++) {
-        joins += rp->ops[i].op == WL_PLAN_OP_JOIN;
-        cold_joins += rp->ops[i].op == WL_PLAN_OP_JOIN &&
-            !strcmp(rp->ops[i].right_relation, c->cold);
-    }
-    CHECK((cold_joins > 1) == c->twice);
+    CHECK(c->self || (cold_joins > 1) == c->twice);
+    CHECK(strcmp(c->name, "self_triangle") || rp->ops[2].key_count == 2);
+    CHECK(strcmp(c->name, "self_resident_keys") ||
+        (rp->ops[1].key_count == 1 && rp->ops[2].key_count == 2));
     /* The JOIN that reads the cold input has two keys exactly in the
      * composite cases, and the permuted ones pair each left key with a
      * right column of another position. */
@@ -1586,7 +1803,13 @@ run_qcase(const qcase_t *c, via_t via)
     CHECK(!strchr(c->ops, 'J') || c->cold_right ||
         wl_columnar_join_test_raw_cold_joins +
         wl_columnar_ops_test_raw_cold_scans > raw_joins + raw_scans);
-    CHECK((c->cold_right && !join_reduce) ==
+    /* In the self cases the raw JOIN of a cold right input reads the input
+     * after a prefix, which the raw scan reads, and at a JOIN after the
+     * rule's first, the raw cold-left JOIN running the first JOIN after no
+     * prefix and the raw cold JOIN aggregate a JOIN before a REDUCE. */
+    bool raw_right = c->self ? !join_reduce &&
+        (c->ops[1] != 'J' || later_cold > 0) : c->cold_right && !join_reduce;
+    CHECK(raw_right ==
         (wl_columnar_join_test_raw_cold_right_joins > raw_right_joins));
     CHECK(!join_reduce || wl_columnar_join_test_raw_cold_join_aggregates >
         raw_join_aggregates);
@@ -1599,15 +1822,21 @@ run_qcase(const qcase_t *c, via_t via)
         hooks_clear();
         CHECK(!until_done(f.s));
         CHECK(round || checkpoints > 0);
-        CHECK(round || right_scan_seen == c->cold_right);
-        /* The copy is scanned at the JOIN that reads it, which then runs. */
-        CHECK(round || (joins_before_right > 0) == c->second);
-        CHECK(round || !c->cold_right ||
-            join_checkpoints > joins_before_right);
-        /* The input is scanned once, and every JOIN of the rule runs; in
-         * the twice cases the later ones read the same copy. */
-        CHECK(round || !c->cold_right || right_scans == 1);
-        CHECK(round || !c->twice || join_starts == joins);
+        bool copied = c->cold_right || c->self;
+        CHECK(round || right_scan_seen == copied);
+        /* The copy is scanned at the JOIN that reads it, which then runs; in
+         * the self cases after the scan of the first input and after any
+         * JOIN of a resident input before that JOIN. */
+        CHECK(round || (joins_before_right > 0) ==
+            (c->self ? first_cold > join : c->second));
+        CHECK(round || !c->self || (checkpoints_before_right > 0 &&
+            checkpoints_before_right < checkpoints));
+        CHECK(round || !copied || join_checkpoints > joins_before_right);
+        /* The input is scanned once as a right input, and every JOIN of
+         * the rule runs; in the twice and self cases the JOINs that read
+         * the input read the same copy. */
+        CHECK(round || !copied || right_scans == 1);
+        CHECK(round || !(c->twice || c->self) || join_starts == joins);
         CHECK(wl_columnar_join_test_raw_cold_right_joins == raw_right_joins);
         CHECK(round || !strchr(c->ops, 'R') || reduce_checkpoints > 0);
         CHECK(round || !strchr(c->ops, 'J') || join_checkpoints > 0);
@@ -1620,6 +1849,19 @@ run_qcase(const qcase_t *c, via_t via)
         CHECK((strcmp(c->name, "right_second_filter_string") &&
             strcmp(c->name, "right_twice_string")) ||
             head_rows(f.s, c->head) == 2);
+        /* A self case publishes rows unless its input is empty. From the
+         * facts, the triangle gives the six rotations of (1, 2, 3) and
+         * (1, 2, 4), not (4, 3, 1), whose (1, 4) is no row; the mapped
+         * case the eight paths of two rows; and the STRING case p to r, q
+         * to p and r to q. */
+        CHECK(!c->self || (c->width && !c->rows) ||
+            head_rows(f.s, c->head) > 0);
+        CHECK(strcmp(c->name, "self_triangle") ||
+            head_rows(f.s, c->head) == 6);
+        CHECK(strcmp(c->name, "self_mapped") ||
+            head_rows(f.s, c->head) == 8);
+        CHECK(strcmp(c->name, "self_string") ||
+            head_rows(f.s, c->head) == 3);
         /* Each left row joins right_rows / right_fan right rows; inserted
          * duplicates stay, and the COUNT counts every pair. */
         const col_rel_t *out = session_find_rel((wl_col_session_t *)f.s,
@@ -1641,6 +1883,21 @@ run_qcase(const qcase_t *c, via_t via)
             CHECK(col_rel_get(out, i, 1) == left * (int64_t)c->cold_fan);
         }
         CHECK(!c->cold_fan || (out && out->nrows > 0));
+        /* With self_fan a row x of the first input joins several rows of
+         * the copy: two head rows share their first column, or, after a
+         * REDUCE, a COUNT exceeds one or a MAX is not x, the least of
+         * them; a MIN is x, which only the comparison with the resident
+         * sessions checks. */
+        bool fanned = false;
+        for (uint32_t i = 0; c->self_fan && out && i < out->nrows; i++)
+            for (uint32_t k = 0; !join_reduce && k < i; k++)
+                fanned |= col_rel_get(out, i, 0) == col_rel_get(out, k, 0);
+        for (uint32_t i = 0; c->self_fan && join_reduce && out &&
+            i < out->nrows; i++)
+            fanned |= strstr(c->name, "count") ? col_rel_get(out, i, 1) > 1
+                : strstr(c->name, "max") ?
+                col_rel_get(out, i, 1) != col_rel_get(out, i, 0) : true;
+        CHECK(!c->self_fan || fanned);
         /* With skew only the even rows of `right` match on both keys, and
          * the odd ones bring first columns the even ones lack, so every
          * head row's first column is that of an even row. */
@@ -1665,17 +1922,21 @@ run_qcase(const qcase_t *c, via_t via)
         CHECK(wl_columnar_join_test_raw_cold_joins == raw_joins);
         CHECK(wl_columnar_join_test_raw_cold_join_aggregates ==
             raw_join_aggregates);
-        if (!round && decode_work != expected_decode_work(&f, c))
+        /* The scan of the first input prepays its prefix's resolution;
+         * the scan of a right input, which reads it whole, none. */
+        uint64_t decoded = c->cold_right ? right_decode_work : decode_work;
+        if (!round && decoded != expected_decode_work(&f, c))
             fprintf(stderr, "%s: decode work %llu, want %llu\n", where,
-                (unsigned long long)decode_work,
+                (unsigned long long)decoded,
                 (unsigned long long)expected_decode_work(&f, c));
-        CHECK(round || decode_work == expected_decode_work(&f, c));
+        CHECK(round || decoded == expected_decode_work(&f, c));
+        CHECK(round || !c->self || !right_decode_work);
         CHECK(wl_columnar_ops_test_raw_cold_scans == raw);
         CHECK(wl_columnar_ops_test_raw_cold_aggregates == raw_aggregates);
         if (round) CHECK(!until_done(f.raw));
         expect_heads(&f, c);
     }
-    if (c->edit || join_reduce ||
+    if (c->edit || join_reduce || c->self ||
         ((c->cold_right || composite || c->later) && c->width)) {
         /* The plan over a resident input, uncontrolled; after a JOIN and
          * an aggregate, for a cold right input and for a JOIN with two
@@ -1686,15 +1947,18 @@ run_qcase(const qcase_t *c, via_t via)
         if (c->right)
             fill_fan(&g, c->right, c->right_width, c->right_rows,
                 c->right_fan, c->skew, true);
-        fill(&g, c->cold, c->width, c->rows, true);
+        fill_fan(&g, c->cold, c->width, c->rows, c->self_fan, c->self_skew,
+            true);
         CHECK(!until_done(g.raw));
         image_t *a = malloc(sizeof(*a)), *b = malloc(sizeof(*b));
         CHECK(a && b);
         image_of(f.s, c->head, a);
         image_of(g.raw, c->head, b);
         CHECK((a->count > 0 || (c->right && !c->right_rows) ||
+            (c->self && c->width && !c->rows) ||
             strstr(c->name, "all_filtered")) && image_equal(a, b));
-        if (join_reduce || c->cold_right || composite || c->later) {
+        if (join_reduce || c->cold_right || composite || c->later ||
+            c->self) {
             hooks_clear();
             CHECK(!until_done(g.s));
             CHECK((!join_reduce || reduce_checkpoints > 0) &&
@@ -1743,6 +2007,8 @@ stop_case(const qcase_t *c, via_t via, int mode, int child)
     set_where(c, via, names[child][mode - 1]);
     uint64_t n = calibrate(c, via, child);
     CHECK(n > 0);
+    /* Stops after the scan of a cold right input began, before its JOIN. */
+    uint64_t in_right = 0;
     for (uint64_t k = 1; k <= n; k++) {
         fixture_t f;
         fixture(&f, case_text(c));
@@ -1756,6 +2022,8 @@ stop_case(const qcase_t *c, via_t via, int mode, int child)
         int rc = until_done(f.s);
         stop_child = 0;
         CHECK(stop_hit);
+        in_right += right_scan_seen && checkpoints_before_right > 0 &&
+            join_checkpoints == joins_before_right;
         /* The control is polled at the checkpoint itself: none follows. */
         CHECK(child_checkpoints(child) == k);
         int code = mode == 1 ? WL_EVALUATION_CONTROL_CANCELLED
@@ -1786,6 +2054,9 @@ stop_case(const qcase_t *c, via_t via, int mode, int child)
         expect_heads(&f, c);
         fixture_destroy(&f);
     }
+    /* In a self case the sweep of the scans stops inside the second one,
+     * after the first installed its output. */
+    CHECK(child || !c->self || in_right > 0);
 }
 
 /* The scan runs its rows within one public call; its first EAGAIN return
@@ -1980,34 +2251,34 @@ cold_both_case(bool left_first)
         ".decl c(v:int64,z:int64)\n.decl out(x:int64,z:int64)\n" \
         "out(x,z) :- a(x,y,w), a(y,v,u), c(v,z).\n"
 
-/* Two cold inputs of a rule whose later JOIN reads one: the resident input
- * of the earlier JOIN with itself is refused under control in either
- * order, and the STEP gives what an uncontrolled session with only the
- * other sealed gives. */
+/* Two cold inputs of a rule whose later JOIN reads one, the earlier JOIN
+ * reading the other with itself: under control the input sealed first is
+ * admitted and the second is refused, in either order, and the STEP gives
+ * what an uncontrolled session with only the first sealed gives. Sealed
+ * first, the input of the earlier JOIN is read by a self-JOIN, whose copy
+ * is scanned at that JOIN. */
 static void
 cold_both_later_case(bool left_first)
 {
     snprintf(where_buf, sizeof(where_buf), "cold_both_later/%s",
         left_first ? "left_first" : "right_first");
     where = where_buf;
+    const char *first = left_first ? "a" : "c";
+    const char *second = left_first ? "c" : "a";
     fixture_t f;
     fixture(&f, SECOND_TEXT);
     fill(&f, "a", 3, 20, true);
     fill(&f, "c", 2, 20, true);
-    CHECK(wl_columnar_session_seal_join_input(f.raw, "c", NULL, NULL) ==
+    CHECK(wl_columnar_session_seal_join_input(f.raw, first, NULL, NULL) ==
         WL_COLUMNAR_SPILL_OK);
-    if (left_first)
-        CHECK(wl_columnar_session_seal_join_input(f.s, "a", NULL, NULL) ==
-            WL_COLUMNAR_SPILL_UNSUPPORTED);
-    CHECK(wl_columnar_session_seal_join_input(f.s, "c", NULL, NULL) ==
+    CHECK(wl_columnar_session_seal_join_input(f.s, first, NULL, NULL) ==
         WL_COLUMNAR_SPILL_OK);
-    if (!left_first)
-        CHECK(wl_columnar_session_seal_join_input(f.s, "a", NULL, NULL) ==
-            WL_COLUMNAR_SPILL_UNSUPPORTED);
+    CHECK(wl_columnar_session_seal_join_input(f.s, second, NULL, NULL) ==
+        WL_COLUMNAR_SPILL_UNSUPPORTED);
     CHECK(!until_done(f.raw));
     hooks_clear();
     CHECK(!until_done(f.s));
-    CHECK(right_scan_seen && joins_before_right > 0);
+    CHECK(right_scan_seen && (joins_before_right > 0) == !left_first);
     image_t *a = malloc(sizeof(*a)), *b = malloc(sizeof(*b));
     CHECK(a && b);
     image_of(f.s, "out", a);
@@ -2152,6 +2423,110 @@ twice_absent_case(via_t via, const char *name, int raw_rc)
     CHECK(rc == expected);
     fixture_destroy(&g);
     fixture_destroy(&f);
+}
+
+/* A self-JOIN whose later JOIN of the copy has a STRING left key against
+ * the cold input's INT64 key, from an edited plan, after the copy's first
+ * JOIN (kind 0) or a JOIN of a resident input (1): the uncontrolled session
+ * admits the seal and its STEP returns ENOTSUP; the controlled one refuses
+ * the seal, and its STEP returns what it returns in a session that never
+ * tried. */
+static void
+self_key_type_case(int kind)
+{
+    snprintf(where_buf, sizeof(where_buf), "self_key_type/%s",
+        kind ? "between" : "twice");
+    where = where_buf;
+    static const char *const texts[2] = {
+        ".decl c(x:int64,y:int64,s:symbol)\n.decl out(x:int64,u:int64)\n"
+        "c(1,2,\"p\"). c(2,3,\"q\"). c(3,1,\"p\").\n"
+        "out(x,u) :- c(x,y,s), c(y,z,t), c(z,u,w).\n",
+        ".decl c(x:int64,y:int64,s:symbol)\n"
+        ".decl a(y:int64,z:int64,t:symbol)\n.decl out(x:int64,u:int64)\n"
+        "c(1,2,\"p\"). c(2,3,\"q\"). c(3,1,\"p\").\n"
+        "a(2,3,\"q\"). a(3,1,\"p\"). a(1,2,\"p\").\n"
+        "out(x,u) :- c(x,y,s), a(y,z,t), c(z,u,w).\n"
+    };
+    fixture_t f;
+    plan_edit = 4;
+    fixture(&f, texts[kind]);
+    char got[16];
+    ops_of(&f, got);
+    CHECK(!strcmp(got, "VJJC"));
+    const wl_plan_relation_t *rp = &f.plan->strata[0].relations[0];
+    CHECK(!strcmp(rp->ops[0].relation_name, "c") &&
+        !strcmp(rp->ops[1].right_relation, kind ? "a" : "c") &&
+        !strcmp(rp->ops[2].right_relation, "c"));
+    CHECK(wl_columnar_session_seal_join_input(f.raw, "c", NULL, NULL) ==
+        WL_COLUMNAR_SPILL_OK);
+    CHECK(wl_columnar_session_seal_join_input(f.s, "c", NULL, NULL) ==
+        WL_COLUMNAR_SPILL_UNSUPPORTED);
+    CHECK(until_done(f.raw) == ENOTSUP);
+    hooks_clear();
+    int rc = until_done(f.s);
+    CHECK(!checkpoints);
+    fixture_t g;
+    plan_edit = 4;
+    fixture(&g, texts[kind]);
+    int expected = until_done(g.s);
+    if (rc != expected)
+        fprintf(stderr, "%s: rc %d, unsealed %d\n", where, rc, expected);
+    CHECK(rc == expected);
+    fixture_destroy(&g);
+    fixture_destroy(&f);
+}
+
+/* A self-JOIN of one cold input followed by a JOIN of another: whichever is
+ * sealed first is admitted, the second is refused under control and stays
+ * resident, and the STEP gives what an uncontrolled session with only the
+ * first sealed gives; either way a copy is scanned, of the input of the
+ * self-JOIN or of the other one. */
+static void
+cold_self_both_case(bool self_first)
+{
+    snprintf(where_buf, sizeof(where_buf), "cold_self_both/%s",
+        self_first ? "self_first" : "other_first");
+    where = where_buf;
+    const char *text = ".decl c(x:int64,y:int64)\n.decl d(z:int64,u:int64)\n"
+        ".decl out(x:int64,u:int64)\n"
+        "out(x,u) :- c(x,y), c(y,z), d(z,u).\n";
+    const char *first = self_first ? "c" : "d";
+    const char *second = self_first ? "d" : "c";
+    fixture_t f;
+    fixture(&f, text);
+    fill(&f, "c", 2, 20, true);
+    fill(&f, "d", 2, 20, true);
+    CHECK(wl_columnar_session_seal_join_input(f.raw, first, NULL, NULL) ==
+        WL_COLUMNAR_SPILL_OK);
+    CHECK(wl_columnar_session_seal_join_input(f.s, first, NULL, NULL) ==
+        WL_COLUMNAR_SPILL_OK);
+    CHECK(wl_columnar_session_seal_join_input(f.s, second, NULL, NULL) ==
+        WL_COLUMNAR_SPILL_UNSUPPORTED);
+    CHECK(!until_done(f.raw));
+    hooks_clear();
+    CHECK(!until_done(f.s));
+    CHECK(checkpoints > 0 && right_scan_seen && right_scans == 1);
+    image_t *a = malloc(sizeof(*a)), *b = malloc(sizeof(*b));
+    CHECK(a && b);
+    image_of(f.s, "out", a);
+    image_of(f.raw, "out", b);
+    CHECK(a->count > 0 && image_equal(a, b));
+    free(a);
+    free(b);
+    fixture_destroy(&f);
+}
+
+/* The head rows of a program over a resident input c of skewed rows. */
+static uint32_t
+skewed_rows(const char *text)
+{
+    fixture_t g;
+    fixture(&g, text);
+    fill_fan(&g, "c", 3, 20, 0, true, false);
+    CHECK(!until_done(g.s));
+    uint32_t n = head_rows(g.s, "out");
+    fixture_destroy(&g);
+    return n;
 }
 
 /* An allocation that the nth JOIN attempt of the rule cannot make, its
@@ -2307,17 +2682,80 @@ read_fault_case(const qcase_t *c)
     fixture_destroy(&f);
 }
 
+/* In a self case, a cancellation requested at the first checkpoint of the
+ * scan of the copy, after the scan of the first input installed its
+ * output, which the scan's next spill read sees; and a fault injected
+ * into the first spill read of that scan, calibrated by a run that counts
+ * the reads before it. */
+static void
+read_cancel_right_case(const qcase_t *c)
+{
+    set_where(c, VIA_LOAD, "read_cancel_right");
+    fixture_t f;
+    fixture(&f, case_text(c));
+    prepare(&f, c, VIA_LOAD);
+    CHECK(!until_done(f.raw));
+    uint64_t before = reserved(&f);
+    hooks_clear();
+    read_cancel_control = f.control;
+    right_read_cancel = true;
+    int rc = until_done(f.s);
+    read_cancel_control = NULL;
+    CHECK(!right_read_cancel && !read_cancel);
+    CHECK(rc == WL_EVALUATION_CONTROL_CANCELLED && right_scan_seen &&
+        checkpoints_before_right > 0);
+    CHECK(head_rows(f.s, c->head) == 0 && reserved(&f) == before);
+    CHECK(!wl_evaluation_control_reset(f.control));
+    CHECK(!until_done(f.s));
+    expect_heads(&f, c);
+    fixture_destroy(&f);
+}
+
+static void
+read_fault_right_case(const qcase_t *c)
+{
+    set_where(c, VIA_LOAD, "read_fault_right");
+    fixture_t f;
+    fixture(&f, case_text(c));
+    prepare(&f, c, VIA_LOAD);
+    hooks_clear();
+    read_ios = 0;
+    CHECK(!until_done(f.s));
+    CHECK(right_scan_seen && reads_before_right > 0 &&
+        read_ios > reads_before_right);
+    unsigned fault = (unsigned)reads_before_right + 1u;
+    fixture_destroy(&f);
+    fixture(&f, case_text(c));
+    prepare(&f, c, VIA_LOAD);
+    CHECK(!until_done(f.raw));
+    uint64_t before = reserved(&f);
+    hooks_clear();
+    read_ios = 0;
+    read_fault = fault;
+    int rc = until_done(f.s);
+    CHECK(!read_fault && rc == EIO && right_scan_seen);
+    CHECK(head_rows(f.s, c->head) == 0 && reserved(&f) == before);
+    CHECK(!wl_evaluation_control_reset(f.control));
+    CHECK(!until_done(f.s));
+    expect_heads(&f, c);
+    fixture_destroy(&f);
+}
+
 /* Governor denials: a blocker leaves `room` bytes free before the STEP. */
 static void
 denial_case(const qcase_t *c, via_t via)
 {
     set_where(c, via, "denial");
     unsigned phases = 0, denials = 0, passes = 0, child_denials = 0;
-    unsigned reduce_denials = 0, prefix_denials = 0;
+    unsigned reduce_denials = 0, prefix_denials = 0, right_phases = 0;
     bool child = strchr(c->ops, 'R') || strchr(c->ops, 'J');
     /* A cold right input after the left input's prefix or after an
      * earlier JOIN. */
     bool prefixed = c->cold_right && (c->ops[1] != 'J' || c->second);
+    /* In a self case, as for a JOIN right after the VARIABLE over a cold
+     * first input in the cases tried, some denials come before the first
+     * scan's first checkpoint, whose room holds its scratch too. */
+    bool early = prefixed || c->self;
     for (uint64_t room = 0; room <= UINT64_C(256) * 1024 && !passes;
         room += 64) {
         fixture_t f;
@@ -2359,6 +2797,12 @@ denial_case(const qcase_t *c, via_t via)
             denials++;
             phases |= 1u << (unsigned)last_phase;
         }
+        /* In a self case, the denials inside the scan of the copy, after
+         * the scan of the first input and before the JOIN progressed. */
+        if (c->self && right_scan_seen &&
+            checkpoints > checkpoints_before_right &&
+            join_checkpoints == joins_before_right)
+            right_phases |= 1u << (unsigned)last_phase;
         if (!checkpoints) prefix_denials++;
         /* Denials in an earlier JOIN, before the scan, are not the child's. */
         if (reduce_checkpoints ||
@@ -2373,15 +2817,17 @@ denial_case(const qcase_t *c, via_t via)
     }
     CHECK(passes == 1);
     /* The last checkpoint before each denial names the action it stopped:
-     * scratch, output, reader, the writer's drain after WRITER_END, and on
-     * the loading route a row read that loads a segment. Before a REDUCE or
-     * a JOIN a denial after WRITER_END is not told apart from the later
-     * ones, so WRITER_END is not required there. After the left input's
-     * prefix, some denials come before the scan began, and in the case run
-     * here none at the scratch: the room that the prefix needs also holds
-     * the scan's scratch, so the scratch is not required there. */
-    CHECK(!prefixed || prefix_denials);
-    unsigned want = (prefixed ? 0u :
+     * scratch, output, reader, the writer's drain after WRITER_END, and on the
+     * loading route a row read that loads a segment. Before a REDUCE or a JOIN
+     * a denial after WRITER_END is not told apart from the later ones, so
+     * WRITER_END is not required there. After the left input's prefix, some
+     * denials come before the scan began, and in the case run here none at the
+     * scratch: the room that the prefix needs also holds the scan's scratch,
+     * so the scratch is not required there, nor in a self case, where in
+     * the cases run some denials come before the first scan's first
+     * checkpoint and the room they need holds its scratch. */
+    CHECK(!early || prefix_denials);
+    unsigned want = (early ? 0u :
         1u << WL_COLUMNAR_COLD_SCAN_ATTEMPT_SCRATCH) |
         1u << WL_COLUMNAR_COLD_SCAN_ATTEMPT_OUTPUT_CREATE |
         1u << WL_COLUMNAR_COLD_SCAN_ATTEMPT_READER |
@@ -2391,6 +2837,13 @@ denial_case(const qcase_t *c, via_t via)
         fprintf(stderr, "%s: denials %u phases %#x\n", where, denials,
             phases);
     CHECK(denials && (phases & want) == want);
+    /* In a self case some denials stop the scan of the copy at its output
+     * and at its reader. */
+    unsigned right_want = 1u << WL_COLUMNAR_COLD_SCAN_ATTEMPT_OUTPUT_CREATE |
+        1u << WL_COLUMNAR_COLD_SCAN_ATTEMPT_READER;
+    if (c->self && (right_phases & right_want) != right_want)
+        fprintf(stderr, "%s: right phases %#x\n", where, right_phases);
+    CHECK(!c->self || (right_phases & right_want) == right_want);
     /* Before a REDUCE or a JOIN some denials come after that child
      * started. */
     CHECK(!child || child_denials);
@@ -2693,8 +3146,65 @@ static const refusal_t refusals[] = {
      ".decl r(y:int64,w:int64)\n.decl c(w:int64,z:int64)\n"
      ".decl out(x:int64,z:int64)\n"
      "out(x,z) :- a(x,y), r(y,w), c(w,z).\n", "c", 2, false},
-    {"self_join", ".decl c(x:int64,y:int64)\n.decl out(x:int64,z:int64)\n"
-     "out(x,z) :- c(x,y), c(y,z).\n", "c", 2, false},
+    /* A self-JOIN of the cold input, refused under control only: with a
+     * third input, whose registry the controlled bound refuses, over a
+     * source with an INLINE compound column, with a JOIN and with a COUNT,
+     * and with a constant or arithmetic head column after a later JOIN of
+     * the copy, with no prefix, whose MAP lane, not a plain column, the
+     * suffix audit refuses. */
+    {"self_third_input", ".decl c(x:int64,y:int64)\n"
+     ".decl a(y:int64,z:int64)\n.decl b(z:int64,w:int64)\n"
+     ".decl out(x:int64,u:int64)\n"
+     "out(x,u) :- c(x,y), a(y,z), b(z,w), c(w,u).\n", "c", 2, false},
+    {"self_inline", ".decl c(i:int64,p:pair/2 inline)\n"
+     ".decl out(i:int64,j:int64)\n"
+     "out(i,j) :- c(i,pair(x,y)), c(x,pair(j,k)).\n", "c", 3, false},
+    {"self_inline_count", ".decl c(i:int64,p:pair/2 inline)\n"
+     ".decl out(i:int64,n:int64)\n"
+     "out(i,count(j)) :- c(i,pair(x,y)), c(x,pair(j,k)).\n", "c", 3, false},
+    {"self_const_head_twice", ".decl c(x:int64,y:int64)\n"
+     ".decl out(x:int64,k:int64)\n"
+     "out(x,5) :- c(x,y), c(y,z), c(z,u).\n", "c", 2, false, false, "VJJMC",
+     1},
+    {"self_between_const", ".decl c(x:int64,y:int64)\n"
+     ".decl a(y:int64,z:int64)\n.decl out(x:int64,k:int64)\n"
+     "out(x,5) :- c(x,y), a(y,z), c(z,u).\n", "c", 2, false, false, "VJJMC",
+     1},
+    {"self_between_arith", ".decl c(x:int64,y:int64)\n"
+     ".decl a(y:int64,z:int64)\n.decl out(x:int64,k:int64)\n"
+     "out(x,u+1) :- c(x,y), a(y,z), c(z,u).\n", "c", 2, false, false,
+     "VJJMC", 1},
+    {"self_arith_head_twice", ".decl c(x:int64,y:int64)\n"
+     ".decl out(x:int64,k:int64)\n"
+     "out(x,u+1) :- c(x,y), c(y,z), c(z,u).\n", "c", 2, false, false,
+     "VJJMC", 1},
+    /* A constant or arithmetic head column after a later JOIN that reads a
+     * cold right input, with no prefix: the suffix audit refuses its MAP
+     * lane, not a plain column, under control only. */
+    {"right_second_const_head", ".decl a(x:int64,y:int64,w:int64)\n"
+     ".decl c(v:int64,z:int64)\n.decl out(x:int64,k:int64)\n"
+     "out(x,5) :- a(x,y,w), a(y,v,u), c(v,z).\n", "c", 2, false, false,
+     "VJJMC", 1},
+    {"right_second_arith_head", ".decl a(x:int64,y:int64,w:int64)\n"
+     ".decl c(v:int64,z:int64)\n.decl out(x:int64,k:int64)\n"
+     "out(x,z+1) :- a(x,y,w), a(y,v,u), c(v,z).\n", "c", 2, false, false,
+     "VJJMC", 1},
+    /* A self-JOIN refused uncontrolled too: a SUM after it, a constant in
+     * the copy's input, a comparison that the planner emits after the JOIN,
+     * and an assignment between the atoms, which it emits as a FILTER and a
+     * MAP after the JOIN. */
+    {"self_sum", ".decl c(x:int64,y:int64)\n.decl out(x:int64,n:int64)\n"
+     "out(x,sum(z)) :- c(x,y), c(y,z).\n", "c", 2, false, true},
+    {"self_cold_filter", ".decl c(x:int64,y:int64)\n"
+     ".decl out(x:int64,y:int64)\nout(x,y) :- c(x,y), c(y,4).\n", "c", 2,
+     false, true, "VJC", 1},
+    {"self_compare", ".decl c(x:int64,y:int64)\n"
+     ".decl out(x:int64,z:int64)\nout(x,z) :- c(x,y), y < 9, c(y,z).\n",
+     "c", 2, false, true, "VJFMC", 1},
+    {"self_map_after", ".decl c(x:int64,y:int64,w:int64)\n"
+     ".decl out(x:int64,z:int64)\n"
+     "out(x,z) :- c(x,y,w), v = w + 1, c(y,z,v).\n", "c", 3, false, true,
+     "VJFMC", 1},
     /* A cold right input read twice, refused uncontrolled too: a constant
      * in the second JOIN's cold input, over two columns of it and over
      * three, a comparison between the JOINs, a COUNT after them, and two
@@ -3179,6 +3689,75 @@ twice_cases(void)
     }
 }
 
+static void
+self_cases(void)
+{
+    for (size_t i = 0; i < NQCASES; i++) {
+        if (!qcases[i].self) continue;
+        run_qcase(&qcases[i], VIA_SEAL);
+        run_qcase(&qcases[i], VIA_LOAD);
+    }
+    /* Over the skewed rows of self_composite, the second key rejects rows
+     * that the first alone pairs. */
+    where = "self_composite/skew";
+    uint32_t both = skewed_rows(SELF3 "out(x,z) :- c(x,y,w), c(y,w,z).\n");
+    uint32_t first = skewed_rows(SELF3 "out(x,z) :- c(x,y,w), c(y,v,z).\n");
+    CHECK(both > 0 && both < first);
+    /* Stops at every checkpoint of both scans with each mode on both
+     * routes, at every JOIN checkpoint with each mode on one route, and at
+     * every REDUCE checkpoint after the JOIN. */
+    for (int mode = 1; mode <= 2; mode++) {
+        stop_case(find_qcase("self_few"), VIA_SEAL, mode, 0);
+        stop_case(find_qcase("self_few"), VIA_LOAD, mode, 0);
+        stop_case(find_qcase("self_filter_few"), VIA_SEAL, mode, 0);
+        stop_case(find_qcase("self_filter_few"), VIA_LOAD, mode, 0);
+    }
+    stop_case(find_qcase("self_few"), VIA_SEAL, 2, 2);
+    stop_case(find_qcase("self_few"), VIA_LOAD, 1, 2);
+    stop_case(find_qcase("self_count_few"), VIA_SEAL, 1, 1);
+    /* Parks in the JOIN of the copy, in the REDUCE after it, in a later
+     * JOIN of the copy and in one after a resident JOIN, and in that
+     * resident JOIN, before the scan of the copy. */
+    parked_join_case(find_qcase("self"), false);
+    parked_join_case(find_qcase("self_count"), true);
+    parked_later_join_case(find_qcase("self_twice"), 2);
+    parked_later_join_case(find_qcase("self_between"), 2);
+    parked_first_join_case(find_qcase("self_between"));
+    /* Allocation faults in the JOIN of the copy, in the resident JOIN
+     * before the scan, in a later JOIN and with two keys. */
+    join_fault_case(find_qcase("self"));
+    join_fault_at(find_qcase("self_between"), true);
+    join_fault_nth(find_qcase("self_twice"), 2);
+    join_fault_nth(find_qcase("self_between"), 2);
+    join_fault_case(find_qcase("self_composite"));
+    read_cancel_case(find_qcase("self"));
+    read_fault_case(find_qcase("self"));
+    read_cancel_right_case(find_qcase("self"));
+    read_cancel_right_case(find_qcase("self_twice"));
+    read_fault_right_case(find_qcase("self"));
+    read_fault_right_case(find_qcase("self_twice"));
+    denial_case(find_qcase("self"), VIA_SEAL);
+    denial_case(find_qcase("self"), VIA_LOAD);
+    denial_case(find_qcase("self_filter"), VIA_SEAL);
+    denial_case(find_qcase("self_filter"), VIA_LOAD);
+    denial_case(find_qcase("self_count"), VIA_SEAL);
+    denial_case(find_qcase("self_twice"), VIA_LOAD);
+    const char *exact[] = {"self", "self_twice", "self_filter_few",
+                           "self_count_few"};
+    for (size_t i = 0; i < sizeof(exact) / sizeof(exact[0]); i++) {
+        uint64_t sealed = exact_case(find_qcase(exact[i]), VIA_SEAL);
+        uint64_t loaded = exact_case(find_qcase(exact[i]), VIA_LOAD);
+        if (sealed != loaded)
+            fprintf(stderr, "exact %s: sealed %llu loaded %llu\n", exact[i],
+                (unsigned long long)sealed, (unsigned long long)loaded);
+        CHECK(sealed == loaded);
+    }
+    self_key_type_case(0);
+    self_key_type_case(1);
+    cold_self_both_case(true);
+    cold_self_both_case(false);
+}
+
 int
 main(int argc, char **argv)
 {
@@ -3197,8 +3776,14 @@ main(int argc, char **argv)
         printf("evaluation_cold_sources twice: ok\n");
         return 0;
     }
+    if (argc > 1 && !strcmp(argv[1], "self")) {
+        self_cases();
+        wl_columnar_join_test_attempt_checkpoint = NULL;
+        printf("evaluation_cold_sources self: ok\n");
+        return 0;
+    }
     for (size_t i = 0; i < NQCASES; i++) {
-        if (qcases[i].cold_right) continue;
+        if (qcases[i].cold_right || qcases[i].self) continue;
         run_qcase(&qcases[i], VIA_SEAL);
         run_qcase(&qcases[i], VIA_LOAD);
     }

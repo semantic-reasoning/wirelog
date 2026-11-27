@@ -2627,6 +2627,57 @@ wl_columnar_session_cold_right_rule(const wl_col_session_t *sess,
     return wl_columnar_session_cold_layout(sess, name);
 }
 
+/* A controlled self-JOIN of a cold input (#2301): VARIABLE over the cold
+ * input, its MAP/FILTER prefix, if any, then the rule's first JOIN; that JOIN
+ * or a later one, `at` the first of them, reads the same input as its right
+ * input, and no JOIN reads another cold input. Every JOIN of the rule has one
+ * key or more. The rule must pass the audits that the uncontrolled route runs
+ * over a cold first input: with a REDUCE, which may follow only as the rule's
+ * next to last op, the uncontrolled cold JOIN aggregate audit with the rule's
+ * first JOIN as its first and an operand type the controlled REDUCE accepts;
+ * otherwise the cold scan prefix audit after a prefix and the cold JOIN prefix
+ * audit with none. The prefix audit with one key compares the key types of
+ * the rule's first JOIN only, while the uncontrolled route compares those of a
+ * later JOIN of the cold input at its STEP, so a rule with no prefix in which
+ * a JOIN after the first reads the input must also pass the suffix audit from
+ * the first JOIN on, which also refuses some MAPs that the uncontrolled route
+ * admits. The composed attempt scans the input through its prefix into the
+ * frame's result slot, as for any cold first input, and at `at` scans it
+ * again, whole, into the cold right slot, which every JOIN of the rule that
+ * reads the input reads. */
+static bool
+wl_columnar_session_cold_self_rule(const wl_col_session_t *sess,
+    const wl_plan_relation_t *rp, const char *name, uint32_t at)
+{
+    uint32_t end = wl_columnar_ops_cold_scan_end(rp, 0);
+    if (rp->op_count < 3 || end >= rp->op_count || at < end ||
+        at >= rp->op_count || rp->ops[0].op != WL_PLAN_OP_VARIABLE ||
+        rp->ops[end].op != WL_PLAN_OP_JOIN) return false;
+    uint32_t last = rp->op_count - 2;
+    bool reduction = rp->op_count >= 4 &&
+        rp->ops[last].op == WL_PLAN_OP_REDUCE, again = false;
+    for (uint32_t i = end; i < rp->op_count; i++) {
+        const char *right = rp->ops[i].right_relation;
+        if ((rp->ops[i].op == WL_PLAN_OP_REDUCE &&
+            (!reduction || i != last)) ||
+            (rp->ops[i].op == WL_PLAN_OP_JOIN && !rp->ops[i].key_count) ||
+            (right && strcmp(right, name) != 0 &&
+            wl_columnar_session_cold_find(sess, right)))
+            return false;
+        again |= i > end && rp->ops[i].op == WL_PLAN_OP_JOIN && right &&
+            !strcmp(right, name);
+    }
+    uint32_t join = 0;
+    if (reduction ? !wl_columnar_join_aggregate_decode(sess, rp, &join) ||
+        join != end ||
+        rp->ops[last].agg_operand_type > WL_PLAN_AGG_OPERAND_FLOAT :
+        end >= 2 ? !wl_columnar_join_cold_scan_prefix(sess, rp, NULL) :
+        !wl_columnar_join_cold_prefix(sess, rp) ||
+        (again && !wl_columnar_join_cold_later_suffix(sess, rp)))
+        return false;
+    return wl_columnar_session_cold_layout(sess, name);
+}
+
 /* A controlled session reads a cold binding only through the composed cold
  * scan attempt: VARIABLE(name), a direct MAP/FILTER prefix holding at least
  * one MAP, then the rule's final CONSOLIDATE (#2301). The prefix may instead
@@ -2637,13 +2688,14 @@ wl_columnar_session_cold_right_rule(const wl_col_session_t *sess,
  * follow it. One JOIN of the rule, its first, after a VARIABLE over another
  * input and that input's MAP/FILTER prefix, if any, or a later one, may
  * instead read the binding as its right input, and so may JOINs after it,
- * under the cold right rule above; a REDUCE may then follow the first.
- * Programs that a controlled STEP routes to the general observed transaction
- * are refused here, while the source is still resident: a head that is also
- * an EDB, the two-EDB single-rule seed shape, and a registry that a
- * successor STEP would find larger than three relations. The registry never
- * shrinks after a seal, so its size plus the heads not yet registered bounds
- * it. */
+ * under the cold right rule above, or, when the rule's first input is the
+ * binding itself, under the cold self rule above; a REDUCE may then follow
+ * the first. Programs that a controlled STEP routes to the general observed
+ * transaction are refused here, while the source is still resident: a head
+ * that is also an EDB, the two-EDB single-rule seed shape, and a registry
+ * that a successor STEP would find larger than three relations. The registry
+ * never shrinks after a seal, so its size plus the heads not yet registered
+ * bounds it. */
 static bool
 wl_columnar_session_cold_controlled_plan(const wl_col_session_t *sess,
     const char *name)
@@ -2686,7 +2738,10 @@ wl_columnar_session_cold_controlled_plan(const wl_col_session_t *sess,
             }
             if (!uses) continue;
             if (at < rp->op_count) {
-                if (!wl_columnar_session_cold_right_rule(sess, rp, name, at))
+                if (rp->ops[0].relation_name &&
+                    !strcmp(rp->ops[0].relation_name, name) ?
+                    !wl_columnar_session_cold_self_rule(sess, rp, name, at) :
+                    !wl_columnar_session_cold_right_rule(sess, rp, name, at))
                     return false;
                 continue;
             }
