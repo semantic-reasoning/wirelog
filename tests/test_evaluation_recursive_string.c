@@ -1960,6 +1960,42 @@ run_observer_end(unsigned heads, bool observed, unsigned phase, bool census)
     free(t.keys);
 }
 
+/* Audit the entire public observer domain before selecting any replay cuts. */
+static void
+run_observer_audit(unsigned heads, bool observed)
+{
+    public_trace_t trace = {0};
+    trace.keys = calloc(16384, sizeof(*trace.keys));
+    trace.public_ordinal = calloc(16384, sizeof(*trace.public_ordinal));
+    CHECK(trace.keys && trace.public_ordinal);
+    ended_case_record(heads, observed, NULL, NULL, UINT32_MAX, 0, false,
+        &trace, true);
+    unsigned returns[2] = {0}, readers[2] = {0};
+    for (unsigned i = 0; i < trace.count; i++) {
+        const public_key_t *key = &trace.keys[i];
+        CHECK(observer_end_domain(key) && key->head_count == heads
+            && !key->round_active && !key->child_active && !key->child[0]
+            && !key->receipt_pending && !key->receipt_ack
+            && !key->retirement[0] && !key->main[0]
+            && !key->observer[0] && !key->resource[0]);
+        unsigned family = (unsigned)key->phase - 9;
+        unsigned work = 2 * family, other = 2 * (1 - family);
+        CHECK(key->observer_work[work] && !key->observer_work[other]
+            && !key->observer_work[other + 1]);
+        returns[family]++;
+        readers[family] += key->observer_work[work + 1] != 0;
+    }
+    if (observed) {
+        CHECK(readers[0] && readers[0] < returns[0]
+            && readers[1] && readers[1] < returns[1]);
+    } else CHECK(!trace.count);
+    printf(
+        "observer_audit heads%u observer%d baseline%u readers%u events%u readers%u passed\n",
+        heads, observed, returns[0], readers[0], returns[1], readers[1]);
+    free(trace.public_ordinal);
+    free(trace.keys);
+}
+
 static void
 run_ended(unsigned heads, bool observed)
 {
@@ -2383,6 +2419,13 @@ main(int argc, char **argv)
 {
     CHECK(!environment("WIRELOG_JOIN_BATCH_BYTES", "")
         && !environment("WIRELOG_JOIN_BATCH_STRICT", ""));
+    if (argc == 4 && !strcmp(argv[1], "observer-audit")) {
+        unsigned heads = (unsigned)strtoul(argv[2], NULL, 10);
+        unsigned observed = (unsigned)strtoul(argv[3], NULL, 10);
+        CHECK(heads >= 1 && heads <= 2 && observed <= 1);
+        run_observer_audit(heads, observed != 0);
+        return 0;
+    }
     if (argc == 4 && (!strcmp(argv[1], "observer-baseline")
         || !strcmp(argv[1], "observer-events")
         || !strcmp(argv[1], "observer-census"))) {

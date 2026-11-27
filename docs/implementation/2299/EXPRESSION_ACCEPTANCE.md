@@ -3498,3 +3498,56 @@ remain open. Wider/mixed/FLOAT SCCs, additional topology, expression/K bodies,
 evaluating Snapshot/C1/batch, seeded heads and pool/prepared-sort transport
 remain outside the qualified STRING scope. K-fusion regression checks do not
 expand that admission. This bundle does not close #2299.
+
+## Prepublication STRING observer BASELINE and EVENTS END
+
+This increment covers public EAGAIN returns during ordinary unary STRING STEP
+with one declared STRING input and the existing one- and two-head projection
+fixtures. With the observer enabled, BASELINE constructs the old image and
+EVENTS prepares signed events before registry publication. In both stages a
+matching Original could end while observer work remained live, and the next
+STEP returned EINVAL without reaching IDLE. The reproduced BASELINE return had
+a live build and no prepare. The EVENTS return had a completed baseline, a
+live prepare and no build. Neither had a selected MAIN or cleanup journal at
+injection.
+
+The mismatch branch now registers matching-ended disposal for those two
+prepublication states after authenticating the saved Original. The observer
+reader and resource paths retain ownership of cleanup and its independent
+funding. Registration records the first result. The existing terminal
+completion records IDLE only after the cleanup has completed.
+
+The copied test view adds the active build or prepare phase and reader
+presence. The audit records every available, unpublished and uncommitted
+public EAGAIN in phases 9 and 10 before selecting any cut. It checks that each
+return has the expected live work record and no conflicting round, child,
+receipt, MAIN or observer cleanup marker. It also requires returns both with
+and without a reader in each observed stage.
+
+| Heads | Stage | Public returns | Classes | First/last endpoints | END and successor histories |
+| --- | --- | ---: | ---: | ---: | ---: |
+| 1 | BASELINE | 655 | 22 | 35 | 70 |
+| 2 | BASELINE | 831 | 22 | 40 | 80 |
+| 1 | EVENTS | 53 | 9 | 16 | 32 |
+| 2 | EVENTS | 95 | 9 | 17 | 34 |
+
+Both observer-off fixtures recorded zero public returns in these stages.
+For each class the test replays the first and last distinct return, matching
+the complete copied key at the actual public ordinal. Both genuine END
+outcomes preserve the first EINVAL, Original report, old public image, absence
+of events and protected operation refusals. The live successor consumes zero
+work. The tests require IDLE with no observer/build/prepare/retirement debt and
+verify the same-input retry against raw rows and signed events.
+
+The 12 observer replay and audit registrations passed in each of six local
+builds, with 216 END and successor histories per build. Clang native and
+ASan/UBSan ran with mbedTLS disabled and enabled. POSIX TSan ran with GCC and
+Clang. Tests used the existing 120-second registration watchdog, TSan
+multiplier of four, and 20,000-call drain guard. Native and ASan/UBSan also
+passed 44 prior retirement END registrations and 42 adjacent checks each,
+including observer resources, phase 8 END, cold-right JOIN, materialized
+selectors and policy checks.
+
+This qualifies the discovered finite prepublication observer envelope.
+Registry, claims, publication and postcommit delivery END, other recipients
+and legal hosts, and remaining Source/carry proofs stay open. Issue #2299 remains open.
