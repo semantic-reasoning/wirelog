@@ -56,7 +56,9 @@ wl_print_tuple(const char *relation, const int64_t *row, uint32_t ncols,
  * Run the full Datalog pipeline: parse -> optimize -> plan ->
  * load inline facts -> execute -> print results.
  *
- * Returns: 0 on success, non-zero on error.
+ * Returns: 0 on success, non-zero on error.  Reaching the fixed-point
+ * iteration limit is an error: a capped snapshot prints no row and a capped
+ * step prints no delta.
  */
 int
 wl_run_pipeline(const char *source, uint32_t num_workers, bool delta_mode,

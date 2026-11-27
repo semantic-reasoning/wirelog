@@ -12,6 +12,7 @@
 #include "driver.h"
 
 #include "../backend.h"
+#include "../columnar/columnar_nanoarrow.h"
 #include "../exec_plan_gen.h"
 #include "../intern.h"
 #include "../ir/program.h"
@@ -421,6 +422,29 @@ delta_tuple_cb(const char *relation, const int64_t *row, uint32_t ncols,
     fprintf(ctx->out, ")\n");
 }
 
+/* A raw snapshot or step returns 0 at the fixed-point iteration limit and a
+ * raw snapshot prints the partial model (#2345).  The CLI reports the limit
+ * instead: no row of a capped snapshot is printed, a capped step prints no
+ * delta, and the run fails. */
+static int
+cli_iteration_limit(void)
+{
+    fprintf(stderr, "error: iteration limit reached before the fixed point; "
+        "no result was printed for this evaluation\n");
+    return -1;
+}
+
+static int
+cli_step(wl_session_t *sess)
+{
+    col_session_cap_scope_t cap_scope;
+    col_session_cap_scope_open(sess, &cap_scope);
+    int rc = wl_session_step(sess);
+    if (col_session_cap_scope_close(sess, &cap_scope) && rc == 0)
+        rc = cli_iteration_limit();
+    return rc;
+}
+
 int
 wl_run_pipeline(const char *source, uint32_t num_workers, bool delta_mode,
     bool watch_mode, uint32_t watch_interval_ms, FILE *out)
@@ -560,10 +584,14 @@ wl_run_pipeline(const char *source, uint32_t num_workers, bool delta_mode,
         /* Delta/watch mode: register delta callback and step through incremental
          * evaluation */
         wl_session_set_delta_cb(sess, delta_tuple_cb, &ctx);
-        rc = wl_session_step(sess);
+        rc = cli_step(sess);
     } else {
         /* Standard mode: snapshot entire state */
+        col_session_cap_scope_t cap_scope;
+        col_session_cap_scope_open(sess, &cap_scope);
         rc = wl_session_snapshot(sess, print_tuple_cb, &ctx);
+        if (col_session_cap_scope_close(sess, &cap_scope) && rc == 0)
+            rc = cli_iteration_limit();
     }
 
     /* Watch mode: read facts from stdin and re-evaluate incrementally */
@@ -592,7 +620,7 @@ wl_run_pipeline(const char *source, uint32_t num_workers, bool delta_mode,
                 continue;
             }
 
-            rc = wl_session_step(sess);
+            rc = cli_step(sess);
             if (rc != 0) {
                 fprintf(stderr, "error: step failed (rc=%d)\n", rc);
                 break;
