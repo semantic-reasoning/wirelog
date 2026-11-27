@@ -837,6 +837,44 @@ advanced_step_tdd(void)
     advanced_close(&a);
 }
 
+/* ---- one-shot executor ---------------------------------------------------- */
+
+static void
+executor_evaluate(void)
+{
+    char text[2048];
+    int n = snprintf(text, sizeof(text), "%sseed(0).\n", program_text);
+    for (int64_t i = 0; i < LENGTH; i++)
+        n += snprintf(text + n, sizeof(text) - (size_t)n,
+                "edge(%d,%d).\n", (int)i, (int)i + 1);
+    CHECK(n > 0 && (size_t)n < sizeof(text));
+    wirelog_error_t err = WIRELOG_OK;
+    wirelog_program_t *program = wirelog_parse_string(text, &err);
+    CHECK(program && err == WIRELOG_OK);
+    wirelog_executor_t *ex = wirelog_executor_create(program, &err);
+    CHECK(ex && err == WIRELOG_OK);
+    set_limit(1);
+    err = WIRELOG_OK;
+    CHECK(wirelog_evaluate(ex, &err) == NULL);
+    CHECK(err == WIRELOG_ERR_ITERATION_LIMIT);
+    CHECK(wirelog_evaluate(ex, &err) == NULL);
+    CHECK(err == WIRELOG_ERR_ITERATION_LIMIT);
+    set_limit(0);
+    wirelog_result_t *result = wirelog_evaluate(ex, &err);
+    CHECK(result && err == WIRELOG_OK);
+    CHECK(wirelog_result_relation_cardinality(result, "p") == LENGTH + 1);
+    const int64_t *values = wirelog_result_get_relation(result, "p");
+    CHECK(values);
+    capture_t c;
+    capture_reset(&c, "p");
+    for (unsigned i = 0; i < LENGTH + 1; i++)
+        capture_row("p", &values[i], 1, &c);
+    CHECK(capture_exact(&c, 0, LENGTH));
+    wirelog_result_free(result);
+    wirelog_executor_free(ex);
+    wirelog_program_free(program);
+}
+
 int
 main(void)
 {
@@ -866,6 +904,7 @@ main(void)
     easy_snapshot_drained_step();
     easy_step_plain_tdd();
     advanced_step_tdd();
-    puts("facade iteration cap: easy and advanced facades passed");
+    executor_evaluate();
+    puts("facade iteration cap: easy, advanced and executor facades passed");
     return 0;
 }
