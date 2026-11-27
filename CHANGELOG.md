@@ -6,6 +6,11 @@ All notable changes to wirelog are documented in this file.
 
 ### Added
 
+- `WIRELOG_ERR_ITERATION_LIMIT` (value `9`) and the feature macro
+  `WIRELOG_ITERATION_LIMIT_VERSION`.  A host can check the library it loaded
+  by testing that `wirelog_error_string(WIRELOG_ERR_ITERATION_LIMIT)` is not
+  the text of an unknown code (#2345).
+
 ### Changed
 
 ### Deprecated
@@ -13,6 +18,20 @@ All notable changes to wirelog are documented in this file.
 ### Removed
 
 ### Fixed
+
+- When recursive evaluation reaches the fixed-point iteration limit,
+  `wirelog_easy_snapshot()`, `wirelog_easy_step()`,
+  `wirelog_session_snapshot()`, `wirelog_session_snapshot_typed()`,
+  `wirelog_session_step()` and `wirelog_evaluate()` now return
+  `WIRELOG_ERR_ITERATION_LIMIT` instead of `WIRELOG_OK`, and a capped
+  snapshot delivers no rows instead of a partial model.  The input stays
+  pending; the limit is fixed, so the same input reaches it again.  The CLI
+  fails at the limit instead of printing a partial result.  The raw
+  `wl_session_snapshot()` and `wl_session_step()` keep returning 0 (#2345).
+- `wirelog_session_step()` no longer returns `WIRELOG_ERR_EXEC` for every
+  step after one whose typed delta could not be delivered (found in #2345).
+- A watch-mode CLI run no longer succeeds when the step for a final input
+  line without a newline fails (found in #2345).
 
 ### Performance
 

@@ -120,6 +120,18 @@ typedef enum {
     WIRELOG_ERR_UNKNOWN = 255,
 } wirelog_error_t;
 
+/**
+ * WIRELOG_ITERATION_LIMIT_VERSION:
+ *
+ * Feature macro for WIRELOG_ERR_ITERATION_LIMIT (#2345).  Its presence means
+ * the facades listed with that value report the fixed-point iteration limit
+ * instead of WIRELOG_OK and deliver no snapshot rows for the capped call.
+ * The macro describes the headers; to check the library a host actually
+ * loaded, test that wirelog_error_string(WIRELOG_ERR_ITERATION_LIMIT) is not
+ * the text returned for an unknown code.
+ */
+#define WIRELOG_ITERATION_LIMIT_VERSION 1
+
 /* ======================================================================== */
 /* Parser API                                                               */
 /* ======================================================================== */
