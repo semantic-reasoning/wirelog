@@ -39,7 +39,7 @@ wl_read_file(const char *path);
  */
 void
 wl_print_tuple(const char *relation, const int64_t *row, uint32_t ncols,
-               FILE *out);
+    FILE *out);
 
 /**
  * wl_run_pipeline:
@@ -60,6 +60,6 @@ wl_print_tuple(const char *relation, const int64_t *row, uint32_t ncols,
  */
 int
 wl_run_pipeline(const char *source, uint32_t num_workers, bool delta_mode,
-                bool watch_mode, uint32_t watch_interval_ms, FILE *out);
+    bool watch_mode, uint32_t watch_interval_ms, FILE *out);
 
 #endif /* WIRELOG_CLI_DRIVER_H */
