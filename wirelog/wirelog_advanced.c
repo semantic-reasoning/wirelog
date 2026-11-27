@@ -872,10 +872,14 @@ wirelog_session_snapshot(wirelog_session_t *session,
         return WIRELOG_ERR_EXEC;
     if (session_has_float_relation(session))
         return WIRELOG_ERR_EXEC;
+    col_session_cap_scope_t cap_scope;
+    col_session_cap_scope_open(session->inner, &cap_scope);
     int rc = wl_session_snapshot(session->inner, callback, user_data);
-    return (wirelog_error_t)wl_facade_session_error_code_with_budget(rc,
+    bool capped = col_session_cap_scope_close(session->inner, &cap_scope);
+    return (wirelog_error_t)wl_facade_session_error_code_with_cap(rc,
                COL_SESSION(session->inner)->extension_expr_status,
-               wl_columnar_session_budget_denied(COL_SESSION(session->inner)));
+               wl_columnar_session_budget_denied(COL_SESSION(session->inner)),
+               capped);
 }
 
 wirelog_error_t
