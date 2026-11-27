@@ -764,6 +764,79 @@ advanced_snapshot_typed(uint32_t workers)
     advanced_close(&a);
 }
 
+/* ---- advanced step -------------------------------------------------------- */
+
+static void
+typed_delta_row(const char *name, const wirelog_typed_row_v1_t *row,
+    int32_t diff, void *data)
+{
+    deltas_t *d = data;
+    CHECK(row->logical_ncols == 1 && row->physical_nlanes == 1);
+    int64_t v = (int64_t)row->lanes[0];
+    delta_row(name, &v, 1, diff, d);
+}
+
+/* mode 0: no callback, 1: delta callback, 2: typed delta callback. */
+static void
+advanced_step(uint32_t workers, unsigned mode)
+{
+    advanced_t a;
+    deltas_t d;
+    all_rows_t rows;
+    advanced_open(&a, program_text, workers);
+    memset(&d, 0, sizeof(d));
+    if (mode == 1)
+        CHECK(wirelog_session_set_delta_cb(a.session, delta_row, &d)
+            == WIRELOG_OK);
+    if (mode == 2)
+        CHECK(wirelog_session_set_typed_delta_cb(a.session, typed_delta_row,
+            &d) == WIRELOG_OK);
+    set_limit(1);
+    CHECK(wirelog_session_step(a.session) == WIRELOG_ERR_ITERATION_LIMIT);
+    CHECK(d.count == 0 && d.minus == 0 && d.foreign == 0);
+    check_retry_state(a.inner, false);
+    CHECK(wirelog_session_step(a.session) == WIRELOG_ERR_ITERATION_LIMIT);
+    set_limit(0);
+    memset(&d, 0, sizeof(d));
+    CHECK(wirelog_session_step(a.session) == WIRELOG_OK);
+    CHECK(mode == 0 ? d.count == 0 : deltas_exact(&d, 0, LENGTH));
+
+    int64_t last[] = { LENGTH - 1, LENGTH };
+    CHECK(wirelog_session_remove(a.session, "edge", last, 1, 2)
+        == WIRELOG_OK);
+    set_limit(1);
+    memset(&d, 0, sizeof(d));
+    CHECK(wirelog_session_step(a.session) == WIRELOG_ERR_ITERATION_LIMIT);
+    CHECK(d.count == 0 && d.minus == 0);
+    check_retry_state(a.inner, true);
+    set_limit(0);
+    CHECK(wirelog_session_step(a.session) == WIRELOG_OK);
+    CHECK(d.count == 0 && d.minus == 0); /* baseline given up at the cap */
+    if (mode != 2) {
+        CHECK(wirelog_session_set_delta_cb(a.session, NULL, NULL)
+            == WIRELOG_OK);
+        CHECK(advanced_snap(&a, &rows) == WIRELOG_OK);
+        CHECK(capture_exact(&rows.p, 0, LENGTH - 1));
+    }
+    advanced_close(&a);
+}
+
+/* W=2: a callback-free plain step capped with two workers active. */
+static void
+advanced_step_tdd(void)
+{
+    advanced_t a;
+    advanced_open(&a, tdd_program_text, 2);
+    set_limit(1);
+    reset_witness(a.inner);
+    CHECK(wirelog_session_step(a.session) == WIRELOG_ERR_ITERATION_LIMIT);
+    CHECK(a.inner->tdd_max_active_workers >= 2);
+    check_retry_state(a.inner, false);
+    set_limit(0);
+    CHECK(wirelog_session_step(a.session) == WIRELOG_OK);
+    advanced_close(&a);
+}
+
 int
 main(void)
 {
@@ -783,6 +856,8 @@ main(void)
         easy_step_delta(w);
         advanced_snapshot(w);
         advanced_snapshot_typed(w);
+        for (unsigned mode = 0; mode < 3; mode++)
+            advanced_step(w, mode);
     }
     easy_snapshot_tdd_route();
     easy_snapshot_boundary();
@@ -790,6 +865,7 @@ main(void)
     easy_snapshot_reentrant();
     easy_snapshot_drained_step();
     easy_step_plain_tdd();
+    advanced_step_tdd();
     puts("facade iteration cap: easy and advanced facades passed");
     return 0;
 }

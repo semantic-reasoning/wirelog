@@ -730,11 +730,15 @@ wirelog_session_step(wirelog_session_t *session)
     /* Report a typed delta failure of this step only, as
      * wirelog_session_snapshot_typed() does for its rows (#2345). */
     session->typed_callback_failed = false;
+    col_session_cap_scope_t cap_scope;
+    col_session_cap_scope_open(session->inner, &cap_scope);
     int rc = wl_session_step(session->inner);
+    bool capped = col_session_cap_scope_close(session->inner, &cap_scope);
     wirelog_error_t error = (wirelog_error_t)
-        wl_facade_session_error_code_with_budget(rc,
+        wl_facade_session_error_code_with_cap(rc,
             COL_SESSION(session->inner)->extension_expr_status,
-            wl_columnar_session_budget_denied(COL_SESSION(session->inner)));
+            wl_columnar_session_budget_denied(COL_SESSION(session->inner)),
+            capped);
     if (error != WIRELOG_OK)
         return error;
     return session->typed_callback_failed ? WIRELOG_ERR_EXEC : WIRELOG_OK;
