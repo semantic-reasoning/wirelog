@@ -14488,10 +14488,10 @@ wl_columnar_session_retirement_packet(const wl_columnar_controlled_step_t *step,
            && j->index == p->index;
 }
 
-/* Metadata registration only; callers separately prove the actual Native
- * owner or completed packet. A successor never supplies disposal funding. */
+/* Metadata registration only. The disposal route proves its resource owners
+ * separately. A successor never supplies disposal funding. */
 static int
-wl_columnar_session_retirement_register_ended(
+wl_columnar_session_observed_register_ended(
     wl_columnar_controlled_step_t *step,
     wl_evaluation_control_t *control, uint64_t id)
 {
@@ -14538,7 +14538,7 @@ wl_columnar_session_retirement_drive(wl_columnar_controlled_step_t *step,
         if (wl_evaluation_control_active_attempt_id(control) != id) {
             if (p->identity != p || p->step != step || !p->registered
                 || !wl_columnar_session_retirement_thread(p)) return EINVAL;
-            return wl_columnar_session_retirement_register_ended(step, control,
+            return wl_columnar_session_observed_register_ended(step, control,
                        id);
         }
         int rc = wl_evaluation_control_charge_attempt(control, id, 0);
@@ -17927,6 +17927,41 @@ wl_columnar_session_recursive_retire(wl_columnar_controlled_step_t *step,
     rc = wl_columnar_session_retirement_drive(step, p, control, id, 1);
     if (!rc) tx->round_owner = NULL;
     return rc ? rc : EAGAIN;
+}
+
+/* Select prepublication observer disposal at the Original mismatch. The
+ * existing observer MAIN route proves reader and build custody during cleanup. */
+static bool
+wl_columnar_session_string_observer_ended(const wl_col_session_t *sess,
+    const wl_columnar_controlled_step_t *step)
+{
+    if (!sess->delta_cb || !step->general_observed || step->published
+        || step->snapshot || step->snapshot_owned || step->snapshot_retry
+        || sess->base.source_c1_admission || sess->join_batch_bytes
+        || !step->transaction_initialized
+        || step->transaction_initialized_bytes != sizeof(*step->transaction)
+        || !step->transaction || step->transaction_discard
+        || step->main_action.identity || step->observed_observer.identity
+        || step->retirement_native_count || step->retirement_busy
+        || step->join_cleanup.kind || step->unary_cleanup.registered
+        || step->native_error_phase != WL_COLUMNAR_SESSION_NATIVE_ERROR_INERT
+        || step->previous_valid || step->previous_funding
+        || sess->cleanup_active || sess->cleanup_pending
+        || step->observed_origin.attempt_id != step->operation_id)
+        return false;
+    const wl_columnar_session_observed_transaction_t *tx = step->transaction;
+    if (!tx->string_projection || tx->seed_selected || tx->committed
+        || !tx->arrays_ready || !tx->schema_started || !tx->originals_started
+        || !tx->heads || !tx->entries || !tx->originals
+        || tx->head_count < 1 || tx->head_count > 2
+        || tx->round_active || tx->round_owner || tx->round_progress.identity
+        || tx->disposal_progress.identity || tx->append_delta
+        || tx->child_active || tx->receipt_pending || tx->receipt_ack
+        || (tx->child_thread_valid && !wl_columnar_session_observed_thread(tx)))
+        return false;
+    return tx->phase == WL_SESSION_OBSERVED_BASELINE && tx->observer_started
+           && !tx->observer_ready && !tx->prepare_started
+           && sess->delta_observer_build && !sess->delta_observer_prepare;
 }
 
 /* END is not forward authority. Authenticate the actual retained round owner
@@ -22845,7 +22880,7 @@ wl_columnar_session_main_dispatch(wl_col_session_t *sess,
         && wl_columnar_session_recursive_retirement_ended(sess, step)) {
         /* Record intent before REPORT can expose READY to Core. Continue the
         * same actual financier/Source transitions; intent grants no work. */
-        int registered = wl_columnar_session_retirement_register_ended(step,
+        int registered = wl_columnar_session_observed_register_ended(step,
                 sess->base.evaluation_control, step->operation_id);
         if (registered != EAGAIN) {
             *selected = true; return registered;
@@ -25780,6 +25815,11 @@ wl_columnar_session_test_string_custody(const wl_col_session_t *sess,
     rc = wl_columnar_session_test_observer_main_view(sess, out->observer);
     if (rc) return rc;
     out->observer[14] = out->observer[14] != 0;
+    if (!tx->committed && !step->published
+        && (tx->phase == WL_SESSION_OBSERVED_BASELINE
+        || tx->phase == WL_SESSION_OBSERVED_EVENTS))
+        wl_columnar_eval_delta_test_prepublication_view(sess,
+            out->observer_work);
     return wl_columnar_session_test_observer_resource_view(sess, out->resource);
 }
 
@@ -29395,8 +29435,9 @@ col_controlled_step_drive(wl_col_session_t *sess,
         if (wl_columnar_session_general_rollback_pending(sess, step, true))
             return wl_columnar_session_observed_drive(sess, step);
 
-        if (wl_columnar_session_recursive_retirement_ended(sess, step))
-            return wl_columnar_session_retirement_register_ended(step,
+        if (wl_columnar_session_recursive_retirement_ended(sess, step)
+            || wl_columnar_session_string_observer_ended(sess, step))
+            return wl_columnar_session_observed_register_ended(step,
                        control, step->operation_id);
 
         if (step->general_observed && step->transaction_initialized && tx

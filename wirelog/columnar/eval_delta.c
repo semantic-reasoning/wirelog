@@ -2471,6 +2471,25 @@ struct wl_columnar_eval_delta_observer_prepare {
 };
 
 #ifdef WL_SESSION_TEST_HOOKS
+/* The session owns these live records throughout the copied observation. */
+void
+wl_columnar_eval_delta_test_prepublication_view(const wl_col_session_t *sess,
+    uint64_t out[4])
+{
+    const wl_columnar_eval_delta_observer_build_t *build =
+        sess->delta_observer_build;
+    const wl_columnar_eval_delta_observer_prepare_t *prepare =
+        sess->delta_observer_prepare;
+    if (build && build->session == sess) {
+        out[0] = 1 + build->phase;
+        out[1] = build->reader.descriptor_held;
+    }
+    if (prepare && prepare->session == sess) {
+        out[2] = 1 + prepare->phase;
+        out[3] = prepare->reader.descriptor_held;
+    }
+}
+
 bool wl_columnar_eval_delta_test_fail_prepare_current_alloc;
 void (*wl_columnar_eval_delta_test_after_prepare_commit)(
     wl_evaluation_control_t *);
