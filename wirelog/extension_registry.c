@@ -98,6 +98,17 @@ wl_facade_session_error_code_with_budget(int rc, int expr_status,
 }
 
 int
+wl_facade_session_error_code_with_cap(int rc, int expr_status,
+    bool budget_denied, bool capped)
+{
+    int error = wl_facade_session_error_code_with_budget(rc, expr_status,
+            budget_denied);
+    if (error == WIRELOG_OK && capped)
+        return WIRELOG_ERR_ITERATION_LIMIT;
+    return error;
+}
+
+int
 wl_facade_fact_mutation_error_code(int rc, bool budget_denied)
 {
     if (budget_denied && rc == ENOMEM)

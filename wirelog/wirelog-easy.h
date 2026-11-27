@@ -380,7 +380,15 @@ wirelog_easy_banner(const char *label);
  * removed since, it emits the model that step left without evaluating
  * again, so a snapshot may follow a step on the same session.
  *
- * Returns: WIRELOG_OK on success, WIRELOG_ERR_EXEC on failure.
+ * If an evaluation in this call reaches the fixed-point iteration limit, the
+ * call forwards no tuples, of any relation, and returns
+ * WIRELOG_ERR_ITERATION_LIMIT; this holds even for a relation that was
+ * complete before the limit was reached.  The input stays pending, so the
+ * next snapshot or step evaluates again.  The limit is fixed, so with the
+ * same input it is reached again: remove input first.
+ *
+ * Returns: WIRELOG_OK on success, WIRELOG_ERR_ITERATION_LIMIT as above,
+ * WIRELOG_ERR_EXEC on failure.
  */
 WIRELOG_API wirelog_error_t
 wirelog_easy_snapshot(wirelog_easy_session_t *s, const char *relation,

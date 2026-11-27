@@ -96,6 +96,12 @@ typedef struct wirelog_executor wirelog_executor_t;
  * wirelog_error_t:
  *
  * Error code enumeration
+ *
+ * WIRELOG_ERR_ITERATION_LIMIT (#2345): an evaluation in this call reached the
+ * fixed-point iteration limit before convergence was established, and the
+ * call delivered no snapshot rows.  The limit is fixed, so the same input
+ * reaches it again; change the input before retrying.  Returned by
+ * wirelog_easy_snapshot().
  */
 typedef enum {
     WIRELOG_OK = 0,
@@ -107,6 +113,7 @@ typedef enum {
     WIRELOG_ERR_COMPOUND_SATURATED = 6,
     WIRELOG_ERR_COMPOUND_BUSY = 7,
     WIRELOG_ERR_MEMORY_BUDGET = 8,
+    WIRELOG_ERR_ITERATION_LIMIT = 9,
     WIRELOG_ERR_UNKNOWN = 255,
 } wirelog_error_t;
 

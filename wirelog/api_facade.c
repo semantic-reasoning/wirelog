@@ -940,6 +940,8 @@ wirelog_error_string(wirelog_error_t error)
         return "out of memory";
     case WIRELOG_ERR_MEMORY_BUDGET:
         return "memory budget exhausted";
+    case WIRELOG_ERR_ITERATION_LIMIT:
+        return "iteration limit reached";
     case WIRELOG_ERR_IO:
         return "I/O error";
     case WIRELOG_ERR_COMPOUND_SATURATED:
