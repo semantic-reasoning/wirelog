@@ -8481,3 +8481,13 @@ foreach heads : [1, 2]
       suite: ['unit', 'tsan', 'evaluation_recursive_string_observer_end'], timeout: 120)
   endforeach
 endforeach
+
+# Actual prepublication observer EVENTS END and live successor histories.
+foreach heads : [1, 2]
+  foreach observed : [0, 1]
+    test('evaluation_recursive_string_observer_events_@0@_@1@'.format(heads, observed),
+      evaluation_recursive_string_exe,
+      args: ['observer-events', heads.to_string(), observed.to_string()],
+      suite: ['unit', 'tsan', 'evaluation_recursive_string_observer_end'], timeout: 120)
+  endforeach
+endforeach

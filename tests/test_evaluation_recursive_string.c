@@ -1745,6 +1745,11 @@ ended_case_record(unsigned heads, bool observed, ended_trace_t *record,
             main_view) && !main_view[0]
             && !wl_columnar_session_test_retirement_view(col, retirement)
             && !retirement[0]);
+        if (expected && observer_end_domain(expected))
+            CHECK(!col->delta_observer && !col->delta_observer_build
+                && !col->delta_observer_prepare
+                && !col->delta_observer_retirement_governor
+                && !col->delta_observer_retirement_gc);
         if (stop.successor) {
             /* Its genuine owner may poll only after old cleanup is closed. */
             CHECK(!wl_evaluation_control_charge_attempt(f.control,
@@ -1900,9 +1905,9 @@ run_owner(unsigned heads, bool observed, bool census, bool selected_main,
     free(t.pick); free(t.class_id); free(t.public_ordinal); free(t.keys);
 }
 
-/* Replay the first and last return of each normalized observer-build state. */
+/* Replay the first and last return of each normalized observer work state. */
 static void
-run_observer_baseline(unsigned heads, bool observed, bool census)
+run_observer_end(unsigned heads, bool observed, unsigned phase, bool census)
 {
     public_trace_t t = {0};
     t.keys = calloc(16384, sizeof(*t.keys));
@@ -1916,11 +1921,13 @@ run_observer_baseline(unsigned heads, bool observed, bool census)
         const public_key_t *k = &t.keys[i];
         CHECK(observer_end_domain(k));
         counts[k->phase - 9]++;
-        if (k->phase != 9) continue;
+        if (k->phase != phase) continue;
         CHECK(!k->round_active && !k->child_active && !k->child[0]
             && !k->receipt_pending && !k->receipt_ack && !k->retirement[0]
             && !k->main[0] && !k->observer[0] && !k->resource[0]
-            && k->observer_work[0] && !k->observer_work[2]);
+            && (phase == 9
+            ? k->observer_work[0] && !k->observer_work[2]
+            : !k->observer_work[0] && k->observer_work[2]));
         unsigned cls = 0;
         for (; cls < classes; cls++)
             if (public_equal(k, &t.keys[first[cls]])) break;
@@ -1941,14 +1948,14 @@ run_observer_baseline(unsigned heads, bool observed, bool census)
                         t.public_ordinal[at], outcome, false);
                     histories++;
                     printf(
-                        "observer_end_cut heads%u observer%d phase9 class%u public%u endpoint%u outcome%u passed\n",
-                        heads, observed, cls, t.public_ordinal[at], end,
+                        "observer_end_cut heads%u observer%d phase%u class%u public%u endpoint%u outcome%u passed\n",
+                        heads, observed, phase, cls, t.public_ordinal[at], end,
                         outcome);
                 }
             }
     printf(
-        "observer_end heads%u observer%d baseline%u events%u classes%u histories%u\n",
-        heads, observed, counts[0], counts[1], classes, histories);
+        "observer_end heads%u observer%d baseline%u events%u phase%u classes%u histories%u\n",
+        heads, observed, counts[0], counts[1], phase, classes, histories);
     free(t.public_ordinal);
     free(t.keys);
 }
@@ -2377,11 +2384,13 @@ main(int argc, char **argv)
     CHECK(!environment("WIRELOG_JOIN_BATCH_BYTES", "")
         && !environment("WIRELOG_JOIN_BATCH_STRICT", ""));
     if (argc == 4 && (!strcmp(argv[1], "observer-baseline")
+        || !strcmp(argv[1], "observer-events")
         || !strcmp(argv[1], "observer-census"))) {
         unsigned heads = (unsigned)strtoul(argv[2], NULL, 10);
         unsigned observed = (unsigned)strtoul(argv[3], NULL, 10);
         CHECK(heads >= 1 && heads <= 2 && observed <= 1);
-        run_observer_baseline(heads, observed != 0,
+        run_observer_end(heads, observed != 0,
+            !strcmp(argv[1], "observer-events") ? 10u : 9u,
             !strcmp(argv[1], "observer-census"));
         return 0;
     }

@@ -17959,9 +17959,13 @@ wl_columnar_session_string_observer_ended(const wl_col_session_t *sess,
         || tx->child_active || tx->receipt_pending || tx->receipt_ack
         || (tx->child_thread_valid && !wl_columnar_session_observed_thread(tx)))
         return false;
-    return tx->phase == WL_SESSION_OBSERVED_BASELINE && tx->observer_started
-           && !tx->observer_ready && !tx->prepare_started
-           && sess->delta_observer_build && !sess->delta_observer_prepare;
+    if (!tx->observer_started) return false;
+    if (tx->phase == WL_SESSION_OBSERVED_BASELINE)
+        return !tx->observer_ready && !tx->prepare_started
+               && sess->delta_observer_build && !sess->delta_observer_prepare;
+    return tx->phase == WL_SESSION_OBSERVED_EVENTS && tx->observer_ready
+           && tx->prepare_started && !tx->prepare_ready && sess->delta_observer
+           && !sess->delta_observer_build && sess->delta_observer_prepare;
 }
 
 /* END is not forward authority. Authenticate the actual retained round owner
