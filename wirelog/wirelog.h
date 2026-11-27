@@ -103,7 +103,8 @@ typedef struct wirelog_executor wirelog_executor_t;
  * reaches it again; change the input before retrying.  Returned by
  * wirelog_easy_snapshot(), wirelog_easy_step() (a capped step reports no
  * delta), wirelog_session_snapshot(), wirelog_session_snapshot_typed() and
- * wirelog_session_step() (a capped step reports no delta).
+ * wirelog_session_step() (a capped step reports no delta), and by
+ * wirelog_evaluate().
  */
 typedef enum {
     WIRELOG_OK = 0,
@@ -299,6 +300,14 @@ wirelog_load_facts_from_csv(wirelog_executor_t *executor,
     const char *relation_name, const char *csv_file,
     wirelog_error_t *error);
 
+/**
+ * Evaluate the program and collect every IDB relation into a new result.
+ *
+ * Returns NULL and sets @error on failure.  If an evaluation reaches the
+ * fixed-point iteration limit, it returns NULL with
+ * WIRELOG_ERR_ITERATION_LIMIT and no partial result; the limit is fixed, so
+ * evaluating the same input again reaches it again.
+ */
 WIRELOG_API wirelog_result_t *
 wirelog_evaluate(wirelog_executor_t *executor, wirelog_error_t *error);
 

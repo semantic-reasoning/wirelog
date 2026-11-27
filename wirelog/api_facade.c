@@ -35,6 +35,8 @@
 int wl_facade_session_error_code(int rc, int expr_status);
 int wl_facade_session_error_code_with_budget(int rc, int expr_status,
     bool budget_denied);
+int wl_facade_session_error_code_with_cap(int rc, int expr_status,
+    bool budget_denied, bool capped);
 
 struct wirelog_executor {
     uint64_t magic;
@@ -824,17 +826,20 @@ wirelog_evaluate(wirelog_executor_t *executor, wirelog_error_t *error)
         .result = result,
         .failed = false,
     };
+    col_session_cap_scope_t cap_scope;
+    col_session_cap_scope_open(executor->session, &cap_scope);
     int snapshot_rc = wl_session_snapshot(executor->session, collect_tuple,
             &ctx);
-    if (snapshot_rc != 0 || ctx.failed) {
+    bool capped = col_session_cap_scope_close(executor->session, &cap_scope);
+    if (snapshot_rc != 0 || ctx.failed || capped) {
         wirelog_result_free(result);
         set_error(error, ctx.failed ? WIRELOG_ERR_MEMORY
                                     : (wirelog_error_t)
-            wl_facade_session_error_code_with_budget(
+            wl_facade_session_error_code_with_cap(
                 snapshot_rc,
                 col_session_get_expression_status(
                     executor->session),
-                wl_session_budget_denied(executor->session)));
+                wl_session_budget_denied(executor->session), capped));
         return NULL;
     }
     if (!result_set_types_from_program(result, executor->program)) {
