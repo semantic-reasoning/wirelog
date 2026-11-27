@@ -173,6 +173,9 @@ raw_retry(wl_plan_t *plan, bool snapshot, bool observed)
     CHECK(cs->pending_input_change && cs->pending_full_input_eval
         && !cs->snapshot_stable_valid && !cs->has_evaluated);
     CHECK(!cs->plain_step_completion_pending && !events.count);
+    /* Raw SNAPSHOT keeps its historical partial image at the cap (#2345):
+     * only the public facades withhold it. */
+    if (snapshot) CHECK(image.count > 0 && image.count < 2 * (LENGTH + 1));
     wl_columnar_eval_serial_test_iteration_limit = 0;
     memset(&image, 0, sizeof(image));
     CHECK(!(snapshot ? wl_session_snapshot(s, tuple, &image) : step(s)));
