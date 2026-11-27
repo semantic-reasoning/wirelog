@@ -3648,6 +3648,13 @@ typedef struct wl_col_session_t {
     /* Last evaluator outcome; consume before calling another stratum. Legacy
      * cap exhaustion returns zero but cannot commit stable-model bookkeeping. */
     bool eval_stratum_iteration_capped;
+    /* Per-call iteration-cap scope of the public facades (#2345); see
+     * col_session_cap_scope_open().  Coordinator-only.  facade_cap_hit is set
+     * by every wl_columnar_session_note_iteration_cap() call and is read only
+     * by the scope that cleared it; facade_cap_withhold makes the snapshot cap
+     * exits deliver no rows. */
+    bool facade_cap_withhold;
+    bool facade_cap_hit;
     wl_columnar_eval_delta_rollback_t *delta_rollback;
     uint64_t delta_rollback_reserved_bytes;
     wl_columnar_eval_delta_observer_t *delta_observer;

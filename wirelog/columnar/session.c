@@ -3470,6 +3470,28 @@ col_session_get_expression_status(wl_session_t *session)
     return session ? COL_SESSION(session)->extension_expr_status : 0;
 }
 
+void
+col_session_cap_scope_open(wl_session_t *session,
+    col_session_cap_scope_t *saved)
+{
+    wl_col_session_t *sess = COL_SESSION(session);
+    saved->withhold = sess->facade_cap_withhold;
+    saved->hit = sess->facade_cap_hit;
+    sess->facade_cap_withhold = true;
+    sess->facade_cap_hit = false;
+}
+
+bool
+col_session_cap_scope_close(wl_session_t *session,
+    const col_session_cap_scope_t *saved)
+{
+    wl_col_session_t *sess = COL_SESSION(session);
+    bool hit = sess->facade_cap_hit;
+    sess->facade_cap_withhold = saved->withhold;
+    sess->facade_cap_hit = saved->hit;
+    return hit;
+}
+
 static void
 session_note_inserted_input(wl_col_session_t *sess, const col_rel_t *relation,
     bool advance_epoch)
@@ -7815,6 +7837,8 @@ col_worker_session_create(wl_col_session_t *coordinator,
      * must never be merged upward. */
     out_worker->eval_stratum_heads_final = false;
     out_worker->eval_stratum_iteration_capped = false;
+    out_worker->facade_cap_withhold = false;
+    out_worker->facade_cap_hit = false;
     out_worker->arr_entries = NULL;
     out_worker->arr_count = 0;
     out_worker->arr_cap = 0;
@@ -9504,10 +9528,11 @@ col_session_discard_uncommitted_strata(const wl_plan_t *plan,
 
 /* Raw cap status remains zero for compatibility, but the partial model is
  * not stable. Retain input staging; a step that holds an observer gives it
- * up after this (#2348). */
+ * up after this (#2348).  A facade's cap scope reads facade_cap_hit (#2345). */
 static void
 wl_columnar_session_note_iteration_cap(wl_col_session_t *sess, uint32_t si)
 {
+    sess->facade_cap_hit = true;
     col_session_note_stratum_extent(sess, si); /* extent to clear on retry */
     sess->pending_input_change = true;
     sess->pending_full_input_eval = true;
@@ -32106,9 +32131,13 @@ col_session_snapshot_impl(wl_session_t *session, wirelog_on_tuple_fn callback,
         int resume_rc = col_session_step_impl(session);
         if (resume_rc != 0)
             return resume_rc;
-        if (sess->eval_stratum_iteration_capped)
+        if (sess->eval_stratum_iteration_capped) {
+            /* The drained step's cap exit already set facade_cap_hit. */
+            if (sess->facade_cap_withhold && sess->facade_cap_hit)
+                return 0;
             return col_session_emit_snapshot(sess->plan, sess, callback,
                        user_data);
+        }
     }
     const wl_plan_t *plan = sess->plan;
     sess->extension_expr_status = 0;
@@ -32504,6 +32533,8 @@ col_session_snapshot_impl(wl_session_t *session, wirelog_on_tuple_fn callback,
         if (sess->eval_stratum_iteration_capped) {
             sess->tdd_decision_tracking_active = false;
             wl_columnar_session_note_iteration_cap(sess, si);
+            if (sess->facade_cap_withhold)
+                return 0; /* a facade reports the cap and delivers no rows */
             return col_session_emit_snapshot(plan, sess, callback, user_data);
         }
         col_session_note_stratum_extent(sess, si);
