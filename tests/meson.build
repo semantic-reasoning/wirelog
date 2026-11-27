@@ -7606,6 +7606,18 @@ test_facade_iteration_cap_exe = executable(
 test('facade_iteration_cap', test_facade_iteration_cap_exe,
      suite: ['unit', 'tsan'], timeout: 60)
 
+# #2345: a failed typed delta fails its own step, not every later one.
+test_advanced_typed_step_failure_exe = executable(
+  'test_advanced_typed_step_failure',
+  files('test_advanced_typed_step_failure.c'),
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
+  link_args: host_machine.system() == 'linux' ? ['-Wl,--wrap=calloc'] : [],
+  override_options: host_machine.system() == 'linux' ? ['b_lto=false'] : [],
+  link_with: host_machine.system() == 'linux' ? [testlib_prod_no_lto] : [testlib_prod],
+)
+test('advanced_typed_step_failure', test_advanced_typed_step_failure_exe)
+
 # #2351: controlled sessions keep stepping, and report governed denials.
 test_controlled_recovery_exe = executable(
   'test_controlled_recovery', files('test_controlled_recovery.c'),

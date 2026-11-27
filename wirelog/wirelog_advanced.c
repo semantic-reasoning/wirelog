@@ -727,6 +727,9 @@ wirelog_session_step(wirelog_session_t *session)
 {
     if (!session)
         return WIRELOG_ERR_EXEC;
+    /* Report a typed delta failure of this step only, as
+     * wirelog_session_snapshot_typed() does for its rows (#2345). */
+    session->typed_callback_failed = false;
     int rc = wl_session_step(session->inner);
     wirelog_error_t error = (wirelog_error_t)
         wl_facade_session_error_code_with_budget(rc,
