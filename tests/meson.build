@@ -7618,6 +7618,16 @@ test_advanced_typed_step_failure_exe = executable(
 )
 test('advanced_typed_step_failure', test_advanced_typed_step_failure_exe)
 
+# #2345: the CLI fails at the iteration limit and prints no capped rows.
+test_cli_iteration_cap_exe = executable(
+  'test_cli_iteration_cap', files('test_cli_iteration_cap.c'),
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
+  c_args: ['-DWL_SESSION_TEST_HOOKS=1'],
+  link_with: [testlib_prod],
+)
+test('cli_iteration_cap', test_cli_iteration_cap_exe)
+
 # #2351: controlled sessions keep stepping, and report governed denials.
 test_controlled_recovery_exe = executable(
   'test_controlled_recovery', files('test_controlled_recovery.c'),
