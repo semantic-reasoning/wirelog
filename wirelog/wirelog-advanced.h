@@ -436,7 +436,16 @@ wirelog_session_snapshot_typed(wirelog_session_t *session,
  * registered) for any insertions/removals derived since the previous
  * step.
  *
- * Returns: WIRELOG_OK on success, WIRELOG_ERR_EXEC on failure.
+ * If the evaluation reaches the fixed-point iteration limit, the step
+ * reports no delta and returns WIRELOG_ERR_ITERATION_LIMIT.  The input stays
+ * pending, so the next step evaluates again; the limit is fixed, so with the
+ * same input it is reached again: remove input first.  The callbacks'
+ * baseline is given up at the limit: on a session that had completed an
+ * evaluation, the step that next completes reports no delta; on a first
+ * evaluation it reports the whole model.
+ *
+ * Returns: WIRELOG_OK on success, WIRELOG_ERR_ITERATION_LIMIT as above,
+ * WIRELOG_ERR_EXEC on failure.
  */
 WIRELOG_API wirelog_error_t
 wirelog_session_step(wirelog_session_t *session);
