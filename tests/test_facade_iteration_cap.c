@@ -482,6 +482,139 @@ easy_snapshot_drained_step(void)
     wirelog_easy_close(s);
 }
 
+/* ---- easy step ---------------------------------------------------------- */
+
+/* Delta events of p and q, each (relation, value) at most once per step. */
+typedef struct {
+    unsigned plus[2][NVALUES];
+    unsigned count, minus, foreign;
+} deltas_t;
+
+static void
+delta_row(const char *name, const int64_t *values, uint32_t width, int diff,
+    void *data)
+{
+    deltas_t *d = data;
+    if (strcmp(name, "p") && strcmp(name, "q")) {
+        d->foreign++;
+        return;
+    }
+    CHECK(width == 1 && values[0] >= 0 && values[0] < NVALUES);
+    if (diff < 0) {
+        d->minus++;
+        return;
+    }
+    CHECK(diff == 1 && !d->plus[name[0] == 'q'][values[0]]++);
+    d->count++;
+}
+
+/* Exactly one +1 for each of p and q over lo..hi, and nothing else of p/q. */
+static bool
+deltas_exact(const deltas_t *d, int64_t lo, int64_t hi)
+{
+    unsigned want = 0;
+    for (unsigned h = 0; h < 2; h++)
+        for (int64_t v = 0; v < NVALUES; v++) {
+            bool in = v >= lo && v <= hi;
+            if (d->plus[h][v] != (in ? 1u : 0u))
+                return false;
+            want += in;
+        }
+    return d->count == want && d->minus == 0;
+}
+
+/* Plain step (no delta callback). */
+static void
+easy_step_plain(uint32_t workers)
+{
+    wirelog_easy_session_t *s = open_session(workers, true);
+    wl_col_session_t *cs = inner(s);
+    capture_t c;
+    set_limit(1);
+    CHECK(wirelog_easy_step(s) == WIRELOG_ERR_ITERATION_LIMIT);
+    check_retry_state(cs, false);
+    CHECK(wirelog_easy_step(s) == WIRELOG_ERR_ITERATION_LIMIT);
+    check_retry_state(cs, false);
+    set_limit(0);
+    CHECK(wirelog_easy_step(s) == WIRELOG_OK);
+    stable_emits = 0;
+    wl_columnar_session_test_before_stable_emit = count_stable_emit;
+    CHECK(snap(s, "p", &c) == WIRELOG_OK && capture_exact(&c, 0, LENGTH));
+    wl_columnar_session_test_before_stable_emit = NULL;
+    CHECK(stable_emits == 1);
+    /* Dirtied by a removal after a committed step. */
+    int64_t last[] = { LENGTH - 1, LENGTH };
+    CHECK(wirelog_easy_remove(s, "edge", last, 2) == WIRELOG_OK);
+    set_limit(1);
+    CHECK(wirelog_easy_step(s) == WIRELOG_ERR_ITERATION_LIMIT);
+    check_retry_state(cs, true);
+    set_limit(0);
+    CHECK(wirelog_easy_step(s) == WIRELOG_OK);
+    CHECK(snap(s, "p", &c) == WIRELOG_OK && capture_exact(&c, 0, LENGTH - 1));
+    wirelog_easy_close(s);
+}
+
+/* W=2: the plain step's cap is reached with two workers selected. */
+static void
+easy_step_plain_tdd(void)
+{
+    wirelog_easy_session_t *s = open_program(tdd_program_text, 2, true);
+    wl_col_session_t *cs = inner(s);
+    capture_t c;
+    set_limit(1);
+    reset_witness(cs);
+    CHECK(wirelog_easy_step(s) == WIRELOG_ERR_ITERATION_LIMIT);
+    CHECK(cs->tdd_max_active_workers >= 2);
+    check_retry_state(cs, false);
+    set_limit(0);
+    CHECK(wirelog_easy_step(s) == WIRELOG_OK);
+    CHECK(snap(s, "p", &c) == WIRELOG_OK && capture_exact(&c, 0, LENGTH));
+    wirelog_easy_close(s);
+}
+
+/* Delta-callback step.  A step with an observer evaluates on the serial
+ * path whatever the worker count.  A capped step reports no difference; on
+ * a first evaluation the completing step reports the whole model, and on a
+ * committed session it reports none (the observer baseline was given up at
+ * the cap, #2348). */
+static void
+easy_step_delta(uint32_t workers)
+{
+    wirelog_easy_session_t *s = open_session(workers, true);
+    wl_col_session_t *cs = inner(s);
+    deltas_t d;
+    capture_t c;
+    memset(&d, 0, sizeof(d));
+    CHECK(wirelog_easy_set_delta_cb(s, delta_row, &d) == WIRELOG_OK);
+    set_limit(1);
+    CHECK(wirelog_easy_step(s) == WIRELOG_ERR_ITERATION_LIMIT);
+    CHECK(d.count == 0 && d.minus == 0 && d.foreign == 0);
+    check_retry_state(cs, false);
+    set_limit(0);
+    memset(&d, 0, sizeof(d));
+    CHECK(wirelog_easy_step(s) == WIRELOG_OK && deltas_exact(&d, 0, LENGTH));
+
+    int64_t last[] = { LENGTH - 1, LENGTH };
+    CHECK(wirelog_easy_remove(s, "edge", last, 2) == WIRELOG_OK);
+    set_limit(1);
+    memset(&d, 0, sizeof(d));
+    CHECK(wirelog_easy_step(s) == WIRELOG_ERR_ITERATION_LIMIT);
+    CHECK(d.count == 0 && d.minus == 0);
+    check_retry_state(cs, true);
+    set_limit(0);
+    memset(&d, 0, sizeof(d));
+    CHECK(wirelog_easy_step(s) == WIRELOG_OK);
+    CHECK(d.count == 0 && d.minus == 0);
+    CHECK(snap(s, "p", &c) == WIRELOG_OK && capture_exact(&c, 0, LENGTH - 1));
+    /* The step after that reports from the completed model again. */
+    CHECK(wirelog_easy_insert(s, "edge", last, 2) == WIRELOG_OK);
+    memset(&d, 0, sizeof(d));
+    CHECK(wirelog_easy_step(s) == WIRELOG_OK && deltas_exact(&d, LENGTH,
+        LENGTH));
+    CHECK(wirelog_easy_set_delta_cb(s, NULL, NULL) == WIRELOG_OK);
+    wirelog_easy_close(s);
+}
+
 int
 main(void)
 {
@@ -497,12 +630,15 @@ main(void)
         easy_snapshot_unrelated(w);
         easy_snapshot_empty_and_fast_path(w);
         easy_snapshot_dirtied(w);
+        easy_step_plain(w);
+        easy_step_delta(w);
     }
     easy_snapshot_tdd_route();
     easy_snapshot_boundary();
     easy_snapshot_raw_unchanged();
     easy_snapshot_reentrant();
     easy_snapshot_drained_step();
-    puts("facade iteration cap: easy snapshot passed");
+    easy_step_plain_tdd();
+    puts("facade iteration cap: easy snapshot and step passed");
     return 0;
 }

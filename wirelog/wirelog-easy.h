@@ -307,7 +307,17 @@ wirelog_easy_remove_sym(wirelog_easy_session_t *s, const char *relation, ...);
  * re-derives every rule, keeping the input rows of a relation that is also
  * a rule head.  Either way a step with nothing pending does no evaluation.
  *
- * Returns: WIRELOG_OK on success, WIRELOG_ERR_EXEC on failure.
+ * If the evaluation reaches the fixed-point iteration limit, the step
+ * reports no difference to the delta callback and returns
+ * WIRELOG_ERR_ITERATION_LIMIT.  The input stays pending, so the next step or
+ * snapshot evaluates again; the limit is fixed, so with the same input it is
+ * reached again: remove input first.  The callback's baseline is given up at
+ * the limit: on a session that had completed an evaluation, the step that
+ * next completes reports no difference, and the step after it reports from
+ * that model; on a first evaluation it reports the whole model.
+ *
+ * Returns: WIRELOG_OK on success, WIRELOG_ERR_ITERATION_LIMIT as above,
+ * WIRELOG_ERR_EXEC on failure.
  */
 WIRELOG_API wirelog_error_t
 wirelog_easy_step(wirelog_easy_session_t *s);
