@@ -3606,7 +3606,10 @@ wl_columnar_eval_plan_numeric_composed_attempt_step_validated_body(
         /* A cold right input is first scanned into its frame slot (#2301),
          * at a JOIN of the rule at or after the end of the left input's
          * MAP/FILTER prefix; a later JOIN of the same input finds the slot
-         * held and runs as an ordinary JOIN that reads it. */
+         * held and runs as an ordinary JOIN that reads it. The rule's first
+         * input may be the same cold input, whose prefix's rows the cold scan
+         * installed at the rule's start; the input is then scanned a second
+         * time, whole. A different cold first input is refused. */
         if (record->plan->ops[record->cursor].op == WL_PLAN_OP_JOIN
             && !record->cold_right_held && record->session->cold_relation
             && wl_columnar_session_cold_find(record->session,
@@ -3614,8 +3617,10 @@ wl_columnar_eval_plan_numeric_composed_attempt_step_validated_body(
             if (record->cursor < wl_columnar_ops_cold_scan_end(record->plan,
                 0) || record->begin
                 || record->cursor + 1 >= record->end
-                || wl_columnar_session_cold_find(record->session,
-                record->plan->ops[0].relation_name)) {
+                || (wl_columnar_session_cold_find(record->session,
+                record->plan->ops[0].relation_name)
+                && strcmp(record->plan->ops[0].relation_name,
+                record->plan->ops[record->cursor].right_relation) != 0)) {
                 record->semantic_result = ENOTSUP;
                 record->phase = WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_RELEASE;
             } else {
