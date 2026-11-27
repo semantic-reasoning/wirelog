@@ -189,6 +189,67 @@ raw_retry(wl_plan_t *plan, bool snapshot, bool observed)
             wl_columnar_memory_governor_ref_get(governor)));
 }
 
+/* #2345: a facade's cap scope withholds the capped image, reports the cap,
+ * and restores the enclosing scope; raw calls outside a scope are unchanged. */
+static void
+cap_scope(wl_plan_t *plan)
+{
+    wl_session_t *s = create(plan, NULL);
+    wl_col_session_t *cs = (wl_col_session_t *)s;
+    capture_t image = {0};
+    col_session_cap_scope_t outer, inner;
+    /* A raw cap outside any scope leaves facade_cap_hit set ... */
+    wl_columnar_eval_serial_test_iteration_limit = 1;
+    CHECK(!wl_session_snapshot(s, tuple, &image));
+    CHECK(image.count > 0 && cs->facade_cap_hit && !cs->facade_cap_withhold);
+    /* ... and a scope opened later does not report it. */
+    wl_columnar_eval_serial_test_iteration_limit = 0;
+    memset(&image, 0, sizeof(image));
+    CHECK(!wl_session_snapshot(s, tuple, &image));
+    CHECK(image.count == 2 * (LENGTH + 1));
+    col_session_cap_scope_open(s, &outer);
+    CHECK(cs->facade_cap_withhold && !cs->facade_cap_hit);
+    memset(&image, 0, sizeof(image));
+    CHECK(!wl_session_snapshot(s, tuple, &image)); /* stable fast path */
+    CHECK(image.count == 2 * (LENGTH + 1));
+    CHECK(!col_session_cap_scope_close(s, &outer));
+    CHECK(!cs->facade_cap_withhold && cs->facade_cap_hit); /* restored */
+    CHECK(!wl_session_try_destroy(&s));
+    CHECK(!wl_intern_detach_memory_governor(plan->intern, governor));
+
+    /* Inside a scope the capped snapshot delivers nothing and keeps the
+     * retry state; a nested scope restores the outer one. */
+    s = create(plan, NULL);
+    cs = (wl_col_session_t *)s;
+    wl_columnar_eval_serial_test_iteration_limit = 1;
+    col_session_cap_scope_open(s, &outer);
+    col_session_cap_scope_open(s, &inner);
+    CHECK(inner.withhold && !inner.hit);
+    memset(&image, 0, sizeof(image));
+    CHECK(!wl_session_snapshot(s, tuple, &image));
+    CHECK(!image.count);
+    CHECK(cs->pending_input_change && cs->pending_full_input_eval
+        && !cs->snapshot_stable_valid && !cs->has_evaluated);
+    CHECK(col_session_cap_scope_close(s, &inner));
+    CHECK(cs->facade_cap_withhold && !cs->facade_cap_hit);
+    CHECK(!col_session_cap_scope_close(s, &outer));
+    CHECK(!cs->facade_cap_withhold);
+    /* After the scope a raw capped snapshot streams its partial image. */
+    CHECK(!wl_session_snapshot(s, tuple, &image));
+    CHECK(image.count > 0 && image.count < 2 * (LENGTH + 1));
+    wl_columnar_eval_serial_test_iteration_limit = 0;
+    memset(&image, 0, sizeof(image));
+    col_session_cap_scope_open(s, &outer);
+    CHECK(!wl_session_snapshot(s, tuple, &image));
+    CHECK(!col_session_cap_scope_close(s, &outer));
+    CHECK(image.count == 2 * (LENGTH + 1));
+    check_model(s);
+    CHECK(!wl_session_try_destroy(&s));
+    CHECK(!wl_intern_detach_memory_governor(plan->intern, governor));
+    CHECK(!wl_columnar_memory_reserved(
+            wl_columnar_memory_governor_ref_get(governor)));
+}
+
 int main(void)
 {
     wl_columnar_memory_resolution_t resolution = {
@@ -226,6 +287,7 @@ int main(void)
     raw_retry(plan, false, false);
     raw_retry(plan, false, true);
     raw_retry(plan, true, false);
+    cap_scope(plan);
     /* Direct raw serial/TDD entry refuses attached control before dispatch. */
     wl_evaluation_control_t *control = NULL;
     CHECK(!wl_evaluation_control_create(0, &control));

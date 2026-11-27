@@ -346,6 +346,31 @@ col_session_get_iteration_count(wl_session_t *sess);
 int
 col_session_get_expression_status(wl_session_t *sess);
 
+/*
+ * Iteration-cap scope of one public facade call (#2345).
+ *
+ * Raw wl_session_snapshot() and wl_session_step() return 0 when an evaluation
+ * stops at the fixed-point iteration limit, and a raw snapshot still delivers
+ * the partial image.  A facade opens a scope before the raw call and closes it
+ * after: inside the scope a capped snapshot delivers no rows, and close()
+ * reports whether an evaluation in the call reached the limit.  open() saves
+ * the previous scope in @saved and close() restores it, so a host callback
+ * that re-enters a facade on the same session (outside the facades' contract)
+ * does not clobber the outer call.  The scope is facade-private: a raw call
+ * made inside it is withheld too.
+ */
+typedef struct {
+    bool withhold;
+    bool hit;
+} col_session_cap_scope_t;
+
+void
+col_session_cap_scope_open(wl_session_t *sess, col_session_cap_scope_t *saved);
+
+bool
+col_session_cap_scope_close(wl_session_t *sess,
+    const col_session_cap_scope_t *saved);
+
 /**
  * col_session_get_perf_stats:
  *
