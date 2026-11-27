@@ -10263,7 +10263,10 @@ typedef struct {
     uint64_t receipt_acknowledged, receipt_index_valid, ack_committed;
     uint64_t owners[2];
     uint64_t retirement[8], child[16], main[16], observer[16], resource[12];
+    uint64_t observer_work[4];
 } wl_columnar_session_test_string_custody_t;
+void wl_columnar_eval_delta_test_prepublication_view(const wl_col_session_t *,
+    uint64_t[4]);
 int wl_columnar_session_test_string_custody(const wl_col_session_t *,
     wl_columnar_session_test_string_custody_t *);
 typedef struct {
