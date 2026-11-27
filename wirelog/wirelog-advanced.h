@@ -421,7 +421,9 @@ wirelog_session_set_typed_delta_cb(wirelog_session_t *session,
 /** Snapshot rows through a borrowed typed descriptor valid during callback.
  * The descriptor arrays and lane storage are owned by the library only until
  * the callback returns; callback registration is synchronous and allocation
- * failure suppresses that callback without changing session state. */
+ * failure suppresses that callback without changing session state.  At the
+ * fixed-point iteration limit it forwards no rows and returns
+ * WIRELOG_ERR_ITERATION_LIMIT, as wirelog_session_snapshot() does. */
 WIRELOG_API wirelog_error_t
 wirelog_session_snapshot_typed(wirelog_session_t *session,
     wirelog_on_typed_tuple_fn callback, void *user_data);

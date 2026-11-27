@@ -102,7 +102,7 @@ typedef struct wirelog_executor wirelog_executor_t;
  * call delivered no snapshot rows.  The limit is fixed, so the same input
  * reaches it again; change the input before retrying.  Returned by
  * wirelog_easy_snapshot(), wirelog_easy_step() (a capped step reports no
- * delta) and wirelog_session_snapshot().
+ * delta), wirelog_session_snapshot() and wirelog_session_snapshot_typed().
  */
 typedef enum {
     WIRELOG_OK = 0,
