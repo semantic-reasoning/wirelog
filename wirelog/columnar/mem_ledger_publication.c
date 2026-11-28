@@ -26,13 +26,6 @@
  * Reversible preparation admits its future work separately:109 then166.
  * Caller record initialization and actual relation/lease work are separate.
  */
-enum {
-    WL_COLUMNAR_MEM_LEDGER_PUBLICATION_PREPARE_WORK = 109,
-    WL_COLUMNAR_MEM_LEDGER_PUBLICATION_INITIAL_WORK = 26,
-    WL_COLUMNAR_MEM_LEDGER_PUBLICATION_APPLY_WORK = 117,
-    WL_COLUMNAR_MEM_LEDGER_PUBLICATION_RELEASE_WORK = 23,
-    WL_COLUMNAR_MEM_LEDGER_PUBLICATION_ROUND_WORK = 28,
-};
 
 typedef char wl_columnar_mem_ledger_publication_admission_bound[
         (WL_COLUMNAR_MEM_LEDGER_PUBLICATION_PREPARE_WORK <=

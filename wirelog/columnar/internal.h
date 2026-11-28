@@ -1126,6 +1126,64 @@ typedef struct wl_columnar_managed_candidate_merge_ack_progress {
     bool busy, performed, report_pending, ack_prepaid, physical_done;
 } wl_columnar_managed_candidate_merge_ack_progress_t;
 
+/* Recipients of the session's private MAIN actions. */
+typedef enum {
+    WL_COLUMNAR_SESSION_MAIN_NONE,
+    WL_COLUMNAR_SESSION_MAIN_RESERVE,
+    WL_COLUMNAR_SESSION_MAIN_SCALAR,
+    WL_COLUMNAR_SESSION_MAIN_DIFF,
+    WL_COLUMNAR_SESSION_MAIN_READER,
+    WL_COLUMNAR_SESSION_MAIN_STAGING_END,
+    WL_COLUMNAR_SESSION_MAIN_STORAGE,
+    WL_COLUMNAR_SESSION_MAIN_MANAGED,
+    WL_COLUMNAR_SESSION_MAIN_EDGE,
+    WL_COLUMNAR_SESSION_MAIN_MERGE,
+    WL_COLUMNAR_SESSION_MAIN_BUILD,
+    WL_COLUMNAR_SESSION_MAIN_FAILED_RETRY,
+    WL_COLUMNAR_SESSION_MAIN_BEGIN_FAILURE,
+    WL_COLUMNAR_SESSION_MAIN_OBSERVER_REGISTER,
+    WL_COLUMNAR_SESSION_MAIN_OBSERVER,
+    WL_COLUMNAR_SESSION_MAIN_OBSERVER_FINISH,
+    WL_COLUMNAR_SESSION_MAIN_MERGE_ACK,
+    WL_COLUMNAR_SESSION_MAIN_OBSERVER_RELEASE,
+    WL_COLUMNAR_SESSION_MAIN_CLOSE_VALIDATE_BEGIN,
+    WL_COLUMNAR_SESSION_MAIN_CLOSE_VALIDATE_STEP,
+    WL_COLUMNAR_SESSION_MAIN_CLOSE_LEASE_PUBLISH,
+    WL_COLUMNAR_SESSION_MAIN_BOOTSTRAP_RECEIPT
+} wl_columnar_session_main_recipient_t;
+
+/* Work of the session's private MAIN actions. Each MAIN action runs under one
+ * private grant of WL_COLUMNAR_SESSION_MAIN_GRANT_WORK, which equals the
+ * quantum the ledger publication fees are bounded by. An observer MAIN
+ * action and a differential payment each charge 128; an observer resource
+ * STEP charges 128 unless its phase charges itself (then 1); a managed merge
+ * acknowledgement action charges 256 and clears at most 64 bytes. */
+enum {
+    WL_COLUMNAR_SESSION_MAIN_GRANT_WORK = 256,
+    WL_COLUMNAR_SESSION_OBSERVER_MAIN_WORK = 128,
+    WL_COLUMNAR_EVAL_DELTA_RESOURCE_STEP_WORK = 128,
+    WL_COLUMNAR_ARRANGEMENT_DIFF_PAY_WORK = 128,
+    WL_COLUMNAR_MANAGED_MERGE_ACK_ACTION_WORK = 256,
+    WL_COLUMNAR_MANAGED_MERGE_ACK_CLEAR_CHUNK = 64
+};
+typedef char wl_columnar_session_main_grant_bound[
+        (WL_COLUMNAR_SESSION_MAIN_GRANT_WORK == WL_EVALUATION_CONTROL_QUANTUM
+        && WL_COLUMNAR_SESSION_OBSERVER_MAIN_WORK
+        <= WL_COLUMNAR_SESSION_MAIN_GRANT_WORK
+        && WL_COLUMNAR_EVAL_DELTA_RESOURCE_STEP_WORK
+        <= WL_COLUMNAR_SESSION_MAIN_GRANT_WORK
+        && WL_COLUMNAR_ARRANGEMENT_DIFF_PAY_WORK
+        <= WL_COLUMNAR_SESSION_MAIN_GRANT_WORK
+        && WL_COLUMNAR_MANAGED_MERGE_ACK_ACTION_WORK
+        <= WL_COLUMNAR_SESSION_MAIN_GRANT_WORK
+        && WL_COLUMNAR_MEM_LEDGER_PUBLICATION_PREPARE_WORK
+        <= WL_EVALUATION_CONTROL_QUANTUM
+        && WL_COLUMNAR_MEM_LEDGER_PUBLICATION_INITIAL_WORK
+        + WL_COLUMNAR_MEM_LEDGER_PUBLICATION_APPLY_WORK
+        + WL_COLUMNAR_MEM_LEDGER_PUBLICATION_RELEASE_WORK
+        + WL_COLUMNAR_MEM_LEDGER_PUBLICATION_ROUND_WORK
+        <= WL_EVALUATION_CONTROL_QUANTUM) ? 1 : -1];
+
 /* A resumable, private incremental consolidation. Initialize the object with
  * { 0 } before begin. The object and its writer are address- and thread-bound;
  * keep it in one frame and pass by pointer.
@@ -3088,6 +3146,11 @@ extern void (*wl_columnar_session_test_main_action_report)(
 extern void (*wl_columnar_session_test_main_action_advanced)(
     struct wl_col_session_t *, wl_evaluation_control_t *, uint64_t,
     unsigned, unsigned, unsigned, int);
+/* Runs once the MAIN grant is open, before the first charge of the action.
+ * rebegun is false on the prepared-close path, which reuses its grant. */
+extern void (*wl_columnar_session_test_main_action_begun)(
+    struct wl_col_session_t *, wl_evaluation_control_t *, uint64_t,
+    unsigned, unsigned, bool);
 int wl_columnar_session_test_observer_main_view(
     const struct wl_col_session_t *, uint64_t[16]);
 bool wl_columnar_session_test_terminal_credit(const struct wl_col_session_t *,

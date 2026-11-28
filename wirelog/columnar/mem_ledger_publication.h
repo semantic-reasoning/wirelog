@@ -6,6 +6,16 @@
 #include "evaluation_control.h"
 #include "thread.h"
 
+/* Admitted work of each controlled publication charge; the derivation and
+ * the admission guard live in mem_ledger_publication.c. */
+enum {
+    WL_COLUMNAR_MEM_LEDGER_PUBLICATION_PREPARE_WORK = 109,
+    WL_COLUMNAR_MEM_LEDGER_PUBLICATION_INITIAL_WORK = 26,
+    WL_COLUMNAR_MEM_LEDGER_PUBLICATION_APPLY_WORK = 117,
+    WL_COLUMNAR_MEM_LEDGER_PUBLICATION_RELEASE_WORK = 23,
+    WL_COLUMNAR_MEM_LEDGER_PUBLICATION_ROUND_WORK = 28,
+};
+
 typedef enum {
     WL_COLUMNAR_MEM_LEDGER_PUBLICATION_ALLOC = 1,
     WL_COLUMNAR_MEM_LEDGER_PUBLICATION_FREE = 2,

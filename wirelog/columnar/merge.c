@@ -4911,7 +4911,8 @@ wl_columnar_managed_candidate_merge_ack_begin_owned(
     /* Real positive Native admission includes this packet's fixed delayed
      * report/ACK proof and caller/return obligation. No fit is inferred from
      * capacity256; exact full caller/ABI qualification remains mandatory. */
-    int rc = wl_evaluation_control_charge_attempt(support, id, 256);
+    int rc = wl_evaluation_control_charge_attempt(support, id,
+            WL_COLUMNAR_MANAGED_MERGE_ACK_ACTION_WORK);
     if (rc) return rc;
     p->parent = parent; p->target = target;
     p->clear_offset = 0; p->clear_atomic_index = 0;
@@ -4941,7 +4942,8 @@ wl_columnar_managed_candidate_merge_ack_step_owned(
     if (!done || !wl_columnar_managed_ack_output(p, target,
         done)) return EINVAL;
     if (p->report_pending || p->physical_done) return EBUSY;
-    rc = wl_evaluation_control_charge_attempt(support, id, 256);
+    rc = wl_evaluation_control_charge_attempt(support, id,
+            WL_COLUMNAR_MANAGED_MERGE_ACK_ACTION_WORK);
     if (rc) return rc;
     p->busy = true; *done = false;
     switch (p->phase) {
@@ -4987,7 +4989,8 @@ wl_columnar_managed_candidate_merge_ack_step_owned(
             p->clear_atomic_index = p->clear_atomic_index + 1;
         } else {
             size_t bytes = boundary - p->clear_offset;
-            if (bytes > 64) bytes = 64;
+            if (bytes > WL_COLUMNAR_MANAGED_MERGE_ACK_CLEAR_CHUNK)
+                bytes = WL_COLUMNAR_MANAGED_MERGE_ACK_CLEAR_CHUNK;
             memset((unsigned char *)target + p->clear_offset, 0, bytes);
             p->clear_offset = p->clear_offset + bytes;
         }
@@ -5016,7 +5019,8 @@ wl_columnar_managed_candidate_merge_ack_action_ack_owned(
         || wl_evaluation_control_active_attempt_id(support)) return EBUSY;
     wl_evaluation_control_report_t report;
     rc = wl_evaluation_control_report(support, &report);
-    if (rc || report.attempt_id != id || report.consumed != 256
+    if (rc || report.attempt_id != id || report.consumed
+        != WL_COLUMNAR_MANAGED_MERGE_ACK_ACTION_WORK
         || report.execution_status || report.cleanup_status) return EINVAL;
     /* Only the already prepaid fixed metadata suffix remains. No byte clear,
      * token initialization/ref/resource/Original/financial action occurs. */

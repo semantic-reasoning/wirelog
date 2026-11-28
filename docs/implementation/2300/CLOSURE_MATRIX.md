@@ -93,7 +93,7 @@ a prerequisite for this operator issue.
 | X.V | Accepted empty/nullary/wide/typed/owned/borrowed/segmented and metadata representations | Existing scalar/source/row/copy components and direct cases; ordinary left/right/both INLINE public histories, typed physical lanes, signed changes and held-reader stops; configured no-tail INLINE numeric cap and malformed/SIDE/unknown descriptor controls; typed INLINE-EDB inputs to scalar recursive preserved bodies, without compound recursive-head qualification; typed INLINE LEFT consumption of actual persistent scalar-RHS indexes with private comparison and fault recovery; new cycles retain typed zero-row scalar/INLINE descriptors/maps and actual source readers | Explicit remaining other-operator/pipeline/recursive representation intersections and containing bounds; ordinary local J07/J08 completed in the linked inventory | OPEN |
 | L.ROW | Actual RUNNING output append and displaced/partial storage | Merged quiet owned-row debt component | Authentic RUNNING adapter, real production consumers, footer refusal and exact retained debt | OPEN |
 | L.END | Batch/source/output/input FINISH and registered native cleanup | Merged finite components; canonical recovery; actual nonstream retained BEGIN/finite scalar END and33 new public recovery histories; all seven controlled owners clear the scalar retirement receipt in funded 64-byte chunks | Sourced per-action inventories for the join batch abort, join host and LFTJ attempt chunk actions; finish stream source adapters, RUNNING ROW/batch and generic FINISH; qualify containing source/carry and all accepted intersections | OPEN |
-| L.PARENT | Observer/transaction/frame/child acquisition and terminal or WORK handoff | Canonical owners and observed recovery; actual abort-observer BUILD/PREPARE/READY reader barrier, finite resource actions and durable ACK; phased private-financier FINISH/detach/release/consume; canonical terminal receipt retains array/header disposal, moved header credit and real controller close after header free; early producer disposition covers every header-zero packet and each allocation/initialization stage; 1,117 public histories cover Original turnover, live successor0, real peer CAS loss, refused close phases, WORK retention and future signed events; retained real Normal generations survive permanent global identity exhaustion; 74 constructor histories and two isolated exhaustion cases cover real creation failure, turnover and before/after BANK refusal; bootstrap receipts settle before header disposal; 20 Snapshot finish histories preserve actual BANK versus OUTER observation/ownership rejection, one reset, retained committed-DONE Tx and the sole Original FINISH; permanent bootstrap BANK stops settle through real MAIN and maintenance outer financial/observation owners, with report stability paired within each actual action; seven actual MAIN-only prior-Snapshot CLOSE histories preserve Original/report/id0 and private funding IDs across real parked before/after refusal and healthy retry, and explicitly reject an unproduced maintenance owner; isolated retained-generation overflow preserves its selected result; financial FINISH commit and matching report observation advance separately before a refusing footer; stable role recipes bind before private births; grouped preparation observes the actual saved BANK generation; 20 real initializer histories cover fresh/reset/Snapshot/CLOSE refusal and pending admission, plus five inactive/id0 failed-retry reset histories; pre-commit non-publication by the abort-observer scenarios of `test_evaluation_observer_resources.c` (unchanged head and input, no callbacks); actual-parent MAIN_DIFF retirement and committed-observer REGISTER/BEGIN/OBSERVE/STEP/FINISH/ACK/RELEASE histories with one-short refusals, a post-action cancel and healthy retry, whose action sequences, reference-session events, settled ledger and Original report equal the healthy history's; recursive MERGE_ACK histories with refusals at fixed positions and a post-action cancel (normal cleanup) or a refused acknowledgement after a WORK stop (abort cleanup); every effective MERGE_ACK action spends 256, the normal-cleanup effective count equals the healthy history's, the abort cleanup proceeds after exactly one refusal, and published paths, the stop result and no cleanup residue are checked | Pre-action cancellation of the MAIN_DIFF, MERGE_ACK and observer recipients (refusal is the only pre-action stop); private-object owner stop histories, and round owners other than the recursive merge acknowledgement; ledger and Original equality for the MERGE_ACK histories and an exact abort-cleanup MERGE_ACK action count; error and pending-denial metadata through disposal; direct observer-resource baseline; qualify complete producer/registration/bootstrap/ACK/caller/native/source/carry intervals | OPEN |
+| L.PARENT | Observer/transaction/frame/child acquisition and terminal or WORK handoff | Canonical owners and observed recovery; actual abort-observer BUILD/PREPARE/READY reader barrier, finite resource actions and durable ACK; phased private-financier FINISH/detach/release/consume; canonical terminal receipt retains array/header disposal, moved header credit and real controller close after header free; early producer disposition covers every header-zero packet and each allocation/initialization stage; 1,117 public histories cover Original turnover, live successor0, real peer CAS loss, refused close phases, WORK retention and future signed events; retained real Normal generations survive permanent global identity exhaustion; 74 constructor histories and two isolated exhaustion cases cover real creation failure, turnover and before/after BANK refusal; bootstrap receipts settle before header disposal; 20 Snapshot finish histories preserve actual BANK versus OUTER observation/ownership rejection, one reset, retained committed-DONE Tx and the sole Original FINISH; permanent bootstrap BANK stops settle through real MAIN and maintenance outer financial/observation owners, with report stability paired within each actual action; seven actual MAIN-only prior-Snapshot CLOSE histories preserve Original/report/id0 and private funding IDs across real parked before/after refusal and healthy retry, and explicitly reject an unproduced maintenance owner; isolated retained-generation overflow preserves its selected result; financial FINISH commit and matching report observation advance separately before a refusing footer; stable role recipes bind before private births; grouped preparation observes the actual saved BANK generation; 20 real initializer histories cover fresh/reset/Snapshot/CLOSE refusal and pending admission, plus five inactive/id0 failed-retry reset histories; pre-commit non-publication by the abort-observer scenarios of `test_evaluation_observer_resources.c` (unchanged head and input, no callbacks); actual-parent MAIN_DIFF retirement and committed-observer REGISTER/BEGIN/OBSERVE/STEP/FINISH/ACK/RELEASE histories with one-short refusals, a post-action cancel and healthy retry, whose action sequences, reference-session events, settled ledger and Original report equal the healthy history's; recursive MERGE_ACK histories with refusals at fixed positions and a post-action cancel (normal cleanup) or a refused acknowledgement after a WORK stop (abort cleanup); every effective MERGE_ACK action spends 256, the normal-cleanup effective count equals the healthy history's, the abort cleanup proceeds after exactly one refusal, and published paths, the stop result and no cleanup residue are checked; the same MAIN_DIFF, MERGE_ACK (normal and abort cleanup) and committed-observer histories with a cancel latched by the test on the private MAIN grant after its rebegin and before the action's first charge, each stopping CANCELLED with nothing spent and the whole grant left before a healthy retry; every acknowledged merge takes the MERGE_ACK action count derived from its layout, abort cleanup acknowledges exactly one whole merge from its BEGIN, and the refused and cancelled MERGE_ACK histories settle the ledger and Original report as their baselines do; the committed-observer resources after the final release equal their pre-epoch state | Private-object owner stop histories, and round owners other than the recursive merge acknowledgement; an Original or user cancellation reaching MAIN actions (the pre-action cancels are test-latched on the private grant); error and pending-denial metadata through disposal; observer-resource baselines for the abort-observer and prepared-close routes, and source/index baselines; qualify complete producer/registration/bootstrap/ACK/caller/native/source/carry intervals | OPEN |
 | S.FIN | Actual Source/financial protocols reached by the enabled operator domains and their new owners | Canonical class/backend-token role policies, issued binder and financial offers; bound Snapshot outer observation/guard/constructor/financier/local-finish producers; prepared checked CLOSE retains slot/ownership before BANK retirement and atomic Original seal, with real cancellation, both seal orders and last-reference tests; GCC/ASan/POSIX focused recovery suites | Whole actual issuer/receipt/provenance graph, ordinary STEP observation schedule, FIRST/CLOSE/publication/FINISH/refusal four-platform intervals and simultaneous Native/Source carry remain unqualified | OPEN |
 | A.FINAL | Activated complete production coverage and platform validation | Existing reviewed numeric probe commits | All rows complete, no disabled-only integration, current-main rebase, independent final gates and actual CI including MSVC | OPEN |
 
@@ -218,6 +218,70 @@ including framed serial SOURCE_END, to the finite END step under its RUNNING
 and FINISH adapters, and drives the recursive step; the recursive drive
 holds no maintenance control. #2370 owns the containing Source issuance and
 Native/Source carry certificates.
+
+The second #2368 bundle (Refs #2368 only) delivers:
+
+- names for the session's private MAIN recipients and MAIN action fees: the
+  MAIN grant (equal to `WL_EVALUATION_CONTROL_QUANTUM`), the observer MAIN
+  fee, the observer resource STEP default quote, the differential payment,
+  the managed merge acknowledgement fee and clear chunk, and the ledger
+  publication fees. The MAIN stop histories take their recipients, grants
+  and one-short refusals from these names. Still literal: the terminal
+  financier's grant, the CLOSE_VALIDATE charges, other session-internal
+  charges, some older observer-resource and frontier SCALAR test oracles,
+  the test mirrors of the MERGE_ACK action argument and of the committed
+  observer reason;
+- pre-action cancellation of the MAIN_DIFF, MERGE_ACK and committed-observer
+  actions. A test-only hook, `wl_columnar_session_test_main_action_begun`,
+  runs once the MAIN grant is open and before the action's first charge,
+  where the test latches a cancel on the private MAIN grant. Production
+  does not cancel that grant, so this covers the CANCELLED arm of the MAIN
+  protocol, not an Original or user cancellation; production reach is
+  unproven. Each cancelled action stops CANCELLED with nothing spent and the
+  whole grant left, unlike a refusal, which shows the one-short limit and a
+  WORK stop. The cancelled positions are:
+  - MAIN_DIFF: the first payment, description and commit and the last
+    payment. A cancelled commit has consumed its description before its
+    first charge, so one PAY and one DESCRIBE precede its retry, as after a
+    refused commit;
+  - MERGE_ACK normal cleanup: the first BEGIN and a STEP from the middle of
+    the history on, chosen by the action kinds of the healthy history;
+  - MERGE_ACK abort cleanup: the first grant after the WORK stop, a BEGIN;
+  - committed observer: REGISTER, the resource BEGIN, the first and a middle
+    OBSERVE, STEP, FINISH, ACK and RELEASE. BEGIN and STEP stop at their
+    0-work poll.
+  Each history otherwise performs the healthy sequence, delivers the
+  reference events where it has them, and settles the ledger and the
+  Original report as the healthy history does;
+- exact MERGE_ACK accounting. One merge acknowledgement takes BEGIN, one
+  action per retirement, one per retirement token, and a clear that
+  initializes each token atomic in its own action and zeroes each gap one
+  clear chunk per action. The count is derived from an actual merge
+  object's layout on each build (88 actions on MSVC native, 101 with MSVC
+  C11) and checked at every BEGIN. Abort cleanup acknowledges exactly one
+  whole merge from its BEGIN. The refused and cancelled normal histories
+  settle the ledger and Original report as the healthy history does; the
+  refused and cancelled abort histories settle them as a stopped abort
+  without MAIN stops does;
+- a direct observer-resource baseline for the committed-observer MAIN
+  route. A session-level snapshot of the observer resource view, reserved
+  bytes, retirement metadata reservation state and retirement state equals,
+  after the final release, the snapshot taken before the epoch. The
+  refused and cancelled histories leave the same snapshot and governor
+  reservation as the healthy one. Every effective resource STEP pays the
+  default quote, so these STEPs take the path that does not charge itself.
+
+It does not close #2368, L.PARENT or L.END. It narrows the list above;
+still open within #2368:
+
+- private-object owner stop histories, and round owners other than the
+  recursive merge acknowledgement;
+- an Original or user cancellation reaching MAIN actions;
+- error and pending-denial metadata through disposal;
+- observer-resource baselines for the abort-observer and prepared-close
+  routes, and source/index baselines;
+- the sourced inventories above;
+- whole caller/registration/ACK bounds.
 
 The remaining RUNNING/stream adapters belong to #2369; containing Source
 issuance, activation and correlated accounting belong to #2370. The bundle
