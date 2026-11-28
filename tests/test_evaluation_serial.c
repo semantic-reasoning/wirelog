@@ -7250,6 +7250,33 @@ enum {
     OBSERVER_MAIN_COMMITTED_REASON = 3
 };
 
+/* Session-level observer resources, read directly from the session rather
+ * than through its controlled step, which is gone once the step completes.
+ * Zero-initialized so whole snapshots compare with memcmp. */
+typedef struct {
+    uint64_t view[16];
+    uint64_t reserved_bytes, metadata_state;
+    unsigned retirement;
+    bool observer, build, prepare, retirement_governor, retirement_gc;
+} observer_resource_baseline_t;
+
+static void
+observer_resource_baseline(const wl_col_session_t *cs,
+    observer_resource_baseline_t *out)
+{
+    memset(out, 0, sizeof(*out));
+    CHECK(!wl_columnar_eval_delta_test_observer_resource_view(cs, out->view));
+    out->reserved_bytes = cs->delta_observer_reserved_bytes;
+    out->metadata_state = atomic_load_explicit(
+        &cs->delta_observer_retirement_metadata.state, memory_order_acquire);
+    out->retirement = (unsigned)cs->delta_observer_retirement;
+    out->observer = cs->delta_observer != NULL;
+    out->build = cs->delta_observer_build != NULL;
+    out->prepare = cs->delta_observer_prepare != NULL;
+    out->retirement_governor = cs->delta_observer_retirement_governor != NULL;
+    out->retirement_gc = cs->delta_observer_retirement_gc;
+}
+
 typedef struct {
     const wl_col_session_t *session;
     bool inject;
@@ -7261,11 +7288,17 @@ typedef struct {
      * open MAIN grant before their first charge instead of refused. */
     bool precancel, precancelling;
     unsigned precancelled, begun_cancels;
+    const unsigned *healthy_recipient, *healthy_action;
+    uint64_t begun_view[16];
     controlled_recursive_main_hook_t previous_advanced;
     void (*previous_begun)(wl_col_session_t *, wl_evaluation_control_t *,
         uint64_t, unsigned, unsigned, bool);
     wl_mem_ledger_snapshot_t ledger;
     wl_evaluation_control_report_t original;
+    /* Observer resources before the committed epoch and after its final
+     * release, and the governor's reservation after that release. */
+    observer_resource_baseline_t before, after;
+    uint64_t governor_reserved;
 } observer_main_probe_t;
 
 static observer_main_probe_t *observer_main_probe;
@@ -7294,6 +7327,10 @@ observer_main_limit(const wl_col_session_t *session, unsigned recipient,
         if (p->count == p->targets[t] && !p->done[t]) {
             p->done[t] = true;
             if (p->precancel) {
+                /* The cancelled grant is the healthy action at this
+                 * position. */
+                CHECK(recipient == p->healthy_recipient[p->count]
+                    && action == p->healthy_action[p->count]);
                 p->precancelling = true; return capacity;
             }
             p->refusing = true;
@@ -7313,8 +7350,16 @@ observer_main_advanced(wl_col_session_t *session,
     observer_main_probe_t *p = observer_main_probe;
     if (p && session == p->session && observer_main_recipient(recipient)
         && p->precancelling) {
-        /* Stopped at its first charge without advancing the resource. */
+        /* Stopped at its first charge: the resource phase (moved by BEGIN,
+         * OBSERVE and STEP) and the observer MAIN state (moved by REGISTER,
+         * FINISH, ACK and RELEASE) are as they were when the grant opened. */
+        uint64_t view[16];
         CHECK(result == WL_EVALUATION_CONTROL_CANCELLED && before == after);
+        /* The first ten view words are the observer's own progress
+         * (identity through resource_done); the rest describe the MAIN
+         * action and its recorded result, which every action updates. */
+        CHECK(!wl_columnar_session_test_observer_main_view(session, view)
+            && !memcmp(view, p->begun_view, 10u * sizeof(view[0])));
     }
     if (p && session == p->session && observer_main_recipient(recipient)
         && p->cancelling) {
@@ -7339,6 +7384,8 @@ observer_main_begun(wl_col_session_t *session,
     if (p && session == p->session && observer_main_recipient(recipient)
         && p->precancelling) {
         CHECK(rebegun);
+        CHECK(!wl_columnar_session_test_observer_main_view(session,
+            p->begun_view));
         wl_evaluation_control_request_cancel(funding);
         ++p->begun_cancels;
     }
@@ -7368,8 +7415,9 @@ observer_main_report(const wl_col_session_t *session, unsigned recipient,
         return;
     }
     /* A resource STEP pays its quote: the default resource step work on the
-     * phases this history reaches, none of which charges itself. Every other
-     * observer action pays the observer MAIN fee. */
+     * phases this history reaches, none of which charges itself (those quote
+     * 1). Every other observer action pays the observer MAIN fee; the two
+     * names are numerically equal today. */
     const bool resource_step = recipient == OBSERVER_MAIN_OBSERVE
         && action == WL_COLUMNAR_EVAL_DELTA_RESOURCE_CALL_STEP;
     CHECK(report.consumed == (resource_step
@@ -7430,6 +7478,8 @@ observer_main_history(observer_main_probe_t *p,
     wl_session_set_delta_cb(reference, observed_multi_capture, expected);
     CHECK(!observed_multi_step(session) && !wl_session_step(reference));
     actual->count = expected->count = 0;
+    observer_resource_baseline((const wl_col_session_t *)session,
+        &p->before);
     /* The second epoch commits and publishes, so its observer is the
      * committed one: REGISTER, the resource BEGIN, OBSERVE and STEP calls,
      * FINISH, ACK and RELEASE. */
@@ -7508,6 +7558,17 @@ observer_main_history(observer_main_probe_t *p,
     /* Nothing is delivered again once the committed epoch is acknowledged. */
     unsigned delivered = actual->count;
     CHECK(!observed_multi_step(session) && actual->count == delivered);
+    /* After the final release the observer resources are back where they
+     * were before the epoch. The acknowledgement at DONE zeroes the reserved
+     * bytes and the retirement state, and no observer, build or prepare
+     * object remains. */
+    observer_resource_baseline(cs, &p->after);
+    CHECK(!memcmp(&p->after, &p->before, sizeof(p->after)));
+    CHECK(!p->after.observer && !p->after.build && !p->after.prepare
+        && !p->after.reserved_bytes && !p->after.retirement_gc
+        && p->after.retirement == WL_COLUMNAR_EVAL_DELTA_OBSERVER_RETIRE_NONE);
+    p->governor_reserved = wl_columnar_memory_reserved(
+        wl_columnar_memory_governor_ref_get(governor));
     CHECK(!wl_session_try_destroy(&session));
     wl_session_destroy(reference);
     wl_evaluation_control_release(control);
@@ -7539,6 +7600,8 @@ test_controlled_committed_observer_main_stops(void)
         healthy->count);
     CHECK(!healthy->refused && !healthy->cancelled
         && healthy->committed_finishes != 0u);
+    printf("committed observer: %llu B reserved after the final release\n",
+        (unsigned long long)healthy->governor_reserved);
     injected->inject = true;
     observer_main_history(injected, healthy);
     CHECK(injected->refused == 8u && injected->cancelled == 1u
@@ -7562,6 +7625,8 @@ test_controlled_committed_observer_main_stops(void)
     observer_main_probe_t *cancelled = calloc(1, sizeof(*cancelled));
     CHECK(cancelled);
     cancelled->precancel = true;
+    cancelled->healthy_recipient = healthy->recipient;
+    cancelled->healthy_action = healthy->action;
     observer_main_history(cancelled, healthy);
     CHECK(cancelled->precancelled == 8u && cancelled->begun_cancels == 8u
         && !cancelled->refused && !cancelled->cancelled
@@ -7582,6 +7647,13 @@ test_controlled_committed_observer_main_stops(void)
         && cancelled->original.cleanup_status
         == healthy->original.cleanup_status
         && cancelled->original.result == healthy->original.result);
+    /* Refusals and cancels leave the observer resources and the governor's
+     * reservation after the final release exactly as the healthy epoch. */
+    CHECK(!memcmp(&injected->after, &healthy->after, sizeof(healthy->after))
+        && !memcmp(&cancelled->after, &healthy->after,
+        sizeof(healthy->after))
+        && injected->governor_reserved == healthy->governor_reserved
+        && cancelled->governor_reserved == healthy->governor_reserved);
     free(healthy); free(injected); free(cancelled);
 }
 
