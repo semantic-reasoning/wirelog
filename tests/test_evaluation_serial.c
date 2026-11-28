@@ -5024,8 +5024,15 @@ test_controlled_recursive_frontier_stops(void)
  * runs under one MAIN grant and charges its whole action fee. */
 enum {
     MERGE_ACK_MAIN_RECIPIENT = WL_COLUMNAR_SESSION_MAIN_MERGE_ACK,
-    MERGE_ACK_MAIN_FEE = WL_COLUMNAR_MANAGED_MERGE_ACK_ACTION_WORK
+    MERGE_ACK_MAIN_FEE = WL_COLUMNAR_MANAGED_MERGE_ACK_ACTION_WORK,
+    /* MAIN action argument: 0 begins an acknowledgement, 1 steps it. */
+    MERGE_ACK_MAIN_BEGIN = 0,
+    MERGE_ACK_MAIN_STEP = 1,
+    MERGE_ACK_MAIN_MAX = 4096
 };
+
+/* Action kinds of the healthy history's effective actions, by position. */
+static unsigned char merge_ack_healthy_actions[MERGE_ACK_MAIN_MAX];
 
 typedef struct {
     const wl_col_session_t *session;
@@ -5035,7 +5042,16 @@ typedef struct {
     bool refusing, cancelling, cancel_done;
     bool refuse_after_stop;
     unsigned after_stop_refused, after_stop_effective;
+    /* Pre-action cancels on the open MAIN grant, before the first charge:
+     * at healthy positions in a normal history, or on the first grant after
+     * the abort stop. */
+    bool precancel, precancel_after_stop, precancelling;
+    unsigned precancel_targets[2], precancel_action;
+    bool precancel_done[2], record_healthy;
+    unsigned precancelled, begun_cancels, after_stop_precancelled;
     controlled_recursive_main_hook_t previous_advanced;
+    void (*previous_begun)(wl_col_session_t *, wl_evaluation_control_t *,
+        uint64_t, unsigned, unsigned, bool);
 } merge_ack_main_probe_t;
 
 static merge_ack_main_probe_t merge_ack_main_probe;
@@ -5052,13 +5068,31 @@ merge_ack_main_limit(const wl_col_session_t *session, unsigned recipient,
     if (session != p->session || recipient != MERGE_ACK_MAIN_RECIPIENT)
         return capacity;
     CHECK(capacity == WL_COLUMNAR_SESSION_MAIN_GRANT_WORK && !p->refusing
-        && !p->cancelling);
+        && !p->cancelling && !p->precancelling);
     ++p->grants;
     if (p->refuse_after_stop && controlled_recursive_stop_fired
         && !p->after_stop_refused) {
         ++p->after_stop_refused;
         p->refusing = true;
         return MERGE_ACK_MAIN_FEE - 1u;
+    }
+    if (p->precancel_after_stop && controlled_recursive_stop_fired
+        && !p->after_stop_precancelled) {
+        ++p->after_stop_precancelled;
+        p->precancelling = true; p->precancel_action = action;
+        return capacity;
+    }
+    if (p->precancel) {
+        for (unsigned t = 0; t < 2; ++t)
+            if (p->effective == p->precancel_targets[t]
+                && !p->precancel_done[t]) {
+                /* The first target is a BEGIN, the second a STEP. */
+                CHECK(action == (t ? MERGE_ACK_MAIN_STEP
+                    : MERGE_ACK_MAIN_BEGIN));
+                p->precancel_done[t] = true;
+                p->precancelling = true; p->precancel_action = action;
+            }
+        return capacity;
     }
     if (p->inject) {
         for (unsigned t = 0; t < 3; ++t)
@@ -5082,6 +5116,9 @@ merge_ack_main_advanced(wl_col_session_t *session,
 {
     merge_ack_main_probe_t *p = &merge_ack_main_probe;
     if (session == p->session && recipient == MERGE_ACK_MAIN_RECIPIENT
+        && p->precancelling)
+        CHECK(result == WL_EVALUATION_CONTROL_CANCELLED);
+    if (session == p->session && recipient == MERGE_ACK_MAIN_RECIPIENT
         && p->cancelling && !result) {
         wl_evaluation_control_request_cancel(funding);
         CHECK(wl_evaluation_control_charge_attempt(funding, id, 0)
@@ -5092,13 +5129,40 @@ merge_ack_main_advanced(wl_col_session_t *session,
             result);
 }
 
+/* The cancel latches on the open MAIN grant before the action runs, so the
+ * action's first charge observes it. */
+static void
+merge_ack_main_begun(wl_col_session_t *session,
+    wl_evaluation_control_t *funding, uint64_t id, unsigned recipient,
+    unsigned action, bool rebegun)
+{
+    merge_ack_main_probe_t *p = &merge_ack_main_probe;
+    if (session == p->session && recipient == MERGE_ACK_MAIN_RECIPIENT
+        && p->precancelling) {
+        CHECK(rebegun);
+        wl_evaluation_control_request_cancel(funding);
+        ++p->begun_cancels;
+    }
+    if (p->previous_begun)
+        p->previous_begun(session, funding, id, recipient, action, rebegun);
+}
+
 static void
 merge_ack_main_report(const wl_col_session_t *session, unsigned recipient,
     unsigned action, wl_evaluation_control_report_t report, int result)
 {
     merge_ack_main_probe_t *p = &merge_ack_main_probe;
-    (void)action;
     if (session != p->session || recipient != MERGE_ACK_MAIN_RECIPIENT) return;
+    if (p->precancelling) {
+        /* Cancelled before its first charge: nothing is spent, the stop is
+         * a cancellation and the whole grant is left. */
+        CHECK(result == WL_EVALUATION_CONTROL_CANCELLED && !report.consumed
+            && report.stop_reason == WL_EVALUATION_CONTROL_CANCELLED
+            && report.limit == WL_COLUMNAR_SESSION_MAIN_GRANT_WORK
+            && action == p->precancel_action);
+        p->precancelling = false; ++p->precancelled;
+        return;
+    }
     if (p->refusing) {
         /* One short of the fee: nothing is spent and the action is retried. */
         CHECK(result == WL_EVALUATION_CONTROL_WORK_LIMIT && !report.consumed);
@@ -5111,13 +5175,24 @@ merge_ack_main_report(const wl_col_session_t *session, unsigned recipient,
     } else {
         CHECK(!result);
     }
+    if (p->record_healthy) {
+        CHECK(p->effective < MERGE_ACK_MAIN_MAX);
+        merge_ack_healthy_actions[p->effective] = (unsigned char)action;
+    }
     ++p->effective;
-    if (p->refuse_after_stop && controlled_recursive_stop_fired)
+    if ((p->refuse_after_stop || p->precancel_after_stop)
+        && controlled_recursive_stop_fired)
         ++p->after_stop_effective;
 }
 
+enum {
+    MERGE_ACK_HISTORY_HEALTHY,
+    MERGE_ACK_HISTORY_REFUSE,
+    MERGE_ACK_HISTORY_PRECANCEL
+};
+
 static unsigned
-merge_ack_main_history(bool inject, unsigned healthy)
+merge_ack_main_history(unsigned mode, unsigned healthy)
 {
     const int64_t edges[] = { 1, 2, 2, 3, 3, 4 };
     const int64_t later_edge[] = { 4, 5 };
@@ -5130,15 +5205,31 @@ merge_ack_main_history(bool inject, unsigned healthy)
     merge_ack_main_probe_t *p = &merge_ack_main_probe;
     memset(p, 0, sizeof(*p));
     p->session = columnar;
-    p->inject = inject;
-    if (inject) {
+    p->inject = mode == MERGE_ACK_HISTORY_REFUSE;
+    p->precancel = mode == MERGE_ACK_HISTORY_PRECANCEL;
+    p->record_healthy = mode == MERGE_ACK_HISTORY_HEALTHY;
+    if (p->inject) {
         p->targets[0] = 0; p->targets[1] = healthy / 2u;
         p->targets[2] = healthy - 1u; p->cancel_at = healthy / 3u;
+    }
+    if (p->precancel) {
+        /* The first acknowledgement BEGIN, and the first STEP from the
+         * middle of the healthy history on. */
+        CHECK(healthy <= MERGE_ACK_MAIN_MAX
+            && merge_ack_healthy_actions[0] == MERGE_ACK_MAIN_BEGIN);
+        p->precancel_targets[0] = 0; p->precancel_targets[1] = UINT_MAX;
+        for (unsigned i = healthy / 2u; i < healthy; ++i)
+            if (merge_ack_healthy_actions[i] == MERGE_ACK_MAIN_STEP) {
+                p->precancel_targets[1] = i; break;
+            }
+        CHECK(p->precancel_targets[1] != UINT_MAX);
     }
     p->previous_advanced = wl_columnar_session_test_main_action_advanced;
     wl_columnar_session_test_main_limit = merge_ack_main_limit;
     wl_columnar_session_test_main_action_report = merge_ack_main_report;
     wl_columnar_session_test_main_action_advanced = merge_ack_main_advanced;
+    p->previous_begun = wl_columnar_session_test_main_action_begun;
+    wl_columnar_session_test_main_action_begun = merge_ack_main_begun;
     CHECK(!controlled_recursive_run(session, control));
     const col_rel_t *path = session_find_rel(columnar, "path");
     CHECK(path && path->nrows == 6);
@@ -5152,14 +5243,21 @@ merge_ack_main_history(bool inject, unsigned healthy)
     wl_columnar_session_test_main_limit = NULL;
     wl_columnar_session_test_main_action_report = NULL;
     wl_columnar_session_test_main_action_advanced = p->previous_advanced;
-    CHECK(!p->refusing && !p->cancelling);
-    if (inject) {
+    wl_columnar_session_test_main_action_begun = p->previous_begun;
+    CHECK(!p->refusing && !p->cancelling && !p->precancelling);
+    if (p->inject) {
         CHECK(p->refusals[0] == 1u && p->refusals[1] == 2u
             && p->refusals[2] == 1u && p->refused == 4u
-            && p->cancel_done && p->cancelled == 1u
+            && p->cancel_done && p->cancelled == 1u && !p->precancelled
             && p->grants == p->effective + p->refused);
+    } else if (p->precancel) {
+        CHECK(p->precancel_done[0] && p->precancel_done[1]
+            && p->precancelled == 2u && p->begun_cancels == 2u
+            && !p->refused && !p->cancelled
+            && p->grants == p->effective + p->precancelled);
     } else {
-        CHECK(!p->refused && !p->cancelled && p->grants == p->effective);
+        CHECK(!p->refused && !p->cancelled && !p->precancelled
+            && p->grants == p->effective);
     }
     unsigned effective = p->effective;
     p->session = NULL;
@@ -5172,24 +5270,31 @@ merge_ack_main_history(bool inject, unsigned healthy)
 
 /* Actual recursive sessions acknowledge every managed merge through MAIN.
  * A refused or cancelled MERGE_ACK grant is neither replayed nor lost: the
- * injected run performs exactly the healthy run's 256 actions and publishes
- * the same path. */
+ * injected run performs exactly the healthy run's effective actions and
+ * publishes the same path. So does a run whose first BEGIN and a STEP from
+ * the middle of the history on are cancelled on their open grant before
+ * their first charge. */
 static void
 test_controlled_recursive_merge_ack_main_stops(void)
 {
-    const unsigned healthy = merge_ack_main_history(false, 0);
+    const unsigned healthy =
+        merge_ack_main_history(MERGE_ACK_HISTORY_HEALTHY, 0);
     printf("recursive MERGE_ACK: %u MAIN actions per healthy history\n",
         healthy);
     CHECK(healthy >= 3u);
-    CHECK(merge_ack_main_history(true, healthy) == healthy);
+    CHECK(merge_ack_main_history(MERGE_ACK_HISTORY_REFUSE, healthy)
+        == healthy);
+    CHECK(merge_ack_main_history(MERGE_ACK_HISTORY_PRECANCEL, healthy)
+        == healthy);
 }
 
 /* A stop of the original control after a merge sends the recursive step to
  * its abort cleanup, which acknowledges the merge through MAIN as well. A
- * refused first MERGE_ACK grant there is retried, the stopped epoch keeps
- * the published path, and a healthy retry completes it. */
+ * first MERGE_ACK grant there that is refused, or cancelled before its first
+ * charge, is retried, the stopped epoch keeps the published path, and a
+ * healthy retry completes it. */
 static void
-test_controlled_recursive_merge_ack_abort_refusal(void)
+merge_ack_abort_history(bool precancel)
 {
     const int64_t edges[] = { 1, 2, 2, 3, 3, 4 };
     const int64_t later_edge[] = { 4, 5 };
@@ -5210,11 +5315,14 @@ test_controlled_recursive_merge_ack_abort_refusal(void)
     merge_ack_main_probe_t *p = &merge_ack_main_probe;
     memset(p, 0, sizeof(*p));
     p->session = columnar;
-    p->refuse_after_stop = true;
+    p->refuse_after_stop = !precancel;
+    p->precancel_after_stop = precancel;
     p->previous_advanced = wl_columnar_session_test_main_action_advanced;
     wl_columnar_session_test_main_limit = merge_ack_main_limit;
     wl_columnar_session_test_main_action_report = merge_ack_main_report;
     wl_columnar_session_test_main_action_advanced = merge_ack_main_advanced;
+    p->previous_begun = wl_columnar_session_test_main_action_begun;
+    wl_columnar_session_test_main_action_begun = merge_ack_main_begun;
     controlled_recursive_stop_phase =
         WL_COLUMNAR_SESSION_TEST_RECURSIVE_AFTER_MERGE;
     controlled_recursive_stop_fired = false;
@@ -5229,11 +5337,16 @@ test_controlled_recursive_merge_ack_abort_refusal(void)
     wl_columnar_session_test_main_limit = NULL;
     wl_columnar_session_test_main_action_report = NULL;
     wl_columnar_session_test_main_action_advanced = p->previous_advanced;
+    wl_columnar_session_test_main_action_begun = p->previous_begun;
     /* The checkpoint exhausts the original control's work. */
     CHECK(controlled_recursive_stop_fired
         && rc == WL_EVALUATION_CONTROL_WORK_LIMIT);
-    CHECK(p->after_stop_refused == 1u && p->after_stop_effective != 0u
-        && !p->refusing && !p->cancelling);
+    CHECK(p->after_stop_refused == (precancel ? 0u : 1u)
+        && p->after_stop_precancelled == (precancel ? 1u : 0u)
+        && p->begun_cancels == p->after_stop_precancelled
+        && p->precancelled == p->after_stop_precancelled
+        && p->after_stop_effective != 0u
+        && !p->refusing && !p->cancelling && !p->precancelling);
     wl_evaluation_control_report_t report;
     CHECK(!wl_evaluation_control_report(control, &report)
         && report.result == rc);
@@ -5251,6 +5364,13 @@ test_controlled_recursive_merge_ack_abort_refusal(void)
     wl_evaluation_control_release(control);
     wl_plan_free(plan);
     wirelog_program_free(program);
+}
+
+static void
+test_controlled_recursive_merge_ack_abort_refusal(void)
+{
+    merge_ack_abort_history(false);
+    merge_ack_abort_history(true);
 }
 
 static void
