@@ -10300,7 +10300,7 @@ typedef struct {
     uint64_t owners[2];
     uint64_t retirement[8], child[16], main[16], observer[16], resource[12];
     uint64_t observer_work[4];
-    uint64_t claim[10];
+    uint64_t claim[12];
 } wl_columnar_session_test_string_custody_t;
 void wl_columnar_eval_delta_test_prepublication_view(const wl_col_session_t *,
     uint64_t[4]);

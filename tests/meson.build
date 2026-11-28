@@ -8573,3 +8573,13 @@ foreach heads : [1, 2]
       suite: ['unit', 'tsan', 'evaluation_recursive_string_prepublication_end'], timeout: 120)
   endforeach
 endforeach
+
+# END during actual reversible role-3 claims before publication.
+foreach heads : [1, 2]
+  foreach observed : [0, 1]
+    test('evaluation_recursive_string_claims_end_@0@_@1@'.format(heads, observed),
+      evaluation_recursive_string_exe,
+      args: ['claims-end', heads.to_string(), observed.to_string()],
+      suite: ['unit', 'tsan', 'evaluation_recursive_string_prepublication_end'], timeout: 120)
+  endforeach
+endforeach

@@ -18148,6 +18148,49 @@ wl_columnar_session_string_reader_ended(const wl_col_session_t *sess,
                &o->reader);
 }
 
+/* Verify the entire bounded set of pending claims. A preceding Original
+* may already hold READY while the current one is still initializing. */
+static bool
+wl_columnar_session_string_claim_ended(const wl_col_session_t *sess,
+    const wl_columnar_controlled_step_t *step)
+{
+    if (!step->retirement_native_count
+        || !wl_columnar_session_string_completed_registry(sess, step))
+        return false;
+    const wl_columnar_session_observed_transaction_t *tx = step->transaction;
+    if (tx->phase != WL_SESSION_OBSERVED_CLAIMS
+        || tx->old_count != tx->head_count + 1 || tx->index >= tx->old_count
+        || tx->differential.started
+        || !tx->originals[tx->index].retirement_progress.identity) return false;
+    unsigned registered = 0;
+    for (uint32_t i = 0; i < tx->old_count; i++) {
+        const wl_columnar_session_observed_original_t *o = &tx->originals[i];
+        const wl_columnar_session_retirement_progress_t *p =
+            &o->retirement_progress;
+        if (!p->identity) {
+            if (i < tx->index && o->retire) return false;
+            continue;
+        }
+        if (i > tx->index || !o->retire || !o->relation
+            || o->relation != tx->old_registry[i] || o->reader.descriptor_held
+            || o->reader.token.owner || p->identity != p || p->step != step
+            || p->parent != o || p->receipt != &o->retirement
+            || p->role != 3 || p->index != i || p->target != o->relation
+            || p->slot != &o->relation || p->replacement || !p->registered
+            || p->busy || p->physical_done || p->cancel_clear
+            || !wl_columnar_session_retirement_thread(p)) return false;
+        /* Only BIND publishes a live scalar receipt. An in-flight
+         * initializer is cancelled by the existing retirement owner. */
+        if (p->begun && (o->retirement.committed
+            || o->retirement.storage.relation != o->relation)) return false;
+        if (i < tx->index && (!p->begun || p->initializer.identity
+            || wl_columnar_relation_scalar_retirement_ready_validate(
+                &o->retirement, o->relation, o->snapshot))) return false;
+        registered++;
+    }
+    return registered == step->retirement_native_count;
+}
+
 /* END is not forward authority. Authenticate the actual retained round owner
  * before reusing retirement_drive's matching-Original disposal registration. */
 static bool
@@ -25952,6 +25995,16 @@ wl_columnar_session_test_string_custody(const wl_col_session_t *sess,
         && tx->phase <= WL_SESSION_OBSERVED_CUTOFF) {
         out->claim[0] = tx->index;
         out->claim[1] = tx->old_count;
+        if (tx->old_count <= 3)
+            for (uint32_t i = 0; i < tx->index && i < tx->old_count; i++) {
+                const wl_columnar_session_observed_original_t *o =
+                    &tx->originals[i];
+                const wl_columnar_session_retirement_progress_t *p =
+                    &o->retirement_progress;
+                if (p->identity == p && p->begun && !p->physical_done
+                    && !p->cancel_clear && o->retirement.ready)
+                    out->claim[11] |= UINT64_C(1) << i;
+            }
         if (tx->index < tx->old_count) {
             const wl_columnar_session_observed_original_t *o =
                 &tx->originals[tx->index];
@@ -25969,6 +26022,10 @@ wl_columnar_session_test_string_custody(const wl_col_session_t *sess,
                     out->claim[8] = o->retirement.ready;
                 }
                 out->claim[9] = o->retirement_progress.registered;
+                const wl_columnar_relation_scalar_retirement_initializer_t *init
+                    =
+                    &o->retirement_progress.initializer;
+                if (init->identity == init) out->claim[10] = 1 + init->phase;
             }
         }
     }
@@ -29646,7 +29703,8 @@ col_controlled_step_drive(wl_col_session_t *sess,
 
         if (wl_columnar_session_recursive_retirement_ended(sess, step)
             || wl_columnar_session_string_observer_ended(sess, step)
-            || wl_columnar_session_string_reader_ended(sess, step))
+            || wl_columnar_session_string_reader_ended(sess, step)
+            || wl_columnar_session_string_claim_ended(sess, step))
             return wl_columnar_session_observed_register_ended(step,
                        control, step->operation_id);
 
