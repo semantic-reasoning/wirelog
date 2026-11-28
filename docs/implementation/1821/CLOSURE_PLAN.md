@@ -778,3 +778,18 @@ single-worker sessions (#2301)". A single scan for both sides with no prefix, a
 third input in such a rule, two cold inputs of one rule, an aggregate after a
 later JOIN, a SNAPSHOT or an observed STEP over a cold input, the program
 refusals of the sixth bundle and more than one worker stay open.
+
+A nineteenth bundle admits, under control, a rule whose first input is a cold
+input and whose first JOIN, and optionally later JOINs, read a different cold
+input as their right input, in either seal order, in the shapes listed in the
+section below, which the uncontrolled route admits at seal: with or without a
+MAP/FILTER prefix, with one key or two, and with a COUNT, MIN or MAX after its
+single JOIN. The new pair rule runs the audits of the cold self rule over the
+two inputs and checks the layout of both. The composed attempt scans the first
+input's prefix into the result slot and, at the first JOIN, the other input
+whole into the cold right slot. See "Two cold inputs of one rule in controlled
+single-worker sessions (#2301)". A frame that holds the copies of two cold
+inputs, for a rule that reads its first input again beside the other, a single
+scan for both sides with no prefix, a third input in such a rule, an aggregate
+after a later JOIN, a SNAPSHOT or an observed STEP over a cold input, the
+program refusals of the sixth bundle and more than one worker stay open.
