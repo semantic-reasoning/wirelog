@@ -4391,7 +4391,8 @@ frontier_main_advanced(wl_col_session_t *session,
 {
     frontier_stop_context_t *c = frontier_stop_context;
     if (c && c->tracking && &session->base == c->session
-        && recipient == 2 && c->current.active) {
+        && recipient == WL_COLUMNAR_SESSION_MAIN_SCALAR
+        && c->current.active) {
         uint64_t progress[16];
         CHECK(!wl_columnar_session_test_retirement_view(session, progress));
         CHECK(wl_evaluation_control_identity(funding) == c->main_identity);
@@ -4418,7 +4419,8 @@ frontier_main_report(const wl_col_session_t *session, unsigned recipient,
     unsigned action, wl_evaluation_control_report_t report, int result)
 {
     frontier_stop_context_t *c = frontier_stop_context;
-    if (c && c->tracking && &session->base == c->session && recipient == 2
+    if (c && c->tracking && &session->base == c->session
+        && recipient == WL_COLUMNAR_SESSION_MAIN_SCALAR
         && action == 1 && c->current.active) {
         uint64_t main[16], progress[16];
         CHECK(!wl_columnar_session_test_main_view(session, main)
@@ -5018,9 +5020,12 @@ test_controlled_recursive_frontier_stops(void)
     frontier_stop_cases(false);
 }
 
-/* The managed-merge acknowledgement recipient of the session's private MAIN
- * recipient enum. Every MERGE_ACK action is one 256 MAIN grant. */
-enum { MERGE_ACK_MAIN_RECIPIENT = 16, MERGE_ACK_MAIN_FEE = 256 };
+/* The managed-merge acknowledgement MAIN recipient. Every MERGE_ACK action
+ * runs under one MAIN grant and charges its whole action fee. */
+enum {
+    MERGE_ACK_MAIN_RECIPIENT = WL_COLUMNAR_SESSION_MAIN_MERGE_ACK,
+    MERGE_ACK_MAIN_FEE = WL_COLUMNAR_MANAGED_MERGE_ACK_ACTION_WORK
+};
 
 typedef struct {
     const wl_col_session_t *session;
@@ -5046,13 +5051,14 @@ merge_ack_main_limit(const wl_col_session_t *session, unsigned recipient,
     (void)action;
     if (session != p->session || recipient != MERGE_ACK_MAIN_RECIPIENT)
         return capacity;
-    CHECK(capacity == MERGE_ACK_MAIN_FEE && !p->refusing && !p->cancelling);
+    CHECK(capacity == WL_COLUMNAR_SESSION_MAIN_GRANT_WORK && !p->refusing
+        && !p->cancelling);
     ++p->grants;
     if (p->refuse_after_stop && controlled_recursive_stop_fired
         && !p->after_stop_refused) {
         ++p->after_stop_refused;
         p->refusing = true;
-        return capacity - 1u;
+        return MERGE_ACK_MAIN_FEE - 1u;
     }
     if (p->inject) {
         for (unsigned t = 0; t < 3; ++t)
@@ -5060,7 +5066,7 @@ merge_ack_main_limit(const wl_col_session_t *session, unsigned recipient,
                 && p->refusals[t] < (t == 1 ? 2u : 1u)) {
                 ++p->refusals[t];
                 p->refusing = true;
-                return capacity - 1u;
+                return MERGE_ACK_MAIN_FEE - 1u;
             }
         p->cancelling = !p->cancel_done && p->effective == p->cancel_at;
     }
@@ -6610,16 +6616,18 @@ test_controlled_frontier_map_failures(void)
         }
 }
 
-/* MAIN_DIFF recipient of the session's private MAIN recipient enum. A DIFF
- * action pays the 128 differential fee, or one of the ledger publication
- * fees of mem_ledger_publication.c: DESCRIBE is PREPARE 109, COMMIT charges
- * INITIAL 26 + APPLY 117 + RELEASE 23 and then ROUND 28. */
+/* The MAIN_DIFF recipient. A DIFF action pays the differential fee, or one
+ * of the ledger publication fees: DESCRIBE is PREPARE, COMMIT charges
+ * INITIAL + APPLY + RELEASE and then ROUND. */
 enum {
-    DIFF_MAIN_RECIPIENT = 3,
-    DIFF_MAIN_PAY = 128,
-    DIFF_MAIN_DESCRIBE = 109,
-    DIFF_MAIN_COMMIT_FIRST = 26 + 117 + 23,
-    DIFF_MAIN_COMMIT = DIFF_MAIN_COMMIT_FIRST + 28,
+    DIFF_MAIN_RECIPIENT = WL_COLUMNAR_SESSION_MAIN_DIFF,
+    DIFF_MAIN_PAY = WL_COLUMNAR_ARRANGEMENT_DIFF_PAY_WORK,
+    DIFF_MAIN_DESCRIBE = WL_COLUMNAR_MEM_LEDGER_PUBLICATION_PREPARE_WORK,
+    DIFF_MAIN_COMMIT_FIRST = WL_COLUMNAR_MEM_LEDGER_PUBLICATION_INITIAL_WORK
+        + WL_COLUMNAR_MEM_LEDGER_PUBLICATION_APPLY_WORK
+        + WL_COLUMNAR_MEM_LEDGER_PUBLICATION_RELEASE_WORK,
+    DIFF_MAIN_COMMIT = DIFF_MAIN_COMMIT_FIRST
+        + WL_COLUMNAR_MEM_LEDGER_PUBLICATION_ROUND_WORK,
     DIFF_MAIN_MAX = 4096
 };
 
@@ -6658,7 +6666,8 @@ diff_main_limit(const wl_col_session_t *session, unsigned recipient,
     (void)action;
     if (!p || session != p->session || recipient != DIFF_MAIN_RECIPIENT)
         return capacity;
-    CHECK(capacity == 256u && !p->refusing && !p->cancelling);
+    CHECK(capacity == WL_COLUMNAR_SESSION_MAIN_GRANT_WORK && !p->refusing
+        && !p->cancelling);
     if (!p->inject || p->count < p->inserted) return capacity;
     const unsigned h = p->count - p->inserted;
     if (h == p->pay_first && !p->done_pay_first) {
@@ -6896,14 +6905,14 @@ test_controlled_persistent_diff_main_stops(void)
     free(healthy); free(injected);
 }
 
-/* Observer recipients of the session's private MAIN recipient enum. Each
- * observer action pays the 128 of wl_columnar_session_main_observer_execute. */
+/* Observer MAIN recipients. Each observer action pays the observer MAIN
+ * fee. */
 enum {
-    OBSERVER_MAIN_REGISTER = 13,
-    OBSERVER_MAIN_OBSERVE = 14,
-    OBSERVER_MAIN_FINISH = 15,
-    OBSERVER_MAIN_RELEASE = 17,
-    OBSERVER_MAIN_FEE = 128,
+    OBSERVER_MAIN_REGISTER = WL_COLUMNAR_SESSION_MAIN_OBSERVER_REGISTER,
+    OBSERVER_MAIN_OBSERVE = WL_COLUMNAR_SESSION_MAIN_OBSERVER,
+    OBSERVER_MAIN_FINISH = WL_COLUMNAR_SESSION_MAIN_OBSERVER_FINISH,
+    OBSERVER_MAIN_RELEASE = WL_COLUMNAR_SESSION_MAIN_OBSERVER_RELEASE,
+    OBSERVER_MAIN_FEE = WL_COLUMNAR_SESSION_OBSERVER_MAIN_WORK,
     OBSERVER_MAIN_MAX = 4096,
     /* Observer reason recorded when the transaction committed and its step
      * published (session.c observer FINISH selection). */
@@ -6941,7 +6950,8 @@ observer_main_limit(const wl_col_session_t *session, unsigned recipient,
     (void)action;
     if (!p || session != p->session || !observer_main_recipient(recipient))
         return capacity;
-    CHECK(capacity == 256u && !p->refusing && !p->cancelling);
+    CHECK(capacity == WL_COLUMNAR_SESSION_MAIN_GRANT_WORK && !p->refusing
+        && !p->cancelling);
     if (!p->inject) return capacity;
     for (unsigned t = 0; t < 8; ++t)
         if (p->count == p->targets[t] && !p->done[t]) {

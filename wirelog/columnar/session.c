@@ -676,30 +676,6 @@ enum {
     WL_COLUMNAR_SESSION_BOOTSTRAP_RECEIPT_RELEASE,
     WL_COLUMNAR_SESSION_BOOTSTRAP_RECEIPT_CONSUMED
 };
-typedef enum {
-    WL_COLUMNAR_SESSION_MAIN_NONE,
-    WL_COLUMNAR_SESSION_MAIN_RESERVE,
-    WL_COLUMNAR_SESSION_MAIN_SCALAR,
-    WL_COLUMNAR_SESSION_MAIN_DIFF,
-    WL_COLUMNAR_SESSION_MAIN_READER,
-    WL_COLUMNAR_SESSION_MAIN_STAGING_END,
-    WL_COLUMNAR_SESSION_MAIN_STORAGE,
-    WL_COLUMNAR_SESSION_MAIN_MANAGED,
-    WL_COLUMNAR_SESSION_MAIN_EDGE,
-    WL_COLUMNAR_SESSION_MAIN_MERGE,
-    WL_COLUMNAR_SESSION_MAIN_BUILD,
-    WL_COLUMNAR_SESSION_MAIN_FAILED_RETRY,
-    WL_COLUMNAR_SESSION_MAIN_BEGIN_FAILURE,
-    WL_COLUMNAR_SESSION_MAIN_OBSERVER_REGISTER,
-    WL_COLUMNAR_SESSION_MAIN_OBSERVER,
-    WL_COLUMNAR_SESSION_MAIN_OBSERVER_FINISH,
-    WL_COLUMNAR_SESSION_MAIN_MERGE_ACK,
-    WL_COLUMNAR_SESSION_MAIN_OBSERVER_RELEASE,
-    WL_COLUMNAR_SESSION_MAIN_CLOSE_VALIDATE_BEGIN,
-    WL_COLUMNAR_SESSION_MAIN_CLOSE_VALIDATE_STEP,
-    WL_COLUMNAR_SESSION_MAIN_CLOSE_LEASE_PUBLISH,
-    WL_COLUMNAR_SESSION_MAIN_BOOTSTRAP_RECEIPT
-} wl_columnar_session_main_recipient_t;
 
 typedef enum {
     WL_COLUMNAR_SESSION_MAIN_INERT,
@@ -22338,7 +22314,8 @@ wl_columnar_session_main_observer_execute(wl_col_session_t *sess,
         if (!reason || j->identity || j->resource.identity ||
             j->resource.session
             || j->finance.control || j->finance.phase) return EINVAL;
-        int rc = wl_evaluation_control_charge_attempt(control, id, 128);
+        int rc = wl_evaluation_control_charge_attempt(control, id,
+                WL_COLUMNAR_SESSION_OBSERVER_MAIN_WORK);
         if (rc) return rc;
         j->session = sess; j->transaction = tx;
         j->control = a->original; j->control_identity = a->original_identity;
@@ -22368,7 +22345,8 @@ wl_columnar_session_main_observer_execute(wl_col_session_t *sess,
     if (a->recipient == WL_COLUMNAR_SESSION_MAIN_OBSERVER_RELEASE) {
         if (!j->native_finished || !j->acknowledged || j->resource.identity
             || j->resource.session || j->resource.busy) return EBUSY;
-        rc = wl_evaluation_control_charge_attempt(control, id, 128);
+        rc = wl_evaluation_control_charge_attempt(control, id,
+                WL_COLUMNAR_SESSION_OBSERVER_MAIN_WORK);
         if (rc) return rc;
         if (tx) tx->observer_started = false;
         step->observer_cleanup_pending = false;
@@ -23230,7 +23208,7 @@ wl_columnar_session_main_action(wl_col_session_t *sess,
     }
     int rc = wl_columnar_session_main_native_prove(sess, step, j);
     if (rc) return rc;
-    uint64_t limit = 256;
+    uint64_t limit = WL_COLUMNAR_SESSION_MAIN_GRANT_WORK;
 #ifdef WL_SESSION_TEST_HOOKS
     if (wl_columnar_session_test_main_limit)
         limit = wl_columnar_session_test_main_limit(sess, recipient, action,

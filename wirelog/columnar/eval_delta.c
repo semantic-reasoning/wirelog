@@ -4192,7 +4192,7 @@ wl_columnar_eval_delta_resource_observe(wl_col_session_t *s,
     out.done = r->phase == WL_COLUMNAR_EVAL_DELTA_RESOURCE_DONE
         || r->phase == WL_COLUMNAR_EVAL_DELTA_RESOURCE_CLEAR;
     if (out.done) return out;
-    out.work = 128;
+    out.work = WL_COLUMNAR_EVAL_DELTA_RESOURCE_STEP_WORK;
     if (r->phase == WL_COLUMNAR_EVAL_DELTA_RESOURCE_BUILD_READER && r->build
         && wl_columnar_eval_delta_resource_relation_reader_live(
             &r->build->reader)) out.work = 1;
@@ -4288,7 +4288,8 @@ wl_columnar_eval_delta_resource_begin(wl_col_session_t *s,
             && s->rotation_ops != &col_rotation_standard_ops
             && s->rotation_ops != &col_rotation_pinned_ops) return out;
     }
-    rc = wl_evaluation_control_charge_attempt(funding, id, 128);
+    rc = wl_evaluation_control_charge_attempt(funding, id,
+            WL_COLUMNAR_SESSION_OBSERVER_MAIN_WORK);
     if (rc) {
         out.protocol = rc; return out;
     }
@@ -4700,7 +4701,8 @@ wl_columnar_eval_delta_resource_ack(wl_col_session_t *s,
         r->build || r->prepare){
         out.protocol = EINVAL; return out;
     }
-    int rc = wl_evaluation_control_charge_attempt(funding, id, 128);
+    int rc = wl_evaluation_control_charge_attempt(funding, id,
+            WL_COLUMNAR_SESSION_OBSERVER_MAIN_WORK);
     if (rc) {
         out.protocol = rc; return out;
     }
@@ -4889,7 +4891,8 @@ wl_columnar_eval_delta_observer_resource_observe_main_owned(wl_col_session_t *s,
         .protocol = permit.protocol
     };
     if (permit.protocol) return out;
-    out.protocol = wl_evaluation_control_charge_attempt(funding, id, 128);
+    out.protocol = wl_evaluation_control_charge_attempt(funding, id,
+            WL_COLUMNAR_SESSION_OBSERVER_MAIN_WORK);
     if (out.protocol) return out;
     if (permit.acked) {
         out.done = out.readers_done = true;
@@ -4937,7 +4940,8 @@ wl_columnar_eval_delta_observer_resource_finish_main_owned(wl_col_session_t *s,
         .protocol = permit.protocol
     };
     if (permit.protocol) return out;
-    out.protocol = wl_evaluation_control_charge_attempt(funding, id, 128);
+    out.protocol = wl_evaluation_control_charge_attempt(funding, id,
+            WL_COLUMNAR_SESSION_OBSERVER_MAIN_WORK);
     if (out.protocol) return out;
     out.protocol = wl_columnar_eval_delta_resource_prove(s, r);
     if (out.protocol) return out;

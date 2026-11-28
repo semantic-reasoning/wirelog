@@ -3603,7 +3603,8 @@ static int
 wl_columnar_arrangement_diff_pay(wl_evaluation_control_t *control, uint64_t id,
     unsigned phase, uint64_t progress)
 {
-    int rc = wl_evaluation_control_charge_attempt(control, id, 128);
+    int rc = wl_evaluation_control_charge_attempt(control, id,
+            WL_COLUMNAR_ARRANGEMENT_DIFF_PAY_WORK);
     if (rc) return rc;
 #ifdef WL_SESSION_TEST_HOOKS
     if (wl_columnar_arrangement_test_diff_checkpoint)
