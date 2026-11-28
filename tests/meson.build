@@ -7720,6 +7720,8 @@ test('evaluation_cold_twice_sources', test_evaluation_cold_sources_exe,
      args: ['twice'], suite: ['unit', 'tsan'], timeout: 300)
 test('evaluation_cold_self_sources', test_evaluation_cold_sources_exe,
      args: ['self'], suite: ['unit', 'tsan'], timeout: 300)
+test('evaluation_cold_both_sources', test_evaluation_cold_sources_exe,
+     args: ['both'], suite: ['unit', 'tsan'], timeout: 300)
 
 test_evaluation_empty_edb_sources_exe = executable(
   'test_evaluation_empty_edb_sources', files('test_evaluation_empty_edb_sources.c'),
