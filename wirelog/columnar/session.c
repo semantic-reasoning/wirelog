@@ -2211,6 +2211,23 @@ session_find_rel(wl_col_session_t *sess, const char *name)
     return NULL;
 }
 
+static col_rel_t *
+session_find_prefixed_linear(wl_col_session_t *sess, const char *prefix,
+    const char *name)
+{
+    /* Like session_find_rel, a built-hash miss and a failed lazy build may
+     * still find an entry in the current registry. Short candidates stop
+     * at NUL in strncmp before suffix pointer arithmetic is attempted. */
+    size_t prefix_len = strlen(prefix);
+    for (uint32_t i = 0; i < sess->nrels; ++i) {
+        col_rel_t *rel = sess->rels[i];
+        if (rel && !strncmp(rel->name, prefix, prefix_len)
+            && !strcmp(rel->name + prefix_len, name))
+            return rel;
+    }
+    return NULL;
+}
+
 col_rel_t *
 wl_columnar_session_find_prefixed(wl_col_session_t *sess, const char *prefix,
     const char *name)
@@ -2228,17 +2245,7 @@ wl_columnar_session_find_prefixed(wl_col_session_t *sess, const char *prefix,
             return wl_columnar_session_hash_lookup_prefixed(sess, prefix,
                        name);
     }
-    /* Like session_find_rel, a built-hash miss and a failed lazy build may
-     * still find an entry in the current registry. Short candidates stop
-     * at NUL in strncmp before suffix pointer arithmetic is attempted. */
-    size_t prefix_len = strlen(prefix);
-    for (uint32_t i = 0; i < sess->nrels; ++i) {
-        col_rel_t *rel = sess->rels[i];
-        if (rel && !strncmp(rel->name, prefix, prefix_len)
-            && !strcmp(rel->name + prefix_len, name))
-            return rel;
-    }
-    return NULL;
+    return session_find_prefixed_linear(sess, prefix, name);
 }
 
 #ifdef WL_SESSION_TEST_HOOKS
@@ -3645,13 +3652,6 @@ wl_columnar_session_private_name_discard(
 
 #define WL_SEED_SHADOW_PREFIX "$in$"
 
-static int
-session_seed_shadow_name(const char *relation, char *out, size_t cap)
-{
-    int len = snprintf(out, cap, WL_SEED_SHADOW_PREFIX "%s", relation);
-    return len < 0 || (size_t)len >= cap ? EOVERFLOW : 0;
-}
-
 static col_rel_t *
 session_seed_shadow(wl_col_session_t *sess, const char *relation)
 {
@@ -3901,17 +3901,16 @@ wl_columnar_session_seed_rows(wl_col_session_t *sess, const char *relation)
  * not.  Fall back to a linear scan on a hash miss as session_find_rel()
  * does, which also covers a hash left incomplete by a failed insert. */
 static col_rel_t *
-session_find_rel_readonly(wl_col_session_t *sess, const char *name)
+session_find_rel_readonly(wl_col_session_t *sess, const char *prefix,
+    const char *name)
 {
     if (sess->rel_hash_nbuckets > 0) {
-        col_rel_t *rel = session_rel_hash_lookup(sess, name);
+        col_rel_t *rel = wl_columnar_session_hash_lookup_prefixed(sess, prefix,
+                name);
         if (rel)
             return rel;
     }
-    for (uint32_t i = 0; i < sess->nrels; i++)
-        if (sess->rels[i] && strcmp(sess->rels[i]->name, name) == 0)
-            return sess->rels[i];
-    return NULL;
+    return session_find_prefixed_linear(sess, prefix, name);
 }
 
 #ifdef WL_SESSION_TEST_HOOKS
@@ -3961,18 +3960,16 @@ col_session_source_query(wl_session_t *session, const wl_source_query_t *q,
 
     /* Select the authoritative storage without creating anything. */
     if (session_plan_has_rule_head(sess->plan, q->relation)) {
-        char name[256];
-        if (session_seed_shadow_name(q->relation, name, sizeof(name)) != 0)
-            return WIRELOG_SOURCE_QUERY_OVERFLOW;
         /* A head's shadow is registered before the first row is appended
          * to the head, and is only ever truncated afterwards; inline facts
          * are refused upstream.  No shadow therefore means no accepted
          * input. */
-        src = session_find_rel_readonly(sess, name);
+        src = session_find_rel_readonly(sess, WL_SEED_SHADOW_PREFIX,
+                q->relation);
     } else {
         /* A relation the session never registered refused every insert
          * (ENOENT), so it has no accepted input either. */
-        src = session_find_rel_readonly(sess, q->relation);
+        src = session_find_rel_readonly(sess, "", q->relation);
     }
     if (!src || src->nrows == 0) {
         if (src && src->ncols != 0 && src->ncols != q->ncols)

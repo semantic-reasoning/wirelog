@@ -49,7 +49,7 @@ runtime campaign timing; its benchmark Git-fixture limits remain historical.
 No complete containing financial, materialized/recursive/pipeline or hosted
 platform certificate follows. O04/F05/F05a and #2371/#2300 remain OPEN.
 
-The [observed EDB removal increment](JOIN_DOMAIN_QUALIFICATION.md#observed-edb-removal-and-typed-retractions) covers complete pending names, typed JOIN consumption, rollback and flat INLINE map disposal. Long input-rulehead seed and retired names and the containing F05 obligations remain open.
+The [observed EDB removal increment](JOIN_DOMAIN_QUALIFICATION.md#observed-edb-removal-and-typed-retractions) covers complete pending names, typed JOIN consumption, rollback and flat INLINE map disposal. Seed and retired input-rulehead names now use the full identifier. The containing F05 obligations remain open.
 
 ## Scope and evaluating Roots
 

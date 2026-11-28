@@ -1483,6 +1483,7 @@ body cases and 28 prior recursive and multiworker regressions. The three focused
 compiler configurations passed 153 tests each. The native extended selection
 passed 287. ABI and CI contract checks passed 11 with one optional skip.
 
-Long input-rulehead seed and retired names (`$in$` and `$out$`), recursive and
+The seed and retired relations of input rule heads now preserve the full name.
+Source inspection follows the same seed name without building an index. Recursive and
 pipeline intersections, complete memory and work accounting, and hosted platform
 qualification remain open under #2371 and #2300.
