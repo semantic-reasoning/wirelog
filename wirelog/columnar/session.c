@@ -3576,6 +3576,73 @@ session_note_inserted_input(wl_col_session_t *sess, const col_rel_t *relation,
  * step with every insert and removal, and appended back after each reset.
  * No plan operator names a `$in$` relation, so evaluation never reads it.
  */
+/* Short keys retain the stack path. A longer transient key has its own
+ * admission until the private relation has copied and funded its owned name. */
+typedef struct {
+    char stack[256];
+    char *name;
+    wl_columnar_memory_reservation_t credit;
+    bool funded;
+} wl_columnar_session_private_name_t;
+
+static int
+wl_columnar_session_private_name_prepare(
+    wl_columnar_session_private_name_t *key, const char *prefix,
+    const char *name,
+    wl_columnar_memory_governor_ref_t *governor)
+{
+    memset(key, 0, sizeof(*key));
+    wl_columnar_memory_reservation_init(&key->credit);
+    size_t length = strlen(name);
+    size_t prefix_len = strlen(prefix);
+    if (length >= SIZE_MAX - prefix_len)
+        return EOVERFLOW;
+    size_t bytes = length + prefix_len + 1u;
+    key->name = key->stack;
+    if (bytes > sizeof(key->stack)) {
+        if (governor) {
+            wl_columnar_memory_admission_status_t status =
+                wl_columnar_memory_reserve_checked(
+                wl_columnar_memory_governor_ref_get(governor), bytes,
+                &key->credit);
+            if (status != WL_COLUMNAR_MEMORY_ADMISSION_OK
+                && status != WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY)
+                return status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED
+                    ? ENOSPC : status == WL_COLUMNAR_MEMORY_ADMISSION_OVERFLOW
+                    ? EOVERFLOW : EINVAL;
+        }
+        char *allocated = malloc(bytes);
+        if (!allocated) {
+            if (governor && !wl_columnar_memory_rollback(&key->credit))
+                abort();
+            return ENOMEM;
+        }
+        if (governor) {
+            if (!wl_columnar_memory_commit(&key->credit, allocated))
+                abort();
+            key->funded = true;
+        }
+        key->name = allocated;
+    }
+    memcpy(key->name, prefix, prefix_len);
+    memcpy(key->name + prefix_len, name, length + 1u);
+    return 0;
+}
+
+static void
+wl_columnar_session_private_name_discard(
+    wl_columnar_session_private_name_t *key)
+{
+    if (key->name && key->name != key->stack)
+        free(key->name);
+    key->name = NULL;
+    if (key->funded) {
+        if (!wl_columnar_memory_release(&key->credit))
+            abort();
+        key->funded = false;
+    }
+}
+
 #define WL_SEED_SHADOW_PREFIX "$in$"
 
 static int
@@ -3588,11 +3655,8 @@ session_seed_shadow_name(const char *relation, char *out, size_t cap)
 static col_rel_t *
 session_seed_shadow(wl_col_session_t *sess, const char *relation)
 {
-    char name[256];
-    if (!sess || !relation
-        || session_seed_shadow_name(relation, name, sizeof(name)) != 0)
-        return NULL;
-    return session_find_rel(sess, name);
+    return sess ? wl_columnar_session_find_prefixed(sess, WL_SEED_SHADOW_PREFIX,
+               relation) : NULL;
 }
 
 static bool
@@ -3624,11 +3688,18 @@ session_head_strata(const wl_plan_t *plan, const char *relation)
 
 /* Register an empty session-private relation called @name. */
 static int
-session_private_rel_create(wl_col_session_t *sess, const char *name)
+session_private_rel_create(wl_col_session_t *sess, const char *prefix,
+    const char *relation)
 {
     col_rel_t *rel = NULL;
-    int rc = wl_columnar_relation_alloc_governed(&rel, name,
+    wl_columnar_session_private_name_t key;
+    int rc = wl_columnar_session_private_name_prepare(&key, prefix, relation,
             sess->memory_governor);
+    if (rc != 0)
+        return rc;
+    rc = wl_columnar_relation_alloc_governed(&rel, key.name,
+            sess->memory_governor);
+    wl_columnar_session_private_name_discard(&key);
     if (rc != 0)
         return rc;
     rc = session_add_rel(sess, rel);
@@ -3642,9 +3713,7 @@ session_private_rel_create(wl_col_session_t *sess, const char *name)
 static int
 session_seed_shadow_create(wl_col_session_t *sess, const char *relation)
 {
-    char name[256];
-    int rc = session_seed_shadow_name(relation, name, sizeof(name));
-    return rc != 0 ? rc : session_private_rel_create(sess, name);
+    return session_private_rel_create(sess, WL_SEED_SHADOW_PREFIX, relation);
 }
 
 /* The shadow a host insert into @r must also write, created on the first
@@ -3804,11 +3873,7 @@ session_seed_shadow_apply_remove(col_rel_t *seed, uint8_t *mask)
 col_rel_t *
 wl_columnar_session_retired_rows(wl_col_session_t *sess, const char *relation)
 {
-    char name[256];
-    int len = snprintf(name, sizeof(name), WL_RETIRED_PREFIX "%s", relation);
-    if (len < 0 || (size_t)len >= sizeof(name))
-        return NULL;
-    return session_find_rel(sess, name);
+    return wl_columnar_session_find_prefixed(sess, WL_RETIRED_PREFIX, relation);
 }
 
 col_rel_t *
@@ -3998,15 +4063,10 @@ session_retire_committed_rows(wl_col_session_t *sess, const col_rel_t *r,
         return 0;
     retired = wl_columnar_session_retired_rows(sess, r->name);
     if (!retired) {
-        char name[256];
-        int len = snprintf(name, sizeof(name), WL_RETIRED_PREFIX "%s",
-                r->name);
-        if (len < 0 || (size_t)len >= sizeof(name))
-            return EOVERFLOW;
-        rc = session_private_rel_create(sess, name);
+        rc = session_private_rel_create(sess, WL_RETIRED_PREFIX, r->name);
         if (rc != 0)
             return rc;
-        retired = session_find_rel(sess, name);
+        retired = wl_columnar_session_retired_rows(sess, r->name);
     }
     if (!wl_columnar_memory_size_mul(count, r->ncols, &cells)
         || !wl_columnar_memory_size_mul(cells, sizeof(int64_t), &bytes)
@@ -9059,71 +9119,6 @@ col_session_remove_recorded(wl_session_t *session, const char *relation,
     return rc;
 }
 
-/* Short keys retain the stack path. A longer transient key has its own
- * admission until the private relation has copied and funded its owned name. */
-typedef struct {
-    char stack[256];
-    char *name;
-    wl_columnar_memory_reservation_t credit;
-    bool funded;
-} wl_columnar_session_retraction_name_t;
-
-static int
-wl_columnar_session_retraction_name_prepare(
-    wl_columnar_session_retraction_name_t *key, const char *name,
-    wl_columnar_memory_governor_ref_t *governor)
-{
-    memset(key, 0, sizeof(*key));
-    wl_columnar_memory_reservation_init(&key->credit);
-    size_t length = strlen(name);
-    if (length > SIZE_MAX - 4u)
-        return EOVERFLOW;
-    size_t bytes = length + 4u;
-    key->name = key->stack;
-    if (bytes > sizeof(key->stack)) {
-        if (governor) {
-            wl_columnar_memory_admission_status_t status =
-                wl_columnar_memory_reserve_checked(
-                wl_columnar_memory_governor_ref_get(governor), bytes,
-                &key->credit);
-            if (status != WL_COLUMNAR_MEMORY_ADMISSION_OK
-                && status != WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY)
-                return status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED
-                    ? ENOSPC : status == WL_COLUMNAR_MEMORY_ADMISSION_OVERFLOW
-                    ? EOVERFLOW : EINVAL;
-        }
-        char *allocated = malloc(bytes);
-        if (!allocated) {
-            if (governor && !wl_columnar_memory_rollback(&key->credit))
-                abort();
-            return ENOMEM;
-        }
-        if (governor) {
-            if (!wl_columnar_memory_commit(&key->credit, allocated))
-                abort();
-            key->funded = true;
-        }
-        key->name = allocated;
-    }
-    memcpy(key->name, "$r$", 3u);
-    memcpy(key->name + 3u, name, length + 1u);
-    return 0;
-}
-
-static void
-wl_columnar_session_retraction_name_discard(
-    wl_columnar_session_retraction_name_t *key)
-{
-    if (key->name && key->name != key->stack)
-        free(key->name);
-    key->name = NULL;
-    if (key->funded) {
-        if (!wl_columnar_memory_release(&key->credit))
-            abort();
-        key->funded = false;
-    }
-}
-
 /*
  * col_session_remove_incremental: Remove rows and pre-seed retraction deltas
  *
@@ -9210,7 +9205,7 @@ col_session_remove_incremental(wl_session_t *session, const char *relation,
     uint32_t match_capacity;
     bool denied = false;
     bool budget_denied = false;
-    wl_columnar_session_retraction_name_t key = { 0 };
+    wl_columnar_session_private_name_t key = { 0 };
     int rc = 0;
 
     match_capacity = num_rows < r->nrows ? num_rows : r->nrows;
@@ -9310,12 +9305,12 @@ col_session_remove_incremental(wl_session_t *session, const char *relation,
         }
     }
 
-    rc = wl_columnar_session_retraction_name_prepare(&key, r->name,
+    rc = wl_columnar_session_private_name_prepare(&key, "$r$", r->name,
             sess->memory_governor);
     if (rc == 0)
         rc = wl_columnar_relation_new_empty_named_like_locked(r, key.name,
                 sess->memory_governor, &rdelta);
-    wl_columnar_session_retraction_name_discard(&key);
+    wl_columnar_session_private_name_discard(&key);
     if (rc != 0 || !rdelta) {
         budget_denied = rc == ENOSPC;
         writer_rc = rc != 0 ? rc : ENOMEM;
@@ -9425,7 +9420,7 @@ col_session_remove_incremental(wl_session_t *session, const char *relation,
     writer_rc = 0;
 
 incremental_release:
-    wl_columnar_session_retraction_name_discard(&key);
+    wl_columnar_session_private_name_discard(&key);
     if (budget_denied)
         sess->remove_staging_budget_denied = true;
     if (previous_reader.owner)
