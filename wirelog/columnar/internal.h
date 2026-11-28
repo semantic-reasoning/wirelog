@@ -3146,6 +3146,11 @@ extern void (*wl_columnar_session_test_main_action_report)(
 extern void (*wl_columnar_session_test_main_action_advanced)(
     struct wl_col_session_t *, wl_evaluation_control_t *, uint64_t,
     unsigned, unsigned, unsigned, int);
+/* Runs once the MAIN grant is open, before the first charge of the action.
+ * rebegun is false on the prepared-close path, which reuses its grant. */
+extern void (*wl_columnar_session_test_main_action_begun)(
+    struct wl_col_session_t *, wl_evaluation_control_t *, uint64_t,
+    unsigned, unsigned, bool);
 int wl_columnar_session_test_observer_main_view(
     const struct wl_col_session_t *, uint64_t[16]);
 bool wl_columnar_session_test_terminal_credit(const struct wl_col_session_t *,

@@ -22961,6 +22961,9 @@ wl_columnar_session_main_execute(wl_col_session_t *sess,
 void (*wl_columnar_session_test_main_action_advanced)(
     wl_col_session_t *, wl_evaluation_control_t *, uint64_t,
     unsigned, unsigned, unsigned, int);
+void (*wl_columnar_session_test_main_action_begun)(
+    wl_col_session_t *, wl_evaluation_control_t *, uint64_t, unsigned,
+    unsigned, bool);
 #endif
 
 static int
@@ -23253,6 +23256,9 @@ wl_columnar_session_main_action(wl_col_session_t *sess,
         ((wl_columnar_arrangement_diff_attempt_t *)target)->cleanup_phase :
         target ==
         &step->observed_observer ? step->observed_observer.resource.phase : 0;
+    if (wl_columnar_session_test_main_action_begun)
+        wl_columnar_session_test_main_action_begun(sess, f->control, f->id,
+            recipient, action, !wl_columnar_session_close_live(step));
 #endif
     if (wl_columnar_session_close_live(step))
         step->prepared_close.native_no_progress = false;

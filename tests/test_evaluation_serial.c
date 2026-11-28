@@ -6643,6 +6643,11 @@ typedef struct {
     bool done_last, done_cancel;
     uint64_t refusing; /* expected consumption of the refused grant + 1 */
     bool cancelling, refusing_commit;
+    /* Pre-action cancel mode: the same first PAY, first DESCRIBE, first
+     * COMMIT and last PAY are cancelled on their open MAIN grant before
+     * their first charge instead of refused. */
+    bool precancel, precancelling, precancelling_commit;
+    unsigned precancelled, begun_cancels;
     controlled_recursive_main_hook_t previous_advanced;
     /* Settled state after the retirement, compared across histories. */
     wl_mem_ledger_snapshot_t ledger;
@@ -6667,9 +6672,20 @@ diff_main_limit(const wl_col_session_t *session, unsigned recipient,
     if (!p || session != p->session || recipient != DIFF_MAIN_RECIPIENT)
         return capacity;
     CHECK(capacity == WL_COLUMNAR_SESSION_MAIN_GRANT_WORK && !p->refusing
-        && !p->cancelling);
+        && !p->cancelling && !p->precancelling);
     if (!p->inject || p->count < p->inserted) return capacity;
     const unsigned h = p->count - p->inserted;
+    if (p->precancel) {
+        bool *done = h == p->pay_first ? &p->done_pay_first
+            : h == p->describe_first ? &p->done_describe
+            : h == p->commit_first ? &p->done_commit_first
+            : h == p->last ? &p->done_last : NULL;
+        if (done && !*done) {
+            *done = true; p->precancelling = true;
+            p->precancelling_commit = h == p->commit_first;
+        }
+        return capacity;
+    }
     if (h == p->pay_first && !p->done_pay_first) {
         p->done_pay_first = true; p->refusing = 1;
         return DIFF_MAIN_PAY - 1u;
@@ -6707,6 +6723,13 @@ diff_main_advanced(wl_col_session_t *session, wl_evaluation_control_t *funding,
 {
     diff_main_probe_t *p = diff_main_probe;
     if (p && session == p->session && recipient == DIFF_MAIN_RECIPIENT
+        && p->precancelling) {
+        /* The action stopped at its first charge; a cancelled payment or
+         * description did not advance the cleanup. */
+        CHECK(result == WL_EVALUATION_CONTROL_CANCELLED);
+        CHECK(p->precancelling_commit || before == after);
+    }
+    if (p && session == p->session && recipient == DIFF_MAIN_RECIPIENT
         && p->cancelling) {
         /* A drain step that progressed returns 0 or EAGAIN; the stop latches
          * on the MAIN grant after its effect. */
@@ -6720,6 +6743,21 @@ diff_main_advanced(wl_col_session_t *session, wl_evaluation_control_t *funding,
             result);
 }
 
+/* The cancel latches on the open MAIN grant before the action runs, so its
+ * first charge (a 0-work poll included) observes it. */
+static void
+diff_main_begun(wl_col_session_t *session, wl_evaluation_control_t *funding,
+    uint64_t id, unsigned recipient, unsigned action, bool rebegun)
+{
+    diff_main_probe_t *p = diff_main_probe;
+    (void)id; (void)action;
+    if (!p || session != p->session || recipient != DIFF_MAIN_RECIPIENT
+        || !p->precancelling) return;
+    CHECK(rebegun);
+    wl_evaluation_control_request_cancel(funding);
+    ++p->begun_cancels;
+}
+
 static void
 diff_main_report(const wl_col_session_t *session, unsigned recipient,
     unsigned action, wl_evaluation_control_report_t report, int result)
@@ -6728,6 +6766,21 @@ diff_main_report(const wl_col_session_t *session, unsigned recipient,
     (void)action;
     if (!p || session != p->session || recipient != DIFF_MAIN_RECIPIENT)
         return;
+    if (p->precancelling) {
+        /* Cancelled before its first charge: nothing is spent, the stop is
+         * a cancellation, and the grant stayed whole (a refusal would show
+         * the one-short limit and a WORK stop). */
+        CHECK(result == WL_EVALUATION_CONTROL_CANCELLED && !report.consumed
+            && report.stop_reason == WL_EVALUATION_CONTROL_CANCELLED
+            && report.limit == WL_COLUMNAR_SESSION_MAIN_GRANT_WORK);
+        if (p->precancelling_commit) {
+            /* COMMIT consumes its description before its first charge. */
+            p->inserted += 2u;
+            p->precancelling_commit = false;
+        }
+        p->precancelling = false; ++p->precancelled;
+        return;
+    }
     if (p->refusing) {
         CHECK(result == WL_EVALUATION_CONTROL_WORK_LIMIT
             && report.consumed == p->refusing - 1u);
@@ -6826,13 +6879,15 @@ diff_main_history(diff_main_probe_t *p, const diff_main_probe_t *healthy)
     wl_columnar_session_test_main_limit = diff_main_limit;
     wl_columnar_session_test_main_action_report = diff_main_report;
     wl_columnar_session_test_main_action_advanced = diff_main_advanced;
+    wl_columnar_session_test_main_action_begun = diff_main_begun;
     int rc = observed_multi_step(session);
+    wl_columnar_session_test_main_action_begun = NULL;
     wl_columnar_session_test_main_limit = NULL;
     wl_columnar_session_test_main_action_report = NULL;
     wl_columnar_session_test_main_action_advanced = p->previous_advanced;
     diff_main_probe = NULL;
     CHECK(!rc && !wl_session_step(reference) && !p->refusing
-        && !p->cancelling);
+        && !p->cancelling && !p->precancelling);
 
     wl_col_session_t *cs = (wl_col_session_t *)session;
     CHECK(!cs->diff_txn_count && actual->count == expected->count);
@@ -6862,7 +6917,11 @@ diff_main_history(diff_main_probe_t *p, const diff_main_probe_t *healthy)
  * consumed, so an acknowledgement and a fresh description precede the retry.
  * A cancel after a payment keeps its effect. The injected history performs
  * exactly the healthy sequence with those two actions before each refused
- * commit, and delivers the reference session's events. */
+ * commit, and delivers the reference session's events. A third history
+ * cancels the first payment, description and commit and the last payment on
+ * their open MAIN grant before their first charge: each stops CANCELLED with
+ * nothing spent and the whole grant left, and the cancelled commit again
+ * needs a fresh acknowledgement and description. */
 static void
 test_controlled_persistent_diff_main_stops(void)
 {
@@ -6902,7 +6961,40 @@ test_controlled_persistent_diff_main_stops(void)
         && injected->original.cleanup_status
         == healthy->original.cleanup_status
         && injected->original.result == healthy->original.result);
-    free(healthy); free(injected);
+
+    /* Cancelling the same positions before their first charge spends
+     * nothing. A cancelled COMMIT has consumed its description exactly as a
+     * refused one, and the settled state again equals the healthy one. */
+    diff_main_probe_t *cancelled = calloc(1, sizeof(*cancelled));
+    CHECK(cancelled);
+    cancelled->inject = cancelled->precancel = true;
+    diff_main_history(cancelled, healthy);
+    CHECK(cancelled->precancelled == 4u && cancelled->begun_cancels == 4u
+        && !cancelled->refused && !cancelled->cancelled
+        && cancelled->inserted == 2u
+        && cancelled->count == healthy->count + 2u);
+    j = 0;
+    for (unsigned i = 0; i < healthy->count; ++i) {
+        if (i == cancelled->commit_first) {
+            CHECK(cancelled->consumed[j] == DIFF_MAIN_PAY
+                && cancelled->consumed[j + 1u] == DIFF_MAIN_DESCRIBE);
+            j += 2u;
+        }
+        CHECK(cancelled->consumed[j++] == healthy->consumed[i]);
+    }
+    CHECK(j == cancelled->count);
+    CHECK(cancelled->ledger.current_bytes == healthy->ledger.current_bytes
+        && !memcmp(cancelled->ledger.subsys_bytes,
+        healthy->ledger.subsys_bytes, sizeof(healthy->ledger.subsys_bytes)));
+    CHECK(cancelled->original.consumed == healthy->original.consumed
+        && cancelled->original.limit == healthy->original.limit
+        && cancelled->original.stop_reason == healthy->original.stop_reason
+        && cancelled->original.execution_status
+        == healthy->original.execution_status
+        && cancelled->original.cleanup_status
+        == healthy->original.cleanup_status
+        && cancelled->original.result == healthy->original.result);
+    free(healthy); free(injected); free(cancelled);
 }
 
 /* Observer MAIN recipients. Each observer action pays the observer MAIN
