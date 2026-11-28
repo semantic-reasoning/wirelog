@@ -2091,6 +2091,51 @@ run_claims_end(unsigned heads, bool observed)
     free(trace.keys);
 }
 
+/* Take the domain before selecting endpoints so absent and unknown
+ * public shapes cannot disappear through a replay filter. */
+static void
+run_prepublication_audit(unsigned heads, bool observed)
+{
+    public_trace_t trace = {0};
+    trace.keys = calloc(16384, sizeof(*trace.keys));
+    trace.public_ordinal = calloc(16384, sizeof(*trace.public_ordinal));
+    CHECK(trace.keys && trace.public_ordinal);
+    ended_case_record(heads, observed, NULL, NULL, UINT32_MAX, 0, false,
+        &trace, prepublication_end_domain);
+    unsigned counts[4] = {0};
+    unsigned readers[3] = {0}, initializing[3] = {0}, begun[3] = {0};
+    for (unsigned i = 0; i < trace.count; i++) {
+        const public_key_t *key = &trace.keys[i];
+        CHECK(prepublication_end_domain(key) && key->head_count == heads
+            && !key->round_active && !key->retirement[0] && !key->child_active
+            && !key->child[0] && !key->receipt_pending && !key->receipt_ack
+            && !key->main[0] && !key->observer[0] && !key->resource[0]);
+        counts[key->phase - 11]++;
+        if (key->phase != 12 && key->phase != 13) continue;
+        CHECK(key->claim[1] == heads + 1 && key->claim[0] > 0
+            && key->claim[0] < key->claim[1] && key->claim[2]);
+        unsigned slot = (unsigned)key->claim[0];
+        if (key->phase == 12) {
+            CHECK(key->claim[3] && !key->claim[4] && !key->claim[11]);
+            readers[slot]++;
+        } else {
+            CHECK(!key->claim[3] && key->claim[4] && key->claim[5] == 3
+                && key->claim[9] && key->claim[11] == ((1u << slot) - 2u));
+            if (key->claim[6]) begun[slot]++;
+            else initializing[slot]++;
+        }
+    }
+    CHECK(!counts[0] && counts[1] == heads && counts[2] && !counts[3]);
+    for (unsigned slot = 1; slot <= heads; slot++)
+        CHECK(readers[slot] && initializing[slot] && begun[slot]);
+    printf(
+        "prepublication_audit heads%u observer%d registry%u readers%u claims%u cutoff%u initializing%u begun%u passed\n",
+        heads, observed, counts[0], counts[1], counts[2], counts[3],
+        initializing[1] + initializing[2], begun[1] + begun[2]);
+    free(trace.public_ordinal);
+    free(trace.keys);
+}
+
 static void
 run_ended(unsigned heads, bool observed)
 {
@@ -2515,14 +2560,17 @@ main(int argc, char **argv)
     CHECK(!environment("WIRELOG_JOIN_BATCH_BYTES", "")
         && !environment("WIRELOG_JOIN_BATCH_STRICT", ""));
     if (argc == 4 && (!strcmp(argv[1], "readers-end")
-        || !strcmp(argv[1], "claims-end"))) {
+        || !strcmp(argv[1], "claims-end")
+        || !strcmp(argv[1], "prepublication-audit"))) {
         unsigned heads = (unsigned)strtoul(argv[2], NULL, 10);
         unsigned observed = (unsigned)strtoul(argv[3], NULL, 10);
         CHECK(heads >= 1 && heads <= 2 && observed <= 1);
         if (!strcmp(argv[1], "readers-end"))
             run_readers_end(heads, observed != 0);
-        else
+        else if (!strcmp(argv[1], "claims-end"))
             run_claims_end(heads, observed != 0);
+        else
+            run_prepublication_audit(heads, observed != 0);
         return 0;
     }
     if (argc == 4 && !strcmp(argv[1], "observer-audit")) {
