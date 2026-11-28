@@ -629,7 +629,7 @@ staging_faults(void)
                 if ((!pending && failure == 3) ||
                     (input_head && failure >= 2)) continue;
                 fixture_t f;
-                fixture_open_impl(&f, input_head ? 6 : 300, true, 1,
+                fixture_open_impl(&f, input_head && !pending ? 6 : 300, true, 1,
                     false, true, false, false, input_head != 0);
                 col_rel_t *source = session_find_rel(COL_SESSION(f.session),
                         f.names[0]);

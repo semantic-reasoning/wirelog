@@ -454,7 +454,7 @@ test_work_limits(void)
     wirelog_session_destroy(s);
     wirelog_program_free(prog);
 
-    /* A head name too long for its `$in$` shadow name. */
+    /* Inspect a long rule head before and after its seed shadow exists. */
     char name[300];
     memset(name, 'q', 260);
     name[260] = '\0';
@@ -466,7 +466,12 @@ test_work_limits(void)
     s = open_session(prog, 1);
     n = 9;
     CHECK(wirelog_session_source_count(s, name, &v, 1, ALL, &n)
-        == WIRELOG_SOURCE_QUERY_OVERFLOW && n == 0, "long head name");
+        == WIRELOG_SOURCE_QUERY_OK && n == 0, "empty long head");
+    ins1(s, name, v);
+    CHECK(count1(s, name, v) == 1, "long head seed");
+    step(s);
+    rem1(s, name, v);
+    CHECK(count1(s, name, v) == 0, "removed long head seed");
     wirelog_session_destroy(s);
     wirelog_program_free(prog);
 }
