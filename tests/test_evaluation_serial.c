@@ -5052,9 +5052,55 @@ typedef struct {
     controlled_recursive_main_hook_t previous_advanced;
     void (*previous_begun)(wl_col_session_t *, wl_evaluation_control_t *,
         uint64_t, unsigned, unsigned, bool);
+    /* Effective actions per acknowledged merge, from the layout. Every
+     * effective BEGIN must follow exactly that many effective actions of
+     * the previous merge. */
+    unsigned per_merge, begins, last_begin;
+    bool count_after_stop, after_stop_began;
 } merge_ack_main_probe_t;
 
 static merge_ack_main_probe_t merge_ack_main_probe;
+
+/* Effective MERGE_ACK actions that acknowledge one managed merge: BEGIN, one
+ * action per retirement, one per retirement token, then the destructive
+ * clear. The clear initializes each token atomic in its own action and
+ * zeroes every gap before, between and after them one clear chunk per
+ * action. Offsets are taken from an actual object. */
+static unsigned
+merge_ack_actions_per_merge(void)
+{
+    static wl_columnar_managed_candidate_merge_t m;
+    const unsigned retirements = (unsigned)(sizeof(m.retirements)
+        / sizeof(m.retirements[0]));
+    const unsigned tokens = (unsigned)(sizeof(m.retirements[0].tokens)
+        / sizeof(m.retirements[0].tokens[0]));
+    const size_t chunk = WL_COLUMNAR_MANAGED_MERGE_ACK_CLEAR_CHUNK;
+    const unsigned char *base = (const unsigned char *)&m;
+    unsigned clear = 0;
+    size_t cursor = 0;
+    for (unsigned r = 0; r < retirements; ++r)
+        for (unsigned t = 0; t < tokens; ++t) {
+            const wl_columnar_memory_reservation_t *k =
+                &m.retirements[r].tokens[t];
+            const unsigned char *atomics[2] = {
+                (const unsigned char *)&k->owner_bits,
+                (const unsigned char *)&k->state
+            };
+            for (unsigned a = 0; a < 2u; ++a) {
+                const size_t at = (size_t)(atomics[a] - base);
+                CHECK(at >= cursor);
+                clear += (unsigned)((at - cursor + chunk - 1u) / chunk) + 1u;
+                cursor = at + sizeof(k->state);
+            }
+        }
+    CHECK(cursor <= sizeof(m));
+    clear += (unsigned)((sizeof(m) - cursor + chunk - 1u) / chunk);
+    const unsigned per_merge = 1u + retirements + retirements * tokens
+        + clear;
+    CHECK(per_merge > 1u + retirements + retirements * tokens
+        + 2u * retirements * tokens);
+    return per_merge;
+}
 
 /* Refusal targets are positions in the healthy action sequence, so each
  * refused grant is retried by the same action. The middle target is refused
@@ -5179,10 +5225,17 @@ merge_ack_main_report(const wl_col_session_t *session, unsigned recipient,
         CHECK(p->effective < MERGE_ACK_MAIN_MAX);
         merge_ack_healthy_actions[p->effective] = (unsigned char)action;
     }
-    ++p->effective;
-    if ((p->refuse_after_stop || p->precancel_after_stop)
-        && controlled_recursive_stop_fired)
+    if (action == MERGE_ACK_MAIN_BEGIN) {
+        if (p->begins) CHECK(p->effective - p->last_begin == p->per_merge);
+        ++p->begins; p->last_begin = p->effective;
+    }
+    if (p->count_after_stop && controlled_recursive_stop_fired) {
+        /* Abort cleanup acknowledges the DONE merge from its BEGIN. */
+        if (!p->after_stop_effective) CHECK(action == MERGE_ACK_MAIN_BEGIN);
+        if (action == MERGE_ACK_MAIN_BEGIN) p->after_stop_began = true;
         ++p->after_stop_effective;
+    }
+    ++p->effective;
 }
 
 enum {
@@ -5191,8 +5244,31 @@ enum {
     MERGE_ACK_HISTORY_PRECANCEL
 };
 
-static unsigned
-merge_ack_main_history(unsigned mode, unsigned healthy)
+/* Settled state of a MERGE_ACK history, compared across histories. */
+typedef struct {
+    unsigned effective, begins;
+    wl_mem_ledger_snapshot_t ledger;
+    wl_evaluation_control_report_t original;
+} merge_ack_outcome_t;
+
+static bool
+merge_ack_outcome_settled_equal(const merge_ack_outcome_t *a,
+    const merge_ack_outcome_t *b)
+{
+    return a->ledger.current_bytes == b->ledger.current_bytes
+           && !memcmp(a->ledger.subsys_bytes, b->ledger.subsys_bytes,
+               sizeof(a->ledger.subsys_bytes))
+           && a->original.consumed == b->original.consumed
+           && a->original.limit == b->original.limit
+           && a->original.stop_reason == b->original.stop_reason
+           && a->original.execution_status == b->original.execution_status
+           && a->original.cleanup_status == b->original.cleanup_status
+           && a->original.result == b->original.result;
+}
+
+static void
+merge_ack_main_history(unsigned mode, unsigned healthy,
+    merge_ack_outcome_t *out)
 {
     const int64_t edges[] = { 1, 2, 2, 3, 3, 4 };
     const int64_t later_edge[] = { 4, 5 };
@@ -5205,6 +5281,7 @@ merge_ack_main_history(unsigned mode, unsigned healthy)
     merge_ack_main_probe_t *p = &merge_ack_main_probe;
     memset(p, 0, sizeof(*p));
     p->session = columnar;
+    p->per_merge = merge_ack_actions_per_merge();
     p->inject = mode == MERGE_ACK_HISTORY_REFUSE;
     p->precancel = mode == MERGE_ACK_HISTORY_PRECANCEL;
     p->record_healthy = mode == MERGE_ACK_HISTORY_HEALTHY;
@@ -5259,13 +5336,18 @@ merge_ack_main_history(unsigned mode, unsigned healthy)
         CHECK(!p->refused && !p->cancelled && !p->precancelled
             && p->grants == p->effective);
     }
-    unsigned effective = p->effective;
+    /* Every acknowledged merge took exactly its layout's actions. */
+    CHECK(p->begins && p->effective - p->last_begin == p->per_merge
+        && p->effective == p->begins * p->per_merge);
+    memset(out, 0, sizeof(*out));
+    out->effective = p->effective; out->begins = p->begins;
+    wl_mem_ledger_snapshot(&columnar->mem_ledger, &out->ledger);
+    CHECK(!wl_evaluation_control_report(control, &out->original));
     p->session = NULL;
     wl_session_destroy(session);
     wl_evaluation_control_release(control);
     wl_plan_free(plan);
     wirelog_program_free(program);
-    return effective;
 }
 
 /* Actual recursive sessions acknowledge every managed merge through MAIN.
@@ -5273,19 +5355,30 @@ merge_ack_main_history(unsigned mode, unsigned healthy)
  * injected run performs exactly the healthy run's effective actions and
  * publishes the same path. So does a run whose first BEGIN and a STEP from
  * the middle of the history on are cancelled on their open grant before
- * their first charge. */
+ * their first charge. Every acknowledged merge takes exactly the actions its
+ * layout implies, and the ledger and original control settle as in the
+ * healthy history. */
 static void
 test_controlled_recursive_merge_ack_main_stops(void)
 {
-    const unsigned healthy =
-        merge_ack_main_history(MERGE_ACK_HISTORY_HEALTHY, 0);
-    printf("recursive MERGE_ACK: %u MAIN actions per healthy history\n",
-        healthy);
-    CHECK(healthy >= 3u);
-    CHECK(merge_ack_main_history(MERGE_ACK_HISTORY_REFUSE, healthy)
-        == healthy);
-    CHECK(merge_ack_main_history(MERGE_ACK_HISTORY_PRECANCEL, healthy)
-        == healthy);
+    merge_ack_outcome_t healthy, refused, cancelled;
+    merge_ack_main_history(MERGE_ACK_HISTORY_HEALTHY, 0, &healthy);
+    printf("recursive MERGE_ACK: %u MAIN actions per healthy history, "
+        "%u merges of %u actions\n", healthy.effective, healthy.begins,
+        merge_ack_actions_per_merge());
+    CHECK(healthy.effective >= 3u);
+    merge_ack_main_history(MERGE_ACK_HISTORY_REFUSE, healthy.effective,
+        &refused);
+    merge_ack_main_history(MERGE_ACK_HISTORY_PRECANCEL, healthy.effective,
+        &cancelled);
+    /* Refusals and cancels neither replay nor drop an action, and leave the
+     * ledger and the original control as the healthy history does. */
+    CHECK(refused.effective == healthy.effective
+        && refused.begins == healthy.begins
+        && cancelled.effective == healthy.effective
+        && cancelled.begins == healthy.begins);
+    CHECK(merge_ack_outcome_settled_equal(&refused, &healthy)
+        && merge_ack_outcome_settled_equal(&cancelled, &healthy));
 }
 
 /* A stop of the original control after a merge sends the recursive step to
@@ -5293,9 +5386,16 @@ test_controlled_recursive_merge_ack_main_stops(void)
  * first MERGE_ACK grant there that is refused, or cancelled before its first
  * charge, is retried, the stopped epoch keeps the published path, and a
  * healthy retry completes it. */
+enum {
+    MERGE_ACK_ABORT_HEALTHY,
+    MERGE_ACK_ABORT_REFUSE,
+    MERGE_ACK_ABORT_PRECANCEL
+};
+
 static void
-merge_ack_abort_history(bool precancel)
+merge_ack_abort_history(unsigned mode, merge_ack_outcome_t *out)
 {
+    const bool precancel = mode == MERGE_ACK_ABORT_PRECANCEL;
     const int64_t edges[] = { 1, 2, 2, 3, 3, 4 };
     const int64_t later_edge[] = { 4, 5 };
     wl_plan_t *plan = NULL;
@@ -5315,8 +5415,10 @@ merge_ack_abort_history(bool precancel)
     merge_ack_main_probe_t *p = &merge_ack_main_probe;
     memset(p, 0, sizeof(*p));
     p->session = columnar;
-    p->refuse_after_stop = !precancel;
+    p->refuse_after_stop = mode == MERGE_ACK_ABORT_REFUSE;
     p->precancel_after_stop = precancel;
+    p->count_after_stop = true;
+    p->per_merge = merge_ack_actions_per_merge();
     p->previous_advanced = wl_columnar_session_test_main_action_advanced;
     wl_columnar_session_test_main_limit = merge_ack_main_limit;
     wl_columnar_session_test_main_action_report = merge_ack_main_report;
@@ -5341,15 +5443,21 @@ merge_ack_abort_history(bool precancel)
     /* The checkpoint exhausts the original control's work. */
     CHECK(controlled_recursive_stop_fired
         && rc == WL_EVALUATION_CONTROL_WORK_LIMIT);
-    CHECK(p->after_stop_refused == (precancel ? 0u : 1u)
+    /* After the stop, abort cleanup acknowledges exactly one merge. */
+    CHECK(p->after_stop_refused == (mode == MERGE_ACK_ABORT_REFUSE ? 1u : 0u)
         && p->after_stop_precancelled == (precancel ? 1u : 0u)
         && p->begun_cancels == p->after_stop_precancelled
         && p->precancelled == p->after_stop_precancelled
-        && p->after_stop_effective != 0u
+        && (!precancel || p->precancel_action == MERGE_ACK_MAIN_BEGIN)
+        && p->after_stop_began && p->after_stop_effective == p->per_merge
         && !p->refusing && !p->cancelling && !p->precancelling);
     wl_evaluation_control_report_t report;
     CHECK(!wl_evaluation_control_report(control, &report)
         && report.result == rc);
+    memset(out, 0, sizeof(*out));
+    out->effective = p->effective; out->begins = p->begins;
+    out->original = report;
+    wl_mem_ledger_snapshot(&columnar->mem_ledger, &out->ledger);
     CHECK(session_find_rel(columnar, "path") == old_path
         && old_path->nrows == 6 && !columnar->cleanup_active
         && !columnar->cleanup_pending);
@@ -5369,8 +5477,19 @@ merge_ack_abort_history(bool precancel)
 static void
 test_controlled_recursive_merge_ack_abort_refusal(void)
 {
-    merge_ack_abort_history(false);
-    merge_ack_abort_history(true);
+    merge_ack_outcome_t healthy, refused, cancelled;
+    merge_ack_abort_history(MERGE_ACK_ABORT_HEALTHY, &healthy);
+    merge_ack_abort_history(MERGE_ACK_ABORT_REFUSE, &refused);
+    merge_ack_abort_history(MERGE_ACK_ABORT_PRECANCEL, &cancelled);
+    /* The stopped epoch spends the same effective actions and settles the
+     * ledger and the stopped original control as the abort without MAIN
+     * stops does. */
+    CHECK(refused.effective == healthy.effective
+        && cancelled.effective == healthy.effective
+        && refused.begins == healthy.begins
+        && cancelled.begins == healthy.begins);
+    CHECK(merge_ack_outcome_settled_equal(&refused, &healthy)
+        && merge_ack_outcome_settled_equal(&cancelled, &healthy));
 }
 
 static void
