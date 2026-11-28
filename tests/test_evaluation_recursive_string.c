@@ -1560,6 +1560,13 @@ observer_end_domain(const public_key_t *k)
 }
 
 static bool
+prepublication_end_domain(const public_key_t *k)
+{
+    return k->available && !k->published && !k->committed
+           && k->phase >= 11 && k->phase <= 14;
+}
+
+static bool
 owner_unselected(const public_key_t *k)
 {
     return owner_domain(k) && !k->main[0];
@@ -1609,7 +1616,7 @@ owner_report(const wl_col_session_t *col, wl_evaluation_control_t *control,
 static void
 ended_case_record(unsigned heads, bool observed, ended_trace_t *record,
     const public_key_t *expected, unsigned target, unsigned outcome, bool early,
-    public_trace_t *owner_record, bool observer_record)
+    public_trace_t *trace, bool (*record_domain)(const public_key_t *))
 {
     fixture_t f; fixture_init(&f, heads, observed);
     CHECK(!step(&f) && !wl_session_step(f.reference));
@@ -1629,6 +1636,7 @@ ended_case_record(unsigned heads, bool observed, ended_trace_t *record,
     bool stopping_case = expected || early;
     owner_auth_t auth = {.fixture = &f};
     bool authenticate_main = expected && owner_selected(expected);
+    bool authenticate_claim = expected && expected->phase == 13;
     if (authenticate_main) {
         CHECK(!owner_auth && !wl_columnar_session_test_main_action_advanced
             && !wl_columnar_session_test_main_report_finished);
@@ -1646,13 +1654,11 @@ ended_case_record(unsigned heads, bool observed, ended_trace_t *record,
             && !wl_columnar_session_test_string_custody(col, &key));
         if (stopping_case || (rc == EAGAIN && !key.published && !key.committed))
             life_public(&f, old, snapshots, stop.successor);
-        if (owner_record && rc == EAGAIN
-            && (observer_record ? observer_end_domain(&key) :
-            owner_domain(&key))) {
-            CHECK(owner_record->count < 16384);
-            unsigned at = owner_record->count++;
-            owner_record->keys[at] = key;
-            owner_record->public_ordinal[at] = calls;
+        if (trace && rc == EAGAIN && record_domain(&key)) {
+            CHECK(trace->count < 16384);
+            unsigned at = trace->count++;
+            trace->keys[at] = key;
+            trace->public_ordinal[at] = calls;
         }
         int category = ended_category(&key);
         if (record && rc == EAGAIN && category >= 0 && category < 2) {
@@ -1676,9 +1682,18 @@ ended_case_record(unsigned heads, bool observed, ended_trace_t *record,
             CHECK(category >= 0 || endstage_eligible(&key)
                 || unbound_eligible(&key) || cleared_eligible(&key)
                 || receipt_eligible(&key) || owner_unselected(&key)
-                || owner_selected(&key) || observer_end_domain(&key));
+                || owner_selected(&key) || observer_end_domain(&key)
+                || prepublication_end_domain(&key));
             if (expected) CHECK(public_equal(&key, expected));
             inject(&stop);
+            if (authenticate_claim) {
+                CHECK(!owner_auth &&
+                    !wl_columnar_session_test_main_action_advanced
+                    && !wl_columnar_session_test_main_report_finished);
+                owner_auth = &auth;
+                wl_columnar_session_test_main_action_advanced = owner_advanced;
+                wl_columnar_session_test_main_report_finished = owner_report;
+            }
             CHECK(wl_session_insert(f.session, "input", &fresh, 1, 1) == EBUSY
                 && wl_session_remove(f.session, "input", &fresh, 1,
                 1) == EBUSY);
@@ -1724,7 +1739,7 @@ ended_case_record(unsigned heads, bool observed, ended_trace_t *record,
             heads, observed, target, outcome, stop.hit, after_end, first_error,
             rc, terminal);
     CHECK(terminal);
-    if (authenticate_main) {
+    if (authenticate_main || authenticate_claim) {
         CHECK(auth.advances && auth.reports);
         wl_columnar_session_test_main_action_advanced = NULL;
         wl_columnar_session_test_main_report_finished = NULL;
@@ -1745,7 +1760,8 @@ ended_case_record(unsigned heads, bool observed, ended_trace_t *record,
             main_view) && !main_view[0]
             && !wl_columnar_session_test_retirement_view(col, retirement)
             && !retirement[0]);
-        if (expected && observer_end_domain(expected))
+        if (expected && (observer_end_domain(expected)
+            || prepublication_end_domain(expected)))
             CHECK(!col->delta_observer && !col->delta_observer_build
                 && !col->delta_observer_prepare
                 && !col->delta_observer_retirement_governor
@@ -1771,7 +1787,8 @@ ended_case_record(unsigned heads, bool observed, ended_trace_t *record,
             retry_calls++) {
             retried = wl_session_step(f.session);
             if (expected &&
-                (owner_domain(expected) || observer_end_domain(expected))
+                (owner_domain(expected) || observer_end_domain(expected)
+                || prepublication_end_domain(expected))
                 && retried == EAGAIN)
                 CHECK(f.session->backend->session_controlled_step_state(
                         f.session)
@@ -1793,7 +1810,7 @@ ended_case(unsigned heads, bool observed, ended_trace_t *record,
     const public_key_t *expected, unsigned target, unsigned outcome, bool early)
 {
     ended_case_record(heads, observed, record, expected, target, outcome, early,
-        NULL, false);
+        NULL, NULL);
 }
 
 /* Only initialized semantic custody enters the finite key, never raw IDs or
@@ -1828,7 +1845,7 @@ run_owner(unsigned heads, bool observed, bool census, bool selected_main,
     t.pick = calloc(16384, sizeof(*t.pick));
     CHECK(t.keys && t.public_ordinal && t.class_id && t.pick);
     ended_case_record(heads, observed, NULL, NULL, UINT32_MAX, 0, false, &t,
-        false);
+        owner_domain);
     unsigned first[2048], last[2048], classes = 0, observations = 0;
     unsigned markers[4] = {0}, rounds = 0;
     bool reached[16][3] = {{false}};
@@ -1914,7 +1931,7 @@ run_observer_end(unsigned heads, bool observed, unsigned phase, bool census)
     t.public_ordinal = calloc(16384, sizeof(*t.public_ordinal));
     CHECK(t.keys && t.public_ordinal);
     ended_case_record(heads, observed, NULL, NULL, UINT32_MAX, 0, false, &t,
-        true);
+        observer_end_domain);
     unsigned counts[2] = {0};
     unsigned first[128], last[128], classes = 0, histories = 0;
     for (unsigned i = 0; i < t.count; i++) {
@@ -1969,7 +1986,7 @@ run_observer_audit(unsigned heads, bool observed)
     trace.public_ordinal = calloc(16384, sizeof(*trace.public_ordinal));
     CHECK(trace.keys && trace.public_ordinal);
     ended_case_record(heads, observed, NULL, NULL, UINT32_MAX, 0, false,
-        &trace, true);
+        &trace, observer_end_domain);
     unsigned returns[2] = {0}, readers[2] = {0};
     for (unsigned i = 0; i < trace.count; i++) {
         const public_key_t *key = &trace.keys[i];
@@ -1992,6 +2009,129 @@ run_observer_audit(unsigned heads, bool observed)
     printf(
         "observer_audit heads%u observer%d baseline%u readers%u events%u readers%u passed\n",
         heads, observed, returns[0], readers[0], returns[1], readers[1]);
+    free(trace.public_ordinal);
+    free(trace.keys);
+}
+
+static void
+run_readers_end(unsigned heads, bool observed)
+{
+    public_trace_t trace = {0};
+    trace.keys = calloc(16384, sizeof(*trace.keys));
+    trace.public_ordinal = calloc(16384, sizeof(*trace.public_ordinal));
+    CHECK(trace.keys && trace.public_ordinal);
+    ended_case_record(heads, observed, NULL, NULL, UINT32_MAX, 0, false,
+        &trace, prepublication_end_domain);
+    unsigned readers = 0;
+    for (unsigned i = 0; i < trace.count; i++) {
+        const public_key_t *key = &trace.keys[i];
+        if (key->phase != 12) continue;
+        CHECK(key->claim[0] < key->claim[1] && key->claim[2]
+            && key->claim[3] && !key->claim[4] && !key->main[0]);
+        for (unsigned outcome = 2; outcome <= 3; outcome++)
+            ended_case(heads, observed, NULL, key, trace.public_ordinal[i],
+                outcome, false);
+        readers++;
+    }
+    CHECK(readers == heads);
+    printf("readers_end heads%u observer%d returns%u histories%u passed\n",
+        heads, observed, readers, 2 * readers);
+    free(trace.public_ordinal);
+    free(trace.keys);
+}
+
+static void
+run_claims_end(unsigned heads, bool observed)
+{
+    public_trace_t trace = {0};
+    trace.keys = calloc(16384, sizeof(*trace.keys));
+    trace.public_ordinal = calloc(16384, sizeof(*trace.public_ordinal));
+    CHECK(trace.keys && trace.public_ordinal);
+    ended_case_record(heads, observed, NULL, NULL, UINT32_MAX, 0, false,
+        &trace, prepublication_end_domain);
+    unsigned first[128], last[128], classes = 0, returns = 0, histories = 0;
+    bool unbegun = false, begun = false, prior = false;
+    for (unsigned i = 0; i < trace.count; i++) {
+        const public_key_t *key = &trace.keys[i];
+        if (key->phase != 13) continue;
+        CHECK(key->claim[0] < key->claim[1] && key->claim[2] && !key->claim[3]
+            && key->claim[4] && key->claim[5] == 3 && key->claim[9]
+            && !key->main[0]);
+        unbegun |= !key->claim[6];
+        begun |= key->claim[6] != 0;
+        prior |= key->claim[11] != 0;
+        unsigned c = 0;
+        for (; c < classes; c++)
+            if (public_equal(key, &trace.keys[first[c]])) break;
+        if (c == classes) {
+            CHECK(classes < 128);
+            first[classes++] = i;
+        }
+        last[c] = i;
+        returns++;
+    }
+    CHECK(returns && unbegun && begun && prior == (heads == 2));
+    for (unsigned c = 0; c < classes; c++)
+        for (unsigned end = 0; end < 2; end++) {
+            unsigned at = end ? last[c] : first[c];
+            if (end && at == first[c]) continue;
+            for (unsigned outcome = 2; outcome <= 3; outcome++) {
+                ended_case(heads, observed, NULL, &trace.keys[at],
+                    trace.public_ordinal[at], outcome, false);
+                printf(
+                    "claims_cut class%u public%u endpoint%u outcome%u passed\n",
+                    c, trace.public_ordinal[at], end, outcome);
+                histories++;
+            }
+        }
+    printf(
+        "claims_end heads%u observer%d returns%u classes%u histories%u passed\n",
+        heads, observed, returns, classes, histories);
+    free(trace.public_ordinal);
+    free(trace.keys);
+}
+
+/* Take the domain before selecting endpoints so absent and unknown
+ * public shapes cannot disappear through a replay filter. */
+static void
+run_prepublication_audit(unsigned heads, bool observed)
+{
+    public_trace_t trace = {0};
+    trace.keys = calloc(16384, sizeof(*trace.keys));
+    trace.public_ordinal = calloc(16384, sizeof(*trace.public_ordinal));
+    CHECK(trace.keys && trace.public_ordinal);
+    ended_case_record(heads, observed, NULL, NULL, UINT32_MAX, 0, false,
+        &trace, prepublication_end_domain);
+    unsigned counts[4] = {0};
+    unsigned readers[3] = {0}, initializing[3] = {0}, begun[3] = {0};
+    for (unsigned i = 0; i < trace.count; i++) {
+        const public_key_t *key = &trace.keys[i];
+        CHECK(prepublication_end_domain(key) && key->head_count == heads
+            && !key->round_active && !key->retirement[0] && !key->child_active
+            && !key->child[0] && !key->receipt_pending && !key->receipt_ack
+            && !key->main[0] && !key->observer[0] && !key->resource[0]);
+        counts[key->phase - 11]++;
+        if (key->phase != 12 && key->phase != 13) continue;
+        CHECK(key->claim[1] == heads + 1 && key->claim[0] > 0
+            && key->claim[0] < key->claim[1] && key->claim[2]);
+        unsigned slot = (unsigned)key->claim[0];
+        if (key->phase == 12) {
+            CHECK(key->claim[3] && !key->claim[4] && !key->claim[11]);
+            readers[slot]++;
+        } else {
+            CHECK(!key->claim[3] && key->claim[4] && key->claim[5] == 3
+                && key->claim[9] && key->claim[11] == ((1u << slot) - 2u));
+            if (key->claim[6]) begun[slot]++;
+            else initializing[slot]++;
+        }
+    }
+    CHECK(!counts[0] && counts[1] == heads && counts[2] && !counts[3]);
+    for (unsigned slot = 1; slot <= heads; slot++)
+        CHECK(readers[slot] && initializing[slot] && begun[slot]);
+    printf(
+        "prepublication_audit heads%u observer%d registry%u readers%u claims%u cutoff%u initializing%u begun%u passed\n",
+        heads, observed, counts[0], counts[1], counts[2], counts[3],
+        initializing[1] + initializing[2], begun[1] + begun[2]);
     free(trace.public_ordinal);
     free(trace.keys);
 }
@@ -2356,7 +2496,7 @@ run_owner_audit(unsigned heads, bool observed)
     t.public_ordinal = calloc(16384, sizeof(*t.public_ordinal));
     CHECK(t.keys && t.public_ordinal);
     ended_case_record(heads, observed, NULL, NULL, UINT32_MAX, 0, false, &t,
-        false);
+        owner_domain);
     unsigned counts[4] = {0}, rounds = 0;
     bool reached[16][2][4] = {{{false}}};
     uint64_t slots[4] = {0}, phases = 0, finance = 0, roles = 0;
@@ -2419,6 +2559,20 @@ main(int argc, char **argv)
 {
     CHECK(!environment("WIRELOG_JOIN_BATCH_BYTES", "")
         && !environment("WIRELOG_JOIN_BATCH_STRICT", ""));
+    if (argc == 4 && (!strcmp(argv[1], "readers-end")
+        || !strcmp(argv[1], "claims-end")
+        || !strcmp(argv[1], "prepublication-audit"))) {
+        unsigned heads = (unsigned)strtoul(argv[2], NULL, 10);
+        unsigned observed = (unsigned)strtoul(argv[3], NULL, 10);
+        CHECK(heads >= 1 && heads <= 2 && observed <= 1);
+        if (!strcmp(argv[1], "readers-end"))
+            run_readers_end(heads, observed != 0);
+        else if (!strcmp(argv[1], "claims-end"))
+            run_claims_end(heads, observed != 0);
+        else
+            run_prepublication_audit(heads, observed != 0);
+        return 0;
+    }
     if (argc == 4 && !strcmp(argv[1], "observer-audit")) {
         unsigned heads = (unsigned)strtoul(argv[2], NULL, 10);
         unsigned observed = (unsigned)strtoul(argv[3], NULL, 10);

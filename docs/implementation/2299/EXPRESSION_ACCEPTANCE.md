@@ -3551,3 +3551,56 @@ selectors and policy checks.
 This qualifies the discovered finite prepublication observer envelope.
 Registry, claims, publication and postcommit delivery END, other recipients
 and legal hosts, and remaining Source/carry proofs stay open. Issue #2299 remains open.
+
+## STRING reader release and reversible claims END
+
+The existing ordinary unary STRING STEP fixtures expose public EAGAIN during
+release of old descriptor readers and preparation of reversible scalar claims.
+Ending the Original at either boundary could return EINVAL while the
+transaction stayed active. The reader failure retained a held reader. The claim
+failures included both an unfinished initializer and a begun claim.
+
+The Original mismatch path verifies the old registry, the closed child
+generation and the actual reader or role-3 claim records before registering
+disposal. For a reader it validates the saved relation and held reader token.
+For claims it verifies every live record, including the earlier READY claim
+that can coexist with the current claim in a two-head fixture. The existing
+disposal path releases readers, resets initializers and cancels reversible
+claims through its own funding and ownership checks. The published model
+stays available throughout cleanup.
+
+The audit records every available uncommitted, unpublished EAGAIN in phases
+11 through 14 before endpoint selection. Each observer setting produces the
+same counts:
+
+| Heads | Registry | Reader release | Reversible claims | Cutoff |
+| --- | ---: | ---: | ---: | ---: |
+| 1 | 0 | 1 | 27 | 0 |
+| 2 | 0 | 2 | 54 | 0 |
+
+Every actual reader release return is replayed. Claims use the first and last
+distinct return of each copied custody class, keyed by the actual Original
+slot, initialization or claim phase, and earlier READY ownership. The one-head
+fixture has 8 classes and 11 endpoints in each observer setting. The two-head
+fixture has 16 classes and 22 endpoints. Both Original END and END with a live
+successor are exercised, for 12 reader and 132 claim histories per build.
+
+The tests require the first EINVAL and the saved Original report, unchanged
+old relation snapshots, zero events and protected-operation refusals through
+cleanup. The successor consumes zero work. Actual private MAIN progress and
+completed reports are checked during claim disposal. A successful finish
+requires debt-free IDLE and a same-input retry matching raw rows and events.
+
+The 12 replay and audit registrations passed in each of six local non-LTO
+builds. Native and ASan/UBSan ran with mbedTLS disabled and enabled.
+GCC and Clang ran the POSIX TSan configuration. The tests retained the
+120-second watchdog, TSan multiplier of four and 20,000-call drain guard.
+Native and ASan/UBSan also passed 44 previous retirement END and 54 adjacent
+registrations each on the same runtime, including observer resources, observer
+BASELINE and EVENTS END, cold-right JOIN, materialized selectors and policy
+checks.
+
+The qualified scope is the discovered finite reader release and reversible
+claim envelope. Registry and cutoff had zero public returns in these fixtures.
+Precommit cutoff, publication and postcommit delivery END, other legal hosts,
+and remaining Source/carry proofs remain open under #2299.

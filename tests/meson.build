@@ -8563,3 +8563,33 @@ foreach retraction_case : ['public', 'staging', 'typed', 'faults', 'stops', 'met
        test_evaluation_retraction_domains_exe, args: [retraction_case],
        suite: ['unit', 'tsan', 'evaluation_join_hosts'], timeout: 120)
 endforeach
+
+# END during actual prepublication release of the old readers.
+foreach heads : [1, 2]
+  foreach observed : [0, 1]
+    test('evaluation_recursive_string_readers_end_@0@_@1@'.format(heads, observed),
+      evaluation_recursive_string_exe,
+      args: ['readers-end', heads.to_string(), observed.to_string()],
+      suite: ['unit', 'tsan', 'evaluation_recursive_string_prepublication_end'], timeout: 120)
+  endforeach
+endforeach
+
+# END during actual reversible role-3 claims before publication.
+foreach heads : [1, 2]
+  foreach observed : [0, 1]
+    test('evaluation_recursive_string_claims_end_@0@_@1@'.format(heads, observed),
+      evaluation_recursive_string_exe,
+      args: ['claims-end', heads.to_string(), observed.to_string()],
+      suite: ['unit', 'tsan', 'evaluation_recursive_string_prepublication_end'], timeout: 120)
+  endforeach
+endforeach
+
+# Full prepublication public-return domain before endpoint selection.
+foreach heads : [1, 2]
+  foreach observed : [0, 1]
+    test('evaluation_recursive_string_prepublication_audit_@0@_@1@'.format(heads, observed),
+      evaluation_recursive_string_exe,
+      args: ['prepublication-audit', heads.to_string(), observed.to_string()],
+      suite: ['unit', 'tsan', 'evaluation_recursive_string_prepublication_end'], timeout: 120)
+  endforeach
+endforeach
