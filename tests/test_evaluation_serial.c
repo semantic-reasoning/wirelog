@@ -7257,7 +7257,13 @@ typedef struct {
     unsigned recipient[OBSERVER_MAIN_MAX], action[OBSERVER_MAIN_MAX];
     unsigned targets[8], cancel_at;
     bool done[8], cancel_done, refusing, cancelling;
+    /* Pre-action cancel mode: the same eight targets are cancelled on their
+     * open MAIN grant before their first charge instead of refused. */
+    bool precancel, precancelling;
+    unsigned precancelled, begun_cancels;
     controlled_recursive_main_hook_t previous_advanced;
+    void (*previous_begun)(wl_col_session_t *, wl_evaluation_control_t *,
+        uint64_t, unsigned, unsigned, bool);
     wl_mem_ledger_snapshot_t ledger;
     wl_evaluation_control_report_t original;
 } observer_main_probe_t;
@@ -7282,11 +7288,15 @@ observer_main_limit(const wl_col_session_t *session, unsigned recipient,
     if (!p || session != p->session || !observer_main_recipient(recipient))
         return capacity;
     CHECK(capacity == WL_COLUMNAR_SESSION_MAIN_GRANT_WORK && !p->refusing
-        && !p->cancelling);
-    if (!p->inject) return capacity;
+        && !p->cancelling && !p->precancelling);
+    if (!p->inject && !p->precancel) return capacity;
     for (unsigned t = 0; t < 8; ++t)
         if (p->count == p->targets[t] && !p->done[t]) {
-            p->done[t] = true; p->refusing = true;
+            p->done[t] = true;
+            if (p->precancel) {
+                p->precancelling = true; return capacity;
+            }
+            p->refusing = true;
             return OBSERVER_MAIN_FEE - 1u;
         }
     if (p->count == p->cancel_at && !p->cancel_done) {
@@ -7302,6 +7312,11 @@ observer_main_advanced(wl_col_session_t *session,
 {
     observer_main_probe_t *p = observer_main_probe;
     if (p && session == p->session && observer_main_recipient(recipient)
+        && p->precancelling) {
+        /* Stopped at its first charge without advancing the resource. */
+        CHECK(result == WL_EVALUATION_CONTROL_CANCELLED && before == after);
+    }
+    if (p && session == p->session && observer_main_recipient(recipient)
         && p->cancelling) {
         CHECK(!result || result == EAGAIN);
         wl_evaluation_control_request_cancel(funding);
@@ -7313,6 +7328,24 @@ observer_main_advanced(wl_col_session_t *session,
             result);
 }
 
+/* The cancel latches on the open MAIN grant before the action runs, so its
+ * first charge, a 0-work poll included, observes it. */
+static void
+observer_main_begun(wl_col_session_t *session,
+    wl_evaluation_control_t *funding, uint64_t id, unsigned recipient,
+    unsigned action, bool rebegun)
+{
+    observer_main_probe_t *p = observer_main_probe;
+    if (p && session == p->session && observer_main_recipient(recipient)
+        && p->precancelling) {
+        CHECK(rebegun);
+        wl_evaluation_control_request_cancel(funding);
+        ++p->begun_cancels;
+    }
+    if (p && p->previous_begun)
+        p->previous_begun(session, funding, id, recipient, action, rebegun);
+}
+
 static void
 observer_main_report(const wl_col_session_t *session, unsigned recipient,
     unsigned action, wl_evaluation_control_report_t report, int result)
@@ -7320,12 +7353,28 @@ observer_main_report(const wl_col_session_t *session, unsigned recipient,
     observer_main_probe_t *p = observer_main_probe;
     if (!p || session != p->session || !observer_main_recipient(recipient))
         return;
+    if (p->precancelling) {
+        /* Cancelled before its first charge: nothing is spent, the stop is
+         * a cancellation and the whole grant is left. */
+        CHECK(result == WL_EVALUATION_CONTROL_CANCELLED && !report.consumed
+            && report.stop_reason == WL_EVALUATION_CONTROL_CANCELLED
+            && report.limit == WL_COLUMNAR_SESSION_MAIN_GRANT_WORK);
+        p->precancelling = false; ++p->precancelled;
+        return;
+    }
     if (p->refusing) {
         CHECK(result == WL_EVALUATION_CONTROL_WORK_LIMIT && !report.consumed);
         p->refusing = false; ++p->refused;
         return;
     }
-    CHECK(report.consumed == OBSERVER_MAIN_FEE && p->count < OBSERVER_MAIN_MAX);
+    /* A resource STEP pays its quote: the default resource step work on the
+     * phases this history reaches, none of which charges itself. Every other
+     * observer action pays the observer MAIN fee. */
+    const bool resource_step = recipient == OBSERVER_MAIN_OBSERVE
+        && action == WL_COLUMNAR_EVAL_DELTA_RESOURCE_CALL_STEP;
+    CHECK(report.consumed == (resource_step
+        ? (uint64_t)WL_COLUMNAR_EVAL_DELTA_RESOURCE_STEP_WORK
+        : (uint64_t)OBSERVER_MAIN_FEE) && p->count < OBSERVER_MAIN_MAX);
     if (p->cancelling) {
         p->cancelling = false; ++p->cancelled;
     }
@@ -7389,7 +7438,7 @@ observer_main_history(observer_main_probe_t *p,
     CHECK(!wl_session_insert(reference, "r", extra, 1, 2));
 
     p->session = (wl_col_session_t *)session;
-    if (p->inject) {
+    if (p->inject || p->precancel) {
         /* REGISTER and RELEASE have their own recipients and FINISH has
          * recipient 15; BEGIN, OBSERVE, STEP and ACK share recipient 14 and
          * are told apart by their resource call. */
@@ -7428,20 +7477,23 @@ observer_main_history(observer_main_probe_t *p,
         p->targets[4] = step; p->targets[5] = finish;
         p->targets[6] = ack; p->targets[7] = release;
         /* The second OBSERVE is cancelled after its effect. */
-        p->cancel_at = observe[1];
+        p->cancel_at = p->inject ? observe[1] : UINT_MAX;
     }
     p->previous_advanced = wl_columnar_session_test_main_action_advanced;
+    p->previous_begun = wl_columnar_session_test_main_action_begun;
     observer_main_probe = p;
     wl_columnar_session_test_main_limit = observer_main_limit;
     wl_columnar_session_test_main_action_report = observer_main_report;
     wl_columnar_session_test_main_action_advanced = observer_main_advanced;
+    wl_columnar_session_test_main_action_begun = observer_main_begun;
     int rc = observed_multi_step(session);
     wl_columnar_session_test_main_limit = NULL;
     wl_columnar_session_test_main_action_report = NULL;
     wl_columnar_session_test_main_action_advanced = p->previous_advanced;
+    wl_columnar_session_test_main_action_begun = p->previous_begun;
     observer_main_probe = NULL;
     CHECK(!rc && !wl_session_step(reference) && !p->refusing
-        && !p->cancelling);
+        && !p->cancelling && !p->precancelling);
 
     wl_col_session_t *cs = (wl_col_session_t *)session;
     CHECK(!cs->diff_txn_count && actual->count == expected->count);
@@ -7473,7 +7525,9 @@ observer_main_history(observer_main_probe_t *p,
  * FINISH, ACK and RELEASE spends nothing, and a cancel after an OBSERVE keeps
  * its effect. The injected history performs exactly the healthy sequence of
  * recipients and calls, delivers the reference events once, and settles the
- * ledger and the original control as the healthy one does. */
+ * ledger and the original control as the healthy one does. So does a history
+ * that cancels the same eight actions on their open grant before their first
+ * charge. */
 static void
 test_controlled_committed_observer_main_stops(void)
 {
@@ -7504,7 +7558,31 @@ test_controlled_committed_observer_main_stops(void)
         && injected->original.cleanup_status
         == healthy->original.cleanup_status
         && injected->original.result == healthy->original.result);
-    free(healthy); free(injected);
+
+    observer_main_probe_t *cancelled = calloc(1, sizeof(*cancelled));
+    CHECK(cancelled);
+    cancelled->precancel = true;
+    observer_main_history(cancelled, healthy);
+    CHECK(cancelled->precancelled == 8u && cancelled->begun_cancels == 8u
+        && !cancelled->refused && !cancelled->cancelled
+        && cancelled->committed_finishes == healthy->committed_finishes
+        && cancelled->count == healthy->count
+        && !memcmp(cancelled->recipient, healthy->recipient,
+        healthy->count * sizeof(healthy->recipient[0]))
+        && !memcmp(cancelled->action, healthy->action,
+        healthy->count * sizeof(healthy->action[0])));
+    CHECK(cancelled->ledger.current_bytes == healthy->ledger.current_bytes
+        && !memcmp(cancelled->ledger.subsys_bytes,
+        healthy->ledger.subsys_bytes, sizeof(healthy->ledger.subsys_bytes)));
+    CHECK(cancelled->original.consumed == healthy->original.consumed
+        && cancelled->original.limit == healthy->original.limit
+        && cancelled->original.stop_reason == healthy->original.stop_reason
+        && cancelled->original.execution_status
+        == healthy->original.execution_status
+        && cancelled->original.cleanup_status
+        == healthy->original.cleanup_status
+        && cancelled->original.result == healthy->original.result);
+    free(healthy); free(injected); free(cancelled);
 }
 
 static unsigned persistent_stop_phase, persistent_stop_hits;
